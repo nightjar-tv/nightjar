@@ -65,11 +65,14 @@ schema and auth decisions in ADR-0003 stand.
 ## Consequences
 
 Only the first video and first audio stream are mapped (`-map 0:v:0 -map
-0:a:0?`), so multi-language MKVs lose alternate audio, and subtitle tracks
-(SRT, ASS, PGS) are dropped, until track selection and subtitle handling land
-later in Phase 2. Seeking is only available once the remux is complete;
-playback of a large title waits for the full stream copy until the HLS
-segmenter arrives. LRU age uses file mtime, so a freshly remuxed but never
-played file and a just-served old file look similar in eviction order. Probe
-failures land in `transcode` and stay unplayable until real transcoding
-exists.
+0:a:0?`), so multi-language MKVs and commentary tracks lose alternate audio
+until Phase 2 multi-track audio selection (planned with downmix rules and
+capability profiles: `playbackInfo` inventory, stable `trackId`, session
+switch model in a follow-up ADR). Subtitle tracks are dropped from the remux
+MP4; text tracks are listed and served as WebVTT sidecars (ADR-0010), and
+ASS/PGS burn-in remains later Phase 2. Seeking is only available once the
+remux is complete; playback of a large title waits for the full stream copy
+until the HLS segmenter arrives. LRU age uses file mtime, so a freshly
+remuxed but never played file and a just-served old file look similar in
+eviction order. Probe failures land in `transcode` and stay unplayable until
+real transcoding exists.
