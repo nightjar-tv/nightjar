@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+version = "0.0.1"
+repository = "https://github.com/nightjar-tv/nightjar"
+
+[workspace.dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust-embed = "8"
+mime_guess = "2"

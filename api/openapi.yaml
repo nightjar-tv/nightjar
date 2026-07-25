@@ -1,0 +1,35 @@
+openapi: 3.1.0
+info:
+  title: Nightjar API
+  version: 0.0.1
+  description: Public API contract. Server types and clients are generated from this file.
+  license:
+    name: GPL-3.0-only
+servers:
+  - url: http://localhost:8096
+    description: Local default
+paths:
+  /api/health:
+    get:
+      operationId: getHealth
+      summary: Liveness check
+      responses:
+        "200":
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+components:
+  schemas:
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          example: ok
+        version:
+          type: string
+        core:
+          type: string

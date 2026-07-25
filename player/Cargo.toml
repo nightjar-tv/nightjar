@@ -1,0 +1,10 @@
+[package]
+name = "nightjar-player"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Shared playback core (stub until Phase 4)"
+
+[lib]
+crate-type = ["rlib"]

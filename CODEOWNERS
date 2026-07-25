@@ -1,0 +1,3 @@
+# Subsystem owners (Rule 6.2). Split into @nightjar-tv/* teams when the org has
+# more than one maintainer; GitHub silently ignores owners that don't exist.
+*       @gmacarthur

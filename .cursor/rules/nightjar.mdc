@@ -1,0 +1,153 @@
+---
+description: Nightjar engineering constitution binding for all AI-generated code
+alwaysApply: true
+---
+
+# Nightjar — Cursor Rules
+
+How an LLM obeys ENGINEERING_RULES.md and docs/GIT_RULES.md while writing code
+that reads like a careful senior engineer wrote it.
+
+## 0. Before writing anything
+
+- Read ENGINEERING_RULES.md. If a request violates it, refuse and cite the rule
+  number (e.g. "This is out of scope per Rule 3, label: post-v1"). Do not build
+  a "small version" of a forbidden thing.
+- Read docs/GIT_RULES.md before any commit, branch, or PR work. Follow it
+  exactly, including §7 (never push, tag, or merge; no AI attribution).
+- Prose (README, docs, ADRs, PR bodies, comments that explain why): plain
+  register, no marketing voice. Match existing docs; see CONTRIBUTING.md.
+  Cap em dashes at one per file in public docs. No bold-phrase-colon bullets,
+  no "not just X, it's Y", no banned marketing words, no summary theater.
+- Read the existing code in the crate/module you're touching FIRST. Match its
+  patterns, naming, error handling, and test style exactly. Consistency with the
+  codebase beats your preferred style, always.
+- If the task is ambiguous, ask ONE clarifying question or state your assumption
+  in one line and proceed. Never generate three alternative implementations.
+
+## 1. Stack boundaries (hard, from ENGINEERING_RULES.md §1–2)
+
+- Rust (Axum + Tokio) for the server. SvelteKit for web. Flutter for app shells.
+  Never introduce another language, framework, ORM, or service. SQLite via rusqlite
+  patterns already in `server/crates/db` (raw SQL, no query builders).
+- FFmpeg is invoked as a child process through the existing orchestration in
+  `server/crates/transcode`. Never add an FFmpeg wrapper crate. Never suggest
+  patching FFmpeg.
+- All logic lives server-side (Rule 2.1). If you find yourself writing sorting,
+  filtering, transcode decisions, or auth checks in Svelte or Dart, stop and move
+  it behind the API.
+- Every new capability is expressed in api/openapi.yaml FIRST, then implemented.
+  Never hand-write API types in clients; they are generated.
+- Nothing may break single-binary deployment (Rule 1.2): no runtime file
+  dependencies, no sidecar processes, no "just install X first."
+
+## 2. Dependencies (Rule 4.4)
+
+- Default answer to a new crate/npm package: NO. Write it yourself if it's under
+  ~200 lines of straightforward code.
+- If a dependency is genuinely justified, stop and say so in the response with
+  the justification (what it does, why not hand-rolled, maintenance status).
+  The human adds it, not you. Never edit Cargo.toml/package.json to add a
+  dependency unprompted.
+- Never add a dependency for: left-pad-tier utilities, date formatting, one
+  regex, retry loops, or anything the standard library does.
+
+## 3. Code that reads human
+
+- Write the code a senior Rust engineer would write on a calm day: obvious names,
+  small functions, straight-line logic, early returns. Cleverness is a defect.
+- Comments explain WHY, never WHAT. No narrated code ("// increment counter"),
+  no section banners, no comment-per-line rhythm that screams generated. Most
+  functions need zero comments. A tricky invariant, an FFmpeg quirk workaround,
+  or a non-obvious ordering constraint gets one precise comment.
+- No filler doc comments that restate the signature ("/// Gets the user by id").
+  Public API items get doc comments only when they add real information:
+  invariants, errors, examples for non-obvious usage.
+- No dead code, no unused imports, no commented-out blocks, no "for future use"
+  parameters, no config options nobody asked for (Rule 4.7).
+- Naming: follow the codebase's existing vocabulary. The thing is called a
+  `MediaItem` everywhere; don't introduce `Asset` or `Content` as a synonym.
+  One concept, one name, repo-wide.
+- Match the module layout that exists. Never create `utils.rs`, `helpers.rs`,
+  `common.rs`, or `misc.rs`. Code lives with its domain.
+- Errors: use the crate's established error type and propagation style. No
+  `.unwrap()`/`.expect()` outside tests and startup. No swallowing errors with
+  `let _ =`. Error messages state what failed and what input caused it.
+- No emojis anywhere in code, comments, commits, or logs.
+
+## 4. Testability and tests (Rule 5.4)
+
+- Everything you write must compile, pass `cargo clippy -- -D warnings`, and be
+  rustfmt-clean. If you can't verify, say so explicitly. Never present untested
+  code as done.
+- Non-trivial logic ships with tests in the same PR. Non-trivial means: branching
+  business logic, parsing, state machines, transcode decision paths, anything
+  touching watch-state math. Getters, glue, and route wiring don't need tests.
+- Tests assert behavior, not implementation: test the transcode DECISION given a
+  media profile, not that a private method was called. Prefer table-driven tests
+  matching the existing style.
+- Design for testability the boring way: pure functions for decisions, injected
+  clock/filesystem only where the codebase already does so. Do not introduce
+  mocking frameworks or trait-object seams speculatively (Rule 4.7).
+- Any playback bug fix must mention the corpus: name the weird-file that should
+  be added to testdata/ (Rule 4.3).
+
+## 5. Scope discipline (Rule 3, Rule 5.5)
+
+- If asked for anything touching: Live TV, DVR, plugins, music/photo libraries,
+  federation, cloud sync, social features, recommendations/ML, or extra themes,
+  respond with the label (`post-v1` or `never`), cite Rule 3, and stop.
+- Do not gold-plate. Implement exactly what was asked. No bonus endpoints, no
+  extra CLI flags, no "while I was here" refactors. If you notice adjacent debt,
+  mention it in one line; don't fix it uninvited.
+- Prefer diffs that delete. If your change can remove code elsewhere, do it and
+  say what you removed (Rule 4.5).
+
+## 6. Change hygiene
+
+- No TODO/FIXME/HACK comments (Rule 4.1). Finish it or flag it to the human as
+  an issue to file. Never leave the marker in code.
+- Keep diffs minimal: don't reformat untouched lines, don't reorder imports in
+  files you didn't otherwise change, don't rename things outside the task.
+- Migrations: SQLite schema changes are append-only numbered migrations following
+  the existing pattern. Never edit a shipped migration. Schema changes are
+  irreversible decisions; flag that an ADR is required (Rule 6.1) before writing one.
+- Public API changes: additive only within a version (Rule 2.3). If a task
+  requires breaking an endpoint, stop and flag it. That is a versioning decision
+  for a human.
+- Commit messages and PR titles/bodies: follow docs/GIT_RULES.md §2–3 exactly
+  (`area: imperative subject under 72 chars`). Never add AI attribution,
+  Co-Authored-By bots, or `feat:`/`fix:` prefixes.
+
+## 7. Web (SvelteKit) and app (Flutter) specifics
+
+- Svelte: components consume the generated API client only. No raw fetch to
+  invented endpoints. Design tokens from `web/src/app.css` CSS variables; never
+  hardcode hex values, fonts, or radii. User-visible strings live in
+  `web/src/lib/copy.ts`. No new UI dependencies (no component libraries, no CSS
+  frameworks beyond what exists).
+- Client state is UI state only (open menus, scroll position). Watch state,
+  sort order, and permissions come from the server. Cache, don't compute
+  (Rule 2.1).
+- Flutter: playback goes through the shared player core FFI, never a platform
+  video plugin (Rule 2.4).
+- Accessibility floor is non-negotiable: keyboard/D-pad focus visible, labels
+  on controls, reduced-motion respected. TV UIs must be operable by arrows +
+  enter alone.
+
+## 8. Honesty rules
+
+- Never claim code compiles, passes tests, or handles an edge case unless you
+  verified it in this session. State what you verified and what you didn't.
+- If you don't know how an FFmpeg flag, codec, or platform quirk behaves, say
+  so. Do not invent flags or plausible-sounding behavior. Media tooling is full
+  of landmines; a confident wrong answer costs days.
+- If the existing code contradicts ENGINEERING_RULES.md, flag the conflict and
+  follow the rules doc (Rule 5.3). Don't silently propagate a violation because
+  it's the local pattern.
+- When you cut a corner for any reason, say exactly which corner, in the
+  response, not in a code comment.
+
+# The test for every generated diff: would the subsystem owner merge this
+# without being able to tell a human didn't write it, and without finding
+# anything in it they didn't ask for?

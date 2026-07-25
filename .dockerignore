@@ -1,0 +1,7 @@
+**/target/
+web/node_modules/
+web/build/
+web/.svelte-kit/
+web/.vite/
+.git
+**/.DS_Store
