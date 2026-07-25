@@ -1,13 +1,12 @@
-use axum::{
-    Router,
-    body::Body,
-    extract::Request,
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::get,
-};
+mod error;
+mod routes;
+mod state;
+mod stream;
+
 use rust_embed::Embed;
+use state::AppState;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tower_http::trace::TraceLayer;
 
 #[derive(Embed)]
@@ -16,6 +15,7 @@ struct Assets;
 
 #[tokio::main]
 async fn main() {
+    let started = std::time::Instant::now();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -23,8 +23,12 @@ async fn main() {
         )
         .init();
 
-    let app = Router::new()
-        .route("/api/health", get(health))
+    let data_dir = data_dir();
+    let db = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
+    let state = AppState::new(db);
+    nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
+
+    let app = routes::router(state)
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http());
 
@@ -32,48 +36,53 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
-    tracing::info!("nightjar listening on http://{addr}");
+    // startup_ms excludes exec/dyld/Gatekeeper time before main; the gate script
+    // measures the full spawn-to-health number and compares against this.
+    tracing::info!(
+        %addr,
+        data_dir = %data_dir.display(),
+        startup_ms = started.elapsed().as_millis() as u64,
+        "nightjar listening"
+    );
     axum::serve(listener, app)
         .await
         .unwrap_or_else(|e| panic!("server error: {e}"));
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        format!(
-            r#"{{"status":"ok","version":"{}","core":"{}"}}"#,
-            env!("CARGO_PKG_VERSION"),
-            nightjar_core::version()
-        ),
-    )
-}
+async fn static_handler(req: axum::extract::Request) -> axum::response::Response {
+    use axum::{
+        body::Body,
+        http::{StatusCode, header},
+        response::IntoResponse,
+    };
 
-async fn static_handler(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
     match Assets::get(path) {
         Some(file) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            Response::builder()
+            axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime.as_ref())
                 .body(Body::from(file.data.into_owned()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        None => {
-            // SPA fallback: serve index.html for unknown paths.
-            match Assets::get("index.html") {
-                Some(file) => Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                    .body(Body::from(file.data.into_owned()))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-                None => (StatusCode::NOT_FOUND, "not found").into_response(),
-            }
-        }
+        None => match Assets::get("index.html") {
+            Some(file) => axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(Body::from(file.data.into_owned()))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            None => (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
     }
+}
+
+fn data_dir() -> PathBuf {
+    std::env::var_os("NIGHTJAR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"))
 }
 
 fn listen_addr() -> SocketAddr {

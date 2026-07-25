@@ -40,7 +40,7 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 **Rule 4.1 — No TODO merges.** Code with TODO/FIXME/HACK comments does not merge unless linked to a filed issue with an owner.
 **Rule 4.2 — CI is law.** Failing CI blocks merge. No force-merges, no "fix it later." CI includes: build, tests, clippy (deny warnings), rustfmt, and the weird-files playback suite.
-**Rule 4.3 — The weird-files suite.** A permanent corpus of hostile media (10-bit HEVC, ASS subs, odd audio layouts, broken containers) runs on every PR touching the pipeline. New playback bug = new file in the corpus, forever.
+**Rule 4.3 — The weird-files suite.** A permanent corpus of hostile media (10-bit HEVC, ASS subs, odd audio layouts, broken containers) runs on every PR touching the pipeline. New playback bug = new file in the corpus, forever. Every corpus file must be legally redistributable: FFmpeg-generated or explicitly licensed — never copyrighted commercial media.
 **Rule 4.4 — Dependencies are liabilities.** Each new crate/package requires justification in the PR description: what it does, why we can't write it in <200 lines, its maintenance status.
 **Rule 4.5 — Delete before you add.** PRs that add a feature should identify what complexity they remove or why net complexity is justified.
 **Rule 4.6 — Dogfooding is mandatory.** Main branch runs as the team's real household media server. If you won't run it at home, don't merge it.
@@ -60,7 +60,7 @@ This document governs all humans and LLMs contributing to this project. When in 
 **Rule 6.2 — One owner per subsystem.** Transcoding, metadata, API, player core, clients — each has exactly one accountable owner.
 **Rule 6.3 — Quarterly rule review.** This document is reviewed once per quarter. Rules can be amended then, and only then, with unanimous agreement.
 **Rule 6.4 — The escape hatch.** If a rule is genuinely blocking shipping, write the ADR explaining why, get unanimous sign-off, and amend the rule — don't violate it silently.
-**Rule 6.5 — Git.** Branching, commits, PRs, and history hygiene are defined in [docs/GIT_RULES.md](docs/GIT_RULES.md). That document binds humans and LLMs the same way this one does.
+**Rule 6.5 — Git.** Branching, commits, PRs, and history hygiene are defined in [docs/GIT_RULES.md](docs/GIT_RULES.md).
 
 ---
 *If a choice makes the binary bigger, the client smarter, the API weaker, or the scope wider — the answer is no.*
