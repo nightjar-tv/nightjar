@@ -120,16 +120,16 @@ share one converter (Rule 4.11).
 
 Extraction still shares remux's whole-file-artifact shape: the first request
 pays for a demux of the source, then hits a named cache object. Cache warming
-on remux start is coupled to that whole-file remux model — it races the demux
-against the stream-copy so captions are ready when the MP4 is. On transcode
-there is no remux-completion moment to warm against; extraction competes with
-the encode for source reads on cold titles. Measured on a NAS-hosted DTS MKV
-(item 1, 500 Days of Summer) with a live HLS encode of the same file: cold
-extract ~255s to first WebVTT byte; cache hit ~0.08s. Copy-deck honesty
-("captions may take a moment") is grounded in that cold figure, not the remux
-Birder ~90s number. If remux converges onto sessions, revisit warming; this is
-the second feature bent around whole-file remux (seek-after-complete was the
-first). A third is a decision made late, not another workaround.
+on remux start races the demux against the stream-copy so captions are ready
+when the MP4 is. Measured dogfooding showed that race loses at real NAS file
+sizes: warm did not finish inside the remux window on completed large titles.
+The remux warm path stays functional and is not invested in further; warming
+moves to session start when remux converges onto HLS (ADR-0011). On transcode
+there is no remux-completion moment; extraction competes with the encode for
+source reads on cold titles. Measured on a NAS-hosted DTS MKV (item 1, 500
+Days of Summer) with a live HLS encode of the same file: cold extract ~255s
+to first WebVTT byte; cache hit ~0.08s. Copy-deck honesty ("captions may take
+a moment") is grounded in that cold figure, not the remux Birder ~90s number.
 
 HLS sessions snapshot serveable tracks at start. A sidecar added while a
 session is live does not appear in that session’s master; it appears on the
