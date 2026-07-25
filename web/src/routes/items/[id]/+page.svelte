@@ -46,6 +46,14 @@
 				(playback.playbackMethod === 'transcode' && playlistUrl != null))
 	);
 
+	// Discovered but not served (ASS/SSA sidecars): say so instead of hiding.
+	const unrenderedSubtitles = $derived(
+		(playback?.subtitleTracks ?? [])
+			.filter((t) => !t.url)
+			.map((t) => `${t.language ?? t.trackId} (${t.codec})`)
+			.join(', ')
+	);
+
 	onMount(() => {
 		let alive = true;
 
@@ -226,6 +234,9 @@
 			{/if}
 			{#if playback.playbackMethod === 'remux' && (playback.subtitleTracks?.length ?? 0) === 0}
 				<p class="preparing">{copy.remuxSubtitleNote}</p>
+			{/if}
+			{#if unrenderedSubtitles}
+				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
 			{/if}
 		{:else if playback.playbackMethod === 'remux' && playback.remuxState === 'failed'}
 			<p class="error" role="alert">

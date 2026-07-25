@@ -35,7 +35,10 @@ pass (Rule 6.1 / 4.9).
      `Movie.srt` → `s`; `Movie.en.srt` → `s-en`; `Movie.en.forced.srt` →
      `s-en.forced`; `Subs/Movie.en.srt` → `s-Subs.en`.
    Adding `Movie.fr.srt` must not renumber an existing selection a client
-   remembered.
+   remembered. The id carries no extension, so `Movie.en.srt` and
+   `Movie.en.vtt` collide on `s-en`; discovery keeps one deterministically
+   (vtt over srt over ass over ssa, the servable format wins) and logs the
+   skipped file.
 
 3. **WebVTT delivery.** Text streams become WebVTT for direct play and
    remux. Do not remux subtitle streams into the MP4 cache; remux stays

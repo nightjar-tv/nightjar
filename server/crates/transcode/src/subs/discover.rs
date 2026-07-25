@@ -40,8 +40,37 @@ pub fn discover_sidecars(video_path: &Path) -> Result<Vec<DiscoveredSidecar>, St
             scan_dir(&dir, stem, Some(sub), &mut out)?;
         }
     }
-    out.sort_by(|a, b| a.track_id.cmp(&b.track_id));
+    // Movie.en.srt and Movie.en.vtt share track_id s-en (the id carries no
+    // extension). One must win deterministically or the DB primary key on
+    // (item, track_id) rejects the whole association. VTT wins: it serves
+    // as-is.
+    out.sort_by(|a, b| {
+        a.track_id
+            .cmp(&b.track_id)
+            .then(format_rank(&a.format).cmp(&format_rank(&b.format)))
+    });
+    out.dedup_by(|loser, winner| {
+        let dup = loser.track_id == winner.track_id;
+        if dup {
+            tracing::warn!(
+                track_id = %winner.track_id,
+                kept = %winner.path.display(),
+                skipped = %loser.path.display(),
+                "duplicate sidecar track id; keeping the servable format"
+            );
+        }
+        dup
+    });
     Ok(out)
+}
+
+fn format_rank(format: &str) -> u8 {
+    match format {
+        "vtt" => 0,
+        "srt" => 1,
+        "ass" => 2,
+        _ => 3,
+    }
 }
 
 fn scan_dir(
@@ -203,6 +232,38 @@ mod tests {
         let unk = parse_sidecar_stem("Movie", "Movie.xx", None).unwrap();
         assert!(unk.language.is_none());
         assert_eq!(unk.track_id, "s-xx");
+    }
+
+    #[test]
+    fn same_suffix_different_extension_dedupes_to_one_track() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("Movie.mkv");
+        File::create(&video).unwrap();
+        File::create(dir.path().join("Movie.en.srt")).unwrap();
+        File::create(dir.path().join("Movie.en.vtt")).unwrap();
+
+        let found = discover_sidecars(&video).unwrap();
+        let en: Vec<_> = found.iter().filter(|s| s.track_id == "s-en").collect();
+        assert_eq!(
+            en.len(),
+            1,
+            "duplicate track_id would break the PK: {found:?}"
+        );
+        assert_eq!(en[0].format, "vtt", "vtt serves as-is and must win");
+    }
+
+    #[test]
+    fn normalisation_shares_language_but_not_identity() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("Movie.mkv");
+        File::create(&video).unwrap();
+        File::create(dir.path().join("Movie.en.srt")).unwrap();
+        File::create(dir.path().join("Movie.eng.srt")).unwrap();
+
+        let found = discover_sidecars(&video).unwrap();
+        let ids: Vec<_> = found.iter().map(|s| s.track_id.as_str()).collect();
+        assert_eq!(ids, vec!["s-en", "s-eng"]);
+        assert!(found.iter().all(|s| s.language.as_deref() == Some("en")));
     }
 
     #[test]
