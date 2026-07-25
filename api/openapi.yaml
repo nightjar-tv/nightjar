@@ -559,7 +559,7 @@ components:
 
     TranscodeSession:
       type: object
-      required: [sessionId, itemId, playlistUrl]
+      required: [sessionId, itemId, playlistUrl, videoEncoder, encoderKind]
       properties:
         sessionId:
           type: string
@@ -569,6 +569,13 @@ components:
         playlistUrl:
           type: string
           description: Path to the HLS media playlist for this session
+        videoEncoder:
+          type: string
+          description: FFmpeg encoder currently used by this session
+        encoderKind:
+          type: string
+          enum: [hardware, software]
+          description: Whether videoEncoder is a hardware or software encoder
 
     Library:
       type: object

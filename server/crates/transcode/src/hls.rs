@@ -94,6 +94,8 @@ struct Session {
     item_id: i64,
     src: PathBuf,
     dir: PathBuf,
+    /// Actual encoder for this process. Future fallback updates this field.
+    video_encoder: String,
     start_ms: u64,
     duration_ms: u64,
     child: Option<Child>,
@@ -179,6 +181,7 @@ impl HlsSessionRegistry {
                     session_id = %id,
                     item_id,
                     start_ms,
+                    encoder = %session.video_encoder,
                     refs = session.refs,
                     "hls session reused"
                 );
@@ -199,6 +202,7 @@ impl HlsSessionRegistry {
                         item_id,
                         src: src.to_path_buf(),
                         dir,
+                        video_encoder: self.video_encoder.clone(),
                         start_ms,
                         duration_ms,
                         child: Some(child),
@@ -207,7 +211,13 @@ impl HlsSessionRegistry {
                         refs: 1,
                     },
                 );
-                tracing::info!(session_id = %id, item_id, start_ms, "hls session started");
+                tracing::info!(
+                    session_id = %id,
+                    item_id,
+                    start_ms,
+                    encoder = %self.video_encoder,
+                    "hls session started"
+                );
                 Ok(id)
             }
         }
@@ -219,6 +229,19 @@ impl HlsSessionRegistry {
             .ok()?
             .get(session_id)
             .map(|s| s.item_id)
+    }
+
+    pub fn encoder(&self, session_id: &str) -> Option<SessionEncoder> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(session_id)?;
+        Some(SessionEncoder {
+            name: session.video_encoder.clone(),
+            kind: if session.video_encoder == "libx264" {
+                EncoderKind::Software
+            } else {
+                EncoderKind::Hardware
+            },
+        })
     }
 
     pub fn refs(&self, session_id: &str) -> Option<usize> {
@@ -255,7 +278,7 @@ impl HlsSessionRegistry {
                 WindowAction::Serve => {}
                 WindowAction::Fork => return Err(PlaylistError::SharedSeekConflict),
                 WindowAction::Restart => {
-                    let encoder = self.video_encoder.clone();
+                    let encoder = session.video_encoder.clone();
                     restart_at(session, aligned, &encoder)?;
                 }
             }
@@ -321,7 +344,7 @@ impl HlsSessionRegistry {
                                 return Err(PlaylistError::SharedSeekConflict);
                             }
                             WindowAction::Restart => {
-                                let encoder = self.video_encoder.clone();
+                                let encoder = session.video_encoder.clone();
                                 restart_at(session, want_ms, &encoder)?;
                                 deadline = Instant::now() + SEGMENT_WAIT;
                             }
@@ -407,6 +430,27 @@ impl HlsSessionRegistry {
         };
         stop_child(&mut session.child);
         let _ = fs::remove_dir_all(&session.dir);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEncoder {
+    pub name: String,
+    pub kind: EncoderKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderKind {
+    Hardware,
+    Software,
+}
+
+impl EncoderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+        }
     }
 }
 
@@ -783,6 +827,13 @@ mod tests {
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        assert_eq!(
+            reg.encoder(&id),
+            Some(SessionEncoder {
+                name: "libx264".into(),
+                kind: EncoderKind::Software,
+            })
+        );
         let playlist = wait_playlist(&reg, &id);
         let text = String::from_utf8_lossy(&playlist);
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{text}");

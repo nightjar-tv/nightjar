@@ -336,6 +336,13 @@ export interface components {
             itemId: number;
             /** @description Path to the HLS media playlist for this session */
             playlistUrl: string;
+            /** @description FFmpeg encoder currently used by this session */
+            videoEncoder: string;
+            /**
+             * @description Whether videoEncoder is a hardware or software encoder
+             * @enum {string}
+             */
+            encoderKind: "hardware" | "software";
         };
         Library: {
             /** Format: int64 */

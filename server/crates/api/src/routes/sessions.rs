@@ -19,6 +19,8 @@ pub struct TranscodeSessionDto {
     pub session_id: String,
     pub item_id: i64,
     pub playlist_url: String,
+    pub video_encoder: String,
+    pub encoder_kind: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -71,21 +73,30 @@ pub async fn start(
 
     let start_ms = query.start_ms.unwrap_or(0);
     let hls = Arc::clone(&state.hls);
+    let hls_for_start = Arc::clone(&hls);
     let src = std::path::PathBuf::from(&row.path);
-    let started =
-        tokio::task::spawn_blocking(move || hls.start(item_id, &src, start_ms, duration_ms as u64))
-            .await
-            .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
+    let started = tokio::task::spawn_blocking(move || {
+        hls_for_start.start(item_id, &src, start_ms, duration_ms as u64)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
 
     match started {
-        Ok(session_id) => Ok((
-            StatusCode::ACCEPTED,
-            Json(TranscodeSessionDto {
-                playlist_url: format!("/api/v0/sessions/{session_id}/index.m3u8"),
-                session_id,
-                item_id,
-            }),
-        )),
+        Ok(session_id) => {
+            let encoder = hls.encoder(&session_id).ok_or_else(|| {
+                ApiError::internal(format!("session {session_id} disappeared after start"))
+            })?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(TranscodeSessionDto {
+                    playlist_url: format!("/api/v0/sessions/{session_id}/index.m3u8"),
+                    session_id,
+                    item_id,
+                    video_encoder: encoder.name,
+                    encoder_kind: encoder.kind.as_str(),
+                }),
+            ))
+        }
         Err(StartSessionError::CapFull) => Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "all transcode sessions are in use; retry shortly".into(),

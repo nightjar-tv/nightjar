@@ -84,5 +84,18 @@ correctly report software-only. Amending the preference policy for VideoToolbox
 quality is expected once remote bitrate caps exist; until then LAN throughput
 wins.
 
+The item-page encoder readout is sourced from the live session, not the startup
+preference, so it stays accurate when fallback changes a session's encoder.
+Mid-stream fallback does not exist yet; today the field reports the encoder
+selected when the session starts, and its meaning becomes "current encoder"
+when fallback lands.
+
+Hardware-over-`libx264` is policy, not incidental sort order: hardware is
+preferred for throughput and power. VideoToolbox quality at low bitrates is the
+known exception that later quality-tuning work may amend.
+
+`GET /api/v0/system/transcode` is public only because Phase 2 has no auth. It
+becomes admin-only in Phase 3 because it discloses server capability.
+
 This advances ADR-0007's deferred hardware work for encode selection only.
 Decode `-hwaccel` and remux remain unchanged.

@@ -8,12 +8,16 @@
 
 	type MediaItem = components['schemas']['MediaItem'];
 	type PlaybackInfo = components['schemas']['PlaybackInfo'];
+	type TranscodeSession = components['schemas']['TranscodeSession'];
 
 	let item = $state<MediaItem | null>(null);
 	let playback = $state<PlaybackInfo | null>(null);
 	let error = $state<string | null>(null);
 	let playlistUrl = $state<string | null>(null);
 	let sessionId = $state<string | null>(null);
+	let sessionEncoder = $state<Pick<TranscodeSession, 'videoEncoder' | 'encoderKind'> | null>(
+		null
+	);
 	let preparingTranscode = $state(false);
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	// Mutable holder so onMount cleanup / pagehide always DELETE the live
@@ -31,6 +35,7 @@
 		const id = sessionRef.id;
 		sessionRef.id = null;
 		sessionId = null;
+		sessionEncoder = null;
 		if (id) void api.deleteTranscodeSession(id);
 	}
 
@@ -72,11 +77,12 @@
 
 			if (playback.playbackMethod === 'transcode') {
 				preparingTranscode = true;
-				let started: { sessionId: string; playlistUrl: string } | null = null;
+				let started: TranscodeSession | null = null;
 				for (let attempt = 0; alive && attempt < 5; attempt++) {
 					try {
 						started = await api.startTranscodeSession(itemId);
 						holdSession(started.sessionId);
+						sessionEncoder = started;
 						break;
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
@@ -133,6 +139,7 @@
 				try {
 					const forked = await api.startTranscodeSession(id, absoluteStartMs);
 					holdSession(forked.sessionId);
+					sessionEncoder = forked;
 					if (prev && prev !== forked.sessionId) {
 						void api.deleteTranscodeSession(prev);
 					}
@@ -182,6 +189,9 @@
 				{#if item.year}· {item.year}{/if}
 				{#if playback.videoCodec}· {playback.videoCodec}{/if}
 				{#if playback.audioCodec}· {playback.audioCodec}{/if}
+				{#if playback.playbackMethod === 'transcode' && sessionEncoder}
+					· transcoding · {sessionEncoder.videoEncoder} ({sessionEncoder.encoderKind})
+				{/if}
 			</p>
 			<p class="reason">{playback.reason}</p>
 		</header>
@@ -191,6 +201,7 @@
 			<video bind:this={videoEl} controls playsinline></video>
 		{:else if playable && playback.streamUrl}
 			{#if (playback.subtitleTracks?.length ?? 0) > 0}
+				<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions) -->
 				<video controls playsinline src={playback.streamUrl} crossorigin="anonymous">
 					{#each playback.subtitleTracks ?? [] as track, i (track.streamIndex)}
 						<track

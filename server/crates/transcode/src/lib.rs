@@ -7,8 +7,8 @@ mod hwaccel;
 mod subs;
 
 pub use hls::{
-    HlsSessionRegistry, PlaylistError, StartAction, StartSessionError, WindowAction, decide_start,
-    decide_window_action,
+    EncoderKind, HlsSessionRegistry, PlaylistError, SessionEncoder, StartAction, StartSessionError,
+    WindowAction, decide_start, decide_window_action,
 };
 pub use hwaccel::{
     EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,
