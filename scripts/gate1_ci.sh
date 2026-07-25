@@ -75,15 +75,6 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 
-sleep 0.5
-RSS_KB=$(ps -o rss= -p "$PID" | tr -d ' ')
-RSS_MB=$(( RSS_KB / 1024 ))
-echo "idle_rss_mb=${RSS_MB}"
-if [[ "$RSS_MB" -gt 50 ]]; then
-  echo "FAIL: idle RSS ${RSS_MB}MB > 50MB" >&2
-  exit 1
-fi
-
 curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
   -H 'content-type: application/json' \
   -d "{\"name\":\"t\",\"path\":\"${MEDIA}\",\"kind\":\"movies\"}" >/dev/null
@@ -106,30 +97,54 @@ else:
 PY
 ITEM=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(json.load(sys.stdin)["items"][0]["id"])')
 
-# Open-ended Range: must get headers quickly (streaming, not full buffer)
+# Criterion is idle RAM with the library loaded, not cold empty process.
+sleep 0.5
+RSS_KB=$(ps -o rss= -p "$PID" | tr -d ' ')
+RSS_MB=$(( RSS_KB / 1024 ))
+echo "idle_rss_mb_with_library=${RSS_MB}"
+if [[ "$RSS_MB" -gt 50 ]]; then
+  echo "FAIL: idle RSS ${RSS_MB}MB > 50MB with library loaded" >&2
+  exit 1
+fi
+
+# Range dance: open-ended (Chrome), tiny probe then mid-file seek (Safari-ish).
 python3 - <<PY
-import urllib.request, time, os
+import urllib.request, time
+
 port = "${PORT}"
 item = "${ITEM}"
-req = urllib.request.Request(
-    f"http://127.0.0.1:{port}/api/v0/items/{item}/stream",
-    headers={"Range": "bytes=0-"},
-)
-t0 = time.perf_counter()
-with urllib.request.urlopen(req, timeout=3) as r:
-    status = r.status
-    # read a small chunk so the body is flowing
-    chunk = r.read(65536)
-elapsed = time.perf_counter() - t0
-print(f"open_ended_range status={status} first_chunk={len(chunk)} elapsed_s={elapsed:.3f}")
-if status not in (200, 206):
-    raise SystemExit(f"unexpected status {status}")
-if elapsed > 2.0:
-    raise SystemExit(f"open-ended Range too slow ({elapsed:.3f}s) — likely buffering")
-if len(chunk) == 0:
-    raise SystemExit("no bytes received")
+base = f"http://127.0.0.1:{port}/api/v0/items/{item}/stream"
+
+def get(range_header):
+    req = urllib.request.Request(base, headers={"Range": range_header})
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=3) as r:
+        status = r.status
+        cr = r.headers.get("Content-Range", "")
+        ar = r.headers.get("Accept-Ranges", "")
+        chunk = r.read(65536)
+        elapsed = time.perf_counter() - t0
+    return status, cr, ar, len(chunk), elapsed
+
+status, cr, ar, n, elapsed = get("bytes=0-")
+print(f"open_ended_range status={status} accept={ar} content_range={cr} first_chunk={n} elapsed_s={elapsed:.3f}")
+if status != 206 or ar != "bytes" or n == 0 or elapsed > 2.0:
+    raise SystemExit("open-ended Range failed")
+
+status, cr, ar, n, elapsed = get("bytes=0-1")
+print(f"safari_probe status={status} content_range={cr} bytes={n} elapsed_s={elapsed:.3f}")
+if status != 206 or not cr.startswith("bytes 0-1/") or n == 0:
+    raise SystemExit("Safari-style bytes=0-1 probe failed")
+size = int(cr.split("/")[1])
+mid = max(size // 2, 2)
+end = min(mid + 65535, size - 1)
+status, cr, ar, n, elapsed = get(f"bytes={mid}-{end}")
+print(f"mid_seek status={status} content_range={cr} first_chunk={n} elapsed_s={elapsed:.3f}")
+if status != 206 or n == 0 or elapsed > 2.0:
+    raise SystemExit("mid-file seek Range failed")
 PY
 
+# Kill -9 after a completed scan; WAL must still serve the library.
 kill -9 "$PID"
 wait "$PID" 2>/dev/null || true
 PID=""
@@ -146,6 +161,45 @@ COUNT=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | pyth
 echo "wal_items_after_kill9=${COUNT}"
 if [[ "$COUNT" -lt 1 ]]; then
   echo "FAIL: library empty or corrupt after kill -9" >&2
+  cat "$LOG" >&2 || true
+  exit 1
+fi
+
+# Kill -9 mid-scan: start a second library scan and shoot the process while probing.
+MEDIA2="$(mktemp -d)"
+ffmpeg -y -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=320x240:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest \
+  "$MEDIA2/during.mp4" >/dev/null
+for i in $(seq 1 40); do
+  ln "$MEDIA2/during.mp4" "$MEDIA2/during_${i}.mp4" 2>/dev/null || cp "$MEDIA2/during.mp4" "$MEDIA2/during_${i}.mp4"
+done
+curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"during\",\"path\":\"${MEDIA2}\",\"kind\":\"movies\"}" >/dev/null
+LIB2=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print([l["id"] for l in json.load(sys.stdin)["libraries"] if l["name"]=="during"][0])')
+JOB2=$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/scan" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobId"])')
+# Give the index pass a moment to land rows, then kill during probe.
+sleep 0.2
+kill -9 "$PID"
+wait "$PID" 2>/dev/null || true
+PID=""
+rm -rf "$MEDIA2"
+
+NIGHTJAR_DATA_DIR="$DATA" NIGHTJAR_PORT="$PORT" "$BIN" >"$LOG" 2>&1 &
+PID=$!
+for _ in $(seq 1 100); do
+  if curl -sf "http://127.0.0.1:${PORT}/api/health" >/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+COUNT1=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
+COUNT2=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
+echo "wal_after_midscan_kill9 lib1=${COUNT1} lib2=${COUNT2} (job ${JOB2} interrupted)"
+if [[ "$COUNT1" -lt 1 ]]; then
+  echo "FAIL: prior library lost after mid-scan kill -9" >&2
   cat "$LOG" >&2 || true
   exit 1
 fi
