@@ -12,6 +12,7 @@ export const copy = {
 	remuxFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
 	transcodeFailed: "This file couldn't be transcoded. Check the logs for the file details.",
 	badgeHint:
-		'Badges: browser plays directly, remux is prepared on first play, transcode starts when you open the item. Embedded subtitles are not shown yet for remuxed files.',
-	remuxSubtitleNote: 'Subtitles embedded in this file are not shown yet. Subtitle support is next.'
+		'Badges: browser plays directly, remux is prepared on first play, transcode starts when you open the item. Text subtitles (SRT and similar) show as captions on direct play and remux; ASS and image subs are not available yet.',
+	remuxSubtitleNote:
+		'Styled or image subtitles in this file are not shown yet. Text tracks (SRT and similar) appear in the player caption menu when present.'
 } as const;

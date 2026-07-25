@@ -33,6 +33,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/items/{item_id}/playback-info",
             get(items::playback_info),
         )
+        .route(
+            "/api/v0/items/{item_id}/subtitles/{stream_index}.vtt",
+            get(items::subtitle_vtt),
+        )
         .route("/api/v0/items/{item_id}/remux", post(items::start_remux))
         .route("/api/v0/items/{item_id}/sessions", post(sessions::start))
         .route(

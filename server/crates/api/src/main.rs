@@ -38,7 +38,13 @@ async fn main() {
         transcode_caps.preferred_h264_encoder.clone(),
     )
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
-    let state = AppState::new(db, remux, hls, transcode_caps);
+    let state = AppState::new(
+        db,
+        remux,
+        hls,
+        transcode_caps,
+        data_dir.join("cache").join("subs"),
+    );
     nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
 
     let app = routes::router(state)

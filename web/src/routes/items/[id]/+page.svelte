@@ -190,11 +190,26 @@
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video bind:this={videoEl} controls playsinline></video>
 		{:else if playable && playback.streamUrl}
-			<!-- svelte-ignore a11y_media_has_caption -->
-			<video controls playsinline src={playback.streamUrl}>
-				Your browser cannot play this file directly.
-			</video>
-			{#if playback.playbackMethod === 'remux'}
+			{#if (playback.subtitleTracks?.length ?? 0) > 0}
+				<video controls playsinline src={playback.streamUrl} crossorigin="anonymous">
+					{#each playback.subtitleTracks ?? [] as track, i (track.streamIndex)}
+						<track
+							kind="subtitles"
+							src={track.url}
+							srclang={track.language ?? 'und'}
+							label={track.label ?? track.language ?? `Subtitles ${track.streamIndex}`}
+							default={i === 0}
+						/>
+					{/each}
+					Your browser cannot play this file directly.
+				</video>
+			{:else}
+				<!-- svelte-ignore a11y_media_has_caption -->
+				<video controls playsinline src={playback.streamUrl}>
+					Your browser cannot play this file directly.
+				</video>
+			{/if}
+			{#if playback.playbackMethod === 'remux' && (playback.subtitleTracks?.length ?? 0) === 0}
 				<p class="preparing">{copy.remuxSubtitleNote}</p>
 			{/if}
 		{:else if playback.playbackMethod === 'remux' && playback.remuxState === 'failed'}

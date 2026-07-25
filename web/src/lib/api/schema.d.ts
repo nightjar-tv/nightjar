@@ -141,6 +141,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/items/{itemId}/subtitles/{streamIndex}.vtt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** WebVTT for one text subtitle stream (ADR-0010) */
+        get: operations["getSubtitleVtt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/items/{itemId}/remux": {
         parameters: {
             query?: never;
@@ -410,6 +427,19 @@ export interface components {
             container?: string | null;
             videoCodec?: string | null;
             audioCodec?: string | null;
+            /** @description Text subtitle tracks as WebVTT sidecars (ADR-0010). Present for directPlay and remux; empty or omitted for transcode until burn-in. */
+            subtitleTracks?: components["schemas"]["SubtitleTrack"][];
+        };
+        SubtitleTrack: {
+            /** @description Absolute ffprobe stream index */
+            streamIndex: number;
+            /** @description Source codec (subrip, mov_text, ...) */
+            codec: string;
+            language?: string | null;
+            /** @description Optional title tag from the container */
+            label?: string | null;
+            /** @description GET path for the WebVTT body */
+            url: string;
         };
         /**
          * @description verified = short encode+demux succeeded; failed = advertised but verify failed; unavailable = not in this ffmpeg build.
@@ -698,6 +728,38 @@ export interface operations {
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSubtitleVtt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+                streamIndex: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebVTT body */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/vtt": string;
+                };
+            };
+            /** @description Item or text subtitle stream not found */
             404: {
                 headers: {
                     [name: string]: unknown;

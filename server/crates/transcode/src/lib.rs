@@ -1,8 +1,10 @@
 //! FFmpeg orchestration: remux cache (ADR-0006), HLS transcode sessions
-//! (ADR-0007), and hardware encode detection (ADR-0009).
+//! (ADR-0007), hardware encode detection (ADR-0009), and text subtitle
+//! WebVTT sidecars (ADR-0010).
 
 mod hls;
 mod hwaccel;
+mod subs;
 
 pub use hls::{
     HlsSessionRegistry, PlaylistError, StartAction, StartSessionError, WindowAction, decide_start,
@@ -12,6 +14,7 @@ pub use hwaccel::{
     EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,
     probe_h264_encoders_arc, select_preferred,
 };
+pub use subs::{TextSubtitleStream, ensure_webvtt, is_text_subtitle_codec, list_text_subtitles};
 
 use std::collections::HashMap;
 use std::fs;

@@ -190,6 +190,32 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/items/{itemId}/subtitles/{streamIndex}.vtt:
+    get:
+      operationId: getSubtitleVtt
+      summary: WebVTT for one text subtitle stream (ADR-0010)
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+        - name: streamIndex
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: WebVTT body
+          content:
+            text/vtt:
+              schema:
+                type: string
+        "404":
+          description: Item or text subtitle stream not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/items/{itemId}/remux:
     post:
       operationId: startRemux
@@ -738,6 +764,36 @@ components:
         audioCodec:
           type: string
           nullable: true
+        subtitleTracks:
+          type: array
+          description: >
+            Text subtitle tracks as WebVTT sidecars (ADR-0010). Present for
+            directPlay and remux; empty or omitted for transcode until burn-in.
+          items:
+            $ref: "#/components/schemas/SubtitleTrack"
+
+    SubtitleTrack:
+      type: object
+      required: [streamIndex, codec, url]
+      properties:
+        streamIndex:
+          type: integer
+          minimum: 0
+          description: Absolute ffprobe stream index
+        codec:
+          type: string
+          description: Source codec (subrip, mov_text, ...)
+        language:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+          description: Optional title tag from the container
+        url:
+          type: string
+          description: GET path for the WebVTT body
+
     EncoderStatus:
       type: string
       enum: [verified, failed, unavailable]
