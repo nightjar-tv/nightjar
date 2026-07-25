@@ -47,6 +47,14 @@ keyframe alignment across any future renditions.
    rendition-addressable (a single-rendition path a variant list could reference),
    not a shape that assumes exactly one rendition forever.
 
+   **First test (2026-07-26, ADR-0010 HLS subtitle renditions).** The condition
+   held. `index.m3u8` remains the media playlist (same path, same VOD body,
+   same segment URIs). The master was added at a new path, `master.m3u8`, and
+   session `playlistUrl` points there. Seek via `?startMs=` works on both the
+   master and the media playlist. Turning `index.m3u8` into a master and moving
+   media to a new path was rejected: that would have changed a URL clients
+   already fetch, which is not what “additive” meant.
+
 5. **Cap accounting is already session-based.** Concurrent transcode caps count
    sessions in the registry, not FFmpeg processes. A future ABR session is one
    logical session with several encode outputs; that model fits the current

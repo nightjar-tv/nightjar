@@ -207,6 +207,12 @@
 		{#if playable && playback.playbackMethod === 'transcode' && playlistUrl}
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video bind:this={videoEl} controls playsinline></video>
+			{#if (playback.subtitleTracks ?? []).some((t) => t.url)}
+				<p class="preparing">{copy.transcodeSubtitlesPreparing}</p>
+			{/if}
+			{#if unrenderedSubtitles}
+				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
+			{/if}
 		{:else if playable && playback.streamUrl}
 			{#if (playback.subtitleTracks?.length ?? 0) > 0}
 				<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions) -->

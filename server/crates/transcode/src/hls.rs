@@ -90,6 +90,18 @@ pub struct HlsSessionRegistry {
     sessions: Mutex<HashMap<String, Session>>,
 }
 
+/// Serveable text track snapshot taken at session create (ADR-0010).
+/// Mid-session sidecar additions do not appear until the next session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HlsSubtitleTrack {
+    pub track_id: String,
+    pub language: Option<String>,
+    pub name: String,
+    pub is_default: bool,
+    pub forced: bool,
+    pub sdh: bool,
+}
+
 struct Session {
     item_id: i64,
     src: PathBuf,
@@ -103,6 +115,8 @@ struct Session {
     failed: Option<String>,
     /// Open players. DELETE decrements; FFmpeg is reaped only at zero (or idle).
     refs: usize,
+    /// Tracks declared in the master at create; reuse keeps this snapshot.
+    subtitle_tracks: Vec<HlsSubtitleTrack>,
 }
 
 impl HlsSessionRegistry {
@@ -153,12 +167,14 @@ impl HlsSessionRegistry {
     /// Starts a session at `start_ms` (aligned), or reuses a live session for
     /// the same item at the same encode window (refcount). Divergent offsets
     /// never share — POST with a new startMs to fork (ADR-0007).
+    /// `subtitle_tracks` is snapshotted on create only; reuse keeps the original.
     pub fn start(
         &self,
         item_id: i64,
         src: &Path,
         start_ms: u64,
         duration_ms: u64,
+        subtitle_tracks: Vec<HlsSubtitleTrack>,
     ) -> Result<String, StartSessionError> {
         let start_ms = align_to_segment(start_ms);
         let mut sessions = self
@@ -209,6 +225,7 @@ impl HlsSessionRegistry {
                         last_access: Instant::now(),
                         failed: None,
                         refs: 1,
+                        subtitle_tracks,
                     },
                 );
                 tracing::info!(
@@ -248,13 +265,67 @@ impl HlsSessionRegistry {
         self.sessions.lock().ok()?.get(session_id).map(|s| s.refs)
     }
 
-    /// Returns the VOD playlist covering the whole title. `start_ms` is seek
+    /// Returns the VOD media playlist (`index.m3u8`). `start_ms` is seek
     /// intent: solo holders restart in place; shared holders get 409 (fork).
     pub fn playlist(
         &self,
         session_id: &str,
         start_ms: Option<u64>,
     ) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, start_ms, |session| {
+            Ok(build_playlist(session.duration_ms))
+        })
+    }
+
+    /// Returns the HLS master playlist (`master.m3u8`). Same seek semantics as
+    /// [`playlist`]; media URI stays `index.m3u8` (ADR-0008 additive).
+    pub fn master(
+        &self,
+        session_id: &str,
+        start_ms: Option<u64>,
+    ) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, start_ms, |session| {
+            Ok(build_master(&session.subtitle_tracks))
+        })
+    }
+
+    /// One-segment subtitle media playlist for a snapshotted track.
+    pub fn subtitle_playlist(
+        &self,
+        session_id: &str,
+        track_id: &str,
+    ) -> Result<Vec<u8>, PlaylistError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| PlaylistError::Failed("hls registry lock poisoned".into()))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or(PlaylistError::NotFound)?;
+        session.last_access = Instant::now();
+        if !session
+            .subtitle_tracks
+            .iter()
+            .any(|t| t.track_id == track_id)
+        {
+            return Err(PlaylistError::NotFound);
+        }
+        Ok(build_subtitle_playlist(
+            session.item_id,
+            track_id,
+            session.duration_ms,
+        ))
+    }
+
+    fn with_ready_session<F>(
+        &self,
+        session_id: &str,
+        start_ms: Option<u64>,
+        build: F,
+    ) -> Result<Vec<u8>, PlaylistError>
+    where
+        F: FnOnce(&Session) -> Result<Vec<u8>, PlaylistError>,
+    {
         let mut sessions = self
             .sessions
             .lock()
@@ -292,7 +363,7 @@ impl HlsSessionRegistry {
         if !session.dir.join(&first).exists() {
             return Err(PlaylistError::NotReady);
         }
-        Ok(build_playlist(session.duration_ms))
+        build(session)
     }
 
     /// Serves init/segment files. Retained segments from a previous encode
@@ -567,6 +638,65 @@ fn build_playlist(duration_ms: u64) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Master playlist: one video variant + optional SUBTITLES group (ADR-0010).
+/// Media URI stays relative `index.m3u8` (ADR-0008).
+fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    if !tracks.is_empty() {
+        for t in tracks {
+            let lang = t.language.as_deref().unwrap_or("und");
+            let default = if t.is_default { "YES" } else { "NO" };
+            let forced = if t.forced { "YES" } else { "NO" };
+            let autoselect = if t.forced { "NO" } else { "YES" };
+            let name = escape_hls_quoted(&t.name);
+            let mut line = format!(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",\
+                 LANGUAGE=\"{lang}\",DEFAULT={default},AUTOSELECT={autoselect},\
+                 FORCED={forced},URI=\"subs/{}.m3u8\"",
+                t.track_id
+            );
+            if t.sdh {
+                line.push_str(
+                    ",CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog\"",
+                );
+            }
+            let _ = writeln!(out, "{line}");
+        }
+        out.push_str(
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.4d401f,mp4a.40.2\",SUBTITLES=\"subs\"\n",
+        );
+    } else {
+        out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.4d401f,mp4a.40.2\"\n");
+    }
+    out.push_str("index.m3u8\n");
+    out.into_bytes()
+}
+
+/// One-segment VOD subtitle playlist pointing at the item VTT URL.
+fn build_subtitle_playlist(item_id: i64, track_id: &str, duration_ms: u64) -> Vec<u8> {
+    use std::fmt::Write;
+    let secs = (duration_ms as f64 / 1000.0).max(0.001);
+    let target = secs.ceil() as u64;
+    let mut out = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:6\n\
+         #EXT-X-TARGETDURATION:{target}\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXT-X-MEDIA-SEQUENCE:0\n"
+    );
+    let _ = writeln!(
+        out,
+        "#EXTINF:{secs:.6},\n/api/v0/items/{item_id}/subtitles/{track_id}.vtt"
+    );
+    out.push_str("#EXT-X-ENDLIST\n");
+    out.into_bytes()
+}
+
+fn escape_hls_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn spawn_ffmpeg(
     src: &Path,
     dir: &Path,
@@ -826,7 +956,7 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        let id = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
         assert_eq!(
             reg.encoder(&id),
             Some(SessionEncoder {
@@ -856,12 +986,12 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264").unwrap();
-        let a = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
-        let b = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        let a = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
+        let b = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
         assert_eq!(a, b);
         assert_eq!(reg.refs(&a), Some(2));
         assert!(matches!(
-            reg.start(2, &src, 0, FIXTURE_MS),
+            reg.start(2, &src, 0, FIXTURE_MS, vec![]),
             Err(StartSessionError::CapFull)
         ));
         assert!(reg.stop(&a));
@@ -884,8 +1014,8 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let shared = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
-        let _other = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        let shared = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
+        let _other = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
         assert_eq!(reg.refs(&shared), Some(2));
         wait_playlist(&reg, &shared);
         assert!(matches!(
@@ -893,7 +1023,7 @@ mod tests {
             Err(PlaylistError::SharedSeekConflict)
         ));
         // Scrubbing viewer forks then releases the shared session.
-        let forked = reg.start(1, &src, 60_000, FIXTURE_MS).unwrap();
+        let forked = reg.start(1, &src, 60_000, FIXTURE_MS, vec![]).unwrap();
         assert_ne!(forked, shared);
         assert_eq!(reg.refs(&forked), Some(1));
         assert!(reg.stop(&shared));
@@ -916,8 +1046,8 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let a = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
-        let b = reg.start(1, &src, 2000, FIXTURE_MS).unwrap();
+        let a = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
+        let b = reg.start(1, &src, 2000, FIXTURE_MS, vec![]).unwrap();
         assert_ne!(a, b);
         reg.stop(&a);
         reg.stop(&b);
@@ -933,7 +1063,7 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        let id = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
         wait_playlist(&reg, &id);
         let early = reg.asset(&id, "seg000.m4s").expect("early segment");
         // Move the window forward; prior segment must still be readable.
@@ -962,8 +1092,8 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let a = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
-        let _b = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        let a = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
+        let _b = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
         wait_playlist(&reg, &a);
         assert!(matches!(
             reg.asset(&a, "seg100.m4s"),
@@ -983,9 +1113,9 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264").unwrap();
-        let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
+        let id = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
         assert!(matches!(
-            reg.start(2, &src, 0, FIXTURE_MS),
+            reg.start(2, &src, 0, FIXTURE_MS, vec![]),
             Err(StartSessionError::CapFull)
         ));
         reg.stop(&id);
@@ -997,6 +1127,55 @@ mod tests {
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(text.ends_with("#EXT-X-ENDLIST\n"));
         assert_eq!(text.matches(".m4s").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn master_playlist_declares_subtitle_group() {
+        let tracks = vec![
+            HlsSubtitleTrack {
+                track_id: "e2".into(),
+                language: Some("en".into()),
+                name: "SDH".into(),
+                is_default: true,
+                forced: false,
+                sdh: true,
+            },
+            HlsSubtitleTrack {
+                track_id: "e3".into(),
+                language: Some("en".into()),
+                name: "en".into(),
+                is_default: false,
+                forced: false,
+                sdh: false,
+            },
+        ];
+        let text = String::from_utf8(build_master(&tracks)).unwrap();
+        assert!(text.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"));
+        assert!(text.contains("GROUP-ID=\"subs\""));
+        assert!(text.contains("URI=\"subs/e2.m3u8\""));
+        assert!(text.contains("SUBTITLES=\"subs\""));
+        assert!(text.contains("\nindex.m3u8\n"));
+        assert!(
+            text.contains("CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog\"")
+        );
+        assert!(!text.contains("media.m3u8"));
+    }
+
+    #[test]
+    fn master_without_tracks_has_no_subtitles_attr() {
+        let text = String::from_utf8(build_master(&[])).unwrap();
+        assert!(!text.contains("EXT-X-MEDIA"));
+        assert!(!text.contains("SUBTITLES="));
+        assert!(text.contains("\nindex.m3u8\n"));
+    }
+
+    #[test]
+    fn subtitle_media_playlist_is_one_segment_vod() {
+        let text = String::from_utf8(build_subtitle_playlist(176, "e2", 90_000)).unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(text.contains("/api/v0/items/176/subtitles/e2.vtt"));
+        assert!(text.ends_with("#EXT-X-ENDLIST\n"));
+        assert_eq!(text.matches("#EXTINF:").count(), 1);
     }
 
     #[test]

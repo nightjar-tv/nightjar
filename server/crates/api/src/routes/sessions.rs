@@ -1,5 +1,5 @@
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::decide;
+use crate::routes::items::{decide, subtitle_tracks_for};
 use crate::state::AppState;
 use axum::{
     Json,
@@ -9,7 +9,9 @@ use axum::{
     response::Response,
 };
 use nightjar_core::PlaybackMethod;
-use nightjar_transcode::{PlaylistError, StartSessionError};
+use nightjar_transcode::{
+    HlsSubtitleTrack, PlaylistError, StartSessionError, warm_embedded_webvtts,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -33,6 +35,12 @@ pub struct StartQuery {
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistQuery {
     pub start_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum PlaylistKind {
+    Master,
+    Media,
 }
 
 pub async fn start(
@@ -71,15 +79,52 @@ pub async fn start(
         });
     };
 
+    let subtitle_tracks = match subtitle_tracks_for(&state, &row) {
+        Ok(tracks) => snapshot_hls_tracks(&tracks),
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "subtitle list failed at session start");
+            Vec::new()
+        }
+    };
+
     let start_ms = query.start_ms.unwrap_or(0);
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
     let src = std::path::PathBuf::from(&row.path);
+    let tracks_for_start = subtitle_tracks;
     let started = tokio::task::spawn_blocking(move || {
-        hls_for_start.start(item_id, &src, start_ms, duration_ms as u64)
+        hls_for_start.start(
+            item_id,
+            &src,
+            start_ms,
+            duration_ms as u64,
+            tracks_for_start,
+        )
     })
     .await
     .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
+
+    // Transcode has no remux-completion moment; warm races the encode.
+    let cache = Arc::clone(&state.subs);
+    let warm_src = std::path::PathBuf::from(&row.path);
+    let warm_id = row.id;
+    let warm_mtime = file_mtime_ms(&warm_src).unwrap_or(row.mtime_ms);
+    let warm_size = row.size_bytes;
+    tokio::task::spawn_blocking(move || {
+        match warm_embedded_webvtts(&cache, warm_id, warm_mtime, warm_size, &warm_src) {
+            Ok(n) if n > 0 => tracing::info!(
+                item_id = warm_id,
+                tracks = n,
+                "warmed embedded subtitle cache"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                item_id = warm_id,
+                error = %e,
+                "subtitle cache warm failed"
+            ),
+        }
+    });
 
     match started {
         Ok(session_id) => {
@@ -89,7 +134,7 @@ pub async fn start(
             Ok((
                 StatusCode::ACCEPTED,
                 Json(TranscodeSessionDto {
-                    playlist_url: format!("/api/v0/sessions/{session_id}/index.m3u8"),
+                    playlist_url: format!("/api/v0/sessions/{session_id}/master.m3u8"),
                     session_id,
                     item_id,
                     video_encoder: encoder.name,
@@ -105,13 +150,97 @@ pub async fn start(
     }
 }
 
+fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec<HlsSubtitleTrack> {
+    let mut out = Vec::new();
+    let mut saw_default = false;
+    for t in tracks {
+        if t.url.is_none() {
+            continue;
+        }
+        let name = t
+            .label
+            .clone()
+            .or_else(|| t.language.clone())
+            .unwrap_or_else(|| t.track_id.clone());
+        let is_default = !saw_default;
+        if is_default {
+            saw_default = true;
+        }
+        out.push(HlsSubtitleTrack {
+            track_id: t.track_id.clone(),
+            language: t.language.clone(),
+            name,
+            is_default,
+            forced: t.forced,
+            sdh: t.sdh,
+        });
+    }
+    out
+}
+
+fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as i64)
+}
+
+pub async fn master(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<PlaylistQuery>,
+) -> ApiResult<Response> {
+    wait_playlist(state, session_id, query.start_ms, PlaylistKind::Master).await
+}
+
 pub async fn playlist(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Query(query): Query<PlaylistQuery>,
 ) -> ApiResult<Response> {
+    wait_playlist(state, session_id, query.start_ms, PlaylistKind::Media).await
+}
+
+pub async fn subtitle_playlist(
+    State(state): State<AppState>,
+    Path((session_id, asset)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let track_id = asset
+        .strip_suffix(".m3u8")
+        .filter(|id| is_valid_sub_track_id(id))
+        .ok_or_else(|| ApiError::not_found(format!("subtitle playlist {asset} not found")))?
+        .to_string();
     let hls = Arc::clone(&state.hls);
-    let start_ms = query.start_ms;
+    let sid = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || hls.subtitle_playlist(&sid, &track_id))
+        .await
+        .map_err(|e| ApiError::internal(format!("hls subtitle playlist task: {e}")))?;
+    match result {
+        Ok(bytes) => m3u8_ok(bytes),
+        Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
+            "subtitle playlist {asset} for session {session_id} not found"
+        ))),
+        Err(other) => map_playlist_err(&session_id, other),
+    }
+}
+
+fn is_valid_sub_track_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some('e') | Some('s') => {
+            chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        }
+        _ => false,
+    }
+}
+
+async fn wait_playlist(
+    state: AppState,
+    session_id: String,
+    start_ms: Option<u64>,
+    kind: PlaylistKind,
+) -> ApiResult<Response> {
+    let hls = Arc::clone(&state.hls);
     let sid = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         // The playlist is held back until FFmpeg writes the init segment.
@@ -119,7 +248,11 @@ pub async fn playlist(
         // so clients see a 200 rather than a thrash of 404s.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match hls.playlist(&sid, start_ms) {
+            let outcome = match kind {
+                PlaylistKind::Master => hls.master(&sid, start_ms),
+                PlaylistKind::Media => hls.playlist(&sid, start_ms),
+            };
+            match outcome {
                 Err(PlaylistError::NotReady) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -131,34 +264,42 @@ pub async fn playlist(
     .map_err(|e| ApiError::internal(format!("hls playlist task: {e}")))?;
 
     match result {
-        Ok(bytes) => {
-            let mut res = Response::new(Body::from(bytes));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/vnd.apple.mpegurl"),
-            );
-            res.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-            Ok(res)
-        }
-        Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
+        Ok(bytes) => m3u8_ok(bytes),
+        Err(e) => map_playlist_err(&session_id, e),
+    }
+}
+
+fn map_playlist_err(session_id: &str, err: PlaylistError) -> ApiResult<Response> {
+    match err {
+        PlaylistError::NotFound => Err(ApiError::not_found(format!(
             "session {session_id} not found"
         ))),
-        Err(PlaylistError::NotReady) => Err(ApiError {
+        PlaylistError::NotReady => Err(ApiError {
             status: StatusCode::NOT_FOUND,
             message: format!("playlist for session {session_id} not ready yet"),
         }),
-        Err(PlaylistError::SharedSeekConflict) => Err(ApiError {
+        PlaylistError::SharedSeekConflict => Err(ApiError {
             status: StatusCode::CONFLICT,
             message: format!(
                 "session {session_id} is shared; POST /api/v0/items/{{id}}/sessions?startMs= to fork"
             ),
         }),
-        Err(PlaylistError::Failed(e)) => Err(ApiError::internal(format!(
+        PlaylistError::Failed(e) => Err(ApiError::internal(format!(
             "session {session_id} failed: {e}"
         ))),
     }
+}
+
+fn m3u8_ok(bytes: Vec<u8>) -> ApiResult<Response> {
+    let mut res = Response::new(Body::from(bytes));
+    *res.status_mut() = StatusCode::OK;
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.apple.mpegurl"),
+    );
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(res)
 }
 
 pub async fn asset(

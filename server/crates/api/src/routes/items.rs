@@ -152,14 +152,10 @@ pub async fn playback_info(
         }
     };
 
-    let subtitle_tracks = match decision.method {
-        PlaybackMethod::DirectPlay | PlaybackMethod::Remux => subtitle_tracks_for(&state, &row)
-            .unwrap_or_else(|e| {
-                tracing::warn!(item_id, error = %e, "subtitle list failed");
-                Vec::new()
-            }),
-        PlaybackMethod::Transcode => Vec::new(),
-    };
+    let subtitle_tracks = subtitle_tracks_for(&state, &row).unwrap_or_else(|e| {
+        tracing::warn!(item_id, error = %e, "subtitle list failed");
+        Vec::new()
+    });
 
     Ok(Json(PlaybackInfoDto {
         item_id: row.id,
@@ -192,16 +188,6 @@ pub async fn subtitle_vtt(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let decision = decide(&row);
-    if !matches!(
-        decision.method,
-        PlaybackMethod::DirectPlay | PlaybackMethod::Remux
-    ) {
-        return Err(ApiError::not_found(format!(
-            "item {item_id} has no text subtitle sidecars for {}",
-            decision.method.as_str()
-        )));
-    }
 
     let cache = Arc::clone(&state.subs);
     let path = if let Some(stream_index) = parse_embedded_track_id(&track_id) {
@@ -280,7 +266,7 @@ fn parse_embedded_track_id(track_id: &str) -> Option<u32> {
     track_id.strip_prefix('e')?.parse().ok()
 }
 
-fn subtitle_tracks_for(
+pub(crate) fn subtitle_tracks_for(
     state: &AppState,
     row: &MediaItemRow,
 ) -> Result<Vec<SubtitleTrackDto>, String> {

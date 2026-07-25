@@ -44,8 +44,16 @@ pub fn router(state: AppState) -> Router {
             get(crate::stream::stream_item),
         )
         .route(
+            "/api/v0/sessions/{session_id}/master.m3u8",
+            get(sessions::master),
+        )
+        .route(
             "/api/v0/sessions/{session_id}/index.m3u8",
             get(sessions::playlist),
+        )
+        .route(
+            "/api/v0/sessions/{session_id}/subs/{asset}",
+            get(sessions::subtitle_playlist),
         )
         .route(
             "/api/v0/sessions/{session_id}/{asset}",

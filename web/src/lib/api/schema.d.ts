@@ -218,6 +218,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/sessions/{sessionId}/master.m3u8": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * HLS master playlist for a transcode session
+         * @description ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start points here. Seek via startMs uses the same window-move rules as the media playlist.
+         */
+        get: operations["getSessionMasterPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/sessions/{sessionId}/index.m3u8": {
         parameters: {
             query?: never;
@@ -225,8 +245,31 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** HLS media playlist for a transcode session */
+        /**
+         * HLS media playlist for a transcode session
+         * @description Media playlist path is stable (ADR-0008). Segment URIs are relative init.mp4 / segNNN.m4s. Also accepts startMs for seek.
+         */
         get: operations["getSessionPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/subs/{asset}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One-segment subtitle media playlist for a session track
+         * @description ADR-0010. EXT-X-MEDIA URI target. References the item WebVTT URL for the snapshotted trackId.
+         */
+        get: operations["getSessionSubtitlePlaylist"];
         put?: never;
         post?: never;
         delete?: never;
@@ -334,7 +377,7 @@ export interface components {
             sessionId: string;
             /** Format: int64 */
             itemId: number;
-            /** @description Path to the HLS media playlist for this session */
+            /** @description Path to the HLS master playlist for this session (master.m3u8). The media playlist remains at index.m3u8 (ADR-0008). */
             playlistUrl: string;
             /** @description FFmpeg encoder currently used by this session */
             videoEncoder: string;
@@ -434,7 +477,7 @@ export interface components {
             container?: string | null;
             videoCodec?: string | null;
             audioCodec?: string | null;
-            /** @description Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars share one shape; differ by source. Present for directPlay and remux; empty or omitted for transcode until burn-in. */
+            /** @description Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars share one shape; differ by source. Listed the same way for directPlay, remux, and transcode. Delivery is via track elements or HLS EXT-X-MEDIA depending on the stream; clients do not branch on method to find tracks. */
             subtitleTracks?: components["schemas"]["SubtitleTrack"][];
         };
         SubtitleTrack: {
@@ -946,6 +989,49 @@ export interface operations {
             };
         };
     };
+    getSessionMasterPlaylist: {
+        parameters: {
+            query?: {
+                /** @description Encode window start. With a single holder, changes restart FFmpeg on this session. With multiple holders, returns 409 so the client can POST a forked session at that offset. */
+                startMs?: number;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS master playlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                };
+            };
+            /** @description Session not found or playlist not ready yet */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Shared session; fork via POST sessions?startMs= */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getSessionPlaylist: {
         parameters: {
             query?: {
@@ -980,6 +1066,39 @@ export interface operations {
             };
             /** @description Shared session; fork via POST sessions?startMs= */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionSubtitlePlaylist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                /** @description {trackId}.m3u8 (e.g. e2.m3u8, s-en.m3u8) */
+                asset: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS subtitle media playlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                };
+            };
+            /** @description Session or track not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

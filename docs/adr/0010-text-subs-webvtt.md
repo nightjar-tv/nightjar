@@ -77,42 +77,67 @@ pass (Rule 6.1 / 4.9).
    missing tracks together), then converted in-process with the same
    `srt_to_webvtt` path sidecars use. Conversion and extraction run on first
    GET via `spawn_blocking`, with a kill timeout on the FFmpeg child. When remux
-   starts, embedded tracks are warmed in the background so the first `<track>`
-   request does not race a cold NAS demux.
+   or an HLS session starts, embedded tracks are warmed in the background so
+   the first caption request does not race a cold NAS demux alone.
 
 8. **API.** `PlaybackInfo.subtitleTracks` is an array of
    `{ trackId, source, codec, language?, label?, forced, sdh, url?, streamIndex? }`.
-   `url` is present only when the track is served as WebVTT. Present for
-   `directPlay` and `remux`; empty for `transcode` until burn-in. NFO and
-   other non-subtitle sidecars are out of scope (Phase 3 metadata import).
+   `url` is present only when the track is served as WebVTT. Listed the same
+   way for `directPlay`, `remux`, and `transcode`. NFO and other non-subtitle
+   sidecars are out of scope (Phase 3 metadata import).
 
-9. **Client.** The item page attaches `<track kind="subtitles">` for each
-   listed track that has a `url` when the video element is used for direct
-   play or remux.
+9. **Delivery skins.** Progressive `<video>` takes subtitles via `<track>`;
+   HLS takes them via master-playlist `EXT-X-MEDIA` (TYPE=SUBTITLES) pointing at
+   a one-segment subtitle media playlist that references the same item VTT URL.
+   Two skins, one inventory (Rule 4.11). The media playlist stays at
+   `index.m3u8`; the master is `master.m3u8` (ADR-0008 additive test held).
+
+10. **Client contract.** `playbackInfo` always lists tracks the same way
+    regardless of playback method. Clients use whatever their player needs
+    (`<track>` vs HLS MEDIA). The API never asks a client to reason about
+    which delivery world it is in (Rule 2.1). Phase 4 Flutter work settles on
+    this before writing client subtitle UI.
+
+11. **Client (web).** Direct play and remux attach `<track kind="subtitles">`
+    for each listed track with a `url`. Transcode relies on the HLS master;
+    native / hls.js caption menus are the control surface (custom picker later).
 
 ## Consequences
 
-ASS/PGS dialogue remains invisible on remux until burn-in. Probing embedded
-subtitle streams on every playback-info adds a short ffprobe; acceptable for
-v0. Cache files are not swept on item delete yet (orphan VTTs age under the
-cap). External NFO / artwork sidecars are Phase 3 metadata-import work, not
-this slice. SRT files that are not UTF-8 are decoded with a Windows-1252
-fallback after a strict UTF-8 attempt so a bad encoding fails closed to
-legible text rather than mojibake-as-UTF-8.
+ASS/PGS dialogue remains invisible until burn-in. Probing embedded subtitle
+streams on every playback-info adds a short ffprobe; acceptable for v0. Cache
+files are not swept on item delete yet (orphan VTTs age under the cap).
+External NFO / artwork sidecars are Phase 3 metadata-import work, not this
+slice. SRT files that are not UTF-8 are decoded with a Windows-1252 fallback
+after a strict UTF-8 attempt so a bad encoding fails closed to legible text
+rather than mojibake-as-UTF-8.
 
 Subtitle extraction is stream-copy (or subtitle-to-SRT remux for mov_text /
 embedded WebVTT) plus in-process conversion. FFmpeg's WebVTT muxer was the
-measured bottleneck: on a NAS-hosted title, `-c:s webvtt` lagged far behind
-`-c:s copy -f srt` for the same demux. Embedded and sidecar tracks share one
-converter (Rule 4.11).
+measured bottleneck: on a NAS-hosted remux title, `-c:s webvtt` lagged far
+behind `-c:s copy -f srt` for the same demux. Embedded and sidecar tracks
+share one converter (Rule 4.11).
 
 Extraction still shares remux's whole-file-artifact shape: the first request
 pays for a demux of the source, then hits a named cache object. Cache warming
 on remux start is coupled to that whole-file remux model — it races the demux
-against the stream-copy so captions are ready when the MP4 is. If remux
-converges onto sessions, revisit warming; this is the second feature bent
-around whole-file remux (seek-after-complete was the first). A third is a
-decision made late, not another workaround.
+against the stream-copy so captions are ready when the MP4 is. On transcode
+there is no remux-completion moment to warm against; extraction competes with
+the encode for source reads on cold titles. Measured on a NAS-hosted DTS MKV
+(item 1, 500 Days of Summer) with a live HLS encode of the same file: cold
+extract ~255s to first WebVTT byte; cache hit ~0.08s. Copy-deck honesty
+("captions may take a moment") is grounded in that cold figure, not the remux
+Birder ~90s number. If remux converges onto sessions, revisit warming; this is
+the second feature bent around whole-file remux (seek-after-complete was the
+first). A third is a decision made late, not another workaround.
+
+HLS sessions snapshot serveable tracks at start. A sidecar added while a
+session is live does not appear in that session’s master; it appears on the
+next session after rescan. That is a consequence of the snapshot, not a bug.
+
+Gate 3: Tizen and webOS ship their own HLS implementations. This slice verifies
+Chrome (hls.js) and Safari (native). TV-browser parity is untested here and is
+a Gate 3 risk — the master playlist increases what those stacks can get wrong.
 
 Convergence onto range-addressable operations is a candidate, not a plan, and
 needs measured dogfooding evidence to justify. Moving remux onto HLS would not
