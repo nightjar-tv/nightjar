@@ -8,8 +8,11 @@ use axum::{
     response::Response,
 };
 use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
-use nightjar_db::MediaItemRow;
-use nightjar_transcode::{RemuxKey, RemuxState, list_text_subtitles};
+use nightjar_db::{MediaItemRow, SidecarRow};
+use nightjar_transcode::{
+    RemuxKey, RemuxState, ensure_embedded_webvtt, ensure_sidecar_webvtt,
+    is_serveable_sidecar_format, list_text_subtitles,
+};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -49,13 +52,19 @@ pub struct MediaItemDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtitleTrackDto {
-    pub stream_index: u32,
+    pub track_id: String,
+    pub source: &'static str,
     pub codec: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    pub url: String,
+    pub forced: bool,
+    pub sdh: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -144,7 +153,7 @@ pub async fn playback_info(
     };
 
     let subtitle_tracks = match decision.method {
-        PlaybackMethod::DirectPlay | PlaybackMethod::Remux => subtitle_tracks_for(&row)
+        PlaybackMethod::DirectPlay | PlaybackMethod::Remux => subtitle_tracks_for(&state, &row)
             .unwrap_or_else(|e| {
                 tracing::warn!(item_id, error = %e, "subtitle list failed");
                 Vec::new()
@@ -173,10 +182,11 @@ pub async fn subtitle_vtt(
     State(state): State<AppState>,
     Path((item_id, asset)): Path<(i64, String)>,
 ) -> ApiResult<Response> {
-    let stream_index = asset
+    let track_id = asset
         .strip_suffix(".vtt")
-        .and_then(|s| s.parse::<u32>().ok())
-        .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?;
+        .filter(|id| is_valid_track_id(id))
+        .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?
+        .to_string();
     let row = state
         .db
         .get_item(item_id)
@@ -193,16 +203,52 @@ pub async fn subtitle_vtt(
         )));
     }
 
-    let cache = state.subs_cache_dir.clone();
-    let src = std::path::PathBuf::from(&row.path);
-    let mtime_ms = file_mtime_ms(&src).unwrap_or(0);
-    let size_bytes = row.size_bytes;
-    let path = tokio::task::spawn_blocking(move || {
-        nightjar_transcode::ensure_webvtt(&cache, item_id, mtime_ms, size_bytes, &src, stream_index)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("subtitle extract task: {e}")))?
-    .map_err(ApiError::not_found)?;
+    let cache = Arc::clone(&state.subs);
+    let path = if let Some(stream_index) = parse_embedded_track_id(&track_id) {
+        let src = std::path::PathBuf::from(&row.path);
+        let mtime_ms = file_mtime_ms(&src).unwrap_or(0);
+        let size_bytes = row.size_bytes;
+        tokio::task::spawn_blocking(move || {
+            ensure_embedded_webvtt(&cache, item_id, mtime_ms, size_bytes, &src, stream_index)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("subtitle extract task: {e}")))?
+        .map_err(ApiError::not_found)?
+    } else {
+        let sidecar = state
+            .db
+            .get_item_sidecar(item_id, &track_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "subtitle track {track_id} not found for item {item_id}"
+                ))
+            })?;
+        if !is_serveable_sidecar_format(&sidecar.format) {
+            return Err(ApiError::not_found(format!(
+                "subtitle track {track_id} is not served as WebVTT"
+            )));
+        }
+        let sidecar_path = std::path::PathBuf::from(sidecar.path);
+        let format = sidecar.format;
+        let mtime_ms = sidecar.mtime_ms;
+        let size_bytes = sidecar.size_bytes;
+        let track_id = track_id.clone();
+        tokio::task::spawn_blocking(move || {
+            ensure_sidecar_webvtt(
+                &cache,
+                item_id,
+                &track_id,
+                &sidecar_path,
+                &format,
+                mtime_ms,
+                size_bytes,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("subtitle convert task: {e}")))?
+        .map_err(ApiError::not_found)?
+    };
 
     let bytes = tokio::fs::read(&path)
         .await
@@ -220,19 +266,62 @@ pub async fn subtitle_vtt(
     Ok(res)
 }
 
-fn subtitle_tracks_for(row: &MediaItemRow) -> Result<Vec<SubtitleTrackDto>, String> {
+fn is_valid_track_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some('e') | Some('s') => {
+            chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        }
+        _ => false,
+    }
+}
+
+fn parse_embedded_track_id(track_id: &str) -> Option<u32> {
+    track_id.strip_prefix('e')?.parse().ok()
+}
+
+fn subtitle_tracks_for(
+    state: &AppState,
+    row: &MediaItemRow,
+) -> Result<Vec<SubtitleTrackDto>, String> {
+    let mut tracks = Vec::new();
     let src = std::path::Path::new(&row.path);
-    let streams = list_text_subtitles(src)?;
-    Ok(streams
-        .into_iter()
-        .map(|s| SubtitleTrackDto {
-            url: format!("/api/v0/items/{}/subtitles/{}.vtt", row.id, s.stream_index),
-            stream_index: s.stream_index,
+    for s in list_text_subtitles(src)? {
+        let track_id = s.track_id();
+        tracks.push(SubtitleTrackDto {
+            url: Some(format!(
+                "/api/v0/items/{}/subtitles/{}.vtt",
+                row.id, track_id
+            )),
+            track_id,
+            source: "embedded",
             codec: s.codec,
             language: s.language,
             label: s.title,
-        })
-        .collect())
+            forced: false,
+            sdh: false,
+            stream_index: Some(s.stream_index),
+        });
+    }
+    for s in state.db.list_item_sidecars(row.id)? {
+        tracks.push(sidecar_to_dto(row.id, &s));
+    }
+    Ok(tracks)
+}
+
+fn sidecar_to_dto(item_id: i64, s: &SidecarRow) -> SubtitleTrackDto {
+    let served = is_serveable_sidecar_format(&s.format);
+    SubtitleTrackDto {
+        url: served.then(|| format!("/api/v0/items/{item_id}/subtitles/{}.vtt", s.track_id)),
+        track_id: s.track_id.clone(),
+        source: "sidecar",
+        codec: s.format.clone(),
+        language: s.language.clone(),
+        label: None,
+        forced: s.forced,
+        sdh: s.sdh,
+        stream_index: None,
+    }
 }
 
 fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {

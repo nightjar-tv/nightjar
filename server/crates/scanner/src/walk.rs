@@ -94,9 +94,18 @@ mod tests {
         let dir = tempdir().unwrap();
         File::create(dir.path().join("a.mp4")).unwrap();
         File::create(dir.path().join("notes.txt")).unwrap();
+        File::create(dir.path().join("Movie.en.srt")).unwrap();
+        File::create(dir.path().join("Movie.vtt")).unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
         File::create(dir.path().join("sub").join("b.mkv")).unwrap();
         let files = walk_media_files(dir.path()).unwrap();
         assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| {
+            let ext = f.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            !matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "srt" | "vtt" | "ass" | "ssa"
+            )
+        }));
     }
 }

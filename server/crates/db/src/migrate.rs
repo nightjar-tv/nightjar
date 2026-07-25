@@ -3,6 +3,7 @@ use rusqlite::Connection;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_scan_jobs.sql")),
+    (3, include_str!("../migrations/003_subtitle_sidecars.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -61,7 +62,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         migrate(&conn).unwrap(); // idempotent
     }
 }

@@ -141,14 +141,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/items/{itemId}/subtitles/{streamIndex}.vtt": {
+    "/api/v0/items/{itemId}/subtitles/{trackId}.vtt": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** WebVTT for one text subtitle stream (ADR-0010) */
+        /** WebVTT for one text subtitle track (ADR-0010) */
         get: operations["getSubtitleVtt"];
         put?: never;
         post?: never;
@@ -434,19 +434,28 @@ export interface components {
             container?: string | null;
             videoCodec?: string | null;
             audioCodec?: string | null;
-            /** @description Text subtitle tracks as WebVTT sidecars (ADR-0010). Present for directPlay and remux; empty or omitted for transcode until burn-in. */
+            /** @description Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars share one shape; differ by source. Present for directPlay and remux; empty or omitted for transcode until burn-in. */
             subtitleTracks?: components["schemas"]["SubtitleTrack"][];
         };
         SubtitleTrack: {
-            /** @description Absolute ffprobe stream index */
-            streamIndex: number;
-            /** @description Source codec (subrip, mov_text, ...) */
+            /** @description Stable id used in the VTT URL. Embedded `e{N}`; sidecar `s` / `s-{suffix}` from the filename (ADR-0010). */
+            trackId: string;
+            /** @enum {string} */
+            source: "embedded" | "sidecar";
+            /** @description Source codec or sidecar format (subrip, srt, vtt, ass, ...) */
             codec: string;
+            /** @description Normalised ISO 639-1 when known; null if unlabelled */
             language?: string | null;
-            /** @description Optional title tag from the container */
+            /** @description Optional title tag from the container (embedded) */
             label?: string | null;
-            /** @description GET path for the WebVTT body */
-            url: string;
+            /** @description Forced-subtitle flag (selection differs from full dialogue) */
+            forced: boolean;
+            /** @description SDH / hearing-impaired flag from the sidecar name */
+            sdh: boolean;
+            /** @description Absolute ffprobe stream index when source is embedded */
+            streamIndex?: number | null;
+            /** @description GET path for the WebVTT body when this track is served. Absent for ASS/SSA and other non-serveable tracks that are still listed. */
+            url?: string | null;
         };
         /**
          * @description verified = short encode+demux succeeded; failed = advertised but verify failed; unavailable = not in this ffmpeg build.
@@ -751,7 +760,8 @@ export interface operations {
             header?: never;
             path: {
                 itemId: components["parameters"]["ItemId"];
-                streamIndex: number;
+                /** @description Stable track id (ADR-0010): `e{streamIndex}` for embedded, `s` / `s-{suffix}` for filesystem sidecars. */
+                trackId: string;
             };
             cookie?: never;
         };
@@ -766,7 +776,7 @@ export interface operations {
                     "text/vtt": string;
                 };
             };
-            /** @description Item or text subtitle stream not found */
+            /** @description Item or serveable subtitle track not found */
             404: {
                 headers: {
                     [name: string]: unknown;

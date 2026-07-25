@@ -203,14 +203,18 @@
 			{#if (playback.subtitleTracks?.length ?? 0) > 0}
 				<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions) -->
 				<video controls playsinline src={playback.streamUrl} crossorigin="anonymous">
-					{#each playback.subtitleTracks ?? [] as track, i (track.streamIndex)}
-						<track
-							kind="subtitles"
-							src={track.url}
-							srclang={track.language ?? 'und'}
-							label={track.label ?? track.language ?? `Subtitles ${track.streamIndex}`}
-							default={i === 0}
-						/>
+					{#each playback.subtitleTracks ?? [] as track, i (track.trackId)}
+						{#if track.url}
+							<track
+								kind="subtitles"
+								src={track.url}
+								srclang={track.language ?? 'und'}
+								label={track.label
+									?? track.language
+									?? `Subtitles ${track.trackId}`}
+								default={i === 0}
+							/>
+						{/if}
 					{/each}
 					Your browser cannot play this file directly.
 				</video>

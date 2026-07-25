@@ -95,6 +95,36 @@ gen h264_aac_srt_mkv.mkv \
   -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -c:s srt -shortest
 rm -f "$SRT"
 
+# 9b. Sidecar .en.srt beside a video (ADR-0010)
+SIDE_DIR="$OUT/sidecar_beside"
+mkdir -p "$SIDE_DIR"
+echo "→ sidecar_beside/Movie.mp4 + Movie.en.srt"
+"$FFMPEG" -y -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest \
+  "$SIDE_DIR/Movie.mp4"
+cat > "$SIDE_DIR/Movie.en.srt" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar sidecar SRT
+EOF
+
+# 9c. Sidecar under Subs/ sibling directory
+SUBS_FIX="$OUT/sidecar_subs_dir"
+mkdir -p "$SUBS_FIX/Subs"
+echo "→ sidecar_subs_dir/Show.mp4 + Subs/Show.en.srt"
+"$FFMPEG" -y -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest \
+  "$SUBS_FIX/Show.mp4"
+cat > "$SUBS_FIX/Subs/Show.en.srt" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar Subs-dir SRT
+EOF
+
 # 10. 7.1 AAC channel layout
 gen h264_aac_71_mp4.mp4 \
   -f lavfi -i "testsrc=size=1280x720:rate=24:duration=2" \

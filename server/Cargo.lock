@@ -554,6 +554,7 @@ version = "0.0.1"
 dependencies = [
  "nightjar-core",
  "nightjar-db",
+ "nightjar-transcode",
  "notify",
  "notify-debouncer-mini",
  "serde",

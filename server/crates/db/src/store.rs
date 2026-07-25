@@ -89,6 +89,20 @@ pub struct ScanJobRow {
     pub finished_at: Option<String>,
 }
 
+/// Filesystem subtitle sidecar stored at index time (ADR-0010).
+#[derive(Debug, Clone)]
+pub struct SidecarRow {
+    pub media_item_id: i64,
+    pub track_id: String,
+    pub path: String,
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+    pub format: String,
+    pub language: Option<String>,
+    pub forced: bool,
+    pub sdh: bool,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -356,6 +370,89 @@ impl Db {
         Ok(n)
     }
 
+    /// Replace all sidecar rows for one media item (index-pass association).
+    pub fn replace_item_sidecars(
+        &self,
+        media_item_id: i64,
+        sidecars: &[SidecarRow],
+    ) -> Result<(), String> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin sidecar replace: {e}"))?;
+        tx.execute(
+            "DELETE FROM media_item_sidecars WHERE media_item_id = ?1",
+            [media_item_id],
+        )
+        .map_err(|e| format!("clear sidecars for item {media_item_id}: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO media_item_sidecars (
+                        media_item_id, track_id, path, mtime_ms, size_bytes,
+                        format, language, forced, sdh
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .map_err(|e| format!("prepare sidecar insert: {e}"))?;
+            for s in sidecars {
+                stmt.execute(params![
+                    media_item_id,
+                    s.track_id,
+                    s.path,
+                    s.mtime_ms,
+                    s.size_bytes,
+                    s.format,
+                    s.language,
+                    s.forced as i64,
+                    s.sdh as i64,
+                ])
+                .map_err(|e| format!("insert sidecar {}: {e}", s.track_id))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit sidecar replace: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_item_sidecars(&self, media_item_id: i64) -> Result<Vec<SidecarRow>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                        format, language, forced, sdh
+                 FROM media_item_sidecars
+                 WHERE media_item_id = ?1
+                 ORDER BY track_id",
+            )
+            .map_err(|e| format!("prepare list sidecars: {e}"))?;
+        let rows = stmt
+            .query_map([media_item_id], map_sidecar)
+            .map_err(|e| format!("list sidecars for item {media_item_id}: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("map sidecar: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_item_sidecar(
+        &self,
+        media_item_id: i64,
+        track_id: &str,
+    ) -> Result<Option<SidecarRow>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                    format, language, forced, sdh
+             FROM media_item_sidecars
+             WHERE media_item_id = ?1 AND track_id = ?2",
+            params![media_item_id, track_id],
+            map_sidecar,
+        )
+        .optional()
+        .map_err(|e| format!("get sidecar {track_id} for item {media_item_id}: {e}"))
+    }
+
     pub fn create_scan_job(&self, library_id: i64) -> Result<i64, String> {
         let conn = self.lock()?;
         conn.execute(
@@ -522,5 +619,21 @@ fn map_scan_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobRow> {
         error_message: r.get(11)?,
         started_at: r.get(12)?,
         finished_at: r.get(13)?,
+    })
+}
+
+fn map_sidecar(r: &rusqlite::Row<'_>) -> rusqlite::Result<SidecarRow> {
+    let forced: i64 = r.get(7)?;
+    let sdh: i64 = r.get(8)?;
+    Ok(SidecarRow {
+        media_item_id: r.get(0)?,
+        track_id: r.get(1)?,
+        path: r.get(2)?,
+        mtime_ms: r.get(3)?,
+        size_bytes: r.get(4)?,
+        format: r.get(5)?,
+        language: r.get(6)?,
+        forced: forced != 0,
+        sdh: sdh != 0,
     })
 }

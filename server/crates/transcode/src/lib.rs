@@ -14,7 +14,11 @@ pub use hwaccel::{
     EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,
     probe_h264_encoders_arc, select_preferred,
 };
-pub use subs::{TextSubtitleStream, ensure_webvtt, is_text_subtitle_codec, list_text_subtitles};
+pub use subs::{
+    DiscoveredSidecar, SubsCache, SubtitleSourceKind, TextSubtitleStream, decode_subtitle_bytes,
+    discover_sidecars, ensure_embedded_webvtt, ensure_sidecar_webvtt, is_serveable_sidecar_format,
+    is_text_subtitle_codec, list_text_subtitles, normalize_language, srt_to_webvtt,
+};
 
 use std::collections::HashMap;
 use std::fs;

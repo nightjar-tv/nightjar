@@ -3,7 +3,9 @@
 mod migrate;
 mod store;
 
-pub use store::{Db, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate, ScanJobRow, UpsertItem};
+pub use store::{
+    Db, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate, ScanJobRow, SidecarRow, UpsertItem,
+};
 
 use std::path::{Path, PathBuf};
 

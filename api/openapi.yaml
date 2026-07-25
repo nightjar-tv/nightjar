@@ -190,18 +190,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /api/v0/items/{itemId}/subtitles/{streamIndex}.vtt:
+  /api/v0/items/{itemId}/subtitles/{trackId}.vtt:
     get:
       operationId: getSubtitleVtt
-      summary: WebVTT for one text subtitle stream (ADR-0010)
+      summary: WebVTT for one text subtitle track (ADR-0010)
       parameters:
         - $ref: "#/components/parameters/ItemId"
-        - name: streamIndex
+        - name: trackId
           in: path
           required: true
+          description: >
+            Stable track id (ADR-0010): `e{streamIndex}` for embedded,
+            `s` / `s-{suffix}` for filesystem sidecars.
           schema:
-            type: integer
-            minimum: 0
+            type: string
+            pattern: '^[es]([A-Za-z0-9._-]*)$'
       responses:
         "200":
           description: WebVTT body
@@ -210,7 +213,7 @@ paths:
               schema:
                 type: string
         "404":
-          description: Item or text subtitle stream not found
+          description: Item or serveable subtitle track not found
           content:
             application/json:
               schema:
@@ -774,32 +777,52 @@ components:
         subtitleTracks:
           type: array
           description: >
-            Text subtitle tracks as WebVTT sidecars (ADR-0010). Present for
-            directPlay and remux; empty or omitted for transcode until burn-in.
+            Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars
+            share one shape; differ by source. Present for directPlay and
+            remux; empty or omitted for transcode until burn-in.
           items:
             $ref: "#/components/schemas/SubtitleTrack"
 
     SubtitleTrack:
       type: object
-      required: [streamIndex, codec, url]
+      required: [trackId, source, codec, forced, sdh]
       properties:
-        streamIndex:
-          type: integer
-          minimum: 0
-          description: Absolute ffprobe stream index
+        trackId:
+          type: string
+          description: >
+            Stable id used in the VTT URL. Embedded `e{N}`; sidecar `s` /
+            `s-{suffix}` from the filename (ADR-0010).
+        source:
+          type: string
+          enum: [embedded, sidecar]
         codec:
           type: string
-          description: Source codec (subrip, mov_text, ...)
+          description: Source codec or sidecar format (subrip, srt, vtt, ass, ...)
         language:
           type: string
           nullable: true
+          description: Normalised ISO 639-1 when known; null if unlabelled
         label:
           type: string
           nullable: true
-          description: Optional title tag from the container
+          description: Optional title tag from the container (embedded)
+        forced:
+          type: boolean
+          description: Forced-subtitle flag (selection differs from full dialogue)
+        sdh:
+          type: boolean
+          description: SDH / hearing-impaired flag from the sidecar name
+        streamIndex:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Absolute ffprobe stream index when source is embedded
         url:
           type: string
-          description: GET path for the WebVTT body
+          nullable: true
+          description: >
+            GET path for the WebVTT body when this track is served. Absent for
+            ASS/SSA and other non-serveable tracks that are still listed.
 
     EncoderStatus:
       type: string

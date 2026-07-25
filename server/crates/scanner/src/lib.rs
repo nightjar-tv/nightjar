@@ -143,6 +143,25 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
     )?;
 
     let removed = db.delete_missing(library_id, &keep_paths)? as u32;
+
+    // Sidecar association always runs, including for unchanged media, so a
+    // new .srt beside an untouched video is stored without waiting for mtime.
+    for file in &files {
+        let path_str = path_to_string(&file.path);
+        let Some((item_id, _)) = db.item_mtime(library_id, &path_str)? else {
+            continue;
+        };
+        match associate_sidecars(db, item_id, &file.path) {
+            Ok(()) => {}
+            Err(e) => tracing::warn!(
+                item_id,
+                path = %file.path.display(),
+                error = %e,
+                "sidecar association failed"
+            ),
+        }
+    }
+
     let index_duration_ms = index_started.elapsed().as_millis() as u64;
     db.set_scan_job_index_done(
         job_id,
@@ -264,6 +283,25 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn associate_sidecars(db: &Db, item_id: i64, video_path: &Path) -> Result<(), String> {
+    let found = nightjar_transcode::discover_sidecars(video_path)?;
+    let rows: Vec<nightjar_db::SidecarRow> = found
+        .into_iter()
+        .map(|s| nightjar_db::SidecarRow {
+            media_item_id: item_id,
+            track_id: s.track_id,
+            path: path_to_string(&s.path),
+            mtime_ms: s.mtime_ms,
+            size_bytes: s.size_bytes,
+            format: s.format,
+            language: s.language,
+            forced: s.forced,
+            sdh: s.sdh,
+        })
+        .collect();
+    db.replace_item_sidecars(item_id, &rows)
+}
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -363,5 +401,50 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn index_associates_sidecar_srt_not_as_media_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(media.join("Subs")).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        fs::write(
+            media.join("Movie.en.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nHi\n",
+        )
+        .unwrap();
+        fs::write(
+            media.join("Subs").join("Movie.en.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nSubs\n",
+        )
+        .unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job_id = start_scan_job(Arc::clone(&db), lib.id).unwrap();
+        for _ in 0..200 {
+            let job = db.get_scan_job(job_id).unwrap().unwrap();
+            if job.state == "completed" || job.state == "failed" {
+                assert_eq!(job.state, "completed");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let items = db.list_items(lib.id).unwrap();
+        assert_eq!(items.len(), 1, "srt must not become media items: {items:?}");
+        let sidecars = db.list_item_sidecars(items[0].id).unwrap();
+        let ids: Vec<_> = sidecars.iter().map(|s| s.track_id.as_str()).collect();
+        assert!(ids.contains(&"s-en"), "{ids:?}");
+        assert!(ids.contains(&"s-Subs.en"), "{ids:?}");
     }
 }
