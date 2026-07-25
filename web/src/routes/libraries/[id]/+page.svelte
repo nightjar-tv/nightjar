@@ -129,7 +129,7 @@
 								{:else if item.playbackMethod === 'directPlay'}
 									<span class="badge ok">browser</span>
 								{:else if item.playbackMethod === 'remux'}
-									<span class="badge">remux</span>
+									<span class="badge ok">remux</span>
 								{:else}
 									<span class="badge">needs transcode</span>
 								{/if}
