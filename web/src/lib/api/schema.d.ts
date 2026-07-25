@@ -252,6 +252,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/system/transcode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Verified H.264 encode capabilities for this process
+         * @description Startup detection-by-verification (ADR-0009). Each candidate is verified | failed | unavailable with a reason when not verified. preferredH264Encoder is what new HLS sessions use for -c:v.
+         */
+        get: operations["getTranscodeCapabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -390,6 +410,26 @@ export interface components {
             container?: string | null;
             videoCodec?: string | null;
             audioCodec?: string | null;
+        };
+        /**
+         * @description verified = short encode+demux succeeded; failed = advertised but verify failed; unavailable = not in this ffmpeg build.
+         * @enum {string}
+         */
+        EncoderStatus: "verified" | "failed" | "unavailable";
+        EncoderCandidate: {
+            /** @description FFmpeg encoder name (e.g. libx264, h264_videotoolbox) */
+            name: string;
+            /** @description Backend family (software, videotoolbox, nvenc, qsv, vaapi, ...) */
+            backend: string;
+            status: components["schemas"]["EncoderStatus"];
+            /** @description Required when status is not verified; null when verified */
+            reason?: string | null;
+        };
+        TranscodeCapabilities: {
+            ffmpegVersion?: string | null;
+            /** @description Encoder name used for new HLS sessions (-c:v) */
+            preferredH264Encoder: string;
+            encoders: components["schemas"]["EncoderCandidate"][];
         };
     };
     responses: never;
@@ -945,6 +985,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTranscodeCapabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Capability readout */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscodeCapabilities"];
                 };
             };
         };

@@ -1,6 +1,7 @@
 pub mod items;
 mod libraries;
 pub mod sessions;
+mod system;
 
 use crate::state::AppState;
 use axum::{
@@ -12,6 +13,10 @@ use serde::Serialize;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route(
+            "/api/v0/system/transcode",
+            get(system::transcode_capabilities),
+        )
         .route(
             "/api/v0/libraries",
             get(libraries::list).post(libraries::create),

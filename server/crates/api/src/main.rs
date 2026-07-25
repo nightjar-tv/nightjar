@@ -30,12 +30,15 @@ async fn main() {
         remux_cache_cap_bytes(),
     )
     .unwrap_or_else(|e| panic!("remux cache: {e}"));
+    // ADR-0009: verify encoders once at startup; sessions reuse this Arc.
+    let transcode_caps = nightjar_transcode::probe_h264_encoders_arc(&data_dir.join("cache"));
     let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
         data_dir.join("cache").join("hls"),
         hls_max_sessions(),
+        transcode_caps.preferred_h264_encoder.clone(),
     )
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
-    let state = AppState::new(db, remux, hls);
+    let state = AppState::new(db, remux, hls, transcode_caps);
     nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
 
     let app = routes::router(state)

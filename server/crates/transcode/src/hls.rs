@@ -84,6 +84,8 @@ pub fn decide_window_action(
 pub struct HlsSessionRegistry {
     root: PathBuf,
     max_sessions: usize,
+    /// Verified H.264 encoder name from ADR-0009 probe (`libx264` fallback).
+    video_encoder: String,
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -103,12 +105,17 @@ struct Session {
 
 impl HlsSessionRegistry {
     /// Creates the HLS cache root, sweeps leftover session dirs from a prior
-    /// process, and starts the idle reaper.
-    pub fn new(root: PathBuf) -> Result<Arc<Self>, String> {
-        Self::with_cap(root, DEFAULT_MAX_SESSIONS)
+    /// process, and starts the idle reaper. `video_encoder` is the preferred
+    /// verified H.264 encoder from ADR-0009 (`libx264` if nothing else works).
+    pub fn new(root: PathBuf, video_encoder: impl Into<String>) -> Result<Arc<Self>, String> {
+        Self::with_cap(root, DEFAULT_MAX_SESSIONS, video_encoder)
     }
 
-    pub fn with_cap(root: PathBuf, max_sessions: usize) -> Result<Arc<Self>, String> {
+    pub fn with_cap(
+        root: PathBuf,
+        max_sessions: usize,
+        video_encoder: impl Into<String>,
+    ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(&root)
             .map_err(|e| format!("create hls cache dir {}: {e}", root.display()))?;
         for entry in fs::read_dir(&root)
@@ -125,9 +132,11 @@ impl HlsSessionRegistry {
             }
         }
 
+        let video_encoder = video_encoder.into();
         let registry = Arc::new(Self {
             root,
             max_sessions,
+            video_encoder,
             next_id: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
         });
@@ -182,7 +191,8 @@ impl HlsSessionRegistry {
                 fs::create_dir_all(&dir).map_err(|e| {
                     StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
                 })?;
-                let child = spawn_ffmpeg(src, &dir, start_ms).map_err(StartSessionError::Spawn)?;
+                let child = spawn_ffmpeg(src, &dir, start_ms, &self.video_encoder)
+                    .map_err(StartSessionError::Spawn)?;
                 sessions.insert(
                     id.clone(),
                     Session {
@@ -244,7 +254,10 @@ impl HlsSessionRegistry {
             match decide_window_action(session.refs, aligned, session.start_ms, on_disk) {
                 WindowAction::Serve => {}
                 WindowAction::Fork => return Err(PlaylistError::SharedSeekConflict),
-                WindowAction::Restart => restart_at(session, aligned)?,
+                WindowAction::Restart => {
+                    let encoder = self.video_encoder.clone();
+                    restart_at(session, aligned, &encoder)?;
+                }
             }
         }
 
@@ -308,7 +321,8 @@ impl HlsSessionRegistry {
                                 return Err(PlaylistError::SharedSeekConflict);
                             }
                             WindowAction::Restart => {
-                                restart_at(session, want_ms)?;
+                                let encoder = self.video_encoder.clone();
+                                restart_at(session, want_ms, &encoder)?;
                                 deadline = Instant::now() + SEGMENT_WAIT;
                             }
                             WindowAction::Serve => {}
@@ -396,20 +410,25 @@ impl HlsSessionRegistry {
     }
 }
 
-fn restart_at(session: &mut Session, start_ms: u64) -> Result<(), PlaylistError> {
+fn restart_at(
+    session: &mut Session,
+    start_ms: u64,
+    video_encoder: &str,
+) -> Result<(), PlaylistError> {
     stop_child(&mut session.child);
     // Gate 2: do not wipe the prior encode window. In-flight segment fetches
     // (seg1127…) must still hit disk while the new window is cooking. Only
     // remove the muxer sidecar; ffmpeg -y overwrites init and new seg indices.
     let index = session.dir.join("index.m3u8");
     let _ = fs::remove_file(&index);
-    let child =
-        spawn_ffmpeg(&session.src, &session.dir, start_ms).map_err(PlaylistError::Failed)?;
+    let child = spawn_ffmpeg(&session.src, &session.dir, start_ms, video_encoder)
+        .map_err(PlaylistError::Failed)?;
     session.child = Some(child);
     session.start_ms = start_ms;
     session.failed = None;
     tracing::info!(
         start_ms,
+        encoder = video_encoder,
         path = %session.src.display(),
         "hls session seek restart"
     );
@@ -504,7 +523,12 @@ fn build_playlist(duration_ms: u64) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn spawn_ffmpeg(src: &Path, dir: &Path, start_ms: u64) -> Result<Child, String> {
+fn spawn_ffmpeg(
+    src: &Path,
+    dir: &Path,
+    start_ms: u64,
+    video_encoder: &str,
+) -> Result<Child, String> {
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
     let start_number = (start_ms / SEGMENT_MS).to_string();
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
@@ -527,17 +551,15 @@ fn spawn_ffmpeg(src: &Path, dir: &Path, start_ms: u64) -> Result<Child, String> 
         // playlist position instead of restarting the clock at zero.
         cmd.args(["-output_ts_offset", &start_secs]);
     }
+    cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v", video_encoder]);
+    if video_encoder == "libx264" {
+        cmd.args(["-preset", "veryfast", "-pix_fmt", "yuv420p"]);
+    } else {
+        // Hardware paths: keep pixel format explicit where the encoder accepts
+        // it; backends that need device-specific graphs failed verification.
+        cmd.args(["-pix_fmt", "yuv420p"]);
+    }
     cmd.args([
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
         // Time-based IDRs derived from SEGMENT_MS (same source as -hls_time and
         // the generated playlist EXTINF). A frame-count -g alone is only 2s at
         // 24 fps; at 60 fps it splits every 0.8s (ADR-0008).
@@ -759,7 +781,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         let playlist = wait_playlist(&reg, &id);
         let text = String::from_utf8_lossy(&playlist);
@@ -782,7 +804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264").unwrap();
         let a = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         let b = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         assert_eq!(a, b);
@@ -810,7 +832,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let shared = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         let _other = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         assert_eq!(reg.refs(&shared), Some(2));
@@ -842,7 +864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let a = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         let b = reg.start(1, &src, 2000, FIXTURE_MS).unwrap();
         assert_ne!(a, b);
@@ -859,7 +881,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         wait_playlist(&reg, &id);
         let early = reg.asset(&id, "seg000.m4s").expect("early segment");
@@ -888,7 +910,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let a = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         let _b = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         wait_playlist(&reg, &a);
@@ -909,7 +931,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1).unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264").unwrap();
         let id = reg.start(1, &src, 0, FIXTURE_MS).unwrap();
         assert!(matches!(
             reg.start(2, &src, 0, FIXTURE_MS),
@@ -984,7 +1006,7 @@ mod tests {
             }
             let enc = dir.path().join(name);
             fs::create_dir_all(&enc).unwrap();
-            let mut child = spawn_ffmpeg(src, &enc, 0).unwrap();
+            let mut child = spawn_ffmpeg(src, &enc, 0, "libx264").unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
                 if child.try_wait().ok().flatten().is_some() {

@@ -1,11 +1,16 @@
-//! FFmpeg orchestration: remux cache (ADR-0006) and HLS transcode sessions
-//! (ADR-0007).
+//! FFmpeg orchestration: remux cache (ADR-0006), HLS transcode sessions
+//! (ADR-0007), and hardware encode detection (ADR-0009).
 
 mod hls;
+mod hwaccel;
 
 pub use hls::{
     HlsSessionRegistry, PlaylistError, StartAction, StartSessionError, WindowAction, decide_start,
     decide_window_action,
+};
+pub use hwaccel::{
+    EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,
+    probe_h264_encoders_arc, select_preferred,
 };
 
 use std::collections::HashMap;

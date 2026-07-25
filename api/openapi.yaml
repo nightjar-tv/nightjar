@@ -413,6 +413,22 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/system/transcode:
+    get:
+      operationId: getTranscodeCapabilities
+      summary: Verified H.264 encode capabilities for this process
+      description: >
+        Startup detection-by-verification (ADR-0009). Each candidate is
+        verified | failed | unavailable with a reason when not verified.
+        preferredH264Encoder is what new HLS sessions use for -c:v.
+      responses:
+        "200":
+          description: Capability readout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscodeCapabilities"
+
 components:
   parameters:
     LibraryId:
@@ -722,3 +738,41 @@ components:
         audioCodec:
           type: string
           nullable: true
+    EncoderStatus:
+      type: string
+      enum: [verified, failed, unavailable]
+      description: >
+        verified = short encode+demux succeeded; failed = advertised but
+        verify failed; unavailable = not in this ffmpeg build.
+
+    EncoderCandidate:
+      type: object
+      required: [name, backend, status]
+      properties:
+        name:
+          type: string
+          description: FFmpeg encoder name (e.g. libx264, h264_videotoolbox)
+        backend:
+          type: string
+          description: Backend family (software, videotoolbox, nvenc, qsv, vaapi, ...)
+        status:
+          $ref: "#/components/schemas/EncoderStatus"
+        reason:
+          type: string
+          nullable: true
+          description: Required when status is not verified; null when verified
+
+    TranscodeCapabilities:
+      type: object
+      required: [preferredH264Encoder, encoders]
+      properties:
+        ffmpegVersion:
+          type: string
+          nullable: true
+        preferredH264Encoder:
+          type: string
+          description: Encoder name used for new HLS sessions (-c:v)
+        encoders:
+          type: array
+          items:
+            $ref: "#/components/schemas/EncoderCandidate"

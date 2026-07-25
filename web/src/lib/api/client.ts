@@ -81,5 +81,7 @@ export const api = {
 	},
 	deleteTranscodeSession: async (sessionId: string) => {
 		await request<undefined>(`/api/v0/sessions/${sessionId}`, { method: 'DELETE' });
-	}
+	},
+	getTranscodeCapabilities: () =>
+		request<Resp<'/api/v0/system/transcode', 'get'>>('/api/v0/system/transcode')
 };
