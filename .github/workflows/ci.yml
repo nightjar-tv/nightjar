@@ -68,3 +68,34 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release -p nightjar-api
+
+  gate1:
+    needs: server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Build web for embed
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+      - name: Build release binary
+        working-directory: server
+        run: cargo build --release -p nightjar-api
+      - name: Generate corpus seeds
+        run: chmod +x testdata/generate.sh testdata/bench_10k.sh scripts/gate1_ci.sh scripts/gate1_scan_10k.sh && ./testdata/generate.sh
+      - name: Gate 1 smoke (startup, RAM, WAL kill-9, Range)
+        env:
+          NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
+        run: ./scripts/gate1_ci.sh
+      - name: Gate 1 scan 10k
+        env:
+          NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
+          SCAN_BUDGET_S: "60"
+        run: ./scripts/gate1_scan_10k.sh

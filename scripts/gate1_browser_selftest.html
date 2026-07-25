@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Nightjar Gate 1 browser self-test</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: #101216;
+        color: #f5f2ea;
+        margin: 2rem;
+      }
+      #result {
+        font-size: 1.5rem;
+        margin: 1rem 0;
+      }
+      video {
+        width: min(720px, 100%);
+        background: #000;
+      }
+      code {
+        color: #4ad6c4;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Gate 1: direct play + seek</h1>
+    <p>
+      Open this page in Safari or Firefox against a running Nightjar. Pass
+      <code>?stream=/api/v0/items/N/stream</code> (same origin) or an absolute
+      stream URL.
+    </p>
+    <div id="result">running…</div>
+    <video id="v" controls playsinline muted></video>
+    <script>
+      (async () => {
+        const params = new URLSearchParams(location.search);
+        const stream =
+          params.get("stream") ||
+          params.get("url") ||
+          "/api/v0/items/1/stream";
+        const v = document.getElementById("v");
+        const out = document.getElementById("result");
+        const say = (ok, msg) => {
+          out.textContent = (ok ? "PASS: " : "FAIL: ") + msg;
+          out.style.color = ok ? "#4ad6c4" : "#ff5c69";
+          document.title = (ok ? "PASS" : "FAIL") + " — Gate 1 browser";
+        };
+        v.src = stream;
+        try {
+          await v.play();
+        } catch (e) {
+          say(false, "play(): " + e);
+          return;
+        }
+        const wait = (pred, ms, label) =>
+          new Promise((resolve) => {
+            const t0 = performance.now();
+            const tick = () => {
+              if (pred()) return resolve({ ok: true, waited: performance.now() - t0 });
+              if (performance.now() - t0 > ms)
+                return resolve({ ok: false, reason: label });
+              requestAnimationFrame(tick);
+            };
+            tick();
+          });
+        const started = await wait(
+          () => v.currentTime > 0.05 && v.readyState >= 2,
+          10000,
+          "no playback progress",
+        );
+        if (!started.ok) {
+          say(
+            false,
+            `${started.reason}; rs=${v.readyState} ns=${v.networkState} err=${v.error && v.error.code}`,
+          );
+          return;
+        }
+        const dur = v.duration;
+        if (!Number.isFinite(dur) || dur < 2) {
+          say(false, "bad duration " + dur);
+          return;
+        }
+        const target = Math.min(dur * 0.5, dur - 0.5);
+        v.currentTime = target;
+        const sought = await wait(
+          () => Math.abs(v.currentTime - target) < 0.75 && !v.seeking,
+          10000,
+          "seek stall",
+        );
+        if (!sought.ok) {
+          say(false, `${sought.reason} at ${v.currentTime}`);
+          return;
+        }
+        say(
+          true,
+          `play ${Math.round(started.waited)}ms, seek ${Math.round(sought.waited)}ms, at ${v.currentTime.toFixed(2)}/${dur.toFixed(2)} (${navigator.userAgent})`,
+        );
+      })();
+    </script>
+  </body>
+</html>
