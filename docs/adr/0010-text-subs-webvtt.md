@@ -73,7 +73,12 @@ pass (Rule 6.1 / 4.9).
    `{NIGHTJAR_DATA_DIR}/cache/subs/` with identity including item id, source
    mtime/size, and `trackId`. Byte-capped LRU from day one
    (`NIGHTJAR_SUBS_CACHE_BYTES`, default 512 MiB), same idea as remux.
-   Conversion and extraction run on first GET via `spawn_blocking`.
+   Embedded text tracks are stream-copied to SRT in one FFmpeg pass (all
+   missing tracks together), then converted in-process with the same
+   `srt_to_webvtt` path sidecars use. Conversion and extraction run on first
+   GET via `spawn_blocking`, with a kill timeout on the FFmpeg child. When remux
+   starts, embedded tracks are warmed in the background so the first `<track>`
+   request does not race a cold NAS demux.
 
 8. **API.** `PlaybackInfo.subtitleTracks` is an array of
    `{ trackId, source, codec, language?, label?, forced, sdh, url?, streamIndex? }`.
@@ -94,3 +99,16 @@ cap). External NFO / artwork sidecars are Phase 3 metadata-import work, not
 this slice. SRT files that are not UTF-8 are decoded with a Windows-1252
 fallback after a strict UTF-8 attempt so a bad encoding fails closed to
 legible text rather than mojibake-as-UTF-8.
+
+Subtitle extraction is stream-copy (or subtitle-to-SRT remux for mov_text /
+embedded WebVTT) plus in-process conversion. FFmpeg's WebVTT muxer was the
+measured bottleneck: on a NAS-hosted title, `-c:s webvtt` lagged far behind
+`-c:s copy -f srt` for the same demux. Embedded and sidecar tracks share one
+converter (Rule 4.11).
+
+Extraction still shares remux's whole-file-artifact shape: the first request
+pays for a demux of the source, then hits a named cache object. Convergence
+onto range-addressable operations is a candidate, not a plan, and needs
+measured dogfooding evidence to justify. Moving remux onto HLS would not
+reduce extraction cost — the cost is the source demux, not the delivery
+model.

@@ -11,7 +11,7 @@ use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playbac
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
     RemuxKey, RemuxState, ensure_embedded_webvtt, ensure_sidecar_webvtt,
-    is_serveable_sidecar_format, list_text_subtitles,
+    is_serveable_sidecar_format, list_text_subtitles, warm_embedded_webvtts,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -351,9 +351,32 @@ pub async fn start_remux(
     let registry = Arc::clone(&state.remux);
     let key = remux_key(&row);
     let src = std::path::PathBuf::from(&row.path);
+    let warm_src = src.clone();
     let started = tokio::task::spawn_blocking(move || registry.start(&key, &src))
         .await
         .map_err(|e| ApiError::internal(format!("remux start task: {e}")))?;
+
+    // First <track> GET otherwise pays ~NAS demux before captions appear.
+    // Warm in parallel with remux so VTT is ready when the MP4 is.
+    let cache = Arc::clone(&state.subs);
+    let warm_id = row.id;
+    let warm_mtime = file_mtime_ms(&warm_src).unwrap_or(row.mtime_ms);
+    let warm_size = row.size_bytes;
+    tokio::task::spawn_blocking(move || {
+        match warm_embedded_webvtts(&cache, warm_id, warm_mtime, warm_size, &warm_src) {
+            Ok(n) if n > 0 => tracing::info!(
+                item_id = warm_id,
+                tracks = n,
+                "warmed embedded subtitle cache"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                item_id = warm_id,
+                error = %e,
+                "subtitle cache warm failed"
+            ),
+        }
+    });
 
     let (remux_state, reason) = match started {
         RemuxState::Ready => ("ready", None),

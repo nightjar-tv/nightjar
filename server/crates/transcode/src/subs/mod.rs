@@ -10,12 +10,17 @@ pub use srt::{decode_subtitle_bytes, srt_to_webvtt};
 
 use serde::Deserialize;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Codecs we can convert to WebVTT without burn-in.
 const TEXT_SUB_CODECS: &[&str] = &["subrip", "srt", "webvtt", "mov_text", "text"];
+
+/// Kill a runaway extract rather than leave ffmpeg demuxing forever on a NAS.
+const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubtitleSourceKind {
@@ -115,6 +120,9 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
 pub struct SubsCache {
     cache_dir: PathBuf,
     cap_bytes: u64,
+    /// Serialises embedded extracts so remux warm and a concurrent `<track>`
+    /// GET cannot share the same `.tmp.srt` paths.
+    extract_lock: Mutex<()>,
 }
 
 impl SubsCache {
@@ -124,6 +132,7 @@ impl SubsCache {
         Ok(Self {
             cache_dir,
             cap_bytes,
+            extract_lock: Mutex::new(()),
         })
     }
 
@@ -151,7 +160,7 @@ impl SubsCache {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".tmp.vtt") {
+            if name.ends_with(".tmp.vtt") || name.ends_with(".tmp.srt") {
                 locked_bytes += meta.len();
                 continue;
             }
@@ -224,7 +233,53 @@ fn select_evictions(
     Ok(victims)
 }
 
+fn vtt_cache_path(
+    cache: &SubsCache,
+    item_id: i64,
+    mtime_ms: i64,
+    size_bytes: i64,
+    track_id: &str,
+) -> PathBuf {
+    cache
+        .cache_dir
+        .join(format!("{item_id}-{mtime_ms}-{size_bytes}-{track_id}.vtt"))
+}
+
+fn cached_vtt(dest: &Path) -> bool {
+    dest.exists() && fs::metadata(dest).map(|m| m.len()).unwrap_or(0) > 0
+}
+
+/// Write WebVTT into the cache from SRT (or raw) bytes via the shared converter.
+fn write_cached_webvtt(cache: &SubsCache, dest: &Path, body: &str) -> Result<(), String> {
+    let tmp = dest.with_extension("tmp.vtt");
+    let out_bytes = body.as_bytes();
+    cache.make_room(out_bytes.len() as u64)?;
+    fs::write(&tmp, out_bytes).map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("rename subtitle cache {}: {e}", dest.display())
+    })?;
+    Ok(())
+}
+
+fn srt_bytes_to_webvtt(bytes: &[u8]) -> String {
+    srt_to_webvtt(&decode_subtitle_bytes(bytes))
+}
+
+/// `-c:s copy` for native subrip; `-c:s srt` remuxes mov_text/webvtt/text into
+/// SRT packets. Never `-c:s webvtt` — that muxer was the measured bottleneck.
+fn srt_encoder_for_codec(codec: &str) -> &'static str {
+    match codec.to_ascii_lowercase().as_str() {
+        "subrip" | "srt" => "copy",
+        _ => "srt",
+    }
+}
+
 /// Ensures a WebVTT file exists for an embedded stream and returns its path.
+///
+/// Missing text tracks for this item are stream-copied to SRT in one FFmpeg
+/// pass, then converted in-process with [`srt_to_webvtt`] (same path as
+/// sidecar `.srt`).
 pub fn ensure_embedded_webvtt(
     cache: &SubsCache,
     item_id: i64,
@@ -234,10 +289,18 @@ pub fn ensure_embedded_webvtt(
     stream_index: u32,
 ) -> Result<PathBuf, String> {
     let track_id = format!("e{stream_index}");
-    let dest = cache
-        .cache_dir
-        .join(format!("{item_id}-{mtime_ms}-{size_bytes}-{track_id}.vtt"));
-    if dest.exists() && fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) > 0 {
+    let dest = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, &track_id);
+    if cached_vtt(&dest) {
+        cache.touch(&dest);
+        return Ok(dest);
+    }
+
+    let _guard = cache
+        .extract_lock
+        .lock()
+        .map_err(|_| "subtitle extract lock poisoned".to_string())?;
+    // Another waiter (remux warm vs GET) may have finished while we blocked.
+    if cached_vtt(&dest) {
         cache.touch(&dest);
         return Ok(dest);
     }
@@ -250,43 +313,153 @@ pub fn ensure_embedded_webvtt(
         ));
     }
 
-    let tmp = cache.cache_dir.join(format!(
-        "{item_id}-{mtime_ms}-{size_bytes}-{track_id}.tmp.vtt"
-    ));
-    let map = format!("0:{stream_index}");
-    let output = Command::new("ffmpeg")
-        .stdin(Stdio::null())
+    let missing: Vec<&TextSubtitleStream> = streams
+        .iter()
+        .filter(|s| {
+            let id = s.track_id();
+            let path = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, &id);
+            !cached_vtt(&path)
+        })
+        .collect();
+    if !missing.is_empty() {
+        extract_embedded_srt_batch(cache, item_id, mtime_ms, size_bytes, src, &missing)?;
+    }
+
+    if !cached_vtt(&dest) {
+        return Err(format!(
+            "subtitle extract produced no WebVTT for stream {stream_index} in {}",
+            src.display()
+        ));
+    }
+    cache.touch(&dest);
+    Ok(dest)
+}
+
+/// Ensure every embedded text track for `src` is cached. One FFmpeg demux fills
+/// all missing tracks. Used to warm the cache when remux starts so VTT is ready
+/// by the time the MP4 is.
+pub fn warm_embedded_webvtts(
+    cache: &SubsCache,
+    item_id: i64,
+    mtime_ms: i64,
+    size_bytes: i64,
+    src: &Path,
+) -> Result<usize, String> {
+    let streams = list_text_subtitles(src)?;
+    if streams.is_empty() {
+        return Ok(0);
+    }
+    // First ensure extracts every missing track in one pass.
+    ensure_embedded_webvtt(
+        cache,
+        item_id,
+        mtime_ms,
+        size_bytes,
+        src,
+        streams[0].stream_index,
+    )?;
+    Ok(streams.len())
+}
+
+fn extract_embedded_srt_batch(
+    cache: &SubsCache,
+    item_id: i64,
+    mtime_ms: i64,
+    size_bytes: i64,
+    src: &Path,
+    streams: &[&TextSubtitleStream],
+) -> Result<(), String> {
+    // One FFmpeg demux → one .tmp.srt per missing track, then shared convert.
+    let mut tmp_srts: Vec<(u32, PathBuf)> = Vec::with_capacity(streams.len());
+    let mut cmd = Command::new("ffmpeg");
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(src)
-        .args(["-map", &map, "-c:s", "webvtt", "-f", "webvtt"])
-        .arg(&tmp)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "ffmpeg not found on PATH".into()
-            } else {
-                format!("spawn ffmpeg for {}: {e}", src.display())
-            }
-        })?;
-    if !output.status.success() {
-        let _ = fs::remove_file(&tmp);
-        let err = String::from_utf8_lossy(&output.stderr);
+        .arg(src);
+    for s in streams {
+        let tmp = cache.cache_dir.join(format!(
+            "{item_id}-{mtime_ms}-{size_bytes}-e{}.tmp.srt",
+            s.stream_index
+        ));
+        let map = format!("0:{}", s.stream_index);
+        let encoder = srt_encoder_for_codec(&s.codec);
+        cmd.args(["-map", &map, "-c:s", encoder, "-f", "srt"])
+            .arg(&tmp);
+        tmp_srts.push((s.stream_index, tmp));
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "ffmpeg not found on PATH".into()
+        } else {
+            format!("spawn ffmpeg for {}: {e}", src.display())
+        }
+    })?;
+    if let Err(e) = wait_extract_child(&mut child, EXTRACT_TIMEOUT) {
+        for (_, tmp) in &tmp_srts {
+            let _ = fs::remove_file(tmp);
+        }
+        tracing::warn!(
+            path = %src.display(),
+            error = %e,
+            "subtitle extract failed or timed out"
+        );
         return Err(format!(
-            "ffmpeg subtitle extract failed for {} stream {stream_index}: {} ({})",
-            src.display(),
-            output.status,
-            err.trim()
+            "ffmpeg subtitle extract failed for {}: {e}",
+            src.display()
         ));
     }
-    let produced = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-    cache.make_room(produced)?;
-    fs::rename(&tmp, &dest).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("rename subtitle cache {}: {e}", dest.display())
-    })?;
-    Ok(dest)
+
+    for (stream_index, tmp_srt) in tmp_srts {
+        let track_id = format!("e{stream_index}");
+        let dest = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, &track_id);
+        let result = (|| {
+            let bytes = fs::read(&tmp_srt).map_err(|e| {
+                format!(
+                    "read extracted srt for stream {stream_index} ({}): {e}",
+                    tmp_srt.display()
+                )
+            })?;
+            let body = srt_bytes_to_webvtt(&bytes);
+            write_cached_webvtt(cache, &dest, &body)
+        })();
+        let _ = fs::remove_file(&tmp_srt);
+        result?;
+    }
+    Ok(())
+}
+
+fn wait_extract_child(child: &mut std::process::Child, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let err = child
+                    .stderr
+                    .as_mut()
+                    .and_then(|s| {
+                        let mut buf = String::new();
+                        s.read_to_string(&mut buf).ok()?;
+                        Some(buf)
+                    })
+                    .unwrap_or_default();
+                let err = err.trim();
+                if err.is_empty() {
+                    return Err(format!("ffmpeg exited {status}"));
+                }
+                return Err(format!("ffmpeg exited {status}: {err}"));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("ffmpeg timed out after {timeout:?}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("wait: {e}")),
+        }
+    }
 }
 
 /// Ensures a WebVTT file exists for a filesystem sidecar and returns its path.
@@ -305,10 +478,8 @@ pub fn ensure_sidecar_webvtt(
             sidecar_path.display()
         ));
     }
-    let dest = cache
-        .cache_dir
-        .join(format!("{item_id}-{mtime_ms}-{size_bytes}-{track_id}.vtt"));
-    if dest.exists() && fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) > 0 {
+    let dest = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, track_id);
+    if cached_vtt(&dest) {
         cache.touch(&dest);
         return Ok(dest);
     }
@@ -323,21 +494,9 @@ pub fn ensure_sidecar_webvtt(
             format!("WEBVTT\n\n{text}")
         }
     } else {
-        let text = decode_subtitle_bytes(&bytes);
-        srt_to_webvtt(&text)
+        srt_bytes_to_webvtt(&bytes)
     };
-
-    let tmp = cache.cache_dir.join(format!(
-        "{item_id}-{mtime_ms}-{size_bytes}-{track_id}.tmp.vtt"
-    ));
-    let out_bytes = body.into_bytes();
-    cache.make_room(out_bytes.len() as u64)?;
-    fs::write(&tmp, &out_bytes)
-        .map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &dest).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("rename subtitle cache {}: {e}", dest.display())
-    })?;
+    write_cached_webvtt(cache, &dest, &body)?;
     Ok(dest)
 }
 
@@ -417,8 +576,102 @@ mod tests {
             body.contains("WEBVTT") || body.starts_with("\u{feff}WEBVTT"),
             "not webvtt: {body}"
         );
+        assert!(
+            body.contains("Nightjar SRT sample"),
+            "converted cue missing: {body}"
+        );
         let again = ensure_embedded_webvtt(&cache, 1, 0, 0, &corpus, idx).unwrap();
         assert_eq!(vtt, again);
+    }
+
+    #[test]
+    fn srt_encoder_copies_subrip_encodes_others() {
+        assert_eq!(srt_encoder_for_codec("subrip"), "copy");
+        assert_eq!(srt_encoder_for_codec("SRT"), "copy");
+        assert_eq!(srt_encoder_for_codec("mov_text"), "srt");
+        assert_eq!(srt_encoder_for_codec("webvtt"), "srt");
+        assert_eq!(srt_encoder_for_codec("text"), "srt");
+    }
+
+    #[test]
+    fn one_pass_fills_all_missing_tracks() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let srt_a = dir.path().join("a.srt");
+        let srt_b = dir.path().join("b.srt");
+        fs::write(&srt_a, "1\n00:00:00,000 --> 00:00:01,000\nTrack A\n").unwrap();
+        fs::write(&srt_b, "1\n00:00:00,000 --> 00:00:01,000\nTrack B\n").unwrap();
+        let mkv = dir.path().join("two_subs.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo:d=1",
+                "-i",
+            ])
+            .arg(&srt_a)
+            .arg("-i")
+            .arg(&srt_b)
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:0",
+                "-map",
+                "3:0",
+                "-shortest",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg multi-sub mux failed");
+            return;
+        }
+        let streams = list_text_subtitles(&mkv).expect("list");
+        assert!(
+            streams.len() >= 2,
+            "expected two text subs, got {streams:?}"
+        );
+        let cache = SubsCache::new(dir.path().join("cache"), 8 * 1024 * 1024).unwrap();
+        let first = ensure_embedded_webvtt(&cache, 9, 1, 1, &mkv, streams[0].stream_index)
+            .expect("extract first");
+        // Requesting one track should have filled both.
+        let second_path = vtt_cache_path(&cache, 9, 1, 1, &format!("e{}", streams[1].stream_index));
+        assert!(
+            cached_vtt(&second_path),
+            "second track should be cached after one-pass extract"
+        );
+        let a = fs::read_to_string(&first).unwrap();
+        let b = fs::read_to_string(&second_path).unwrap();
+        assert!(a.contains("Track A") || b.contains("Track A"));
+        assert!(a.contains("Track B") || b.contains("Track B"));
     }
 
     #[test]

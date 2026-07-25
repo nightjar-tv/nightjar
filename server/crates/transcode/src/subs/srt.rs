@@ -229,4 +229,55 @@ mod tests {
         let text = decode_subtitle_bytes(srt.as_bytes());
         assert_eq!(text, srt);
     }
+
+    /// Shapes FFmpeg emits when stream-copying subrip out of an MKV.
+    #[test]
+    fn ffmpeg_stream_copy_srt_shapes() {
+        // Comma millis, multi-line cue body, no hours-omitted form here.
+        let srt = "\
+1
+00:00:01,376 --> 00:00:02,711
+[projector sounds]
+
+4
+00:00:20,979 --> 00:00:23,940
+the human thing is not
+so complicated.
+
+5
+00:00:23,940 --> 00:00:27,610
+[doppler sound effect]
+";
+        let vtt = srt_to_webvtt(srt);
+        assert!(vtt.contains("00:00:01.376 --> 00:00:02.711"));
+        assert!(vtt.contains("the human thing is not\nso complicated."));
+        assert!(vtt.contains("[doppler sound effect]"));
+    }
+
+    #[test]
+    fn ffmpeg_font_and_an_tags_passed_through() {
+        // mov_text / some rippers emit font face tags; ASS-ish {\an8} can
+        // survive a text extract. Pass through — browser ignores unknowns.
+        let srt = "\
+1
+00:00:00,000 --> 00:00:01,500
+<font face=\"Arial\" size=\"20\">Hello</font>
+
+2
+00:00:01,500 --> 00:00:03,000
+{\\an8}Top of screen
+";
+        let vtt = srt_to_webvtt(srt);
+        assert!(vtt.contains("<font face=\"Arial\" size=\"20\">Hello</font>"));
+        assert!(vtt.contains("{\\an8}Top of screen"));
+    }
+
+    #[test]
+    fn ffmpeg_position_coords_stripped_from_timing() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000 X1:40 X2:600 Y1:20 Y2:50\nHi\n";
+        let vtt = srt_to_webvtt(srt);
+        assert!(vtt.contains("00:00:01.000 --> 00:00:02.000\n"));
+        assert!(!vtt.contains("X1:"));
+        assert!(vtt.contains("Hi"));
+    }
 }
