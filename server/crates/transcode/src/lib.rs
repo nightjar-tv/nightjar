@@ -3,7 +3,10 @@
 
 mod hls;
 
-pub use hls::{HlsSessionRegistry, PlaylistError, StartSessionError};
+pub use hls::{
+    HlsSessionRegistry, PlaylistError, StartAction, StartSessionError, WindowAction, decide_start,
+    decide_window_action,
+};
 
 use std::collections::HashMap;
 use std::fs;

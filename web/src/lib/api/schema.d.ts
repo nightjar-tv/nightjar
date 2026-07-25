@@ -192,7 +192,7 @@ export interface paths {
         put?: never;
         /**
          * Start an HLS software-transcode session for an item
-         * @description ADR-0007. Returns 202 with sessionId and playlistUrl. Concurrent sessions are capped; when full, returns 503 and clients retry. Seek beyond the encoded window is signalled via playlist ?startMs=.
+         * @description ADR-0007. Returns 202 with sessionId and playlistUrl. Reuses a live session for the same item at the same startMs (refcount). A divergent startMs forks a new session so other viewers are not disrupted. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
          */
         post: operations["startTranscodeSession"];
         delete?: never;
@@ -777,7 +777,10 @@ export interface operations {
     };
     startTranscodeSession: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Encode window start in milliseconds (default 0) */
+                startMs?: number;
+            };
             header?: never;
             path: {
                 itemId: components["parameters"]["ItemId"];
@@ -786,7 +789,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Session started or already running for this request */
+            /** @description Session started or reused for this item and startMs */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -827,7 +830,7 @@ export interface operations {
     getSessionPlaylist: {
         parameters: {
             query?: {
-                /** @description Seek target in milliseconds. A value different from the session's current encode window restarts FFmpeg at that offset (ADR-0007). */
+                /** @description Encode window start. With a single holder, changes restart FFmpeg on this session. With multiple holders, returns 409 so the client can POST a forked session at that offset. */
                 startMs?: number;
             };
             header?: never;
@@ -849,6 +852,15 @@ export interface operations {
             };
             /** @description Session not found or playlist not ready yet */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Shared session; fork via POST sessions?startMs= */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -881,6 +893,24 @@ export interface operations {
             };
             /** @description Session or asset not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Shared session; scrub would restart the shared encoder. Client forks via POST /api/v0/items/{itemId}/sessions?startMs= and DELETE of its prior session id. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Segment not on disk yet (encoder still cooking). Retryable; do not treat as a permanent miss. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

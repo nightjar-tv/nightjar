@@ -276,14 +276,23 @@ paths:
       operationId: startTranscodeSession
       summary: Start an HLS software-transcode session for an item
       description: >
-        ADR-0007. Returns 202 with sessionId and playlistUrl. Concurrent
-        sessions are capped; when full, returns 503 and clients retry.
-        Seek beyond the encoded window is signalled via playlist ?startMs=.
+        ADR-0007. Returns 202 with sessionId and playlistUrl. Reuses a live
+        session for the same item at the same startMs (refcount). A divergent
+        startMs forks a new session so other viewers are not disrupted.
+        Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
       parameters:
         - $ref: "#/components/parameters/ItemId"
+        - name: startMs
+          in: query
+          required: false
+          description: Encode window start in milliseconds (default 0)
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
       responses:
         "202":
-          description: Session started or already running for this request
+          description: Session started or reused for this item and startMs
           content:
             application/json:
               schema:
@@ -317,8 +326,9 @@ paths:
           in: query
           required: false
           description: >
-            Seek target in milliseconds. A value different from the session's
-            current encode window restarts FFmpeg at that offset (ADR-0007).
+            Encode window start. With a single holder, changes restart FFmpeg
+            on this session. With multiple holders, returns 409 so the client
+            can POST a forked session at that offset.
           schema:
             type: integer
             format: int64
@@ -332,6 +342,12 @@ paths:
                 type: string
         "404":
           description: Session not found or playlist not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Shared session; fork via POST sessions?startMs=
           content:
             application/json:
               schema:
@@ -359,6 +375,23 @@ paths:
                 format: binary
         "404":
           description: Session or asset not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >
+            Shared session; scrub would restart the shared encoder. Client
+            forks via POST /api/v0/items/{itemId}/sessions?startMs= and DELETE
+            of its prior session id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: >
+            Segment not on disk yet (encoder still cooking). Retryable; do not
+            treat as a permanent miss.
           content:
             application/json:
               schema:

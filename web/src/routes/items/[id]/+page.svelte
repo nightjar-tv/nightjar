@@ -13,10 +13,26 @@
 	let playback = $state<PlaybackInfo | null>(null);
 	let error = $state<string | null>(null);
 	let playlistUrl = $state<string | null>(null);
+	let sessionId = $state<string | null>(null);
 	let preparingTranscode = $state(false);
 	let videoEl = $state<HTMLVideoElement | null>(null);
+	// Mutable holder so onMount cleanup / pagehide always DELETE the live
+	// session even if the $state read in a stale closure is still null.
+	const sessionRef: { id: string | null } = { id: null };
 
 	const itemId = $derived(Number(page.params.id));
+
+	function holdSession(id: string | null) {
+		sessionRef.id = id;
+		sessionId = id;
+	}
+
+	function releaseSession() {
+		const id = sessionRef.id;
+		sessionRef.id = null;
+		sessionId = null;
+		if (id) void api.deleteTranscodeSession(id);
+	}
 
 	const playable = $derived(
 		playback != null &&
@@ -27,7 +43,12 @@
 
 	onMount(() => {
 		let alive = true;
-		let sessionId: string | null = null;
+
+		const onPageHide = () => releaseSession();
+		// pagehide DELETE: refresh/close must drop the ref (the refs=4 leak
+		// was remounts without teardown). Cannot unit-test in node; sequence
+		// is holdSession → pagehide/releaseSession → DELETE → refs--.
+		window.addEventListener('pagehide', onPageHide);
 
 		(async () => {
 			item = await api.getItem(itemId);
@@ -55,7 +76,7 @@
 				for (let attempt = 0; alive && attempt < 5; attempt++) {
 					try {
 						started = await api.startTranscodeSession(itemId);
-						sessionId = started.sessionId;
+						holdSession(started.sessionId);
 						break;
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
@@ -71,7 +92,7 @@
 					error = copy.sessionsBusy;
 					return;
 				}
-				// Wait until the first playlist bytes exist so native HLS does not fail once.
+				// Wait until init is ready so the VOD playlist is servable.
 				for (let i = 0; alive && i < 100; i++) {
 					const res = await fetch(started.playlistUrl);
 					if (res.ok) {
@@ -91,19 +112,47 @@
 
 		return () => {
 			alive = false;
-			if (sessionId) {
-				void api.deleteTranscodeSession(sessionId);
-			}
+			window.removeEventListener('pagehide', onPageHide);
+			releaseSession();
 		};
 	});
 
 	$effect(() => {
 		const video = videoEl;
 		const url = playlistUrl;
+		const id = itemId;
 		if (!video || !url || playback?.playbackMethod !== 'transcode') {
 			return;
 		}
-		const handle = attachHls(video, url);
+		// Expected scrub sequence with a second browser on the same title:
+		// reuse (refs++) on load → seeked → playlist 409 → forkAt POSTs new
+		// startMs + DELETE prior id (refs-- on shared) → one new session.
+		const handle = attachHls(video, url, {
+			forkAt: async (absoluteStartMs) => {
+				const prev = sessionRef.id;
+				try {
+					const forked = await api.startTranscodeSession(id, absoluteStartMs);
+					holdSession(forked.sessionId);
+					if (prev && prev !== forked.sessionId) {
+						void api.deleteTranscodeSession(prev);
+					}
+					for (let i = 0; i < 50; i++) {
+						const res = await fetch(forked.playlistUrl);
+						if (res.ok) break;
+						await new Promise((r) => setTimeout(r, 100));
+					}
+					return forked;
+				} catch (e) {
+					const msg = e instanceof Error ? e.message : String(e);
+					if (msg.includes('retry shortly') || msg.includes('in use')) {
+						error = copy.sessionsBusy;
+						return null;
+					}
+					throw e;
+				}
+			},
+			onSession: (sid) => holdSession(sid)
+		});
 		return () => handle.destroy();
 	});
 </script>

@@ -23,6 +23,12 @@ pub struct TranscodeSessionDto {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StartQuery {
+    pub start_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaylistQuery {
     pub start_ms: Option<u64>,
 }
@@ -30,6 +36,7 @@ pub struct PlaylistQuery {
 pub async fn start(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
+    Query(query): Query<StartQuery>,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
     let row = state
         .db
@@ -53,11 +60,22 @@ pub async fn start(
         });
     }
 
+    let Some(duration_ms) = row.duration_ms.filter(|d| *d > 0) else {
+        return Err(ApiError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: format!(
+                "item {item_id} has no probed duration; cannot build a session playlist"
+            ),
+        });
+    };
+
+    let start_ms = query.start_ms.unwrap_or(0);
     let hls = Arc::clone(&state.hls);
     let src = std::path::PathBuf::from(&row.path);
-    let started = tokio::task::spawn_blocking(move || hls.start(item_id, &src))
-        .await
-        .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
+    let started =
+        tokio::task::spawn_blocking(move || hls.start(item_id, &src, start_ms, duration_ms as u64))
+            .await
+            .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
 
     match started {
         Ok(session_id) => Ok((
@@ -82,13 +100,13 @@ pub async fn playlist(
     Query(query): Query<PlaylistQuery>,
 ) -> ApiResult<Response> {
     let hls = Arc::clone(&state.hls);
-    let start_ms = query.start_ms.unwrap_or(0);
+    let start_ms = query.start_ms;
     let sid = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // After a seek restart the playlist is briefly absent; wait up to 2s
-        // so clients (and Gate 2's 3s seek budget) see a 200 rather than a
-        // thrash of 404s.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // The playlist is held back until FFmpeg writes the init segment.
+        // Cold 1080p software encodes need a couple of seconds; wait up to 5s
+        // so clients see a 200 rather than a thrash of 404s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match hls.playlist(&sid, start_ms) {
                 Err(PlaylistError::NotReady) if std::time::Instant::now() < deadline => {
@@ -119,6 +137,12 @@ pub async fn playlist(
         Err(PlaylistError::NotReady) => Err(ApiError {
             status: StatusCode::NOT_FOUND,
             message: format!("playlist for session {session_id} not ready yet"),
+        }),
+        Err(PlaylistError::SharedSeekConflict) => Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "session {session_id} is shared; POST /api/v0/items/{{id}}/sessions?startMs= to fork"
+            ),
         }),
         Err(PlaylistError::Failed(e)) => Err(ApiError::internal(format!(
             "session {session_id} failed: {e}"
@@ -153,9 +177,18 @@ pub async fn asset(
         Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
             "asset {asset} for session {session_id} not found"
         ))),
-        Err(PlaylistError::NotReady) => Err(ApiError::not_found(format!(
-            "asset {asset} for session {session_id} not ready"
-        ))),
+        // Not yet on disk: ask the player to retry. 404 makes hls.js / Safari
+        // give up on the fragment; 503 is recoverable while FFmpeg catches up.
+        Err(PlaylistError::NotReady) => Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("asset {asset} for session {session_id} not ready yet"),
+        }),
+        Err(PlaylistError::SharedSeekConflict) => Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "session {session_id} is shared; POST /api/v0/items/{{id}}/sessions?startMs= to fork"
+            ),
+        }),
         Err(PlaylistError::Failed(e)) => Err(ApiError::internal(e)),
     }
 }

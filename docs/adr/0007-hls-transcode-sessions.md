@@ -17,38 +17,53 @@ on long titles.
    `libx264` and AAC stereo. Remux stays the ADR-0006 whole-file cache for this
    slice. Unifying remux onto HLS sessions is a candidate once sessions are
    proven; it is not done here (two risks in one PR).
-2. **Session API.** `POST /api/v0/items/{itemId}/sessions` returns 202 with
-   `sessionId` and `playlistUrl`. A second POST for the same item reuses the
-   live session (refcount++) so two browsers do not burn two slots on one
-   title. `DELETE` decrements the refcount and only reaps FFmpeg when it hits
-   zero. Idle timeout still force-reaps abandoned sessions. Clients fetch
-   `GET /api/v0/sessions/{sessionId}/index.m3u8` and the init/segment files it
-   references. Playback-info for transcode exposes `sessionsUrl` (the POST
-   target). `streamUrl` remains for byte streams only (direct play and remux).
-3. **Lifecycle (Gate 2: no orphaned FFmpeg).** Concurrent sessions are hard-capped
-   (default 3). Idle timeout: no playlist or segment request for 60 seconds
-   kills FFmpeg and deletes the session directory. Explicit DELETE on player
-   teardown does the same. Startup sweeps `{NIGHTJAR_DATA_DIR}/cache/hls/` of
-   leftover session dirs. Process kill on session end waits and reaps so no
-   zombies remain.
-4. **Seek = restart at offset.** A seek beyond the currently encoded window
-   kills FFmpeg and restarts with `-ss` at the seek target, wiping that
-   session’s segment dir and regenerating the playlist. Waiting for the
-   encoder to crawl forward is rejected; restart-at-offset is what meets the
-   Gate 2 three-second seek criterion. The client signals seek via the
-   playlist query `?startMs=`; a changed offset triggers restart.
-5. **Segments are bounded.** Each session writes under
-   `{NIGHTJAR_DATA_DIR}/cache/hls/{sessionId}/`. FFmpeg runs with a finite
-   `hls_list_size` and `delete_segments` so the directory is a sliding window,
-   not an unbounded grow. Same disk-full reasoning as the remux cache.
+2. **Session API.** `POST /api/v0/items/{itemId}/sessions?startMs=` returns 202
+   with `sessionId` and `playlistUrl`. Reuse is keyed by `(itemId, startMs)` with
+   a refcount so two browsers at the same encode window share one FFmpeg.
+   `DELETE` decrements the refcount and only reaps when it hits zero. Playback-info
+   exposes `sessionsUrl`; `streamUrl` stays for byte streams (direct/remux).
+3. **Lifecycle (Gate 2: no orphaned FFmpeg).** Concurrent sessions are capped by
+   `NIGHTJAR_HLS_MAX_SESSIONS` (default 3, the Gate 2 N100 figure). Idle
+   timeout: no playlist or segment request for 60 seconds force-reaps the
+   session **regardless of refcount**. Crashed or sleeping tabs never DELETE;
+   without idle beating the counter, refs only go up. Explicit DELETE on
+   teardown (and `pagehide`) still releases a holder. Startup sweeps leftover
+   session dirs. Process kill waits and reaps so no zombies remain.
+4. **Seek = restart or fork, retain prior segments.** A lone holder may restart
+   in place via playlist `?startMs=` or a far-ahead segment fetch (kill FFmpeg,
+   `-ss` / `-start_number` / `-output_ts_offset`, do **not** wipe prior-window
+   segments — Gate 2: in-flight fetches must not 404 while the new window
+   cooks). When refs > 1, that path returns 409; the seeking client POSTs a new
+   session at the offset (fork) and DELETEs its prior hold so the ref moves.
+   Waiting for the encoder to crawl forward is rejected.
+5. **The playlist is a generated VOD, not FFmpeg's.** The server builds a
+   playlist covering the probed duration (2s segments, `ENDLIST`) and serves
+   it once the first window segment exists. Segment requests that are still
+   cooking return 503 (retryable), not 404. Segments live under
+   `{NIGHTJAR_DATA_DIR}/cache/hls/{sessionId}/`; disk is bounded by session
+   idle/stop cleanup of the whole dir.
 6. **Client.** Safari plays HLS natively when
    `video.canPlayType('application/vnd.apple.mpegurl')` is non-empty. Other
-   browsers use hls.js (Apache-2.0). Hand-rolling MSE and playlist parsing is
-   well over the Rule 4.4 line; Safari-only would fail Gate 2.
+   browsers use hls.js (Apache-2.0). Seek handling uses the `seeked` event
+   only (not `seeking` ticks). Hand-rolling MSE is well over Rule 4.4;
+   Safari-only would fail Gate 2.
 
 ## Consequences
 
 Hardware acceleration, subtitle burn-in, multi-bitrate ladders, and remux→HLS
 unification remain later Phase 2 work. First audio and video streams only
-(same map as remux). A full disk still fails SQLite writes; the sliding window
-and session idle cleanup are the mitigations for this path.
+(same map as remux). A full disk still fails SQLite writes; session idle
+cleanup is the mitigation for this path. Two household viewers of the same
+film at different points each cost a session slot after the first divergent
+seek.
+
+The eventual cap model is a global cap protecting server CPU plus a per-user
+cap for household fairness, with the settings UI arriving in Phase 3 alongside
+the admin screens. `NIGHTJAR_HLS_MAX_SESSIONS` stays global until users exist
+(Rule 4.7).
+
+Item-keyed session sharing is re-examined in Phase 3 together with per-user
+caps, because attributing a shared session to a user's quota is currently
+undefined and the fork-on-scrub rule has absorbed several rounds of patches.
+One session per viewer with a higher cap is the candidate simplification.
+These are intent, not committed work in this slice.

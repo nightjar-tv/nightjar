@@ -72,11 +72,13 @@ export const api = {
 		request<Resp<'/api/v0/items/{itemId}/remux', 'post'>>(`/api/v0/items/${itemId}/remux`, {
 			method: 'POST'
 		}),
-	startTranscodeSession: (itemId: number) =>
-		request<Resp<'/api/v0/items/{itemId}/sessions', 'post'>>(
-			`/api/v0/items/${itemId}/sessions`,
+	startTranscodeSession: (itemId: number, startMs = 0) => {
+		const q = startMs > 0 ? `?startMs=${startMs}` : '';
+		return request<Resp<'/api/v0/items/{itemId}/sessions', 'post'>>(
+			`/api/v0/items/${itemId}/sessions${q}`,
 			{ method: 'POST' }
-		),
+		);
+	},
 	deleteTranscodeSession: async (sessionId: string) => {
 		await request<undefined>(`/api/v0/sessions/${sessionId}`, { method: 'DELETE' });
 	}

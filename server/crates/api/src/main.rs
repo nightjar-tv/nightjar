@@ -30,8 +30,11 @@ async fn main() {
         remux_cache_cap_bytes(),
     )
     .unwrap_or_else(|e| panic!("remux cache: {e}"));
-    let hls = nightjar_transcode::HlsSessionRegistry::new(data_dir.join("cache").join("hls"))
-        .unwrap_or_else(|e| panic!("hls cache: {e}"));
+    let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
+        data_dir.join("cache").join("hls"),
+        hls_max_sessions(),
+    )
+    .unwrap_or_else(|e| panic!("hls cache: {e}"));
     let state = AppState::new(db, remux, hls);
     nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
 
@@ -69,16 +72,31 @@ async fn static_handler(req: axum::extract::Request) -> axum::response::Response
     match Assets::get(path) {
         Some(file) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
+            // Hashed `/_app/immutable/*` can be cached forever; index.html must
+            // not be, or Chrome keeps a stale shell that points at deleted
+            // chunks (and our SPA fallback used to 200 HTML for those misses).
+            let cache = if path.starts_with("_app/immutable/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
             axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, cache)
                 .body(Body::from(file.data.into_owned()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        None if path.starts_with("_app/") => {
+            // Never SPA-fallback hashed assets: a 200 HTML body for a .js URL
+            // leaves Chrome running a broken or stale module graph.
+            (StatusCode::NOT_FOUND, "not found").into_response()
         }
         None => match Assets::get("index.html") {
             Some(file) => axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-cache")
                 .body(Body::from(file.data.into_owned()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             None => (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -97,6 +115,15 @@ fn remux_cache_cap_bytes() -> u64 {
     std::env::var("NIGHTJAR_REMUX_CACHE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT)
+}
+
+fn hls_max_sessions() -> usize {
+    const DEFAULT: usize = 3;
+    std::env::var("NIGHTJAR_HLS_MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT)
 }
 
