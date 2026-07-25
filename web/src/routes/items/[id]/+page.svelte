@@ -85,6 +85,9 @@
 			<video controls playsinline src={playback.streamUrl}>
 				Your browser cannot play this file directly.
 			</video>
+			{#if playback.playbackMethod === 'remux'}
+				<p class="preparing">{copy.remuxSubtitleNote}</p>
+			{/if}
 		{:else if playback.playbackMethod === 'remux' && playback.remuxState === 'failed'}
 			<p class="error" role="alert">
 				{copy.remuxFailed}

@@ -10,5 +10,6 @@ export const copy = {
 	needsTranscode:
 		"This file needs transcoding, which isn't built yet. It will play in a later release.",
 	badgeHint:
-		'Badges: browser plays directly, remux is prepared on first play, needs transcode waits for a later release.'
+		'Badges: browser plays directly, remux is prepared on first play, needs transcode waits for a later release. Embedded subtitles are not shown yet for remuxed files.',
+	remuxSubtitleNote: 'Subtitles embedded in this file are not shown yet. Subtitle support is next.'
 } as const;
