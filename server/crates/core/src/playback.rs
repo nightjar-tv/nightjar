@@ -1,101 +1,138 @@
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackMethod {
+    DirectPlay,
+    Remux,
+    Transcode,
+}
+
+impl PlaybackMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectPlay => "directPlay",
+            Self::Remux => "remux",
+            Self::Transcode => "transcode",
+        }
+    }
+}
+
+/// What a client can play natively. The compatibility contract for Phase 2
+/// (ADR-0006); richer per-client profiles arrive additively later.
+pub struct ClientCapabilityProfile {
+    pub video_codecs: &'static [&'static str],
+    pub audio_codecs: &'static [&'static str],
+    /// ffprobe format_name parts accepted for direct play.
+    pub containers: &'static [&'static str],
+    /// File extensions treated as an accepted container without a probe match.
+    pub extensions: &'static [&'static str],
+}
+
+/// Phase 1 browser whitelist: H.264 family + AAC in MP4/M4V.
+pub const BROWSER_V0: ClientCapabilityProfile = ClientCapabilityProfile {
+    video_codecs: &["h264", "avc", "avc1"],
+    audio_codecs: &["aac", "mp4a"],
+    containers: &["mp4", "m4v", "mov"],
+    extensions: &["mp4", "m4v"],
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaybackDecision {
-    pub direct_play: bool,
-    pub needs_transcode: bool,
+    pub method: PlaybackMethod,
     pub reason: String,
     pub mime_type: String,
 }
 
-/// Phase 1 browser-safe whitelist. Seed of the Phase 2 capability-profile system.
+/// (file streams × client capability profile) → directPlay | remux | transcode.
 ///
-/// Direct play only when the file is H.264 (8-bit family) + AAC in an MP4/M4V
-/// container. Everything else needs remux/transcode (Phase 2). Probe failures
-/// and pending probes block direct play. We will not claim browser playback
-/// without a successful probe.
-pub fn decide_direct_play(
+/// Codecs the client plays in an accepted container direct play; the same
+/// codecs in any other container remux (stream copy to MP4); everything else,
+/// including pending and failed probes, is transcode. We will not claim
+/// browser playback without a successful probe.
+pub fn decide_playback(
     path: &str,
     container: Option<&str>,
     video_codec: Option<&str>,
     audio_codec: Option<&str>,
     scan_error: Option<&str>,
     probe_status: &str,
+    profile: &ClientCapabilityProfile,
 ) -> PlaybackDecision {
-    let mime = mime_for_path(path);
-
     if probe_status == "indexed" {
         return PlaybackDecision {
-            direct_play: false,
-            needs_transcode: true,
+            method: PlaybackMethod::Transcode,
             reason: "probe pending".into(),
-            mime_type: mime,
+            mime_type: mime_for_path(path),
         };
     }
 
     if let Some(err) = scan_error.filter(|e| !e.is_empty()) {
         return PlaybackDecision {
-            direct_play: false,
-            needs_transcode: true,
+            method: PlaybackMethod::Transcode,
             reason: format!("probe failed: {err}"),
-            mime_type: mime,
+            mime_type: mime_for_path(path),
         };
     }
 
-    let video_ok = matches_video(video_codec);
-    let audio_ok = matches_audio(audio_codec);
-    let container_ok = matches_container(path, container);
+    let video_ok = matches_codec(video_codec, profile.video_codecs);
+    let audio_ok = matches_codec(audio_codec, profile.audio_codecs);
+    let container_ok = matches_container(path, container, profile);
 
-    if video_ok && audio_ok && container_ok {
+    if video_ok && audio_ok {
+        if container_ok {
+            return PlaybackDecision {
+                method: PlaybackMethod::DirectPlay,
+                reason: "codecs and container supported by client".into(),
+                mime_type: mime_for_path(path),
+            };
+        }
         return PlaybackDecision {
-            direct_play: true,
-            needs_transcode: false,
-            reason: "H.264 + AAC in MP4; Phase 1 browser direct play".into(),
-            mime_type: mime,
+            method: PlaybackMethod::Remux,
+            reason: "codecs supported; container needs repackaging to MP4".into(),
+            mime_type: "video/mp4".into(),
         };
     }
 
     let mut why = Vec::new();
-    if !container_ok {
-        why.push("container not MP4/M4V");
-    }
     if !video_ok {
-        why.push("video not H.264");
+        why.push("video codec unsupported");
     }
     if !audio_ok {
-        why.push("audio not AAC");
+        why.push("audio codec unsupported");
     }
     PlaybackDecision {
-        direct_play: false,
-        needs_transcode: true,
+        method: PlaybackMethod::Transcode,
         reason: format!("needs transcode: {}", why.join(", ")),
-        mime_type: mime,
+        mime_type: mime_for_path(path),
     }
 }
 
-fn matches_video(codec: Option<&str>) -> bool {
-    matches!(
-        codec.map(|c| c.to_ascii_lowercase()).as_deref(),
-        Some("h264" | "avc" | "avc1")
-    )
+fn matches_codec(codec: Option<&str>, accepted: &[&str]) -> bool {
+    match codec {
+        Some(c) => {
+            let c = c.to_ascii_lowercase();
+            accepted.contains(&c.as_str())
+        }
+        None => false,
+    }
 }
 
-fn matches_audio(codec: Option<&str>) -> bool {
-    matches!(
-        codec.map(|c| c.to_ascii_lowercase()).as_deref(),
-        Some("aac" | "mp4a")
-    )
-}
-
-fn matches_container(path: &str, container: Option<&str>) -> bool {
+fn matches_container(
+    path: &str,
+    container: Option<&str>,
+    profile: &ClientCapabilityProfile,
+) -> bool {
     let path_l = path.to_ascii_lowercase();
-    if path_l.ends_with(".mp4") || path_l.ends_with(".m4v") {
+    if profile
+        .extensions
+        .iter()
+        .any(|ext| path_l.ends_with(&format!(".{ext}")))
+    {
         return true;
     }
     let c = container.unwrap_or("").to_ascii_lowercase();
     // ffprobe format_name is often "mov,mp4,m4a,3gp,3g2,mj2"
-    c.split(',')
-        .any(|p| matches!(p.trim(), "mp4" | "m4v" | "mov"))
+    c.split(',').any(|p| profile.containers.contains(&p.trim()))
 }
 
 pub fn mime_for_path(path: &str) -> String {
@@ -121,38 +158,97 @@ pub fn mime_for_path(path: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn h264_aac_mp4_direct_plays() {
-        let d = decide_direct_play(
-            "/a/b.mp4",
-            Some("mov,mp4,m4a"),
-            Some("h264"),
-            Some("aac"),
-            None,
-            "probed",
-        );
-        assert!(d.direct_play);
-        assert!(!d.needs_transcode);
+    fn decide(
+        path: &str,
+        container: Option<&str>,
+        video: Option<&str>,
+        audio: Option<&str>,
+        scan_error: Option<&str>,
+        probe_status: &str,
+    ) -> PlaybackDecision {
+        decide_playback(
+            path,
+            container,
+            video,
+            audio,
+            scan_error,
+            probe_status,
+            &BROWSER_V0,
+        )
     }
 
     #[test]
-    fn h264_ac3_needs_transcode() {
-        let d = decide_direct_play(
-            "/a/b.mp4",
-            Some("mp4"),
-            Some("h264"),
-            Some("ac3"),
-            None,
-            "probed",
-        );
-        assert!(!d.direct_play);
-        assert!(d.needs_transcode);
-        assert!(d.reason.contains("audio not AAC"));
+    fn table_of_expected_methods() {
+        let cases = [
+            (
+                "h264 aac mp4 direct plays",
+                decide(
+                    "/a/b.mp4",
+                    Some("mov,mp4,m4a"),
+                    Some("h264"),
+                    Some("aac"),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::DirectPlay,
+            ),
+            (
+                "h264 aac mkv remuxes",
+                decide(
+                    "/a/b.mkv",
+                    Some("matroska,webm"),
+                    Some("h264"),
+                    Some("aac"),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::Remux,
+            ),
+            (
+                "h264 ac3 mp4 transcodes",
+                decide(
+                    "/a/b.mp4",
+                    Some("mp4"),
+                    Some("h264"),
+                    Some("ac3"),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::Transcode,
+            ),
+            (
+                "hevc aac mp4 transcodes",
+                decide(
+                    "/a/b.mp4",
+                    Some("mp4"),
+                    Some("hevc"),
+                    Some("aac"),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::Transcode,
+            ),
+            (
+                "hevc ac3 mkv transcodes",
+                decide(
+                    "/a/b.mkv",
+                    Some("matroska,webm"),
+                    Some("hevc"),
+                    Some("ac3"),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::Transcode,
+            ),
+        ];
+        for (name, decision, expected) in cases {
+            assert_eq!(decision.method, expected, "{name}: {}", decision.reason);
+        }
     }
 
     #[test]
-    fn mkv_needs_transcode() {
-        let d = decide_direct_play(
+    fn remux_reports_mp4_mime_not_source_mime() {
+        let d = decide(
             "/a/b.mkv",
             Some("matroska,webm"),
             Some("h264"),
@@ -160,26 +256,13 @@ mod tests {
             None,
             "probed",
         );
-        assert!(!d.direct_play);
-        assert!(d.needs_transcode);
+        assert_eq!(d.method, PlaybackMethod::Remux);
+        assert_eq!(d.mime_type, "video/mp4");
     }
 
     #[test]
-    fn hevc_needs_transcode() {
-        let d = decide_direct_play(
-            "/a/b.mp4",
-            Some("mp4"),
-            Some("hevc"),
-            Some("aac"),
-            None,
-            "probed",
-        );
-        assert!(!d.direct_play);
-    }
-
-    #[test]
-    fn probe_error_blocks() {
-        let d = decide_direct_play(
+    fn probe_error_is_transcode() {
+        let d = decide(
             "/a/b.mp4",
             None,
             None,
@@ -187,14 +270,29 @@ mod tests {
             Some("ffprobe missing"),
             "error",
         );
-        assert!(!d.direct_play);
-        assert!(d.needs_transcode);
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(d.reason.contains("probe failed"));
     }
 
     #[test]
-    fn indexed_blocks_until_probed() {
-        let d = decide_direct_play("/a/b.mp4", None, None, None, None, "indexed");
-        assert!(!d.direct_play);
+    fn indexed_is_transcode_until_probed() {
+        let d = decide("/a/b.mp4", None, None, None, None, "indexed");
+        assert_eq!(d.method, PlaybackMethod::Transcode);
         assert!(d.reason.contains("probe pending"));
+    }
+
+    #[test]
+    fn transcode_reason_names_the_offending_stream() {
+        let d = decide(
+            "/a/b.mkv",
+            Some("matroska,webm"),
+            Some("h264"),
+            Some("dts"),
+            None,
+            "probed",
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(d.reason.contains("audio codec unsupported"));
+        assert!(!d.reason.contains("video codec unsupported"));
     }
 }

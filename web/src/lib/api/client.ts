@@ -67,5 +67,9 @@ export const api = {
 	getPlaybackInfo: (itemId: number) =>
 		request<Resp<'/api/v0/items/{itemId}/playback-info', 'get'>>(
 			`/api/v0/items/${itemId}/playback-info`
-		)
+		),
+	startRemux: (itemId: number) =>
+		request<Resp<'/api/v0/items/{itemId}/remux', 'post'>>(`/api/v0/items/${itemId}/remux`, {
+			method: 'POST'
+		})
 };

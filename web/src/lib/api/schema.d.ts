@@ -131,10 +131,30 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Direct-play capability and stream URL for an item */
+        /** Playback method, remux state, and stream URL for an item */
         get: operations["getPlaybackInfo"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/items/{itemId}/remux": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start (or reuse) a background remux for an item
+         * @description Async job per ADR-0006. Returns the current state immediately; poll playback-info until remuxState is ready. When all remux slots are busy the state stays notStarted with a reason; clients re-POST on each poll tick while they see notStarted.
+         */
+        post: operations["startRemux"];
         delete?: never;
         options?: never;
         head?: never;
@@ -148,7 +168,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Direct-play byte stream (supports HTTP Range) */
+        /**
+         * Byte stream for playback (supports HTTP Range)
+         * @description Serves the original file for directPlay items and the remuxed MP4 for remux items once remuxState is ready.
+         */
         get: operations["streamItem"];
         put?: never;
         post?: never;
@@ -182,6 +205,23 @@ export interface components {
         ProbeStatus: "indexed" | "probed" | "error";
         /** @enum {string} */
         ScanJobState: "queued" | "indexing" | "probing" | "completed" | "failed";
+        /**
+         * @description directPlay = browser plays the original file; remux = same codecs repackaged to MP4 by a background job; transcode = needs re-encoding, not available yet. Pending or failed probes report transcode.
+         * @enum {string}
+         */
+        PlaybackMethod: "directPlay" | "remux" | "transcode";
+        /**
+         * @description Only meaningful when playbackMethod is remux. notStarted may carry a busy reason when all remux slots are in use; clients re-POST while they see it (ADR-0006).
+         * @enum {string}
+         */
+        RemuxState: "notStarted" | "preparing" | "ready" | "failed";
+        RemuxAccepted: {
+            /** Format: int64 */
+            itemId: number;
+            remuxState: components["schemas"]["RemuxState"];
+            /** @description Why the job is not running yet, or why it failed */
+            reason?: string;
+        };
         Library: {
             /** Format: int64 */
             id: number;
@@ -218,10 +258,7 @@ export interface components {
             sizeBytes: number;
             probeStatus: components["schemas"]["ProbeStatus"];
             scanError?: string | null;
-            /** @description Phase 1 browser-safe direct play (H.264 + AAC in MP4). False means needsTranscode; Phase 2 will remux/transcode. False while probeStatus is indexed. */
-            directPlay: boolean;
-            /** @description Inverse of directPlay for Phase 1; kept explicit for clients. */
-            needsTranscode: boolean;
+            playbackMethod: components["schemas"]["PlaybackMethod"];
         };
         ScanJobAccepted: {
             /** Format: int64 */
@@ -257,12 +294,16 @@ export interface components {
         PlaybackInfo: {
             /** Format: int64 */
             itemId: number;
-            /** @description Phase 1 browser-safe whitelist (H.264 + AAC in MP4) */
-            directPlay: boolean;
-            needsTranscode: boolean;
-            /** @description Why direct play is or is not available */
-            reason?: string;
-            streamUrl: string;
+            playbackMethod: components["schemas"]["PlaybackMethod"];
+            /** @description Present when playbackMethod is remux */
+            remuxState?: components["schemas"]["RemuxState"];
+            /** @description Present when remuxState is failed or start is blocked */
+            remuxError?: string;
+            /** @description Why the decision engine chose this method */
+            reason: string;
+            /** @description Present only when the item is playable now: directPlay, or remux with remuxState ready. */
+            streamUrl?: string;
+            /** @description video/mp4 for remux regardless of the source container */
             mimeType: string;
             /** Format: int64 */
             durationMs?: number | null;
@@ -546,6 +587,46 @@ export interface operations {
             };
         };
     };
+    startRemux: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Remux state after this request */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemuxAccepted"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Item does not use the remux method */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     streamItem: {
         parameters: {
             query?: never;
@@ -579,6 +660,24 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Remux not ready; POST remux and poll playback-info */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Item needs transcoding, which is not available yet */
+            415: {
                 headers: {
                     [name: string]: unknown;
                 };

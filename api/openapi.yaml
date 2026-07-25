@@ -1,10 +1,11 @@
 openapi: 3.1.0
 info:
   title: Nightjar API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Public API contract. Server handlers and the web client are built against
-    this file. Phase 1 (v0): libraries, items, playback info, direct-play stream.
+    this file. v0: libraries, items, playback info, direct-play and remux
+    streams (ADR-0006).
   license:
     name: GPL-3.0-only
 servers:
@@ -172,7 +173,7 @@ paths:
   /api/v0/items/{itemId}/playback-info:
     get:
       operationId: getPlaybackInfo
-      summary: Direct-play capability and stream URL for an item
+      summary: Playback method, remux state, and stream URL for an item
       parameters:
         - $ref: "#/components/parameters/ItemId"
       responses:
@@ -189,10 +190,44 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/items/{itemId}/remux:
+    post:
+      operationId: startRemux
+      summary: Start (or reuse) a background remux for an item
+      description: >
+        Async job per ADR-0006. Returns the current state immediately; poll
+        playback-info until remuxState is ready. When all remux slots are busy
+        the state stays notStarted with a reason; clients re-POST on each poll
+        tick while they see notStarted.
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "202":
+          description: Remux state after this request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemuxAccepted"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: Item does not use the remux method
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/items/{itemId}/stream:
     get:
       operationId: streamItem
-      summary: Direct-play byte stream (supports HTTP Range)
+      summary: Byte stream for playback (supports HTTP Range)
+      description: >
+        Serves the original file for directPlay items and the remuxed MP4 for
+        remux items once remuxState is ready.
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: Range
@@ -217,6 +252,18 @@ paths:
                 format: binary
         "404":
           description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Remux not ready; POST remux and poll playback-info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: Item needs transcoding, which is not available yet
           content:
             application/json:
               schema:
@@ -290,6 +337,35 @@ components:
       type: string
       enum: [queued, indexing, probing, completed, failed]
 
+    PlaybackMethod:
+      type: string
+      enum: [directPlay, remux, transcode]
+      description: >
+        directPlay = browser plays the original file; remux = same codecs
+        repackaged to MP4 by a background job; transcode = needs re-encoding,
+        not available yet. Pending or failed probes report transcode.
+
+    RemuxState:
+      type: string
+      enum: [notStarted, preparing, ready, failed]
+      description: >
+        Only meaningful when playbackMethod is remux. notStarted may carry a
+        busy reason when all remux slots are in use; clients re-POST while
+        they see it (ADR-0006).
+
+    RemuxAccepted:
+      type: object
+      required: [itemId, remuxState]
+      properties:
+        itemId:
+          type: integer
+          format: int64
+        remuxState:
+          $ref: "#/components/schemas/RemuxState"
+        reason:
+          type: string
+          description: Why the job is not running yet, or why it failed
+
     Library:
       type: object
       required: [id, name, path, kind, itemCount]
@@ -322,7 +398,7 @@ components:
 
     MediaItem:
       type: object
-      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, directPlay, needsTranscode]
+      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, playbackMethod]
       properties:
         id:
           type: integer
@@ -372,15 +448,8 @@ components:
         scanError:
           type: string
           nullable: true
-        directPlay:
-          type: boolean
-          description: >
-            Phase 1 browser-safe direct play (H.264 + AAC in MP4). False means
-            needsTranscode; Phase 2 will remux/transcode. False while probeStatus
-            is indexed.
-        needsTranscode:
-          type: boolean
-          description: Inverse of directPlay for Phase 1; kept explicit for clients.
+        playbackMethod:
+          $ref: "#/components/schemas/PlaybackMethod"
 
     ScanJobAccepted:
       type: object
@@ -449,23 +518,30 @@ components:
 
     PlaybackInfo:
       type: object
-      required: [itemId, directPlay, needsTranscode, streamUrl, mimeType]
+      required: [itemId, playbackMethod, reason, mimeType]
       properties:
         itemId:
           type: integer
           format: int64
-        directPlay:
-          type: boolean
-          description: Phase 1 browser-safe whitelist (H.264 + AAC in MP4)
-        needsTranscode:
-          type: boolean
+        playbackMethod:
+          $ref: "#/components/schemas/PlaybackMethod"
+        remuxState:
+          $ref: "#/components/schemas/RemuxState"
+          description: Present when playbackMethod is remux
+        remuxError:
+          type: string
+          description: Present when remuxState is failed or start is blocked
         reason:
           type: string
-          description: Why direct play is or is not available
+          description: Why the decision engine chose this method
         streamUrl:
           type: string
+          description: >
+            Present only when the item is playable now: directPlay, or remux
+            with remuxState ready.
         mimeType:
           type: string
+          description: video/mp4 for remux regardless of the source container
         durationMs:
           type: integer
           format: int64

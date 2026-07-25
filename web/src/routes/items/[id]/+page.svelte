@@ -14,13 +14,40 @@
 
 	const itemId = $derived(Number(page.params.id));
 
+	const playable = $derived(
+		playback != null &&
+			(playback.playbackMethod === 'directPlay' ||
+				(playback.playbackMethod === 'remux' && playback.remuxState === 'ready'))
+	);
+
 	onMount(() => {
+		let alive = true;
+
 		(async () => {
 			item = await api.getItem(itemId);
 			playback = await api.getPlaybackInfo(itemId);
+			// Remux runs as a background job (ADR-0006): re-POST while slots are
+			// busy (notStarted), poll until ready or failed.
+			while (
+				alive &&
+				playback.playbackMethod === 'remux' &&
+				playback.remuxState !== 'ready' &&
+				playback.remuxState !== 'failed'
+			) {
+				if (playback.remuxState === 'notStarted') {
+					await api.startRemux(itemId);
+				}
+				await new Promise((r) => setTimeout(r, 400));
+				if (!alive) return;
+				playback = await api.getPlaybackInfo(itemId);
+			}
 		})().catch((e: Error) => {
 			error = e.message;
 		});
+
+		return () => {
+			alive = false;
+		};
 	});
 </script>
 
@@ -53,13 +80,20 @@
 			<p class="reason">{playback.reason}</p>
 		</header>
 
-		{#if playback.directPlay}
+		{#if playable}
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video controls playsinline src={playback.streamUrl}>
 				Your browser cannot play this file directly.
 			</video>
+		{:else if playback.playbackMethod === 'remux' && playback.remuxState === 'failed'}
+			<p class="error" role="alert">
+				{copy.remuxFailed}
+				{#if playback.remuxError}({playback.remuxError}){/if}
+			</p>
+		{:else if playback.playbackMethod === 'remux'}
+			<p class="preparing" role="status">{copy.preparingPlayback}</p>
 		{:else}
-			<p class="error">{copy.playbackFailed}</p>
+			<p class="error">{copy.needsTranscode}</p>
 		{/if}
 	{/if}
 </main>
@@ -98,5 +132,10 @@
 	}
 	.error {
 		color: var(--dusk);
+	}
+	.preparing {
+		font-family: 'Spline Sans Mono', ui-monospace, monospace;
+		font-size: 0.875rem;
+		color: var(--moth-dim);
 	}
 </style>

@@ -115,19 +115,21 @@
 		{#if items.length === 0}
 			<p class="empty">No items yet. Run a scan.</p>
 		{:else}
-			<p class="hint">{copy.phase1Hint}</p>
+			<p class="hint">{copy.badgeHint}</p>
 			<ul class="grid">
 				{#each items as item (item.id)}
 					<li>
 						<a href="/items/{item.id}">
 							<span class="row">
 								<span class="title">{item.title}</span>
-								{#if item.directPlay}
-									<span class="badge ok">browser</span>
-								{:else if item.probeStatus === 'indexed'}
+								{#if item.probeStatus === 'indexed'}
 									<span class="badge">probing…</span>
 								{:else if item.scanError || item.probeStatus === 'error'}
 									<span class="badge bad">probe error</span>
+								{:else if item.playbackMethod === 'directPlay'}
+									<span class="badge ok">browser</span>
+								{:else if item.playbackMethod === 'remux'}
+									<span class="badge">remux</span>
 								{:else}
 									<span class="badge">needs transcode</span>
 								{/if}

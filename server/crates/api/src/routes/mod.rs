@@ -1,4 +1,4 @@
-mod items;
+pub mod items;
 mod libraries;
 
 use crate::state::AppState;
@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/items/{item_id}/playback-info",
             get(items::playback_info),
         )
+        .route("/api/v0/items/{item_id}/remux", post(items::start_remux))
         .route(
             "/api/v0/items/{item_id}/stream",
             get(crate::stream::stream_item),

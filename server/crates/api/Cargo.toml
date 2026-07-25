@@ -23,3 +23,4 @@ tokio-util = { workspace = true }
 nightjar-core = { path = "../core" }
 nightjar-db = { path = "../db" }
 nightjar-scanner = { path = "../scanner" }
+nightjar-transcode = { path = "../transcode" }

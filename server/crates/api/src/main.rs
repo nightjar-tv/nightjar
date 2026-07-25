@@ -25,7 +25,12 @@ async fn main() {
 
     let data_dir = data_dir();
     let db = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
-    let state = AppState::new(db);
+    let remux = nightjar_transcode::RemuxRegistry::new(
+        data_dir.join("cache").join("remux"),
+        remux_cache_cap_bytes(),
+    )
+    .unwrap_or_else(|e| panic!("remux cache: {e}"));
+    let state = AppState::new(db, remux);
     nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
 
     let app = routes::router(state)
@@ -83,6 +88,14 @@ fn data_dir() -> PathBuf {
     std::env::var_os("NIGHTJAR_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("data"))
+}
+
+fn remux_cache_cap_bytes() -> u64 {
+    const DEFAULT: u64 = 10 * 1024 * 1024 * 1024;
+    std::env::var("NIGHTJAR_REMUX_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT)
 }
 
 fn listen_addr() -> SocketAddr {

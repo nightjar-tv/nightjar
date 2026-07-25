@@ -6,3 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
