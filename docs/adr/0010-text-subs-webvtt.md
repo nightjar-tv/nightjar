@@ -107,8 +107,14 @@ measured bottleneck: on a NAS-hosted title, `-c:s webvtt` lagged far behind
 converter (Rule 4.11).
 
 Extraction still shares remux's whole-file-artifact shape: the first request
-pays for a demux of the source, then hits a named cache object. Convergence
-onto range-addressable operations is a candidate, not a plan, and needs
-measured dogfooding evidence to justify. Moving remux onto HLS would not
+pays for a demux of the source, then hits a named cache object. Cache warming
+on remux start is coupled to that whole-file remux model — it races the demux
+against the stream-copy so captions are ready when the MP4 is. If remux
+converges onto sessions, revisit warming; this is the second feature bent
+around whole-file remux (seek-after-complete was the first). A third is a
+decision made late, not another workaround.
+
+Convergence onto range-addressable operations is a candidate, not a plan, and
+needs measured dogfooding evidence to justify. Moving remux onto HLS would not
 reduce extraction cost — the cost is the source demux, not the delivery
 model.
