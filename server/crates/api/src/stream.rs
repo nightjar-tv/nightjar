@@ -63,7 +63,7 @@ pub async fn stream_item(
         PlaybackMethod::Transcode => Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: format!(
-                "item {item_id} needs transcoding, which is not available yet: {}",
+                "item {item_id} needs HLS transcode; POST /api/v0/items/{item_id}/sessions: {}",
                 decision.reason
             ),
         }),

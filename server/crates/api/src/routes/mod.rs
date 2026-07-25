@@ -1,10 +1,11 @@
 pub mod items;
 mod libraries;
+pub mod sessions;
 
 use crate::state::AppState;
 use axum::{
     Json, Router,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Serialize;
 
@@ -28,10 +29,20 @@ pub fn router(state: AppState) -> Router {
             get(items::playback_info),
         )
         .route("/api/v0/items/{item_id}/remux", post(items::start_remux))
+        .route("/api/v0/items/{item_id}/sessions", post(sessions::start))
         .route(
             "/api/v0/items/{item_id}/stream",
             get(crate::stream::stream_item),
         )
+        .route(
+            "/api/v0/sessions/{session_id}/index.m3u8",
+            get(sessions::playlist),
+        )
+        .route(
+            "/api/v0/sessions/{session_id}/{asset}",
+            get(sessions::asset),
+        )
+        .route("/api/v0/sessions/{session_id}", delete(sessions::delete))
         .with_state(state)
 }
 

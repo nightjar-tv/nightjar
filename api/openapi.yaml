@@ -263,13 +263,122 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "415":
-          description: Item needs transcoding, which is not available yet
+          description: Item needs HLS transcode; POST /api/v0/items/{itemId}/sessions
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "416":
           description: Range not satisfiable
+
+  /api/v0/items/{itemId}/sessions:
+    post:
+      operationId: startTranscodeSession
+      summary: Start an HLS software-transcode session for an item
+      description: >
+        ADR-0007. Returns 202 with sessionId and playlistUrl. Concurrent
+        sessions are capped; when full, returns 503 and clients retry.
+        Seek beyond the encoded window is signalled via playlist ?startMs=.
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "202":
+          description: Session started or already running for this request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscodeSession"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: Item does not use the transcode method
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Session cap full; retry shortly
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/index.m3u8:
+    get:
+      operationId: getSessionPlaylist
+      summary: HLS media playlist for a transcode session
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: startMs
+          in: query
+          required: false
+          description: >
+            Seek target in milliseconds. A value different from the session's
+            current encode window restarts FFmpeg at that offset (ADR-0007).
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: HLS playlist
+          content:
+            application/vnd.apple.mpegurl:
+              schema:
+                type: string
+        "404":
+          description: Session not found or playlist not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/{asset}:
+    get:
+      operationId: getSessionAsset
+      summary: HLS init segment or media segment for a session
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: asset
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^(init\.mp4|seg[0-9]+\.m4s)$'
+      responses:
+        "200":
+          description: Segment bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Session or asset not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}:
+    delete:
+      operationId: deleteTranscodeSession
+      summary: Stop a transcode session and reap its FFmpeg process
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "204":
+          description: Stopped (or already gone)
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
 components:
   parameters:
@@ -297,6 +406,13 @@ components:
         type: integer
         format: int64
         minimum: 1
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
 
   schemas:
     Health:
@@ -365,6 +481,19 @@ components:
         reason:
           type: string
           description: Why the job is not running yet, or why it failed
+
+    TranscodeSession:
+      type: object
+      required: [sessionId, itemId, playlistUrl]
+      properties:
+        sessionId:
+          type: string
+        itemId:
+          type: integer
+          format: int64
+        playlistUrl:
+          type: string
+          description: Path to the HLS media playlist for this session
 
     Library:
       type: object
@@ -539,9 +668,14 @@ components:
           description: >
             Present only when the item is playable now: directPlay, or remux
             with remuxState ready.
+        sessionsUrl:
+          type: string
+          description: >
+            Present when playbackMethod is transcode. POST here to start an
+            HLS session (ADR-0007).
         mimeType:
           type: string
-          description: video/mp4 for remux regardless of the source container
+          description: video/mp4 for remux; application/vnd.apple.mpegurl for HLS
         durationMs:
           type: integer
           format: int64

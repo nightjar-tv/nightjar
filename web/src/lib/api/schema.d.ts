@@ -181,6 +181,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/items/{itemId}/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start an HLS software-transcode session for an item
+         * @description ADR-0007. Returns 202 with sessionId and playlistUrl. Concurrent sessions are capped; when full, returns 503 and clients retry. Seek beyond the encoded window is signalled via playlist ?startMs=.
+         */
+        post: operations["startTranscodeSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/index.m3u8": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** HLS media playlist for a transcode session */
+        get: operations["getSessionPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/{asset}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** HLS init segment or media segment for a session */
+        get: operations["getSessionAsset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Stop a transcode session and reap its FFmpeg process */
+        delete: operations["deleteTranscodeSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -221,6 +292,13 @@ export interface components {
             remuxState: components["schemas"]["RemuxState"];
             /** @description Why the job is not running yet, or why it failed */
             reason?: string;
+        };
+        TranscodeSession: {
+            sessionId: string;
+            /** Format: int64 */
+            itemId: number;
+            /** @description Path to the HLS media playlist for this session */
+            playlistUrl: string;
         };
         Library: {
             /** Format: int64 */
@@ -303,7 +381,9 @@ export interface components {
             reason: string;
             /** @description Present only when the item is playable now: directPlay, or remux with remuxState ready. */
             streamUrl?: string;
-            /** @description video/mp4 for remux regardless of the source container */
+            /** @description Present when playbackMethod is transcode. POST here to start an HLS session (ADR-0007). */
+            sessionsUrl?: string;
+            /** @description video/mp4 for remux; application/vnd.apple.mpegurl for HLS */
             mimeType: string;
             /** Format: int64 */
             durationMs?: number | null;
@@ -317,6 +397,7 @@ export interface components {
         LibraryId: number;
         ItemId: number;
         JobId: number;
+        SessionId: string;
     };
     requestBodies: never;
     headers: never;
@@ -676,7 +757,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item needs transcoding, which is not available yet */
+            /** @description Item needs HLS transcode; POST /api/v0/items/{itemId}/sessions */
             415: {
                 headers: {
                     [name: string]: unknown;
@@ -691,6 +772,150 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    startTranscodeSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session started or already running for this request */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscodeSession"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Item does not use the transcode method */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Session cap full; retry shortly */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionPlaylist: {
+        parameters: {
+            query?: {
+                /** @description Seek target in milliseconds. A value different from the session's current encode window restarts FFmpeg at that offset (ADR-0007). */
+                startMs?: number;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS playlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                };
+            };
+            /** @description Session not found or playlist not ready yet */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionAsset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                asset: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Segment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Session or asset not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deleteTranscodeSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stopped (or already gone) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
         };
     };

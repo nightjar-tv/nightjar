@@ -130,6 +130,8 @@
 									<span class="badge ok">browser</span>
 								{:else if item.playbackMethod === 'remux'}
 									<span class="badge ok">remux</span>
+								{:else if item.playbackMethod === 'transcode'}
+									<span class="badge">transcode</span>
 								{:else}
 									<span class="badge">needs transcode</span>
 								{/if}

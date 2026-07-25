@@ -30,7 +30,9 @@ async fn main() {
         remux_cache_cap_bytes(),
     )
     .unwrap_or_else(|e| panic!("remux cache: {e}"));
-    let state = AppState::new(db, remux);
+    let hls = nightjar_transcode::HlsSessionRegistry::new(data_dir.join("cache").join("hls"))
+        .unwrap_or_else(|e| panic!("hls cache: {e}"));
+    let state = AppState::new(db, remux, hls);
     nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
 
     let app = routes::router(state)

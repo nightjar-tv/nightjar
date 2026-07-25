@@ -1,5 +1,9 @@
-//! FFmpeg orchestration. Phase 2 slice one: stream-copy remux sessions to a
-//! capped on-disk cache (ADR-0006). HLS and re-encode arrive later in Phase 2.
+//! FFmpeg orchestration: remux cache (ADR-0006) and HLS transcode sessions
+//! (ADR-0007).
+
+mod hls;
+
+pub use hls::{HlsSessionRegistry, PlaylistError, StartSessionError};
 
 use std::collections::HashMap;
 use std::fs;

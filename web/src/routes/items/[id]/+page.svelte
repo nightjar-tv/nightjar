@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
+	import { attachHls } from '$lib/hlsPlayer';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItem'];
@@ -11,43 +12,99 @@
 	let item = $state<MediaItem | null>(null);
 	let playback = $state<PlaybackInfo | null>(null);
 	let error = $state<string | null>(null);
+	let playlistUrl = $state<string | null>(null);
+	let preparingTranscode = $state(false);
+	let videoEl = $state<HTMLVideoElement | null>(null);
 
 	const itemId = $derived(Number(page.params.id));
 
 	const playable = $derived(
 		playback != null &&
 			(playback.playbackMethod === 'directPlay' ||
-				(playback.playbackMethod === 'remux' && playback.remuxState === 'ready'))
+				(playback.playbackMethod === 'remux' && playback.remuxState === 'ready') ||
+				(playback.playbackMethod === 'transcode' && playlistUrl != null))
 	);
 
 	onMount(() => {
 		let alive = true;
+		let sessionId: string | null = null;
 
 		(async () => {
 			item = await api.getItem(itemId);
 			playback = await api.getPlaybackInfo(itemId);
-			// Remux runs as a background job (ADR-0006): re-POST while slots are
-			// busy (notStarted), poll until ready or failed.
-			while (
-				alive &&
-				playback.playbackMethod === 'remux' &&
-				playback.remuxState !== 'ready' &&
-				playback.remuxState !== 'failed'
-			) {
-				if (playback.remuxState === 'notStarted') {
-					await api.startRemux(itemId);
+
+			if (playback.playbackMethod === 'remux') {
+				while (
+					alive &&
+					playback.remuxState !== 'ready' &&
+					playback.remuxState !== 'failed'
+				) {
+					if (playback.remuxState === 'notStarted') {
+						await api.startRemux(itemId);
+					}
+					await new Promise((r) => setTimeout(r, 400));
+					if (!alive) return;
+					playback = await api.getPlaybackInfo(itemId);
 				}
-				await new Promise((r) => setTimeout(r, 400));
-				if (!alive) return;
-				playback = await api.getPlaybackInfo(itemId);
+				return;
+			}
+
+			if (playback.playbackMethod === 'transcode') {
+				preparingTranscode = true;
+				let started: { sessionId: string; playlistUrl: string } | null = null;
+				for (let attempt = 0; alive && attempt < 30; attempt++) {
+					try {
+						started = await api.startTranscodeSession(itemId);
+						sessionId = started.sessionId;
+						break;
+					} catch (e) {
+						const msg = e instanceof Error ? e.message : String(e);
+						if (msg.includes('retry shortly') || msg.includes('in use')) {
+							await new Promise((r) => setTimeout(r, 400));
+							continue;
+						}
+						throw e;
+					}
+				}
+				if (!started) {
+					preparingTranscode = false;
+					error = copy.transcodeFailed;
+					return;
+				}
+				// Wait until the first playlist bytes exist so native HLS does not fail once.
+				for (let i = 0; alive && i < 100; i++) {
+					const res = await fetch(started.playlistUrl);
+					if (res.ok) {
+						playlistUrl = started.playlistUrl;
+						preparingTranscode = false;
+						return;
+					}
+					await new Promise((r) => setTimeout(r, 200));
+				}
+				preparingTranscode = false;
+				error = copy.transcodeFailed;
 			}
 		})().catch((e: Error) => {
+			preparingTranscode = false;
 			error = e.message;
 		});
 
 		return () => {
 			alive = false;
+			if (sessionId) {
+				void api.deleteTranscodeSession(sessionId);
+			}
 		};
+	});
+
+	$effect(() => {
+		const video = videoEl;
+		const url = playlistUrl;
+		if (!video || !url || playback?.playbackMethod !== 'transcode') {
+			return;
+		}
+		const handle = attachHls(video, url);
+		return () => handle.destroy();
 	});
 </script>
 
@@ -80,7 +137,10 @@
 			<p class="reason">{playback.reason}</p>
 		</header>
 
-		{#if playable}
+		{#if playable && playback.playbackMethod === 'transcode' && playlistUrl}
+			<!-- svelte-ignore a11y_media_has_caption -->
+			<video bind:this={videoEl} controls playsinline></video>
+		{:else if playable && playback.streamUrl}
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video controls playsinline src={playback.streamUrl}>
 				Your browser cannot play this file directly.
@@ -95,8 +155,10 @@
 			</p>
 		{:else if playback.playbackMethod === 'remux'}
 			<p class="preparing" role="status">{copy.preparingPlayback}</p>
-		{:else}
-			<p class="error">{copy.needsTranscode}</p>
+		{:else if preparingTranscode}
+			<p class="preparing" role="status">{copy.preparingTranscode}</p>
+		{:else if playback.playbackMethod === 'transcode'}
+			<p class="error">{copy.transcodeFailed}</p>
 		{/if}
 	{/if}
 </main>

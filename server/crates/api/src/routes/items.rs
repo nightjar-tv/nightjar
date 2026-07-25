@@ -56,6 +56,8 @@ pub struct PlaybackInfoDto {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions_url: Option<String>,
     pub mime_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
@@ -100,21 +102,28 @@ pub async fn playback_info(
     let decision = decide(&row);
 
     let stream_url = format!("/api/v0/items/{item_id}/stream");
-    let (remux_state, remux_error, stream_url) = match decision.method {
-        PlaybackMethod::DirectPlay => (None, None, Some(stream_url)),
-        PlaybackMethod::Transcode => (None, None, None),
+    let (remux_state, remux_error, stream_url, sessions_url, mime_type) = match decision.method {
+        PlaybackMethod::DirectPlay => (None, None, Some(stream_url), None, decision.mime_type),
+        PlaybackMethod::Transcode => (
+            None,
+            None,
+            None,
+            Some(format!("/api/v0/items/{item_id}/sessions")),
+            "application/vnd.apple.mpegurl".into(),
+        ),
         PlaybackMethod::Remux => {
             let registry = Arc::clone(&state.remux);
             let key = remux_key(&row);
             let status = tokio::task::spawn_blocking(move || registry.status(&key))
                 .await
                 .map_err(|e| ApiError::internal(format!("remux status task: {e}")))?;
-            match status {
+            let (state_s, err, url) = match status {
                 RemuxState::Ready => (Some("ready"), None, Some(stream_url)),
                 RemuxState::Preparing => (Some("preparing"), None, None),
                 RemuxState::NotStarted { reason } => (Some("notStarted"), reason, None),
                 RemuxState::Failed(e) => (Some("failed"), Some(e), None),
-            }
+            };
+            (state_s, err, url, None, decision.mime_type)
         }
     };
 
@@ -125,7 +134,8 @@ pub async fn playback_info(
         remux_error,
         reason: decision.reason,
         stream_url,
-        mime_type: decision.mime_type,
+        sessions_url,
+        mime_type,
         duration_ms: row.duration_ms,
         container: row.container,
         video_codec: row.video_codec,

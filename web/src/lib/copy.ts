@@ -6,10 +6,10 @@ export const copy = {
 	emptyLibraryHint: 'Add a media folder and Nightjar will take care of the rest.',
 	addFolder: 'Add folder',
 	preparingPlayback: 'Preparing playback. Large files can take a few minutes.',
+	preparingTranscode: 'Starting transcode session…',
 	remuxFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
-	needsTranscode:
-		"This file needs transcoding, which isn't built yet. It will play in a later release.",
+	transcodeFailed: "This file couldn't be transcoded. Check the logs for the file details.",
 	badgeHint:
-		'Badges: browser plays directly, remux is prepared on first play, needs transcode waits for a later release. Embedded subtitles are not shown yet for remuxed files.',
+		'Badges: browser plays directly, remux is prepared on first play, transcode starts when you open the item. Embedded subtitles are not shown yet for remuxed files.',
 	remuxSubtitleNote: 'Subtitles embedded in this file are not shown yet. Subtitle support is next.'
 } as const;
