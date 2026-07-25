@@ -7,6 +7,8 @@ export const copy = {
 	addFolder: 'Add folder',
 	preparingPlayback: 'Preparing playback. Large files can take a few minutes.',
 	preparingTranscode: 'Starting transcode session…',
+	sessionsBusy:
+		'All transcode sessions are in use. Close another player tab and try again.',
 	remuxFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
 	transcodeFailed: "This file couldn't be transcoded. Check the logs for the file details.",
 	badgeHint:

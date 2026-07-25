@@ -18,11 +18,13 @@ on long titles.
    slice. Unifying remux onto HLS sessions is a candidate once sessions are
    proven; it is not done here (two risks in one PR).
 2. **Session API.** `POST /api/v0/items/{itemId}/sessions` returns 202 with
-   `sessionId` and `playlistUrl`. Clients fetch
+   `sessionId` and `playlistUrl`. A second POST for the same item reuses the
+   live session (refcount++) so two browsers do not burn two slots on one
+   title. `DELETE` decrements the refcount and only reaps FFmpeg when it hits
+   zero. Idle timeout still force-reaps abandoned sessions. Clients fetch
    `GET /api/v0/sessions/{sessionId}/index.m3u8` and the init/segment files it
-   references. `DELETE /api/v0/sessions/{sessionId}` stops the session.
-   Playback-info for transcode exposes `sessionsUrl` (the POST target).
-   `streamUrl` remains for byte streams only (direct play and remux).
+   references. Playback-info for transcode exposes `sessionsUrl` (the POST
+   target). `streamUrl` remains for byte streams only (direct play and remux).
 3. **Lifecycle (Gate 2: no orphaned FFmpeg).** Concurrent sessions are hard-capped
    (default 3). Idle timeout: no playlist or segment request for 60 seconds
    kills FFmpeg and deletes the session directory. Explicit DELETE on player

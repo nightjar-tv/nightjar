@@ -52,7 +52,7 @@
 			if (playback.playbackMethod === 'transcode') {
 				preparingTranscode = true;
 				let started: { sessionId: string; playlistUrl: string } | null = null;
-				for (let attempt = 0; alive && attempt < 30; attempt++) {
+				for (let attempt = 0; alive && attempt < 5; attempt++) {
 					try {
 						started = await api.startTranscodeSession(itemId);
 						sessionId = started.sessionId;
@@ -60,7 +60,7 @@
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
 						if (msg.includes('retry shortly') || msg.includes('in use')) {
-							await new Promise((r) => setTimeout(r, 400));
+							await new Promise((r) => setTimeout(r, 1000));
 							continue;
 						}
 						throw e;
@@ -68,7 +68,7 @@
 				}
 				if (!started) {
 					preparingTranscode = false;
-					error = copy.transcodeFailed;
+					error = copy.sessionsBusy;
 					return;
 				}
 				// Wait until the first playlist bytes exist so native HLS does not fail once.

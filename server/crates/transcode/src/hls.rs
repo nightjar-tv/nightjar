@@ -41,6 +41,8 @@ struct Session {
     child: Option<Child>,
     last_access: Instant,
     failed: Option<String>,
+    /// Open players. DELETE decrements; FFmpeg is reaped only at zero (or idle).
+    refs: usize,
 }
 
 impl HlsSessionRegistry {
@@ -81,11 +83,31 @@ impl HlsSessionRegistry {
         Ok(registry)
     }
 
+    /// Starts a session or reuses the live one for this item (ADR-0007).
+    /// Multiple browsers share one encode; DELETE only reaps when the last
+    /// holder releases.
     pub fn start(&self, item_id: i64, src: &Path) -> Result<String, StartSessionError> {
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
+
+        if let Some((id, session)) = sessions
+            .iter_mut()
+            .find(|(_, s)| s.item_id == item_id && s.failed.is_none())
+            .map(|(id, s)| (id.clone(), s))
+        {
+            session.refs += 1;
+            session.last_access = Instant::now();
+            tracing::info!(
+                session_id = %id,
+                item_id,
+                refs = session.refs,
+                "hls session reused"
+            );
+            return Ok(id);
+        }
+
         if sessions.len() >= self.max_sessions {
             return Err(StartSessionError::CapFull);
         }
@@ -107,6 +129,7 @@ impl HlsSessionRegistry {
                 child: Some(child),
                 last_access: Instant::now(),
                 failed: None,
+                refs: 1,
             },
         );
         tracing::info!(session_id = %id, item_id, "hls session started");
@@ -190,9 +213,20 @@ impl HlsSessionRegistry {
             Ok(g) => g,
             Err(_) => return false,
         };
-        let Some(mut session) = sessions.remove(session_id) else {
+        let Some(session) = sessions.get_mut(session_id) else {
             return false;
         };
+        session.refs = session.refs.saturating_sub(1);
+        session.last_access = Instant::now();
+        if session.refs > 0 {
+            tracing::info!(
+                session_id,
+                refs = session.refs,
+                "hls session release; still in use"
+            );
+            return true;
+        }
+        let mut session = sessions.remove(session_id).expect("just checked");
         stop_child(&mut session.child);
         if let Err(e) = fs::remove_dir_all(&session.dir) {
             tracing::warn!(
@@ -205,6 +239,8 @@ impl HlsSessionRegistry {
         true
     }
 
+    /// Idle and failed sessions are fully reaped regardless of refcount —
+    /// clients that vanished without DELETE would otherwise pin the cap forever.
     fn reaper_loop(&self) {
         loop {
             std::thread::sleep(REAPER_TICK);
@@ -214,15 +250,27 @@ impl HlsSessionRegistry {
                 };
                 sessions
                     .iter()
-                    .filter(|(_, s)| s.last_access.elapsed() > IDLE_TIMEOUT)
+                    .filter(|(_, s)| s.last_access.elapsed() > IDLE_TIMEOUT || s.failed.is_some())
                     .map(|(id, _)| id.clone())
                     .collect()
             };
             for id in stale {
-                tracing::info!(session_id = %id, "hls session idle timeout");
-                self.stop(&id);
+                tracing::info!(session_id = %id, "hls session idle or failed reap");
+                self.force_stop(&id);
             }
         }
+    }
+
+    fn force_stop(&self, session_id: &str) {
+        let mut sessions = match self.sessions.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(mut session) = sessions.remove(session_id) else {
+            return;
+        };
+        stop_child(&mut session.child);
+        let _ = fs::remove_dir_all(&session.dir);
     }
 }
 
@@ -403,6 +451,34 @@ mod tests {
         assert!(text.contains("init.mp4") || text.contains(".m4s"), "{text}");
         assert!(reg.stop(&id));
         assert!(matches!(reg.playlist(&id, 0), Err(PlaylistError::NotFound)));
+    }
+
+    #[test]
+    fn reuse_same_item_shares_session_until_last_release() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture(&src);
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1).unwrap();
+        let a = reg.start(1, &src).unwrap();
+        let b = reg.start(1, &src).unwrap();
+        assert_eq!(a, b, "second start must reuse");
+        // Cap is 1; a different item must fail while this session lives.
+        assert!(matches!(
+            reg.start(2, &src),
+            Err(StartSessionError::CapFull)
+        ));
+        assert!(reg.stop(&a));
+        wait_playlist(&reg, &a); // still alive after one release
+        assert!(reg.stop(&a));
+        assert!(matches!(reg.playlist(&a, 0), Err(PlaylistError::NotFound)));
+        // Slot free again.
+        let c = reg.start(2, &src).unwrap();
+        assert_ne!(c, a);
+        reg.stop(&c);
     }
 
     #[test]
