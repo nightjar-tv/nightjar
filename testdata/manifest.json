@@ -1,4 +1,134 @@
 {
   "version": 1,
-  "files": []
+  "license_policy": "FFmpeg-generated or explicitly licensed only (ENGINEERING_RULES Rule 4.3). Never commercial media.",
+  "generate": "testdata/generate.sh",
+  "files": [
+    {
+      "path": "files/h264_aac_mp4.mp4",
+      "tags": ["h264", "aac", "mp4", "phase1-direct"],
+      "expect": "browser direct play"
+    },
+    {
+      "path": "files/h264_ac3_mp4.mp4",
+      "tags": ["h264", "ac3", "mp4"],
+      "expect": "needs transcode (AC3)"
+    },
+    {
+      "path": "files/h264_aac_mkv.mkv",
+      "tags": ["h264", "aac", "mkv"],
+      "expect": "needs transcode (container)"
+    },
+    {
+      "path": "files/hevc_aac_mp4.mp4",
+      "tags": ["hevc", "aac", "mp4"],
+      "expect": "needs transcode (HEVC)"
+    },
+    {
+      "path": "files/hevc10_aac_mp4.mp4",
+      "tags": ["hevc", "10bit", "aac", "mp4"],
+      "expect": "needs transcode (10-bit HEVC)"
+    },
+    {
+      "path": "files/av1_aac_mp4.mp4",
+      "tags": ["av1", "aac", "mp4"],
+      "expect": "needs transcode (AV1)"
+    },
+    {
+      "path": "files/mpeg2_interlaced.ts",
+      "tags": ["mpeg2", "interlaced"],
+      "expect": "needs transcode or structured probe"
+    },
+    {
+      "path": "files/h264_aac_ass_mkv.mkv",
+      "tags": ["ass", "subs", "mkv"],
+      "expect": "needs transcode; ASS present"
+    },
+    {
+      "path": "files/h264_aac_srt_mkv.mkv",
+      "tags": ["srt", "subs", "mkv"],
+      "expect": "needs transcode; SRT present"
+    },
+    {
+      "path": "files/h264_aac_pgs_mkv.mkv",
+      "tags": ["pgs", "image-subs", "mkv"],
+      "expect": "needs transcode; hdmv_pgs_subtitle track present"
+    },
+    {
+      "path": "files/h264_aac_71_mp4.mp4",
+      "tags": ["aac", "7.1", "mp4"],
+      "expect": "direct play per Phase 1 whitelist (AAC); channel layout may still be awkward in browsers"
+    },
+    {
+      "path": "files/h264_eac3_mp4.mp4",
+      "tags": ["eac3", "mp4"],
+      "expect": "needs transcode (E-AC3)"
+    },
+    {
+      "path": "files/h264_aac_vfr_mp4.mp4",
+      "tags": ["vfr", "h264", "aac"],
+      "expect": "direct play if probed as h264/aac/mp4"
+    },
+    {
+      "path": "files/broken_moov.mp4",
+      "tags": ["broken-moov", "hostile"],
+      "expect": "structured scan_error; no crash"
+    },
+    {
+      "path": "files/vp9_opus_webm.webm",
+      "tags": ["vp9", "opus", "webm"],
+      "expect": "needs transcode"
+    },
+    {
+      "path": "files/h264_aac_mov.mov",
+      "tags": ["h264", "aac", "mov"],
+      "expect": "direct play (mov in mp4 family)"
+    },
+    {
+      "path": "files/h264_mp3_mp4.mp4",
+      "tags": ["h264", "mp3", "mp4"],
+      "expect": "needs transcode (MP3 not on AAC whitelist)"
+    },
+    {
+      "path": "files/h264_aac_32k_mp4.mp4",
+      "tags": ["aac", "32000hz"],
+      "expect": "direct play per whitelist"
+    },
+    {
+      "path": "files/h264_aac_mono_mp4.mp4",
+      "tags": ["aac", "mono"],
+      "expect": "direct play per whitelist"
+    },
+    {
+      "path": "files/mpeg4_mp2_avi.avi",
+      "tags": ["mpeg4", "avi"],
+      "expect": "needs transcode"
+    },
+    {
+      "path": "files/hevc_hdr10_mp4.mp4",
+      "tags": ["hevc", "hdr10", "pq", "bt2020"],
+      "expect": "needs transcode; HDR10 metadata present"
+    },
+    {
+      "path": "files/large-range-trigger.mp4",
+      "tags": ["h264", "aac", "range", "generated"],
+      "expect": "open-ended Range streams without buffering whole file",
+      "commit": false,
+      "note": "Produced by generate.sh; gitignored via large-*. Multi-GB variant: LARGE=1."
+    },
+    {
+      "path": "files/large-over-4gb.mp4",
+      "tags": ["h264", "aac", "over-4gb", "offsets"],
+      "expect": "probe OK; Range past 4GiB uses 64-bit offsets; needs OVER4GB=1 to generate",
+      "commit": false,
+      "note": "Valid moov at start, sparse-extended past 4 GiB. Catches 32-bit offset bugs."
+    },
+    {
+      "path": null,
+      "id": "dolby_vision_profile_8",
+      "tags": ["dolby-vision", "profile-8"],
+      "expect": "needs transcode once sourced",
+      "status": "pending source",
+      "note": "Hard to synthesize cleanly. Park until an explicitly licensed DV P8 clip is obtained (Rule 4.3)."
+    }
+  ]
 }

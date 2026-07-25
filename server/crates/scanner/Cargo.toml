@@ -6,3 +6,14 @@ license.workspace = true
 publish = false
 
 [dependencies]
+nightjar-core = { path = "../core" }
+nightjar-db = { path = "../db" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing.workspace = true
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+nightjar-db = { path = "../db" }
