@@ -171,8 +171,12 @@ pub async fn playback_info(
 
 pub async fn subtitle_vtt(
     State(state): State<AppState>,
-    Path((item_id, stream_index)): Path<(i64, u32)>,
+    Path((item_id, asset)): Path<(i64, String)>,
 ) -> ApiResult<Response> {
+    let stream_index = asset
+        .strip_suffix(".vtt")
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?;
     let row = state
         .db
         .get_item(item_id)

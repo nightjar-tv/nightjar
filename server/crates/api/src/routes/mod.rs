@@ -34,7 +34,7 @@ pub fn router(state: AppState) -> Router {
             get(items::playback_info),
         )
         .route(
-            "/api/v0/items/{item_id}/subtitles/{stream_index}.vtt",
+            "/api/v0/items/{item_id}/subtitles/{asset}",
             get(items::subtitle_vtt),
         )
         .route("/api/v0/items/{item_id}/remux", post(items::start_remux))
