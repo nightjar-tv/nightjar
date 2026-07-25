@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_MAX_SESSIONS: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
+/// Locked HLS segment duration (ADR-0008). Future renditions must match this
+/// value and the matching forced-keyframe interval.
 const SEGMENT_MS: u64 = 2000;
 const SEGMENT_WAIT: Duration = Duration::from_secs(15);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
@@ -469,22 +471,26 @@ fn segment_index(name: &str) -> Option<u64> {
 
 /// Static VOD playlist for the full title. Players get the real duration and
 /// a working scrubber; the encoder fills segments in behind it and `asset`
-/// waits for stragglers. EXTINF is the nominal 2s cadence; fMP4 timestamps
-/// carry the exact timing.
+/// waits for stragglers. EXTINF follows SEGMENT_MS; fMP4 timestamps carry the
+/// exact timing.
 fn build_playlist(duration_ms: u64) -> Vec<u8> {
     use std::fmt::Write;
     let full = duration_ms / SEGMENT_MS;
     let rem_ms = duration_ms % SEGMENT_MS;
-    let mut out = String::from(
+    let segment_secs = SEGMENT_MS as f64 / 1000.0;
+    // TARGETDURATION is an integer number of seconds (HLS); ceil so a
+    // non-whole SEGMENT_MS still validates.
+    let target = segment_secs.ceil() as u64;
+    let mut out = format!(
         "#EXTM3U\n\
          #EXT-X-VERSION:7\n\
-         #EXT-X-TARGETDURATION:2\n\
+         #EXT-X-TARGETDURATION:{target}\n\
          #EXT-X-PLAYLIST-TYPE:VOD\n\
          #EXT-X-MEDIA-SEQUENCE:0\n\
-         #EXT-X-MAP:URI=\"init.mp4\"\n",
+         #EXT-X-MAP:URI=\"init.mp4\"\n"
     );
     for i in 0..full {
-        let _ = writeln!(out, "#EXTINF:2.000000,\n{}", segment_name(i));
+        let _ = writeln!(out, "#EXTINF:{segment_secs:.6},\n{}", segment_name(i));
     }
     if rem_ms > 0 {
         let _ = writeln!(
@@ -501,6 +507,9 @@ fn build_playlist(duration_ms: u64) -> Vec<u8> {
 fn spawn_ffmpeg(src: &Path, dir: &Path, start_ms: u64) -> Result<Child, String> {
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
     let start_number = (start_ms / SEGMENT_MS).to_string();
+    let segment_secs = SEGMENT_MS as f64 / 1000.0;
+    let force_kf = format!("expr:gte(t,n_forced*{segment_secs})");
+    let hls_time = format!("{segment_secs}");
     let mut cmd = Command::new("ffmpeg");
     cmd.current_dir(dir)
         .stdin(Stdio::null())
@@ -529,10 +538,16 @@ fn spawn_ffmpeg(src: &Path, dir: &Path, start_ms: u64) -> Result<Child, String> 
         "veryfast",
         "-pix_fmt",
         "yuv420p",
-        // Fixed 2s GOP so hls_time=2 cuts on keyframes. force_key_frames
-        // expressions have been flaky with fMP4 on some FFmpeg builds.
+        // Time-based IDRs derived from SEGMENT_MS (same source as -hls_time and
+        // the generated playlist EXTINF). A frame-count -g alone is only 2s at
+        // 24 fps; at 60 fps it splits every 0.8s (ADR-0008).
+        "-force_key_frames",
+        force_kf.as_str(),
+        // Ceiling only; force_key_frames owns the cadence. Keep this large
+        // enough that high-fps sources still hit the SEGMENT_MS wall first.
+        // Scenecut off so FFmpeg cannot insert unaligned IDRs.
         "-g",
-        "48",
+        "600",
         "-keyint_min",
         "48",
         "-sc_threshold",
@@ -546,7 +561,7 @@ fn spawn_ffmpeg(src: &Path, dir: &Path, start_ms: u64) -> Result<Child, String> 
         "-f",
         "hls",
         "-hls_time",
-        "2",
+        hls_time.as_str(),
         "-hls_list_size",
         "0",
         "-hls_flags",
@@ -918,5 +933,129 @@ mod tests {
         assert!(!is_safe_asset("../etc/passwd"));
         assert_eq!(segment_index("seg042.m4s"), Some(42));
         assert_eq!(segment_index("init.mp4"), None);
+    }
+
+    /// Keyframe PTS must land on SEGMENT_MS boundaries regardless of source
+    /// frame rate. A frame-count -g fails this at 60 fps and on VFR.
+    #[test]
+    fn keyframes_align_to_segment_duration() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fps60 = dir.path().join("60fps.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=60:duration=6",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                fps60.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "60fps fixture encode failed");
+
+        let vfr = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_vfr_mp4.mp4");
+        let cases: &[(&str, &Path)] = &[("60fps", fps60.as_path()), ("vfr", vfr.as_path())];
+
+        for (name, src) in cases {
+            if !src.exists() {
+                eprintln!("skipping {name}: missing {}", src.display());
+                continue;
+            }
+            let enc = dir.path().join(name);
+            fs::create_dir_all(&enc).unwrap();
+            let mut child = spawn_ffmpeg(src, &enc, 0).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            stop_child(&mut Some(child));
+            assert!(
+                enc.join("index.m3u8").exists(),
+                "{name}: ffmpeg playlist missing"
+            );
+            assert!(
+                enc.join("seg000.m4s").exists(),
+                "{name}: expected at least seg000.m4s"
+            );
+
+            let joined = dir.path().join(format!("{name}-joined.mp4"));
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+                .arg(enc.join("index.m3u8"))
+                .args(["-c", "copy"])
+                .arg(&joined)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}: remux from HLS failed");
+
+            let out = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=key_frame,pts_time",
+                    "-of",
+                    "csv=p=0",
+                ])
+                .arg(&joined)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{name}: ffprobe failed");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let key_pts: Vec<f64> = text
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.split(',');
+                    let key = parts.next()?;
+                    let pts = parts.next()?;
+                    if key == "1" { pts.parse().ok() } else { None }
+                })
+                .collect();
+            assert!(!key_pts.is_empty(), "{name}: no keyframes\n{text}");
+
+            let segment_s = SEGMENT_MS as f64 / 1000.0;
+            for pts in &key_pts {
+                let nearest = (pts / segment_s).round() * segment_s;
+                assert!(
+                    (pts - nearest).abs() < 0.05,
+                    "{name}: keyframe at {pts} not on a {segment_s}s boundary ({key_pts:?})"
+                );
+            }
+            assert!(
+                key_pts.iter().any(|p| (*p - 0.0).abs() < 0.05),
+                "{name}: missing IDR at 0 ({key_pts:?})"
+            );
+            assert!(
+                key_pts.iter().any(|p| (*p - segment_s).abs() < 0.05),
+                "{name}: missing IDR at {segment_s}s ({key_pts:?})"
+            );
+        }
     }
 }

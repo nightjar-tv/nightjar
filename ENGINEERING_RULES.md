@@ -45,6 +45,8 @@ This document governs all humans and LLMs contributing to this project. When in 
 **Rule 4.5 — Delete before you add.** PRs that add a feature should identify what complexity they remove or why net complexity is justified.
 **Rule 4.6 — Dogfooding is mandatory.** Main branch runs as the team's real household media server. If you won't run it at home, don't merge it.
 **Rule 4.7 — No speculative abstraction.** No traits, generics, or config options for hypothetical future needs. Abstract on the second concrete use case, not the first.
+**Rule 4.8 — Incomplete, never provisional.** Ship a finished slice or do not merge it. Do not land half-built behaviour behind a "provisional", "temporary", or "good enough for now" label that quietly becomes permanent.
+**Rule 4.9 — Data shapes before writers.** Any on-disk or on-wire shape that is expensive to change (segment duration, keyframe cadence, cache keys, schema columns, URL paths that clients bookmark) is decided in an ADR before the code that writes it. Illustration: a frame-count `-g 48` looked like a 2-second GOP until a 60 fps source made segments 0.8s; locking a time-based interval in ADR-0008 is the kind of decision this rule requires up front.
 
 ## 5. LLM-Specific Rules
 
