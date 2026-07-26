@@ -19,9 +19,20 @@ const REAPER_TICK: Duration = Duration::from_secs(5);
 const SEGMENT_MS: u64 = 2000;
 const SEGMENT_WAIT: Duration = Duration::from_secs(15);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
-/// How far ahead of the latest on-disk segment a request may be before we
-/// treat it as a scrub that needs a window move.
+/// Safari's sequential prefetch reaches two segments beyond the current
+/// on-disk frontier; farther requests are treated as a scrub.
 const CATCH_UP_SEGMENTS: u64 = 2;
+/// Safari retried refused segments at one-second intervals. A two-second floor
+/// prevents adjacent prefetch misses from repeatedly moving the encode window.
+const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// Maximum unprimed window move. Sixteen segments accepts Safari's measured
+/// eight-segment EXT-X-START dig-back with margin while rejecting seg000-class
+/// attach prefetch hundreds of segments behind a mid-title window.
+const ALIGN_BEHIND_SEGMENTS: u64 = 16;
+/// Safari requested eight segments before EXT-X-START when switching tracks.
+/// Encoding exactly that span early serves its first request without making
+/// each seek transcode the former 16-segment margin before first frame.
+const ENCODE_LEAD_SEGMENTS: u64 = 8;
 
 #[derive(Debug)]
 pub enum StartSessionError {
@@ -65,7 +76,7 @@ impl AudioSelection {
     }
 }
 
-/// Pure window-move decision for a playlist/segment seek intent.
+/// Pure window-move decision for an explicit playlist `?startMs=` seek.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowAction {
     /// Target on disk, or already cooking at this window — serve/wait.
@@ -84,6 +95,61 @@ pub fn decide_window_action(
         WindowAction::Serve
     } else {
         WindowAction::Restart
+    }
+}
+
+/// What to do when a segment is missing from disk (ADR-0011 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentMissAction {
+    /// In-window cooking, restart suppressed, or too soon since last restart.
+    Wait,
+    /// Move the encode window to the requested index.
+    Restart,
+}
+
+/// Deliberate restart policy for cold regions of a full-title VOD playlist.
+///
+/// - Behind the window: always restart once the session is `primed` (a real
+///   scrub back). Before that, follow only within `ALIGN_BEHIND_SEGMENTS` —
+///   the player settling near EXT-X-START — so attach prefetch of `seg000`
+///   cannot yank a mid-title encode back to zero, while a start segment a
+///   few behind the window still converges instead of deadlocking.
+/// - Ahead: restart only past `CATCH_UP_SEGMENTS` of the cooking band end.
+///   The band end is `max(frontier, play_start_idx)` so encode lead-in
+///   (window starts before `#EXT-X-START`) does not treat land-point
+///   prefetch as a forward scrub and thrash-restart every 2s. Frontier is
+///   still the latest on-disk segment **at or after** the window start;
+///   retained pre-window segments must not count.
+/// - Either way: respect `RESTART_MIN_INTERVAL`.
+pub fn decide_segment_miss(
+    idx: u64,
+    window_start_idx: u64,
+    play_start_idx: u64,
+    latest_on_disk: Option<u64>,
+    primed: bool,
+    since_last_restart: Duration,
+) -> SegmentMissAction {
+    if since_last_restart < RESTART_MIN_INTERVAL {
+        return SegmentMissAction::Wait;
+    }
+    if idx < window_start_idx {
+        let behind = window_start_idx - idx;
+        return if primed || behind <= ALIGN_BEHIND_SEGMENTS {
+            SegmentMissAction::Restart
+        } else {
+            SegmentMissAction::Wait
+        };
+    }
+    let frontier = latest_on_disk
+        .filter(|&l| l >= window_start_idx)
+        .unwrap_or(window_start_idx);
+    // Lead-in encodes before play_start; requests near EXT-X-START are still
+    // in the cooking band, not a scrub past the land point.
+    let band_end = frontier.max(play_start_idx);
+    if idx > band_end.saturating_add(CATCH_UP_SEGMENTS) {
+        SegmentMissAction::Restart
+    } else {
+        SegmentMissAction::Wait
     }
 }
 
@@ -116,10 +182,18 @@ struct Session {
     audio: AudioSelection,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
+    /// Encode window start (may lead `play_start_ms` so a client that
+    /// digs a few segments behind EXT-X-START still lands in-window).
     start_ms: u64,
+    /// Client land point for `#EXT-X-START` / seek intent.
+    play_start_ms: u64,
     duration_ms: u64,
     child: Option<Child>,
     last_access: Instant,
+    /// Last encode-window restart (create counts as one) for the min-interval guard.
+    last_restart: Instant,
+    /// True after serving at least one segment at or past encode `start_ms`.
+    primed: bool,
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
@@ -185,7 +259,8 @@ impl HlsSessionRegistry {
         audio: AudioSelection,
         subtitle_tracks: Vec<HlsSubtitleTrack>,
     ) -> Result<String, StartSessionError> {
-        let start_ms = align_to_segment(start_ms);
+        let play_start_ms = align_to_segment(start_ms);
+        let start_ms = encode_start_ms(play_start_ms);
         let mut sessions = self
             .sessions
             .lock()
@@ -199,12 +274,20 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&dir).map_err(|e| {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
-        let child = spawn_ffmpeg(src, &dir, start_ms, mode, audio.clone(), &self.video_encoder)
-            .map_err(StartSessionError::Spawn)?;
+        let child = spawn_ffmpeg(
+            src,
+            &dir,
+            start_ms,
+            mode,
+            audio.clone(),
+            &self.video_encoder,
+        )
+        .map_err(StartSessionError::Spawn)?;
         tracing::info!(
             session_id = %id,
             item_id,
             start_ms,
+            play_start_ms,
             mode = ?mode,
             audio_stream = ?audio.stream_index,
             audio_channels = audio.channels,
@@ -221,9 +304,12 @@ impl HlsSessionRegistry {
                 audio,
                 video_encoder: self.video_encoder.clone(),
                 start_ms,
+                play_start_ms,
                 duration_ms,
                 child: Some(child),
                 last_access: Instant::now(),
+                last_restart: Instant::now(),
+                primed: false,
                 failed: None,
                 subtitle_tracks,
             },
@@ -266,7 +352,7 @@ impl HlsSessionRegistry {
         start_ms: Option<u64>,
     ) -> Result<Vec<u8>, PlaylistError> {
         self.with_ready_session(session_id, start_ms, |session| {
-            Ok(build_playlist(session.duration_ms, session.start_ms))
+            Ok(build_playlist(session.duration_ms, session.play_start_ms))
         })
     }
 
@@ -338,7 +424,7 @@ impl HlsSessionRegistry {
                 .dir
                 .join(segment_name(aligned / SEGMENT_MS))
                 .exists();
-            match decide_window_action(aligned, session.start_ms, on_disk) {
+            match decide_window_action(aligned, session.play_start_ms, on_disk) {
                 WindowAction::Serve => {}
                 WindowAction::Restart => {
                     let encoder = session.video_encoder.clone();
@@ -359,8 +445,9 @@ impl HlsSessionRegistry {
     }
 
     /// Serves init/segment files. Retained segments from a previous encode
-    /// window stay readable. A request far ahead of what is on disk restarts
-    /// the window. Safari native scrub hits this path only.
+    /// window stay readable. Missing segments in a cold region of the
+    /// full-title VOD return 503 while a guarded restart cooks them
+    /// (ADR-0011 amendment). Safari native scrub often hits this path only.
     pub fn asset(&self, session_id: &str, name: &str) -> Result<Vec<u8>, PlaylistError> {
         if !is_safe_asset(name) {
             return Err(PlaylistError::NotFound);
@@ -385,6 +472,11 @@ impl HlsSessionRegistry {
                 }
                 // Retained prior-window segments are served immediately.
                 if let Ok(bytes) = fs::read(session.dir.join(&file_name)) {
+                    if let Some(idx) = requested
+                        && idx >= session.start_ms / SEGMENT_MS
+                    {
+                        session.primed = true;
+                    }
                     return Ok(bytes);
                 }
                 if let Some(err) = note_child_exit(session) {
@@ -393,27 +485,39 @@ impl HlsSessionRegistry {
                 if file_name == "init.mp4" {
                     // Rewritten on restart; wait for the new init.
                 } else if let Some(idx) = requested {
-                    let latest = latest_segment_index(&session.dir);
-                    let far_ahead = match latest {
-                        Some(l) => idx > l.saturating_add(CATCH_UP_SEGMENTS),
-                        None => idx > session.start_ms / SEGMENT_MS + CATCH_UP_SEGMENTS,
-                    };
-                    if far_ahead {
-                        let want_ms = idx * SEGMENT_MS;
-                        let on_disk = false;
-                        match decide_window_action(want_ms, session.start_ms, on_disk) {
-                            WindowAction::Restart => {
+                    let window_start = session.start_ms / SEGMENT_MS;
+                    let play_start = session.play_start_ms / SEGMENT_MS;
+                    let latest = latest_segment_in_window(&session.dir, window_start);
+                    let since = session.last_restart.elapsed();
+                    match decide_segment_miss(
+                        idx,
+                        window_start,
+                        play_start,
+                        latest,
+                        session.primed,
+                        since,
+                    ) {
+                        SegmentMissAction::Restart => {
+                            let want_ms = idx * SEGMENT_MS;
+                            // Same encode window is a no-op that only kills
+                            // the cooking encoder (the retained-frontier bug).
+                            if encode_start_ms(want_ms) != session.start_ms {
                                 let encoder = session.video_encoder.clone();
                                 restart_at(session, want_ms, &encoder)?;
                                 deadline = Instant::now() + SEGMENT_WAIT;
                             }
-                            WindowAction::Serve => {}
                         }
-                    } else if session.child.is_none() && idx < session.start_ms / SEGMENT_MS {
-                        // Before the current window and not retained on disk.
-                        return Err(PlaylistError::NotFound);
-                    } else if session.child.is_none() {
-                        return Err(PlaylistError::NotFound);
+                        SegmentMissAction::Wait => {
+                            if session.child.is_none() {
+                                return Err(PlaylistError::NotFound);
+                            }
+                            // Attach prefetch of pre-window indices must not
+                            // burn SEGMENT_WAIT; 503 immediately so the client
+                            // can fetch the EXT-X-START region instead.
+                            if idx < window_start && !session.primed {
+                                return Err(PlaylistError::NotReady);
+                            }
+                        }
                     }
                 }
             }
@@ -507,9 +611,11 @@ impl EncoderKind {
 
 fn restart_at(
     session: &mut Session,
-    start_ms: u64,
+    play_ms: u64,
     video_encoder: &str,
 ) -> Result<(), PlaylistError> {
+    let play_start_ms = align_to_segment(play_ms);
+    let start_ms = encode_start_ms(play_start_ms);
     stop_child(&mut session.child);
     // Gate 2: do not wipe the prior encode window. In-flight segment fetches
     // (seg1127…) must still hit disk while the new window is cooking. Only
@@ -527,9 +633,13 @@ fn restart_at(
     .map_err(PlaylistError::Failed)?;
     session.child = Some(child);
     session.start_ms = start_ms;
+    session.play_start_ms = play_start_ms;
     session.failed = None;
+    session.last_restart = Instant::now();
+    session.primed = false;
     tracing::info!(
         start_ms,
+        play_start_ms,
         encoder = video_encoder,
         path = %session.src.display(),
         "hls session seek restart"
@@ -563,12 +673,22 @@ fn align_to_segment(ms: u64) -> u64 {
     (ms / SEGMENT_MS) * SEGMENT_MS
 }
 
+/// Encode a little earlier than the play land point so a client that
+/// requests a few segments behind `#EXT-X-START` (Safari near-start
+/// alignment) hits the cooking window instead of a behind-window miss.
+fn encode_start_ms(play_ms: u64) -> u64 {
+    align_to_segment(play_ms.saturating_sub(ENCODE_LEAD_SEGMENTS * SEGMENT_MS))
+}
+
 fn segment_name(index: u64) -> String {
     format!("seg{index:03}.m4s")
 }
 
-/// Highest `segNNN.m4s` index present in `dir`, if any.
-fn latest_segment_index(dir: &Path) -> Option<u64> {
+/// Highest `segNNN.m4s` index at or after `window_start` in `dir`.
+/// Retained segments from an earlier encode window must not count as the
+/// live frontier: otherwise an in-window miss looks far-ahead of those
+/// stale indices and restarts at the same offset forever.
+fn latest_segment_in_window(dir: &Path, window_start: u64) -> Option<u64> {
     let mut best: Option<u64> = None;
     let Ok(entries) = fs::read_dir(dir) else {
         return None;
@@ -578,7 +698,9 @@ fn latest_segment_index(dir: &Path) -> Option<u64> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if let Some(idx) = segment_index(name) {
+        if let Some(idx) = segment_index(name)
+            && idx >= window_start
+        {
             best = Some(best.map_or(idx, |b| b.max(idx)));
         }
     }
@@ -590,14 +712,14 @@ fn segment_index(name: &str) -> Option<u64> {
     name.strip_prefix("seg")?.strip_suffix(".m4s")?.parse().ok()
 }
 
-/// VOD media playlist from the session window to the end of the title.
-/// A mid-title session (audio switch, seek restart) must not advertise
-/// segments before `start_ms`: players (Chrome especially) fetch seg000
-/// from a full-from-zero list and spin on 503. Prior-window retention still
-/// works after a scrub — the next playlist is rebuilt at the new window.
+/// Full-title VOD media playlist (ADR-0011 amendment).
+///
+/// Lists every segment from `seg000` through the probed duration so the
+/// scrubber is title-absolute. `start_ms` only sets `#EXT-X-START` for the
+/// preferred land point; cold regions return 503 while a guarded restart
+/// cooks them. The playlist does not omit pre-window indices.
 fn build_playlist(duration_ms: u64, start_ms: u64) -> Vec<u8> {
     use std::fmt::Write;
-    let start_idx = start_ms / SEGMENT_MS;
     let full = duration_ms / SEGMENT_MS;
     let rem_ms = duration_ms % SEGMENT_MS;
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
@@ -609,13 +731,20 @@ fn build_playlist(duration_ms: u64, start_ms: u64) -> Vec<u8> {
          #EXT-X-VERSION:7\n\
          #EXT-X-TARGETDURATION:{target}\n\
          #EXT-X-PLAYLIST-TYPE:VOD\n\
-         #EXT-X-MEDIA-SEQUENCE:{start_idx}\n\
+         #EXT-X-MEDIA-SEQUENCE:0\n\
          #EXT-X-MAP:URI=\"init.mp4\"\n"
     );
-    for i in start_idx..full {
+    if start_ms > 0 {
+        let _ = writeln!(
+            out,
+            "#EXT-X-START:TIME-OFFSET={:.3},PRECISE=YES",
+            start_ms as f64 / 1000.0
+        );
+    }
+    for i in 0..full {
         let _ = writeln!(out, "#EXTINF:{segment_secs:.6},\n{}", segment_name(i));
     }
-    if rem_ms > 0 && full >= start_idx {
+    if rem_ms > 0 {
         let _ = writeln!(
             out,
             "#EXTINF:{:.6},\n{}",
@@ -629,6 +758,11 @@ fn build_playlist(duration_ms: u64, start_ms: u64) -> Vec<u8> {
 
 /// Master playlist: one video variant + optional SUBTITLES group (ADR-0010).
 /// Media URI stays relative `index.m3u8` (ADR-0008).
+///
+/// CODECS is omitted on purpose: a wrong value (we previously advertised
+/// Main@L3.1 while VideoToolbox emits High@L4.0) makes Safari native HLS
+/// refuse the variant outright. Better no hint than a lying one; the init
+/// segment carries the real codec string.
 fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
     use std::fmt::Write;
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
@@ -652,11 +786,9 @@ fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
             }
             let _ = writeln!(out, "{line}");
         }
-        out.push_str(
-            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.4d401f,mp4a.40.2\",SUBTITLES=\"subs\"\n",
-        );
+        out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000,SUBTITLES=\"subs\"\n");
     } else {
-        out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.4d401f,mp4a.40.2\"\n");
+        out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000\n");
     }
     out.push_str("index.m3u8\n");
     out.into_bytes()
@@ -722,8 +854,7 @@ fn spawn_ffmpeg(
     };
     cmd.args(["-map", "0:v:0", "-map", &audio_map]);
     let downmix = if audio.needs_downmix() {
-        let filter =
-            stereo_downmix_filter(audio.channels, audio.channel_layout.as_deref());
+        let filter = stereo_downmix_filter(audio.channels, audio.channel_layout.as_deref());
         if filter.is_none() {
             tracing::warn!(
                 channels = audio.channels,
@@ -758,6 +889,23 @@ fn spawn_ffmpeg(
                 // verification.
                 cmd.args(["-pix_fmt", "yuv420p"]);
             }
+            // Browser sessions are SDR. VideoToolbox otherwise copies PQ/BT.2020
+            // VUI and HDR10 side data from an HDR source onto an 8-bit encode;
+            // Safari native HLS rejects that (Chrome/hls.js is more forgiving).
+            // Color flags alone are not enough on videotoolbox — strip side
+            // data and force BT.709 through setparams.
+            cmd.args([
+                "-map_metadata",
+                "-1",
+                "-vf",
+                "sidedata=delete,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+            ]);
             cmd.args([
                 // Time-based IDRs derived from SEGMENT_MS (same source as
                 // -hls_time and the generated playlist EXTINF). A frame-count
@@ -858,6 +1006,11 @@ mod tests {
     }
 
     fn make_fixture(path: &Path) {
+        make_fixture_secs(path, 4);
+    }
+
+    fn make_fixture_secs(path: &Path, secs: u32) {
+        let d = secs.to_string();
         let status = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -867,11 +1020,11 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=black:s=64x64:d=4",
+                &format!("color=c=black:s=64x64:d={d}"),
                 "-f",
                 "lavfi",
                 "-i",
-                "sine=frequency=440:duration=4",
+                &format!("sine=frequency=440:duration={d}"),
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -910,6 +1063,19 @@ mod tests {
         panic!("playlist not ready in time");
     }
 
+    fn wait_asset(reg: &HlsSessionRegistry, id: &str, name: &str) -> Vec<u8> {
+        for _ in 0..150 {
+            match reg.asset(id, name) {
+                Ok(bytes) => return bytes,
+                Err(PlaylistError::NotReady) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("asset {name} error: {e:?}"),
+            }
+        }
+        panic!("asset {name} not ready in time");
+    }
+
     #[test]
     fn window_decision_table() {
         // (name, requested_ms, window_start_ms, on_disk, expected)
@@ -944,6 +1110,239 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn segment_miss_decision_table() {
+        let cool = RESTART_MIN_INTERVAL;
+        let hot = Duration::from_millis(0);
+        // (name, idx, window_start_idx, play_start_idx, latest, primed, since, expected)
+        let cases = [
+            (
+                "unprimed far behind waits (attach prefetch of seg000)",
+                0,
+                600,
+                616,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "unprimed just behind follows the player (start alignment)",
+                625,
+                632,
+                648,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "unprimed behind at tolerance follows",
+                616,
+                632,
+                648,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "unprimed behind past tolerance waits (seg000-class prefetch)",
+                615,
+                632,
+                648,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "primed behind restarts (scrub back)",
+                0,
+                4,
+                4,
+                Some(10),
+                true,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "primed behind within min interval waits",
+                0,
+                4,
+                4,
+                Some(10),
+                true,
+                hot,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "far ahead of play band restarts",
+                20,
+                4,
+                4,
+                Some(10),
+                true,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "near frontier waits (cooking)",
+                11,
+                4,
+                4,
+                Some(10),
+                true,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "far ahead within min interval waits",
+                20,
+                4,
+                4,
+                Some(10),
+                true,
+                hot,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "retained pre-window latest does not fake far-ahead",
+                1052,
+                1052,
+                1052,
+                Some(7),
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "in-window cooking waits when frontier is window start",
+                1052,
+                1052,
+                1052,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "lead-in band near EXT-X-START waits (no thrash restart)",
+                656,
+                648,
+                664,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "lead-in band at play land waits",
+                664,
+                648,
+                664,
+                Some(650),
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "past play land by more than catch-up restarts",
+                670,
+                648,
+                664,
+                Some(650),
+                false,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+        ];
+        for (name, idx, window, play, latest, primed, since, expected) in cases {
+            assert_eq!(
+                decide_segment_miss(idx, window, play, latest, primed, since),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn miss_restart_offset_lands_on_requested_segment() {
+        // Invariant: a Restart for segment N aims play at N (encode may
+        // lead by ENCODE_LEAD_SEGMENTS), so the new window contains N.
+        let cases = [(13u64, 1052u64), (0, 100), (1614, 1052)];
+        for (idx, window) in cases {
+            let action = decide_segment_miss(
+                idx,
+                window,
+                window,
+                Some(window),
+                true,
+                RESTART_MIN_INTERVAL,
+            );
+            assert_eq!(action, SegmentMissAction::Restart, "idx={idx}");
+            let want_ms = idx * SEGMENT_MS;
+            let new_window = encode_start_ms(want_ms) / SEGMENT_MS;
+            assert!(
+                new_window <= idx,
+                "window after restart must contain segment N (idx={idx}, window={new_window})"
+            );
+            assert!(
+                idx - new_window <= ENCODE_LEAD_SEGMENTS,
+                "lead-in must stay within ENCODE_LEAD_SEGMENTS"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_lead_in_covers_measured_safari_dig_back() {
+        assert_eq!(
+            encode_start_ms(1_264_000),
+            1_264_000 - ENCODE_LEAD_SEGMENTS * SEGMENT_MS
+        );
+        assert_eq!(encode_start_ms(1_000), 0);
+        assert_eq!(encode_start_ms(0), 0);
+    }
+
+    /// Fresh mid-title session: first segment request behind the play land
+    /// point (Safari EXT-X-START dig-back) must still be served. Encode
+    /// lead-in keeps it in-window; decide_segment_miss tolerance is the
+    /// backup when the dig exceeds the lead-in.
+    #[test]
+    fn new_session_serves_first_requested_segment() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 60);
+        let duration_ms = 60_000;
+        let play_ms = 40_000; // seg020; encode lead-in → seg012
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                play_ms,
+                duration_ms,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
+            .unwrap();
+        let playlist = wait_playlist(&reg, &id);
+        let text = String::from_utf8_lossy(&playlist);
+        assert!(
+            text.contains("#EXT-X-START:TIME-OFFSET=40.000,PRECISE=YES"),
+            "play land stays at the requested offset, not the encode lead-in: {text}"
+        );
+        // Seven segments behind play (~Safari dig); still inside lead-in.
+        let bytes = wait_asset(&reg, &id, "seg013.m4s");
+        assert!(!bytes.is_empty(), "first requested segment must be served");
+        assert!(reg.stop(&id));
     }
 
     #[test]
@@ -1312,12 +1711,24 @@ mod tests {
     }
 
     #[test]
-    fn mid_window_playlist_skips_segments_before_start() {
+    fn mid_window_playlist_is_full_title_with_start_tag() {
         let text = String::from_utf8(build_playlist(10_000, 4_000)).unwrap();
-        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{text}");
-        assert!(!text.contains("seg000.m4s"), "{text}");
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{text}");
+        assert!(
+            text.contains("#EXT-X-START:TIME-OFFSET=4.000,PRECISE=YES"),
+            "{text}"
+        );
+        assert!(text.contains("seg000.m4s"), "{text}");
         assert!(text.contains("seg002.m4s"), "{text}");
-        assert_eq!(text.matches(".m4s").count(), 3, "{text}");
+        assert!(!text.contains("EXT-X-GAP"), "{text}");
+        assert_eq!(text.matches(".m4s").count(), 5, "{text}");
+    }
+
+    #[test]
+    fn zero_start_playlist_has_no_start_tag() {
+        let text = String::from_utf8(build_playlist(5000, 0)).unwrap();
+        assert!(!text.contains("EXT-X-START"), "{text}");
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{text}");
     }
 
     #[test]
@@ -1349,6 +1760,7 @@ mod tests {
         assert!(
             text.contains("CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog\"")
         );
+        assert!(!text.contains("CODECS="), "{text}");
         assert!(!text.contains("media.m3u8"));
     }
 
@@ -1357,6 +1769,7 @@ mod tests {
         let text = String::from_utf8(build_master(&[])).unwrap();
         assert!(!text.contains("EXT-X-MEDIA"));
         assert!(!text.contains("SUBTITLES="));
+        assert!(!text.contains("CODECS="), "{text}");
         assert!(text.contains("\nindex.m3u8\n"));
     }
 

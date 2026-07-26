@@ -102,3 +102,75 @@ This supersedes ADR-0006's delivery decisions (async remux job, remux cache,
 `remuxState`, stream-from-cache). ADR-0006's decision-engine shape
 (`directPlay | remux | transcode` × capability profile) stands. ADR-0007's
 "remux stays whole-file for this slice" is closed by this ADR.
+
+## Amendment: full-title VOD playlist and load-bearing 503 (2026-07-26)
+
+Safari dogfood capture during audio-track switching (ADR-0012) showed native
+HLS never had a design bug with an honest mid-window playlist: after a switch
+at ~10 s it requested `seg004`, not `seg000`; both switches POSTed
+title-absolute `startMs`; scrub drove window moves through segment fetches
+alone (no `?startMs=`). The remaining symptom is cosmetic — after a mid-title
+attach the native scrubber shows a zero-based clock (e.g. `0:00:02`) while
+playback is correctly mid-title.
+
+That reframes a full-title playlist: it is a scrubber correctness fix, not a
+client workaround. Forcing hls.js on Safari to hide a lying playlist is
+rejected (contradicts ADR-0007 §6 native-on-Safari; loses the hardware HLS
+path iOS/tvOS need).
+
+**Decision (accepted; implementation follows this ADR).**
+
+6. **Playlist lists the full probed duration from `seg000`.**
+   `EXT-X-PLAYLIST-TYPE:VOD` with `ENDLIST` again means what it says: the
+   media playlist claims the entire title. `MEDIA-SEQUENCE` stays 0.
+   Mid-title session start and audio switch still spawn FFmpeg at the window
+   (`-ss` / `-start_number` / `-output_ts_offset`); they do not pre-encode
+   the whole title.
+
+7. **Out-of-window segment requests are load-bearing 503s, not 404s.**
+   A segment the current encode window has not produced (and that is not
+   retained on disk from a prior window) returns **503** while the session
+   restarts at that offset and the segment cooks — the same retry contract
+   already used for not-yet-ready in-window segments (ADR-0007 §5). 404
+   means the session is gone or the name is illegal. Under a full-title
+   VOD claim, 503 is the normal path for scrub/prefetch into a cold region,
+   not an edge case. Clients must retry; giving up on 404 is wrong here.
+
+8. **Restart triggers are deliberate, not incidental.** Safari prefetched
+   ~50 segments on a cold attach in the capture; an unguarded "any miss
+   restarts" rule would turn prefetch overshoot into an encoder storm.
+   Restart on segment fetch only when:
+   - the requested index is outside the current window by more than a small
+     tolerance (same class as today's far-ahead `CATCH_UP_SEGMENTS` guard),
+     and
+   - a minimum interval has passed since the last restart on that session,
+     and
+   - for requests *behind* the window: either the session is `primed`
+     (real scrub back), or the miss is within `ALIGN_BEHIND_SEGMENTS` of
+     the encode start (player settling near `#EXT-X-START`). Unprimed
+     misses farther behind than that return 503 immediately without
+     restart, so attach prefetch of `seg000` cannot yank a mid-title
+     encode back to zero, while a first request a few segments behind
+     the land point still converges instead of deadlocking.
+   Encode windows lead the play land point by eight segments. The 2026-07-26
+   switch capture measured Safari's first request exactly eight segments
+   behind `#EXT-X-START`; four would not contain that request. A 16-segment
+   lead worked but increased measured seek-to-first-segment time from 1.84 s
+   to 3.93–4.56 s, outside Gate 2's three-second budget. Eight is therefore
+   the measured correctness floor, pending the full Gate 2 timing rerun.
+   Far-ahead restart uses `max(frontier, play_start)` as the band end so
+   land-point prefetch inside that lead-in does not thrash-restart the
+   encoder.
+   In-window cooking continues to wait/503 without restart. Playlist
+   `?startMs=` remains an explicit restart signal from the web client's
+   `seeked` handler; native Safari often skips it and hits this segment path
+   instead.
+
+**Not decided here.** Content-addressed multi-window encode (serve any
+range without serial restart) stays deferred as too large; this amendment is
+the smaller "session follows the player" step.
+
+This supersedes the interim mid-window-only listing (playlist omits
+pre-window segments via `MEDIA-SEQUENCE`) used while audio switch landed.
+ADR-0007 §5's "503 while cooking" contract is unchanged in kind and
+extended in scope to cold regions of a full-title VOD.

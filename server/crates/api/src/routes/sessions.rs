@@ -16,6 +16,23 @@ use nightjar_transcode::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter so Safari/Chrome attach→switch request order is
+/// readable in the dogfood log (`rg hls_client_req /tmp/nightjar-dogfood.log`).
+static HLS_CLIENT_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn log_hls_client_req(session_id: &str, resource: &str, start_ms: Option<u64>, status: u16) {
+    let seq = HLS_CLIENT_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        seq,
+        session_id,
+        resource,
+        start_ms,
+        status,
+        "hls_client_req"
+    );
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,6 +137,7 @@ pub async fn start(
             let encoder = hls.encoder(&session_id).ok_or_else(|| {
                 ApiError::internal(format!("session {session_id} disappeared after start"))
             })?;
+            log_hls_client_req(&session_id, "POST /sessions", Some(start_ms), 202);
             Ok((
                 StatusCode::ACCEPTED,
                 Json(TranscodeSessionDto {
@@ -131,10 +149,13 @@ pub async fn start(
                 }),
             ))
         }
-        Err(StartSessionError::CapFull) => Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "all playback sessions are in use; retry shortly".into(),
-        }),
+        Err(StartSessionError::CapFull) => {
+            log_hls_client_req("-", "POST /sessions", Some(start_ms), 503);
+            Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "all playback sessions are in use; retry shortly".into(),
+            })
+        }
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),
     }
 }
@@ -298,8 +319,27 @@ async fn wait_playlist(
     .map_err(|e| ApiError::internal(format!("hls playlist task: {e}")))?;
 
     match result {
-        Ok(bytes) => m3u8_ok(bytes),
-        Err(e) => map_playlist_err(&session_id, e),
+        Ok(bytes) => {
+            let resource = match kind {
+                PlaylistKind::Master => "master.m3u8",
+                PlaylistKind::Media => "index.m3u8",
+            };
+            log_hls_client_req(&session_id, resource, start_ms, 200);
+            m3u8_ok(bytes)
+        }
+        Err(e) => {
+            let resource = match kind {
+                PlaylistKind::Master => "master.m3u8",
+                PlaylistKind::Media => "index.m3u8",
+            };
+            let status = match &e {
+                PlaylistError::NotFound => 404,
+                PlaylistError::NotReady => 503,
+                PlaylistError::Failed(_) => 500,
+            };
+            log_hls_client_req(&session_id, resource, start_ms, status);
+            map_playlist_err(&session_id, e)
+        }
     }
 }
 
@@ -346,6 +386,7 @@ pub async fn asset(
 
     match result {
         Ok(bytes) => {
+            log_hls_client_req(&session_id, &asset, None, 200);
             let mime = if asset.ends_with(".mp4") {
                 "video/mp4"
             } else {
@@ -357,16 +398,25 @@ pub async fn asset(
                 .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
             Ok(res)
         }
-        Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
-            "asset {asset} for session {session_id} not found"
-        ))),
+        Err(PlaylistError::NotFound) => {
+            log_hls_client_req(&session_id, &asset, None, 404);
+            Err(ApiError::not_found(format!(
+                "asset {asset} for session {session_id} not found"
+            )))
+        }
         // Not yet on disk: ask the player to retry. 404 makes hls.js / Safari
         // give up on the fragment; 503 is recoverable while FFmpeg catches up.
-        Err(PlaylistError::NotReady) => Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: format!("asset {asset} for session {session_id} not ready yet"),
-        }),
-        Err(PlaylistError::Failed(e)) => Err(ApiError::internal(e)),
+        Err(PlaylistError::NotReady) => {
+            log_hls_client_req(&session_id, &asset, None, 503);
+            Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("asset {asset} for session {session_id} not ready yet"),
+            })
+        }
+        Err(PlaylistError::Failed(e)) => {
+            log_hls_client_req(&session_id, &asset, None, 500);
+            Err(ApiError::internal(e))
+        }
     }
 }
 
@@ -380,9 +430,11 @@ pub async fn delete(
         .await
         .map_err(|e| ApiError::internal(format!("hls stop task: {e}")))?;
     if stopped {
+        log_hls_client_req(&session_id, "DELETE /sessions", None, 204);
         Ok(StatusCode::NO_CONTENT)
     } else {
         // Idempotent teardown: already gone is fine for player unmount.
+        log_hls_client_req(&session_id, "DELETE /sessions", None, 204);
         Ok(StatusCode::NO_CONTENT)
     }
 }

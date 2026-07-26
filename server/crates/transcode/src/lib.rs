@@ -11,7 +11,8 @@ mod subs;
 pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
     AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PlaylistError,
-    SessionEncoder, SessionMode, StartSessionError, WindowAction, decide_window_action,
+    SegmentMissAction, SessionEncoder, SessionMode, StartSessionError, WindowAction,
+    decide_segment_miss, decide_window_action,
 };
 pub use hwaccel::{
     EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,

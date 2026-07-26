@@ -147,3 +147,10 @@ automated proxy; someone still has to hear a real title.
 two orders of magnitude inside the 3 s revisit budget on this hardware. That
 number is what keeps alternate AUDIO renditions closed. NAS multi-track titles
 should be re-checked when dogfooding.
+
+**Scrubber after mid-title switch.** Safari native keeps title-absolute
+`startMs` on switch and requests the window's first segment (capture: `seg004`
+after a 10 s switch, not `seg000`). The native scrubber still shows a
+zero-based clock under mid-window playlists. Fixing that is a full-title VOD
+playlist with load-bearing 503 + guarded restarts (ADR-0011 amendment), not a
+client-player change.

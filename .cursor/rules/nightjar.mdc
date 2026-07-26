@@ -24,6 +24,11 @@ that reads like a careful senior engineer wrote it.
   codebase beats your preferred style, always.
 - If the task is ambiguous, ask ONE clarifying question or state your assumption
   in one line and proceed. Never generate three alternative implementations.
+- Before changing playback behaviour (session start, playlist shape, segment
+ status codes, seek/restart rules, player attach): capture the client's ordered
+ request sequence from attach through the action under test. Do not speculate
+ with playlist or player edits until that trace exists. One capture beats
+ multiple guessing commits.
 
 ## 1. Stack boundaries (hard, from ENGINEERING_RULES.md §1–2)
 

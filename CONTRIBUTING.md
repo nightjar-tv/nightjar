@@ -11,3 +11,12 @@ Docs are plain prose, no marketing voice. Match the register of existing docs
 
 New playback bugs come with a sample file under `testdata/` (Rule 4.3). PRs that
 shrink the codebase are the most welcome kind.
+
+## Playback behaviour changes
+
+Before changing how sessions, playlists, or segment responses behave, capture
+the client's actual request sequence (ordered playlist and segment GETs with
+status codes) from attach through the action under test — for example audio
+switch or scrub. One capture answers questions that rounds of speculative
+playlist edits will not. Prefer server-side request logging on the dogfood
+binary over guessing from browser console snippets alone.
