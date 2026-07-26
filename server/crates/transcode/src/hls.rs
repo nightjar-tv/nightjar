@@ -266,7 +266,7 @@ impl HlsSessionRegistry {
         start_ms: Option<u64>,
     ) -> Result<Vec<u8>, PlaylistError> {
         self.with_ready_session(session_id, start_ms, |session| {
-            Ok(build_playlist(session.duration_ms))
+            Ok(build_playlist(session.duration_ms, session.start_ms))
         })
     }
 
@@ -590,12 +590,14 @@ fn segment_index(name: &str) -> Option<u64> {
     name.strip_prefix("seg")?.strip_suffix(".m4s")?.parse().ok()
 }
 
-/// Static VOD playlist for the full title. Players get the real duration and
-/// a working scrubber; the encoder fills segments in behind it and `asset`
-/// waits for stragglers. EXTINF follows SEGMENT_MS; fMP4 timestamps carry the
-/// exact timing.
-fn build_playlist(duration_ms: u64) -> Vec<u8> {
+/// VOD media playlist from the session window to the end of the title.
+/// A mid-title session (audio switch, seek restart) must not advertise
+/// segments before `start_ms`: players (Chrome especially) fetch seg000
+/// from a full-from-zero list and spin on 503. Prior-window retention still
+/// works after a scrub — the next playlist is rebuilt at the new window.
+fn build_playlist(duration_ms: u64, start_ms: u64) -> Vec<u8> {
     use std::fmt::Write;
+    let start_idx = start_ms / SEGMENT_MS;
     let full = duration_ms / SEGMENT_MS;
     let rem_ms = duration_ms % SEGMENT_MS;
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
@@ -607,13 +609,13 @@ fn build_playlist(duration_ms: u64) -> Vec<u8> {
          #EXT-X-VERSION:7\n\
          #EXT-X-TARGETDURATION:{target}\n\
          #EXT-X-PLAYLIST-TYPE:VOD\n\
-         #EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-MEDIA-SEQUENCE:{start_idx}\n\
          #EXT-X-MAP:URI=\"init.mp4\"\n"
     );
-    for i in 0..full {
+    for i in start_idx..full {
         let _ = writeln!(out, "#EXTINF:{segment_secs:.6},\n{}", segment_name(i));
     }
-    if rem_ms > 0 {
+    if rem_ms > 0 && full >= start_idx {
         let _ = writeln!(
             out,
             "#EXTINF:{:.6},\n{}",
@@ -1302,9 +1304,19 @@ mod tests {
 
     #[test]
     fn vod_playlist_covers_full_duration() {
-        let text = String::from_utf8(build_playlist(5000)).unwrap();
+        let text = String::from_utf8(build_playlist(5000, 0)).unwrap();
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"));
         assert!(text.ends_with("#EXT-X-ENDLIST\n"));
+        assert_eq!(text.matches(".m4s").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn mid_window_playlist_skips_segments_before_start() {
+        let text = String::from_utf8(build_playlist(10_000, 4_000)).unwrap();
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{text}");
+        assert!(!text.contains("seg000.m4s"), "{text}");
+        assert!(text.contains("seg002.m4s"), "{text}");
         assert_eq!(text.matches(".m4s").count(), 3, "{text}");
     }
 

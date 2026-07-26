@@ -15,9 +15,11 @@ export function canPlayNativeHls(video: HTMLVideoElement): boolean {
  * 3. Player requests the target segment; server waits until it exists
  *    (503 while cooking, not 404).
  *
- * Mid-title attach (audio switch, ADR-0012): the session only has segments
- * from its window start. Opening at 0 fetches seg000 → 404/503 and a spin.
- * Start at the window offset before the first segment request.
+ * Mid-title sessions (audio switch): the media playlist starts at the
+ * session window (`EXT-X-MEDIA-SEQUENCE`), so players must not be pointed
+ * at a `#t=` fragment — Safari's HLS path treats that as a broken source
+ * (play button strikethrough). Absolute fMP4 timestamps keep the scrubber
+ * near the real offset once the first segment arrives.
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -27,22 +29,17 @@ export function attachHls(
 	let hls: Hls | null = null;
 	let destroyed = false;
 	let seekInFlight = false;
-	// The initial land on startAtSeconds is not a user scrub — skip the
-	// server seek notify so we do not restart a window we just opened.
+	// First land after a mid-title attach is not a user scrub.
 	let suppressSeekNotify = startAtSeconds > 0;
 
 	if (canPlayNativeHls(video)) {
-		// Media fragment asks Safari to begin at the offset; setting
-		// currentTime after loadedmetadata is too late (seg000 already fired).
-		video.src =
-			startAtSeconds > 0 ? `${playlistBase}#t=${startAtSeconds}` : playlistBase;
+		video.src = playlistBase;
 	} else if (!Hls.isSupported()) {
 		throw new Error('HLS playback is not supported in this browser');
 	} else {
 		hls = new Hls({
 			enableWorker: true,
-			maxBufferHole: 1.5,
-			...(startAtSeconds > 0 ? { startPosition: startAtSeconds } : {})
+			maxBufferHole: 1.5
 		});
 		// Not-ready segments return 503; treat as retryable network errors.
 		hls.on(Hls.Events.ERROR, (_event, data) => {
