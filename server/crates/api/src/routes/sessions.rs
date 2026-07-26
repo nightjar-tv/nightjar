@@ -182,9 +182,13 @@ fn resolve_audio(row: &MediaItemRow, requested: Option<&str>) -> Result<AudioSel
 }
 
 fn stored_channels(row: &MediaItemRow) -> u32 {
+    // NULL after an additive migration must not read as "0 channels / under
+    // ceiling": session start would skip the pan and copy multi-channel AAC.
+    // Prefer a live inventory; this value is only the fallback when listing
+    // failed. Over-ceiling forces the downmix path until the next probe.
     row.audio_channels
         .and_then(|c| u32::try_from(c).ok())
-        .unwrap_or(0)
+        .unwrap_or(u32::MAX)
 }
 
 fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec<HlsSubtitleTrack> {
@@ -304,8 +308,11 @@ fn map_playlist_err(session_id: &str, err: PlaylistError) -> ApiResult<Response>
         PlaylistError::NotFound => Err(ApiError::not_found(format!(
             "session {session_id} not found"
         ))),
+        // Same as segment assets: 503 is retryable while FFmpeg catches up.
+        // 404 was indistinguishable from a dead session and made audio-switch
+        // waits look like hard failures in the browser console.
         PlaylistError::NotReady => Err(ApiError {
-            status: StatusCode::NOT_FOUND,
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!("playlist for session {session_id} not ready yet"),
         }),
         PlaylistError::Failed(e) => Err(ApiError::internal(format!(

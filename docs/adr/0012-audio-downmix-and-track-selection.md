@@ -93,6 +93,13 @@ the same session surface so audio switching is solved once.
    (append-only migration) so `decide_playback` can apply the channel ceiling
    without a live probe. Full per-track inventory is probed on demand at
    playback-info time (same as embedded subtitles). No audio-sidecar table.
+   **NULL is not within-ceiling.** After migration 004, existing rows keep
+   NULL until the next probe. `decide_playback` treats unknown channel count
+   as a session (hybrid downmix), not DirectPlay. Session start that falls
+   back to the stored count when inventory fails does the same. Pattern for
+   later upgrades: a new nullable column the decision engine depends on must
+   either backfill in the migration or define a safe interpretation of NULL;
+   "rescan to finish the upgrade" is not a shipping plan.
 
 8. **API.** OpenAPI adds `AudioTrack` and `PlaybackInfo.audioTracks`; session
    start accepts optional `audioTrackId` (default = flagged default / first).
@@ -110,6 +117,18 @@ layouts where the client can take them) restores some of that ground.
 
 **Lost.** Instant DirectPlay of multi-channel AAC in MP4/M4V when channels
 exceed the profile ceiling. In-place audio switch without a new session.
+
+**Upgrade / NULL columns.** Migration 004 adds `audio_channels` without a
+backfill. The safe reading of NULL is "channel ceiling not yet known →
+session," so an upgraded dogfood DB does not keep DirectPlaying 5.1 AAC until
+someone remembers to rescan. Gate 4's v0.x→v1 migration test on a real dogfood
+database should keep asserting this class of gap: new decision inputs ship with
+a NULL policy, not with a manual ops step. The cost: until channel counts are
+filled, first playback of otherwise DirectPlay titles is a session, so a large
+library puts more pressure on the session cap than steady state. Safe and slow
+beats fast and wrong. A post-migration background backfill of decision columns
+(same shape as scan-time subtitle extraction) would close that window without
+asking the user to rescan; that is a follow-up, not a reason to weaken NULL.
 
 **Gained.** Dialogue-preserving downmix. Reachable secondary audio tracks.
 One switch model for remux and transcode. Hybrid avoids pointless video

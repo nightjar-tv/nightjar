@@ -14,6 +14,10 @@ export function canPlayNativeHls(video: HTMLVideoElement): boolean {
  *    that offset and retains prior-window segments (ADR-0011).
  * 3. Player requests the target segment; server waits until it exists
  *    (503 while cooking, not 404).
+ *
+ * Mid-title attach (audio switch, ADR-0012): the session only has segments
+ * from its window start. Opening at 0 fetches seg000 → 404/503 and a spin.
+ * Start at the window offset before the first segment request.
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -23,15 +27,22 @@ export function attachHls(
 	let hls: Hls | null = null;
 	let destroyed = false;
 	let seekInFlight = false;
+	// The initial land on startAtSeconds is not a user scrub — skip the
+	// server seek notify so we do not restart a window we just opened.
+	let suppressSeekNotify = startAtSeconds > 0;
 
 	if (canPlayNativeHls(video)) {
-		video.src = playlistBase;
+		// Media fragment asks Safari to begin at the offset; setting
+		// currentTime after loadedmetadata is too late (seg000 already fired).
+		video.src =
+			startAtSeconds > 0 ? `${playlistBase}#t=${startAtSeconds}` : playlistBase;
 	} else if (!Hls.isSupported()) {
 		throw new Error('HLS playback is not supported in this browser');
 	} else {
 		hls = new Hls({
 			enableWorker: true,
-			maxBufferHole: 1.5
+			maxBufferHole: 1.5,
+			...(startAtSeconds > 0 ? { startPosition: startAtSeconds } : {})
 		});
 		// Not-ready segments return 503; treat as retryable network errors.
 		hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -48,6 +59,10 @@ export function attachHls(
 
 	const onSeeked = () => {
 		if (destroyed || seekInFlight) return;
+		if (suppressSeekNotify) {
+			suppressSeekNotify = false;
+			return;
+		}
 		seekInFlight = true;
 		void (async () => {
 			try {
@@ -61,23 +76,12 @@ export function attachHls(
 		})();
 	};
 
-	// A session started mid-title (audio switch, ADR-0012) has no segments
-	// before its window, so the element must open at that offset rather than
-	// at zero.
-	const onLoadedMetadata = () => {
-		video.currentTime = startAtSeconds;
-	};
-
 	video.addEventListener('seeked', onSeeked);
-	if (startAtSeconds > 0) {
-		video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
-	}
 
 	return {
 		destroy: () => {
 			destroyed = true;
 			video.removeEventListener('seeked', onSeeked);
-			video.removeEventListener('loadedmetadata', onLoadedMetadata);
 			if (hls) {
 				hls.destroy();
 				hls = null;

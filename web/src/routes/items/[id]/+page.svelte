@@ -54,6 +54,8 @@
 		for (let i = 0; liveRef.alive && i < 100; i++) {
 			const res = await fetch(url);
 			if (res.ok) return true;
+			// Gone for good (deleted / never created). 503 means still cooking.
+			if (res.status === 404) return false;
 			await new Promise((r) => setTimeout(r, 200));
 		}
 		return false;

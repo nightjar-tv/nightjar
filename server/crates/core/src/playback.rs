@@ -57,6 +57,9 @@ pub struct PlaybackDecision {
 /// `audio_channels` is the first-audio channel count. A track above the
 /// profile ceiling loses direct play even when its codec and container are
 /// fine: the session copies video and encodes a stereo downmix (ADR-0012).
+/// `None` also loses direct play when the profile has a ceiling: an upgraded
+/// database may still have NULL after migration 004 until the next probe, and
+/// treating that as "within ceiling" would keep direct-playing 5.1 to browsers.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_playback(
     path: &str,
@@ -93,13 +96,10 @@ pub fn decide_playback(
     let container_ok = matches_container(path, container, profile);
 
     if video_ok && audio_ok {
-        if let Some(excess) = exceeds_channel_ceiling(audio_channels, profile) {
+        if let Some(reason) = channel_ceiling_session_reason(audio_channels, profile) {
             return PlaybackDecision {
                 method: PlaybackMethod::Remux,
-                reason: format!(
-                    "codecs supported; {excess}-channel audio exceeds the client ceiling \
-                     and is downmixed by a session"
-                ),
+                reason,
                 mime_type: "application/vnd.apple.mpegurl".into(),
             };
         }
@@ -131,15 +131,26 @@ pub fn decide_playback(
     }
 }
 
-/// The offending channel count when the track is above the profile ceiling.
-/// An unprobed channel count is not treated as excess: the codec whitelist
-/// already gates on a successful probe.
-fn exceeds_channel_ceiling(
+/// Why this title cannot DirectPlay under the profile's channel ceiling.
+/// Known over-ceiling counts and unknown (`None`) both force a session when
+/// the profile sets `max_audio_channels`: NULL must not pass as safe.
+fn channel_ceiling_session_reason(
     audio_channels: Option<u32>,
     profile: &ClientCapabilityProfile,
-) -> Option<u32> {
+) -> Option<String> {
     let max = profile.max_audio_channels?;
-    audio_channels.filter(|c| *c > max)
+    match audio_channels {
+        Some(c) if c > max => Some(format!(
+            "codecs supported; {c}-channel audio exceeds the client ceiling \
+             and is downmixed by a session"
+        )),
+        None => Some(
+            "codecs supported; audio channel count not yet stored, \
+             session downmix until probed"
+                .into(),
+        ),
+        Some(_) => None,
+    }
 }
 
 fn matches_codec(codec: Option<&str>, accepted: &[&str]) -> bool {
@@ -324,7 +335,7 @@ mod tests {
                 PlaybackMethod::DirectPlay,
             ),
             (
-                "unknown channel count does not narrow direct play",
+                "unknown channel count forces a session, not unsafe direct play",
                 decide_channels(
                     "/a/b.mp4",
                     Some("mov,mp4,m4a"),
@@ -334,7 +345,7 @@ mod tests {
                     None,
                     "probed",
                 ),
-                PlaybackMethod::DirectPlay,
+                PlaybackMethod::Remux,
             ),
         ];
         for (name, decision, expected) in cases {
@@ -359,6 +370,21 @@ mod tests {
         assert_eq!(d.mime_type, "application/vnd.apple.mpegurl");
         assert!(d.reason.contains("8-channel"), "{}", d.reason);
         assert!(!d.reason.contains("container"), "{}", d.reason);
+    }
+
+    #[test]
+    fn null_channel_count_session_names_the_gap() {
+        let d = decide_channels(
+            "/a/b.mp4",
+            Some("mov,mp4,m4a"),
+            Some("h264"),
+            Some("aac"),
+            None,
+            None,
+            "probed",
+        );
+        assert_eq!(d.method, PlaybackMethod::Remux);
+        assert!(d.reason.contains("not yet stored"), "{}", d.reason);
     }
 
     #[test]
