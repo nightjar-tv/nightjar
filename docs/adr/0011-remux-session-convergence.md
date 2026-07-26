@@ -60,6 +60,16 @@ Post-convergence numbers above are from `POST .../sessions` to the first
 servable `seg000.m4s` on the same NAS and titles, with
 `videoEncoder`/`encoderKind` = `copy`.
 
+The 9.10 s for the 11.15 GiB title is not a container-parse limitation of large
+files. Re-measuring four times put the same title anywhere from 0.65 s to
+7.31 s, and the 8.98 GiB title that first read 0.20 s later read 7.21 s under
+NAS contention. First video packet sits at byte 8166 (header at the front), so
+first-segment latency tracks NAS read contention, not moov size. The old
+whole-file wait (minutes) came from copying the entire file before playback;
+the session path pays only for the first segment's source reads, so it stays in
+the low seconds regardless of file size, jittering with the NAS rather than
+with the title. No large-file limitation to document beyond NAS throughput.
+
 ## Consequences
 
 **Lost.** Byte-range seeking simplicity on a finished MP4; the instant cached
@@ -79,6 +89,14 @@ differ by a field (`SessionMode::Copy` vs encode), not by architecture
 boundaries follow source keyframes. The generated VOD playlist still uses
 `SEGMENT_MS` for indexing; real segment duration may vary. That is acceptable
 for v0 remux; ABR alignment (ADR-0008) still applies to encoded sessions.
+
+**No session sharing.** Session reuse by `(itemId, startMs)` is removed with
+fork-on-scrub (§3), so two viewers of the same title get two FFmpeg processes.
+With `-c copy` that is cheap CPU, but both count against the global session cap
+(`NIGHTJAR_HLS_MAX_SESSIONS`, default 3): a household watching the same film on
+two devices holds two of three slots. That is the accepted trade — sharing was
+the source of most session bugs — and the per-user cap model (ADR-0007
+consequences, Phase 3) is where fairness accounting returns.
 
 This supersedes ADR-0006's delivery decisions (async remux job, remux cache,
 `remuxState`, stream-from-cache). ADR-0006's decision-engine shape

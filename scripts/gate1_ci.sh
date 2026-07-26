@@ -26,6 +26,21 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+# Stale-binary guard. Twice in this project a leftover release binary served
+# old behaviour and nearly produced a false measurement; both were caught by
+# checking mtimes, not by luck. Refuse to trust a binary older than any tracked
+# source under server/ or the embedded web/build. Set NIGHTJAR_SKIP_STALE_CHECK=1
+# to bypass (e.g. measuring an intentionally pinned build).
+if [[ "${NIGHTJAR_SKIP_STALE_CHECK:-0}" != "1" ]]; then
+  newer="$(find "$ROOT/server" "$ROOT/web/build" \
+    -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.html' -o -name '*.js' -o -name '*.css' \) \
+    -newer "$BIN" -print -quit 2>/dev/null || true)"
+  if [[ -n "$newer" ]]; then
+    echo "FAIL: $BIN is older than $newer; rebuild before measuring (or set NIGHTJAR_SKIP_STALE_CHECK=1)" >&2
+    exit 1
+  fi
+fi
+
 ffmpeg -y -hide_banner -loglevel error \
   -f lavfi -i "testsrc=size=320x240:rate=24:duration=1" \
   -f lavfi -i "sine=frequency=440:duration=1" \
