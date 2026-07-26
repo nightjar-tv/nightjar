@@ -89,6 +89,16 @@
       "expect": "main track flagged default; commentary reachable by trackId and labelled from its title tag (ADR-0012)"
     },
     {
+      "path": "files/h264_flac_60_mkv.mkv",
+      "tags": ["flac", "6.0", "downmix-fallback", "mkv"],
+      "expect": "session with -ac 2 fallback: 6.0 shares a channel count with 5.1 but not the pan index map (ADR-0012)"
+    },
+    {
+      "path": "files/h264_ac3_51side_mkv.mkv",
+      "tags": ["ac3", "5.1(side)", "downmix-fallback", "mkv"],
+      "expect": "session with -ac 2 fallback: 5.1(side) is over ceiling and outside the pan tables (ADR-0012)"
+    },
+    {
       "path": "files/h264_eac3_mp4.mp4",
       "tags": ["eac3", "mp4"],
       "expect": "needs transcode (E-AC3)"

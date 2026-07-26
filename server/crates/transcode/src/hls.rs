@@ -47,18 +47,20 @@ pub enum SessionMode {
 
 /// Which audio track a session maps, and the ceiling it must fit (ADR-0012).
 /// Switching tracks is a new session, so this never changes in place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSelection {
     /// Absolute ffprobe stream index; `None` maps the first audio stream.
     pub stream_index: Option<u32>,
     /// Channel count of the selected track.
     pub channels: u32,
+    /// ffprobe `channel_layout` when present (`5.1`, `6.0`, …).
+    pub channel_layout: Option<String>,
     /// Client ceiling from the capability profile.
     pub max_channels: u32,
 }
 
 impl AudioSelection {
-    fn needs_downmix(self) -> bool {
+    fn needs_downmix(&self) -> bool {
         self.channels > self.max_channels
     }
 }
@@ -197,8 +199,18 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&dir).map_err(|e| {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
-        let child = spawn_ffmpeg(src, &dir, start_ms, mode, audio, &self.video_encoder)
+        let child = spawn_ffmpeg(src, &dir, start_ms, mode, audio.clone(), &self.video_encoder)
             .map_err(StartSessionError::Spawn)?;
+        tracing::info!(
+            session_id = %id,
+            item_id,
+            start_ms,
+            mode = ?mode,
+            audio_stream = ?audio.stream_index,
+            audio_channels = audio.channels,
+            encoder = %self.video_encoder,
+            "hls session started"
+        );
         sessions.insert(
             id.clone(),
             Session {
@@ -215,16 +227,6 @@ impl HlsSessionRegistry {
                 failed: None,
                 subtitle_tracks,
             },
-        );
-        tracing::info!(
-            session_id = %id,
-            item_id,
-            start_ms,
-            mode = ?mode,
-            audio_stream = ?audio.stream_index,
-            audio_channels = audio.channels,
-            encoder = %self.video_encoder,
-            "hls session started"
         );
         Ok(id)
     }
@@ -519,7 +521,7 @@ fn restart_at(
         &session.dir,
         start_ms,
         session.mode,
-        session.audio,
+        session.audio.clone(),
         video_encoder,
     )
     .map_err(PlaylistError::Failed)?;
@@ -718,10 +720,12 @@ fn spawn_ffmpeg(
     };
     cmd.args(["-map", "0:v:0", "-map", &audio_map]);
     let downmix = if audio.needs_downmix() {
-        let filter = stereo_downmix_filter(audio.channels);
+        let filter =
+            stereo_downmix_filter(audio.channels, audio.channel_layout.as_deref());
         if filter.is_none() {
             tracing::warn!(
                 channels = audio.channels,
+                layout = audio.channel_layout.as_deref().unwrap_or("unknown"),
                 path = %src.display(),
                 "no downmix matrix for this layout; falling back to -ac 2"
             );
@@ -886,6 +890,7 @@ mod tests {
         AudioSelection {
             stream_index: None,
             channels: 2,
+            channel_layout: Some("stereo".into()),
             max_channels: 2,
         }
     }
@@ -1206,6 +1211,7 @@ mod tests {
         let audio = AudioSelection {
             stream_index: None,
             channels: 6,
+            channel_layout: Some("5.1".into()),
             max_channels: 2,
         };
         let joined = encode_and_join(
@@ -1216,6 +1222,57 @@ mod tests {
             "no_such_encoder",
         );
         assert_eq!(probe_entry(&joined, "v:0", "codec_name"), "h264");
+        assert_eq!(probe_entry(&joined, "a:0", "channels"), "2");
+    }
+
+    /// 6.0 shares a channel count with 5.1 but not the index map; falling
+    /// back to -ac 2 is the correct (if imperfect) path (ADR-0012).
+    #[test]
+    fn unknown_named_layout_falls_back_to_ac2() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("six_oh.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=24:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=6.0:sample_rate=48000:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "flac",
+                "-shortest",
+                src.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            stereo_downmix_filter(6, Some("6.0")).is_none(),
+            "6.0 must not use the 5.1 pan table"
+        );
+        let audio = AudioSelection {
+            stream_index: None,
+            channels: 6,
+            channel_layout: Some("6.0".into()),
+            max_channels: 2,
+        };
+        let joined = encode_and_join(&src, dir.path(), SessionMode::Transcode, audio, "libx264");
         assert_eq!(probe_entry(&joined, "a:0", "channels"), "2");
     }
 
@@ -1232,6 +1289,7 @@ mod tests {
         let second = AudioSelection {
             stream_index: Some(2),
             channels: 1,
+            channel_layout: Some("mono".into()),
             max_channels: 2,
         };
         let joined = encode_and_join(&src, dir.path(), SessionMode::Copy, second, "libx264");

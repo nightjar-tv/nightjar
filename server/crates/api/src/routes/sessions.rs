@@ -175,6 +175,7 @@ fn resolve_audio(row: &MediaItemRow, requested: Option<&str>) -> Result<AudioSel
             return Ok(AudioSelection {
                 stream_index: None,
                 channels: stored_channels(row),
+                channel_layout: None,
                 max_channels,
             });
         }
@@ -191,11 +192,13 @@ fn resolve_audio(row: &MediaItemRow, requested: Option<&str>) -> Result<AudioSel
         Some(t) => AudioSelection {
             stream_index: Some(t.stream_index),
             channels: t.channels,
+            channel_layout: t.channel_layout.clone(),
             max_channels,
         },
         None => AudioSelection {
             stream_index: None,
             channels: stored_channels(row),
+            channel_layout: None,
             max_channels,
         },
     })

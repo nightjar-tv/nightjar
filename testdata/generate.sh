@@ -254,6 +254,20 @@ gen h264_aac_commentary_mkv.mkv \
   -metadata:s:a:1 language=eng -metadata:s:a:1 title="Commentary" \
   -disposition:a:0 default -disposition:a:1 0 -shortest
 
+# 25. 6.0 FLAC (no LFE). Same channel count as 5.1; pan table must not apply
+# (ADR-0012 falls back to -ac 2 with a warning).
+gen h264_flac_60_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "anullsrc=channel_layout=6.0:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a flac -shortest
+
+# 26. 5.1(side) AC3. AAC strips this layout tag; AC3 keeps it so the fallback
+# path is reachable from inventory (ADR-0012).
+gen h264_ac3_51side_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "anullsrc=channel_layout=5.1(side):sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a ac3 -shortest
+
 # Optional multi-GB open-ended Range stress (never commit; gitignored)
 if [[ "${LARGE:-}" == "1" ]]; then
   echo "→ large-open-ended-range.mp4 (~2 GB, gitignored)"

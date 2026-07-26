@@ -89,21 +89,38 @@ pub fn list_audio_tracks(src: &Path) -> Result<Vec<AudioStream>, String> {
 /// (ADR-0012). Centre is mixed into both ears at full gain so dialogue
 /// survives; LFE rides at 0.5 so explosions keep weight without burying it.
 /// `None` means no table for this layout: the caller falls back to `-ac 2`.
-pub fn stereo_downmix_filter(channels: u32) -> Option<String> {
-    // FFmpeg native order: FL FR FC LFE BL BR (SL SR).
+///
+/// Layouts are matched by name, not channel count: `6.0` and `5.1(side)`
+/// also report six channels but do not share the 5.1(back) index map, and
+/// applying that matrix can drop dialogue. Unknown named layouts fall back.
+/// When ffprobe omits the layout, channel count is the last-resort guess
+/// (anonymous AAC often ships as "6 channels" with no layout tag).
+pub fn stereo_downmix_filter(channels: u32, channel_layout: Option<&str>) -> Option<String> {
+    // FFmpeg native order for 5.1(back): FL FR FC LFE BL BR; 7.1 adds SL SR.
     let (front, centre, lfe, surround) = ("0.707", "1.0", "0.5", "0.707");
-    match channels {
-        6 => Some(format!(
+    let five_one = || {
+        format!(
             "pan=stereo\
              |c0={front}*c0+{centre}*c2+{surround}*c4+{lfe}*c3\
              |c1={front}*c1+{centre}*c2+{surround}*c5+{lfe}*c3"
-        )),
-        8 => Some(format!(
+        )
+    };
+    let seven_one = || {
+        format!(
             "pan=stereo\
              |c0={front}*c0+{centre}*c2+{surround}*c4+{surround}*c6+{lfe}*c3\
              |c1={front}*c1+{centre}*c2+{surround}*c5+{surround}*c7+{lfe}*c3"
-        )),
-        _ => None,
+        )
+    };
+    match channel_layout {
+        Some("5.1") | Some("5.1(back)") => Some(five_one()),
+        Some("7.1") | Some("7.1(wide)") => Some(seven_one()),
+        Some(_) => None,
+        None => match channels {
+            6 => Some(five_one()),
+            8 => Some(seven_one()),
+            _ => None,
+        },
     }
 }
 
@@ -155,12 +172,16 @@ mod tests {
 
     #[test]
     fn downmix_matrix_table() {
-        let five_one = stereo_downmix_filter(6).expect("5.1 has a matrix");
+        let five_one = stereo_downmix_filter(6, Some("5.1")).expect("5.1 has a matrix");
         assert_eq!(
             five_one,
             "pan=stereo|c0=0.707*c0+1.0*c2+0.707*c4+0.5*c3|c1=0.707*c1+1.0*c2+0.707*c5+0.5*c3"
         );
-        let seven_one = stereo_downmix_filter(8).expect("7.1 has a matrix");
+        assert_eq!(
+            stereo_downmix_filter(6, Some("5.1(back)")).as_deref(),
+            Some(five_one.as_str())
+        );
+        let seven_one = stereo_downmix_filter(8, Some("7.1")).expect("7.1 has a matrix");
         assert_eq!(
             seven_one,
             "pan=stereo|c0=0.707*c0+1.0*c2+0.707*c4+0.707*c6+0.5*c3\
@@ -175,10 +196,19 @@ mod tests {
                 "centre must reach both ears"
             );
         }
+        // Same channel count as 5.1, wrong index map — must not borrow the table.
+        assert!(stereo_downmix_filter(6, Some("6.0")).is_none());
+        assert!(stereo_downmix_filter(6, Some("5.1(side)")).is_none());
         // No table: the caller falls back to -ac 2 rather than to silence.
         for odd in [1, 2, 3, 4, 5, 7, 12] {
-            assert!(stereo_downmix_filter(odd).is_none(), "{odd} has no table");
+            assert!(
+                stereo_downmix_filter(odd, None).is_none(),
+                "{odd} has no table"
+            );
         }
+        // Anonymous 6/8-channel (no layout tag) keeps the channel-count guess.
+        assert!(stereo_downmix_filter(6, None).is_some());
+        assert!(stereo_downmix_filter(8, None).is_some());
     }
 
     fn ffmpeg_available() -> bool {
@@ -221,7 +251,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (channels, layout) in [(6u32, "5.1"), (8, "7.1")] {
             let out = dir.path().join(format!("{channels}.wav"));
-            let filter = stereo_downmix_filter(channels).unwrap();
+            let filter = stereo_downmix_filter(channels, Some(layout)).unwrap();
             let status = Command::new("ffmpeg")
                 .args([
                     "-nostdin",

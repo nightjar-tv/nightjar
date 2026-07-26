@@ -47,8 +47,13 @@ the same session surface so audio switching is solved once.
    ```
 
    7.1 adds side surrounds at the same surround coefficient. Mono/stereo
-   sources skip the filter. Layouts outside these tables fall back to
-   `-ac 2` with a logged warning (better than silence).
+   sources skip the filter. Layouts are matched by name (`5.1`, `5.1(back)`,
+   `7.1`, `7.1(wide)`), not by channel count: `6.0` and `5.1(side)` also
+   report six channels but do not share the 5.1(back) index map, so applying
+   that matrix can drop dialogue. Those — and any other named layout outside
+   the tables — fall back to `-ac 2` with a logged warning (better than
+   silence). When ffprobe omits the layout, channel count is the last-resort
+   guess for anonymous six/eight-channel streams.
 
 4. **Multi-track: restart-on-switch via a fresh session.** Switching audio
    POSTs a new session at the current position with a different
@@ -64,7 +69,10 @@ the same session surface so audio switching is solved once.
    (switch during playback). If warm switches consistently exceed 3s, or the
    cost is source-read dominated rather than encode-startup dominated,
    alternate HLS AUDIO renditions get their own ADR. A preference without
-   that threshold decays.
+   that threshold decays. **Measured (corpus multilang MKV, local disk,
+   2026-07-26):** cold start 0.11 s; warm switch to `e2` 0.11 s — two orders
+   of magnitude inside the 3 s budget. Alternate renditions stay closed unless
+   that number moves.
 
 6. **Track identity (Rule 4.9 / 4.11).** Embedded audio uses
    `trackId = e{streamIndex}` (absolute ffprobe index), the same scheme as
@@ -108,13 +116,15 @@ One switch model for remux and transcode. Hybrid avoids pointless video
 re-encodes. Seek retention policy stays single-purpose.
 
 **Corpus.** Existing 7.1 and mono fixtures verify the ceiling and passthrough.
-New synthetic multi-language and commentary MKVs cover switch. Dialogue
-audibility of a 5.1→stereo downmix is a listen check, not a CI assert: a
-centre-only 5.1 tone through the pan matrix lands equal energy in both stereo
-channels (~−21 dB RMS), which is the automated proxy; someone still has to
-hear a real title.
+New synthetic multi-language and commentary MKVs cover switch. `6.0` (FLAC)
+and `5.1(side)` (AC3) fixtures cover the `-ac 2` fallback: same channel count
+as a pan table, wrong index map. Dialogue audibility of a 5.1→stereo downmix
+is a listen check, not a CI assert: a centre-only 5.1 tone through the pan
+matrix lands equal energy in both stereo channels (~−21 dB RMS), which is the
+automated proxy; someone still has to hear a real title.
 
 **Measured switch (corpus multilang MKV, local disk).** Cold session start
 0.11 s; warm mid-playback switch to `e2` (fresh POST + first segment) 0.11 s —
-inside the 3 s revisit budget on this hardware. NAS multi-track titles should
-be re-checked when dogfooding.
+two orders of magnitude inside the 3 s revisit budget on this hardware. That
+number is what keeps alternate AUDIO renditions closed. NAS multi-track titles
+should be re-checked when dogfooding.
