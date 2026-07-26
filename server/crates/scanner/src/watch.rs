@@ -1,5 +1,6 @@
 //! Debounced filesystem watch that triggers async library rescans.
 
+use crate::reachability::REACHABILITY_INTERVAL;
 use crate::{LibraryPool, start_scan_job};
 use nightjar_db::Db;
 use notify::RecursiveMode;
@@ -22,9 +23,6 @@ pub fn spawn_library_watcher(db: Arc<Db>, pool: Arc<LibraryPool>) {
 }
 
 fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
-    // Recursive FS watches on SMB compete with the index walk for metadata
-    // IOPS (dogfood: Movies cold walk >15 min with notify vs ~2 min poll-only).
-    // Poll remains the reliable path on network shares (ADR-0013).
     let poll_only = std::env::var("NIGHTJAR_POLL_ONLY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -38,8 +36,10 @@ fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
 fn run_poll_only(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
     let mut watched: HashMap<i64, PathBuf> = HashMap::new();
     let mut last_poll = std::time::Instant::now();
+    let mut last_reach = std::time::Instant::now();
     loop {
         sync_library_roots(&db, &mut watched)?;
+        maybe_reachability(&pool, &mut last_reach);
         std::thread::sleep(Duration::from_secs(5));
         maybe_poll(&db, &pool, &watched, &mut last_poll);
     }
@@ -54,8 +54,7 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
 
     let mut watched: HashMap<i64, PathBuf> = HashMap::new();
     let mut last_poll = std::time::Instant::now();
-    // Recursive SMB watches compete with the cold walk for metadata IOPS.
-    // Poll until one index pass finishes (walk cache warm), then arm notify.
+    let mut last_reach = std::time::Instant::now();
     let mut notify_armed = false;
     loop {
         if notify_armed {
@@ -77,14 +76,14 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                         continue;
                     }
                     if let Some(id) = library_for_path(&watched, &ev.path) {
+                        if !pool.is_library_reachable(id) {
+                            continue;
+                        }
                         tracing::info!(
                             library_id = id,
                             path = %ev.path.display(),
                             "fs change; starting scan job"
                         );
-                        // If a walk is already past this directory, coalescing
-                        // into the active job would miss the add. Mark dirty so
-                        // a follow-up scan runs when the active job finishes.
                         match db.active_scan_job(id) {
                             Ok(Some(_)) => pool.mark_scan_dirty(id),
                             Ok(None) => {}
@@ -111,8 +110,19 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                 return Err("watch channel disconnected".into());
             }
         }
+        maybe_reachability(&pool, &mut last_reach);
         maybe_poll(&db, &pool, &watched, &mut last_poll);
     }
+}
+
+fn maybe_reachability(pool: &Arc<LibraryPool>, last: &mut std::time::Instant) {
+    if last.elapsed() < REACHABILITY_INTERVAL {
+        return;
+    }
+    if let Err(e) = pool.tick_reachability() {
+        tracing::warn!(error = %e, "reachability tick failed");
+    }
+    *last = std::time::Instant::now();
 }
 
 fn maybe_poll(
@@ -126,6 +136,9 @@ fn maybe_poll(
         return;
     }
     for library_id in watched.keys() {
+        if !pool.is_library_reachable(*library_id) {
+            continue;
+        }
         tracing::info!(
             library_id,
             poll_interval_s = poll_every.as_secs(),

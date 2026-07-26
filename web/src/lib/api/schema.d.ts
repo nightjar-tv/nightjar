@@ -330,15 +330,15 @@ export interface components {
         /** @enum {string} */
         MediaKind: "movie" | "episode" | "unknown";
         /**
-         * @description indexed = walk+filename done, codecs pending; probed = ffprobe ok; error = ffprobe failed (see scanError).
+         * @description indexed = walk+filename done, codecs pending; probed = ffprobe ok; error = permanent ffprobe/parse failure (see scanError); unavailable = mount/IO absence, retriable (ADR-0014).
          * @enum {string}
          */
-        ProbeStatus: "indexed" | "probed" | "error";
+        ProbeStatus: "indexed" | "probed" | "error" | "unavailable";
         /**
-         * @description pending = extract queued or in progress; ready = WebVTT on disk; none = no serveable text tracks; error = last extract failed (ADR-0013).
+         * @description pending = extract queued or in progress; ready = WebVTT on disk; none = no serveable text tracks; error = permanent extract failure; unavailable = mount/IO absence, retriable (ADR-0014).
          * @enum {string}
          */
-        SubtitleStatus: "pending" | "ready" | "none" | "error";
+        SubtitleStatus: "pending" | "ready" | "none" | "error" | "unavailable";
         /** @enum {string} */
         ScanJobState: "queued" | "indexing" | "probing" | "completed" | "failed";
         /**
@@ -368,6 +368,8 @@ export interface components {
             kind: components["schemas"]["LibraryKind"];
             /** Format: int64 */
             itemCount: number;
+            /** @description False when the library root is not reachable (unmounted share, missing path). Work is paused until it returns (ADR-0014). */
+            reachable: boolean;
         };
         CreateLibraryRequest: {
             name: string;

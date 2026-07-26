@@ -101,8 +101,11 @@
 		<header>
 			<h1>{library.name}</h1>
 			<p class="path">{library.path}</p>
+			{#if !library.reachable}
+				<p class="error" role="alert">{copy.folderUnreachable(library.path)}</p>
+			{/if}
 			<button type="button" onclick={scan} disabled={scanning}>
-				{scanning ? 'Scanning…' : 'Scan library'}
+				{scanning ? 'Scanning…' : library.reachable ? 'Scan library' : copy.rescan}
 			</button>
 			{#if scanning}
 				<p class="scan">{copy.scanInProgress}</p>

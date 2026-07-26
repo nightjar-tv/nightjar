@@ -28,6 +28,25 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Refuse extract when the data volume has less free space than this.
 const MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// IO kinds that usually mean the mount/share is gone, not a bad subtitle file.
+pub fn io_error_is_availability(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::BrokenPipe
+            | ErrorKind::TimedOut
+            | ErrorKind::UnexpectedEof
+    ) || err.raw_os_error().is_some_and(|c| {
+        // ESTALE / ENOTCONN on Unix when the SMB mount half-dies.
+        c == 70 || c == 57 || c == 60
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubtitleSourceKind {
     Embedded,
@@ -319,8 +338,16 @@ fn write_sidecar_webvtt(
     item_id: i64,
     sidecar: &SidecarInput,
 ) -> Result<(), String> {
-    let bytes = fs::read(&sidecar.path)
-        .map_err(|e| format!("read sidecar subtitle {}: {e}", sidecar.path.display()))?;
+    let bytes = fs::read(&sidecar.path).map_err(|e| {
+        if crate::io_error_is_availability(&e) {
+            format!(
+                "unavailable: read sidecar subtitle {}: {e}",
+                sidecar.path.display()
+            )
+        } else {
+            format!("read sidecar subtitle {}: {e}", sidecar.path.display())
+        }
+    })?;
     let body = if sidecar.format.eq_ignore_ascii_case("vtt") {
         let text = decode_subtitle_bytes(&bytes);
         if text.contains("WEBVTT") {

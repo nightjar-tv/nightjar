@@ -5,6 +5,9 @@ export const copy = {
 	emptyLibrary: 'Nothing roosting here yet.',
 	emptyLibraryHint: 'Add a media folder and Nightjar will take care of the rest.',
 	addFolder: 'Add folder',
+	folderUnreachable: (path: string) =>
+		`The folder ${path} isn't reachable. Check that the drive is mounted, then rescan.`,
+	rescan: 'Rescan',
 	preparingSession: 'Starting playback session…',
 	sessionsBusy:
 		'All playback sessions are in use. Close another player tab and try again.',
@@ -17,4 +20,4 @@ export const copy = {
 	switchingAudio: 'Switching audio track…',
 	audioSwitchUnsupported:
 		'This browser cannot switch audio tracks on a file it plays directly.'
-} as const;
+};

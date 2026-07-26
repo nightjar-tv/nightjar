@@ -17,6 +17,7 @@ pub struct LibraryDto {
     pub path: String,
     pub kind: String,
     pub item_count: i64,
+    pub reachable: bool,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +193,7 @@ fn to_dto(row: nightjar_db::LibraryRow) -> LibraryDto {
         path: row.path,
         kind: row.kind,
         item_count: row.item_count,
+        reachable: row.reachable,
     }
 }
 

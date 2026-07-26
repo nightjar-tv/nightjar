@@ -1,4 +1,5 @@
 use crate::probe;
+use crate::reachability::{self, Availability, Reachability, message_looks_unavailable};
 use crate::walk::WalkCache;
 use nightjar_db::{Db, ProbeUpdate};
 use nightjar_transcode::{ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles};
@@ -18,26 +19,29 @@ pub enum WorkKind {
 pub struct WorkItem {
     pub kind: WorkKind,
     pub item_id: i64,
+    pub library_id: i64,
     pub path: PathBuf,
     pub scan_job_id: Option<i64>,
     batch: Option<Arc<ProbeBatchState>>,
 }
 
 impl WorkItem {
-    pub fn probe(item_id: i64, path: PathBuf, scan_job_id: Option<i64>) -> Self {
+    pub fn probe(item_id: i64, library_id: i64, path: PathBuf, scan_job_id: Option<i64>) -> Self {
         Self {
             kind: WorkKind::Probe,
             item_id,
+            library_id,
             path,
             scan_job_id,
             batch: None,
         }
     }
 
-    pub fn extract(item_id: i64, path: PathBuf) -> Self {
+    pub fn extract(item_id: i64, library_id: i64, path: PathBuf) -> Self {
         Self {
             kind: WorkKind::Extract,
             item_id,
+            library_id,
             path,
             scan_job_id: None,
             batch: None,
@@ -82,20 +86,15 @@ pub struct LibraryPool {
     queue: Mutex<Queue>,
     available: Condvar,
     walk_caches: Mutex<HashMap<i64, WalkCache>>,
-    /// Longest recent index-pass wall time; poll interval scales from this.
     last_index_ms: AtomicU64,
-    /// Libraries that saw an fs change while a scan job was already active.
-    /// The in-progress walk may have already passed the changed directory;
-    /// a follow-up scan runs after the active job finishes (ADR-0013).
     scan_dirty: Mutex<HashSet<i64>>,
-    /// Count of libraries currently in the index walk. Extract work is deferred
-    /// while this is non-zero so SMB reads for listing are not starved by
-    /// multi-minute demuxes (ADR-0013).
     index_active: AtomicUsize,
+    pub availability: Arc<Availability>,
 }
 
 impl LibraryPool {
     pub fn spawn(db: Arc<Db>, subs: Arc<SubsStore>) -> Arc<Self> {
+        let availability = Availability::new();
         let pool = Arc::new(Self {
             db,
             subs,
@@ -108,6 +107,7 @@ impl LibraryPool {
             last_index_ms: AtomicU64::new(0),
             scan_dirty: Mutex::new(HashSet::new()),
             index_active: AtomicUsize::new(0),
+            availability,
         });
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -120,7 +120,17 @@ impl LibraryPool {
                 .spawn(move || worker.run_worker())
                 .expect("spawn library worker");
         }
+        // Seed pause set from DB.
+        if let Ok(libs) = pool.db.list_libraries() {
+            for lib in libs {
+                pool.availability.pause.set_paused(lib.id, !lib.reachable);
+            }
+        }
         pool
+    }
+
+    pub fn transition_count(&self) -> u64 {
+        self.availability.transitions.load(Ordering::Relaxed)
     }
 
     pub fn record_index_duration_ms(&self, ms: u64) {
@@ -131,8 +141,6 @@ impl LibraryPool {
         self.last_index_ms.load(Ordering::Relaxed)
     }
 
-    /// Poll period: at least 60s, else 2× the longest recent index pass so a
-    /// full SMB walk cannot stack on top of itself (ADR-0013).
     pub fn poll_interval(&self) -> Duration {
         let ms = self.last_index_duration_ms();
         let secs = (ms.saturating_mul(2) / 1000).max(60);
@@ -170,7 +178,80 @@ impl LibraryPool {
         }
     }
 
+    pub fn is_library_reachable(&self, library_id: i64) -> bool {
+        !self.availability.pause.is_paused(library_id)
+    }
+
+    /// Apply a reachability transition. One log line per change (ADR-0014).
+    pub fn set_library_reachability(
+        &self,
+        library_id: i64,
+        path: &str,
+        reachable: bool,
+    ) -> Result<(), String> {
+        let was_paused = self.availability.pause.is_paused(library_id);
+        let now_paused = !reachable;
+        if was_paused == now_paused {
+            let _ = self.db.set_library_reachable(library_id, reachable);
+            return Ok(());
+        }
+        self.db.set_library_reachable(library_id, reachable)?;
+        self.availability.pause.set_paused(library_id, now_paused);
+        self.availability
+            .transitions
+            .fetch_add(1, Ordering::Relaxed);
+        if reachable {
+            tracing::info!(library_id, path, "library reachable");
+            let (probes, extracts) = self.db.requeue_unavailable_for_library(library_id)?;
+            if probes > 0 || extracts > 0 {
+                tracing::info!(
+                    library_id,
+                    probes,
+                    extracts,
+                    "re-queued availability failures"
+                );
+            }
+            self.purge_queue_for_library(library_id);
+            self.drain_pending_probes()?;
+            self.drain_pending_extracts()?;
+        } else {
+            tracing::info!(library_id, path, "library unreachable");
+            self.purge_queue_for_library(library_id);
+        }
+        self.available.notify_all();
+        Ok(())
+    }
+
+    fn purge_queue_for_library(&self, library_id: i64) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept_probes = VecDeque::new();
+        while let Some(item) = queue.probes.pop_front() {
+            if item.library_id == library_id {
+                if let Some(batch) = item.batch {
+                    let mut remaining = batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
+                    *remaining = remaining.saturating_sub(1);
+                    if *remaining == 0 {
+                        batch.ready.notify_all();
+                    }
+                }
+            } else {
+                kept_probes.push_back(item);
+            }
+        }
+        queue.probes = kept_probes;
+        let mut kept_extracts = VecDeque::new();
+        while let Some(item) = queue.extracts.pop_front() {
+            if item.library_id != library_id {
+                kept_extracts.push_back(item);
+            }
+        }
+        queue.extracts = kept_extracts;
+    }
+
     pub fn enqueue(&self, item: WorkItem) {
+        if self.availability.pause.is_paused(item.library_id) {
+            return;
+        }
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         match item.kind {
             WorkKind::Probe => queue.probes.push_back(item),
@@ -189,6 +270,11 @@ impl LibraryPool {
         }
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         for mut item in items {
+            if self.availability.pause.is_paused(item.library_id) {
+                let mut remaining = state.remaining.lock().unwrap_or_else(|e| e.into_inner());
+                *remaining = remaining.saturating_sub(1);
+                continue;
+            }
             item.kind = WorkKind::Probe;
             item.batch = Some(Arc::clone(&state));
             queue.probes.push_back(item);
@@ -197,19 +283,23 @@ impl LibraryPool {
         ProbeBatch { state }
     }
 
-    /// Re-queue items left `indexed` after a prior process exit (ADR-0013).
     pub fn drain_pending_probes(&self) -> Result<usize, String> {
         let items = self.db.list_indexed_unprobed()?;
         let n = items.len();
-        for (item_id, path) in items {
-            self.enqueue(WorkItem::probe(item_id, PathBuf::from(path), None));
+        for (item_id, path, library_id) in items {
+            self.enqueue(WorkItem::probe(
+                item_id,
+                library_id,
+                PathBuf::from(path),
+                None,
+            ));
         }
         Ok(n)
     }
 
     pub fn drain_pending_extracts(&self) -> Result<(), String> {
-        for (item_id, path, _, _) in self.db.list_pending_subtitle_items()? {
-            self.enqueue(WorkItem::extract(item_id, PathBuf::from(path)));
+        for (item_id, path, _, _, library_id) in self.db.list_pending_subtitle_items()? {
+            self.enqueue(WorkItem::extract(item_id, library_id, PathBuf::from(path)));
         }
         Ok(())
     }
@@ -222,19 +312,48 @@ impl LibraryPool {
         self.subs.cleanup_orphans(&self.db.list_all_item_ids()?)
     }
 
+    /// One reachability tick for all libraries (non-overlapping).
+    pub fn tick_reachability(&self) -> Result<(), String> {
+        if !self.availability.tick_gate.try_begin() {
+            return Ok(());
+        }
+        let result = (|| {
+            for lib in self.db.list_libraries()? {
+                let state = reachability::check_root(std::path::Path::new(&lib.path));
+                let reachable = matches!(state, Reachability::Reachable);
+                self.set_library_reachability(lib.id, &lib.path, reachable)?;
+            }
+            Ok(())
+        })();
+        self.availability.tick_gate.end();
+        result
+    }
+
     fn run_worker(&self) {
         loop {
             let item = {
                 let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if let Some(item) = queue.probes.pop_front() {
+                        if self.availability.pause.is_paused(item.library_id) {
+                            if let Some(batch) = &item.batch {
+                                let mut remaining =
+                                    batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
+                                *remaining = remaining.saturating_sub(1);
+                                if *remaining == 0 {
+                                    batch.ready.notify_all();
+                                }
+                            }
+                            continue;
+                        }
                         break item;
                     }
-                    // Defer extracts while any library is walking so index
-                    // listing keeps SMB bandwidth (probe still runs).
                     if self.index_active.load(Ordering::SeqCst) == 0
                         && let Some(item) = queue.extracts.pop_front()
                     {
+                        if self.availability.pause.is_paused(item.library_id) {
+                            continue;
+                        }
                         break item;
                     }
                     queue = self
@@ -251,7 +370,21 @@ impl LibraryPool {
         }
     }
 
+    fn finish_batch(item: &WorkItem) {
+        if let Some(batch) = &item.batch {
+            let mut remaining = batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
+            *remaining -= 1;
+            if *remaining == 0 {
+                batch.ready.notify_all();
+            }
+        }
+    }
+
     fn probe(&self, item: WorkItem) {
+        if self.availability.pause.is_paused(item.library_id) {
+            Self::finish_batch(&item);
+            return;
+        }
         let update = match probe::ffprobe(&item.path) {
             Ok(p) => ProbeUpdate {
                 item_id: item.item_id,
@@ -266,22 +399,58 @@ impl LibraryPool {
                 scan_error: None,
             },
             Err(e) => {
-                tracing::warn!(path = %item.path.display(), error = %e, "ffprobe failed");
-                ProbeUpdate {
-                    item_id: item.item_id,
-                    duration_ms: None,
-                    container: None,
-                    video_codec: None,
-                    audio_codec: None,
-                    audio_channels: None,
-                    width: None,
-                    height: None,
-                    probe_status: "error".into(),
-                    scan_error: Some(e),
+                let unavailable = self.availability.pause.is_paused(item.library_id)
+                    || message_looks_unavailable(&e)
+                    || {
+                        // Re-check root: mid-pass unmount.
+                        self.db
+                            .get_library(item.library_id)
+                            .ok()
+                            .flatten()
+                            .map(|lib| {
+                                matches!(
+                                    reachability::check_root(std::path::Path::new(&lib.path)),
+                                    Reachability::Unreachable
+                                )
+                            })
+                            .unwrap_or(false)
+                    };
+                if unavailable {
+                    tracing::warn!(
+                        path = %item.path.display(),
+                        error = %e,
+                        "ffprobe unavailable"
+                    );
+                    ProbeUpdate {
+                        item_id: item.item_id,
+                        duration_ms: None,
+                        container: None,
+                        video_codec: None,
+                        audio_codec: None,
+                        audio_channels: None,
+                        width: None,
+                        height: None,
+                        probe_status: "unavailable".into(),
+                        scan_error: Some(e),
+                    }
+                } else {
+                    tracing::warn!(path = %item.path.display(), error = %e, "ffprobe failed");
+                    ProbeUpdate {
+                        item_id: item.item_id,
+                        duration_ms: None,
+                        container: None,
+                        video_codec: None,
+                        audio_codec: None,
+                        audio_channels: None,
+                        width: None,
+                        height: None,
+                        probe_status: "error".into(),
+                        scan_error: Some(e),
+                    }
                 }
             }
         };
-        let failed = update.scan_error.is_some();
+        let failed = update.probe_status == "error";
         if let Err(e) = self.db.apply_probe_update(&update) {
             tracing::warn!(item_id = item.item_id, error = %e, "probe update failed");
         }
@@ -290,16 +459,13 @@ impl LibraryPool {
         {
             tracing::warn!(job_id, error = %e, "probe counter bump failed");
         }
-        if let Some(batch) = item.batch {
-            let mut remaining = batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
-            *remaining -= 1;
-            if *remaining == 0 {
-                batch.ready.notify_all();
-            }
-        }
+        Self::finish_batch(&item);
     }
 
     fn extract(&self, item: WorkItem) {
+        if self.availability.pause.is_paused(item.library_id) {
+            return;
+        }
         let row = match self.db.get_item(item.item_id) {
             Ok(Some(row)) => row,
             Ok(None) => return,
@@ -347,12 +513,40 @@ impl LibraryPool {
                 tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract deferred");
             }
             Err(e) => {
-                tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract failed");
-                if let Err(status_err) =
-                    self.db
-                        .set_subtitle_status(item.item_id, "error", None, None)
-                {
-                    tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle error failed");
+                let unavailable = self.availability.pause.is_paused(item.library_id)
+                    || message_looks_unavailable(&e)
+                    || self
+                        .db
+                        .get_library(item.library_id)
+                        .ok()
+                        .flatten()
+                        .map(|lib| {
+                            matches!(
+                                reachability::check_root(std::path::Path::new(&lib.path)),
+                                Reachability::Unreachable
+                            )
+                        })
+                        .unwrap_or(false);
+                if unavailable {
+                    tracing::warn!(
+                        item_id = item.item_id,
+                        error = %e,
+                        "subtitle extract unavailable"
+                    );
+                    if let Err(status_err) =
+                        self.db
+                            .set_subtitle_status(item.item_id, "unavailable", None, None)
+                    {
+                        tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle unavailable failed");
+                    }
+                } else {
+                    tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract failed");
+                    if let Err(status_err) =
+                        self.db
+                            .set_subtitle_status(item.item_id, "error", None, None)
+                    {
+                        tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle error failed");
+                    }
                 }
             }
         }

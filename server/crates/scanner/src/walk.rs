@@ -51,6 +51,8 @@ pub struct WalkOutcome {
     /// Directories whose contents were readdir'd this pass (cold, or mtime moved).
     /// Sidecar rediscovery is only needed for media whose parent is in this set.
     pub relisted_dirs: HashSet<PathBuf>,
+    /// Metadata/readdir failures skipped during the walk (ADR-0014 doubt signal).
+    pub listing_errors: u32,
 }
 
 /// Walk `root`, following directories but not symlink loops. Permission errors are skipped.
@@ -65,6 +67,7 @@ pub fn walk_media_files_cached(
 ) -> Result<WalkOutcome, String> {
     let mut out = Vec::new();
     let mut relisted_dirs = HashSet::new();
+    let mut listing_errors = 0u32;
     let mut stack = vec![root.to_path_buf()];
     let mut seen = HashSet::new();
     let mut next_dirs: HashMap<PathBuf, CachedDir> = HashMap::new();
@@ -77,6 +80,7 @@ pub fn walk_media_files_cached(
         let meta = match fs::metadata(&dir) {
             Ok(m) => m,
             Err(e) => {
+                listing_errors += 1;
                 tracing::warn!(path = %dir.display(), error = %e, "skip unreadable directory");
                 continue;
             }
@@ -99,6 +103,7 @@ pub fn walk_media_files_cached(
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
+                listing_errors += 1;
                 tracing::warn!(path = %dir.display(), error = %e, "skip unreadable directory");
                 continue;
             }
@@ -107,6 +112,7 @@ pub fn walk_media_files_cached(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
+                    listing_errors += 1;
                     tracing::warn!(error = %e, "skip unreadable entry");
                     continue;
                 }
@@ -115,6 +121,7 @@ pub fn walk_media_files_cached(
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
+                    listing_errors += 1;
                     tracing::warn!(path = %path.display(), error = %e, "skip unreadable metadata");
                     continue;
                 }
@@ -155,6 +162,7 @@ pub fn walk_media_files_cached(
     Ok(WalkOutcome {
         files: out,
         relisted_dirs,
+        listing_errors,
     })
 }
 

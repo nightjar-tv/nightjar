@@ -35,11 +35,13 @@ struct FfStream {
     height: Option<i32>,
 }
 
+const STDERR_TAIL: usize = 512;
+
 pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
-            "quiet",
+            "error",
             "-print_format",
             "json",
             "-show_format",
@@ -49,18 +51,23 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "ffprobe not found on PATH".into()
+                "spawn ffprobe: not found on PATH".into()
             } else {
                 format!("spawn ffprobe for {}: {e}", path.display())
             }
         })?;
 
     if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr_tail(stderr.trim());
         return Err(format!(
-            "ffprobe failed for {}: {}",
-            path.display(),
-            stderr.trim()
+            "ffprobe failed for {} (exit {code}): {tail}",
+            path.display()
         ));
     }
 
@@ -108,4 +115,64 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
         width,
         height,
     })
+}
+
+fn stderr_tail(s: &str) -> String {
+    if s.is_empty() {
+        return "(no stderr)".into();
+    }
+    if s.len() <= STDERR_TAIL {
+        return s.to_string();
+    }
+    let start = s.len() - STDERR_TAIL;
+    format!("…{}", &s[start..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn spawn_failure_message_is_distinct() {
+        // Point PATH away so spawn fails distinctly from process exit.
+        let err = {
+            let old = std::env::var_os("PATH");
+            unsafe { std::env::set_var("PATH", "/var/empty-nightjar-no-ffprobe") };
+            let r = ffprobe(Path::new("/tmp/x.mkv"));
+            match old {
+                Some(v) => unsafe { std::env::set_var("PATH", v) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+            r.unwrap_err()
+        };
+        assert!(
+            err.starts_with("spawn ffprobe"),
+            "expected spawn message, got {err}"
+        );
+        assert!(!err.starts_with("ffprobe failed"));
+    }
+
+    #[test]
+    fn process_failure_includes_exit_code() {
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_none()
+            && Command::new("ffprobe")
+                .arg("-version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                == false
+        {
+            return;
+        }
+        let path = PathBuf::from("/tmp/nightjar-definitely-missing-probe-target.mkv");
+        let err = ffprobe(&path).unwrap_err();
+        assert!(
+            err.contains("exit ") || err.starts_with("spawn ffprobe"),
+            "expected exit code or spawn, got {err}"
+        );
+        if err.starts_with("ffprobe failed") {
+            assert!(!err.ends_with(": "), "empty body after colon: {err}");
+        }
+    }
 }

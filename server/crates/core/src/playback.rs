@@ -68,10 +68,14 @@ pub fn decide_playback(
     probe_status: &str,
     profile: &ClientCapabilityProfile,
 ) -> PlaybackDecision {
-    if probe_status == "indexed" {
+    if probe_status == "indexed" || probe_status == "unavailable" {
         return PlaybackDecision {
             method: PlaybackMethod::Transcode,
-            reason: "probe pending".into(),
+            reason: if probe_status == "unavailable" {
+                "library unavailable".into()
+            } else {
+                "probe pending".into()
+            },
             mime_type: mime_for_path(path),
         };
     }

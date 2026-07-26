@@ -20,8 +20,8 @@ pub use hwaccel::{
 pub use subs::{
     DiscoveredSidecar, ExtractOutcome, SidecarInput, SubsStore, SubtitleSourceKind,
     TextSubtitleStream, decode_subtitle_bytes, discover_sidecars, extract_item_subtitles,
-    is_serveable_sidecar_format, is_text_subtitle_codec, list_text_subtitles, normalize_language,
-    srt_to_webvtt, stored_webvtt,
+    io_error_is_availability, is_serveable_sidecar_format, is_text_subtitle_codec,
+    list_text_subtitles, normalize_language, srt_to_webvtt, stored_webvtt,
 };
 
 pub fn version() -> &'static str {

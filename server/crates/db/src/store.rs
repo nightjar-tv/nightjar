@@ -1,4 +1,5 @@
 use crate::migrate;
+use crate::status::{parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -21,6 +22,8 @@ pub struct LibraryRow {
     pub path: String,
     pub kind: String,
     pub item_count: i64,
+    /// ADR-0014: false when the library root is not reachable.
+    pub reachable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +146,7 @@ impl Db {
             path: lib.path.clone(),
             kind: lib.kind.clone(),
             item_count: 0,
+            reachable: true,
         })
     }
 
@@ -151,21 +155,14 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT l.id, l.name, l.path, l.kind,
-                        (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id)
+                        (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id),
+                        l.reachable
                  FROM libraries l
                  ORDER BY l.name COLLATE NOCASE",
             )
             .map_err(|e| format!("prepare list libraries: {e}"))?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(LibraryRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    kind: r.get(3)?,
-                    item_count: r.get(4)?,
-                })
-            })
+            .query_map([], map_library)
             .map_err(|e| format!("query libraries: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("read libraries: {e}"))
@@ -175,21 +172,34 @@ impl Db {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT l.id, l.name, l.path, l.kind,
-                    (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id)
+                    (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id),
+                    l.reachable
              FROM libraries l WHERE l.id = ?1",
             [id],
-            |r| {
-                Ok(LibraryRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    kind: r.get(3)?,
-                    item_count: r.get(4)?,
-                })
-            },
+            map_library,
         )
         .optional()
         .map_err(|e| format!("get library {id}: {e}"))
+    }
+
+    pub fn set_library_reachable(&self, library_id: i64, reachable: bool) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE libraries SET reachable = ?2 WHERE id = ?1",
+            params![library_id, reachable as i64],
+        )
+        .map_err(|e| format!("set library {library_id} reachable: {e}"))?;
+        Ok(())
+    }
+
+    pub fn count_items(&self, library_id: i64) -> Result<i64, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM media_items WHERE library_id = ?1",
+            [library_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("count items for library {library_id}: {e}"))
     }
 
     pub fn list_items(&self, library_id: i64) -> Result<Vec<MediaItemRow>, String> {
@@ -337,6 +347,7 @@ impl Db {
     }
 
     pub fn apply_probe_update(&self, update: &ProbeUpdate) -> Result<(), String> {
+        let status = parse_probe_status(&update.probe_status)?;
         let conn = self.lock()?;
         conn.execute(
             "UPDATE media_items SET
@@ -360,7 +371,7 @@ impl Db {
                 update.audio_channels,
                 update.width,
                 update.height,
-                update.probe_status,
+                status,
                 update.scan_error,
             ],
         )
@@ -375,6 +386,7 @@ impl Db {
         source_mtime_ms: Option<i64>,
         source_size_bytes: Option<i64>,
     ) -> Result<(), String> {
+        let status = parse_subtitle_status(status)?;
         let conn = self.lock()?;
         conn.execute(
             "UPDATE media_items SET
@@ -388,27 +400,54 @@ impl Db {
         Ok(())
     }
 
+    /// Reset availability failures so the pool can re-drain them (ADR-0014).
+    pub fn requeue_unavailable_for_library(
+        &self,
+        library_id: i64,
+    ) -> Result<(usize, usize), String> {
+        let conn = self.lock()?;
+        let probes = conn
+            .execute(
+                "UPDATE media_items SET probe_status = 'indexed', scan_error = NULL
+                 WHERE library_id = ?1 AND probe_status = 'unavailable'",
+                [library_id],
+            )
+            .map_err(|e| format!("requeue unavailable probes: {e}"))?;
+        let extracts = conn
+            .execute(
+                "UPDATE media_items SET subtitle_status = 'pending',
+                    subtitle_source_mtime_ms = NULL, subtitle_source_size_bytes = NULL
+                 WHERE library_id = ?1 AND subtitle_status = 'unavailable'",
+                [library_id],
+            )
+            .map_err(|e| format!("requeue unavailable extracts: {e}"))?;
+        Ok((probes, extracts))
+    }
+
     /// Items that never finished probing (e.g. process restart mid-scan).
-    pub fn list_indexed_unprobed(&self) -> Result<Vec<(i64, String)>, String> {
+    /// Returns (item_id, path, library_id).
+    pub fn list_indexed_unprobed(&self) -> Result<Vec<(i64, String, i64)>, String> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, path FROM media_items
+                "SELECT id, path, library_id FROM media_items
                  WHERE probe_status = 'indexed'
                  ORDER BY id",
             )
             .map_err(|e| format!("prepare indexed unprobed: {e}"))?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map_err(|e| format!("list indexed unprobed: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("read indexed unprobed: {e}"))
     }
 
-    pub fn list_pending_subtitle_items(&self) -> Result<Vec<(i64, String, i64, i64)>, String> {
+    /// Returns (item_id, path, mtime_ms, size_bytes, library_id).
+    #[allow(clippy::type_complexity)]
+    pub fn list_pending_subtitle_items(&self) -> Result<Vec<(i64, String, i64, i64, i64)>, String> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, path, mtime_ms, size_bytes FROM media_items
+                "SELECT id, path, mtime_ms, size_bytes, library_id FROM media_items
                  WHERE subtitle_status = 'pending'
                     OR (subtitle_status = 'ready' AND (
                         subtitle_source_mtime_ms IS NOT mtime_ms
@@ -416,10 +455,12 @@ impl Db {
                     ))",
             )
             .map_err(|e| format!("prepare pending subtitle items: {e}"))?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .map_err(|e| format!("list pending subtitle items: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read pending subtitle items: {e}"))
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .map_err(|e| format!("list pending subtitle items: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read pending subtitle items: {e}"))
     }
 
     pub fn list_all_item_ids(&self) -> Result<Vec<i64>, String> {
@@ -765,6 +806,18 @@ impl Db {
         .map_err(|e| format!("fail scan job: {e}"))?;
         Ok(())
     }
+}
+
+fn map_library(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRow> {
+    let reachable_i: i64 = r.get(5)?;
+    Ok(LibraryRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        kind: r.get(3)?,
+        item_count: r.get(4)?,
+        reachable: reachable_i != 0,
+    })
 }
 
 fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {

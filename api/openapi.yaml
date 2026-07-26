@@ -545,18 +545,19 @@ components:
 
     ProbeStatus:
       type: string
-      enum: [indexed, probed, error]
+      enum: [indexed, probed, error, unavailable]
       description: >
         indexed = walk+filename done, codecs pending; probed = ffprobe ok;
-        error = ffprobe failed (see scanError).
+        error = permanent ffprobe/parse failure (see scanError);
+        unavailable = mount/IO absence, retriable (ADR-0014).
 
     SubtitleStatus:
       type: string
-      enum: [pending, ready, none, error]
+      enum: [pending, ready, none, error, unavailable]
       description: >
         pending = extract queued or in progress; ready = WebVTT on disk;
-        none = no serveable text tracks; error = last extract failed
-        (ADR-0013).
+        none = no serveable text tracks; error = permanent extract failure;
+        unavailable = mount/IO absence, retriable (ADR-0014).
 
     ScanJobState:
       type: string
@@ -599,7 +600,7 @@ components:
 
     Library:
       type: object
-      required: [id, name, path, kind, itemCount]
+      required: [id, name, path, kind, itemCount, reachable]
       properties:
         id:
           type: integer
@@ -613,6 +614,11 @@ components:
         itemCount:
           type: integer
           format: int64
+        reachable:
+          type: boolean
+          description: >
+            False when the library root is not reachable (unmounted share,
+            missing path). Work is paused until it returns (ADR-0014).
 
     CreateLibraryRequest:
       type: object
