@@ -131,7 +131,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Playback method, remux state, and stream URL for an item */
+        /** Playback method and delivery URL for an item */
         get: operations["getPlaybackInfo"];
         put?: never;
         post?: never;
@@ -158,26 +158,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/items/{itemId}/remux": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Start (or reuse) a background remux for an item
-         * @description Async job per ADR-0006. Returns the current state immediately; poll playback-info until remuxState is ready. When all remux slots are busy the state stays notStarted with a reason; clients re-POST on each poll tick while they see notStarted.
-         */
-        post: operations["startRemux"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v0/items/{itemId}/stream": {
         parameters: {
             query?: never;
@@ -187,7 +167,7 @@ export interface paths {
         };
         /**
          * Byte stream for playback (supports HTTP Range)
-         * @description Serves the original file for directPlay items and the remuxed MP4 for remux items once remuxState is ready.
+         * @description Serves the original file for directPlay items. Remux and transcode items are delivered as HLS sessions (ADR-0011).
          */
         get: operations["streamItem"];
         put?: never;
@@ -208,8 +188,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Start an HLS software-transcode session for an item
-         * @description ADR-0007. Returns 202 with sessionId and playlistUrl. Reuses a live session for the same item at the same startMs (refcount). A divergent startMs forks a new session so other viewers are not disrupted. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+         * Start an HLS playback session for an item
+         * @description ADR-0011. Returns 202 with sessionId and playlistUrl. Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Each POST creates a session; seek with ?startMs= on the playlist restarts that session in place. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
          */
         post: operations["startTranscodeSession"];
         delete?: never;
@@ -226,7 +206,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * HLS master playlist for a transcode session
+         * HLS master playlist for a playback session
          * @description ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start points here. Seek via startMs uses the same window-move rules as the media playlist.
          */
         get: operations["getSessionMasterPlaylist"];
@@ -246,7 +226,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * HLS media playlist for a transcode session
+         * HLS media playlist for a playback session
          * @description Media playlist path is stable (ADR-0008). Segment URIs are relative init.mp4 / segNNN.m4s. Also accepts startMs for seek.
          */
         get: operations["getSessionPlaylist"];
@@ -305,7 +285,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Stop a transcode session and reap its FFmpeg process */
+        /** Stop a playback session and reap its FFmpeg process */
         delete: operations["deleteTranscodeSession"];
         options?: never;
         head?: never;
@@ -357,35 +337,23 @@ export interface components {
         /** @enum {string} */
         ScanJobState: "queued" | "indexing" | "probing" | "completed" | "failed";
         /**
-         * @description directPlay = browser plays the original file; remux = same codecs repackaged to MP4 by a background job; transcode = needs re-encoding, not available yet. Pending or failed probes report transcode.
+         * @description directPlay = browser plays the original file; remux = same codecs in a container the client cannot open, delivered as a stream-copy HLS session; transcode = needs re-encoding, delivered as an encoding HLS session. Pending or failed probes report transcode.
          * @enum {string}
          */
         PlaybackMethod: "directPlay" | "remux" | "transcode";
-        /**
-         * @description Only meaningful when playbackMethod is remux. notStarted may carry a busy reason when all remux slots are in use; clients re-POST while they see it (ADR-0006).
-         * @enum {string}
-         */
-        RemuxState: "notStarted" | "preparing" | "ready" | "failed";
-        RemuxAccepted: {
-            /** Format: int64 */
-            itemId: number;
-            remuxState: components["schemas"]["RemuxState"];
-            /** @description Why the job is not running yet, or why it failed */
-            reason?: string;
-        };
         TranscodeSession: {
             sessionId: string;
             /** Format: int64 */
             itemId: number;
             /** @description Path to the HLS master playlist for this session (master.m3u8). The media playlist remains at index.m3u8 (ADR-0008). */
             playlistUrl: string;
-            /** @description FFmpeg encoder currently used by this session */
+            /** @description FFmpeg encoder currently used by this session, or "copy" when the session stream-copies video (remux). */
             videoEncoder: string;
             /**
-             * @description Whether videoEncoder is a hardware or software encoder
+             * @description Whether videoEncoder is a hardware encoder, a software encoder, or a stream copy.
              * @enum {string}
              */
-            encoderKind: "hardware" | "software";
+            encoderKind: "hardware" | "software" | "copy";
         };
         Library: {
             /** Format: int64 */
@@ -460,17 +428,13 @@ export interface components {
             /** Format: int64 */
             itemId: number;
             playbackMethod: components["schemas"]["PlaybackMethod"];
-            /** @description Present when playbackMethod is remux */
-            remuxState?: components["schemas"]["RemuxState"];
-            /** @description Present when remuxState is failed or start is blocked */
-            remuxError?: string;
             /** @description Why the decision engine chose this method */
             reason: string;
-            /** @description Present only when the item is playable now: directPlay, or remux with remuxState ready. */
+            /** @description Present only when playbackMethod is directPlay */
             streamUrl?: string;
-            /** @description Present when playbackMethod is transcode. POST here to start an HLS session (ADR-0007). */
+            /** @description Present when playbackMethod is remux or transcode. POST here to start an HLS session (ADR-0011). */
             sessionsUrl?: string;
-            /** @description video/mp4 for remux; application/vnd.apple.mpegurl for HLS */
+            /** @description Source MIME for directPlay; application/vnd.apple.mpegurl for session playback. */
             mimeType: string;
             /** Format: int64 */
             durationMs?: number | null;
@@ -830,46 +794,6 @@ export interface operations {
             };
         };
     };
-    startRemux: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                itemId: components["parameters"]["ItemId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Remux state after this request */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RemuxAccepted"];
-                };
-            };
-            /** @description Not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Item does not use the remux method */
-            415: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
     streamItem: {
         parameters: {
             query?: never;
@@ -910,16 +834,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Remux not ready; POST remux and poll playback-info */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Item needs HLS transcode; POST /api/v0/items/{itemId}/sessions */
+            /** @description Item needs an HLS session; POST /api/v0/items/{itemId}/sessions */
             415: {
                 headers: {
                     [name: string]: unknown;
@@ -951,7 +866,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Session started or reused for this item and startMs */
+            /** @description Session started for this item */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -969,7 +884,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item does not use the transcode method */
+            /** @description Item direct plays, or is not ready for a session */
             415: {
                 headers: {
                     [name: string]: unknown;
@@ -992,7 +907,7 @@ export interface operations {
     getSessionMasterPlaylist: {
         parameters: {
             query?: {
-                /** @description Encode window start. With a single holder, changes restart FFmpeg on this session. With multiple holders, returns 409 so the client can POST a forked session at that offset. */
+                /** @description Encode window start; a change restarts this session there */
                 startMs?: number;
             };
             header?: never;
@@ -1021,21 +936,12 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Shared session; fork via POST sessions?startMs= */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     getSessionPlaylist: {
         parameters: {
             query?: {
-                /** @description Encode window start. With a single holder, changes restart FFmpeg on this session. With multiple holders, returns 409 so the client can POST a forked session at that offset. */
+                /** @description Encode window start; a change restarts this session there */
                 startMs?: number;
             };
             header?: never;
@@ -1057,15 +963,6 @@ export interface operations {
             };
             /** @description Session not found or playlist not ready yet */
             404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Shared session; fork via POST sessions?startMs= */
-            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1131,15 +1028,6 @@ export interface operations {
             };
             /** @description Session or asset not found */
             404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Shared session; scrub would restart the shared encoder. Client forks via POST /api/v0/items/{itemId}/sessions?startMs= and DELETE of its prior session id. */
-            409: {
                 headers: {
                     [name: string]: unknown;
                 };

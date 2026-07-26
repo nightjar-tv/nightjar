@@ -1,5 +1,5 @@
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::{decide, remux_key};
+use crate::routes::items::decide;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -8,9 +8,7 @@ use axum::{
     response::Response,
 };
 use nightjar_core::{PlaybackMethod, mime_for_path};
-use nightjar_transcode::RemuxState;
 use std::io::SeekFrom;
-use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -33,37 +31,10 @@ pub async fn stream_item(
             let mime = mime_for_path(&row.path);
             serve_file(path, mime, &headers).await
         }
-        PlaybackMethod::Remux => {
-            let registry = Arc::clone(&state.remux);
-            let key = remux_key(&row);
-            let cache_path = registry.cache_path(&key);
-            let status = tokio::task::spawn_blocking(move || {
-                let status = registry.status(&key);
-                if status == RemuxState::Ready {
-                    registry.touch(&key);
-                }
-                status
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("remux status task: {e}")))?;
-            match status {
-                RemuxState::Ready => serve_file(cache_path, "video/mp4".into(), &headers).await,
-                RemuxState::Failed(e) => Err(ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: format!("remux failed for item {item_id}: {e}"),
-                }),
-                _ => Err(ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: format!(
-                        "remux not ready for item {item_id}; POST /api/v0/items/{item_id}/remux and poll playback-info"
-                    ),
-                }),
-            }
-        }
-        PlaybackMethod::Transcode => Err(ApiError {
+        PlaybackMethod::Remux | PlaybackMethod::Transcode => Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: format!(
-                "item {item_id} needs HLS transcode; POST /api/v0/items/{item_id}/sessions: {}",
+                "item {item_id} needs an HLS session; POST /api/v0/items/{item_id}/sessions: {}",
                 decision.reason
             ),
         }),

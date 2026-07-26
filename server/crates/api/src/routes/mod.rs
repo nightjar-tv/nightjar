@@ -37,7 +37,6 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/items/{item_id}/subtitles/{asset}",
             get(items::subtitle_vtt),
         )
-        .route("/api/v0/items/{item_id}/remux", post(items::start_remux))
         .route("/api/v0/items/{item_id}/sessions", post(sessions::start))
         .route(
             "/api/v0/items/{item_id}/stream",

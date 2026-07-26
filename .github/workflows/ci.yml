@@ -70,7 +70,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
-          # Remux tests must fail, not skip, when ffmpeg is missing in CI.
+          # FFmpeg tests must fail, not skip, when ffmpeg is missing in CI.
           NIGHTJAR_TEST_REQUIRE_FFMPEG: "1"
       - run: cargo build --release -p nightjar-api
 

@@ -10,7 +10,7 @@ use axum::{
 };
 use nightjar_core::PlaybackMethod;
 use nightjar_transcode::{
-    HlsSubtitleTrack, PlaylistError, StartSessionError, warm_embedded_webvtts,
+    HlsSubtitleTrack, PlaylistError, SessionMode, StartSessionError, warm_embedded_webvtts,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -54,19 +54,23 @@ pub async fn start(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
     let decision = decide(&row);
-    if decision.method != PlaybackMethod::Transcode {
-        return Err(ApiError {
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            message: format!("item {item_id} does not use transcode: {}", decision.reason),
-        });
-    }
+    let mode = match decision.method {
+        PlaybackMethod::Remux => SessionMode::Copy,
+        PlaybackMethod::Transcode => SessionMode::Transcode,
+        PlaybackMethod::DirectPlay => {
+            return Err(ApiError {
+                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                message: format!(
+                    "item {item_id} does not need a session: {}",
+                    decision.reason
+                ),
+            });
+        }
+    };
     if row.probe_status != "probed" {
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            message: format!(
-                "item {item_id} is not ready to transcode: {}",
-                decision.reason
-            ),
+            message: format!("item {item_id} is not ready to play: {}", decision.reason),
         });
     }
 
@@ -98,13 +102,15 @@ pub async fn start(
             &src,
             start_ms,
             duration_ms as u64,
+            mode,
             tracks_for_start,
         )
     })
     .await
     .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
 
-    // Transcode has no remux-completion moment; warm races the encode.
+    // First caption request otherwise pays a cold demux of the source; warm
+    // races the session instead (ADR-0010).
     let cache = Arc::clone(&state.subs);
     let warm_src = std::path::PathBuf::from(&row.path);
     let warm_id = row.id;
@@ -144,7 +150,7 @@ pub async fn start(
         }
         Err(StartSessionError::CapFull) => Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "all transcode sessions are in use; retry shortly".into(),
+            message: "all playback sessions are in use; retry shortly".into(),
         }),
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),
     }
@@ -278,12 +284,6 @@ fn map_playlist_err(session_id: &str, err: PlaylistError) -> ApiResult<Response>
             status: StatusCode::NOT_FOUND,
             message: format!("playlist for session {session_id} not ready yet"),
         }),
-        PlaylistError::SharedSeekConflict => Err(ApiError {
-            status: StatusCode::CONFLICT,
-            message: format!(
-                "session {session_id} is shared; POST /api/v0/items/{{id}}/sessions?startMs= to fork"
-            ),
-        }),
         PlaylistError::Failed(e) => Err(ApiError::internal(format!(
             "session {session_id} failed: {e}"
         ))),
@@ -334,12 +334,6 @@ pub async fn asset(
         Err(PlaylistError::NotReady) => Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!("asset {asset} for session {session_id} not ready yet"),
-        }),
-        Err(PlaylistError::SharedSeekConflict) => Err(ApiError {
-            status: StatusCode::CONFLICT,
-            message: format!(
-                "session {session_id} is shared; POST /api/v0/items/{{id}}/sessions?startMs= to fork"
-            ),
         }),
         Err(PlaylistError::Failed(e)) => Err(ApiError::internal(e)),
     }

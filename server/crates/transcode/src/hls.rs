@@ -1,4 +1,6 @@
-//! HLS software-transcode sessions (ADR-0007).
+//! HLS playback sessions (ADR-0007). A session either stream-copies the
+//! source (remux) or re-encodes it (transcode); the two differ by
+//! [`SessionMode`] and nothing else (ADR-0011).
 
 use std::collections::HashMap;
 use std::fs;
@@ -17,7 +19,7 @@ const SEGMENT_MS: u64 = 2000;
 const SEGMENT_WAIT: Duration = Duration::from_secs(15);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
 /// How far ahead of the latest on-disk segment a request may be before we
-/// treat it as a scrub that needs a window move (restart or fork).
+/// treat it as a scrub that needs a window move.
 const CATCH_UP_SEGMENTS: u64 = 2;
 
 #[derive(Debug)]
@@ -31,17 +33,15 @@ pub enum PlaylistError {
     NotFound,
     NotReady,
     Failed(String),
-    /// Other holders share this encode window; client must POST a new session
-    /// at the seek offset instead of restarting this one.
-    SharedSeekConflict,
 }
 
-/// Pure start decision (table-tested). Cap is checked only when creating.
+/// What FFmpeg does with the source for this session (ADR-0011).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartAction {
-    Reuse,
-    Create,
-    CapFull,
+pub enum SessionMode {
+    /// Stream copy: codecs already play, only the container changes.
+    Copy,
+    /// Re-encode to H.264 + AAC.
+    Transcode,
 }
 
 /// Pure window-move decision for a playlist/segment seek intent.
@@ -49,24 +49,11 @@ pub enum StartAction {
 pub enum WindowAction {
     /// Target on disk, or already cooking at this window — serve/wait.
     Serve,
-    /// Sole holder: restart FFmpeg at the aligned offset.
+    /// Restart FFmpeg at the aligned offset.
     Restart,
-    /// Shared holders: client must fork via POST ?startMs=.
-    Fork,
-}
-
-pub fn decide_start(reusable_exists: bool, slots_full: bool) -> StartAction {
-    if reusable_exists {
-        StartAction::Reuse
-    } else if slots_full {
-        StartAction::CapFull
-    } else {
-        StartAction::Create
-    }
 }
 
 pub fn decide_window_action(
-    refs: usize,
     requested_ms: u64,
     window_start_ms: u64,
     target_on_disk: bool,
@@ -74,8 +61,6 @@ pub fn decide_window_action(
     let aligned = align_to_segment(requested_ms);
     if target_on_disk || aligned == window_start_ms {
         WindowAction::Serve
-    } else if refs > 1 {
-        WindowAction::Fork
     } else {
         WindowAction::Restart
     }
@@ -106,6 +91,7 @@ struct Session {
     item_id: i64,
     src: PathBuf,
     dir: PathBuf,
+    mode: SessionMode,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
     start_ms: u64,
@@ -113,9 +99,7 @@ struct Session {
     child: Option<Child>,
     last_access: Instant,
     failed: Option<String>,
-    /// Open players. DELETE decrements; FFmpeg is reaped only at zero (or idle).
-    refs: usize,
-    /// Tracks declared in the master at create; reuse keeps this snapshot.
+    /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
 }
 
@@ -164,16 +148,16 @@ impl HlsSessionRegistry {
         Ok(registry)
     }
 
-    /// Starts a session at `start_ms` (aligned), or reuses a live session for
-    /// the same item at the same encode window (refcount). Divergent offsets
-    /// never share — POST with a new startMs to fork (ADR-0007).
-    /// `subtitle_tracks` is snapshotted on create only; reuse keeps the original.
+    /// Starts a session at `start_ms` (aligned). Every call creates its own
+    /// session; seeking restarts that session in place (ADR-0011).
+    /// `subtitle_tracks` is snapshotted here and never revisited.
     pub fn start(
         &self,
         item_id: i64,
         src: &Path,
         start_ms: u64,
         duration_ms: u64,
+        mode: SessionMode,
         subtitle_tracks: Vec<HlsSubtitleTrack>,
     ) -> Result<String, StartSessionError> {
         let start_ms = align_to_segment(start_ms);
@@ -181,63 +165,42 @@ impl HlsSessionRegistry {
             .sessions
             .lock()
             .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
-
-        let reusable = sessions
-            .iter()
-            .find(|(_, s)| s.item_id == item_id && s.start_ms == start_ms && s.failed.is_none())
-            .map(|(id, _)| id.clone());
-        match decide_start(reusable.is_some(), sessions.len() >= self.max_sessions) {
-            StartAction::Reuse => {
-                let id = reusable.expect("decide_start Reuse");
-                let session = sessions.get_mut(&id).expect("reusable id");
-                session.refs += 1;
-                // Do not bump last_access on join — only playlist/segment
-                // traffic proves a live viewer (idle reaper must beat refs).
-                tracing::info!(
-                    session_id = %id,
-                    item_id,
-                    start_ms,
-                    encoder = %session.video_encoder,
-                    refs = session.refs,
-                    "hls session reused"
-                );
-                Ok(id)
-            }
-            StartAction::CapFull => Err(StartSessionError::CapFull),
-            StartAction::Create => {
-                let id = format!("s{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-                let dir = self.root.join(&id);
-                fs::create_dir_all(&dir).map_err(|e| {
-                    StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
-                })?;
-                let child = spawn_ffmpeg(src, &dir, start_ms, &self.video_encoder)
-                    .map_err(StartSessionError::Spawn)?;
-                sessions.insert(
-                    id.clone(),
-                    Session {
-                        item_id,
-                        src: src.to_path_buf(),
-                        dir,
-                        video_encoder: self.video_encoder.clone(),
-                        start_ms,
-                        duration_ms,
-                        child: Some(child),
-                        last_access: Instant::now(),
-                        failed: None,
-                        refs: 1,
-                        subtitle_tracks,
-                    },
-                );
-                tracing::info!(
-                    session_id = %id,
-                    item_id,
-                    start_ms,
-                    encoder = %self.video_encoder,
-                    "hls session started"
-                );
-                Ok(id)
-            }
+        if sessions.len() >= self.max_sessions {
+            return Err(StartSessionError::CapFull);
         }
+
+        let id = format!("s{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let dir = self.root.join(&id);
+        fs::create_dir_all(&dir).map_err(|e| {
+            StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
+        })?;
+        let child = spawn_ffmpeg(src, &dir, start_ms, mode, &self.video_encoder)
+            .map_err(StartSessionError::Spawn)?;
+        sessions.insert(
+            id.clone(),
+            Session {
+                item_id,
+                src: src.to_path_buf(),
+                dir,
+                mode,
+                video_encoder: self.video_encoder.clone(),
+                start_ms,
+                duration_ms,
+                child: Some(child),
+                last_access: Instant::now(),
+                failed: None,
+                subtitle_tracks,
+            },
+        );
+        tracing::info!(
+            session_id = %id,
+            item_id,
+            start_ms,
+            mode = ?mode,
+            encoder = %self.video_encoder,
+            "hls session started"
+        );
+        Ok(id)
     }
 
     pub fn item_id(&self, session_id: &str) -> Option<i64> {
@@ -251,22 +214,24 @@ impl HlsSessionRegistry {
     pub fn encoder(&self, session_id: &str) -> Option<SessionEncoder> {
         let sessions = self.sessions.lock().ok()?;
         let session = sessions.get(session_id)?;
-        Some(SessionEncoder {
-            name: session.video_encoder.clone(),
-            kind: if session.video_encoder == "libx264" {
-                EncoderKind::Software
-            } else {
-                EncoderKind::Hardware
+        Some(match session.mode {
+            SessionMode::Copy => SessionEncoder {
+                name: "copy".into(),
+                kind: EncoderKind::Copy,
+            },
+            SessionMode::Transcode => SessionEncoder {
+                name: session.video_encoder.clone(),
+                kind: if session.video_encoder == "libx264" {
+                    EncoderKind::Software
+                } else {
+                    EncoderKind::Hardware
+                },
             },
         })
     }
 
-    pub fn refs(&self, session_id: &str) -> Option<usize> {
-        self.sessions.lock().ok()?.get(session_id).map(|s| s.refs)
-    }
-
     /// Returns the VOD media playlist (`index.m3u8`). `start_ms` is seek
-    /// intent: solo holders restart in place; shared holders get 409 (fork).
+    /// intent: a divergent offset restarts this session in place.
     pub fn playlist(
         &self,
         session_id: &str,
@@ -345,9 +310,8 @@ impl HlsSessionRegistry {
                 .dir
                 .join(segment_name(aligned / SEGMENT_MS))
                 .exists();
-            match decide_window_action(session.refs, aligned, session.start_ms, on_disk) {
+            match decide_window_action(aligned, session.start_ms, on_disk) {
                 WindowAction::Serve => {}
-                WindowAction::Fork => return Err(PlaylistError::SharedSeekConflict),
                 WindowAction::Restart => {
                     let encoder = session.video_encoder.clone();
                     restart_at(session, aligned, &encoder)?;
@@ -367,8 +331,8 @@ impl HlsSessionRegistry {
     }
 
     /// Serves init/segment files. Retained segments from a previous encode
-    /// window stay readable. A request far ahead of what is on disk moves the
-    /// window (restart or 409). Safari native scrub hits this path only.
+    /// window stay readable. A request far ahead of what is on disk restarts
+    /// the window. Safari native scrub hits this path only.
     pub fn asset(&self, session_id: &str, name: &str) -> Result<Vec<u8>, PlaylistError> {
         if !is_safe_asset(name) {
             return Err(PlaylistError::NotFound);
@@ -409,11 +373,7 @@ impl HlsSessionRegistry {
                     if far_ahead {
                         let want_ms = idx * SEGMENT_MS;
                         let on_disk = false;
-                        match decide_window_action(session.refs, want_ms, session.start_ms, on_disk)
-                        {
-                            WindowAction::Fork => {
-                                return Err(PlaylistError::SharedSeekConflict);
-                            }
+                        match decide_window_action(want_ms, session.start_ms, on_disk) {
                             WindowAction::Restart => {
                                 let encoder = session.video_encoder.clone();
                                 restart_at(session, want_ms, &encoder)?;
@@ -436,26 +396,16 @@ impl HlsSessionRegistry {
         }
     }
 
+    /// Stops the session this player owns. One session per POST, so there is
+    /// no other holder to consider.
     pub fn stop(&self, session_id: &str) -> bool {
         let mut sessions = match self.sessions.lock() {
             Ok(g) => g,
             Err(_) => return false,
         };
-        let Some(session) = sessions.get_mut(session_id) else {
+        let Some(mut session) = sessions.remove(session_id) else {
             return false;
         };
-        session.refs = session.refs.saturating_sub(1);
-        // Do not bump last_access: a departing holder is not proof of playback,
-        // and refreshing here would defeat the idle reaper that must beat refs.
-        if session.refs > 0 {
-            tracing::info!(
-                session_id,
-                refs = session.refs,
-                "hls session release; still in use"
-            );
-            return true;
-        }
-        let mut session = sessions.remove(session_id).expect("just checked");
         stop_child(&mut session.child);
         if let Err(e) = fs::remove_dir_all(&session.dir) {
             tracing::warn!(
@@ -468,9 +418,9 @@ impl HlsSessionRegistry {
         true
     }
 
-    /// Idle and failed sessions are force-reaped even when refs remain.
-    /// Crashed or sleeping tabs never DELETE; without this the refcount only
-    /// goes up and Gate 2's zero-orphan criterion fails 48 hours later.
+    /// Idle and failed sessions are reaped without a DELETE. Crashed or
+    /// sleeping tabs never send one; without this Gate 2's zero-orphan
+    /// criterion fails 48 hours later.
     fn reaper_loop(&self) {
         loop {
             std::thread::sleep(REAPER_TICK);
@@ -514,6 +464,7 @@ pub struct SessionEncoder {
 pub enum EncoderKind {
     Hardware,
     Software,
+    Copy,
 }
 
 impl EncoderKind {
@@ -521,6 +472,7 @@ impl EncoderKind {
         match self {
             Self::Hardware => "hardware",
             Self::Software => "software",
+            Self::Copy => "copy",
         }
     }
 }
@@ -536,8 +488,14 @@ fn restart_at(
     // remove the muxer sidecar; ffmpeg -y overwrites init and new seg indices.
     let index = session.dir.join("index.m3u8");
     let _ = fs::remove_file(&index);
-    let child = spawn_ffmpeg(&session.src, &session.dir, start_ms, video_encoder)
-        .map_err(PlaylistError::Failed)?;
+    let child = spawn_ffmpeg(
+        &session.src,
+        &session.dir,
+        start_ms,
+        session.mode,
+        video_encoder,
+    )
+    .map_err(PlaylistError::Failed)?;
     session.child = Some(child);
     session.start_ms = start_ms;
     session.failed = None;
@@ -701,6 +659,7 @@ fn spawn_ffmpeg(
     src: &Path,
     dir: &Path,
     start_ms: u64,
+    mode: SessionMode,
     video_encoder: &str,
 ) -> Result<Child, String> {
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
@@ -725,35 +684,50 @@ fn spawn_ffmpeg(
         // playlist position instead of restarting the clock at zero.
         cmd.args(["-output_ts_offset", &start_secs]);
     }
-    cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v", video_encoder]);
-    if video_encoder == "libx264" {
-        cmd.args(["-preset", "veryfast", "-pix_fmt", "yuv420p"]);
-    } else {
-        // Hardware paths: keep pixel format explicit where the encoder accepts
-        // it; backends that need device-specific graphs failed verification.
-        cmd.args(["-pix_fmt", "yuv420p"]);
+    cmd.args(["-map", "0:v:0", "-map", "0:a:0?"]);
+    match mode {
+        // Copy cannot place IDRs, so -hls_time is only a target: segments
+        // break at source keyframes (ADR-0011).
+        SessionMode::Copy => {
+            cmd.args(["-c", "copy"]);
+        }
+        SessionMode::Transcode => {
+            cmd.args(["-c:v", video_encoder]);
+            if video_encoder == "libx264" {
+                cmd.args(["-preset", "veryfast", "-pix_fmt", "yuv420p"]);
+            } else {
+                // Hardware paths: keep pixel format explicit where the encoder
+                // accepts it; backends that need device-specific graphs failed
+                // verification.
+                cmd.args(["-pix_fmt", "yuv420p"]);
+            }
+            cmd.args([
+                // Time-based IDRs derived from SEGMENT_MS (same source as
+                // -hls_time and the generated playlist EXTINF). A frame-count
+                // -g alone is only 2s at 24 fps; at 60 fps it splits every
+                // 0.8s (ADR-0008).
+                "-force_key_frames",
+                force_kf.as_str(),
+                // Ceiling only; force_key_frames owns the cadence. Keep this
+                // large enough that high-fps sources still hit the SEGMENT_MS
+                // wall first. Scenecut off so FFmpeg cannot insert unaligned
+                // IDRs.
+                "-g",
+                "600",
+                "-keyint_min",
+                "48",
+                "-sc_threshold",
+                "0",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+                "-b:a",
+                "192k",
+            ]);
+        }
     }
     cmd.args([
-        // Time-based IDRs derived from SEGMENT_MS (same source as -hls_time and
-        // the generated playlist EXTINF). A frame-count -g alone is only 2s at
-        // 24 fps; at 60 fps it splits every 0.8s (ADR-0008).
-        "-force_key_frames",
-        force_kf.as_str(),
-        // Ceiling only; force_key_frames owns the cadence. Keep this large
-        // enough that high-fps sources still hit the SEGMENT_MS wall first.
-        // Scenecut off so FFmpeg cannot insert unaligned IDRs.
-        "-g",
-        "600",
-        "-keyint_min",
-        "48",
-        "-sc_threshold",
-        "0",
-        "-c:a",
-        "aac",
-        "-ac",
-        "2",
-        "-b:a",
-        "192k",
         "-f",
         "hls",
         "-hls_time",
@@ -864,82 +838,35 @@ mod tests {
     }
 
     #[test]
-    fn start_decision_table() {
-        let cases = [
-            (
-                "reuse when live session exists",
-                true,
-                false,
-                StartAction::Reuse,
-            ),
-            (
-                "reuse even if slots look full",
-                true,
-                true,
-                StartAction::Reuse,
-            ),
-            ("create when free slot", false, false, StartAction::Create),
-            (
-                "cap full when no reusable",
-                false,
-                true,
-                StartAction::CapFull,
-            ),
-        ];
-        for (name, reusable, full, expected) in cases {
-            assert_eq!(decide_start(reusable, full), expected, "{name}");
-        }
-    }
-
-    #[test]
     fn window_decision_table() {
-        // (name, refs, requested_ms, window_start_ms, on_disk, expected)
+        // (name, requested_ms, window_start_ms, on_disk, expected)
         let cases = [
-            ("on disk is serve", 1, 10_000, 0, true, WindowAction::Serve),
+            ("on disk is serve", 10_000, 0, true, WindowAction::Serve),
             (
                 "same window cooking is serve",
-                1,
                 2000,
                 2000,
                 false,
                 WindowAction::Serve,
             ),
             (
-                "solo divergent restarts",
-                1,
+                "divergent offset restarts",
                 10_000,
                 0,
                 false,
                 WindowAction::Restart,
             ),
             (
-                "shared divergent forks",
-                2,
-                10_000,
-                0,
-                false,
-                WindowAction::Fork,
-            ),
-            (
-                "shared but on disk serves",
-                3,
-                4000,
-                0,
-                true,
-                WindowAction::Serve,
-            ),
-            (
                 "aligns request before compare",
-                1,
                 2500,
                 2000,
                 false,
                 WindowAction::Serve,
             ),
         ];
-        for (name, refs, req, window, on_disk, expected) in cases {
+        for (name, req, window, on_disk, expected) in cases {
             assert_eq!(
-                decide_window_action(refs, req, window, on_disk),
+                decide_window_action(req, window, on_disk),
                 expected,
                 "{name}"
             );
@@ -956,7 +883,9 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let id = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
+        let id = reg
+            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .unwrap();
         assert_eq!(
             reg.encoder(&id),
             Some(SessionEncoder {
@@ -976,8 +905,10 @@ mod tests {
         ));
     }
 
+    /// One session per start, even for the same item at the same offset, and
+    /// stopping one leaves the other playing (ADR-0011).
     #[test]
-    fn reuse_same_item_shares_until_last_release() {
+    fn every_start_is_its_own_session() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -985,72 +916,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264").unwrap();
-        let a = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        let b = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(reg.refs(&a), Some(2));
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let a = reg
+            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .unwrap();
+        let b = reg
+            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .unwrap();
+        assert_ne!(a, b);
         assert!(matches!(
-            reg.start(2, &src, 0, FIXTURE_MS, vec![]),
+            reg.start(2, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![]),
             Err(StartSessionError::CapFull)
         ));
-        assert!(reg.stop(&a));
-        assert_eq!(reg.refs(&a), Some(1));
-        wait_playlist(&reg, &a);
         assert!(reg.stop(&a));
         assert!(matches!(
             reg.playlist(&a, None),
             Err(PlaylistError::NotFound)
         ));
-    }
-
-    #[test]
-    fn fork_moves_ref_off_shared_session() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("in.mp4");
-        make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let shared = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        let _other = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        assert_eq!(reg.refs(&shared), Some(2));
-        wait_playlist(&reg, &shared);
-        assert!(matches!(
-            reg.playlist(&shared, Some(60_000)),
-            Err(PlaylistError::SharedSeekConflict)
-        ));
-        // Scrubbing viewer forks then releases the shared session.
-        let forked = reg.start(1, &src, 60_000, FIXTURE_MS, vec![]).unwrap();
-        assert_ne!(forked, shared);
-        assert_eq!(reg.refs(&forked), Some(1));
-        assert!(reg.stop(&shared));
-        assert_eq!(
-            reg.refs(&shared),
-            Some(1),
-            "other viewer still holds the original"
-        );
-        reg.stop(&shared);
-        reg.stop(&forked);
-    }
-
-    #[test]
-    fn divergent_offset_is_separate_session() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("in.mp4");
-        make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let a = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        let b = reg.start(1, &src, 2000, FIXTURE_MS, vec![]).unwrap();
-        assert_ne!(a, b);
-        reg.stop(&a);
+        wait_playlist(&reg, &b);
         reg.stop(&b);
+    }
+
+    /// A copy session must never reach the configured encoder: an unusable
+    /// encoder name still yields segments because video is stream-copied.
+    #[test]
+    fn copy_session_bypasses_the_encoder() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture(&src);
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "no_such_encoder").unwrap();
+        let id = reg
+            .start(1, &src, 0, FIXTURE_MS, SessionMode::Copy, vec![])
+            .unwrap();
+        assert_eq!(
+            reg.encoder(&id),
+            Some(SessionEncoder {
+                name: "copy".into(),
+                kind: EncoderKind::Copy,
+            })
+        );
+        wait_playlist(&reg, &id);
+        assert!(reg.asset(&id, "seg000.m4s").is_ok());
+        reg.stop(&id);
     }
 
     #[test]
@@ -1063,7 +975,9 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let id = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
+        let id = reg
+            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .unwrap();
         wait_playlist(&reg, &id);
         let early = reg.asset(&id, "seg000.m4s").expect("early segment");
         // Move the window forward; prior segment must still be readable.
@@ -1079,45 +993,6 @@ mod tests {
             .expect("retained segment must not 404 after seek");
         assert_eq!(early.len(), still.len());
         assert!(reg.asset(&id, "seg001.m4s").is_ok());
-        reg.stop(&id);
-    }
-
-    #[test]
-    fn shared_asset_scrub_conflicts() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("in.mp4");
-        make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        let a = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        let _b = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        wait_playlist(&reg, &a);
-        assert!(matches!(
-            reg.asset(&a, "seg100.m4s"),
-            Err(PlaylistError::SharedSeekConflict)
-        ));
-        reg.stop(&a);
-        reg.stop(&a);
-    }
-
-    #[test]
-    fn cap_full_rejects() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("in.mp4");
-        make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264").unwrap();
-        let id = reg.start(1, &src, 0, FIXTURE_MS, vec![]).unwrap();
-        assert!(matches!(
-            reg.start(2, &src, 0, FIXTURE_MS, vec![]),
-            Err(StartSessionError::CapFull)
-        ));
         reg.stop(&id);
     }
 
@@ -1236,7 +1111,7 @@ mod tests {
             }
             let enc = dir.path().join(name);
             fs::create_dir_all(&enc).unwrap();
-            let mut child = spawn_ffmpeg(src, &enc, 0, "libx264").unwrap();
+            let mut child = spawn_ffmpeg(src, &enc, 0, SessionMode::Transcode, "libx264").unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
                 if child.try_wait().ok().flatten().is_some() {

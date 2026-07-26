@@ -68,10 +68,6 @@ export const api = {
 		request<Resp<'/api/v0/items/{itemId}/playback-info', 'get'>>(
 			`/api/v0/items/${itemId}/playback-info`
 		),
-	startRemux: (itemId: number) =>
-		request<Resp<'/api/v0/items/{itemId}/remux', 'post'>>(`/api/v0/items/${itemId}/remux`, {
-			method: 'POST'
-		}),
 	startTranscodeSession: (itemId: number, startMs = 0) => {
 		const q = startMs > 0 ? `?startMs=${startMs}` : '';
 		return request<Resp<'/api/v0/items/{itemId}/sessions', 'post'>>(

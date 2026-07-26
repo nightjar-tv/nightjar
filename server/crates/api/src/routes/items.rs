@@ -10,8 +10,7 @@ use axum::{
 use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
-    RemuxKey, RemuxState, ensure_embedded_webvtt, ensure_sidecar_webvtt,
-    is_serveable_sidecar_format, list_text_subtitles, warm_embedded_webvtts,
+    ensure_embedded_webvtt, ensure_sidecar_webvtt, is_serveable_sidecar_format, list_text_subtitles,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -72,10 +71,6 @@ pub struct SubtitleTrackDto {
 pub struct PlaybackInfoDto {
     pub item_id: i64,
     pub playback_method: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remux_state: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remux_error: Option<String>,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_url: Option<String>,
@@ -92,15 +87,6 @@ pub struct PlaybackInfoDto {
     pub audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub subtitle_tracks: Vec<SubtitleTrackDto>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemuxAcceptedDto {
-    pub item_id: i64,
-    pub remux_state: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 pub async fn get(
@@ -126,29 +112,12 @@ pub async fn playback_info(
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
     let decision = decide(&row);
 
-    let stream_url = format!("/api/v0/items/{item_id}/stream");
-    let (remux_state, remux_error, stream_url, sessions_url, mime_type) = match decision.method {
-        PlaybackMethod::DirectPlay => (None, None, Some(stream_url), None, decision.mime_type),
-        PlaybackMethod::Transcode => (
-            None,
-            None,
-            None,
-            Some(format!("/api/v0/items/{item_id}/sessions")),
-            "application/vnd.apple.mpegurl".into(),
-        ),
-        PlaybackMethod::Remux => {
-            let registry = Arc::clone(&state.remux);
-            let key = remux_key(&row);
-            let status = tokio::task::spawn_blocking(move || registry.status(&key))
-                .await
-                .map_err(|e| ApiError::internal(format!("remux status task: {e}")))?;
-            let (state_s, err, url) = match status {
-                RemuxState::Ready => (Some("ready"), None, Some(stream_url)),
-                RemuxState::Preparing => (Some("preparing"), None, None),
-                RemuxState::NotStarted { reason } => (Some("notStarted"), reason, None),
-                RemuxState::Failed(e) => (Some("failed"), Some(e), None),
-            };
-            (state_s, err, url, None, decision.mime_type)
+    // Remux and transcode both play through a session; only direct play is
+    // served from the file itself (ADR-0011).
+    let (stream_url, sessions_url) = match decision.method {
+        PlaybackMethod::DirectPlay => (Some(format!("/api/v0/items/{item_id}/stream")), None),
+        PlaybackMethod::Remux | PlaybackMethod::Transcode => {
+            (None, Some(format!("/api/v0/items/{item_id}/sessions")))
         }
     };
 
@@ -160,12 +129,10 @@ pub async fn playback_info(
     Ok(Json(PlaybackInfoDto {
         item_id: row.id,
         playback_method: decision.method.as_str(),
-        remux_state,
-        remux_error,
         reason: decision.reason,
         stream_url,
         sessions_url,
-        mime_type,
+        mime_type: decision.mime_type,
         duration_ms: row.duration_ms,
         container: row.container,
         video_codec: row.video_codec,
@@ -317,69 +284,6 @@ fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
     Some(dur.as_millis() as i64)
 }
 
-pub async fn start_remux(
-    State(state): State<AppState>,
-    Path(item_id): Path<i64>,
-) -> ApiResult<(StatusCode, Json<RemuxAcceptedDto>)> {
-    let row = state
-        .db
-        .get_item(item_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let decision = decide(&row);
-    if decision.method != PlaybackMethod::Remux {
-        return Err(ApiError {
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            message: format!("item {item_id} does not use remux: {}", decision.reason),
-        });
-    }
-
-    let registry = Arc::clone(&state.remux);
-    let key = remux_key(&row);
-    let src = std::path::PathBuf::from(&row.path);
-    let warm_src = src.clone();
-    let started = tokio::task::spawn_blocking(move || registry.start(&key, &src))
-        .await
-        .map_err(|e| ApiError::internal(format!("remux start task: {e}")))?;
-
-    // First <track> GET otherwise pays ~NAS demux before captions appear.
-    // Warm in parallel with remux so VTT is ready when the MP4 is.
-    let cache = Arc::clone(&state.subs);
-    let warm_id = row.id;
-    let warm_mtime = file_mtime_ms(&warm_src).unwrap_or(row.mtime_ms);
-    let warm_size = row.size_bytes;
-    tokio::task::spawn_blocking(move || {
-        match warm_embedded_webvtts(&cache, warm_id, warm_mtime, warm_size, &warm_src) {
-            Ok(n) if n > 0 => tracing::info!(
-                item_id = warm_id,
-                tracks = n,
-                "warmed embedded subtitle cache"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                item_id = warm_id,
-                error = %e,
-                "subtitle cache warm failed"
-            ),
-        }
-    });
-
-    let (remux_state, reason) = match started {
-        RemuxState::Ready => ("ready", None),
-        RemuxState::Preparing => ("preparing", None),
-        RemuxState::NotStarted { reason } => ("notStarted", reason),
-        RemuxState::Failed(e) => ("failed", Some(e)),
-    };
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(RemuxAcceptedDto {
-            item_id: row.id,
-            remux_state,
-            reason,
-        }),
-    ))
-}
-
 pub fn decide(row: &MediaItemRow) -> PlaybackDecision {
     decide_playback(
         &row.path,
@@ -390,14 +294,6 @@ pub fn decide(row: &MediaItemRow) -> PlaybackDecision {
         &row.probe_status,
         &BROWSER_V0,
     )
-}
-
-pub fn remux_key(row: &MediaItemRow) -> RemuxKey {
-    RemuxKey {
-        item_id: row.id,
-        mtime_ms: row.mtime_ms,
-        size_bytes: row.size_bytes,
-    }
 }
 
 pub fn to_dto(row: MediaItemRow) -> MediaItemDto {

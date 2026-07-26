@@ -120,8 +120,8 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
 pub struct SubsCache {
     cache_dir: PathBuf,
     cap_bytes: u64,
-    /// Serialises embedded extracts so remux warm and a concurrent `<track>`
-    /// GET cannot share the same `.tmp.srt` paths.
+    /// Serialises embedded extracts so a session warm and a concurrent
+    /// `<track>` GET cannot share the same `.tmp.srt` paths.
     extract_lock: Mutex<()>,
 }
 
@@ -299,7 +299,7 @@ pub fn ensure_embedded_webvtt(
         .extract_lock
         .lock()
         .map_err(|_| "subtitle extract lock poisoned".to_string())?;
-    // Another waiter (remux warm vs GET) may have finished while we blocked.
+    // Another waiter (session warm vs GET) may have finished while we blocked.
     if cached_vtt(&dest) {
         cache.touch(&dest);
         return Ok(dest);
@@ -336,8 +336,8 @@ pub fn ensure_embedded_webvtt(
 }
 
 /// Ensure every embedded text track for `src` is cached. One FFmpeg demux fills
-/// all missing tracks. Used to warm the cache when remux starts so VTT is ready
-/// by the time the MP4 is.
+/// all missing tracks. Used to warm the cache when a playback session starts so
+/// the first caption request does not pay for a cold demux alone.
 pub fn warm_embedded_webvtts(
     cache: &SubsCache,
     item_id: i64,

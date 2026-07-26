@@ -1,11 +1,10 @@
 use nightjar_db::Db;
-use nightjar_transcode::{HlsSessionRegistry, RemuxRegistry, SubsCache, TranscodeCapabilities};
+use nightjar_transcode::{HlsSessionRegistry, SubsCache, TranscodeCapabilities};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Db>,
-    pub remux: Arc<RemuxRegistry>,
     pub hls: Arc<HlsSessionRegistry>,
     pub transcode_caps: Arc<TranscodeCapabilities>,
     pub subs: Arc<SubsCache>,
@@ -14,14 +13,12 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         db: Db,
-        remux: RemuxRegistry,
         hls: Arc<HlsSessionRegistry>,
         transcode_caps: Arc<TranscodeCapabilities>,
         subs: SubsCache,
     ) -> Self {
         Self {
             db: Arc::new(db),
-            remux: Arc::new(remux),
             hls,
             transcode_caps,
             subs: Arc::new(subs),

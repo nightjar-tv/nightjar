@@ -4,8 +4,8 @@ info:
   version: 0.2.0
   description: |
     Public API contract. Server handlers and the web client are built against
-    this file. v0: libraries, items, playback info, direct-play and remux
-    streams (ADR-0006).
+    this file. v0: libraries, items, playback info, direct-play streams, and
+    HLS playback sessions (ADR-0011).
   license:
     name: GPL-3.0-only
 servers:
@@ -173,7 +173,7 @@ paths:
   /api/v0/items/{itemId}/playback-info:
     get:
       operationId: getPlaybackInfo
-      summary: Playback method, remux state, and stream URL for an item
+      summary: Playback method and delivery URL for an item
       parameters:
         - $ref: "#/components/parameters/ItemId"
       responses:
@@ -219,44 +219,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /api/v0/items/{itemId}/remux:
-    post:
-      operationId: startRemux
-      summary: Start (or reuse) a background remux for an item
-      description: >
-        Async job per ADR-0006. Returns the current state immediately; poll
-        playback-info until remuxState is ready. When all remux slots are busy
-        the state stays notStarted with a reason; clients re-POST on each poll
-        tick while they see notStarted.
-      parameters:
-        - $ref: "#/components/parameters/ItemId"
-      responses:
-        "202":
-          description: Remux state after this request
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RemuxAccepted"
-        "404":
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "415":
-          description: Item does not use the remux method
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
   /api/v0/items/{itemId}/stream:
     get:
       operationId: streamItem
       summary: Byte stream for playback (supports HTTP Range)
       description: >
-        Serves the original file for directPlay items and the remuxed MP4 for
-        remux items once remuxState is ready.
+        Serves the original file for directPlay items. Remux and transcode
+        items are delivered as HLS sessions (ADR-0011).
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: Range
@@ -285,14 +254,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-        "409":
-          description: Remux not ready; POST remux and poll playback-info
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
         "415":
-          description: Item needs HLS transcode; POST /api/v0/items/{itemId}/sessions
+          description: Item needs an HLS session; POST /api/v0/items/{itemId}/sessions
           content:
             application/json:
               schema:
@@ -303,12 +266,13 @@ paths:
   /api/v0/items/{itemId}/sessions:
     post:
       operationId: startTranscodeSession
-      summary: Start an HLS software-transcode session for an item
+      summary: Start an HLS playback session for an item
       description: >
-        ADR-0007. Returns 202 with sessionId and playlistUrl. Reuses a live
-        session for the same item at the same startMs (refcount). A divergent
-        startMs forks a new session so other viewers are not disrupted.
-        Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+        ADR-0011. Returns 202 with sessionId and playlistUrl. Remux items get
+        a stream-copy session, transcode items a re-encoding one; the shape is
+        identical. Each POST creates a session; seek with ?startMs= on the
+        playlist restarts that session in place. Concurrent sessions are capped
+        via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: startMs
@@ -321,7 +285,7 @@ paths:
             minimum: 0
       responses:
         "202":
-          description: Session started or reused for this item and startMs
+          description: Session started for this item
           content:
             application/json:
               schema:
@@ -333,7 +297,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "415":
-          description: Item does not use the transcode method
+          description: Item direct plays, or is not ready for a session
           content:
             application/json:
               schema:
@@ -348,7 +312,7 @@ paths:
   /api/v0/sessions/{sessionId}/master.m3u8:
     get:
       operationId: getSessionMasterPlaylist
-      summary: HLS master playlist for a transcode session
+      summary: HLS master playlist for a playback session
       description: >
         ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8)
         and optional SUBTITLES group. playlistUrl from session start points
@@ -359,10 +323,7 @@ paths:
         - name: startMs
           in: query
           required: false
-          description: >
-            Encode window start. With a single holder, changes restart FFmpeg
-            on this session. With multiple holders, returns 409 so the client
-            can POST a forked session at that offset.
+          description: Encode window start; a change restarts this session there
           schema:
             type: integer
             format: int64
@@ -380,17 +341,11 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-        "409":
-          description: Shared session; fork via POST sessions?startMs=
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
 
   /api/v0/sessions/{sessionId}/index.m3u8:
     get:
       operationId: getSessionPlaylist
-      summary: HLS media playlist for a transcode session
+      summary: HLS media playlist for a playback session
       description: >
         Media playlist path is stable (ADR-0008). Segment URIs are relative
         init.mp4 / segNNN.m4s. Also accepts startMs for seek.
@@ -399,10 +354,7 @@ paths:
         - name: startMs
           in: query
           required: false
-          description: >
-            Encode window start. With a single holder, changes restart FFmpeg
-            on this session. With multiple holders, returns 409 so the client
-            can POST a forked session at that offset.
+          description: Encode window start; a change restarts this session there
           schema:
             type: integer
             format: int64
@@ -416,12 +368,6 @@ paths:
                 type: string
         "404":
           description: Session not found or playlist not ready yet
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "409":
-          description: Shared session; fork via POST sessions?startMs=
           content:
             application/json:
               schema:
@@ -483,15 +429,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-        "409":
-          description: >
-            Shared session; scrub would restart the shared encoder. Client
-            forks via POST /api/v0/items/{itemId}/sessions?startMs= and DELETE
-            of its prior session id.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
         "503":
           description: >
             Segment not on disk yet (encoder still cooking). Retryable; do not
@@ -504,7 +441,7 @@ paths:
   /api/v0/sessions/{sessionId}:
     delete:
       operationId: deleteTranscodeSession
-      summary: Stop a transcode session and reap its FFmpeg process
+      summary: Stop a playback session and reap its FFmpeg process
       parameters:
         - $ref: "#/components/parameters/SessionId"
       responses:
@@ -610,30 +547,10 @@ components:
       type: string
       enum: [directPlay, remux, transcode]
       description: >
-        directPlay = browser plays the original file; remux = same codecs
-        repackaged to MP4 by a background job; transcode = needs re-encoding,
-        not available yet. Pending or failed probes report transcode.
-
-    RemuxState:
-      type: string
-      enum: [notStarted, preparing, ready, failed]
-      description: >
-        Only meaningful when playbackMethod is remux. notStarted may carry a
-        busy reason when all remux slots are in use; clients re-POST while
-        they see it (ADR-0006).
-
-    RemuxAccepted:
-      type: object
-      required: [itemId, remuxState]
-      properties:
-        itemId:
-          type: integer
-          format: int64
-        remuxState:
-          $ref: "#/components/schemas/RemuxState"
-        reason:
-          type: string
-          description: Why the job is not running yet, or why it failed
+        directPlay = browser plays the original file; remux = same codecs in a
+        container the client cannot open, delivered as a stream-copy HLS
+        session; transcode = needs re-encoding, delivered as an encoding HLS
+        session. Pending or failed probes report transcode.
 
     TranscodeSession:
       type: object
@@ -651,11 +568,15 @@ components:
             The media playlist remains at index.m3u8 (ADR-0008).
         videoEncoder:
           type: string
-          description: FFmpeg encoder currently used by this session
+          description: >
+            FFmpeg encoder currently used by this session, or "copy" when the
+            session stream-copies video (remux).
         encoderKind:
           type: string
-          enum: [hardware, software]
-          description: Whether videoEncoder is a hardware or software encoder
+          enum: [hardware, software, copy]
+          description: >
+            Whether videoEncoder is a hardware encoder, a software encoder, or
+            a stream copy.
 
     Library:
       type: object
@@ -816,28 +737,22 @@ components:
           format: int64
         playbackMethod:
           $ref: "#/components/schemas/PlaybackMethod"
-        remuxState:
-          $ref: "#/components/schemas/RemuxState"
-          description: Present when playbackMethod is remux
-        remuxError:
-          type: string
-          description: Present when remuxState is failed or start is blocked
         reason:
           type: string
           description: Why the decision engine chose this method
         streamUrl:
           type: string
-          description: >
-            Present only when the item is playable now: directPlay, or remux
-            with remuxState ready.
+          description: Present only when playbackMethod is directPlay
         sessionsUrl:
           type: string
           description: >
-            Present when playbackMethod is transcode. POST here to start an
-            HLS session (ADR-0007).
+            Present when playbackMethod is remux or transcode. POST here to
+            start an HLS session (ADR-0011).
         mimeType:
           type: string
-          description: video/mp4 for remux; application/vnd.apple.mpegurl for HLS
+          description: >
+            Source MIME for directPlay; application/vnd.apple.mpegurl for
+            session playback.
         durationMs:
           type: integer
           format: int64

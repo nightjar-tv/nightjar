@@ -50,11 +50,11 @@ Published image tags and GitHub Releases are not available yet.
 Nightjar is in active development toward v1.
 
 Working now: libraries, async scan (index then probe), item list, direct-play
-streaming with HTTP Range, remux of browser-safe codecs in other containers
-(H.264 + AAC in MKV plays after a background repackage), embedded web UI.
-Single-user, no auth.
+streaming with HTTP Range, HLS playback sessions for everything else (stream
+copy when only the container is wrong, software re-encode otherwise), text
+subtitles as WebVTT, embedded web UI. Single-user, no auth.
 
-Not built yet: transcoding (re-encode), HLS, subtitles, multi-user, watch
+Not built yet: image-subtitle burn-in, multi-user, watch
 state/resume, metadata providers, official app clients. See the ADRs under `docs/adr/` for decisions
 already locked, and [ENGINEERING_RULES.md](ENGINEERING_RULES.md) for v1 scope
 (Live TV, DVR, plugins, and music are out).

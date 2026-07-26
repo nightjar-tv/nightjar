@@ -46,9 +46,9 @@ pub struct PlaybackDecision {
 /// (file streams × client capability profile) → directPlay | remux | transcode.
 ///
 /// Codecs the client plays in an accepted container direct play; the same
-/// codecs in any other container remux (stream copy to MP4); everything else,
-/// including pending and failed probes, is transcode. We will not claim
-/// browser playback without a successful probe.
+/// codecs in any other container remux (a stream-copy HLS session, ADR-0011);
+/// everything else, including pending and failed probes, is transcode. We will
+/// not claim browser playback without a successful probe.
 pub fn decide_playback(
     path: &str,
     container: Option<&str>,
@@ -88,8 +88,8 @@ pub fn decide_playback(
         }
         return PlaybackDecision {
             method: PlaybackMethod::Remux,
-            reason: "codecs supported; container needs repackaging to MP4".into(),
-            mime_type: "video/mp4".into(),
+            reason: "codecs supported; container needs a stream-copy session".into(),
+            mime_type: "application/vnd.apple.mpegurl".into(),
         };
     }
 
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn remux_reports_mp4_mime_not_source_mime() {
+    fn remux_reports_hls_mime_not_source_mime() {
         let d = decide(
             "/a/b.mkv",
             Some("matroska,webm"),
@@ -257,7 +257,7 @@ mod tests {
             "probed",
         );
         assert_eq!(d.method, PlaybackMethod::Remux);
-        assert_eq!(d.mime_type, "video/mp4");
+        assert_eq!(d.mime_type, "application/vnd.apple.mpegurl");
     }
 
     #[test]

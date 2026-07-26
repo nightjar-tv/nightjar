@@ -14,9 +14,11 @@ on long titles.
 ## Decision
 
 1. **Delivery.** Transcode is served as HLS fMP4. Software encode uses
-   `libx264` and AAC stereo. Remux stays the ADR-0006 whole-file cache for this
-   slice. Unifying remux onto HLS sessions is a candidate once sessions are
-   proven; it is not done here (two risks in one PR).
+   `libx264` and AAC stereo. Remux stayed the ADR-0006 whole-file cache for
+   this slice; unifying remux onto HLS sessions was deferred (two risks in
+   one PR). **Closed by [ADR-0011](0011-remux-session-convergence.md):** remux
+   is now a copy-mode HLS session, and session reuse / fork-on-scrub are
+   removed.
 2. **Session API.** `POST /api/v0/items/{itemId}/sessions?startMs=` returns 202
    with `sessionId` and `playlistUrl`. Reuse is keyed by `(itemId, startMs)` with
    a refcount so two browsers at the same encode window share one FFmpeg.
@@ -50,20 +52,13 @@ on long titles.
 
 ## Consequences
 
-Hardware acceleration, subtitle burn-in, multi-bitrate ladders, and remux→HLS
-unification remain later Phase 2 work. First audio and video streams only
-(same map as remux). A full disk still fails SQLite writes; session idle
-cleanup is the mitigation for this path. Two household viewers of the same
-film at different points each cost a session slot after the first divergent
-seek.
+Hardware acceleration, subtitle burn-in, and multi-bitrate ladders remain
+later Phase 2 work. Remux→HLS unification is decided in ADR-0011. First audio
+and video streams only (same map as remux). A full disk still fails SQLite
+writes; session idle cleanup is the mitigation for this path.
 
 The eventual cap model is a global cap protecting server CPU plus a per-user
 cap for household fairness, with the settings UI arriving in Phase 3 alongside
 the admin screens. `NIGHTJAR_HLS_MAX_SESSIONS` stays global until users exist
-(Rule 4.7).
-
-Item-keyed session sharing is re-examined in Phase 3 together with per-user
-caps, because attributing a shared session to a user's quota is currently
-undefined and the fork-on-scrub rule has absorbed several rounds of patches.
-One session per viewer with a higher cap is the candidate simplification.
-These are intent, not committed work in this slice.
+(Rule 4.7). Item-keyed session sharing and fork-on-scrub were removed in
+ADR-0011 (one session per POST; seek restarts in place).

@@ -98,9 +98,10 @@ pass (Rule 6.1 / 4.9).
     which delivery world it is in (Rule 2.1). Phase 4 Flutter work settles on
     this before writing client subtitle UI.
 
-11. **Client (web).** Direct play and remux attach `<track kind="subtitles">`
-    for each listed track with a `url`. Transcode relies on the HLS master;
-    native / hls.js caption menus are the control surface (custom picker later).
+11. **Client (web).** Direct play attaches `<track kind="subtitles">` for each
+    listed track with a `url`. Remux and transcode both play as HLS sessions
+    and take subtitles from the master playlist (ADR-0011); native / hls.js
+    caption menus are the control surface (custom picker later).
 
 ## Consequences
 

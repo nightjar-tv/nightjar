@@ -14,11 +14,10 @@
 	let playback = $state<PlaybackInfo | null>(null);
 	let error = $state<string | null>(null);
 	let playlistUrl = $state<string | null>(null);
-	let sessionId = $state<string | null>(null);
 	let sessionEncoder = $state<Pick<TranscodeSession, 'videoEncoder' | 'encoderKind'> | null>(
 		null
 	);
-	let preparingTranscode = $state(false);
+	let preparingSession = $state(false);
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	// Mutable holder so onMount cleanup / pagehide always DELETE the live
 	// session even if the $state read in a stale closure is still null.
@@ -26,24 +25,15 @@
 
 	const itemId = $derived(Number(page.params.id));
 
-	function holdSession(id: string | null) {
-		sessionRef.id = id;
-		sessionId = id;
-	}
-
 	function releaseSession() {
 		const id = sessionRef.id;
 		sessionRef.id = null;
-		sessionId = null;
 		sessionEncoder = null;
 		if (id) void api.deleteTranscodeSession(id);
 	}
 
 	const playable = $derived(
-		playback != null &&
-			(playback.playbackMethod === 'directPlay' ||
-				(playback.playbackMethod === 'remux' && playback.remuxState === 'ready') ||
-				(playback.playbackMethod === 'transcode' && playlistUrl != null))
+		playback != null && (playback.playbackMethod === 'directPlay' || playlistUrl != null)
 	);
 
 	// Discovered but not served (ASS/SSA sidecars): say so instead of hiding.
@@ -58,38 +48,22 @@
 		let alive = true;
 
 		const onPageHide = () => releaseSession();
-		// pagehide DELETE: refresh/close must drop the ref (the refs=4 leak
-		// was remounts without teardown). Cannot unit-test in node; sequence
-		// is holdSession → pagehide/releaseSession → DELETE → refs--.
+		// pagehide DELETE: refresh and close must stop the session. Remounts
+		// without teardown used to leave FFmpeg running until the idle reaper.
 		window.addEventListener('pagehide', onPageHide);
 
 		(async () => {
 			item = await api.getItem(itemId);
 			playback = await api.getPlaybackInfo(itemId);
 
-			if (playback.playbackMethod === 'remux') {
-				while (
-					alive &&
-					playback.remuxState !== 'ready' &&
-					playback.remuxState !== 'failed'
-				) {
-					if (playback.remuxState === 'notStarted') {
-						await api.startRemux(itemId);
-					}
-					await new Promise((r) => setTimeout(r, 400));
-					if (!alive) return;
-					playback = await api.getPlaybackInfo(itemId);
-				}
-				return;
-			}
-
-			if (playback.playbackMethod === 'transcode') {
-				preparingTranscode = true;
+			// Remux and transcode both play through a session (ADR-0011).
+			if (playback.playbackMethod !== 'directPlay') {
+				preparingSession = true;
 				let started: TranscodeSession | null = null;
 				for (let attempt = 0; alive && attempt < 5; attempt++) {
 					try {
 						started = await api.startTranscodeSession(itemId);
-						holdSession(started.sessionId);
+						sessionRef.id = started.sessionId;
 						sessionEncoder = started;
 						break;
 					} catch (e) {
@@ -102,7 +76,7 @@
 					}
 				}
 				if (!started) {
-					preparingTranscode = false;
+					preparingSession = false;
 					error = copy.sessionsBusy;
 					return;
 				}
@@ -111,16 +85,16 @@
 					const res = await fetch(started.playlistUrl);
 					if (res.ok) {
 						playlistUrl = started.playlistUrl;
-						preparingTranscode = false;
+						preparingSession = false;
 						return;
 					}
 					await new Promise((r) => setTimeout(r, 200));
 				}
-				preparingTranscode = false;
-				error = copy.transcodeFailed;
+				preparingSession = false;
+				error = copy.sessionFailed;
 			}
 		})().catch((e: Error) => {
-			preparingTranscode = false;
+			preparingSession = false;
 			error = e.message;
 		});
 
@@ -134,40 +108,10 @@
 	$effect(() => {
 		const video = videoEl;
 		const url = playlistUrl;
-		const id = itemId;
-		if (!video || !url || playback?.playbackMethod !== 'transcode') {
+		if (!video || !url) {
 			return;
 		}
-		// Expected scrub sequence with a second browser on the same title:
-		// reuse (refs++) on load → seeked → playlist 409 → forkAt POSTs new
-		// startMs + DELETE prior id (refs-- on shared) → one new session.
-		const handle = attachHls(video, url, {
-			forkAt: async (absoluteStartMs) => {
-				const prev = sessionRef.id;
-				try {
-					const forked = await api.startTranscodeSession(id, absoluteStartMs);
-					holdSession(forked.sessionId);
-					sessionEncoder = forked;
-					if (prev && prev !== forked.sessionId) {
-						void api.deleteTranscodeSession(prev);
-					}
-					for (let i = 0; i < 50; i++) {
-						const res = await fetch(forked.playlistUrl);
-						if (res.ok) break;
-						await new Promise((r) => setTimeout(r, 100));
-					}
-					return forked;
-				} catch (e) {
-					const msg = e instanceof Error ? e.message : String(e);
-					if (msg.includes('retry shortly') || msg.includes('in use')) {
-						error = copy.sessionsBusy;
-						return null;
-					}
-					throw e;
-				}
-			},
-			onSession: (sid) => holdSession(sid)
-		});
+		const handle = attachHls(video, url);
 		return () => handle.destroy();
 	});
 </script>
@@ -197,18 +141,20 @@
 				{#if item.year}· {item.year}{/if}
 				{#if playback.videoCodec}· {playback.videoCodec}{/if}
 				{#if playback.audioCodec}· {playback.audioCodec}{/if}
-				{#if playback.playbackMethod === 'transcode' && sessionEncoder}
+				{#if sessionEncoder?.encoderKind === 'copy'}
+					· stream copy
+				{:else if sessionEncoder}
 					· transcoding · {sessionEncoder.videoEncoder} ({sessionEncoder.encoderKind})
 				{/if}
 			</p>
 			<p class="reason">{playback.reason}</p>
 		</header>
 
-		{#if playable && playback.playbackMethod === 'transcode' && playlistUrl}
+		{#if playable && playlistUrl}
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video bind:this={videoEl} controls playsinline></video>
 			{#if (playback.subtitleTracks ?? []).some((t) => t.url)}
-				<p class="preparing">{copy.transcodeSubtitlesPreparing}</p>
+				<p class="preparing">{copy.sessionSubtitlesPreparing}</p>
 			{/if}
 			{#if unrenderedSubtitles}
 				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
@@ -238,23 +184,13 @@
 					Your browser cannot play this file directly.
 				</video>
 			{/if}
-			{#if playback.playbackMethod === 'remux' && (playback.subtitleTracks?.length ?? 0) === 0}
-				<p class="preparing">{copy.remuxSubtitleNote}</p>
-			{/if}
 			{#if unrenderedSubtitles}
 				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
 			{/if}
-		{:else if playback.playbackMethod === 'remux' && playback.remuxState === 'failed'}
-			<p class="error" role="alert">
-				{copy.remuxFailed}
-				{#if playback.remuxError}({playback.remuxError}){/if}
-			</p>
-		{:else if playback.playbackMethod === 'remux'}
-			<p class="preparing" role="status">{copy.preparingPlayback}</p>
-		{:else if preparingTranscode}
-			<p class="preparing" role="status">{copy.preparingTranscode}</p>
-		{:else if playback.playbackMethod === 'transcode'}
-			<p class="error">{copy.transcodeFailed}</p>
+		{:else if preparingSession}
+			<p class="preparing" role="status">{copy.preparingSession}</p>
+		{:else if playback.playbackMethod !== 'directPlay'}
+			<p class="error">{copy.sessionFailed}</p>
 		{/if}
 	{/if}
 </main>

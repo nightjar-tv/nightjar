@@ -1,7 +1,10 @@
 # ADR-0006: Phase 2 playback decision engine and remux delivery
 
-- Status: accepted
+- Status: superseded by [ADR-0011](0011-remux-session-convergence.md)
+  (delivery / remux job / cache / remuxState). Decision-engine shape
+  (`directPlay | remux | transcode` × profile) still stands.
 - Date: 2026-07-25
+- Superseded: 2026-07-26
 
 ## Context
 

@@ -16,7 +16,7 @@
     {
       "path": "files/h264_aac_mkv.mkv",
       "tags": ["h264", "aac", "mkv"],
-      "expect": "remux (container only; ADR-0006)"
+      "expect": "remux as an HLS copy session (container only; ADR-0011)"
     },
     {
       "path": "files/hevc_aac_mp4.mp4",
@@ -41,12 +41,12 @@
     {
       "path": "files/h264_aac_ass_mkv.mkv",
       "tags": ["ass", "subs", "mkv"],
-      "expect": "remux; ASS listed but not served as WebVTT (burn-in later)"
+      "expect": "remux (HLS copy session); ASS listed but not served as WebVTT (burn-in later)"
     },
     {
       "path": "files/h264_aac_srt_mkv.mkv",
       "tags": ["srt", "subs", "mkv", "embedded"],
-      "expect": "remux; embedded SRT served as WebVTT sidecar (ADR-0010)"
+      "expect": "remux (HLS copy session); embedded SRT served as WebVTT sidecar (ADR-0010)"
     },
     {
       "path": "files/sidecar_beside/Movie.mp4",
@@ -71,7 +71,7 @@
     {
       "path": "files/h264_aac_pgs_mkv.mkv",
       "tags": ["pgs", "image-subs", "mkv"],
-      "expect": "remux; hdmv_pgs_subtitle omitted until burn-in"
+      "expect": "remux (HLS copy session); hdmv_pgs_subtitle omitted until burn-in"
     },
     {
       "path": "files/h264_aac_71_mp4.mp4",
