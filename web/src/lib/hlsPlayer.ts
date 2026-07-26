@@ -17,7 +17,8 @@ export function canPlayNativeHls(video: HTMLVideoElement): boolean {
  */
 export function attachHls(
 	video: HTMLVideoElement,
-	playlistBase: string
+	playlistBase: string,
+	startAtSeconds = 0
 ): { destroy: () => void } {
 	let hls: Hls | null = null;
 	let destroyed = false;
@@ -60,12 +61,23 @@ export function attachHls(
 		})();
 	};
 
+	// A session started mid-title (audio switch, ADR-0012) has no segments
+	// before its window, so the element must open at that offset rather than
+	// at zero.
+	const onLoadedMetadata = () => {
+		video.currentTime = startAtSeconds;
+	};
+
 	video.addEventListener('seeked', onSeeked);
+	if (startAtSeconds > 0) {
+		video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+	}
 
 	return {
 		destroy: () => {
 			destroyed = true;
 			video.removeEventListener('seeked', onSeeked);
+			video.removeEventListener('loadedmetadata', onLoadedMetadata);
 			if (hls) {
 				hls.destroy();
 				hls = null;

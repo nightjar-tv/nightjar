@@ -5,7 +5,7 @@ mod lang;
 mod srt;
 
 pub use discover::{DiscoveredSidecar, discover_sidecars};
-pub use lang::normalize_language;
+pub use lang::{container_stream_language, normalize_language};
 pub use srt::{decode_subtitle_bytes, srt_to_webvtt};
 
 use serde::Deserialize;
@@ -102,14 +102,10 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
             continue;
         };
         let tags = stream.tags.unwrap_or_default();
-        let language = tags
-            .language
-            .filter(|s| !s.is_empty())
-            .and_then(|l| normalize_language(&l).or(Some(l.to_ascii_lowercase())));
         out.push(TextSubtitleStream {
+            language: container_stream_language(tags.language),
             stream_index: index,
             codec,
-            language,
             title: tags.title.filter(|s| !s.is_empty()),
         });
     }

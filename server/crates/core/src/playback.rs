@@ -26,14 +26,18 @@ pub struct ClientCapabilityProfile {
     pub containers: &'static [&'static str],
     /// File extensions treated as an accepted container without a probe match.
     pub extensions: &'static [&'static str],
+    /// Highest audio channel count the client renders usefully; tracks above
+    /// it are downmixed by a session (ADR-0012). `None` means no ceiling.
+    pub max_audio_channels: Option<u32>,
 }
 
-/// Phase 1 browser whitelist: H.264 family + AAC in MP4/M4V.
+/// Phase 1 browser whitelist: H.264 family + AAC in MP4/M4V, stereo audio.
 pub const BROWSER_V0: ClientCapabilityProfile = ClientCapabilityProfile {
     video_codecs: &["h264", "avc", "avc1"],
     audio_codecs: &["aac", "mp4a"],
     containers: &["mp4", "m4v", "mov"],
     extensions: &["mp4", "m4v"],
+    max_audio_channels: Some(2),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,11 +53,17 @@ pub struct PlaybackDecision {
 /// codecs in any other container remux (a stream-copy HLS session, ADR-0011);
 /// everything else, including pending and failed probes, is transcode. We will
 /// not claim browser playback without a successful probe.
+///
+/// `audio_channels` is the first-audio channel count. A track above the
+/// profile ceiling loses direct play even when its codec and container are
+/// fine: the session copies video and encodes a stereo downmix (ADR-0012).
+#[allow(clippy::too_many_arguments)]
 pub fn decide_playback(
     path: &str,
     container: Option<&str>,
     video_codec: Option<&str>,
     audio_codec: Option<&str>,
+    audio_channels: Option<u32>,
     scan_error: Option<&str>,
     probe_status: &str,
     profile: &ClientCapabilityProfile,
@@ -79,6 +89,16 @@ pub fn decide_playback(
     let container_ok = matches_container(path, container, profile);
 
     if video_ok && audio_ok {
+        if let Some(excess) = exceeds_channel_ceiling(audio_channels, profile) {
+            return PlaybackDecision {
+                method: PlaybackMethod::Remux,
+                reason: format!(
+                    "codecs supported; {excess}-channel audio exceeds the client ceiling \
+                     and is downmixed by a session"
+                ),
+                mime_type: "application/vnd.apple.mpegurl".into(),
+            };
+        }
         if container_ok {
             return PlaybackDecision {
                 method: PlaybackMethod::DirectPlay,
@@ -105,6 +125,17 @@ pub fn decide_playback(
         reason: format!("needs transcode: {}", why.join(", ")),
         mime_type: mime_for_path(path),
     }
+}
+
+/// The offending channel count when the track is above the profile ceiling.
+/// An unprobed channel count is not treated as excess: the codec whitelist
+/// already gates on a successful probe.
+fn exceeds_channel_ceiling(
+    audio_channels: Option<u32>,
+    profile: &ClientCapabilityProfile,
+) -> Option<u32> {
+    let max = profile.max_audio_channels?;
+    audio_channels.filter(|c| *c > max)
 }
 
 fn matches_codec(codec: Option<&str>, accepted: &[&str]) -> bool {
@@ -166,11 +197,33 @@ mod tests {
         scan_error: Option<&str>,
         probe_status: &str,
     ) -> PlaybackDecision {
+        decide_channels(
+            path,
+            container,
+            video,
+            audio,
+            Some(2),
+            scan_error,
+            probe_status,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide_channels(
+        path: &str,
+        container: Option<&str>,
+        video: Option<&str>,
+        audio: Option<&str>,
+        channels: Option<u32>,
+        scan_error: Option<&str>,
+        probe_status: &str,
+    ) -> PlaybackDecision {
         decide_playback(
             path,
             container,
             video,
             audio,
+            channels,
             scan_error,
             probe_status,
             &BROWSER_V0,
@@ -240,10 +293,68 @@ mod tests {
                 ),
                 PlaybackMethod::Transcode,
             ),
+            (
+                "7.1 aac mp4 needs a session for the downmix",
+                decide_channels(
+                    "/a/b.mp4",
+                    Some("mov,mp4,m4a"),
+                    Some("h264"),
+                    Some("aac"),
+                    Some(8),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::Remux,
+            ),
+            (
+                "mono aac mp4 stays direct play",
+                decide_channels(
+                    "/a/b.mp4",
+                    Some("mov,mp4,m4a"),
+                    Some("h264"),
+                    Some("aac"),
+                    Some(1),
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::DirectPlay,
+            ),
+            (
+                "unknown channel count does not narrow direct play",
+                decide_channels(
+                    "/a/b.mp4",
+                    Some("mov,mp4,m4a"),
+                    Some("h264"),
+                    Some("aac"),
+                    None,
+                    None,
+                    "probed",
+                ),
+                PlaybackMethod::DirectPlay,
+            ),
         ];
         for (name, decision, expected) in cases {
             assert_eq!(decision.method, expected, "{name}: {}", decision.reason);
         }
+    }
+
+    /// ADR-0012: the 7.1 downgrade is user-visible, so the reason has to name
+    /// the layout rather than blame the container.
+    #[test]
+    fn channel_ceiling_session_reports_hls_mime_and_names_the_layout() {
+        let d = decide_channels(
+            "/a/b.mp4",
+            Some("mov,mp4,m4a"),
+            Some("h264"),
+            Some("aac"),
+            Some(8),
+            None,
+            "probed",
+        );
+        assert_eq!(d.method, PlaybackMethod::Remux);
+        assert_eq!(d.mime_type, "application/vnd.apple.mpegurl");
+        assert!(d.reason.contains("8-channel"), "{}", d.reason);
+        assert!(!d.reason.contains("container"), "{}", d.reason);
     }
 
     #[test]

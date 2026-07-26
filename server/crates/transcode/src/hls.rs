@@ -2,6 +2,7 @@
 //! source (remux) or re-encodes it (transcode); the two differ by
 //! [`SessionMode`] and nothing else (ADR-0011).
 
+use super::audio::stereo_downmix_filter;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,24 @@ pub enum SessionMode {
     Copy,
     /// Re-encode to H.264 + AAC.
     Transcode,
+}
+
+/// Which audio track a session maps, and the ceiling it must fit (ADR-0012).
+/// Switching tracks is a new session, so this never changes in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSelection {
+    /// Absolute ffprobe stream index; `None` maps the first audio stream.
+    pub stream_index: Option<u32>,
+    /// Channel count of the selected track.
+    pub channels: u32,
+    /// Client ceiling from the capability profile.
+    pub max_channels: u32,
+}
+
+impl AudioSelection {
+    fn needs_downmix(self) -> bool {
+        self.channels > self.max_channels
+    }
 }
 
 /// Pure window-move decision for a playlist/segment seek intent.
@@ -92,6 +111,7 @@ struct Session {
     src: PathBuf,
     dir: PathBuf,
     mode: SessionMode,
+    audio: AudioSelection,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
     start_ms: u64,
@@ -149,8 +169,10 @@ impl HlsSessionRegistry {
     }
 
     /// Starts a session at `start_ms` (aligned). Every call creates its own
-    /// session; seeking restarts that session in place (ADR-0011).
+    /// session; seeking restarts that session in place (ADR-0011). Switching
+    /// audio does not: it starts a fresh session (ADR-0012).
     /// `subtitle_tracks` is snapshotted here and never revisited.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         item_id: i64,
@@ -158,6 +180,7 @@ impl HlsSessionRegistry {
         start_ms: u64,
         duration_ms: u64,
         mode: SessionMode,
+        audio: AudioSelection,
         subtitle_tracks: Vec<HlsSubtitleTrack>,
     ) -> Result<String, StartSessionError> {
         let start_ms = align_to_segment(start_ms);
@@ -174,7 +197,7 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&dir).map_err(|e| {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
-        let child = spawn_ffmpeg(src, &dir, start_ms, mode, &self.video_encoder)
+        let child = spawn_ffmpeg(src, &dir, start_ms, mode, audio, &self.video_encoder)
             .map_err(StartSessionError::Spawn)?;
         sessions.insert(
             id.clone(),
@@ -183,6 +206,7 @@ impl HlsSessionRegistry {
                 src: src.to_path_buf(),
                 dir,
                 mode,
+                audio,
                 video_encoder: self.video_encoder.clone(),
                 start_ms,
                 duration_ms,
@@ -197,6 +221,8 @@ impl HlsSessionRegistry {
             item_id,
             start_ms,
             mode = ?mode,
+            audio_stream = ?audio.stream_index,
+            audio_channels = audio.channels,
             encoder = %self.video_encoder,
             "hls session started"
         );
@@ -493,6 +519,7 @@ fn restart_at(
         &session.dir,
         start_ms,
         session.mode,
+        session.audio,
         video_encoder,
     )
     .map_err(PlaylistError::Failed)?;
@@ -660,6 +687,7 @@ fn spawn_ffmpeg(
     dir: &Path,
     start_ms: u64,
     mode: SessionMode,
+    audio: AudioSelection,
     video_encoder: &str,
 ) -> Result<Child, String> {
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
@@ -684,8 +712,31 @@ fn spawn_ffmpeg(
         // playlist position instead of restarting the clock at zero.
         cmd.args(["-output_ts_offset", &start_secs]);
     }
-    cmd.args(["-map", "0:v:0", "-map", "0:a:0?"]);
+    let audio_map = match audio.stream_index {
+        Some(index) => format!("0:{index}"),
+        None => "0:a:0?".to_string(),
+    };
+    cmd.args(["-map", "0:v:0", "-map", &audio_map]);
+    let downmix = if audio.needs_downmix() {
+        let filter = stereo_downmix_filter(audio.channels);
+        if filter.is_none() {
+            tracing::warn!(
+                channels = audio.channels,
+                path = %src.display(),
+                "no downmix matrix for this layout; falling back to -ac 2"
+            );
+        }
+        filter
+    } else {
+        None
+    };
     match mode {
+        // Hybrid: the codecs already copy and only the channel layout forces
+        // work, so video still copies while audio is encoded (ADR-0012).
+        SessionMode::Copy if audio.needs_downmix() => {
+            cmd.args(["-c:v", "copy"]);
+            push_audio_encode(&mut cmd, downmix.as_deref());
+        }
         // Copy cannot place IDRs, so -hls_time is only a target: segments
         // break at source keyframes (ADR-0011).
         SessionMode::Copy => {
@@ -718,13 +769,8 @@ fn spawn_ffmpeg(
                 "48",
                 "-sc_threshold",
                 "0",
-                "-c:a",
-                "aac",
-                "-ac",
-                "2",
-                "-b:a",
-                "192k",
             ]);
+            push_audio_encode(&mut cmd, downmix.as_deref());
         }
     }
     cmd.args([
@@ -755,6 +801,17 @@ fn spawn_ffmpeg(
             format!("spawn ffmpeg for {}: {e}", src.display())
         }
     })
+}
+
+/// Stereo AAC for the mapped track. With a matrix, `pan` does the mixdown;
+/// without one, bare `-ac 2` is the fallback (ADR-0012) — swresample's
+/// default matrix under-weights centre, which is why the matrix exists.
+fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
+    cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+    match downmix {
+        Some(filter) => cmd.args(["-filter:a", filter]),
+        None => cmd.args(["-ac", "2"]),
+    };
 }
 
 fn stop_child(child: &mut Option<Child>) {
@@ -824,6 +881,15 @@ mod tests {
 
     const FIXTURE_MS: u64 = 4000;
 
+    /// First audio track, already inside the browser ceiling.
+    fn stereo() -> AudioSelection {
+        AudioSelection {
+            stream_index: None,
+            channels: 2,
+            max_channels: 2,
+        }
+    }
+
     fn wait_playlist(reg: &HlsSessionRegistry, id: &str) -> Vec<u8> {
         for _ in 0..100 {
             match reg.playlist(id, None) {
@@ -884,7 +950,15 @@ mod tests {
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
-            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .start(
+                1,
+                &src,
+                0,
+                FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
             .unwrap();
         assert_eq!(
             reg.encoder(&id),
@@ -918,14 +992,38 @@ mod tests {
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
         let a = reg
-            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .start(
+                1,
+                &src,
+                0,
+                FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
             .unwrap();
         let b = reg
-            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .start(
+                1,
+                &src,
+                0,
+                FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
             .unwrap();
         assert_ne!(a, b);
         assert!(matches!(
-            reg.start(2, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![]),
+            reg.start(
+                2,
+                &src,
+                0,
+                FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![]
+            ),
             Err(StartSessionError::CapFull)
         ));
         assert!(reg.stop(&a));
@@ -951,7 +1049,7 @@ mod tests {
         let reg =
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "no_such_encoder").unwrap();
         let id = reg
-            .start(1, &src, 0, FIXTURE_MS, SessionMode::Copy, vec![])
+            .start(1, &src, 0, FIXTURE_MS, SessionMode::Copy, stereo(), vec![])
             .unwrap();
         assert_eq!(
             reg.encoder(&id),
@@ -976,7 +1074,15 @@ mod tests {
         make_fixture(&src);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
-            .start(1, &src, 0, FIXTURE_MS, SessionMode::Transcode, vec![])
+            .start(
+                1,
+                &src,
+                0,
+                FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
             .unwrap();
         wait_playlist(&reg, &id);
         let early = reg.asset(&id, "seg000.m4s").expect("early segment");
@@ -994,6 +1100,146 @@ mod tests {
         assert_eq!(early.len(), still.len());
         assert!(reg.asset(&id, "seg001.m4s").is_ok());
         reg.stop(&id);
+    }
+
+    /// Encodes a fixture whose audio streams carry `layouts`, one stream each.
+    fn make_fixture_layouts(path: &Path, layouts: &[&str]) {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=4",
+        ]);
+        for layout in layouts {
+            cmd.args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("anullsrc=r=48000:cl={layout}:d=4"),
+            ]);
+        }
+        cmd.args(["-map", "0:v:0"]);
+        for i in 1..=layouts.len() {
+            cmd.args(["-map", &format!("{i}:a:0")]);
+        }
+        cmd.args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]);
+        let status = cmd.arg(path).status().unwrap();
+        assert!(status.success(), "fixture encode failed for {layouts:?}");
+    }
+
+    /// Runs one session encode to completion and joins its segments back into
+    /// a single file so the delivered streams can be probed.
+    fn encode_and_join(
+        src: &Path,
+        dir: &Path,
+        mode: SessionMode,
+        audio: AudioSelection,
+        encoder: &str,
+    ) -> PathBuf {
+        let enc = dir.join("enc");
+        fs::create_dir_all(&enc).unwrap();
+        let mut child = spawn_ffmpeg(src, &enc, 0, mode, audio, encoder).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop_child(&mut Some(child));
+        assert!(
+            enc.join("seg000.m4s").exists(),
+            "session produced no segments"
+        );
+        let joined = dir.join("joined.mp4");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(enc.join("index.m3u8"))
+            .args(["-c", "copy"])
+            .arg(&joined)
+            .status()
+            .unwrap();
+        assert!(status.success(), "remux from HLS failed");
+        joined
+    }
+
+    fn probe_entry(path: &Path, select: &str, entry: &str) -> String {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                select,
+                "-show_entries",
+                &format!("stream={entry}"),
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe failed for {}",
+            path.display()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// ADR-0012 decision 2: a 5.1 track above the ceiling forces an audio
+    /// encode, never a video one. The registry encoder is unusable, so any
+    /// attempt to re-encode video fails the whole session.
+    #[test]
+    fn copy_session_downmixes_audio_without_touching_video() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("surround.mp4");
+        make_fixture_layouts(&src, &["5.1"]);
+        let audio = AudioSelection {
+            stream_index: None,
+            channels: 6,
+            max_channels: 2,
+        };
+        let joined = encode_and_join(
+            &src,
+            dir.path(),
+            SessionMode::Copy,
+            audio,
+            "no_such_encoder",
+        );
+        assert_eq!(probe_entry(&joined, "v:0", "codec_name"), "h264");
+        assert_eq!(probe_entry(&joined, "a:0", "channels"), "2");
+    }
+
+    /// A non-default track is reachable by absolute stream index (ADR-0012).
+    #[test]
+    fn session_maps_the_selected_audio_stream() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("two_audio.mp4");
+        make_fixture_layouts(&src, &["stereo", "mono"]);
+        let second = AudioSelection {
+            stream_index: Some(2),
+            channels: 1,
+            max_channels: 2,
+        };
+        let joined = encode_and_join(&src, dir.path(), SessionMode::Copy, second, "libx264");
+        assert_eq!(
+            probe_entry(&joined, "a:0", "channels"),
+            "1",
+            "expected the mono second track, not the stereo default"
+        );
     }
 
     #[test]
@@ -1111,7 +1357,8 @@ mod tests {
             }
             let enc = dir.path().join(name);
             fs::create_dir_all(&enc).unwrap();
-            let mut child = spawn_ffmpeg(src, &enc, 0, SessionMode::Transcode, "libx264").unwrap();
+            let mut child =
+                spawn_ffmpeg(src, &enc, 0, SessionMode::Transcode, stereo(), "libx264").unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
                 if child.try_wait().ok().flatten().is_some() {

@@ -13,5 +13,9 @@ export const copy = {
 		'Badges: browser plays directly, remux and transcode start a playback session when you open the item. Text subtitles (SRT and similar) show in the player caption menu; ASS and image subs are not available yet.',
 	sessionSubtitlesPreparing:
 		'Captions may take a moment on first play while the file is read.',
-	subtitlesFoundNotRendered: 'Subtitle files found but not rendered yet:'
+	subtitlesFoundNotRendered: 'Subtitle files found but not rendered yet:',
+	audioTrack: 'Audio track',
+	switchingAudio: 'Switching audio track…',
+	audioSwitchUnsupported:
+		'This browser cannot switch audio tracks on a file it plays directly.'
 } as const;

@@ -68,10 +68,13 @@ export const api = {
 		request<Resp<'/api/v0/items/{itemId}/playback-info', 'get'>>(
 			`/api/v0/items/${itemId}/playback-info`
 		),
-	startTranscodeSession: (itemId: number, startMs = 0) => {
-		const q = startMs > 0 ? `?startMs=${startMs}` : '';
+	startTranscodeSession: (itemId: number, startMs = 0, audioTrackId?: string) => {
+		const params = new URLSearchParams();
+		if (startMs > 0) params.set('startMs', String(startMs));
+		if (audioTrackId) params.set('audioTrackId', audioTrackId);
+		const q = params.toString();
 		return request<Resp<'/api/v0/items/{itemId}/sessions', 'post'>>(
-			`/api/v0/items/${itemId}/sessions${q}`,
+			`/api/v0/items/${itemId}/sessions${q ? `?${q}` : ''}`,
 			{ method: 'POST' }
 		);
 	},

@@ -441,8 +441,28 @@ export interface components {
             container?: string | null;
             videoCodec?: string | null;
             audioCodec?: string | null;
+            /** @description Audio tracks in the source (ADR-0012). Listed the same way for directPlay, remux, and transcode: the client asks for a trackId and never reasons about the delivery path to find tracks. Direct play switches client-side; sessions take audioTrackId at start. */
+            audioTracks?: components["schemas"]["AudioTrack"][];
             /** @description Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars share one shape; differ by source. Listed the same way for directPlay, remux, and transcode. Delivery is via track elements or HLS EXT-X-MEDIA depending on the stream; clients do not branch on method to find tracks. */
             subtitleTracks?: components["schemas"]["SubtitleTrack"][];
+        };
+        AudioTrack: {
+            /** @description Stable id `e{streamIndex}`, the same scheme as embedded subtitles (ADR-0010 / ADR-0012). */
+            trackId: string;
+            /** @description Source codec (aac, ac3, eac3, dts, ...) */
+            codec: string;
+            /** @description Normalised ISO 639-1 when known; null if unlabelled */
+            language?: string | null;
+            /** @description Channel count. Tracks above the client ceiling are downmixed to stereo by the session with an explicit pan matrix. */
+            channels: number;
+            /** @description FFmpeg layout name (stereo, 5.1, 7.1, ...) when reported */
+            channelLayout?: string | null;
+            /** @description Optional title tag from the container (e.g. Commentary) */
+            label?: string | null;
+            /** @description Container default disposition. Exactly one track is default: the flagged one, else the first. */
+            default: boolean;
+            /** @description Absolute ffprobe stream index */
+            streamIndex: number;
         };
         SubtitleTrack: {
             /** @description Stable id used in the VTT URL. Embedded `e{N}`; sidecar `s` / `s-{suffix}` from the filename (ADR-0010). */
@@ -857,6 +877,8 @@ export interface operations {
             query?: {
                 /** @description Encode window start in milliseconds (default 0) */
                 startMs?: number;
+                /** @description Audio track to map, from playbackInfo.audioTracks (ADR-0012). Defaults to the flagged default track, else the first. Switching audio starts a new session at the current position and DELETEs the old one. */
+                audioTrackId?: string;
             };
             header?: never;
             path: {

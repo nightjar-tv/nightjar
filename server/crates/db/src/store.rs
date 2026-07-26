@@ -39,6 +39,7 @@ pub struct MediaItemRow {
     pub container: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    pub audio_channels: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub probe_status: String,
@@ -65,6 +66,7 @@ pub struct ProbeUpdate {
     pub container: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    pub audio_channels: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub probe_status: String,
@@ -193,7 +195,8 @@ impl Db {
             .prepare(
                 "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
-                        audio_codec, width, height, probe_status, scan_error
+                        audio_codec, audio_channels, width, height, probe_status,
+                        scan_error
                  FROM media_items
                  WHERE library_id = ?1
                  ORDER BY title COLLATE NOCASE, season, episode",
@@ -211,7 +214,8 @@ impl Db {
         conn.query_row(
             "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                     year, season, episode, duration_ms, container, video_codec,
-                    audio_codec, width, height, probe_status, scan_error
+                    audio_codec, audio_channels, width, height, probe_status,
+                    scan_error
              FROM media_items WHERE id = ?1",
             [id],
             map_item,
@@ -248,11 +252,13 @@ impl Db {
                     "INSERT INTO media_items (
                         library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
-                        audio_codec, width, height, probe_status, scan_error, probed_at
+                        audio_codec, audio_channels, width, height, probe_status,
+                        scan_error, probed_at
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6,
                         ?7, ?8, ?9, NULL, NULL, NULL,
-                        NULL, NULL, NULL, 'indexed', NULL, NULL
+                        NULL, NULL, NULL, NULL, 'indexed',
+                        NULL, NULL
                      )
                      ON CONFLICT(library_id, path) DO UPDATE SET
                         mtime_ms = excluded.mtime_ms,
@@ -266,6 +272,7 @@ impl Db {
                         container = NULL,
                         video_codec = NULL,
                         audio_codec = NULL,
+                        audio_channels = NULL,
                         width = NULL,
                         height = NULL,
                         probe_status = 'indexed',
@@ -312,10 +319,11 @@ impl Db {
                 container = ?3,
                 video_codec = ?4,
                 audio_codec = ?5,
-                width = ?6,
-                height = ?7,
-                probe_status = ?8,
-                scan_error = ?9,
+                audio_channels = ?6,
+                width = ?7,
+                height = ?8,
+                probe_status = ?9,
+                scan_error = ?10,
                 probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
@@ -324,6 +332,7 @@ impl Db {
                 update.container,
                 update.video_codec,
                 update.audio_codec,
+                update.audio_channels,
                 update.width,
                 update.height,
                 update.probe_status,
@@ -596,10 +605,11 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         container: r.get(11)?,
         video_codec: r.get(12)?,
         audio_codec: r.get(13)?,
-        width: r.get(14)?,
-        height: r.get(15)?,
-        probe_status: r.get(16)?,
-        scan_error: r.get(17)?,
+        audio_channels: r.get(14)?,
+        width: r.get(15)?,
+        height: r.get(16)?,
+        probe_status: r.get(17)?,
+        scan_error: r.get(18)?,
     })
 }
 

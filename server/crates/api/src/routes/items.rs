@@ -10,7 +10,8 @@ use axum::{
 use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
-    ensure_embedded_webvtt, ensure_sidecar_webvtt, is_serveable_sidecar_format, list_text_subtitles,
+    ensure_embedded_webvtt, ensure_sidecar_webvtt, is_serveable_sidecar_format, list_audio_tracks,
+    list_text_subtitles,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -46,6 +47,22 @@ pub struct MediaItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_error: Option<String>,
     pub playback_method: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackDto {
+    pub track_id: String,
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub channels: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub default: bool,
+    pub stream_index: u32,
 }
 
 #[derive(Serialize)]
@@ -86,6 +103,8 @@ pub struct PlaybackInfoDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio_tracks: Vec<AudioTrackDto>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub subtitle_tracks: Vec<SubtitleTrackDto>,
 }
 
@@ -125,6 +144,12 @@ pub async fn playback_info(
         tracing::warn!(item_id, error = %e, "subtitle list failed");
         Vec::new()
     });
+    // Listed the same for every method: the client asks for a track and never
+    // reasons about delivery to find one (ADR-0012).
+    let audio_tracks = audio_tracks_for(&row).unwrap_or_else(|e| {
+        tracing::warn!(item_id, error = %e, "audio track list failed");
+        Vec::new()
+    });
 
     Ok(Json(PlaybackInfoDto {
         item_id: row.id,
@@ -137,6 +162,7 @@ pub async fn playback_info(
         container: row.container,
         video_codec: row.video_codec,
         audio_codec: row.audio_codec,
+        audio_tracks,
         subtitle_tracks,
     }))
 }
@@ -233,6 +259,23 @@ fn parse_embedded_track_id(track_id: &str) -> Option<u32> {
     track_id.strip_prefix('e')?.parse().ok()
 }
 
+pub(crate) fn audio_tracks_for(row: &MediaItemRow) -> Result<Vec<AudioTrackDto>, String> {
+    let tracks = list_audio_tracks(std::path::Path::new(&row.path))?
+        .into_iter()
+        .map(|a| AudioTrackDto {
+            track_id: a.track_id(),
+            codec: a.codec,
+            language: a.language,
+            channels: a.channels,
+            channel_layout: a.channel_layout,
+            label: a.title,
+            default: a.is_default,
+            stream_index: a.stream_index,
+        })
+        .collect();
+    Ok(tracks)
+}
+
 pub(crate) fn subtitle_tracks_for(
     state: &AppState,
     row: &MediaItemRow,
@@ -290,6 +333,7 @@ pub fn decide(row: &MediaItemRow) -> PlaybackDecision {
         row.container.as_deref(),
         row.video_codec.as_deref(),
         row.audio_codec.as_deref(),
+        row.audio_channels.and_then(|c| u32::try_from(c).ok()),
         row.scan_error.as_deref(),
         &row.probe_status,
         &BROWSER_V0,

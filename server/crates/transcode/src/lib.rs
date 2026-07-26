@@ -1,14 +1,17 @@
 //! FFmpeg orchestration: HLS playback sessions in copy or encode mode
-//! (ADR-0007, ADR-0011), hardware encode detection (ADR-0009), and text
-//! subtitle WebVTT sidecars (ADR-0010).
+//! (ADR-0007, ADR-0011), hardware encode detection (ADR-0009), text
+//! subtitle WebVTT sidecars (ADR-0010), and audio track selection with
+//! stereo downmix (ADR-0012).
 
+mod audio;
 mod hls;
 mod hwaccel;
 mod subs;
 
+pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
-    EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PlaylistError, SessionEncoder, SessionMode,
-    StartSessionError, WindowAction, decide_window_action,
+    AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PlaylistError,
+    SessionEncoder, SessionMode, StartSessionError, WindowAction, decide_window_action,
 };
 pub use hwaccel::{
     EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,

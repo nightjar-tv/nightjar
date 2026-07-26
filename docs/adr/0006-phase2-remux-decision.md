@@ -69,9 +69,10 @@ schema and auth decisions in ADR-0003 stand.
 
 Only the first video and first audio stream are mapped (`-map 0:v:0 -map
 0:a:0?`), so multi-language MKVs and commentary tracks lose alternate audio
-until Phase 2 multi-track audio selection (planned with downmix rules and
-capability profiles: `playbackInfo` inventory, stable `trackId`, session
-switch model in a follow-up ADR). Subtitle tracks are dropped from the remux
+until Phase 2 multi-track audio selection. That follow-up is closed by
+[ADR-0012](0012-audio-downmix-and-track-selection.md): inventory, stable
+`trackId`, session switch model, downmix rules, and the channel ceiling on
+`ClientCapabilityProfile`. Subtitle tracks are dropped from the remux
 MP4; text tracks are listed and served as WebVTT sidecars (ADR-0010), and
 ASS/PGS burn-in remains later Phase 2. Seeking is only available once the
 remux is complete; playback of a large title waits for the full stream copy

@@ -8,9 +8,11 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use nightjar_core::PlaybackMethod;
+use nightjar_core::{BROWSER_V0, PlaybackMethod};
+use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
-    HlsSubtitleTrack, PlaylistError, SessionMode, StartSessionError, warm_embedded_webvtts,
+    AudioSelection, HlsSubtitleTrack, PlaylistError, SessionMode, StartSessionError,
+    list_audio_tracks, warm_embedded_webvtts,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -29,6 +31,7 @@ pub struct TranscodeSessionDto {
 #[serde(rename_all = "camelCase")]
 pub struct StartQuery {
     pub start_ms: Option<u64>,
+    pub audio_track_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +94,8 @@ pub async fn start(
         }
     };
 
+    let audio = resolve_audio(&row, query.audio_track_id.as_deref())?;
+
     let start_ms = query.start_ms.unwrap_or(0);
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
@@ -103,6 +108,7 @@ pub async fn start(
             start_ms,
             duration_ms as u64,
             mode,
+            audio,
             tracks_for_start,
         )
     })
@@ -154,6 +160,51 @@ pub async fn start(
         }),
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),
     }
+}
+
+/// Which audio stream this session maps (ADR-0012). No `audioTrackId` takes
+/// the container default, else the first track.
+fn resolve_audio(row: &MediaItemRow, requested: Option<&str>) -> Result<AudioSelection, ApiError> {
+    let max_channels = BROWSER_V0.max_audio_channels.unwrap_or(u32::MAX);
+    let tracks = match list_audio_tracks(std::path::Path::new(&row.path)) {
+        Ok(tracks) => tracks,
+        // Without a requested track the stored first-audio count still
+        // applies the ceiling, so a failed inventory need not fail playback.
+        Err(e) if requested.is_none() => {
+            tracing::warn!(item_id = row.id, error = %e, "audio track list failed at session start");
+            return Ok(AudioSelection {
+                stream_index: None,
+                channels: stored_channels(row),
+                max_channels,
+            });
+        }
+        Err(e) => return Err(ApiError::internal(e)),
+    };
+
+    let track = match requested {
+        Some(id) => Some(tracks.iter().find(|t| t.track_id() == id).ok_or_else(|| {
+            ApiError::not_found(format!("audio track {id} not found for item {}", row.id))
+        })?),
+        None => tracks.iter().find(|t| t.is_default),
+    };
+    Ok(match track {
+        Some(t) => AudioSelection {
+            stream_index: Some(t.stream_index),
+            channels: t.channels,
+            max_channels,
+        },
+        None => AudioSelection {
+            stream_index: None,
+            channels: stored_channels(row),
+            max_channels,
+        },
+    })
+}
+
+fn stored_channels(row: &MediaItemRow) -> u32 {
+    row.audio_channels
+        .and_then(|c| u32::try_from(c).ok())
+        .unwrap_or(0)
 }
 
 fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec<HlsSubtitleTrack> {

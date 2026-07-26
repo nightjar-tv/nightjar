@@ -8,6 +8,8 @@ pub struct ProbeResult {
     pub container: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    /// Channel count of the first audio stream (ADR-0012 channel ceiling).
+    pub audio_channels: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
 }
@@ -28,6 +30,7 @@ struct FfFormat {
 struct FfStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    channels: Option<i64>,
     width: Option<i32>,
     height: Option<i32>,
 }
@@ -78,6 +81,7 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
 
     let mut video_codec = None;
     let mut audio_codec = None;
+    let mut audio_channels = None;
     let mut width = None;
     let mut height = None;
     for stream in parsed.streams.unwrap_or_default() {
@@ -89,6 +93,7 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
             }
             Some("audio") if audio_codec.is_none() => {
                 audio_codec = stream.codec_name;
+                audio_channels = stream.channels;
             }
             _ => {}
         }
@@ -99,6 +104,7 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
         container,
         video_codec,
         audio_codec,
+        audio_channels,
         width,
         height,
     })

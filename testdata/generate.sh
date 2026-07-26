@@ -233,6 +233,27 @@ gen hevc_hdr10_mp4.mp4 \
   -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
   -c:a aac -ac 2 -shortest
 
+# 23. Two AAC stereo tracks tagged eng/spa (ADR-0012 multi-track switch)
+gen h264_aac_multilang_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=2" \
+  -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 \
+  -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa -shortest
+
+# 24. Main + commentary. Unlabelled second tracks are how commentary ships;
+# the label comes from the title tag, not the language.
+gen h264_aac_commentary_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -f lavfi -i "sine=frequency=220:sample_rate=48000:duration=2" \
+  -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 \
+  -metadata:s:a:0 language=eng -metadata:s:a:0 title="Main" \
+  -metadata:s:a:1 language=eng -metadata:s:a:1 title="Commentary" \
+  -disposition:a:0 default -disposition:a:1 0 -shortest
+
 # Optional multi-GB open-ended Range stress (never commit; gitignored)
 if [[ "${LARGE:-}" == "1" ]]; then
   echo "→ large-open-ended-range.mp4 (~2 GB, gitignored)"

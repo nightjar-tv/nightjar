@@ -20,6 +20,15 @@ pub fn normalize_language(token: &str) -> Option<String> {
     None
 }
 
+/// Language for a container stream tag. FFmpeg writes `und` on untagged
+/// streams — every MP4 audio track carries it — and that means unlabelled,
+/// not a language, so it must not reach clients as one. Unrecognised but
+/// real tokens are kept lowercased rather than dropped.
+pub fn container_stream_language(tag: Option<String>) -> Option<String> {
+    let tag = tag.filter(|s| !s.trim().is_empty() && !s.trim().eq_ignore_ascii_case("und"))?;
+    Some(normalize_language(&tag).unwrap_or_else(|| tag.trim().to_ascii_lowercase()))
+}
+
 const KNOWN_639_1: &[&str] = &[
     "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az", "ba", "be", "bg", "bh",
     "bi", "bm", "bn", "bo", "br", "bs", "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy", "da",
@@ -136,5 +145,25 @@ mod tests {
         assert_eq!(normalize_language("xyz"), None);
         assert_eq!(normalize_language("english"), None);
         assert_eq!(normalize_language("forced"), None);
+    }
+
+    #[test]
+    fn container_tags_treat_und_as_unlabelled() {
+        assert_eq!(
+            container_stream_language(Some("eng".into())).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            container_stream_language(Some("qya".into())).as_deref(),
+            Some("qya")
+        );
+        for unlabelled in ["und", "UND", "", "  "] {
+            assert_eq!(
+                container_stream_language(Some(unlabelled.into())),
+                None,
+                "{unlabelled:?} is not a language"
+            );
+        }
+        assert_eq!(container_stream_language(None), None);
     }
 }

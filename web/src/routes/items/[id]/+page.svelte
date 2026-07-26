@@ -9,6 +9,9 @@
 	type MediaItem = components['schemas']['MediaItem'];
 	type PlaybackInfo = components['schemas']['PlaybackInfo'];
 	type TranscodeSession = components['schemas']['TranscodeSession'];
+	type AudioTrack = components['schemas']['AudioTrack'];
+	// Not in lib.dom: only Safari exposes the media element track list today.
+	type BrowserAudioTracks = { length: number; [index: number]: { enabled: boolean } };
 
 	let item = $state<MediaItem | null>(null);
 	let playback = $state<PlaybackInfo | null>(null);
@@ -18,18 +21,106 @@
 		null
 	);
 	let preparingSession = $state(false);
+	let switchingAudio = $state(false);
+	let audioNote = $state<string | null>(null);
+	let selectedAudioTrackId = $state<string | null>(null);
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	// Mutable holder so onMount cleanup / pagehide always DELETE the live
 	// session even if the $state read in a stale closure is still null.
 	const sessionRef: { id: string | null } = { id: null };
+	// Non-reactive so changing it does not re-run the attach effect on its own.
+	const resumeRef = { seconds: 0 };
+	// Read by every await loop so an unmount mid-flight stops the loop and
+	// reaps whatever it already started.
+	const liveRef = { alive: true };
 
 	const itemId = $derived(Number(page.params.id));
+	const audioTracks = $derived(playback?.audioTracks ?? []);
 
 	function releaseSession() {
 		const id = sessionRef.id;
 		sessionRef.id = null;
 		sessionEncoder = null;
 		if (id) void api.deleteTranscodeSession(id);
+	}
+
+	function audioTrackLabel(track: AudioTrack): string {
+		const name = track.label ?? track.language ?? track.trackId;
+		return track.channelLayout ? `${name} · ${track.channelLayout}` : name;
+	}
+
+	/** Poll a session playlist until FFmpeg has written its first segment. */
+	async function waitForPlaylist(url: string): Promise<boolean> {
+		for (let i = 0; liveRef.alive && i < 100; i++) {
+			const res = await fetch(url);
+			if (res.ok) return true;
+			await new Promise((r) => setTimeout(r, 200));
+		}
+		return false;
+	}
+
+	function selectAudio(trackId: string) {
+		if (trackId === selectedAudioTrackId) return;
+		selectedAudioTrackId = trackId;
+		audioNote = null;
+		const track = audioTracks.find((t) => t.trackId === trackId);
+		// Direct play is free only while the selected track fits the client
+		// ceiling. An over-ceiling secondary (e.g. 5.1 commentary on a stereo
+		// default) needs a hybrid session so the pan downmix still runs
+		// (ADR-0012).
+		if (
+			playback?.playbackMethod === 'directPlay' &&
+			track != null &&
+			track.channels <= 2
+		) {
+			switchDirectPlayAudio(trackId);
+		} else {
+			void switchSessionAudio(trackId);
+		}
+	}
+
+	/** Direct play: the container already holds every track, so the switch
+	 *  is client-side and free where the browser exposes the list. */
+	function switchDirectPlayAudio(trackId: string) {
+		const list = (videoEl as (HTMLVideoElement & { audioTracks?: BrowserAudioTracks }) | null)
+			?.audioTracks;
+		const index = audioTracks.findIndex((t) => t.trackId === trackId);
+		if (!list || index < 0) {
+			audioNote = copy.audioSwitchUnsupported;
+			return;
+		}
+		for (let i = 0; i < list.length; i++) {
+			list[i].enabled = i === index;
+		}
+	}
+
+	/** Sessions: a fresh session at the current position, then drop the old
+	 *  one. Init and prior segments carry the old audio config, so this is
+	 *  never a window move inside the seek path (ADR-0012). */
+	async function switchSessionAudio(trackId: string) {
+		const startMs = Math.max(0, Math.floor((videoEl?.currentTime ?? 0) * 1000));
+		const previous = sessionRef.id;
+		switchingAudio = true;
+		try {
+			const started = await api.startTranscodeSession(itemId, startMs, trackId);
+			const ready = await waitForPlaylist(started.playlistUrl);
+			// Never adopt a session the page no longer owns; leaving it for
+			// the idle reaper burns a cap slot for a minute.
+			if (!ready || !liveRef.alive) {
+				void api.deleteTranscodeSession(started.sessionId);
+				if (liveRef.alive) error = copy.sessionFailed;
+				return;
+			}
+			sessionRef.id = started.sessionId;
+			sessionEncoder = started;
+			resumeRef.seconds = startMs / 1000;
+			playlistUrl = started.playlistUrl;
+			if (previous) void api.deleteTranscodeSession(previous);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			switchingAudio = false;
+		}
 	}
 
 	const playable = $derived(
@@ -45,7 +136,7 @@
 	);
 
 	onMount(() => {
-		let alive = true;
+		liveRef.alive = true;
 
 		const onPageHide = () => releaseSession();
 		// pagehide DELETE: refresh and close must stop the session. Remounts
@@ -55,12 +146,14 @@
 		(async () => {
 			item = await api.getItem(itemId);
 			playback = await api.getPlaybackInfo(itemId);
+			selectedAudioTrackId =
+				playback.audioTracks?.find((t) => t.default)?.trackId ?? null;
 
 			// Remux and transcode both play through a session (ADR-0011).
 			if (playback.playbackMethod !== 'directPlay') {
 				preparingSession = true;
 				let started: TranscodeSession | null = null;
-				for (let attempt = 0; alive && attempt < 5; attempt++) {
+				for (let attempt = 0; liveRef.alive && attempt < 5; attempt++) {
 					try {
 						started = await api.startTranscodeSession(itemId);
 						sessionRef.id = started.sessionId;
@@ -81,14 +174,10 @@
 					return;
 				}
 				// Wait until init is ready so the VOD playlist is servable.
-				for (let i = 0; alive && i < 100; i++) {
-					const res = await fetch(started.playlistUrl);
-					if (res.ok) {
-						playlistUrl = started.playlistUrl;
-						preparingSession = false;
-						return;
-					}
-					await new Promise((r) => setTimeout(r, 200));
+				if (await waitForPlaylist(started.playlistUrl)) {
+					playlistUrl = started.playlistUrl;
+					preparingSession = false;
+					return;
 				}
 				preparingSession = false;
 				error = copy.sessionFailed;
@@ -99,7 +188,7 @@
 		});
 
 		return () => {
-			alive = false;
+			liveRef.alive = false;
 			window.removeEventListener('pagehide', onPageHide);
 			releaseSession();
 		};
@@ -111,7 +200,7 @@
 		if (!video || !url) {
 			return;
 		}
-		const handle = attachHls(video, url);
+		const handle = attachHls(video, url, resumeRef.seconds);
 		return () => handle.destroy();
 	});
 </script>
@@ -162,7 +251,13 @@
 		{:else if playable && playback.streamUrl}
 			{#if (playback.subtitleTracks?.length ?? 0) > 0}
 				<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions) -->
-				<video controls playsinline src={playback.streamUrl} crossorigin="anonymous">
+				<video
+					bind:this={videoEl}
+					controls
+					playsinline
+					src={playback.streamUrl}
+					crossorigin="anonymous"
+				>
 					{#each playback.subtitleTracks ?? [] as track, i (track.trackId)}
 						{#if track.url}
 							<track
@@ -180,7 +275,7 @@
 				</video>
 			{:else}
 				<!-- svelte-ignore a11y_media_has_caption -->
-				<video controls playsinline src={playback.streamUrl}>
+				<video bind:this={videoEl} controls playsinline src={playback.streamUrl}>
 					Your browser cannot play this file directly.
 				</video>
 			{/if}
@@ -191,6 +286,31 @@
 			<p class="preparing" role="status">{copy.preparingSession}</p>
 		{:else if playback.playbackMethod !== 'directPlay'}
 			<p class="error">{copy.sessionFailed}</p>
+		{/if}
+
+		{#if playable && audioTracks.length > 1}
+			<fieldset class="tracks">
+				<legend>{copy.audioTrack}</legend>
+				{#each audioTracks as track (track.trackId)}
+					<label>
+						<input
+							type="radio"
+							name="audio-track"
+							value={track.trackId}
+							checked={track.trackId === selectedAudioTrackId}
+							disabled={switchingAudio}
+							onchange={() => selectAudio(track.trackId)}
+						/>
+						{audioTrackLabel(track)}
+					</label>
+				{/each}
+			</fieldset>
+			{#if switchingAudio}
+				<p class="preparing" role="status">{copy.switchingAudio}</p>
+			{/if}
+			{#if audioNote}
+				<p class="preparing" role="status">{audioNote}</p>
+			{/if}
 		{/if}
 	{/if}
 </main>
@@ -234,5 +354,30 @@
 		font-family: 'Spline Sans Mono', ui-monospace, monospace;
 		font-size: 0.875rem;
 		color: var(--moth-dim);
+	}
+	.tracks {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem 1rem;
+		align-items: center;
+		margin-top: 1rem;
+		padding: 0.75rem 1rem;
+		border: 1px solid var(--moth-dim);
+		border-radius: 8px;
+		font-family: 'Spline Sans Mono', ui-monospace, monospace;
+		font-size: 0.875rem;
+	}
+	.tracks legend {
+		color: var(--moth-dim);
+		padding: 0 0.35rem;
+	}
+	.tracks label {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.tracks input:focus-visible {
+		outline: 2px solid currentColor;
+		outline-offset: 2px;
 	}
 </style>

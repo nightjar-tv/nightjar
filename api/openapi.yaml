@@ -283,6 +283,17 @@ paths:
             type: integer
             format: int64
             minimum: 0
+        - name: audioTrackId
+          in: query
+          required: false
+          description: >
+            Audio track to map, from playbackInfo.audioTracks (ADR-0012).
+            Defaults to the flagged default track, else the first. Switching
+            audio starts a new session at the current position and DELETEs the
+            old one.
+          schema:
+            type: string
+            pattern: '^e[0-9]+$'
       responses:
         "202":
           description: Session started for this item
@@ -766,6 +777,15 @@ components:
         audioCodec:
           type: string
           nullable: true
+        audioTracks:
+          type: array
+          description: >
+            Audio tracks in the source (ADR-0012). Listed the same way for
+            directPlay, remux, and transcode: the client asks for a trackId
+            and never reasons about the delivery path to find tracks. Direct
+            play switches client-side; sessions take audioTrackId at start.
+          items:
+            $ref: "#/components/schemas/AudioTrack"
         subtitleTracks:
           type: array
           description: >
@@ -776,6 +796,47 @@ components:
             on method to find tracks.
           items:
             $ref: "#/components/schemas/SubtitleTrack"
+
+    AudioTrack:
+      type: object
+      required: [trackId, codec, channels, default, streamIndex]
+      properties:
+        trackId:
+          type: string
+          description: >
+            Stable id `e{streamIndex}`, the same scheme as embedded subtitles
+            (ADR-0010 / ADR-0012).
+          pattern: '^e[0-9]+$'
+        codec:
+          type: string
+          description: Source codec (aac, ac3, eac3, dts, ...)
+        language:
+          type: string
+          nullable: true
+          description: Normalised ISO 639-1 when known; null if unlabelled
+        channels:
+          type: integer
+          minimum: 1
+          description: >
+            Channel count. Tracks above the client ceiling are downmixed to
+            stereo by the session with an explicit pan matrix.
+        channelLayout:
+          type: string
+          nullable: true
+          description: FFmpeg layout name (stereo, 5.1, 7.1, ...) when reported
+        label:
+          type: string
+          nullable: true
+          description: Optional title tag from the container (e.g. Commentary)
+        default:
+          type: boolean
+          description: >
+            Container default disposition. Exactly one track is default: the
+            flagged one, else the first.
+        streamIndex:
+          type: integer
+          minimum: 0
+          description: Absolute ffprobe stream index
 
     SubtitleTrack:
       type: object
