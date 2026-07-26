@@ -79,7 +79,15 @@ export const api = {
 		);
 	},
 	deleteTranscodeSession: async (sessionId: string) => {
-		await request<undefined>(`/api/v0/sessions/${sessionId}`, { method: 'DELETE' });
+		// keepalive: survives pagehide/unload so the DELETE reaches the
+		// server instead of being killed mid-flight (Safari reports that as
+		// a misleading CORS failure). Bodyless DELETE is well under the
+		// 64 KB keepalive limit. The idle reaper remains the backstop when
+		// keepalive is unsupported or still fails — do not remove it.
+		await request<undefined>(`/api/v0/sessions/${sessionId}`, {
+			method: 'DELETE',
+			keepalive: true
+		});
 	},
 	getTranscodeCapabilities: () =>
 		request<Resp<'/api/v0/system/transcode', 'get'>>('/api/v0/system/transcode')

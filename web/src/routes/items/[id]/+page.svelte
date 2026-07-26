@@ -145,8 +145,9 @@
 		liveRef.alive = true;
 
 		const onPageHide = () => releaseSession();
-		// pagehide DELETE: refresh and close must stop the session. Remounts
-		// without teardown used to leave FFmpeg running until the idle reaper.
+		// pagehide DELETE (keepalive): refresh and close must stop the
+		// session. keepalive reduces orphans; the idle reaper is still the
+		// Gate 2 backstop when the request never leaves the browser.
 		window.addEventListener('pagehide', onPageHide);
 
 		(async () => {
