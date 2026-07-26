@@ -146,13 +146,29 @@ this ADR records that as the reason, and the tests below lock it.
       when that job finishes, a follow-up scan starts immediately. Poll
       reuse does not set the dirty bit (it would force a double cold walk
       on every long index).
-   4. **Pause extract during the index walk.** Extract demuxes are
+   4. **Pause extract for the whole indexing phase.** Extract demuxes are
       multi-minute SMB reads. Running them concurrently with a Movies
       cold walk stretched that walk past 22 minutes with zero rows
       committed; the same tiny library indexed in 12 ms idle and 11 s
       under extract load. Workers still prefer probe over extract, and
-      additionally refuse to start new extracts while any library is in
-      its walk. One in-flight demux may finish; new ones wait.
+      refuse to start new extracts from `begin_index` through
+      `set_scan_job_index_done` (walk, upserts, and sidecar rediscovery),
+      not only during the walk itself. One in-flight demux may finish;
+      new ones wait.
+   5. **Sidecar rediscovery is not a full-library readdir.** A pass that
+      called `discover_sidecars` for every unchanged title cost ~700 ms
+      per parent on this SMB mount (~20 min for ~1,750 Movies). Added and
+      updated items associate sidecars in the upsert flush. Unchanged
+      media are re-checked only when the walk cache was already warm and
+      the parent was re-listed (a new `.srt` bumps that dir's mtime). A
+      cold cache after restart skips the bulk pass; existing sidecar rows
+      stay in the DB.
+   6. **Defer recursive `notify` until the first index pass finishes.**
+      Arming recursive watches on an SMB Movies root during the cold walk
+      competed for metadata IOPS and pushed walks past 15–20 minutes.
+      The watcher polls until `last_index_duration_ms > 0`, then arms
+      notify. `NIGHTJAR_POLL_ONLY=1` keeps notify off for shares where
+      poll alone is preferred.
 
 9. **Probe and scan-job resume across restarts.** Items left
    `probe_status = indexed` after a process exit are stranded if the pool
@@ -171,60 +187,114 @@ this ADR records that as the reason, and the tests below lock it.
    files. Startup fails those rows with "scan interrupted by process
    restart" before accepting work.
 
+10. **Lazy background extraction is the accepted backfill strategy.**
+    A first pass over tens of thousands of titles is multi-day wall clock
+    (numbers below). That is acceptable as library hygiene: probe makes
+    titles playable first; extract drains `pending` in the background;
+    restarts re-enqueue. It is not a description of first play for a
+    title the queue has not reached yet.
+
+11. **First-play captions for a still-`pending` title remain open.**
+    The backfill number does not say what a user waiting on one title
+    experiences. A 10 GB text-bearing title at ~56 MB/s still needs about
+    three minutes of demux before a complete WebVTT exists. The
+    growing-`<track>` experiment (Consequences) asked whether a partial
+    VTT could appear in the player while demux continues. No browser
+    under test picked up cues from an append-in-place file without a
+    track reload. Until a first-play design is chosen (play-triggered
+    extract priority plus preparing UI, or a client that reloads
+    `<track>`), do not treat first-play captions as settled by this ADR.
+
 ## Consequences
 
 - First play of an already-extracted title shows captions immediately.
   Measured on a ready title: WebVTT GET 0.5–4 ms; HLS master playlist
   included `#EXT-X-MEDIA:TYPE=SUBTITLES` on the first fetch (0.38 s
   including session create) with playlist entries pointing at the stored
-  VTT URLs. Chrome and Safari both opened the item page; browser JS
-  automation was not available to scrape the `<track>` element, so the
-  API/HLS path is the verified number. First play of a title still
-  `pending` shows the preparing line, not a multi-minute hang inside the
-  GET.
-- Add-file timings on the household NAS (2026-07-26), isolated library
-  rooted at a single title directory (~4 KB probe MKV + sidecar):
+  VTT URLs. First play of a title still `pending` shows the preparing
+  line, not a multi-minute hang inside the GET. Whether that preparing
+  line can become near-immediate captions is still open (§11).
+- Add-file timings on the full household Movies library over SMB
+  (2026-07-26), extracts paused during index, tiny probe MKV + sidecar,
+  ~1,750 titles on `/Users/gmacarthur/mnt-media/Movies`:
 
-  | Path | Until listed | Until playable | Until subtitled |
-  |---|---|---|---|
-  | Explicit `POST /scan` (idle) | 0.26 s | 0.26 s | 0.51 s |
-  | Watcher (`notify` fired; concurrent Movies extract on same share) | 27 s | 27 s | 27 s |
+  | Path | Until listed | Until playable | Until subtitled | Discovering walk |
+  |---|---|---|---|---|
+  | Poll fallback (`NIGHTJAR_POLL_ONLY=1`; natural poll after cold 111.6 s, interval 223 s) | 148.7 s | 148.7 s | 148.7 s | 567 ms |
+  | Watcher (`notify` armed after first index; fs create) | 4.4 s | 4.4 s | 4.4 s | 524 ms |
 
-  The first column is the property this slice exists to deliver. Under a
-  full Movies cold walk fighting extract demuxes, a new title under the
-  Movies root had still not been indexed after 22 minutes (walk alive,
-  `added=0`); that is why extracts pause during index and why the dirty
-  follow-up exists. Do not treat the 27 s watcher row as a Movies-scale
-  guarantee until a walk completes without extract contention.
+  Cold index on the same mount was 103–112 s with `sidecar_checked=0`
+  after the rediscovery change (earlier contended cold walks ran past
+  20 minutes). Listed/playable/subtitled landed in the same sample for
+  the probe title: warm walk plus probe plus sidecar convert finished
+  inside one poll tick. Poll wall time is dominated by waiting for the
+  scaled interval, not by the walk. An idle single-directory library
+  still indexes in 0.26 s listed / 0.51 s subtitled via `POST /scan`;
+  that is not the Movies-scale number.
+
+  The earlier 27 s watcher row was a tiny library under concurrent
+  Movies extract load and is superseded by the Movies-scale table above.
+- Growing-`<track>` experiment (Playwright Chromium / Firefox / WebKit,
+  partial WebVTT served to `<video>` while cues were appended):
+
+  | Browser | Append in place (no reload) | Reload `<track>` (new URL) |
+  |---|---|---|
+  | Chromium | No | Yes |
+  | WebKit (Safari) | No | Yes |
+  | Firefox | No | Yes (cues empty until `mode` toggled `disabled`→`showing`) |
+
+  Progressive growing VTT does not give near-immediate first-play
+  captions without client cooperation. The fallback under consideration
+  is play-triggered extract priority plus honest preparing UI (§11).
 - A first extract pass is wall-clock bound by sequential NAS read speed,
   not by pool width: extract is serialised by a process-wide lock (shared
   tmp paths), and subtitle packets are interleaved throughout the
   container, so each text-bearing title costs roughly one full read.
   Parallel extract would only split the same pipe.
 
-  Measured on the dogfood Movies library (2026-07-26):
+  Movies (2026-07-26):
 
   | Quantity | Value |
   |---|---|
   | Library size | 1,745 titles, 16.5 TB, mean 9.5 GB, p90 17.8 GB |
-  | Titles with an extractable text track (subrip/mov_text/webvtt/text) | 68% by count, **74% by bytes** (200-file sample) |
-  | Demux throughput (two 8–10 GB subrip titles, isolated) | 54 and 56 MB/s, ~18 s/GB, flat across 1 vs 4 tracks |
-  | Header-only classify probe (`ffprobe -select_streams s`) | ~0.26 s/title |
+  | Text-bearing (subrip/mov_text/webvtt/text) | 68% by count, **74% by bytes** (n=200) |
+  | Demux throughput (8–10 GB subrip titles, isolated) | 54–56 MB/s, ~18 s/GB |
+  | Header-only classify | ~0.26 s/title → ~7.5 min for 1,745 titles |
 
   Text-bearing bytes ≈ 0.74 × 16.5 TB = 12.3 TB at ~18 s/GB ≈ **61 hours
-  (~2.6 days)** for the Movies first pass, single stream, uncontended.
-  Filtering to text-bearing items removes only ~26% of the read volume
-  here; this library is subtitle-heavy (subrip dominant), so
-  extract-only-where-text-exists is not the large win it would be on a
-  library without embedded subs. Image/ASS tracks (PGS, dvd_subtitle,
-  ass) are skipped and cost only the classify probe.
+  (~2.6 days)** demux, plus classify.
+
+  TV Shows (2026-07-26), same share:
+
+  | Quantity | Value |
+  |---|---|
+  | Library size | 23,060 files, est. 32.5 TB (n=500 sizes; mean 1.41 GB, p50 0.96, p90 3.20) |
+  | Text-bearing | **54% by count, 62.3% by bytes** (n=200) |
+  | Demux throughput (three ~1.15–1.38 GB episodes, isolated) | 26.2 / 26.5 / 31.2 MB/s (walls 44 / 52 / 43 s) |
+  | Header-only classify | mean 0.167 s (p50 0.142, p90 0.263) → **~64 min** for 23,060 titles before demux |
+
+  Text-bearing bytes ≈ 0.623 × 32.5 TB ≈ 20.2 TB. At ~28 MB/s (~36 s/GB)
+  that is ≈ **202 hours (~8.4 days)** demux, plus the classify overhead.
+  Episode-sized files are still demux-dominated at these sizes: ~50 s
+  read versus ~0.17 s classify. The 0.26 s × 23k ≈ 100 min figure is an
+  upper bound using the Movies classify sample; the measured TV mean is
+  lower. Very small files would invert that ratio; this library's p50 is
+  near 1 GB.
+
+  Combined first-pass estimate (~24,800 items), serial, uncontended:
+
+  | Library | Classify | Demux (text-bearing bytes) | Total |
+  |---|---|---|---|
+  | Movies | ~7.5 min | ~61 h | **~2.6 days** |
+  | TV Shows | ~64 min | ~202 h | **~8.5 days** |
+  | Both | ~1.2 h | ~263 h | **~11 days** |
+
+  Lazy background extraction accepts that wall clock (§10). It does not
+  close first-play for a title still waiting in the queue (§11).
 
   The earlier **21 items/hour** figure was measured while a cold Movies
-  index walk was starving the same share; it is a contention artifact, not
-  the steady-state rate, and is superseded by the throughput number above.
-  Extracts now pause during the index walk for exactly this reason. TV
-  Shows (~23,058 files, smaller per title) is not yet byte-measured; the
-  full 24,800-item estimate needs that pass before it is stated.
+  index walk was starving the same share; it is a contention artifact,
+  superseded by the throughput numbers above.
 - Schema migration `005` adds `subtitle_status` and the source mtime/size
   stamp columns (append-only). OpenAPI gains `subtitleStatus` on item and
   playback-info schemas (additive, v0).

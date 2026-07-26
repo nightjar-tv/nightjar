@@ -54,14 +54,17 @@ fn run_scan_job(
     }
 
     let index_started = Instant::now();
-    // Hold extract workers off the share for the walk; one in-flight demux may
-    // still finish, but new extracts do not start until end_index.
+    // Hold extract workers off the share for the whole indexing phase (walk,
+    // upserts, sidecar rediscovery). One in-flight demux may still finish;
+    // new extracts wait until end_index, after set_scan_job_index_done.
     pool.begin_index();
-    let files = pool.with_walk_cache(library_id, |cache| {
+    let index_result = (|| -> Result<(u32, u32, u32, u32, Vec<pool::WorkItem>, u64), String> {
+    let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
+    let outcome = pool.with_walk_cache(library_id, |cache| {
         walk::walk_media_files_cached(root, Some(cache))
-    });
-    pool.end_index();
-    let files = files?;
+    })?;
+    let files = outcome.files;
+    let relisted_dirs = outcome.relisted_dirs;
     let mut added = 0u32;
     let mut updated = 0u32;
     let mut unchanged = 0u32;
@@ -71,6 +74,7 @@ fn run_scan_job(
     let mut probe_queue = Vec::new();
 
     let flush = |db: &Db,
+                 pool: &LibraryPool,
                  library_id: i64,
                  pending: &mut Vec<UpsertItem>,
                  were_existing: &mut Vec<bool>,
@@ -81,6 +85,7 @@ fn run_scan_job(
         if pending.is_empty() {
             return Ok(());
         }
+        let paths: Vec<PathBuf> = pending.iter().map(|p| PathBuf::from(&p.path)).collect();
         let ids = db.upsert_items_indexed(library_id, pending)?;
         for (i, id) in ids.into_iter().enumerate() {
             if were_existing[i] {
@@ -90,9 +95,24 @@ fn run_scan_job(
             }
             probe_queue.push(pool::WorkItem::probe(
                 id,
-                PathBuf::from(&pending[i].path),
+                paths[i].clone(),
                 Some(job_id),
             ));
+            // New or replaced media: discover sidecars now so we do not need a
+            // full-library rediscovery after every cold walk.
+            match associate_sidecars(db, id, &paths[i]) {
+                Ok(true) => {
+                    db.mark_items_subtitle_pending(&[id])?;
+                    pool.enqueue(pool::WorkItem::extract(id, paths[i].clone()));
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    item_id = id,
+                    path = %paths[i].display(),
+                    error = %e,
+                    "sidecar association failed"
+                ),
+            }
         }
         pending.clear();
         were_existing.clear();
@@ -133,6 +153,7 @@ fn run_scan_job(
                 if pending_upserts.len() >= INDEX_BATCH {
                     flush(
                         db,
+                        pool,
                         library_id,
                         &mut pending_upserts,
                         &mut pending_were_existing,
@@ -147,6 +168,7 @@ fn run_scan_job(
 
     flush(
         db,
+        pool,
         library_id,
         &mut pending_upserts,
         &mut pending_were_existing,
@@ -166,25 +188,41 @@ fn run_scan_job(
         tracing::warn!(error = %e, "subtitle orphan cleanup failed");
     }
 
-    // Sidecar association always runs, including for unchanged media, so a
-    // new .srt beside an untouched video is stored without waiting for mtime.
-    for file in &files {
-        let path_str = path_to_string(&file.path);
-        let Some((item_id, _)) = db.item_mtime(library_id, &path_str)? else {
-            continue;
-        };
-        match associate_sidecars(db, item_id, &file.path) {
-            Ok(true) => {
-                db.mark_items_subtitle_pending(&[item_id])?;
-                pool.enqueue(pool::WorkItem::extract(item_id, file.path.clone()));
+    // Rediscover sidecars beside unchanged media only when the walk cache was
+    // warm and the parent was re-listed (new .srt bumps dir mtime). A cold
+    // cache would mark every dir relisted and re-pay ~20 min of SMB readdir;
+    // existing sidecar rows stay in the DB across restarts, and add/update
+    // already ran associate_sidecars in flush.
+    let mut sidecar_checked = 0u32;
+    if cache_warm {
+        for file in &files {
+            let Some(parent) = file.path.parent() else {
+                continue;
+            };
+            if !relisted_dirs.contains(parent) {
+                continue;
             }
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                item_id,
-                path = %file.path.display(),
-                error = %e,
-                "sidecar association failed"
-            ),
+            let path_str = path_to_string(&file.path);
+            let Some((item_id, mtime)) = db.item_mtime(library_id, &path_str)? else {
+                continue;
+            };
+            if mtime != file.mtime_ms {
+                continue;
+            }
+            sidecar_checked += 1;
+            match associate_sidecars(db, item_id, &file.path) {
+                Ok(true) => {
+                    db.mark_items_subtitle_pending(&[item_id])?;
+                    pool.enqueue(pool::WorkItem::extract(item_id, file.path.clone()));
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    item_id,
+                    path = %file.path.display(),
+                    error = %e,
+                    "sidecar association failed"
+                ),
+            }
         }
     }
 
@@ -206,10 +244,16 @@ fn run_scan_job(
         updated,
         removed,
         unchanged,
+        sidecar_checked,
+        relisted_dirs = relisted_dirs.len(),
         to_probe = probe_queue.len(),
         index_duration_ms,
         "index pass done"
     );
+    Ok((added, updated, removed, unchanged, probe_queue, index_duration_ms))
+    })();
+    pool.end_index();
+    let (_added, _updated, _removed, _unchanged, probe_queue, _index_duration_ms) = index_result?;
 
     let probe_started = Instant::now();
     let probe_ids: Vec<i64> = probe_queue.iter().map(|item| item.item_id).collect();

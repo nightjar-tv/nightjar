@@ -127,10 +127,14 @@ impl LibraryPool {
         self.last_index_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
+    pub fn last_index_duration_ms(&self) -> u64 {
+        self.last_index_ms.load(Ordering::Relaxed)
+    }
+
     /// Poll period: at least 60s, else 2× the longest recent index pass so a
     /// full SMB walk cannot stack on top of itself (ADR-0013).
     pub fn poll_interval(&self) -> Duration {
-        let ms = self.last_index_ms.load(Ordering::Relaxed);
+        let ms = self.last_index_duration_ms();
         let secs = (ms.saturating_mul(2) / 1000).max(60);
         Duration::from_secs(secs)
     }

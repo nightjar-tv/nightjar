@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -38,6 +38,19 @@ impl WalkCache {
     pub fn clear(&mut self) {
         self.dirs.clear();
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.dirs.is_empty()
+    }
+}
+
+/// Result of a media walk, including which directories were actually re-listed.
+#[derive(Debug, Default)]
+pub struct WalkOutcome {
+    pub files: Vec<MediaFile>,
+    /// Directories whose contents were readdir'd this pass (cold, or mtime moved).
+    /// Sidecar rediscovery is only needed for media whose parent is in this set.
+    pub relisted_dirs: HashSet<PathBuf>,
 }
 
 /// Walk `root`, following directories but not symlink loops. Permission errors are skipped.
@@ -49,10 +62,11 @@ impl WalkCache {
 pub fn walk_media_files_cached(
     root: &Path,
     mut cache: Option<&mut WalkCache>,
-) -> Result<Vec<MediaFile>, String> {
+) -> Result<WalkOutcome, String> {
     let mut out = Vec::new();
+    let mut relisted_dirs = HashSet::new();
     let mut stack = vec![root.to_path_buf()];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut next_dirs: HashMap<PathBuf, CachedDir> = HashMap::new();
 
     while let Some(dir) = stack.pop() {
@@ -79,6 +93,7 @@ pub fn walk_media_files_cached(
             continue;
         }
 
+        relisted_dirs.insert(dir.clone());
         let mut files = Vec::new();
         let mut children = Vec::new();
         let entries = match fs::read_dir(&dir) {
@@ -137,7 +152,10 @@ pub fn walk_media_files_cached(
     }
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
+    Ok(WalkOutcome {
+        files: out,
+        relisted_dirs,
+    })
 }
 
 fn mtime_ms_from(meta: &std::fs::Metadata) -> i64 {
@@ -172,9 +190,9 @@ mod tests {
         File::create(dir.path().join("Movie.vtt")).unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
         File::create(dir.path().join("sub").join("b.mkv")).unwrap();
-        let files = walk_media_files_cached(dir.path(), None).unwrap();
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|f| {
+        let outcome = walk_media_files_cached(dir.path(), None).unwrap();
+        assert_eq!(outcome.files.len(), 2);
+        assert!(outcome.files.iter().all(|f| {
             let ext = f.path.extension().and_then(|e| e.to_str()).unwrap_or("");
             !matches!(
                 ext.to_ascii_lowercase().as_str(),
@@ -192,20 +210,47 @@ mod tests {
 
         let mut cache = WalkCache::new();
         let first = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.files.len(), 1);
+        assert!(first.relisted_dirs.contains(&nested));
 
-        // Unchanged tree: same files, cache hit path.
+        // Unchanged tree: same files, cache hit path — no readdir.
         let second = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
-        assert_eq!(second.len(), 1);
+        assert_eq!(second.files.len(), 1);
+        assert!(second.relisted_dirs.is_empty());
 
         // Nested add updates only the immediate parent mtime; ancestors may not.
         thread::sleep(Duration::from_millis(1100));
         File::create(nested.join("two.mkv")).unwrap();
         let third = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
         assert_eq!(
-            third.len(),
+            third.files.len(),
             2,
             "immediate-parent mtime change must surface the new file"
+        );
+        assert!(third.relisted_dirs.contains(&nested));
+        assert!(
+            !third.relisted_dirs.contains(root.path()),
+            "unchanged ancestors must not be re-listed"
+        );
+    }
+
+    #[test]
+    fn sidecar_parent_relisted_when_srt_added() {
+        let root = tempdir().unwrap();
+        let movie = root.path().join("Movie");
+        fs::create_dir_all(&movie).unwrap();
+        File::create(movie.join("Movie.mkv")).unwrap();
+
+        let mut cache = WalkCache::new();
+        let _ = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
+
+        thread::sleep(Duration::from_millis(1100));
+        File::create(movie.join("Movie.en.srt")).unwrap();
+        let after = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
+        assert_eq!(after.files.len(), 1);
+        assert!(
+            after.relisted_dirs.contains(&movie),
+            "new sidecar bumps parent mtime so rediscovery can run"
         );
     }
 }

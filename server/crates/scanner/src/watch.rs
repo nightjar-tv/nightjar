@@ -22,6 +22,30 @@ pub fn spawn_library_watcher(db: Arc<Db>, pool: Arc<LibraryPool>) {
 }
 
 fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
+    // Recursive FS watches on SMB compete with the index walk for metadata
+    // IOPS (dogfood: Movies cold walk >15 min with notify vs ~2 min poll-only).
+    // Poll remains the reliable path on network shares (ADR-0013).
+    let poll_only = std::env::var("NIGHTJAR_POLL_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if poll_only {
+        tracing::info!("library watcher poll-only; FS notify disabled");
+        return run_poll_only(db, pool);
+    }
+    run_with_notify(db, pool)
+}
+
+fn run_poll_only(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
+    let mut watched: HashMap<i64, PathBuf> = HashMap::new();
+    let mut last_poll = std::time::Instant::now();
+    loop {
+        sync_library_roots(&db, &mut watched)?;
+        std::thread::sleep(Duration::from_secs(5));
+        maybe_poll(&db, &pool, &watched, &mut last_poll);
+    }
+}
+
+fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_secs(2), move |res| {
         let _ = tx.send(res);
@@ -30,8 +54,21 @@ fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
 
     let mut watched: HashMap<i64, PathBuf> = HashMap::new();
     let mut last_poll = std::time::Instant::now();
+    // Recursive SMB watches compete with the cold walk for metadata IOPS.
+    // Poll until one index pass finishes (walk cache warm), then arm notify.
+    let mut notify_armed = false;
     loop {
-        sync_watches(&db, &mut debouncer, &mut watched)?;
+        if notify_armed {
+            sync_watches(&db, &mut debouncer, &mut watched)?;
+        } else {
+            sync_library_roots(&db, &mut watched)?;
+            if pool.last_index_duration_ms() > 0 {
+                watched.clear();
+                sync_watches(&db, &mut debouncer, &mut watched)?;
+                notify_armed = true;
+                tracing::info!("armed recursive FS notify after first index pass");
+            }
+        }
 
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(events)) => {
@@ -74,21 +111,42 @@ fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                 return Err("watch channel disconnected".into());
             }
         }
-        let poll_every = pool.poll_interval();
-        if last_poll.elapsed() >= poll_every {
-            for library_id in watched.keys() {
-                tracing::info!(
-                    library_id,
-                    poll_interval_s = poll_every.as_secs(),
-                    "poll rescan; starting scan job"
-                );
-                if let Err(e) = start_scan_job(Arc::clone(&db), Arc::clone(&pool), *library_id) {
-                    tracing::warn!(library_id, error = %e, "poll scan failed");
-                }
-            }
-            last_poll = std::time::Instant::now();
+        maybe_poll(&db, &pool, &watched, &mut last_poll);
+    }
+}
+
+fn maybe_poll(
+    db: &Arc<Db>,
+    pool: &Arc<LibraryPool>,
+    watched: &HashMap<i64, PathBuf>,
+    last_poll: &mut std::time::Instant,
+) {
+    let poll_every = pool.poll_interval();
+    if last_poll.elapsed() < poll_every {
+        return;
+    }
+    for library_id in watched.keys() {
+        tracing::info!(
+            library_id,
+            poll_interval_s = poll_every.as_secs(),
+            "poll rescan; starting scan job"
+        );
+        if let Err(e) = start_scan_job(Arc::clone(db), Arc::clone(pool), *library_id) {
+            tracing::warn!(library_id, error = %e, "poll scan failed");
         }
     }
+    *last_poll = std::time::Instant::now();
+}
+
+fn sync_library_roots(db: &Db, watched: &mut HashMap<i64, PathBuf>) -> Result<(), String> {
+    for lib in db.list_libraries()? {
+        let path = PathBuf::from(&lib.path);
+        if watched.get(&lib.id) != Some(&path) {
+            tracing::info!(library_id = lib.id, path = %path.display(), "poll-only library root");
+            watched.insert(lib.id, path);
+        }
+    }
+    Ok(())
 }
 
 fn sync_watches(
