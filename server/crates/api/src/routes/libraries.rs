@@ -131,8 +131,9 @@ pub async fn scan(
     Path(library_id): Path<i64>,
 ) -> ApiResult<(StatusCode, Json<ScanJobAcceptedDto>)> {
     let db = std::sync::Arc::clone(&state.db);
+    let pool = std::sync::Arc::clone(&state.pool);
     let job_id =
-        tokio::task::spawn_blocking(move || nightjar_scanner::start_scan_job(db, library_id))
+        tokio::task::spawn_blocking(move || nightjar_scanner::start_scan_job(db, pool, library_id))
             .await
             .map_err(|e| ApiError::internal(format!("scan start join: {e}")))?
             .map_err(|e| {

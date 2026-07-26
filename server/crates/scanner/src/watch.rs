@@ -1,6 +1,6 @@
 //! Debounced filesystem watch that triggers async library rescans.
 
-use crate::start_scan_job;
+use crate::{LibraryPool, start_scan_job};
 use nightjar_db::Db;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
@@ -10,18 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Watch every library root; on change, start an async rescan (mtime-incremental).
-pub fn spawn_library_watcher(db: Arc<Db>) {
+pub fn spawn_library_watcher(db: Arc<Db>, pool: Arc<LibraryPool>) {
     std::thread::Builder::new()
         .name("nightjar-watch".into())
         .spawn(move || {
-            if let Err(e) = run(db) {
+            if let Err(e) = run(db, pool) {
                 tracing::error!(error = %e, "library watcher stopped");
             }
         })
         .expect("spawn library watcher");
 }
 
-fn run(db: Arc<Db>) -> Result<(), String> {
+fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_secs(2), move |res| {
         let _ = tx.send(res);
@@ -29,6 +29,7 @@ fn run(db: Arc<Db>) -> Result<(), String> {
     .map_err(|e| format!("create debouncer: {e}"))?;
 
     let mut watched: HashMap<i64, PathBuf> = HashMap::new();
+    let mut last_poll = std::time::Instant::now();
     loop {
         sync_watches(&db, &mut debouncer, &mut watched)?;
 
@@ -44,7 +45,7 @@ fn run(db: Arc<Db>) -> Result<(), String> {
                             path = %ev.path.display(),
                             "fs change; starting scan job"
                         );
-                        match start_scan_job(Arc::clone(&db), id) {
+                        match start_scan_job(Arc::clone(&db), Arc::clone(&pool), id) {
                             Ok(job_id) => {
                                 tracing::info!(library_id = id, job_id, "watch scan job accepted")
                             }
@@ -60,6 +61,15 @@ fn run(db: Arc<Db>) -> Result<(), String> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("watch channel disconnected".into());
             }
+        }
+        if last_poll.elapsed() >= Duration::from_secs(60) {
+            for library_id in watched.keys() {
+                tracing::info!(library_id, "poll rescan; starting scan job");
+                if let Err(e) = start_scan_job(Arc::clone(&db), Arc::clone(&pool), *library_id) {
+                    tracing::warn!(library_id, error = %e, "poll scan failed");
+                }
+            }
+            last_poll = std::time::Instant::now();
         }
     }
 }

@@ -1,28 +1,23 @@
 //! Library scanner: index pass, then bounded ffprobe pool (ADR-0004).
 
+mod pool;
 mod probe;
 mod walk;
 mod watch;
 
+pub use pool::LibraryPool;
 pub use watch::spawn_library_watcher;
 
 use nightjar_core::parse_filename;
-use nightjar_db::{Db, ProbeUpdate, UpsertItem};
+use nightjar_db::{Db, UpsertItem};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 const INDEX_BATCH: usize = 200;
 
-#[derive(Debug, Clone)]
-struct ProbeWork {
-    item_id: i64,
-    path: PathBuf,
-}
-
 /// Start (or reuse) an async scan job. Returns the job id immediately.
-pub fn start_scan_job(db: Arc<Db>, library_id: i64) -> Result<i64, String> {
+pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
     if db.get_library(library_id)?.is_none() {
         return Err(format!("library {library_id} not found"));
     }
@@ -33,7 +28,7 @@ pub fn start_scan_job(db: Arc<Db>, library_id: i64) -> Result<i64, String> {
     std::thread::Builder::new()
         .name(format!("scan-job-{job_id}"))
         .spawn(move || {
-            if let Err(e) = run_scan_job(&db, job_id, library_id) {
+            if let Err(e) = run_scan_job(&db, &pool, job_id, library_id) {
                 tracing::error!(job_id, library_id, error = %e, "scan job failed");
                 let _ = db.fail_scan_job(job_id, &e);
             }
@@ -42,7 +37,12 @@ pub fn start_scan_job(db: Arc<Db>, library_id: i64) -> Result<i64, String> {
     Ok(job_id)
 }
 
-fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String> {
+fn run_scan_job(
+    db: &Arc<Db>,
+    pool: &Arc<LibraryPool>,
+    job_id: i64,
+    library_id: i64,
+) -> Result<(), String> {
     db.set_scan_job_state(job_id, "indexing")?;
 
     let lib = db
@@ -61,13 +61,13 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
     let mut keep_paths = Vec::with_capacity(files.len());
     let mut pending_upserts: Vec<UpsertItem> = Vec::with_capacity(INDEX_BATCH);
     let mut pending_were_existing: Vec<bool> = Vec::with_capacity(INDEX_BATCH);
-    let mut probe_queue: Vec<ProbeWork> = Vec::new();
+    let mut probe_queue = Vec::new();
 
     let flush = |db: &Db,
                  library_id: i64,
                  pending: &mut Vec<UpsertItem>,
                  were_existing: &mut Vec<bool>,
-                 probe_queue: &mut Vec<ProbeWork>,
+                 probe_queue: &mut Vec<pool::WorkItem>,
                  added: &mut u32,
                  updated: &mut u32|
      -> Result<(), String> {
@@ -81,10 +81,11 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
             } else {
                 *added += 1;
             }
-            probe_queue.push(ProbeWork {
-                item_id: id,
-                path: PathBuf::from(&pending[i].path),
-            });
+            probe_queue.push(pool::WorkItem::probe(
+                id,
+                PathBuf::from(&pending[i].path),
+                Some(job_id),
+            ));
         }
         pending.clear();
         were_existing.clear();
@@ -142,7 +143,16 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
         &mut updated,
     )?;
 
-    let removed = db.delete_missing(library_id, &keep_paths)? as u32;
+    let deleted_ids = db.delete_missing(library_id, &keep_paths)?;
+    for item_id in &deleted_ids {
+        if let Err(e) = pool.remove_item_subtitles(*item_id) {
+            tracing::warn!(item_id, error = %e, "remove deleted subtitle directory failed");
+        }
+    }
+    let removed = deleted_ids.len() as u32;
+    if let Err(e) = pool.cleanup_orphan_subtitles() {
+        tracing::warn!(error = %e, "subtitle orphan cleanup failed");
+    }
 
     // Sidecar association always runs, including for unchanged media, so a
     // new .srt beside an untouched video is stored without waiting for mtime.
@@ -152,7 +162,11 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
             continue;
         };
         match associate_sidecars(db, item_id, &file.path) {
-            Ok(()) => {}
+            Ok(true) => {
+                db.mark_items_subtitle_pending(&[item_id])?;
+                pool.enqueue(pool::WorkItem::extract(item_id, file.path.clone()));
+            }
+            Ok(false) => {}
             Err(e) => tracing::warn!(
                 item_id,
                 path = %file.path.display(),
@@ -185,7 +199,14 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
     );
 
     let probe_started = Instant::now();
-    run_probe_pool(db, job_id, probe_queue)?;
+    let probe_ids: Vec<i64> = probe_queue.iter().map(|item| item.item_id).collect();
+    pool.enqueue_probe_batch(probe_queue).wait();
+    for item_id in probe_ids {
+        if let Some(row) = db.get_item(item_id)? {
+            pool.enqueue(pool::WorkItem::extract(item_id, PathBuf::from(row.path)));
+        }
+    }
+    pool.drain_pending_extracts()?;
     let probe_duration_ms = probe_started.elapsed().as_millis() as u64;
     db.complete_scan_job(job_id, probe_duration_ms)?;
 
@@ -193,99 +214,11 @@ fn run_scan_job(db: &Arc<Db>, job_id: i64, library_id: i64) -> Result<(), String
     Ok(())
 }
 
-fn run_probe_pool(db: &Arc<Db>, job_id: i64, work: Vec<ProbeWork>) -> Result<(), String> {
-    if work.is_empty() {
-        return Ok(());
-    }
-
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(2, 16);
-    let (tx, rx) = mpsc::channel::<ProbeWork>();
-    let rx = Arc::new(Mutex::new(rx));
-    let mut handles = Vec::with_capacity(workers);
-
-    for i in 0..workers {
-        let rx = Arc::clone(&rx);
-        let db = Arc::clone(db);
-        let handle = std::thread::Builder::new()
-            .name(format!("ffprobe-{job_id}-{i}"))
-            .spawn(move || {
-                loop {
-                    let next = {
-                        let guard = match rx.lock() {
-                            Ok(g) => g,
-                            Err(_) => break,
-                        };
-                        guard.recv()
-                    };
-                    let Ok(item) = next else { break };
-                    let update = match probe::ffprobe(&item.path) {
-                        Ok(p) => ProbeUpdate {
-                            item_id: item.item_id,
-                            duration_ms: p.duration_ms,
-                            container: p.container,
-                            video_codec: p.video_codec,
-                            audio_codec: p.audio_codec,
-                            audio_channels: p.audio_channels,
-                            width: p.width,
-                            height: p.height,
-                            probe_status: "probed".into(),
-                            scan_error: None,
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %item.path.display(),
-                                error = %e,
-                                "ffprobe failed"
-                            );
-                            ProbeUpdate {
-                                item_id: item.item_id,
-                                duration_ms: None,
-                                container: None,
-                                video_codec: None,
-                                audio_codec: None,
-                                audio_channels: None,
-                                width: None,
-                                height: None,
-                                probe_status: "error".into(),
-                                scan_error: Some(e),
-                            }
-                        }
-                    };
-                    let is_err = update.scan_error.is_some();
-                    if let Err(e) = db.apply_probe_update(&update) {
-                        tracing::warn!(item_id = item.item_id, error = %e, "probe update failed");
-                    }
-                    if let Err(e) = db.bump_scan_job_probe(job_id, is_err) {
-                        tracing::warn!(job_id, error = %e, "probe counter bump failed");
-                    }
-                }
-            })
-            .map_err(|e| format!("spawn ffprobe worker: {e}"))?;
-        handles.push(handle);
-    }
-
-    for item in work {
-        tx.send(item)
-            .map_err(|e| format!("enqueue probe work: {e}"))?;
-    }
-    drop(tx);
-
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|_| "ffprobe worker panicked".to_string())?;
-    }
-    Ok(())
-}
-
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn associate_sidecars(db: &Db, item_id: i64, video_path: &Path) -> Result<(), String> {
+fn associate_sidecars(db: &Db, item_id: i64, video_path: &Path) -> Result<bool, String> {
     let found = nightjar_transcode::discover_sidecars(video_path)?;
     let rows: Vec<nightjar_db::SidecarRow> = found
         .into_iter()
@@ -312,8 +245,14 @@ pub fn version() -> &'static str {
 mod tests {
     use super::*;
     use nightjar_db::NewLibrary;
+    use nightjar_transcode::SubsStore;
     use std::fs;
     use std::process::Command;
+
+    fn test_pool(db: &Arc<Db>, data_dir: &Path) -> Arc<LibraryPool> {
+        let subs = Arc::new(SubsStore::new(data_dir.join("subs")).unwrap());
+        LibraryPool::spawn(Arc::clone(db), subs)
+    }
 
     #[test]
     fn index_pass_lists_before_probe_and_broken_moov_errors() {
@@ -354,6 +293,7 @@ mod tests {
         fs::write(&broken, b"not a real mp4").unwrap();
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
         let lib = db
             .create_library(&NewLibrary {
                 name: "t".into(),
@@ -362,7 +302,7 @@ mod tests {
             })
             .unwrap();
 
-        let job_id = start_scan_job(Arc::clone(&db), lib.id).unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
         // Wait for completion.
         for _ in 0..200 {
             let job = db.get_scan_job(job_id).unwrap().unwrap();
@@ -393,7 +333,7 @@ mod tests {
         }
 
         // Unchanged rescan: index fast, nothing to probe.
-        let job2 = start_scan_job(Arc::clone(&db), lib.id).unwrap();
+        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
         for _ in 0..200 {
             let job = db.get_scan_job(job2).unwrap().unwrap();
             if job.state == "completed" {
@@ -424,6 +364,7 @@ mod tests {
         .unwrap();
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
         let lib = db
             .create_library(&NewLibrary {
                 name: "t".into(),
@@ -432,7 +373,7 @@ mod tests {
             })
             .unwrap();
 
-        let job_id = start_scan_job(Arc::clone(&db), lib.id).unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
         for _ in 0..200 {
             let job = db.get_scan_job(job_id).unwrap().unwrap();
             if job.state == "completed" || job.state == "failed" {

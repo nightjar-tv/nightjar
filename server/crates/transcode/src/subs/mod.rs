@@ -1,4 +1,7 @@
-//! Text subtitle → WebVTT (ADR-0010): embedded extract + sidecar convert.
+//! Text subtitle → WebVTT (ADR-0010 / ADR-0013).
+//!
+//! Extraction runs at scan time into derived library data under
+//! `{NIGHTJAR_DATA_DIR}/subs/{itemId}/{trackId}.vtt`. Playback only reads.
 
 mod discover;
 mod lang;
@@ -14,13 +17,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Codecs we can convert to WebVTT without burn-in.
 const TEXT_SUB_CODECS: &[&str] = &["subrip", "srt", "webvtt", "mov_text", "text"];
 
 /// Kill a runaway extract rather than leave ffmpeg demuxing forever on a NAS.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Refuse extract when the data volume has less free space than this.
+const MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubtitleSourceKind {
@@ -50,6 +56,22 @@ impl TextSubtitleStream {
     pub fn track_id(&self) -> String {
         format!("e{}", self.stream_index)
     }
+}
+
+/// Filesystem sidecar input for a scan-time extract job.
+#[derive(Debug, Clone)]
+pub struct SidecarInput {
+    pub track_id: String,
+    pub path: PathBuf,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractOutcome {
+    /// No serveable text tracks (embedded or sidecar).
+    None,
+    /// All serveable tracks written under the item directory.
+    Ready,
 }
 
 pub fn is_text_subtitle_codec(codec: &str) -> bool {
@@ -112,148 +134,102 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
     Ok(out)
 }
 
-/// Byte-capped WebVTT cache under `{data}/cache/subs` (ADR-0010).
-pub struct SubsCache {
-    cache_dir: PathBuf,
-    cap_bytes: u64,
-    /// Serialises embedded extracts so a session warm and a concurrent
-    /// `<track>` GET cannot share the same `.tmp.srt` paths.
+/// Derived-library subtitle store under `{data}/subs` (ADR-0013). Not a cache.
+pub struct SubsStore {
+    root: PathBuf,
+    /// Serialises extracts so two workers never share the same item tmp paths.
     extract_lock: Mutex<()>,
 }
 
-impl SubsCache {
-    pub fn new(cache_dir: PathBuf, cap_bytes: u64) -> Result<Self, String> {
-        fs::create_dir_all(&cache_dir)
-            .map_err(|e| format!("create subs cache dir {}: {e}", cache_dir.display()))?;
+impl SubsStore {
+    pub fn new(root: PathBuf) -> Result<Self, String> {
+        fs::create_dir_all(&root)
+            .map_err(|e| format!("create subs dir {}: {e}", root.display()))?;
         Ok(Self {
-            cache_dir,
-            cap_bytes,
+            root,
             extract_lock: Mutex::new(()),
         })
     }
 
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
-    fn make_room(&self, needed: u64) -> Result<(), String> {
-        if needed > self.cap_bytes {
-            return Err(format!(
-                "subtitle output is {needed} bytes but the subs cache cap ({} bytes) cannot hold it; raise NIGHTJAR_SUBS_CACHE_BYTES",
-                self.cap_bytes
-            ));
+    pub fn item_dir(&self, item_id: i64) -> PathBuf {
+        self.root.join(item_id.to_string())
+    }
+
+    pub fn vtt_path(&self, item_id: i64, track_id: &str) -> PathBuf {
+        self.item_dir(item_id).join(format!("{track_id}.vtt"))
+    }
+
+    pub fn has_vtt(&self, item_id: i64, track_id: &str) -> bool {
+        let path = self.vtt_path(item_id, track_id);
+        path.exists() && fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0
+    }
+
+    pub fn remove_item(&self, item_id: i64) -> Result<(), String> {
+        let dir = self.item_dir(item_id);
+        if !dir.exists() {
+            return Ok(());
         }
-        let mut evictable = Vec::new();
-        let mut locked_bytes = 0u64;
-        for entry in fs::read_dir(&self.cache_dir)
-            .map_err(|e| format!("read subs cache dir {}: {e}", self.cache_dir.display()))?
-            .flatten()
-        {
-            let Ok(meta) = entry.metadata() else {
+        fs::remove_dir_all(&dir)
+            .map_err(|e| format!("remove subs for item {item_id} ({}): {e}", dir.display()))
+    }
+
+    /// Delete `subs/{id}/` directories whose id is not in `keep_ids`.
+    pub fn cleanup_orphans(&self, keep_ids: &[i64]) -> Result<usize, String> {
+        let mut keep: std::collections::HashSet<i64> = keep_ids.iter().copied().collect();
+        let mut removed = 0usize;
+        let entries = match fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(format!("read subs root {}: {e}", self.root.display()));
+            }
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
                 continue;
             };
-            if !meta.is_file() {
+            if !ft.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".tmp.vtt") || name.ends_with(".tmp.srt") {
-                locked_bytes += meta.len();
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|s| s.parse::<i64>().ok()) else {
+                continue;
+            };
+            if keep.remove(&id) {
                 continue;
             }
-            if !name.ends_with(".vtt") {
-                continue;
-            }
-            evictable.push(CacheFile {
-                name,
-                size: meta.len(),
-                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            });
-        }
-        let victims = select_evictions(evictable, locked_bytes, needed, self.cap_bytes)?;
-        for name in victims {
-            let path = self.cache_dir.join(&name);
-            match fs::remove_file(&path) {
-                Ok(()) => tracing::info!(path = %path.display(), "evicted subtitle cache file"),
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "subtitle eviction failed")
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => {
+                    tracing::info!(item_id = id, "removed orphan subtitle directory");
+                    removed += 1;
                 }
+                Err(e) => tracing::warn!(
+                    item_id = id,
+                    path = %entry.path().display(),
+                    error = %e,
+                    "orphan subtitle cleanup failed"
+                ),
             }
         }
-        Ok(())
-    }
-
-    fn touch(&self, path: &Path) {
-        let touched = fs::File::options()
-            .append(true)
-            .open(path)
-            .and_then(|f| f.set_modified(SystemTime::now()));
-        if let Err(e) = touched {
-            tracing::warn!(path = %path.display(), error = %e, "subtitle cache touch failed");
-        }
+        Ok(removed)
     }
 }
 
-struct CacheFile {
-    name: String,
-    size: u64,
-    modified: SystemTime,
-}
-
-fn select_evictions(
-    mut evictable: Vec<CacheFile>,
-    locked_bytes: u64,
-    needed: u64,
-    cap: u64,
-) -> Result<Vec<String>, String> {
-    let all_evictable: u64 = evictable.iter().map(|f| f.size).sum();
-    let floor = locked_bytes.saturating_add(needed);
-    if floor > cap {
-        return Err(format!(
-            "subs cache cap ({cap} bytes) cannot fit {needed} more bytes alongside {locked_bytes} bytes of in-flight output"
-        ));
+fn write_webvtt(dest: &Path, body: &str) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create subtitle dir {}: {e}", parent.display()))?;
     }
-    let budget_for_ready = cap - floor;
-    if all_evictable <= budget_for_ready {
-        return Ok(Vec::new());
-    }
-    evictable.sort_by_key(|f| f.modified);
-    let mut to_free = all_evictable - budget_for_ready;
-    let mut victims = Vec::new();
-    for file in evictable {
-        if to_free == 0 {
-            break;
-        }
-        to_free = to_free.saturating_sub(file.size);
-        victims.push(file.name);
-    }
-    Ok(victims)
-}
-
-fn vtt_cache_path(
-    cache: &SubsCache,
-    item_id: i64,
-    mtime_ms: i64,
-    size_bytes: i64,
-    track_id: &str,
-) -> PathBuf {
-    cache
-        .cache_dir
-        .join(format!("{item_id}-{mtime_ms}-{size_bytes}-{track_id}.vtt"))
-}
-
-fn cached_vtt(dest: &Path) -> bool {
-    dest.exists() && fs::metadata(dest).map(|m| m.len()).unwrap_or(0) > 0
-}
-
-/// Write WebVTT into the cache from SRT (or raw) bytes via the shared converter.
-fn write_cached_webvtt(cache: &SubsCache, dest: &Path, body: &str) -> Result<(), String> {
     let tmp = dest.with_extension("tmp.vtt");
-    let out_bytes = body.as_bytes();
-    cache.make_room(out_bytes.len() as u64)?;
-    fs::write(&tmp, out_bytes).map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
+    fs::write(&tmp, body.as_bytes())
+        .map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
     fs::rename(&tmp, dest).map_err(|e| {
         let _ = fs::remove_file(&tmp);
-        format!("rename subtitle cache {}: {e}", dest.display())
+        format!("rename subtitle {}: {e}", dest.display())
     })?;
     Ok(())
 }
@@ -271,101 +247,100 @@ fn srt_encoder_for_codec(codec: &str) -> &'static str {
     }
 }
 
-/// Ensures a WebVTT file exists for an embedded stream and returns its path.
-///
-/// Missing text tracks for this item are stream-copied to SRT in one FFmpeg
-/// pass, then converted in-process with [`srt_to_webvtt`] (same path as
-/// sidecar `.srt`).
-pub fn ensure_embedded_webvtt(
-    cache: &SubsCache,
+/// Extract/convert every serveable track for one item (ADR-0013). One FFmpeg
+/// demux fills all embedded text tracks; sidecars convert in-process.
+pub fn extract_item_subtitles(
+    store: &SubsStore,
     item_id: i64,
-    mtime_ms: i64,
-    size_bytes: i64,
     src: &Path,
-    stream_index: u32,
-) -> Result<PathBuf, String> {
-    let track_id = format!("e{stream_index}");
-    let dest = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, &track_id);
-    if cached_vtt(&dest) {
-        cache.touch(&dest);
-        return Ok(dest);
-    }
-
-    let _guard = cache
+    sidecars: &[SidecarInput],
+) -> Result<ExtractOutcome, String> {
+    let _guard = store
         .extract_lock
         .lock()
         .map_err(|_| "subtitle extract lock poisoned".to_string())?;
-    // Another waiter (session warm vs GET) may have finished while we blocked.
-    if cached_vtt(&dest) {
-        cache.touch(&dest);
-        return Ok(dest);
-    }
 
-    let streams = list_text_subtitles(src)?;
-    if !streams.iter().any(|s| s.stream_index == stream_index) {
-        return Err(format!(
-            "stream {stream_index} is not a text subtitle in {}",
-            src.display()
-        ));
-    }
+    ensure_free_space(store.root())?;
 
-    let missing: Vec<&TextSubtitleStream> = streams
+    let serveable_sidecars: Vec<&SidecarInput> = sidecars
         .iter()
-        .filter(|s| {
-            let id = s.track_id();
-            let path = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, &id);
-            !cached_vtt(&path)
-        })
+        .filter(|s| is_serveable_sidecar_format(&s.format))
         .collect();
-    if !missing.is_empty() {
-        extract_embedded_srt_batch(cache, item_id, mtime_ms, size_bytes, src, &missing)?;
+    // Sidecar-only titles still extract when the container probe fails (corrupt
+    // video, permission), so external .srt next to a bad file is not stranded.
+    let embedded = match list_text_subtitles(src) {
+        Ok(v) => v,
+        Err(e) if !serveable_sidecars.is_empty() => {
+            tracing::warn!(
+                path = %src.display(),
+                error = %e,
+                "embedded subtitle probe failed; continuing with sidecars"
+            );
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    if embedded.is_empty() && serveable_sidecars.is_empty() {
+        store.remove_item(item_id)?;
+        return Ok(ExtractOutcome::None);
     }
 
-    if !cached_vtt(&dest) {
-        return Err(format!(
-            "subtitle extract produced no WebVTT for stream {stream_index} in {}",
-            src.display()
-        ));
+    // Fresh directory so a prior generation cannot leave a stale track.
+    store.remove_item(item_id)?;
+    fs::create_dir_all(store.item_dir(item_id))
+        .map_err(|e| format!("create subtitle dir for item {item_id}: {e}"))?;
+
+    if !embedded.is_empty() {
+        let refs: Vec<&TextSubtitleStream> = embedded.iter().collect();
+        extract_embedded_srt_batch(store, item_id, src, &refs)?;
     }
-    cache.touch(&dest);
-    Ok(dest)
+
+    for s in serveable_sidecars {
+        write_sidecar_webvtt(store, item_id, s)?;
+    }
+
+    Ok(ExtractOutcome::Ready)
 }
 
-/// Ensure every embedded text track for `src` is cached. One FFmpeg demux fills
-/// all missing tracks. Used to warm the cache when a playback session starts so
-/// the first caption request does not pay for a cold demux alone.
-pub fn warm_embedded_webvtts(
-    cache: &SubsCache,
-    item_id: i64,
-    mtime_ms: i64,
-    size_bytes: i64,
-    src: &Path,
-) -> Result<usize, String> {
-    let streams = list_text_subtitles(src)?;
-    if streams.is_empty() {
-        return Ok(0);
+/// Path of an already-extracted WebVTT, or an error if missing.
+pub fn stored_webvtt(store: &SubsStore, item_id: i64, track_id: &str) -> Result<PathBuf, String> {
+    let path = store.vtt_path(item_id, track_id);
+    if store.has_vtt(item_id, track_id) {
+        Ok(path)
+    } else {
+        Err(format!(
+            "subtitle {track_id} for item {item_id} is not extracted yet"
+        ))
     }
-    // First ensure extracts every missing track in one pass.
-    ensure_embedded_webvtt(
-        cache,
-        item_id,
-        mtime_ms,
-        size_bytes,
-        src,
-        streams[0].stream_index,
-    )?;
-    Ok(streams.len())
+}
+
+fn write_sidecar_webvtt(
+    store: &SubsStore,
+    item_id: i64,
+    sidecar: &SidecarInput,
+) -> Result<(), String> {
+    let bytes = fs::read(&sidecar.path)
+        .map_err(|e| format!("read sidecar subtitle {}: {e}", sidecar.path.display()))?;
+    let body = if sidecar.format.eq_ignore_ascii_case("vtt") {
+        let text = decode_subtitle_bytes(&bytes);
+        if text.contains("WEBVTT") {
+            text
+        } else {
+            format!("WEBVTT\n\n{text}")
+        }
+    } else {
+        srt_bytes_to_webvtt(&bytes)
+    };
+    write_webvtt(&store.vtt_path(item_id, &sidecar.track_id), &body)
 }
 
 fn extract_embedded_srt_batch(
-    cache: &SubsCache,
+    store: &SubsStore,
     item_id: i64,
-    mtime_ms: i64,
-    size_bytes: i64,
     src: &Path,
     streams: &[&TextSubtitleStream],
 ) -> Result<(), String> {
-    // One FFmpeg demux → one .tmp.srt per missing track, then shared convert.
+    let item_dir = store.item_dir(item_id);
     let mut tmp_srts: Vec<(u32, PathBuf)> = Vec::with_capacity(streams.len());
     let mut cmd = Command::new("ffmpeg");
     cmd.stdin(Stdio::null())
@@ -374,10 +349,7 @@ fn extract_embedded_srt_batch(
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(src);
     for s in streams {
-        let tmp = cache.cache_dir.join(format!(
-            "{item_id}-{mtime_ms}-{size_bytes}-e{}.tmp.srt",
-            s.stream_index
-        ));
+        let tmp = item_dir.join(format!("e{}.tmp.srt", s.stream_index));
         let map = format!("0:{}", s.stream_index);
         let encoder = srt_encoder_for_codec(&s.codec);
         cmd.args(["-map", &map, "-c:s", encoder, "-f", "srt"])
@@ -409,7 +381,7 @@ fn extract_embedded_srt_batch(
 
     for (stream_index, tmp_srt) in tmp_srts {
         let track_id = format!("e{stream_index}");
-        let dest = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, &track_id);
+        let dest = store.vtt_path(item_id, &track_id);
         let result = (|| {
             let bytes = fs::read(&tmp_srt).map_err(|e| {
                 format!(
@@ -418,7 +390,7 @@ fn extract_embedded_srt_batch(
                 )
             })?;
             let body = srt_bytes_to_webvtt(&bytes);
-            write_cached_webvtt(cache, &dest, &body)
+            write_webvtt(&dest, &body)
         })();
         let _ = fs::remove_file(&tmp_srt);
         result?;
@@ -458,42 +430,51 @@ fn wait_extract_child(child: &mut std::process::Child, timeout: Duration) -> Res
     }
 }
 
-/// Ensures a WebVTT file exists for a filesystem sidecar and returns its path.
-pub fn ensure_sidecar_webvtt(
-    cache: &SubsCache,
-    item_id: i64,
-    track_id: &str,
-    sidecar_path: &Path,
-    format: &str,
-    mtime_ms: i64,
-    size_bytes: i64,
-) -> Result<PathBuf, String> {
-    if !is_serveable_sidecar_format(format) {
+fn ensure_free_space(path: &Path) -> Result<(), String> {
+    let available = available_bytes(path)?;
+    if available < MIN_FREE_BYTES {
         return Err(format!(
-            "sidecar format {format} is not served as WebVTT ({})",
-            sidecar_path.display()
+            "subtitle extract refused: data volume has {available} free bytes; need at least {MIN_FREE_BYTES}"
         ));
     }
-    let dest = vtt_cache_path(cache, item_id, mtime_ms, size_bytes, track_id);
-    if cached_vtt(&dest) {
-        cache.touch(&dest);
-        return Ok(dest);
-    }
+    Ok(())
+}
 
-    let bytes = fs::read(sidecar_path)
-        .map_err(|e| format!("read sidecar subtitle {}: {e}", sidecar_path.display()))?;
-    let body = if format.eq_ignore_ascii_case("vtt") {
-        let text = decode_subtitle_bytes(&bytes);
-        if text.contains("WEBVTT") {
-            text
-        } else {
-            format!("WEBVTT\n\n{text}")
-        }
+/// Free bytes on the volume containing `path`, via `df -k` (no new crate).
+fn available_bytes(path: &Path) -> Result<u64, String> {
+    let probe = if path.exists() {
+        path.to_path_buf()
     } else {
-        srt_bytes_to_webvtt(&bytes)
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
     };
-    write_cached_webvtt(cache, &dest, &body)?;
-    Ok(dest)
+    let output = Command::new("df")
+        .args(["-k"])
+        .arg(&probe)
+        .output()
+        .map_err(|e| format!("df for {}: {e}", probe.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "df failed for {}: {}",
+            probe.display(),
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Header + one data line; Available is the 4th field on both macOS and Linux.
+    let line = stdout
+        .lines()
+        .nth(1)
+        .ok_or_else(|| format!("df produced no data for {}", probe.display()))?;
+    let avail_k = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| format!("df line missing available column: {line}"))?
+        .parse::<u64>()
+        .map_err(|e| format!("parse df available: {e}"))?;
+    Ok(avail_k.saturating_mul(1024))
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,6 +499,25 @@ struct FfTags {
 mod tests {
     use super::*;
 
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn skip_without_ffmpeg() -> bool {
+        if ffmpeg_available() {
+            return false;
+        }
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_some() {
+            panic!("ffmpeg required (NIGHTJAR_TEST_REQUIRE_FFMPEG set) but not on PATH");
+        }
+        eprintln!("skipping: ffmpeg not on PATH");
+        true
+    }
+
     #[test]
     fn text_codec_allowlist() {
         assert!(is_text_subtitle_codec("subrip"));
@@ -538,18 +538,19 @@ mod tests {
         assert_eq!(s.track_id(), "e2");
     }
 
-    fn ffmpeg_available() -> bool {
-        Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    #[test]
+    fn vtt_path_keys_on_item_and_track_not_media_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        let p = store.vtt_path(42, "e2");
+        assert_eq!(p, dir.path().join("42").join("e2.vtt"));
+        // Reorganising media must not change the stored path.
+        assert!(!p.to_string_lossy().contains("Movies"));
     }
 
     #[test]
     fn extracts_srt_from_corpus_fixture() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
+        if skip_without_ffmpeg() {
             return;
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -563,10 +564,12 @@ mod tests {
             !streams.is_empty(),
             "expected at least one text sub on SRT fixture"
         );
-        let idx = streams[0].stream_index;
         let dir = tempfile::tempdir().unwrap();
-        let cache = SubsCache::new(dir.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
-        let vtt = ensure_embedded_webvtt(&cache, 1, 0, 0, &corpus, idx).expect("extract");
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        let outcome = extract_item_subtitles(&store, 1, &corpus, &[]).expect("extract");
+        assert_eq!(outcome, ExtractOutcome::Ready);
+        let track_id = streams[0].track_id();
+        let vtt = stored_webvtt(&store, 1, &track_id).unwrap();
         let body = fs::read_to_string(&vtt).unwrap();
         assert!(
             body.contains("WEBVTT") || body.starts_with("\u{feff}WEBVTT"),
@@ -576,8 +579,6 @@ mod tests {
             body.contains("Nightjar SRT sample"),
             "converted cue missing: {body}"
         );
-        let again = ensure_embedded_webvtt(&cache, 1, 0, 0, &corpus, idx).unwrap();
-        assert_eq!(vtt, again);
     }
 
     #[test]
@@ -591,8 +592,7 @@ mod tests {
 
     #[test]
     fn one_pass_fills_all_missing_tracks() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
+        if skip_without_ffmpeg() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -655,60 +655,129 @@ mod tests {
             streams.len() >= 2,
             "expected two text subs, got {streams:?}"
         );
-        let cache = SubsCache::new(dir.path().join("cache"), 8 * 1024 * 1024).unwrap();
-        let first = ensure_embedded_webvtt(&cache, 9, 1, 1, &mkv, streams[0].stream_index)
-            .expect("extract first");
-        // Requesting one track should have filled both.
-        let second_path = vtt_cache_path(&cache, 9, 1, 1, &format!("e{}", streams[1].stream_index));
-        assert!(
-            cached_vtt(&second_path),
-            "second track should be cached after one-pass extract"
-        );
-        let a = fs::read_to_string(&first).unwrap();
-        let b = fs::read_to_string(&second_path).unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        extract_item_subtitles(&store, 9, &mkv, &[]).expect("extract");
+        assert!(store.has_vtt(9, &streams[0].track_id()));
+        assert!(store.has_vtt(9, &streams[1].track_id()));
+        let a = fs::read_to_string(store.vtt_path(9, &streams[0].track_id())).unwrap();
+        let b = fs::read_to_string(store.vtt_path(9, &streams[1].track_id())).unwrap();
         assert!(a.contains("Track A") || b.contains("Track A"));
         assert!(a.contains("Track B") || b.contains("Track B"));
     }
 
     #[test]
-    fn converts_sidecar_srt_with_cache() {
+    fn sidecar_addition_does_not_shadow_embedded_store_path() {
         let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let item_id = 7i64;
+        fs::create_dir_all(store.item_dir(item_id)).unwrap();
+        write_webvtt(
+            &store.vtt_path(item_id, "e2"),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nEmb\n",
+        )
+        .unwrap();
+        let embedded_before = fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap();
+
         let srt_path = dir.path().join("Movie.en.srt");
         fs::write(
             &srt_path,
             "1\n00:00:00,000 --> 00:00:01,000\nSidecar hello\n",
         )
         .unwrap();
-        let cache_dir = dir.path().join("cache");
-        let cache = SubsCache::new(cache_dir, 1024 * 1024).unwrap();
-        let vtt = ensure_sidecar_webvtt(&cache, 7, "s-en", &srt_path, "srt", 1, 42).unwrap();
-        let body = fs::read_to_string(&vtt).unwrap();
-        assert!(body.contains("WEBVTT"));
-        assert!(body.contains("Sidecar hello"));
-        let again = ensure_sidecar_webvtt(&cache, 7, "s-en", &srt_path, "srt", 1, 42).unwrap();
-        assert_eq!(vtt, again);
+        // Simulate only writing the new sidecar track into an existing item dir
+        // the way a mistaken ordinal scheme would collide; our namespaces must not.
+        write_sidecar_webvtt(
+            &store,
+            item_id,
+            &SidecarInput {
+                track_id: "s-en".into(),
+                path: srt_path,
+                format: "srt".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(store.has_vtt(item_id, "e2"));
+        assert!(store.has_vtt(item_id, "s-en"));
+        assert_eq!(
+            fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap(),
+            embedded_before,
+            "adding a sidecar must not renumber or overwrite embedded e2"
+        );
+        let side = fs::read_to_string(store.vtt_path(item_id, "s-en")).unwrap();
+        assert!(side.contains("Sidecar hello"));
     }
 
     #[test]
-    fn eviction_frees_oldest() {
-        let victims = select_evictions(
-            vec![
-                CacheFile {
-                    name: "old.vtt".into(),
-                    size: 40,
-                    modified: SystemTime::UNIX_EPOCH,
-                },
-                CacheFile {
-                    name: "new.vtt".into(),
-                    size: 40,
-                    modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10),
-                },
-            ],
-            0,
-            50,
-            100,
+    fn converts_sidecar_srt() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let srt_path = dir.path().join("Movie.en.srt");
+        fs::write(
+            &srt_path,
+            "1\n00:00:00,000 --> 00:00:01,000\nSidecar hello\n",
         )
         .unwrap();
-        assert_eq!(victims, vec!["old.vtt"]);
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let outcome = extract_item_subtitles(
+            &store,
+            7,
+            &video,
+            &[SidecarInput {
+                track_id: "s-en".into(),
+                path: srt_path,
+                format: "srt".into(),
+            }],
+        )
+        .expect("sidecar-only extract");
+        assert_eq!(outcome, ExtractOutcome::Ready);
+        let body = fs::read_to_string(store.vtt_path(7, "s-en")).unwrap();
+        assert!(body.contains("WEBVTT"));
+        assert!(body.contains("Sidecar hello"));
+    }
+
+    #[test]
+    fn cleanup_removes_orphan_item_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(store.item_dir(1)).unwrap();
+        fs::create_dir_all(store.item_dir(2)).unwrap();
+        write_webvtt(&store.vtt_path(1, "e2"), "WEBVTT\n").unwrap();
+        write_webvtt(&store.vtt_path(2, "e2"), "WEBVTT\n").unwrap();
+        let n = store.cleanup_orphans(&[1]).unwrap();
+        assert_eq!(n, 1);
+        assert!(store.item_dir(1).exists());
+        assert!(!store.item_dir(2).exists());
+    }
+
+    #[test]
+    fn invalidation_rewrites_on_fresh_extract() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        extract_item_subtitles(&store, 3, &corpus, &[]).unwrap();
+        let streams = list_text_subtitles(&corpus).unwrap();
+        let track = streams[0].track_id();
+        let first = fs::read_to_string(store.vtt_path(3, &track)).unwrap();
+        // Stale marker file that must disappear when we re-extract into a fresh dir.
+        write_webvtt(&store.vtt_path(3, "e999"), "WEBVTT\n\nstale\n").unwrap();
+        assert!(store.has_vtt(3, "e999"));
+        extract_item_subtitles(&store, 3, &corpus, &[]).unwrap();
+        assert!(
+            !store.has_vtt(3, "e999"),
+            "re-extract must clear prior generation"
+        );
+        let second = fs::read_to_string(store.vtt_path(3, &track)).unwrap();
+        assert!(second.contains("WEBVTT"));
+        assert_eq!(first.lines().next(), second.lines().next());
     }
 }

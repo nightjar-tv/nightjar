@@ -1,7 +1,7 @@
 //! FFmpeg orchestration: HLS playback sessions in copy or encode mode
 //! (ADR-0007, ADR-0011), hardware encode detection (ADR-0009), text
-//! subtitle WebVTT sidecars (ADR-0010), and audio track selection with
-//! stereo downmix (ADR-0012).
+//! subtitle WebVTT at scan time (ADR-0010 / ADR-0013), and audio track
+//! selection with stereo downmix (ADR-0012).
 
 mod audio;
 mod hls;
@@ -18,10 +18,10 @@ pub use hwaccel::{
     probe_h264_encoders_arc, select_preferred,
 };
 pub use subs::{
-    DiscoveredSidecar, SubsCache, SubtitleSourceKind, TextSubtitleStream, decode_subtitle_bytes,
-    discover_sidecars, ensure_embedded_webvtt, ensure_sidecar_webvtt, is_serveable_sidecar_format,
-    is_text_subtitle_codec, list_text_subtitles, normalize_language, srt_to_webvtt,
-    warm_embedded_webvtts,
+    DiscoveredSidecar, ExtractOutcome, SidecarInput, SubsStore, SubtitleSourceKind,
+    TextSubtitleStream, decode_subtitle_bytes, discover_sidecars, extract_item_subtitles,
+    is_serveable_sidecar_format, is_text_subtitle_codec, list_text_subtitles, normalize_language,
+    srt_to_webvtt, stored_webvtt,
 };
 
 pub fn version() -> &'static str {

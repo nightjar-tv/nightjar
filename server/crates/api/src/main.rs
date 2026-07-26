@@ -25,11 +25,8 @@ async fn main() {
 
     let data_dir = data_dir();
     let db = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
-    let subs = nightjar_transcode::SubsCache::new(
-        data_dir.join("cache").join("subs"),
-        subs_cache_cap_bytes(),
-    )
-    .unwrap_or_else(|e| panic!("subs cache: {e}"));
+    let subs = nightjar_transcode::SubsStore::new(data_dir.join("subs"))
+        .unwrap_or_else(|e| panic!("subtitle store: {e}"));
     // ADR-0009: verify encoders once at startup; sessions reuse this Arc.
     let transcode_caps = nightjar_transcode::probe_h264_encoders_arc(&data_dir.join("cache"));
     let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
@@ -38,8 +35,25 @@ async fn main() {
         transcode_caps.preferred_h264_encoder.clone(),
     )
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
-    let state = AppState::new(db, hls, transcode_caps, subs);
-    nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db));
+    let db = std::sync::Arc::new(db);
+    let subs = std::sync::Arc::new(subs);
+    let pool = nightjar_scanner::LibraryPool::spawn(
+        std::sync::Arc::clone(&db),
+        std::sync::Arc::clone(&subs),
+    );
+    pool.drain_pending_extracts()
+        .unwrap_or_else(|e| tracing::warn!(error = %e, "enqueue pending subtitle extracts failed"));
+    if let Err(e) = pool.cleanup_orphan_subtitles() {
+        tracing::warn!(error = %e, "subtitle orphan cleanup failed");
+    }
+    let state = AppState {
+        db,
+        hls,
+        transcode_caps,
+        subs,
+        pool: std::sync::Arc::clone(&pool),
+    };
+    nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db), pool);
 
     let app = routes::router(state)
         .fallback(static_handler)
@@ -111,14 +125,6 @@ fn data_dir() -> PathBuf {
     std::env::var_os("NIGHTJAR_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("data"))
-}
-
-fn subs_cache_cap_bytes() -> u64 {
-    const DEFAULT: u64 = 512 * 1024 * 1024;
-    std::env::var("NIGHTJAR_SUBS_CACHE_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT)
 }
 
 fn hls_max_sessions() -> usize {

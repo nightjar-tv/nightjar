@@ -5,6 +5,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/002_scan_jobs.sql")),
     (3, include_str!("../migrations/003_subtitle_sidecars.sql")),
     (4, include_str!("../migrations/004_audio_channels.sql")),
+    (5, include_str!("../migrations/005_subtitle_status.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -63,7 +64,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         migrate(&conn).unwrap(); // idempotent
     }
 
@@ -94,5 +95,9 @@ mod tests {
             .query_row("SELECT audio_channels FROM media_items", [], |r| r.get(0))
             .unwrap();
         assert_eq!(channels, None, "existing rows carry a null channel count");
+        let status: String = conn
+            .query_row("SELECT subtitle_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "pending");
     }
 }

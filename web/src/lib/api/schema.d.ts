@@ -334,6 +334,11 @@ export interface components {
          * @enum {string}
          */
         ProbeStatus: "indexed" | "probed" | "error";
+        /**
+         * @description pending = extract queued or in progress; ready = WebVTT on disk; none = no serveable text tracks; error = last extract failed (ADR-0013).
+         * @enum {string}
+         */
+        SubtitleStatus: "pending" | "ready" | "none" | "error";
         /** @enum {string} */
         ScanJobState: "queued" | "indexing" | "probing" | "completed" | "failed";
         /**
@@ -390,6 +395,7 @@ export interface components {
             /** Format: int64 */
             sizeBytes: number;
             probeStatus: components["schemas"]["ProbeStatus"];
+            subtitleStatus: components["schemas"]["SubtitleStatus"];
             scanError?: string | null;
             playbackMethod: components["schemas"]["PlaybackMethod"];
         };
@@ -443,7 +449,8 @@ export interface components {
             audioCodec?: string | null;
             /** @description Audio tracks in the source (ADR-0012). Listed the same way for directPlay, remux, and transcode: the client asks for a trackId and never reasons about the delivery path to find tracks. Direct play switches client-side; sessions take audioTrackId at start. */
             audioTracks?: components["schemas"]["AudioTrack"][];
-            /** @description Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars share one shape; differ by source. Listed the same way for directPlay, remux, and transcode. Delivery is via track elements or HLS EXT-X-MEDIA depending on the stream; clients do not branch on method to find tracks. */
+            subtitleStatus: components["schemas"]["SubtitleStatus"];
+            /** @description Text subtitle tracks (ADR-0010 / ADR-0013). Embedded and filesystem sidecars share one shape; differ by source. url is present only when the WebVTT file is already extracted. Listed the same way for directPlay, remux, and transcode. */
             subtitleTracks?: components["schemas"]["SubtitleTrack"][];
         };
         AudioTrack: {

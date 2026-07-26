@@ -12,7 +12,7 @@ use nightjar_core::{BROWSER_V0, PlaybackMethod};
 use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
     AudioSelection, HlsSubtitleTrack, PlaylistError, SessionMode, StartSessionError,
-    list_audio_tracks, warm_embedded_webvtts,
+    list_audio_tracks,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -115,29 +115,6 @@ pub async fn start(
     .await
     .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
 
-    // First caption request otherwise pays a cold demux of the source; warm
-    // races the session instead (ADR-0010).
-    let cache = Arc::clone(&state.subs);
-    let warm_src = std::path::PathBuf::from(&row.path);
-    let warm_id = row.id;
-    let warm_mtime = file_mtime_ms(&warm_src).unwrap_or(row.mtime_ms);
-    let warm_size = row.size_bytes;
-    tokio::task::spawn_blocking(move || {
-        match warm_embedded_webvtts(&cache, warm_id, warm_mtime, warm_size, &warm_src) {
-            Ok(n) if n > 0 => tracing::info!(
-                item_id = warm_id,
-                tracks = n,
-                "warmed embedded subtitle cache"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                item_id = warm_id,
-                error = %e,
-                "subtitle cache warm failed"
-            ),
-        }
-    });
-
     match started {
         Ok(session_id) => {
             let encoder = hls.encoder(&session_id).ok_or_else(|| {
@@ -236,13 +213,6 @@ fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec
         });
     }
     out
-}
-
-fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(dur.as_millis() as i64)
 }
 
 pub async fn master(

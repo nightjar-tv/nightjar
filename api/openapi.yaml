@@ -550,6 +550,14 @@ components:
         indexed = walk+filename done, codecs pending; probed = ffprobe ok;
         error = ffprobe failed (see scanError).
 
+    SubtitleStatus:
+      type: string
+      enum: [pending, ready, none, error]
+      description: >
+        pending = extract queued or in progress; ready = WebVTT on disk;
+        none = no serveable text tracks; error = last extract failed
+        (ADR-0013).
+
     ScanJobState:
       type: string
       enum: [queued, indexing, probing, completed, failed]
@@ -621,7 +629,7 @@ components:
 
     MediaItem:
       type: object
-      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, playbackMethod]
+      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, subtitleStatus, playbackMethod]
       properties:
         id:
           type: integer
@@ -668,6 +676,8 @@ components:
           format: int64
         probeStatus:
           $ref: "#/components/schemas/ProbeStatus"
+        subtitleStatus:
+          $ref: "#/components/schemas/SubtitleStatus"
         scanError:
           type: string
           nullable: true
@@ -741,7 +751,7 @@ components:
 
     PlaybackInfo:
       type: object
-      required: [itemId, playbackMethod, reason, mimeType]
+      required: [itemId, playbackMethod, reason, mimeType, subtitleStatus]
       properties:
         itemId:
           type: integer
@@ -786,14 +796,15 @@ components:
             play switches client-side; sessions take audioTrackId at start.
           items:
             $ref: "#/components/schemas/AudioTrack"
+        subtitleStatus:
+          $ref: "#/components/schemas/SubtitleStatus"
         subtitleTracks:
           type: array
           description: >
-            Text subtitle tracks (ADR-0010). Embedded and filesystem sidecars
-            share one shape; differ by source. Listed the same way for
-            directPlay, remux, and transcode. Delivery is via track elements
-            or HLS EXT-X-MEDIA depending on the stream; clients do not branch
-            on method to find tracks.
+            Text subtitle tracks (ADR-0010 / ADR-0013). Embedded and filesystem
+            sidecars share one shape; differ by source. url is present only
+            when the WebVTT file is already extracted. Listed the same way for
+            directPlay, remux, and transcode.
           items:
             $ref: "#/components/schemas/SubtitleTrack"
 

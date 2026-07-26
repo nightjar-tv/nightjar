@@ -11,8 +11,7 @@ export const copy = {
 	sessionFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
 	badgeHint:
 		'Badges: browser plays directly, remux and transcode start a playback session when you open the item. Text subtitles (SRT and similar) show in the player caption menu; ASS and image subs are not available yet.',
-	sessionSubtitlesPreparing:
-		'Captions may take a moment on first play while the file is read.',
+	subtitlesPreparing: 'Subtitles are being prepared.',
 	subtitlesFoundNotRendered: 'Subtitle files found but not rendered yet:',
 	audioTrack: 'Audio track',
 	switchingAudio: 'Switching audio track…',

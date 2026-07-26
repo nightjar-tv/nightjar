@@ -10,11 +10,9 @@ use axum::{
 use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
-    ensure_embedded_webvtt, ensure_sidecar_webvtt, is_serveable_sidecar_format, list_audio_tracks,
-    list_text_subtitles,
+    is_serveable_sidecar_format, list_audio_tracks, list_text_subtitles, stored_webvtt,
 };
 use serde::Serialize;
-use std::sync::Arc;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +42,7 @@ pub struct MediaItemDto {
     pub height: Option<i32>,
     pub size_bytes: i64,
     pub probe_status: String,
+    pub subtitle_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_error: Option<String>,
     pub playback_method: &'static str,
@@ -104,6 +103,7 @@ pub struct PlaybackInfoDto {
     pub audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub audio_tracks: Vec<AudioTrackDto>,
+    pub subtitle_status: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub subtitle_tracks: Vec<SubtitleTrackDto>,
 }
@@ -159,10 +159,11 @@ pub async fn playback_info(
         sessions_url,
         mime_type: decision.mime_type,
         duration_ms: row.duration_ms,
-        container: row.container,
-        video_codec: row.video_codec,
-        audio_codec: row.audio_codec,
+        container: row.container.clone(),
+        video_codec: row.video_codec.clone(),
+        audio_codec: row.audio_codec.clone(),
         audio_tracks,
+        subtitle_status: row.subtitle_status.clone(),
         subtitle_tracks,
     }))
 }
@@ -176,58 +177,14 @@ pub async fn subtitle_vtt(
         .filter(|id| is_valid_track_id(id))
         .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?
         .to_string();
-    let row = state
+    let _row = state
         .db
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
 
-    let cache = Arc::clone(&state.subs);
-    let path = if let Some(stream_index) = parse_embedded_track_id(&track_id) {
-        let src = std::path::PathBuf::from(&row.path);
-        let mtime_ms = file_mtime_ms(&src).unwrap_or(0);
-        let size_bytes = row.size_bytes;
-        tokio::task::spawn_blocking(move || {
-            ensure_embedded_webvtt(&cache, item_id, mtime_ms, size_bytes, &src, stream_index)
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("subtitle extract task: {e}")))?
-        .map_err(ApiError::not_found)?
-    } else {
-        let sidecar = state
-            .db
-            .get_item_sidecar(item_id, &track_id)
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| {
-                ApiError::not_found(format!(
-                    "subtitle track {track_id} not found for item {item_id}"
-                ))
-            })?;
-        if !is_serveable_sidecar_format(&sidecar.format) {
-            return Err(ApiError::not_found(format!(
-                "subtitle track {track_id} is not served as WebVTT"
-            )));
-        }
-        let sidecar_path = std::path::PathBuf::from(sidecar.path);
-        let format = sidecar.format;
-        let mtime_ms = sidecar.mtime_ms;
-        let size_bytes = sidecar.size_bytes;
-        let track_id = track_id.clone();
-        tokio::task::spawn_blocking(move || {
-            ensure_sidecar_webvtt(
-                &cache,
-                item_id,
-                &track_id,
-                &sidecar_path,
-                &format,
-                mtime_ms,
-                size_bytes,
-            )
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("subtitle convert task: {e}")))?
-        .map_err(ApiError::not_found)?
-    };
+    // ADR-0013: playback never extracts; serve a stored file or 404.
+    let path = stored_webvtt(&state.subs, item_id, &track_id).map_err(ApiError::not_found)?;
 
     let bytes = tokio::fs::read(&path)
         .await
@@ -255,10 +212,6 @@ fn is_valid_track_id(id: &str) -> bool {
     }
 }
 
-fn parse_embedded_track_id(track_id: &str) -> Option<u32> {
-    track_id.strip_prefix('e')?.parse().ok()
-}
-
 pub(crate) fn audio_tracks_for(row: &MediaItemRow) -> Result<Vec<AudioTrackDto>, String> {
     let tracks = list_audio_tracks(std::path::Path::new(&row.path))?
         .into_iter()
@@ -284,11 +237,9 @@ pub(crate) fn subtitle_tracks_for(
     let src = std::path::Path::new(&row.path);
     for s in list_text_subtitles(src)? {
         let track_id = s.track_id();
+        let ready = state.subs.has_vtt(row.id, &track_id);
         tracks.push(SubtitleTrackDto {
-            url: Some(format!(
-                "/api/v0/items/{}/subtitles/{}.vtt",
-                row.id, track_id
-            )),
+            url: ready.then(|| format!("/api/v0/items/{}/subtitles/{}.vtt", row.id, track_id)),
             track_id,
             source: "embedded",
             codec: s.codec,
@@ -300,13 +251,13 @@ pub(crate) fn subtitle_tracks_for(
         });
     }
     for s in state.db.list_item_sidecars(row.id)? {
-        tracks.push(sidecar_to_dto(row.id, &s));
+        tracks.push(sidecar_to_dto(state, row.id, &s));
     }
     Ok(tracks)
 }
 
-fn sidecar_to_dto(item_id: i64, s: &SidecarRow) -> SubtitleTrackDto {
-    let served = is_serveable_sidecar_format(&s.format);
+fn sidecar_to_dto(state: &AppState, item_id: i64, s: &SidecarRow) -> SubtitleTrackDto {
+    let served = is_serveable_sidecar_format(&s.format) && state.subs.has_vtt(item_id, &s.track_id);
     SubtitleTrackDto {
         url: served.then(|| format!("/api/v0/items/{item_id}/subtitles/{}.vtt", s.track_id)),
         track_id: s.track_id.clone(),
@@ -318,13 +269,6 @@ fn sidecar_to_dto(item_id: i64, s: &SidecarRow) -> SubtitleTrackDto {
         sdh: s.sdh,
         stream_index: None,
     }
-}
-
-fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(dur.as_millis() as i64)
 }
 
 pub fn decide(row: &MediaItemRow) -> PlaybackDecision {
@@ -359,6 +303,7 @@ pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
         height: row.height,
         size_bytes: row.size_bytes,
         probe_status: row.probe_status,
+        subtitle_status: row.subtitle_status,
         scan_error: row.scan_error,
         playback_method: decision.method.as_str(),
     }
