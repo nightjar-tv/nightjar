@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -13,17 +14,73 @@ pub struct MediaFile {
     pub size_bytes: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CachedDir {
+    /// Directory mtime in milliseconds since epoch.
+    mtime_ms: i64,
+    /// Media files directly in this directory (not recursive).
+    files: Vec<MediaFile>,
+    /// Child directories discovered on the last listing of this directory.
+    children: Vec<PathBuf>,
+}
+
+/// Per-library walk memory so poll cycles can skip unchanged directories.
+#[derive(Debug, Default, Clone)]
+pub struct WalkCache {
+    dirs: HashMap<PathBuf, CachedDir>,
+}
+
+impl WalkCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.dirs.clear();
+    }
+}
+
 /// Walk `root`, following directories but not symlink loops. Permission errors are skipped.
-pub fn walk_media_files(root: &Path) -> Result<Vec<MediaFile>, String> {
+///
+/// When `cache` is provided, directories whose mtime matches the previous walk are not
+/// re-listed: their prior file list and child set are reused. That is the cheap
+/// poll path (ADR-0013). Immediate-parent mtime updates when a file is added;
+/// ancestors need not.
+pub fn walk_media_files_cached(
+    root: &Path,
+    mut cache: Option<&mut WalkCache>,
+) -> Result<Vec<MediaFile>, String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut seen = std::collections::HashSet::new();
+    let mut next_dirs: HashMap<PathBuf, CachedDir> = HashMap::new();
 
     while let Some(dir) = stack.pop() {
         let canon = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         if !seen.insert(canon) {
             continue;
         }
+        let meta = match fs::metadata(&dir) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "skip unreadable directory");
+                continue;
+            }
+        };
+        let mtime_ms = mtime_ms_from(&meta);
+
+        if let Some(cache) = cache.as_mut()
+            && let Some(prev) = cache.dirs.get(&dir)
+            && prev.mtime_ms == mtime_ms
+        {
+            out.extend(prev.files.iter().cloned());
+            stack.extend(prev.children.iter().cloned());
+            next_dirs.insert(dir.clone(), prev.clone());
+            continue;
+        }
+
+        let mut files = Vec::new();
+        let mut children = Vec::new();
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
@@ -48,7 +105,7 @@ pub fn walk_media_files(root: &Path) -> Result<Vec<MediaFile>, String> {
                 }
             };
             if meta.is_dir() {
-                // Do not follow symlinked dirs into cycles; canonicalize+seen handles loops.
+                children.push(path.clone());
                 stack.push(path);
                 continue;
             }
@@ -58,22 +115,37 @@ pub fn walk_media_files(root: &Path) -> Result<Vec<MediaFile>, String> {
             if !is_media(&path) {
                 continue;
             }
-            let mtime_ms = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            out.push(MediaFile {
+            files.push(MediaFile {
                 path,
-                mtime_ms,
+                mtime_ms: mtime_ms_from(&meta),
                 size_bytes: meta.len() as i64,
             });
         }
+        out.extend(files.iter().cloned());
+        next_dirs.insert(
+            dir,
+            CachedDir {
+                mtime_ms,
+                files,
+                children,
+            },
+        );
+    }
+
+    if let Some(cache) = cache.as_mut() {
+        cache.dirs = next_dirs;
     }
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+fn mtime_ms_from(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn is_media(path: &Path) -> bool {
@@ -87,6 +159,8 @@ fn is_media(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -98,7 +172,7 @@ mod tests {
         File::create(dir.path().join("Movie.vtt")).unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
         File::create(dir.path().join("sub").join("b.mkv")).unwrap();
-        let files = walk_media_files(dir.path()).unwrap();
+        let files = walk_media_files_cached(dir.path(), None).unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|f| {
             let ext = f.path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -107,5 +181,31 @@ mod tests {
                 "srt" | "vtt" | "ass" | "ssa"
             )
         }));
+    }
+
+    #[test]
+    fn dir_mtime_cache_skips_unchanged_and_sees_nested_add() {
+        let root = tempdir().unwrap();
+        let nested = root.path().join("A").join("B");
+        fs::create_dir_all(&nested).unwrap();
+        File::create(nested.join("one.mp4")).unwrap();
+
+        let mut cache = WalkCache::new();
+        let first = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Unchanged tree: same files, cache hit path.
+        let second = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
+        assert_eq!(second.len(), 1);
+
+        // Nested add updates only the immediate parent mtime; ancestors may not.
+        thread::sleep(Duration::from_millis(1100));
+        File::create(nested.join("two.mkv")).unwrap();
+        let third = walk_media_files_cached(root.path(), Some(&mut cache)).unwrap();
+        assert_eq!(
+            third.len(),
+            2,
+            "immediate-parent mtime change must surface the new file"
+        );
     }
 }

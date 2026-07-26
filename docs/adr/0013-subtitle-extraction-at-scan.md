@@ -109,23 +109,101 @@ this ADR records that as the reason, and the tests below lock it.
    `NIGHTJAR_SUBS_CACHE_BYTES`. Net complexity must fall: extraction moves
    to one place (the worker), serve becomes a file read.
 
-8. **Watcher polling fallback.** `notify` / inotify does not deliver
-   create events over SMB. If index insert for a newly copied title is
-   late, the watcher is the cause, not the probe queue. The library
-   watcher keeps the debounced `notify` path and adds a periodic
-   mtime-incremental scan of every library root so "add a file and it
-   appears" holds on network shares. Probe-queue contention remains a
-   separate diagnosis when the row exists as `indexed` for a long time.
+8. **Watcher polling fallback.** `notify` does not reliably deliver create
+   events over SMB. If index insert for a newly copied title is late, the
+   watcher is the cause, not the probe queue. The library watcher keeps the
+   debounced `notify` path and adds a periodic mtime-incremental scan of
+   every library root so "add a file and it appears" holds on network
+   shares. On the household macOS SMB mount, `notify` did fire for a nested
+   create (~2.4 s to the watch event); the poll remains the fallback when
+   it does not.
+
+   Poll cost on the household NAS (2026-07-26), Movies library only
+   (~1,748 media files, 1,763 dirs over SMB at ~15 MB/s):
+
+   | Pass | Wall |
+   |---|---|
+   | Cold full tree walk (readdir + file stat) | 73–152 s |
+   | Warm poll: re-stat every known dir, readdir only if that dir's mtime changed | 0.02–11 s (0 dirs changed) |
+
+   TV Shows on the same share is ~23,058 media files (~110 s for a
+   filename find alone). A fixed 60 s full-walk poll is longer than one
+   Movies walk and would stack I/O on top of probe and extract. Changes
+   that follow from the numbers:
+
+   1. **Directory-mtime walk cache.** Unchanged directories reuse the prior
+      file list and child set; only dirs whose own mtime moved are
+      re-listed. Immediate-parent mtime updates when a file is added;
+      ancestors need not. This is the steady-state poll path.
+   2. **Interval scales with index duration.**
+      `poll_interval = max(60s, 2 × last_index_duration)`. After a cold
+      ~150 s Movies index the next poll waits ~300 s, so walks cannot
+      pile up.
+   3. **Dirty follow-up after a busy scan.** `start_scan_job` reuses an
+      active job. An fs change that arrives after the walk has already
+      passed that directory would otherwise wait for the next poll. The
+      watcher marks the library dirty when an fs event hits an active job;
+      when that job finishes, a follow-up scan starts immediately. Poll
+      reuse does not set the dirty bit (it would force a double cold walk
+      on every long index).
+   4. **Pause extract during the index walk.** Extract demuxes are
+      multi-minute SMB reads. Running them concurrently with a Movies
+      cold walk stretched that walk past 22 minutes with zero rows
+      committed; the same tiny library indexed in 12 ms idle and 11 s
+      under extract load. Workers still prefer probe over extract, and
+      additionally refuse to start new extracts while any library is in
+      its walk. One in-flight demux may finish; new ones wait.
+
+9. **Probe and scan-job resume across restarts.** Items left
+   `probe_status = indexed` after a process exit are stranded if the pool
+   only accepts work from the current index pass: unchanged mtime skips
+   them forever, and subtitle extract behind that queue never runs.
+   Startup drains `indexed` rows into the probe queue the same way it
+   drains pending extracts; an unchanged index pass also re-queues
+   still-`indexed` items. Measured on the dogfood DB before the fix:
+   1,006 indexed / 739 probed / 1,745 total (57.6% stranded). After the
+   fix, a restart logged `resumed indexed items awaiting probe count=1006`
+   and the indexed count drained.
+
+   The same restart leaves `scan_jobs` rows in `queued` / `indexing` /
+   `probing`. `POST /scan` reuses an active job id, so a zombie probing
+   row blocks every later scan and the poll fallback never indexes new
+   files. Startup fails those rows with "scan interrupted by process
+   restart" before accepting work.
 
 ## Consequences
 
-- First play of an already-extracted title shows captions immediately
-  (Chrome and Safari). First play of a title still `pending` shows the
-  preparing line, not a multi-minute hang inside the GET.
-- A 24,800-item first extract pass is wall-clock bound by NAS read speed
-  and pool width. Measured rate after dogfooding on the household share:
-  _TBD items/hour; estimate for 24,800 = TBD_. Fill this blank from the
-  same run that verifies the slice; do not invent it.
+- First play of an already-extracted title shows captions immediately.
+  Measured on a ready title: WebVTT GET 0.5–4 ms; HLS master playlist
+  included `#EXT-X-MEDIA:TYPE=SUBTITLES` on the first fetch (0.38 s
+  including session create) with playlist entries pointing at the stored
+  VTT URLs. Chrome and Safari both opened the item page; browser JS
+  automation was not available to scrape the `<track>` element, so the
+  API/HLS path is the verified number. First play of a title still
+  `pending` shows the preparing line, not a multi-minute hang inside the
+  GET.
+- Add-file timings on the household NAS (2026-07-26), isolated library
+  rooted at a single title directory (~4 KB probe MKV + sidecar):
+
+  | Path | Until listed | Until playable | Until subtitled |
+  |---|---|---|---|
+  | Explicit `POST /scan` (idle) | 0.26 s | 0.26 s | 0.51 s |
+  | Watcher (`notify` fired; concurrent Movies extract on same share) | 27 s | 27 s | 27 s |
+
+  The first column is the property this slice exists to deliver. Under a
+  full Movies cold walk fighting extract demuxes, a new title under the
+  Movies root had still not been indexed after 22 minutes (walk alive,
+  `added=0`); that is why extracts pause during index and why the dirty
+  follow-up exists. Do not treat the 27 s watcher row as a Movies-scale
+  guarantee until a walk completes without extract contention.
+- A 24,800-item first extract pass is wall-clock bound by NAS read speed.
+  Extract is serialised by a process-wide lock (shared tmp paths). Measured
+  on the dogfood Movies library (1,745 pending, mean file size ~9.5 GB)
+  while a cold Movies index walk was also on the share: **21 items/hour**
+  (6 completed in 1,018 s; mix of `ready` and `none`). Extrapolated
+  24,800 ≈ **1,180 hours** (~49 days) at that rate. Steady-state without
+  a concurrent cold walk should be higher; re-measure after extracts are
+  paused during index before treating 21/h as the floor.
 - Schema migration `005` adds `subtitle_status` and the source mtime/size
   stamp columns (append-only). OpenAPI gains `subtitleStatus` on item and
   playback-info schemas (additive, v0).
@@ -134,3 +212,6 @@ this ADR records that as the reason, and the tests below lock it.
   playback trigger are replaced.
 - Image / ASS burn-in remains later Phase 2 work; those tracks stay listed
   without `url`.
+- Directory-mtime polling can miss an add if the SMB server fails to bump
+  the immediate parent mtime; the scaled full cold walk after process
+  restart still heals that. Do not raise the poll frequency to compensate.

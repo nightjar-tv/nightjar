@@ -240,6 +240,23 @@ impl Db {
         .map_err(|e| format!("item mtime: {e}"))
     }
 
+    /// id, mtime_ms, probe_status for one library path.
+    pub fn item_index_row(
+        &self,
+        library_id: i64,
+        path: &str,
+    ) -> Result<Option<(i64, i64, String)>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, mtime_ms, probe_status FROM media_items
+             WHERE library_id = ?1 AND path = ?2",
+            params![library_id, path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| format!("item index row: {e}"))
+    }
+
     /// Upsert index-pass rows in one transaction. Returns item ids in input order.
     pub fn upsert_items_indexed(
         &self,
@@ -369,6 +386,22 @@ impl Db {
         )
         .map_err(|e| format!("set subtitle status for item {item_id}: {e}"))?;
         Ok(())
+    }
+
+    /// Items that never finished probing (e.g. process restart mid-scan).
+    pub fn list_indexed_unprobed(&self) -> Result<Vec<(i64, String)>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path FROM media_items
+                 WHERE probe_status = 'indexed'
+                 ORDER BY id",
+            )
+            .map_err(|e| format!("prepare indexed unprobed: {e}"))?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("list indexed unprobed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read indexed unprobed: {e}"))
     }
 
     pub fn list_pending_subtitle_items(&self) -> Result<Vec<(i64, String, i64, i64)>, String> {
@@ -613,6 +646,23 @@ impl Db {
         )
         .optional()
         .map_err(|e| format!("active scan job: {e}"))
+    }
+
+    /// Mark in-flight scan jobs failed. A process exit leaves rows in
+    /// queued/indexing/probing with no worker; reusing them blocks new scans.
+    pub fn fail_stale_scan_jobs(&self) -> Result<usize, String> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute(
+                "UPDATE scan_jobs SET
+                    state = 'failed',
+                    error_message = 'scan interrupted by process restart',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE state IN ('queued', 'indexing', 'probing')",
+                [],
+            )
+            .map_err(|e| format!("fail stale scan jobs: {e}"))?;
+        Ok(n)
     }
 
     pub fn get_scan_job(&self, job_id: i64) -> Result<Option<ScanJobRow>, String> {

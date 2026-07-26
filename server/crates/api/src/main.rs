@@ -25,6 +25,11 @@ async fn main() {
 
     let data_dir = data_dir();
     let db = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
+    match db.fail_stale_scan_jobs() {
+        Ok(n) if n > 0 => tracing::info!(count = n, "cleared scan jobs left active by a prior exit"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "clear stale scan jobs failed"),
+    }
     let subs = nightjar_transcode::SubsStore::new(data_dir.join("subs"))
         .unwrap_or_else(|e| panic!("subtitle store: {e}"));
     // ADR-0009: verify encoders once at startup; sessions reuse this Arc.
@@ -41,6 +46,11 @@ async fn main() {
         std::sync::Arc::clone(&db),
         std::sync::Arc::clone(&subs),
     );
+    match pool.drain_pending_probes() {
+        Ok(n) if n > 0 => tracing::info!(count = n, "resumed indexed items awaiting probe"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "enqueue pending probes failed"),
+    }
     pool.drain_pending_extracts()
         .unwrap_or_else(|e| tracing::warn!(error = %e, "enqueue pending subtitle extracts failed"));
     if let Err(e) = pool.cleanup_orphan_subtitles() {

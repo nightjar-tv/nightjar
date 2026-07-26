@@ -1,9 +1,12 @@
 use crate::probe;
+use crate::walk::WalkCache;
 use nightjar_db::{Db, ProbeUpdate};
 use nightjar_transcode::{ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
@@ -78,6 +81,17 @@ pub struct LibraryPool {
     subs: Arc<SubsStore>,
     queue: Mutex<Queue>,
     available: Condvar,
+    walk_caches: Mutex<HashMap<i64, WalkCache>>,
+    /// Longest recent index-pass wall time; poll interval scales from this.
+    last_index_ms: AtomicU64,
+    /// Libraries that saw an fs change while a scan job was already active.
+    /// The in-progress walk may have already passed the changed directory;
+    /// a follow-up scan runs after the active job finishes (ADR-0013).
+    scan_dirty: Mutex<HashSet<i64>>,
+    /// Count of libraries currently in the index walk. Extract work is deferred
+    /// while this is non-zero so SMB reads for listing are not starved by
+    /// multi-minute demuxes (ADR-0013).
+    index_active: AtomicUsize,
 }
 
 impl LibraryPool {
@@ -90,6 +104,10 @@ impl LibraryPool {
                 extracts: VecDeque::new(),
             }),
             available: Condvar::new(),
+            walk_caches: Mutex::new(HashMap::new()),
+            last_index_ms: AtomicU64::new(0),
+            scan_dirty: Mutex::new(HashSet::new()),
+            index_active: AtomicUsize::new(0),
         });
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -103,6 +121,49 @@ impl LibraryPool {
                 .expect("spawn library worker");
         }
         pool
+    }
+
+    pub fn record_index_duration_ms(&self, ms: u64) {
+        self.last_index_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// Poll period: at least 60s, else 2× the longest recent index pass so a
+    /// full SMB walk cannot stack on top of itself (ADR-0013).
+    pub fn poll_interval(&self) -> Duration {
+        let ms = self.last_index_ms.load(Ordering::Relaxed);
+        let secs = (ms.saturating_mul(2) / 1000).max(60);
+        Duration::from_secs(secs)
+    }
+
+    pub fn with_walk_cache<R>(&self, library_id: i64, f: impl FnOnce(&mut WalkCache) -> R) -> R {
+        let mut caches = self.walk_caches.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = caches.entry(library_id).or_default();
+        f(cache)
+    }
+
+    pub fn mark_scan_dirty(&self, library_id: i64) {
+        self.scan_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(library_id);
+    }
+
+    pub fn take_scan_dirty(&self, library_id: i64) -> bool {
+        self.scan_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&library_id)
+    }
+
+    pub fn begin_index(&self) {
+        self.index_active.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn end_index(&self) {
+        let prev = self.index_active.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.available.notify_all();
+        }
     }
 
     pub fn enqueue(&self, item: WorkItem) {
@@ -132,6 +193,16 @@ impl LibraryPool {
         ProbeBatch { state }
     }
 
+    /// Re-queue items left `indexed` after a prior process exit (ADR-0013).
+    pub fn drain_pending_probes(&self) -> Result<usize, String> {
+        let items = self.db.list_indexed_unprobed()?;
+        let n = items.len();
+        for (item_id, path) in items {
+            self.enqueue(WorkItem::probe(item_id, PathBuf::from(path), None));
+        }
+        Ok(n)
+    }
+
     pub fn drain_pending_extracts(&self) -> Result<(), String> {
         for (item_id, path, _, _) in self.db.list_pending_subtitle_items()? {
             self.enqueue(WorkItem::extract(item_id, PathBuf::from(path)));
@@ -155,13 +226,18 @@ impl LibraryPool {
                     if let Some(item) = queue.probes.pop_front() {
                         break item;
                     }
-                    if let Some(item) = queue.extracts.pop_front() {
+                    // Defer extracts while any library is walking so index
+                    // listing keeps SMB bandwidth (probe still runs).
+                    if self.index_active.load(Ordering::SeqCst) == 0
+                        && let Some(item) = queue.extracts.pop_front()
+                    {
                         break item;
                     }
                     queue = self
                         .available
-                        .wait(queue)
-                        .unwrap_or_else(|e| e.into_inner());
+                        .wait_timeout(queue, Duration::from_secs(1))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
                 }
             };
             match item.kind {

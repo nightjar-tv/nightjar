@@ -45,6 +45,18 @@ fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                             path = %ev.path.display(),
                             "fs change; starting scan job"
                         );
+                        // If a walk is already past this directory, coalescing
+                        // into the active job would miss the add. Mark dirty so
+                        // a follow-up scan runs when the active job finishes.
+                        match db.active_scan_job(id) {
+                            Ok(Some(_)) => pool.mark_scan_dirty(id),
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(
+                                library_id = id,
+                                error = %e,
+                                "active scan job check failed"
+                            ),
+                        }
                         match start_scan_job(Arc::clone(&db), Arc::clone(&pool), id) {
                             Ok(job_id) => {
                                 tracing::info!(library_id = id, job_id, "watch scan job accepted")
@@ -62,9 +74,14 @@ fn run(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                 return Err("watch channel disconnected".into());
             }
         }
-        if last_poll.elapsed() >= Duration::from_secs(60) {
+        let poll_every = pool.poll_interval();
+        if last_poll.elapsed() >= poll_every {
             for library_id in watched.keys() {
-                tracing::info!(library_id, "poll rescan; starting scan job");
+                tracing::info!(
+                    library_id,
+                    poll_interval_s = poll_every.as_secs(),
+                    "poll rescan; starting scan job"
+                );
                 if let Err(e) = start_scan_job(Arc::clone(&db), Arc::clone(&pool), *library_id) {
                     tracing::warn!(library_id, error = %e, "poll scan failed");
                 }

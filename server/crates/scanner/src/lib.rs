@@ -54,7 +54,14 @@ fn run_scan_job(
     }
 
     let index_started = Instant::now();
-    let files = walk::walk_media_files(root)?;
+    // Hold extract workers off the share for the walk; one in-flight demux may
+    // still finish, but new extracts do not start until end_index.
+    pool.begin_index();
+    let files = pool.with_walk_cache(library_id, |cache| {
+        walk::walk_media_files_cached(root, Some(cache))
+    });
+    pool.end_index();
+    let files = files?;
     let mut added = 0u32;
     let mut updated = 0u32;
     let mut unchanged = 0u32;
@@ -96,9 +103,14 @@ fn run_scan_job(
         let path_str = path_to_string(&file.path);
         keep_paths.push(path_str.clone());
 
-        match db.item_mtime(library_id, &path_str)? {
-            Some((_, mtime)) if mtime == file.mtime_ms => {
+        match db.item_index_row(library_id, &path_str)? {
+            Some((id, mtime, probe_status)) if mtime == file.mtime_ms => {
                 unchanged += 1;
+                // A prior run may have indexed this file and died before probe.
+                // Unchanged mtime alone must not leave it stranded forever.
+                if probe_status == "indexed" {
+                    probe_queue.push(pool::WorkItem::probe(id, file.path.clone(), Some(job_id)));
+                }
             }
             existing => {
                 let file_name = file
@@ -177,6 +189,7 @@ fn run_scan_job(
     }
 
     let index_duration_ms = index_started.elapsed().as_millis() as u64;
+    pool.record_index_duration_ms(index_duration_ms);
     db.set_scan_job_index_done(
         job_id,
         added,
@@ -211,6 +224,13 @@ fn run_scan_job(
     db.complete_scan_job(job_id, probe_duration_ms)?;
 
     tracing::info!(job_id, library_id, probe_duration_ms, "scan job completed");
+    if pool.take_scan_dirty(library_id) {
+        tracing::info!(
+            library_id,
+            "library changed during scan; starting follow-up job"
+        );
+        start_scan_job(Arc::clone(db), Arc::clone(pool), library_id)?;
+    }
     Ok(())
 }
 
