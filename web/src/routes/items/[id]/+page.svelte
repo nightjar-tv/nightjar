@@ -3,7 +3,7 @@
 	import { page } from '$app/state';
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
-	import { attachHls } from '$lib/hlsPlayer';
+	import { attachHls, type HlsHandle } from '$lib/hlsPlayer';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItem'];
@@ -30,6 +30,9 @@
 	const sessionRef: { id: string | null } = { id: null };
 	// Non-reactive so changing it does not re-run the attach effect on its own.
 	const resumeRef = { seconds: 0 };
+	// Current attach handle; its positionSeconds() is title-absolute where
+	// raw currentTime is not after a mid-title switch (see hlsPlayer).
+	const playerRef: { handle: HlsHandle | null } = { handle: null };
 	// Read by every await loop so an unmount mid-flight stops the loop and
 	// reaps whatever it already started.
 	const liveRef = { alive: true };
@@ -100,7 +103,8 @@
 	 *  one. Init and prior segments carry the old audio config, so this is
 	 *  never a window move inside the seek path (ADR-0012). */
 	async function switchSessionAudio(trackId: string) {
-		const startMs = Math.max(0, Math.floor((videoEl?.currentTime ?? 0) * 1000));
+		const seconds = playerRef.handle?.positionSeconds() ?? videoEl?.currentTime ?? 0;
+		const startMs = Math.max(0, Math.floor(seconds * 1000));
 		const previous = sessionRef.id;
 		switchingAudio = true;
 		try {
@@ -203,7 +207,11 @@
 			return;
 		}
 		const handle = attachHls(video, url, resumeRef.seconds);
-		return () => handle.destroy();
+		playerRef.handle = handle;
+		return () => {
+			playerRef.handle = null;
+			handle.destroy();
+		};
 	});
 </script>
 
