@@ -196,14 +196,35 @@ this ADR records that as the reason, and the tests below lock it.
   `added=0`); that is why extracts pause during index and why the dirty
   follow-up exists. Do not treat the 27 s watcher row as a Movies-scale
   guarantee until a walk completes without extract contention.
-- A 24,800-item first extract pass is wall-clock bound by NAS read speed.
-  Extract is serialised by a process-wide lock (shared tmp paths). Measured
-  on the dogfood Movies library (1,745 pending, mean file size ~9.5 GB)
-  while a cold Movies index walk was also on the share: **21 items/hour**
-  (6 completed in 1,018 s; mix of `ready` and `none`). Extrapolated
-  24,800 ≈ **1,180 hours** (~49 days) at that rate. Steady-state without
-  a concurrent cold walk should be higher; re-measure after extracts are
-  paused during index before treating 21/h as the floor.
+- A first extract pass is wall-clock bound by sequential NAS read speed,
+  not by pool width: extract is serialised by a process-wide lock (shared
+  tmp paths), and subtitle packets are interleaved throughout the
+  container, so each text-bearing title costs roughly one full read.
+  Parallel extract would only split the same pipe.
+
+  Measured on the dogfood Movies library (2026-07-26):
+
+  | Quantity | Value |
+  |---|---|
+  | Library size | 1,745 titles, 16.5 TB, mean 9.5 GB, p90 17.8 GB |
+  | Titles with an extractable text track (subrip/mov_text/webvtt/text) | 68% by count, **74% by bytes** (200-file sample) |
+  | Demux throughput (two 8–10 GB subrip titles, isolated) | 54 and 56 MB/s, ~18 s/GB, flat across 1 vs 4 tracks |
+  | Header-only classify probe (`ffprobe -select_streams s`) | ~0.26 s/title |
+
+  Text-bearing bytes ≈ 0.74 × 16.5 TB = 12.3 TB at ~18 s/GB ≈ **61 hours
+  (~2.6 days)** for the Movies first pass, single stream, uncontended.
+  Filtering to text-bearing items removes only ~26% of the read volume
+  here; this library is subtitle-heavy (subrip dominant), so
+  extract-only-where-text-exists is not the large win it would be on a
+  library without embedded subs. Image/ASS tracks (PGS, dvd_subtitle,
+  ass) are skipped and cost only the classify probe.
+
+  The earlier **21 items/hour** figure was measured while a cold Movies
+  index walk was starving the same share; it is a contention artifact, not
+  the steady-state rate, and is superseded by the throughput number above.
+  Extracts now pause during the index walk for exactly this reason. TV
+  Shows (~23,058 files, smaller per title) is not yet byte-measured; the
+  full 24,800-item estimate needs that pass before it is stated.
 - Schema migration `005` adds `subtitle_status` and the source mtime/size
   stamp columns (append-only). OpenAPI gains `subtitleStatus` on item and
   playback-info schemas (additive, v0).
