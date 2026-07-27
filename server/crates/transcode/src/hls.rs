@@ -17,7 +17,10 @@ const REAPER_TICK: Duration = Duration::from_secs(5);
 /// Locked HLS segment duration (ADR-0008). Future renditions must match this
 /// value and the matching forced-keyframe interval.
 const SEGMENT_MS: u64 = 2000;
-const SEGMENT_WAIT: Duration = Duration::from_secs(15);
+/// How long a segment or init fetch may block before returning 503. Mid-title
+/// hardware transcodes on a NAS library can exceed 15s (dogfood: ~16s to
+/// seg1098 after a Chrome seek on Up 1080p).
+const SEGMENT_WAIT: Duration = Duration::from_secs(30);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
 /// Safari's sequential prefetch reaches two segments beyond the current
 /// on-disk frontier; farther requests are treated as a scrub.

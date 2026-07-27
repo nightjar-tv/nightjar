@@ -122,14 +122,15 @@
 			// Reap it now so a hardware encoder slot is not held while the new
 			// session cooks.
 			if (previous) void api.deleteTranscodeSession(previous);
-			const playlistOk = await waitForReady(started.playlistUrl);
-			// Land segment (aligned 2s index) must be servable before cutover
-			// so attach does not sit on a cold 503 at the switch point.
+			// Wait only for the land segment. The asset route long-polls with the
+			// same budget as segment fetches; master/index are not ready until
+			// init exists anyway, and a second master poll adds latency without
+			// shortening mid-title NAS transcode time.
 			const landIdx = Math.floor(startMs / 2000);
 			const landName = `seg${String(landIdx).padStart(3, '0')}.m4s`;
-			const landOk =
-				playlistOk &&
-				(await waitForReady(sessionAssetUrl(started.playlistUrl, landName)));
+			const landOk = await waitForReady(
+				sessionAssetUrl(started.playlistUrl, landName)
+			);
 			// Never adopt a session the page no longer owns; leaving it for
 			// the idle reaper burns a cap slot for a minute.
 			if (!landOk || !liveRef.alive) {
