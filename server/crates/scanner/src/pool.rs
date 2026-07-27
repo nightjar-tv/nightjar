@@ -141,12 +141,6 @@ impl LibraryPool {
         self.last_index_ms.load(Ordering::Relaxed)
     }
 
-    pub fn poll_interval(&self) -> Duration {
-        let ms = self.last_index_duration_ms();
-        let secs = (ms.saturating_mul(2) / 1000).max(60);
-        Duration::from_secs(secs)
-    }
-
     pub fn with_walk_cache<R>(&self, library_id: i64, f: impl FnOnce(&mut WalkCache) -> R) -> R {
         let mut caches = self.walk_caches.lock().unwrap_or_else(|e| e.into_inner());
         let cache = caches.entry(library_id).or_default();

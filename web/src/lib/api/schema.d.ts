@@ -31,7 +31,7 @@ export interface paths {
         /** List all libraries */
         get: operations["listLibraries"];
         put?: never;
-        /** Create a library pointing at a local folder */
+        /** Create a library and enqueue its first scan (ADR-0015) */
         post: operations["createLibrary"];
         delete?: never;
         options?: never;
@@ -376,6 +376,22 @@ export interface components {
             path: string;
             kind: components["schemas"]["LibraryKind"];
         };
+        /** @description Library row plus the scan job enqueued on create (ADR-0015). */
+        CreateLibraryResponse: {
+            /** Format: int64 */
+            id: number;
+            name: string;
+            path: string;
+            kind: components["schemas"]["LibraryKind"];
+            /** Format: int64 */
+            itemCount: number;
+            reachable: boolean;
+            /**
+             * Format: int64
+             * @description Async scan job started for this library.
+             */
+            jobId: number;
+        };
         MediaItem: {
             /** Format: int64 */
             id: number;
@@ -582,13 +598,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Created */
+            /** @description Library created and scan job accepted. The walk runs asynchronously (ADR-0004); poll GET /scan-jobs/{jobId} for progress. */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Library"];
+                    "application/json": components["schemas"]["CreateLibraryResponse"];
                 };
             };
             /** @description Invalid request */

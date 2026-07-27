@@ -22,8 +22,12 @@ use std::time::Instant;
 
 const INDEX_BATCH: usize = 200;
 
-/// Start (or reuse) an async scan job. Returns the job id immediately.
-pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
+/// Request a library scan (ADR-0015). Sole entry point for creation, notify,
+/// poll, and manual scan. Returns the active or newly accepted job id.
+///
+/// If a scan is already running, marks the library dirty for exactly one
+/// follow-up when it finishes and returns the active job id.
+pub fn request_scan(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
     let lib = db
         .get_library(library_id)?
         .ok_or_else(|| format!("library {library_id} not found"))?;
@@ -32,6 +36,7 @@ pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> R
         return Err(format!("library path is not reachable: {}", lib.path));
     }
     if let Some(existing) = db.active_scan_job(library_id)? {
+        pool.mark_scan_dirty(library_id);
         return Ok(existing);
     }
     let job_id = db.create_scan_job(library_id)?;
@@ -42,9 +47,23 @@ pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> R
                 tracing::error!(job_id, library_id, error = %e, "scan job failed");
                 let _ = db.fail_scan_job(job_id, &e);
             }
+            if pool.take_scan_dirty(library_id) {
+                tracing::info!(
+                    library_id,
+                    "library dirty after scan; starting follow-up job"
+                );
+                if let Err(e) = request_scan(Arc::clone(&db), Arc::clone(&pool), library_id) {
+                    tracing::warn!(library_id, error = %e, "follow-up scan failed");
+                }
+            }
         })
         .map_err(|e| format!("spawn scan job {job_id}: {e}"))?;
     Ok(job_id)
+}
+
+/// Alias kept for tests and call sites that mean "start discovery".
+pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
+    request_scan(db, pool, library_id)
 }
 
 fn run_scan_job(
@@ -331,13 +350,6 @@ fn run_scan_job(
     db.complete_scan_job(job_id, probe_duration_ms)?;
 
     tracing::info!(job_id, library_id, probe_duration_ms, "scan job completed");
-    if pool.take_scan_dirty(library_id) {
-        tracing::info!(
-            library_id,
-            "library changed during scan; starting follow-up job"
-        );
-        start_scan_job(Arc::clone(db), Arc::clone(pool), library_id)?;
-    }
     Ok(())
 }
 
@@ -697,5 +709,95 @@ mod tests {
             again.probe_status, "error",
             "permanent errors must not be re-queued by reachability recovery"
         );
+    }
+
+    #[test]
+    fn triggers_during_scan_coalesce_to_one_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        for i in 0..200 {
+            let season = media.join(format!("Show/Season {}", i % 10));
+            fs::create_dir_all(&season).unwrap();
+            fs::write(season.join(format!("E{i:03}.mp4")), b"x").unwrap();
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "shows".into(),
+            })
+            .unwrap();
+
+        let job1 = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+
+        let mut overlapped = false;
+        for _ in 0..400 {
+            if db.active_scan_job(lib.id).unwrap() == Some(job1) {
+                for _ in 0..8 {
+                    let id = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+                    assert_eq!(id, job1, "must reuse active job");
+                }
+                overlapped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            overlapped,
+            "scan finished before overlap window; enlarge fixture if this flakes"
+        );
+
+        for _ in 0..800 {
+            if db.active_scan_job(lib.id).unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(db.active_scan_job(lib.id).unwrap().is_none());
+
+        let mut completed = 0;
+        for id in job1..job1 + 8 {
+            if let Ok(Some(j)) = db.get_scan_job(id) {
+                if j.library_id == lib.id && (j.state == "completed" || j.state == "failed") {
+                    completed += 1;
+                }
+            }
+        }
+        assert_eq!(
+            completed, 2,
+            "one follow-up after coalesced triggers, got {completed}"
+        );
+    }
+
+    #[test]
+    fn create_then_request_scan_returns_job_without_blocking_on_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("A.mp4"), b"x").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let job_id = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "request_scan must return before the walk finishes"
+        );
+        assert!(job_id > 0);
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(job.library_id, lib.id);
     }
 }

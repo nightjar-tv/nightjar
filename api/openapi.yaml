@@ -43,7 +43,7 @@ paths:
                       $ref: "#/components/schemas/Library"
     post:
       operationId: createLibrary
-      summary: Create a library pointing at a local folder
+      summary: Create a library and enqueue its first scan (ADR-0015)
       requestBody:
         required: true
         content:
@@ -52,11 +52,13 @@ paths:
               $ref: "#/components/schemas/CreateLibraryRequest"
       responses:
         "201":
-          description: Created
+          description: >
+            Library created and scan job accepted. The walk runs asynchronously
+            (ADR-0004); poll GET /scan-jobs/{jobId} for progress.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Library"
+                $ref: "#/components/schemas/CreateLibraryResponse"
         "400":
           description: Invalid request
           content:
@@ -632,6 +634,31 @@ components:
           minLength: 1
         kind:
           $ref: "#/components/schemas/LibraryKind"
+
+    CreateLibraryResponse:
+      type: object
+      required: [id, name, path, kind, itemCount, reachable, jobId]
+      description: >
+        Library row plus the scan job enqueued on create (ADR-0015).
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        path:
+          type: string
+        kind:
+          $ref: "#/components/schemas/LibraryKind"
+        itemCount:
+          type: integer
+          format: int64
+        reachable:
+          type: boolean
+        jobId:
+          type: integer
+          format: int64
+          description: Async scan job started for this library.
 
     MediaItem:
       type: object

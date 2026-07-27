@@ -1,7 +1,9 @@
-//! Debounced filesystem watch that triggers async library rescans.
+//! Library discovery triggers: notify + fixed poll backstop (ADR-0015).
+//!
+//! Every trigger calls [`crate::request_scan`]. Notify never disables poll.
 
 use crate::reachability::REACHABILITY_INTERVAL;
-use crate::{LibraryPool, start_scan_job};
+use crate::{LibraryPool, request_scan};
 use nightjar_db::Db;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
@@ -10,7 +12,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Watch every library root; on change, start an async rescan (mtime-incremental).
+/// Fixed poll interval (ADR-0015). ~3% duty cycle at 1.7 s TV warm / 60 s.
+/// Override with `NIGHTJAR_POLL_INTERVAL_SECS`.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
+
+fn poll_interval() -> Duration {
+    let secs = std::env::var("NIGHTJAR_POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
+        .clamp(5, 3600);
+    Duration::from_secs(secs)
+}
+
+/// Watch every library root; on change, request a scan. Poll remains the
+/// verification backstop whether or not notify delivers events.
 pub fn spawn_library_watcher(db: Arc<Db>, pool: Arc<LibraryPool>) {
     std::thread::Builder::new()
         .name("nightjar-watch".into())
@@ -55,6 +71,8 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
     let mut watched: HashMap<i64, PathBuf> = HashMap::new();
     let mut last_poll = std::time::Instant::now();
     let mut last_reach = std::time::Instant::now();
+    // Defer recursive watches until the first index finishes so they do not
+    // compete with cold SMB metadata IOPS (ADR-0013). Poll still runs.
     let mut notify_armed = false;
     loop {
         if notify_armed {
@@ -82,23 +100,14 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                         tracing::info!(
                             library_id = id,
                             path = %ev.path.display(),
-                            "fs change; starting scan job"
+                            "fs change; requesting scan"
                         );
-                        match db.active_scan_job(id) {
-                            Ok(Some(_)) => pool.mark_scan_dirty(id),
-                            Ok(None) => {}
-                            Err(e) => tracing::warn!(
-                                library_id = id,
-                                error = %e,
-                                "active scan job check failed"
-                            ),
-                        }
-                        match start_scan_job(Arc::clone(&db), Arc::clone(&pool), id) {
+                        match request_scan(Arc::clone(&db), Arc::clone(&pool), id) {
                             Ok(job_id) => {
-                                tracing::info!(library_id = id, job_id, "watch scan job accepted")
+                                tracing::info!(library_id = id, job_id, "scan accepted")
                             }
                             Err(e) => {
-                                tracing::warn!(library_id = id, error = %e, "watch scan failed")
+                                tracing::warn!(library_id = id, error = %e, "scan request failed")
                             }
                         }
                     }
@@ -131,7 +140,7 @@ fn maybe_poll(
     watched: &HashMap<i64, PathBuf>,
     last_poll: &mut std::time::Instant,
 ) {
-    let poll_every = pool.poll_interval();
+    let poll_every = poll_interval();
     if last_poll.elapsed() < poll_every {
         return;
     }
@@ -142,9 +151,9 @@ fn maybe_poll(
         tracing::info!(
             library_id,
             poll_interval_s = poll_every.as_secs(),
-            "poll rescan; starting scan job"
+            "poll; requesting scan"
         );
-        if let Err(e) = start_scan_job(Arc::clone(db), Arc::clone(pool), *library_id) {
+        if let Err(e) = request_scan(Arc::clone(db), Arc::clone(pool), *library_id) {
             tracing::warn!(library_id, error = %e, "poll scan failed");
         }
     }
@@ -152,10 +161,13 @@ fn maybe_poll(
 }
 
 fn sync_library_roots(db: &Db, watched: &mut HashMap<i64, PathBuf>) -> Result<(), String> {
-    for lib in db.list_libraries()? {
+    let libs = db.list_libraries()?;
+    let live: std::collections::HashSet<i64> = libs.iter().map(|l| l.id).collect();
+    watched.retain(|id, _| live.contains(id));
+    for lib in libs {
         let path = PathBuf::from(&lib.path);
         if watched.get(&lib.id) != Some(&path) {
-            tracing::info!(library_id = lib.id, path = %path.display(), "poll-only library root");
+            tracing::info!(library_id = lib.id, path = %path.display(), "library root for poll");
             watched.insert(lib.id, path);
         }
     }
@@ -168,10 +180,24 @@ fn sync_watches(
     watched: &mut HashMap<i64, PathBuf>,
 ) -> Result<(), String> {
     let libs = db.list_libraries()?;
+    let live: std::collections::HashSet<i64> = libs.iter().map(|l| l.id).collect();
+    for id in watched
+        .keys()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect::<Vec<_>>()
+    {
+        if let Some(path) = watched.remove(&id) {
+            let _ = debouncer.watcher().unwatch(&path);
+        }
+    }
     for lib in libs {
         let path = PathBuf::from(&lib.path);
         if watched.get(&lib.id) == Some(&path) {
             continue;
+        }
+        if let Some(old) = watched.remove(&lib.id) {
+            let _ = debouncer.watcher().unwatch(&old);
         }
         match debouncer.watcher().watch(&path, RecursiveMode::Recursive) {
             Ok(()) => {
@@ -179,7 +205,14 @@ fn sync_watches(
                 watched.insert(lib.id, path);
             }
             Err(e) => {
-                tracing::warn!(library_id = lib.id, path = %path.display(), error = %e, "watch path failed");
+                // Still poll this root; notify is only an accelerator.
+                tracing::warn!(
+                    library_id = lib.id,
+                    path = %path.display(),
+                    error = %e,
+                    "watch path failed; poll continues"
+                );
+                watched.insert(lib.id, path);
             }
         }
     }
@@ -191,4 +224,17 @@ fn library_for_path(watched: &HashMap<i64, PathBuf>, path: &Path) -> Option<i64>
         .iter()
         .find(|(_, root)| path.starts_with(root))
         .map(|(id, _)| *id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_interval_default_is_sixty() {
+        // Avoid depending on ambient env in unit tests: clamp logic only.
+        assert_eq!(DEFAULT_POLL_INTERVAL_SECS, 60);
+        let secs = 60u64.clamp(5, 3600);
+        assert_eq!(Duration::from_secs(secs), Duration::from_secs(60));
+    }
 }
