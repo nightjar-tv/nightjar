@@ -318,6 +318,26 @@ this ADR records that as the reason, and the tests below lock it.
     accepted gap until a separate client seek/reload fix; it is not
     solved by clipping.
 
+    **Safari native HLS after seek: client cue injection (2026-07-28).**
+    Delivery stays EXT-X-MEDIA → `subs/{trackId}/segNNN.vtt` (one wire
+    shape; Rule 4.11). Linear Safari playback can populate the native
+    TextTrack from that rendition. After a user scrub, WebKit does not
+    reliably reload those cues: dogfood traces showed teardown → media
+    advance → re-show → 15s cover wait still at `cues=0` with the
+    segment endpoint confirmed correct via curl. Mode bounce, Off→English
+    dwells, and seeking-time disable all failed the same way. This matches
+    the class of Safari native-HLS subtitle reload failures reported by
+    other players (e.g. Shaka). The web client therefore, after the first
+    scrub on the native-hls attach path only, disables the HLS-managed
+    TextTrack, fetches the playhead segment (and the next) from the same
+    `segNNN.vtt` URLs, parses WebVTT locally, and `addCue`s onto a
+    `video.addTextTrack` track, continuing segment-by-segment on
+    `timeupdate`. hls.js remains a separate backend: scrub uses
+    `startLoad` to retarget TEXT fragments. Pattern: when a browser's
+    default subtitle-reload path fails after seek, the client drives
+    cues explicitly against the existing segmented VTT URLs rather than
+    inventing a third delivery shape.
+
 ## Consequences
 
 - First play of an already-extracted title shows captions immediately.

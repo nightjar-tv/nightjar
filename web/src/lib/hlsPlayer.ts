@@ -1,4 +1,11 @@
 import Hls from 'hls.js';
+import {
+	parseSubtitleTrackIdsFromMaster,
+	parseWebVttCues,
+	segmentIndexAtSeconds,
+	sessionBaseFromMaster,
+	subtitleSegmentUrl
+} from './nativeHlsSubs';
 
 export {
 	needsSubtitleWatch,
@@ -18,7 +25,10 @@ console.warn('[nj-subs] hlsPlayer module loaded');
  * - `native-hls`: Apple WebKit (Safari / iOS). Chosen by engine check, not
  *   `canPlayType` alone — Chromium returns `"maybe"` for the HLS MIME and
  *   must not take this path. Hardware path; `#t=` land before first segment.
- * - `hls-js`: Chromium / Firefox MSE. Captions: EXT-X-MEDIA SUBTITLES.
+ *   After a user scrub, captions are injected from `subs/{id}/segNNN.vtt`
+ *   (WebKit does not reload EXT-X-MEDIA TextTracks — ADR-0013).
+ * - `hls-js`: Chromium / Firefox MSE. Captions: EXT-X-MEDIA SUBTITLES;
+ *   scrub uses `startLoad` to retarget the subtitle stream controller.
  */
 type AttachBackend = 'native-hls' | 'hls-js';
 
@@ -137,10 +147,12 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
  * Attach an HLS VOD playlist.
  *
  * Scrub sequence:
- * 1. User finishes a scrub → `seeked` fires once (not `seeking` ticks).
- * 2. Client GETs playlist?startMs=T (explicit restart). Safari often skips
- *    this and hits the segment path instead; the server handles both.
- * 3. Player requests the target segment; 503 while cooking (ADR-0011).
+ * 1. User finishes a scrub → `seeked` fires once.
+ * 2. hls.js: GET playlist?startMs=T then subtitle `startLoad` reassert.
+ * 3. Native Safari: no master?startMs= (segment GETs move the window,
+ *    ADR-0011). Captions switch to manual VTT segment fetch + cue inject
+ *    because WebKit does not reload EXT-X-MEDIA TextTracks after seek
+ *    (ADR-0013).
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -166,6 +178,230 @@ export function attachHls(
 
 	const positionSeconds = (): number => Math.max(0, video.currentTime);
 
+	// --- Safari native: post-seek cue injection (ADR-0013) -----------------
+	const sessionBase = sessionBaseFromMaster(playlistBase);
+	let nativeInjectMode = false;
+	let nativeInjectTrack: TextTrack | null = null;
+	let nativeInjectGen = 0;
+	const nativeLoadedSegs = new Set<number>();
+	let nativeTrackIds: string[] | null = null;
+	let nativeTrackIdsPromise: Promise<string[]> | null = null;
+	let nativeInjectTimeHandler: (() => void) | null = null;
+
+	const disableHlsTextTracks = () => {
+		const list = video.textTracks;
+		for (let i = 0; i < list.length; i++) {
+			const t = list[i];
+			if (!t || t === nativeInjectTrack) continue;
+			t.mode = 'disabled';
+		}
+	};
+
+	const clearInjectCues = (track: TextTrack) => {
+		const cues = track.cues;
+		if (!cues) return;
+		for (let i = cues.length - 1; i >= 0; i--) {
+			const c = cues[i];
+			if (c) track.removeCue(c);
+		}
+	};
+
+	const cancelNativeInject = () => {
+		nativeInjectGen += 1;
+	};
+
+	const ensureNativeTrackIds = async (): Promise<string[]> => {
+		if (nativeTrackIds) return nativeTrackIds;
+		if (!nativeTrackIdsPromise) {
+			nativeTrackIdsPromise = (async () => {
+				const res = await fetch(playlistBase.split('#')[0] ?? playlistBase);
+				if (!res.ok) {
+					throw new Error(`master fetch ${res.status}`);
+				}
+				const body = await res.text();
+				const ids = parseSubtitleTrackIdsFromMaster(body);
+				nativeTrackIds = ids;
+				logSubs('native inject master track ids', { ids });
+				return ids;
+			})().catch((err) => {
+				nativeTrackIdsPromise = null;
+				throw err;
+			});
+		}
+		return nativeTrackIdsPromise;
+	};
+
+	const ensureInjectTrack = (index: number): TextTrack => {
+		disableHlsTextTracks();
+		if (!nativeInjectTrack) {
+			const src = video.textTracks[index];
+			nativeInjectTrack = video.addTextTrack(
+				'subtitles',
+				src?.label || 'Subtitles',
+				src?.language || 'en'
+			);
+			logSubs('native inject track created', {
+				label: nativeInjectTrack.label,
+				language: nativeInjectTrack.language
+			});
+		}
+		nativeInjectTrack.mode = wantedSubtitle >= 0 ? 'showing' : 'disabled';
+		return nativeInjectTrack;
+	};
+
+	const pruneInjectCues = (track: TextTrack, beforeSec: number) => {
+		const cues = track.cues;
+		if (!cues) return;
+		for (let i = cues.length - 1; i >= 0; i--) {
+			const c = cues[i];
+			if (c && c.endTime < beforeSec) track.removeCue(c);
+		}
+	};
+
+	const fetchAndInjectSegment = async (
+		track: TextTrack,
+		trackId: string,
+		segIdx: number,
+		gen: number
+	) => {
+		if (destroyed || gen !== nativeInjectGen) return;
+		if (nativeLoadedSegs.has(segIdx)) return;
+		const url = subtitleSegmentUrl(sessionBase, trackId, segIdx);
+		let body: string;
+		try {
+			const res = await fetch(url);
+			if (destroyed || gen !== nativeInjectGen) return;
+			if (!res.ok) {
+				logSubs('native inject segment network error', {
+					segIdx,
+					url,
+					status: res.status
+				});
+				return;
+			}
+			body = await res.text();
+		} catch (err) {
+			logSubs('native inject segment network error', {
+				segIdx,
+				url,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return;
+		}
+		if (destroyed || gen !== nativeInjectGen) return;
+
+		let cues;
+		try {
+			cues = parseWebVttCues(body);
+		} catch (err) {
+			logSubs('native inject segment parse error', {
+				segIdx,
+				url,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return;
+		}
+
+		logSubs('native inject segment fetched', {
+			segIdx,
+			url,
+			parsed: cues.length
+		});
+		if (cues.length === 0) {
+			nativeLoadedSegs.add(segIdx);
+			return;
+		}
+
+		let injected = 0;
+		for (const cue of cues) {
+			try {
+				const vtt = new VTTCue(cue.startSec, cue.endSec, cue.text);
+				if (cue.id) vtt.id = cue.id;
+				track.addCue(vtt);
+				injected += 1;
+			} catch (err) {
+				logSubs('native inject addCue failure', {
+					segIdx,
+					id: cue.id ?? null,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+		nativeLoadedSegs.add(segIdx);
+		logSubs('native inject cues injected', {
+			segIdx,
+			injected,
+			trackCues: track.cues?.length ?? 0
+		});
+	};
+
+	const syncNativeInject = async (reset: boolean) => {
+		if (destroyed || !nativeInjectMode || wantedSubtitle < 0) return;
+		const gen = nativeInjectGen;
+		let trackIds: string[];
+		try {
+			trackIds = await ensureNativeTrackIds();
+		} catch (err) {
+			logSubs('native inject master fetch error', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return;
+		}
+		if (destroyed || gen !== nativeInjectGen) return;
+
+		const idx = Math.min(wantedSubtitle, Math.max(0, trackIds.length - 1));
+		const trackId = trackIds[idx];
+		if (!trackId) {
+			logSubs('native inject no track id', { wantedSubtitle: idx });
+			return;
+		}
+
+		const track = ensureInjectTrack(idx);
+		if (reset) {
+			clearInjectCues(track);
+			nativeLoadedSegs.clear();
+			logSubs('native inject reset for scrub', {
+				t: video.currentTime,
+				trackId
+			});
+		} else {
+			pruneInjectCues(track, video.currentTime - 30);
+		}
+
+		const seg = segmentIndexAtSeconds(video.currentTime);
+		await fetchAndInjectSegment(track, trackId, seg, gen);
+		await fetchAndInjectSegment(track, trackId, seg + 1, gen);
+	};
+
+	const armNativeInjectTimeupdate = () => {
+		if (nativeInjectTimeHandler) return;
+		nativeInjectTimeHandler = () => {
+			if (destroyed || !nativeInjectMode || wantedSubtitle < 0) return;
+			void syncNativeInject(false);
+		};
+		video.addEventListener('timeupdate', nativeInjectTimeHandler);
+	};
+
+	const disarmNativeInjectTimeupdate = () => {
+		if (!nativeInjectTimeHandler) return;
+		video.removeEventListener('timeupdate', nativeInjectTimeHandler);
+		nativeInjectTimeHandler = null;
+	};
+
+	const enterNativeInjectMode = () => {
+		if (nativeInjectMode) {
+			cancelNativeInject();
+			void syncNativeInject(true);
+			return;
+		}
+		nativeInjectMode = true;
+		cancelNativeInject();
+		disableHlsTextTracks();
+		armNativeInjectTimeupdate();
+		logSubs('native inject mode on', { t: video.currentTime });
+		void syncNativeInject(true);
+	};
+
 	const applyWantedSubtitle = () => {
 		if (destroyed) return;
 		if (hls) {
@@ -185,6 +421,20 @@ export function attachHls(
 			logSubtitleState(`select track ${idx}`, hls);
 			return;
 		}
+		if (nativeInjectMode) {
+			disableHlsTextTracks();
+			if (wantedSubtitle < 0) {
+				if (nativeInjectTrack) {
+					clearInjectCues(nativeInjectTrack);
+					nativeInjectTrack.mode = 'disabled';
+				}
+				nativeLoadedSegs.clear();
+				logSubs('native inject captions off');
+				return;
+			}
+			void syncNativeInject(true);
+			return;
+		}
 		const list = video.textTracks;
 		if (list.length === 0) {
 			logNativeTracks('native apply — no textTracks yet', video, {
@@ -200,19 +450,9 @@ export function attachHls(
 		logNativeTracks('native apply', video, { wantedSubtitle });
 	};
 
-	/** After scrub, re-select the track and sync subtitle loading to the
-	 *  playhead. hls.js: seek can finish before SubtitleStreamController
-	 *  sees onMediaSeeking, so startLoad retargets TEXT frags. Native
-	 *  Safari reassert is rewritten separately (mode bounce/dwell patches
-	 *  failed dogfood); leave DEFAULT=YES alone here. */
-	const reassertSubtitleAfterSeek = () => {
-		if (destroyed || wantedSubtitle < 0) return;
-		if (!hls) {
-			logNativeTracks('seek native — no reassert (pending rewrite)', video, {
-				wantedSubtitle
-			});
-			return;
-		}
+	/** hls.js only: retarget subtitle fragments after scrub. */
+	const reassertHlsSubtitleAfterSeek = () => {
+		if (destroyed || !hls || wantedSubtitle < 0) return;
 		const idx = Math.min(wantedSubtitle, Math.max(0, hls.subtitleTracks.length - 1));
 		const t = video.currentTime;
 		logSubs('seek reassert hls.js', { idx, currentTime: t });
@@ -230,6 +470,10 @@ export function attachHls(
 
 	const onAddTrack = () => {
 		logNativeTracks('native addtrack', video, { wantedSubtitle });
+		if (nativeInjectMode) {
+			disableHlsTextTracks();
+			return;
+		}
 		if (wantedSubtitle < 0) applyWantedSubtitle();
 	};
 
@@ -241,16 +485,14 @@ export function attachHls(
 		if (destroyed || seekInFlight) return;
 		if (suppressSeekNotify) {
 			suppressSeekNotify = false;
-			if (hls) reassertSubtitleAfterSeek();
+			if (hls) reassertHlsSubtitleAfterSeek();
 			else {
 				logNativeTracks('seek suppress — attach land', video, { wantedSubtitle });
 			}
 			return;
 		}
-		// Native Safari: no master?startMs= — segment GETs move the window
-		// (ADR-0011); a fetch here can restart encode and abort TEXT load.
 		if (!hls) {
-			reassertSubtitleAfterSeek();
+			if (wantedSubtitle >= 0) enterNativeInjectMode();
 			return;
 		}
 		seekInFlight = true;
@@ -262,7 +504,7 @@ export function attachHls(
 				// Network blip: the player retries the segment fetch itself.
 			} finally {
 				seekInFlight = false;
-				reassertSubtitleAfterSeek();
+				reassertHlsSubtitleAfterSeek();
 			}
 		})();
 	};
@@ -369,6 +611,7 @@ export function attachHls(
 	}
 
 	const setSubtitleTrack = (index: number) => {
+		cancelNativeInject();
 		wantedSubtitle = index;
 		applyWantedSubtitle();
 	};
@@ -377,10 +620,17 @@ export function attachHls(
 		destroy: () => {
 			if (destroyed) return;
 			destroyed = true;
+			cancelNativeInject();
+			disarmNativeInjectTimeupdate();
 			video.removeEventListener('seeked', onSeeked);
 			video.removeEventListener('canplay', onCanPlay);
 			video.textTracks.removeEventListener('addtrack', onAddTrack);
 			video.textTracks.removeEventListener('change', onTextTrackChange);
+			if (nativeInjectTrack) {
+				clearInjectCues(nativeInjectTrack);
+				nativeInjectTrack.mode = 'disabled';
+				nativeInjectTrack = null;
+			}
 			if (hls) {
 				hls.destroy();
 				hls = null;
