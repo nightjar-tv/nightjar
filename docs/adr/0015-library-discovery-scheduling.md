@@ -43,10 +43,25 @@ confidence scoring, or per-library backoff.
 
 4. **Notify is a trigger, not a mode.** An FS event calls `request_scan`
    sooner. It never disables polling. There is no gate that stops poll
-   because notify armed. Recursive watches may still be deferred until the
-   first index finishes so they do not starve SMB metadata IOPS during a
-   cold walk (ADR-0013); that is an arming optimisation, not a poll
-   replacement.
+   because notify armed, and there is **no notify-works detection**
+   anywhere in the system by design.
+
+   What notify is for now: on a **local** library it shortens detection
+   from up to one poll interval down to a couple of seconds. On **network
+   shares** where notify arms but never fires (SMB and similar), nothing
+   breaks because poll is the guarantee. Notify is an accelerator, never
+   a gate.
+
+   Recursive watches are still **deferred until the first index pass
+   finishes**. Originally that avoided starving a cold SMB walk of
+   metadata IOPS: with serial walks, arming recursive watches during the
+   cold TV pass pushed walks past 15–20 minutes (ADR-0013), and serial
+   cold TV after remount measured 687–729 s. Parallel directory re-stats
+   brought cold TV to ~150 s on the same link (ADR-0013 §8.7), so that
+   starvation justification is **stale**. The deferral is left in place
+   because it is harmless (poll covers the window before notify arms) and
+   can be revisited; it must not be mistaken for a load-bearing
+   correctness rule or removed/kept out of superstition.
 
 5. **Fixed poll interval.** Default **60 seconds**. Configurable via
    `NIGHTJAR_POLL_INTERVAL_SECS` (same class of knob as
