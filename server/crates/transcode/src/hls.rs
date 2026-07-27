@@ -321,7 +321,7 @@ impl HlsSessionRegistry {
             Session {
                 item_id,
                 src: src.to_path_buf(),
-                dir,
+                dir: dir.clone(),
                 mode,
                 audio,
                 video_encoder: self.video_encoder.clone(),
@@ -337,6 +337,8 @@ impl HlsSessionRegistry {
                 subtitle_tracks,
             },
         );
+        drop(sessions);
+        spawn_segment_milestone_watch(id.clone(), dir, start_ms, play_start_ms);
         Ok(id)
     }
 
@@ -670,7 +672,88 @@ fn restart_at(
         path = %session.src.display(),
         "hls session seek restart"
     );
+    let watch_dir = session.dir.clone();
+    // session_id is not in Session; callers log via restart fields. Milestone
+    // watch uses a synthetic id from the directory name.
+    let watch_id = session
+        .dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    spawn_segment_milestone_watch(watch_id, watch_dir, start_ms, play_start_ms);
     Ok(())
+}
+
+/// Polls the session dir and emits one log line per encode milestone so
+/// latency investigations can separate seek, first segment, lead-in, and
+/// land without inferring from client 503s. Investigation-only: does not
+/// change session behaviour.
+fn spawn_segment_milestone_watch(
+    session_id: String,
+    dir: PathBuf,
+    start_ms: u64,
+    play_start_ms: u64,
+) {
+    std::thread::Builder::new()
+        .name(format!("hls-milestones-{session_id}"))
+        .spawn(move || {
+            let t0 = Instant::now();
+            let window = start_ms / SEGMENT_MS;
+            let land = play_start_ms / SEGMENT_MS;
+            let mut seen_init = false;
+            let mut next = window;
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while Instant::now() < deadline {
+                if !seen_init && dir.join("init.mp4").exists() {
+                    seen_init = true;
+                    tracing::info!(
+                        session_id = %session_id,
+                        elapsed_ms = t0.elapsed().as_millis(),
+                        start_ms,
+                        play_start_ms,
+                        "hls_milestone_init"
+                    );
+                }
+                while next <= land {
+                    let name = segment_name(next);
+                    let path = dir.join(&name);
+                    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let kind = if next == window {
+                        "first_window"
+                    } else if next == land {
+                        "land"
+                    } else {
+                        "lead_in"
+                    };
+                    tracing::info!(
+                        session_id = %session_id,
+                        elapsed_ms = t0.elapsed().as_millis(),
+                        segment = %name,
+                        segment_idx = next,
+                        kind,
+                        start_ms,
+                        play_start_ms,
+                        "hls_milestone_segment"
+                    );
+                    next += 1;
+                }
+                if next > land && seen_init {
+                    tracing::info!(
+                        session_id = %session_id,
+                        elapsed_ms = t0.elapsed().as_millis(),
+                        start_ms,
+                        play_start_ms,
+                        "hls_milestone_land_complete"
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .ok();
 }
 
 /// Logs once when the encode window's first segment appears. This is the

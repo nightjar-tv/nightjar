@@ -4,6 +4,12 @@
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
 	import { attachHls, parkForSwitch, type HlsHandle } from '$lib/hlsPlayer';
+	import {
+		attachModeFromSearch,
+		LatencyProbe,
+		probeEnabled,
+		type AttachMode
+	} from '$lib/latencyProbe';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItem'];
@@ -39,6 +45,9 @@
 
 	const itemId = $derived(Number(page.params.id));
 	const audioTracks = $derived(playback?.audioTracks ?? []);
+	// Investigation: ?njAttach=land|first|two and ?njProbe=1 (see latencyProbe.ts).
+	const attachMode = $derived(attachModeFromSearch(page.url.search));
+	const probeOn = $derived(probeEnabled(page.url.search));
 
 	function releaseSession() {
 		const id = sessionRef.id;
@@ -110,6 +119,9 @@
 		const seconds = playerRef.handle?.positionSeconds() ?? videoEl?.currentTime ?? 0;
 		const startMs = Math.max(0, Math.floor(seconds * 1000));
 		const previous = sessionRef.id;
+		const probe = new LatencyProbe(attachMode, probeOn);
+		const unspy = probe.installFetchSpy();
+		probe.mark('switch_requested', `startMs=${startMs} mode=${attachMode}`);
 		switchingAudio = true;
 		// Park immediately so the old track cannot keep playing past the
 		// switch point and then jump backwards when the new session lands.
@@ -118,22 +130,25 @@
 		playlistUrl = null;
 		try {
 			const started = await api.startTranscodeSession(itemId, startMs, trackId);
+			probe.mark('session_post_ok', started.sessionId);
 			// The old session is no longer honest UI once the player is parked.
 			// Reap it now so a hardware encoder slot is not held while the new
 			// session cooks.
 			if (previous) void api.deleteTranscodeSession(previous);
-			// Wait only for the land segment. The asset route long-polls with the
-			// same budget as segment fetches; master/index are not ready until
-			// init exists anyway, and a second master poll adds latency without
-			// shortening mid-title NAS transcode time.
+			probe.mark('old_session_deleted', previous ?? 'none');
+			probe.mark('wait_begin', attachMode);
 			const landIdx = Math.floor(startMs / 2000);
-			const landName = `seg${String(landIdx).padStart(3, '0')}.m4s`;
-			const landOk = await waitForReady(
-				sessionAssetUrl(started.playlistUrl, landName)
+			const windowIdx = Math.max(0, landIdx - 8);
+			const ready = await waitForAttachReady(
+				started.playlistUrl,
+				windowIdx,
+				landIdx,
+				attachMode,
+				probe
 			);
 			// Never adopt a session the page no longer owns; leaving it for
 			// the idle reaper burns a cap slot for a minute.
-			if (!landOk || !liveRef.alive) {
+			if (!ready || !liveRef.alive) {
 				void api.deleteTranscodeSession(started.sessionId);
 				if (liveRef.alive) error = copy.sessionFailed;
 				return;
@@ -141,12 +156,49 @@
 			sessionRef.id = started.sessionId;
 			sessionEncoder = started;
 			resumeRef.seconds = startMs / 1000;
+			probe.mark('attach', started.playlistUrl);
+			if (videoEl) probe.wireVideo(videoEl);
 			playlistUrl = started.playlistUrl;
+			if (probeOn) {
+				// Defer summary until after first frame likely lands.
+				setTimeout(() => {
+					console.info('[nj-probe-summary]', JSON.stringify(probe.summary()));
+				}, 8000);
+			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
+			unspy();
 			switchingAudio = false;
 		}
+	}
+
+	/** Investigation attach gate: land (shipped), first window seg, or two segs. */
+	async function waitForAttachReady(
+		playlist: string,
+		windowIdx: number,
+		landIdx: number,
+		mode: AttachMode,
+		probe: LatencyProbe
+	): Promise<boolean> {
+		const masterOk = await waitForReady(playlist);
+		if (masterOk) probe.mark('master_ready');
+		if (!masterOk) return false;
+		if (mode === 'land') {
+			const landName = `seg${String(landIdx).padStart(3, '0')}.m4s`;
+			const ok = await waitForReady(sessionAssetUrl(playlist, landName));
+			if (ok) probe.mark('land_seg_ready', landName);
+			return ok;
+		}
+		const firstName = `seg${String(windowIdx).padStart(3, '0')}.m4s`;
+		const firstOk = await waitForReady(sessionAssetUrl(playlist, firstName));
+		if (firstOk) probe.mark('first_seg_ready', firstName);
+		if (!firstOk) return false;
+		if (mode === 'first') return true;
+		const secondName = `seg${String(windowIdx + 1).padStart(3, '0')}.m4s`;
+		const secondOk = await waitForReady(sessionAssetUrl(playlist, secondName));
+		if (secondOk) probe.mark('second_seg_ready', secondName);
+		return secondOk;
 	}
 
 	const playable = $derived(
