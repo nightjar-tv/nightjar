@@ -25,9 +25,12 @@ const CATCH_UP_SEGMENTS: u64 = 2;
 /// Safari retried refused segments at one-second intervals. A two-second floor
 /// prevents adjacent prefetch misses from repeatedly moving the encode window.
 const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
-/// Maximum unprimed window move. Sixteen segments accepts Safari's measured
-/// eight-segment EXT-X-START dig-back with margin while rejecting seg000-class
-/// attach prefetch hundreds of segments behind a mid-title window.
+/// Maximum unprimed distance *behind the play land point* (`#EXT-X-START`)
+/// that still counts as start alignment rather than attach prefetch of
+/// `seg000`. Measured from `play_start`, not the encode window: lead-in puts
+/// the window eight segments earlier, and window-relative math treated
+/// `seg000` at a ~40 s switch (12 behind the window, 20 behind play) as
+/// alignment and yanked the encode back to zero.
 const ALIGN_BEHIND_SEGMENTS: u64 = 16;
 /// Safari requested eight segments before EXT-X-START when switching tracks.
 /// Encoding exactly that span early serves its first request without making
@@ -109,18 +112,20 @@ pub enum SegmentMissAction {
 
 /// Deliberate restart policy for cold regions of a full-title VOD playlist.
 ///
-/// - Behind the window: always restart once the session is `primed` (a real
-///   scrub back). Before that, follow only within `ALIGN_BEHIND_SEGMENTS` —
-///   the player settling near EXT-X-START — so attach prefetch of `seg000`
-///   cannot yank a mid-title encode back to zero, while a start segment a
-///   few behind the window still converges instead of deadlocking.
-/// - Ahead: restart only past `CATCH_UP_SEGMENTS` of the cooking band end.
-///   The band end is `max(frontier, play_start_idx)` so encode lead-in
-///   (window starts before `#EXT-X-START`) does not treat land-point
-///   prefetch as a forward scrub and thrash-restart every 2s. Frontier is
-///   still the latest on-disk segment **at or after** the window start;
-///   retained pre-window segments must not count.
-/// - Either way: respect `RESTART_MIN_INTERVAL`.
+/// - Behind the window: once `primed`, always restart (real scrub back),
+///   gated by `RESTART_MIN_INTERVAL`. Before that, follow only when the
+///   miss is within `ALIGN_BEHIND_SEGMENTS` of **play_start** (the player
+///   settling near `#EXT-X-START`) — and do it even inside the min
+///   interval, otherwise a fresh mid-title session deadlocks for two
+///   seconds on dig-back past the encode lead-in. Farther behind (attach
+///   prefetch of `seg000`) waits without restart so the encode is not
+///   yanked to zero.
+/// - Ahead: restart only past `CATCH_UP_SEGMENTS` of the cooking band end,
+///   gated by `RESTART_MIN_INTERVAL`. The band end is
+///   `max(frontier, play_start_idx)` so encode lead-in (window starts
+///   before `#EXT-X-START`) does not treat land-point prefetch as a
+///   forward scrub. Frontier is the latest on-disk segment **at or after**
+///   the window start; retained pre-window segments must not count.
 pub fn decide_segment_miss(
     idx: u64,
     window_start_idx: u64,
@@ -129,16 +134,25 @@ pub fn decide_segment_miss(
     primed: bool,
     since_last_restart: Duration,
 ) -> SegmentMissAction {
-    if since_last_restart < RESTART_MIN_INTERVAL {
-        return SegmentMissAction::Wait;
-    }
     if idx < window_start_idx {
-        let behind = window_start_idx - idx;
-        return if primed || behind <= ALIGN_BEHIND_SEGMENTS {
+        if primed {
+            return if since_last_restart < RESTART_MIN_INTERVAL {
+                SegmentMissAction::Wait
+            } else {
+                SegmentMissAction::Restart
+            };
+        }
+        let behind_play = play_start_idx.saturating_sub(idx);
+        return if behind_play <= ALIGN_BEHIND_SEGMENTS {
+            // Start alignment: bypass min-interval so create's last_restart
+            // does not 503-deadlock dig-back past the lead-in.
             SegmentMissAction::Restart
         } else {
             SegmentMissAction::Wait
         };
+    }
+    if since_last_restart < RESTART_MIN_INTERVAL {
+        return SegmentMissAction::Wait;
     }
     let frontier = latest_on_disk
         .filter(|&l| l >= window_start_idx)
@@ -1129,9 +1143,19 @@ mod tests {
                 SegmentMissAction::Wait,
             ),
             (
-                "unprimed just behind follows the player (start alignment)",
-                625,
+                "unprimed mid-title seg000 waits (play-relative, not window)",
+                0,
+                12,
+                20,
+                None,
+                false,
+                cool,
+                SegmentMissAction::Wait,
+            ),
+            (
+                "unprimed dig past lead-in follows play land",
                 632,
+                640,
                 648,
                 None,
                 false,
@@ -1139,9 +1163,19 @@ mod tests {
                 SegmentMissAction::Restart,
             ),
             (
-                "unprimed behind at tolerance follows",
-                616,
+                "unprimed dig past lead-in bypasses create min-interval",
                 632,
+                640,
+                648,
+                None,
+                false,
+                hot,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "unprimed behind at tolerance follows",
+                632,
+                640,
                 648,
                 None,
                 false,
@@ -1150,8 +1184,8 @@ mod tests {
             ),
             (
                 "unprimed behind past tolerance waits (seg000-class prefetch)",
-                615,
-                632,
+                631,
+                640,
                 648,
                 None,
                 false,
@@ -1304,6 +1338,90 @@ mod tests {
         );
         assert_eq!(encode_start_ms(1_000), 0);
         assert_eq!(encode_start_ms(0), 0);
+    }
+
+    /// Switch session (fresh POST at mid-title with a new audio config): the
+    /// first real request is Safari's EXT-X-START dig-back, not seg000.
+    /// Encode lead-in must serve it; seg000 must 503 without yanking the
+    /// window back to zero (play-relative ALIGN, ADR-0011).
+    #[test]
+    fn switch_session_serves_first_requested_segment() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 60);
+        let duration_ms = 60_000;
+        let play_ms = 40_000; // seg020; encode lead-in → seg012
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+
+        // Prior session still holding a cap slot (s9→s10 dogfood pattern).
+        let prior = reg
+            .start(
+                1,
+                &src,
+                0,
+                duration_ms,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
+            .unwrap();
+        wait_playlist(&reg, &prior);
+
+        let switched = reg
+            .start(
+                1,
+                &src,
+                play_ms,
+                duration_ms,
+                SessionMode::Transcode,
+                AudioSelection {
+                    stream_index: Some(0),
+                    channels: 2,
+                    channel_layout: Some("stereo".into()),
+                    max_channels: 2,
+                },
+                vec![],
+            )
+            .unwrap();
+        let playlist = wait_playlist(&reg, &switched);
+        let text = String::from_utf8_lossy(&playlist);
+        assert!(
+            text.contains("#EXT-X-START:TIME-OFFSET=40.000,PRECISE=YES"),
+            "switch land stays at the requested offset: {text}"
+        );
+
+        // Capture: attach prefetch of seg000 must not move the window.
+        // Immediate NotReady while FFmpeg is alive; never a silent yank to 0
+        // (which would make the next dig-back miss and look like a 503 storm).
+        match reg.asset(&switched, "seg000.m4s") {
+            Err(PlaylistError::NotReady) => {}
+            other => {
+                // Tiny fixtures may finish the encode before this assert; the
+                // window must still be the mid-title lead-in either way.
+                eprintln!("seg000 after switch playlist: {other:?}");
+            }
+        }
+        assert_eq!(
+            decide_segment_miss(0, 12, 20, None, false, RESTART_MIN_INTERVAL),
+            SegmentMissAction::Wait,
+            "seg000 at a 40s switch must not count as start alignment"
+        );
+
+        // First real request: dig-back inside lead-in (same as new_session).
+        let bytes = wait_asset(&reg, &switched, "seg013.m4s");
+        assert!(
+            !bytes.is_empty(),
+            "switch session first dig-back segment must be served without 503-forever"
+        );
+        let land = wait_asset(&reg, &switched, "seg020.m4s");
+        assert!(!land.is_empty(), "switch land segment must serve");
+
+        assert!(reg.stop(&prior));
+        assert!(reg.stop(&switched));
     }
 
     /// Fresh mid-title session: first segment request behind the play land

@@ -8,9 +8,11 @@ import Hls from 'hls.js';
  * - `native-hls`: Safari / WebKit. `video.src = playlist`. Hardware HLS
  *   path; required for iOS/tvOS. Scrub often drives window moves via
  *   segment fetches alone (no `?startMs=`). Desktop Safari ignores
- *   EXT-X-START, so a mid-title attach must seek to the window itself on
- *   loadedmetadata or Safari fetches pre-window segments and stalls on
- *   their 503s.
+ *   `#EXT-X-START`; a mid-title attach must land via a `#t=` media
+ *   fragment *before* the first segment request. Setting `currentTime` on
+ *   `loadedmetadata` is too late — `seg000` has already fired and stalls
+ *   on its unprimed 503 (ADR-0011). `#t=` was unsafe under mid-window
+ *   playlists; full-title VOD makes it the correct land signal again.
  * - `hls-js`: Chromium / Firefox MSE. `startPosition` lands a mid-title
  *   attach; network/media errors are retried. Scrub notifies via `seeked`
  *   → `playlist?startMs=`.
@@ -62,12 +64,17 @@ export function attachHls(
 	const positionSeconds = (): number => Math.max(0, video.currentTime);
 
 	if (backend === 'native-hls') {
-		video.src = playlistBase;
+		// Media fragment asks Safari to begin at the offset before any
+		// segment fetch. loadedmetadata + currentTime is a backup only.
+		video.src =
+			startAtSeconds > 0 ? `${playlistBase}#t=${startAtSeconds}` : playlistBase;
 		if (startAtSeconds > 0) {
 			video.addEventListener(
 				'loadedmetadata',
 				() => {
-					if (!destroyed) video.currentTime = startAtSeconds;
+					if (!destroyed && Math.abs(video.currentTime - startAtSeconds) > 1) {
+						video.currentTime = startAtSeconds;
+					}
 				},
 				{ once: true }
 			);
@@ -77,7 +84,7 @@ export function attachHls(
 			enableWorker: true,
 			maxBufferHole: 1.5,
 			// Full-title playlist: land at the session window (hls.js; native
-			// uses EXT-X-START from the server instead).
+			// uses #t= / EXT-X-START from the server instead).
 			startPosition: startAtSeconds > 0 ? startAtSeconds : -1
 		});
 		hls.on(Hls.Events.ERROR, (_event, data) => {
