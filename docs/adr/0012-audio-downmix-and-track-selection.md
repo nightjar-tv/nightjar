@@ -63,16 +63,47 @@ the same session surface so audio switching is solved once.
    old audio config). Overloading one path with two retention policies is how
    subtle bugs arrive. More HTTP round trips, less cleverness.
 
-5. **Revisit trigger.** Restart-on-switch stays while warm mid-playback
-   switch time stays inside Gate 2's three-second seek budget on reference
-   hardware. Measure cold (session start with a non-default track) and warm
-   (switch during playback). If warm switches consistently exceed 3s, or the
-   cost is source-read dominated rather than encode-startup dominated,
-   alternate HLS AUDIO renditions get their own ADR. A preference without
-   that threshold decays. **Measured (corpus multilang MKV, local disk,
-   2026-07-26):** cold start 0.11 s; warm switch to `e2` 0.11 s — two orders
-   of magnitude inside the 3 s budget. Alternate renditions stay closed unless
-   that number moves.
+5. **Revisit triggers.** Restart-on-switch is revisited when either fires:
+
+   - **Latency.** Warm mid-playback switch time exceeds Gate 2's three-second
+     seek budget on reference hardware (cold start with a non-default track
+     measured the same way). If switches are source-read dominated rather
+     than encode-startup dominated, that also counts. **Measured (corpus
+     multilang MKV, local disk, 2026-07-26):** cold start 0.11 s; warm switch
+     to `e2` 0.11 s — two orders of magnitude inside the 3 s budget.
+   - **Visible reload.** The cutover itself reads as a reload (old track
+     keeps playing, then playback jumps back to the switch point) even when
+     the latency number is fine. That complaint is independent of the 3 s
+     budget and has now fired in dogfood. Mitigations on the restart path
+     (park old playback and show a loading state until the new land segment
+     is ready; fix mid-title `seg000` yank/503 on switch) address honesty in
+     the UI without changing the session model. If dogfood still rejects the
+     parked-and-resume cutover after those land, alternate HLS AUDIO
+     renditions get their own ADR.
+
+   **Measurement vs alternate AUDIO renditions (2026-07-27, not implemented).**
+   Forced-transcode case (libx264 `veryfast`, 60 s 1280x720 synthetic, two
+   stereo AAC tracks, 2 s fMP4 HLS segments, same encoder class as a
+   nightjar transcode session). Peak/mean `%cpu` sampled every 200 ms from
+   `ps`; encode rate is source duration / wall.
+
+   | Approach | Peak CPU | Mean CPU | Encode rate | Output |
+   |---|---:|---:|---:|---|
+   | Restart: one session (V+A0) | 542% | 407% | 25.9x | 1.97 MB · ~64 KiB/muxed seg |
+   | Restart: second session (V+A1, full title) | 538% | 422% | 26.0x | 1.97 MB · ~64 KiB/muxed seg |
+   | Restart: both tracks as two full sessions | n/a | n/a | 4.63 s wall | 3.94 MB |
+   | Renditions: V + A0 + A1 in one ffmpeg | 574% | 458% | 26.0x | 2.95 MB · video ~33 KiB/seg, each audio ~31 KiB/seg |
+
+   Renditions cost ~6% higher peak CPU and ~12% higher mean than a single
+   restart session on this hardware, finish the full title in one pass at the
+   same encode rate, and write both audios for ~75% of the bytes of two
+   full restart sessions (video encoded once). They do **not** win the
+   latency trigger (already at 0.11 s) and they do not by themselves remove
+   the need for a loading state on first attach. **Decision for v1:** keep
+   restart-on-switch. The latency trigger stays green; the visible-reload
+   trigger is handled by parking playback during switch plus the mid-title
+   segment fix. Alternate renditions stay closed unless a later dogfood pass
+   still rejects that cutover.
 
 6. **Track identity (Rule 4.9 / 4.11).** Embedded audio uses
    `trackId = e{streamIndex}` (absolute ffprobe index), the same scheme as
@@ -144,9 +175,13 @@ automated proxy; someone still has to hear a real title.
 
 **Measured switch (corpus multilang MKV, local disk).** Cold session start
 0.11 s; warm mid-playback switch to `e2` (fresh POST + first segment) 0.11 s —
-two orders of magnitude inside the 3 s revisit budget on this hardware. That
-number is what keeps alternate AUDIO renditions closed. NAS multi-track titles
-should be re-checked when dogfooding.
+two orders of magnitude inside the 3 s latency revisit budget on this
+hardware. **Visible-reload revisit (2026-07-27):** dogfood rejected the
+cutover feel independent of that number. Parked loading state and mid-title
+segment fix keep restart-on-switch for v1; forced-transcode measurement vs
+`EXT-X-MEDIA:TYPE=AUDIO` alternate renditions is under Decision §5 (renditions
+not implemented). NAS multi-track titles should still be re-checked when
+dogfooding the parked cutover.
 
 **Scrubber after mid-title switch.** Safari native keeps title-absolute
 `startMs` on switch and requests the window's first segment (capture: `seg004`
