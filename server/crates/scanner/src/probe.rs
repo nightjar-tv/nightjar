@@ -156,12 +156,11 @@ mod tests {
     #[test]
     fn process_failure_includes_exit_code() {
         if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_none()
-            && Command::new("ffprobe")
+            && !Command::new("ffprobe")
                 .arg("-version")
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
-                == false
         {
             return;
         }

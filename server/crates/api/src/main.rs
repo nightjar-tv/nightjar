@@ -26,7 +26,9 @@ async fn main() {
     let data_dir = data_dir();
     let db = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
     match db.fail_stale_scan_jobs() {
-        Ok(n) if n > 0 => tracing::info!(count = n, "cleared scan jobs left active by a prior exit"),
+        Ok(n) if n > 0 => {
+            tracing::info!(count = n, "cleared scan jobs left active by a prior exit")
+        }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "clear stale scan jobs failed"),
     }

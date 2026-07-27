@@ -514,8 +514,8 @@ mod tests {
         for i in 0..12 {
             let d = root.path().join(format!("show{i}")).join("Season 1");
             fs::create_dir_all(&d).unwrap();
-            File::create(d.join(format!("E01.mkv"))).unwrap();
-            File::create(d.join(format!("E02.mp4"))).unwrap();
+            File::create(d.join("E01.mkv")).unwrap();
+            File::create(d.join("E02.mp4")).unwrap();
         }
 
         let mut serial_cache = WalkCache::new();

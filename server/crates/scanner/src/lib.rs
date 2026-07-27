@@ -761,10 +761,11 @@ mod tests {
 
         let mut completed = 0;
         for id in job1..job1 + 8 {
-            if let Ok(Some(j)) = db.get_scan_job(id) {
-                if j.library_id == lib.id && (j.state == "completed" || j.state == "failed") {
-                    completed += 1;
-                }
+            if let Ok(Some(j)) = db.get_scan_job(id)
+                && j.library_id == lib.id
+                && (j.state == "completed" || j.state == "failed")
+            {
+                completed += 1;
             }
         }
         assert_eq!(
