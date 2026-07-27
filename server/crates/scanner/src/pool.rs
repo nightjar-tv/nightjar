@@ -249,9 +249,18 @@ impl LibraryPool {
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         match item.kind {
             WorkKind::Probe => queue.probes.push_back(item),
-            WorkKind::Extract => queue.extracts.push_back(item),
+            WorkKind::Extract => Self::enqueue_extract_unique(&mut queue, item),
         }
         self.available.notify_one();
+    }
+
+    fn enqueue_extract_unique(queue: &mut Queue, item: WorkItem) {
+        // Same-pass enqueue + drain_pending_extracts can otherwise queue the
+        // same item twice and waste another multi-minute demux.
+        if queue.extracts.iter().any(|w| w.item_id == item.item_id) {
+            return;
+        }
+        queue.extracts.push_back(item);
     }
 
     pub fn enqueue_probe_batch(&self, items: Vec<WorkItem>) -> ProbeBatch {
@@ -468,6 +477,11 @@ impl LibraryPool {
                 return;
             }
         };
+        // Permanent failure: no path to success until the source row is
+        // re-upserted (mtime/size change resets status to pending).
+        if row.subtitle_status == "error" {
+            return;
+        }
         let sidecars = match self.db.list_item_sidecars(item.item_id) {
             Ok(rows) => rows
                 .into_iter()
@@ -544,5 +558,26 @@ impl LibraryPool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enqueue_extract_unique_skips_duplicate_item_id() {
+        let mut queue = Queue {
+            probes: VecDeque::new(),
+            extracts: VecDeque::new(),
+        };
+        let first = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"));
+        let second = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"));
+
+        LibraryPool::enqueue_extract_unique(&mut queue, first);
+        LibraryPool::enqueue_extract_unique(&mut queue, second);
+
+        assert_eq!(queue.extracts.len(), 1);
+        assert_eq!(queue.extracts[0].item_id, 42);
     }
 }
