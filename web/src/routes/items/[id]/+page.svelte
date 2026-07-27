@@ -1,9 +1,14 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
-	import { attachHls, parkForSwitch, type HlsHandle } from '$lib/hlsPlayer';
+	import {
+		attachHls,
+		parkForSwitch,
+		watchProgressiveSubtitles,
+		type HlsHandle
+	} from '$lib/hlsPlayer';
 	import {
 		attachModeFromSearch,
 		LatencyProbe,
@@ -16,6 +21,7 @@
 	type PlaybackInfo = components['schemas']['PlaybackInfo'];
 	type TranscodeSession = components['schemas']['TranscodeSession'];
 	type AudioTrack = components['schemas']['AudioTrack'];
+	type SubtitleTrack = components['schemas']['SubtitleTrack'];
 	// Not in lib.dom: only Safari exposes the media element track list today.
 	type BrowserAudioTracks = { length: number; [index: number]: { enabled: boolean } };
 
@@ -30,6 +36,8 @@
 	let switchingAudio = $state(false);
 	let audioNote = $state<string | null>(null);
 	let selectedAudioTrackId = $state<string | null>(null);
+	/** HLS captions index into session MEDIA tracks; -1 = off. */
+	let selectedSubtitleIndex = $state(0);
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	// Mutable holder so onMount cleanup / pagehide always DELETE the live
 	// session even if the $state read in a stale closure is still null.
@@ -45,6 +53,10 @@
 
 	const itemId = $derived(Number(page.params.id));
 	const audioTracks = $derived(playback?.audioTracks ?? []);
+	/** Tracks the HLS master can advertise (ready store VTT only). */
+	const hlsSubtitleTracks = $derived(
+		(playback?.subtitleTracks ?? []).filter((t) => t.readiness === 'complete' && t.url)
+	);
 	// Investigation: ?njAttach=land|first|two and ?njProbe=1 (see latencyProbe.ts).
 	const attachMode = $derived(attachModeFromSearch(page.url.search));
 	const probeOn = $derived(probeEnabled(page.url.search));
@@ -59,6 +71,15 @@
 	function audioTrackLabel(track: AudioTrack): string {
 		const name = track.label ?? track.language ?? track.trackId;
 		return track.channelLayout ? `${name} · ${track.channelLayout}` : name;
+	}
+
+	function subtitleTrackLabel(track: SubtitleTrack): string {
+		return track.label ?? track.language ?? track.trackId;
+	}
+
+	function selectSubtitle(index: number) {
+		selectedSubtitleIndex = index;
+		playerRef.handle?.setSubtitleTrack(index);
 	}
 
 	/** Poll until FFmpeg has written a servable response (playlist or segment). */
@@ -209,13 +230,27 @@
 				switchingAudio)
 	);
 
-	// Discovered but not served (ASS/SSA sidecars): say so instead of hiding.
+	// Listed but not served (ASS/SSA): readiness absent. Preparing tracks have
+	// readiness without url — do not call those "not rendered".
 	const unrenderedSubtitles = $derived(
 		(playback?.subtitleTracks ?? [])
-			.filter((t) => !t.url)
+			.filter((t) => !t.url && t.readiness == null)
 			.map((t) => `${t.language ?? t.trackId} (${t.codec})`)
 			.join(', ')
 	);
+
+	const subtitlesPreparing = $derived(
+		(playback?.subtitleTracks ?? []).some((t) => t.readiness === 'preparing') ||
+			(playback?.subtitleStatus === 'pending' &&
+				!(playback?.subtitleTracks ?? []).some((t) => t.url))
+	);
+
+	// Stable while readiness changes so the watcher is not torn down on every poll.
+	const progressiveKey = $derived.by(() => {
+		if (!videoEl) return null;
+		if (playback?.playbackMethod !== 'directPlay' || !playback.streamUrl) return null;
+		return `${itemId}:${playback.streamUrl}`;
+	});
 
 	onMount(() => {
 		liveRef.alive = true;
@@ -283,12 +318,37 @@
 		if (!video || !url) {
 			return;
 		}
+		console.warn('[nj-subs] item page attaching HLS', url);
 		const handle = attachHls(video, url, resumeRef.seconds);
 		playerRef.handle = handle;
 		return () => {
 			playerRef.handle = null;
 			handle.destroy();
 		};
+	});
+
+	// Direct-play progressive `<track>` reload (ADR-0013 §11). HLS captions
+	// use segmented EXT-X-MEDIA (ready = store slice; cold = session demux).
+	$effect(() => {
+		const key = progressiveKey;
+		const video = videoEl;
+		if (!key || !video) {
+			return;
+		}
+		const initial = untrack(() => playback);
+		if (!initial) {
+			return;
+		}
+		const handle = watchProgressiveSubtitles({
+			video,
+			initial,
+			fetchPlaybackInfo: () => api.getPlaybackInfo(itemId),
+			isAlive: () => liveRef.alive,
+			onPlaybackInfo: (next) => {
+				playback = next;
+			}
+		});
+		return () => handle.destroy();
 	});
 </script>
 
@@ -329,46 +389,26 @@
 		{#if playable && playlistUrl}
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video bind:this={videoEl} controls playsinline></video>
-			{#if playback.subtitleStatus === 'pending'}
+			{#if subtitlesPreparing}
 				<p class="preparing">{copy.subtitlesPreparing}</p>
 			{/if}
 			{#if unrenderedSubtitles}
 				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
 			{/if}
 		{:else if playable && playback.streamUrl}
-			{#if playback.subtitleStatus === 'pending'}
+			{#if subtitlesPreparing}
 				<p class="preparing">{copy.subtitlesPreparing}</p>
 			{/if}
-			{#if (playback.subtitleTracks?.length ?? 0) > 0}
-				<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions) -->
-				<video
-					bind:this={videoEl}
-					controls
-					playsinline
-					src={playback.streamUrl}
-					crossorigin="anonymous"
-				>
-					{#each playback.subtitleTracks ?? [] as track, i (track.trackId)}
-						{#if track.url}
-							<track
-								kind="subtitles"
-								src={track.url}
-								srclang={track.language ?? 'und'}
-								label={track.label
-									?? track.language
-									?? `Subtitles ${track.trackId}`}
-								default={i === 0}
-							/>
-						{/if}
-					{/each}
-					Your browser cannot play this file directly.
-				</video>
-			{:else}
-				<!-- svelte-ignore a11y_media_has_caption -->
-				<video bind:this={videoEl} controls playsinline src={playback.streamUrl}>
-					Your browser cannot play this file directly.
-				</video>
-			{/if}
+			<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions; tracks attached by watchProgressiveSubtitles) -->
+			<video
+				bind:this={videoEl}
+				controls
+				playsinline
+				src={playback.streamUrl}
+				crossorigin="anonymous"
+			>
+				Your browser cannot play this file directly.
+			</video>
 			{#if unrenderedSubtitles}
 				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
 			{/if}
@@ -378,6 +418,34 @@
 			<p class="preparing" role="status">{copy.preparingSession}</p>
 		{:else if playback.playbackMethod !== 'directPlay'}
 			<p class="error">{copy.sessionFailed}</p>
+		{/if}
+
+		{#if playable && playlistUrl && hlsSubtitleTracks.length > 0}
+			<fieldset class="tracks">
+				<legend>{copy.subtitleTrack}</legend>
+				<label>
+					<input
+						type="radio"
+						name="subtitle-track"
+						value="-1"
+						checked={selectedSubtitleIndex < 0}
+						onchange={() => selectSubtitle(-1)}
+					/>
+					{copy.subtitleOff}
+				</label>
+				{#each hlsSubtitleTracks as track, i (track.trackId)}
+					<label>
+						<input
+							type="radio"
+							name="subtitle-track"
+							value={i}
+							checked={selectedSubtitleIndex === i}
+							onchange={() => selectSubtitle(i)}
+						/>
+						{subtitleTrackLabel(track)}
+					</label>
+				{/each}
+			</fieldset>
 		{/if}
 
 		{#if playable && audioTracks.length > 1}

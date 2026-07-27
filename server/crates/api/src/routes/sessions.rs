@@ -104,12 +104,28 @@ pub async fn start(
     };
 
     let subtitle_tracks = match subtitle_tracks_for(&state, &row) {
-        Ok(tracks) => snapshot_hls_tracks(&tracks),
+        Ok(tracks) => match snapshot_hls_tracks(&state, &row, &tracks) {
+            Ok(snap) => snap,
+            Err(e) => {
+                tracing::warn!(item_id, error = %e, "subtitle snapshot failed at session start");
+                Vec::new()
+            }
+        },
         Err(e) => {
             tracing::warn!(item_id, error = %e, "subtitle list failed at session start");
             Vec::new()
         }
     };
+
+    // First-play: sessions (remux/transcode) hit the same cold-title latency
+    // as direct play, so bump extract here too (ADR-0013 §11).
+    if row.subtitle_status == "pending" {
+        state.pool.prioritize_extract(
+            row.id,
+            row.library_id,
+            std::path::PathBuf::from(&row.path),
+        );
+    }
 
     let audio = resolve_audio(&row, query.audio_track_id.as_deref())?;
 
@@ -212,11 +228,21 @@ fn stored_channels(row: &MediaItemRow) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec<HlsSubtitleTrack> {
+fn snapshot_hls_tracks(
+    state: &AppState,
+    row: &MediaItemRow,
+    tracks: &[crate::routes::items::SubtitleTrackDto],
+) -> Result<Vec<HlsSubtitleTrack>, String> {
+    let sidecars = state.db.list_item_sidecars(row.id)?;
     let mut out = Vec::new();
     let mut saw_default = false;
     for t in tracks {
-        if t.url.is_none() {
+        // HLS MEDIA only for fully extracted tracks. Declaring a cold
+        // session-inline rendition re-demuxes the source beside the encode
+        // and can block Safari start when seg000.vtt never lands (ADR-0013).
+        // Pending/partial stay on play-priority extract + preparing UI;
+        // captions appear on the next session once complete.
+        if t.readiness != Some("complete") || t.url.is_none() {
             continue;
         }
         let name = t
@@ -228,6 +254,15 @@ fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec
         if is_default {
             saw_default = true;
         }
+        let (stream_index, sidecar_path) = if t.source == "sidecar" {
+            let path = sidecars
+                .iter()
+                .find(|s| s.track_id == t.track_id)
+                .map(|s| std::path::PathBuf::from(&s.path));
+            (None, path)
+        } else {
+            (t.stream_index, None)
+        };
         out.push(HlsSubtitleTrack {
             track_id: t.track_id.clone(),
             language: t.language.clone(),
@@ -235,9 +270,14 @@ fn snapshot_hls_tracks(tracks: &[crate::routes::items::SubtitleTrackDto]) -> Vec
             is_default,
             forced: t.forced,
             sdh: t.sdh,
+            item_id: row.id,
+            stream_index,
+            sidecar_path,
+            codec: t.codec.clone(),
+            item_vtt_path: Some(state.subs.vtt_path(row.id, &t.track_id)),
         });
     }
-    out
+    Ok(out)
 }
 
 pub async fn master(
@@ -260,32 +300,62 @@ pub async fn subtitle_playlist(
     State(state): State<AppState>,
     Path((session_id, asset)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    let track_id = asset
-        .strip_suffix(".m3u8")
-        .filter(|id| is_valid_sub_track_id(id))
-        .ok_or_else(|| ApiError::not_found(format!("subtitle playlist {asset} not found")))?
-        .to_string();
-    let hls = Arc::clone(&state.hls);
-    let sid = session_id.clone();
-    let result = tokio::task::spawn_blocking(move || hls.subtitle_playlist(&sid, &track_id))
-        .await
-        .map_err(|e| ApiError::internal(format!("hls subtitle playlist task: {e}")))?;
-    match result {
-        Ok(bytes) => m3u8_ok(bytes),
-        Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
-            "subtitle playlist {asset} for session {session_id} not found"
-        ))),
-        Err(other) => map_playlist_err(&session_id, other),
-    }
-}
+    // `{trackId}.m3u8` or `{trackId}/segNNN.vtt` (plan item 2).
+    // Parse to typed fields only — never join the catch-all string into a path.
+    use super::track_ids::{SessionSubtitleAsset, parse_session_subtitle_asset};
+    let parsed = parse_session_subtitle_asset(&asset)
+        .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?;
 
-fn is_valid_sub_track_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    match chars.next() {
-        Some('e') | Some('s') => {
-            chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    match parsed {
+        SessionSubtitleAsset::Playlist { track_id } => {
+            let hls = Arc::clone(&state.hls);
+            let sid = session_id.clone();
+            let result = tokio::task::spawn_blocking(move || hls.subtitle_playlist(&sid, &track_id))
+                .await
+                .map_err(|e| ApiError::internal(format!("hls subtitle playlist task: {e}")))?;
+            match result {
+                Ok(bytes) => m3u8_ok(bytes),
+                Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
+                    "subtitle playlist {asset} for session {session_id} not found"
+                ))),
+                Err(PlaylistError::NotReady) => Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: format!("subtitle playlist {asset} not ready"),
+                }),
+                Err(other) => map_playlist_err(&session_id, other),
+            }
         }
-        _ => false,
+        SessionSubtitleAsset::Segment { track_id, index } => {
+            let hls = Arc::clone(&state.hls);
+            let sid = session_id.clone();
+            let result =
+                tokio::task::spawn_blocking(move || hls.subtitle_segment(&sid, &track_id, index))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("hls subtitle segment task: {e}")))?;
+            match result {
+                Ok(bytes) => {
+                    let mut res = Response::new(Body::from(bytes));
+                    *res.status_mut() = StatusCode::OK;
+                    res.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/vtt; charset=utf-8"),
+                    );
+                    res.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("private, no-cache"),
+                    );
+                    Ok(res)
+                }
+                Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
+                    "subtitle asset {asset} for session {session_id} not found"
+                ))),
+                Err(PlaylistError::NotReady) => Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: format!("subtitle segment {asset} not ready"),
+                }),
+                Err(other) => map_playlist_err(&session_id, other),
+            }
+        }
     }
 }
 

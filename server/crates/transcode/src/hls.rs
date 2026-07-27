@@ -9,6 +9,7 @@
 //! do not tax every seek with padding before the land frame.
 
 use super::audio::stereo_downmix_filter;
+use super::subs::{SessionSubInput, prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -182,7 +183,7 @@ pub struct HlsSessionRegistry {
     sessions: Mutex<HashMap<String, Session>>,
 }
 
-/// Serveable text track snapshot taken at session create (ADR-0010).
+/// Serveable text track snapshot taken at session create (ADR-0010 / ADR-0013).
 /// Mid-session sidecar additions do not appear until the next session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HlsSubtitleTrack {
@@ -192,6 +193,18 @@ pub struct HlsSubtitleTrack {
     pub is_default: bool,
     pub forced: bool,
     pub sdh: bool,
+    /// Item id (for logging / future use).
+    pub item_id: i64,
+    /// Embedded stream index, or None for a sidecar.
+    pub stream_index: Option<u32>,
+    /// Sidecar file path when `stream_index` is None.
+    pub sidecar_path: Option<PathBuf>,
+    /// Source codec / sidecar format (subrip, srt, vtt, …).
+    pub codec: String,
+    /// When set, 2s HLS segments are sliced from this on-disk item VTT
+    /// (ready extract). No session demux. When None, session-inline demux
+    /// writes `subs/{trackId}/full.vtt` instead.
+    pub item_vtt_path: Option<PathBuf>,
 }
 
 struct Session {
@@ -306,6 +319,9 @@ impl HlsSessionRegistry {
             &self.video_encoder,
         )
         .map_err(StartSessionError::Spawn)?;
+        // Only cold (non-store) tracks need a session demux. Ready tracks
+        // point MEDIA at the item VTT and must not re-read the source.
+        spawn_session_subtitle_worker(src, &dir, &subtitle_tracks);
         let spawn_ms = spawn_started.elapsed().as_millis();
         tracing::info!(
             session_id = %id,
@@ -396,7 +412,7 @@ impl HlsSessionRegistry {
         })
     }
 
-    /// One-segment subtitle media playlist for a snapshotted track.
+    /// Multi-segment subtitle media playlist for a snapshotted track (plan item 2).
     pub fn subtitle_playlist(
         &self,
         session_id: &str,
@@ -417,11 +433,57 @@ impl HlsSessionRegistry {
         {
             return Err(PlaylistError::NotFound);
         }
-        Ok(build_subtitle_playlist(
-            session.item_id,
-            track_id,
-            session.duration_ms,
-        ))
+        // Hold until video is ready so clients attach media + subs together.
+        let first = segment_name(session.start_ms / SEGMENT_MS);
+        if !session.dir.join(&first).exists() {
+            if let Some(err) = note_child_exit(session) {
+                return Err(PlaylistError::Failed(err));
+            }
+            return Err(PlaylistError::NotReady);
+        }
+        let track = session
+            .subtitle_tracks
+            .iter()
+            .find(|t| t.track_id == track_id)
+            .expect("track checked above");
+        Ok(build_subtitle_playlist_for(track, session.duration_ms))
+    }
+
+    /// Sliced WebVTT for one 2s window (`subs/{trackId}/segNNN.vtt`).
+    pub fn subtitle_segment(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        segment_idx: u64,
+    ) -> Result<Vec<u8>, PlaylistError> {
+        let deadline = Instant::now() + SEGMENT_WAIT;
+        loop {
+            let result = {
+                let mut sessions = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| PlaylistError::Failed("hls registry lock poisoned".into()))?;
+                let session = sessions
+                    .get_mut(session_id)
+                    .ok_or(PlaylistError::NotFound)?;
+                session.last_access = Instant::now();
+                if !session
+                    .subtitle_tracks
+                    .iter()
+                    .any(|t| t.track_id == track_id)
+                {
+                    return Err(PlaylistError::NotFound);
+                }
+                read_subtitle_segment(session, track_id, segment_idx)
+            };
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(PlaylistError::NotReady) if Instant::now() < deadline => {
+                    std::thread::sleep(SEGMENT_POLL);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn with_ready_session<F>(
@@ -935,11 +997,21 @@ fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// One-segment VOD subtitle playlist pointing at the item VTT URL.
-fn build_subtitle_playlist(item_id: i64, track_id: &str, duration_ms: u64) -> Vec<u8> {
+/// Subtitle media playlist for one snapshotted track: always 2s VOD segments
+/// aligned to the video timeline. Segment bodies come from the item store
+/// VTT ([`HlsSubtitleTrack::item_vtt_path`]) or session-inline demux.
+fn build_subtitle_playlist_for(track: &HlsSubtitleTrack, duration_ms: u64) -> Vec<u8> {
+    build_segmented_subtitle_playlist(&track.track_id, duration_ms)
+}
+
+/// Multi-segment VOD subtitle playlist aligned to SEGMENT_MS.
+/// Segment URIs are relative to `subs/{trackId}.m3u8`.
+fn build_segmented_subtitle_playlist(track_id: &str, duration_ms: u64) -> Vec<u8> {
     use std::fmt::Write;
-    let secs = (duration_ms as f64 / 1000.0).max(0.001);
-    let target = secs.ceil() as u64;
+    let full = duration_ms / SEGMENT_MS;
+    let rem_ms = duration_ms % SEGMENT_MS;
+    let segment_secs = SEGMENT_MS as f64 / 1000.0;
+    let target = segment_secs.ceil() as u64;
     let mut out = format!(
         "#EXTM3U\n\
          #EXT-X-VERSION:6\n\
@@ -947,12 +1019,100 @@ fn build_subtitle_playlist(item_id: i64, track_id: &str, duration_ms: u64) -> Ve
          #EXT-X-PLAYLIST-TYPE:VOD\n\
          #EXT-X-MEDIA-SEQUENCE:0\n"
     );
-    let _ = writeln!(
-        out,
-        "#EXTINF:{secs:.6},\n/api/v0/items/{item_id}/subtitles/{track_id}.vtt"
-    );
+    for i in 0..full {
+        let _ = writeln!(
+            out,
+            "#EXTINF:{segment_secs:.6},\n{track_id}/{}",
+            segment_vtt_name(i)
+        );
+    }
+    if rem_ms > 0 {
+        let _ = writeln!(
+            out,
+            "#EXTINF:{:.6},\n{track_id}/{}",
+            rem_ms as f64 / 1000.0,
+            segment_vtt_name(full)
+        );
+    }
     out.push_str("#EXT-X-ENDLIST\n");
     out.into_bytes()
+}
+
+fn segment_vtt_name(index: u64) -> String {
+    format!("seg{index:03}.vtt")
+}
+
+fn spawn_session_subtitle_worker(src: &Path, dir: &Path, tracks: &[HlsSubtitleTrack]) {
+    let inputs: Vec<SessionSubInput> = tracks
+        .iter()
+        .filter(|t| t.item_vtt_path.is_none())
+        .map(|t| SessionSubInput {
+            track_id: t.track_id.clone(),
+            codec: t.codec.clone(),
+            stream_index: t.stream_index,
+            sidecar_path: t.sidecar_path.clone(),
+        })
+        .collect();
+    if inputs.is_empty() {
+        return;
+    }
+    let src = src.to_path_buf();
+    let dir = dir.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("hls-subs".into())
+        .spawn(move || {
+            if let Err(e) = prepare_session_subtitles(&src, &dir, &inputs) {
+                tracing::warn!(
+                    path = %src.display(),
+                    error = %e,
+                    "session subtitle prep failed"
+                );
+            }
+        });
+}
+
+fn read_subtitle_segment(
+    session: &Session,
+    track_id: &str,
+    segment_idx: u64,
+) -> Result<Vec<u8>, PlaylistError> {
+    // Belt: track_id must be a single Normal component (API allowlist is the
+    // primary gate; this stops a regression from joining `..` into session.dir).
+    use std::path::Component;
+    let mut comps = Path::new(track_id).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => {}
+        _ => return Err(PlaylistError::NotFound),
+    }
+    let track = session
+        .subtitle_tracks
+        .iter()
+        .find(|t| t.track_id == track_id)
+        .ok_or(PlaylistError::NotFound)?;
+
+    let (full_path, done) = if let Some(path) = &track.item_vtt_path {
+        // Ready extract: complete file, slice in-process (no session demux).
+        (path.clone(), true)
+    } else {
+        let track_dir = session.dir.join("subs").join(track_id);
+        (track_dir.join("full.vtt"), track_dir.join("done").exists())
+    };
+    if !full_path.exists() {
+        return Err(PlaylistError::NotReady);
+    }
+    let body = fs::read_to_string(&full_path).map_err(|e| {
+        PlaylistError::Failed(format!("read subtitle {}: {e}", full_path.display()))
+    })?;
+    let start_ms = segment_idx * SEGMENT_MS;
+    let end_ms = start_ms + SEGMENT_MS;
+    if !done {
+        match webvtt_max_cue_end_ms(&body) {
+            None => return Err(PlaylistError::NotReady),
+            Some(max_end) if max_end < start_ms => return Err(PlaylistError::NotReady),
+            Some(_) => {}
+        }
+    }
+    Ok(slice_webvtt(&body, start_ms, end_ms).into_bytes())
 }
 
 fn escape_hls_quoted(s: &str) -> String {
@@ -1610,6 +1770,75 @@ mod tests {
         ));
     }
 
+    /// Session-inline demux with no scan-time extract: the video segment and
+    /// the first subtitle window both become servable from one session start.
+    #[test]
+    fn session_subtitle_segment_without_scan_extract() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        assert!(!streams.is_empty());
+        let track = &streams[0];
+        let track_id = track.track_id();
+        let dir = tempfile::tempdir().unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        // Short window: we only need first video seg + first subtitle slice.
+        let id = reg
+            .start(
+                1,
+                &corpus,
+                0,
+                4000,
+                SessionMode::Copy,
+                stereo(),
+                vec![HlsSubtitleTrack {
+                    track_id: track_id.clone(),
+                    language: track.language.clone(),
+                    name: track_id.clone(),
+                    is_default: true,
+                    forced: false,
+                    sdh: false,
+                    item_id: 1,
+                    stream_index: Some(track.stream_index),
+                    sidecar_path: None,
+                    codec: track.codec.clone(),
+                    item_vtt_path: None,
+                }],
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let sub_pl = reg.subtitle_playlist(&id, &track_id).expect("sub playlist");
+        let sub_text = String::from_utf8_lossy(&sub_pl);
+        assert!(
+            sub_text.contains(&format!("{track_id}/seg000.vtt")),
+            "{sub_text}"
+        );
+        let mut seg = None;
+        for _ in 0..100 {
+            match reg.subtitle_segment(&id, &track_id, 0) {
+                Ok(bytes) => {
+                    seg = Some(bytes);
+                    break;
+                }
+                Err(PlaylistError::NotReady) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("subtitle segment: {e:?}"),
+            }
+        }
+        let seg = String::from_utf8(seg.expect("subtitle seg000 not ready in time")).unwrap();
+        assert!(seg.contains("\nNightjar SRT sample\n"), "{seg}");
+        reg.stop(&id);
+    }
+
     /// One session per start, even for the same item at the same offset, and
     /// stopping one leaves the other playing (ADR-0011).
     #[test]
@@ -1966,6 +2195,11 @@ mod tests {
                 is_default: true,
                 forced: false,
                 sdh: true,
+                item_id: 176,
+                stream_index: Some(2),
+                sidecar_path: None,
+                codec: "subrip".into(),
+                item_vtt_path: None,
             },
             HlsSubtitleTrack {
                 track_id: "e3".into(),
@@ -1974,6 +2208,11 @@ mod tests {
                 is_default: false,
                 forced: false,
                 sdh: false,
+                item_id: 176,
+                stream_index: Some(3),
+                sidecar_path: None,
+                codec: "subrip".into(),
+                item_vtt_path: None,
             },
         ];
         let text = String::from_utf8(build_master(&tracks)).unwrap();
@@ -1999,12 +2238,84 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_media_playlist_is_one_segment_vod() {
-        let text = String::from_utf8(build_subtitle_playlist(176, "e2", 90_000)).unwrap();
+    fn subtitle_media_playlist_is_segmented_vod() {
+        let text = String::from_utf8(build_segmented_subtitle_playlist("e2", 5000)).unwrap();
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
-        assert!(text.contains("/api/v0/items/176/subtitles/e2.vtt"));
+        assert!(text.contains("e2/seg000.vtt"));
+        assert!(text.contains("e2/seg001.vtt"));
+        assert!(text.contains("e2/seg002.vtt"));
+        assert!(!text.contains("/api/v0/items/"));
         assert!(text.ends_with("#EXT-X-ENDLIST\n"));
-        assert_eq!(text.matches("#EXTINF:").count(), 1);
+        assert_eq!(text.matches("#EXTINF:").count(), 3);
+    }
+
+    /// Ready-store path: slice cues from an on-disk item VTT without session demux.
+    #[test]
+    fn item_store_vtt_slices_into_hls_segments() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let vtt = dir.path().join("e2.vtt");
+        fs::write(
+            &vtt,
+            "WEBVTT\n\n1\n00:00:00.500 --> 00:00:01.500\nHello\n\n2\n00:00:02.500 --> 00:00:03.500\nWorld\n\n",
+        )
+        .unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                4000,
+                SessionMode::Copy,
+                stereo(),
+                vec![HlsSubtitleTrack {
+                    track_id: "e2".into(),
+                    language: Some("en".into()),
+                    name: "en".into(),
+                    is_default: true,
+                    forced: false,
+                    sdh: false,
+                    item_id: 1,
+                    stream_index: Some(2),
+                    sidecar_path: None,
+                    codec: "subrip".into(),
+                    item_vtt_path: Some(vtt),
+                }],
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let sub_pl = String::from_utf8(reg.subtitle_playlist(&id, "e2").unwrap()).unwrap();
+        assert!(sub_pl.contains("e2/seg000.vtt"), "{sub_pl}");
+        assert!(!sub_pl.contains("/api/v0/items/"), "{sub_pl}");
+        let seg0 = String::from_utf8(reg.subtitle_segment(&id, "e2", 0).unwrap()).unwrap();
+        assert!(seg0.contains("Hello"), "{seg0}");
+        assert!(!seg0.contains("World"), "{seg0}");
+        let seg1 = String::from_utf8(reg.subtitle_segment(&id, "e2", 1).unwrap()).unwrap();
+        assert!(seg1.contains("World"), "{seg1}");
+        assert!(!seg1.contains("Hello"), "{seg1}");
+        reg.stop(&id);
+    }
+
+    /// Segment count and boundaries mirror the video VOD playlist so a
+    /// player's segment index maps to the same subtitle window.
+    #[test]
+    fn subtitle_media_playlist_matches_video_segment_count() {
+        for duration_ms in [4000u64, 5000, 90_000] {
+            let video = String::from_utf8(build_playlist(duration_ms, 0)).unwrap();
+            let subs =
+                String::from_utf8(build_segmented_subtitle_playlist("e2", duration_ms)).unwrap();
+            assert_eq!(
+                video.matches(".m4s").count(),
+                subs.matches(".vtt").count(),
+                "duration_ms={duration_ms}"
+            );
+        }
     }
 
     #[test]

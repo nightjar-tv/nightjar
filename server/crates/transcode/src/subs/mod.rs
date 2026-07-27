@@ -5,13 +5,16 @@
 
 mod discover;
 mod lang;
+mod slice;
 mod srt;
 
 pub use discover::{DiscoveredSidecar, discover_sidecars};
 pub use lang::{container_stream_language, normalize_language};
+pub use slice::{slice_webvtt, webvtt_max_cue_end_ms};
 pub use srt::{decode_subtitle_bytes, srt_to_webvtt};
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,6 +27,9 @@ const TEXT_SUB_CODECS: &[&str] = &["subrip", "srt", "webvtt", "mov_text", "text"
 
 /// Kill a runaway extract rather than leave ffmpeg demuxing forever on a NAS.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often to publish a growing WebVTT while FFmpeg demuxes (ADR-0013 §11).
+const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
 /// Refuse extract when the data volume has less free space than this.
 const MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
@@ -60,6 +66,30 @@ impl SubtitleSourceKind {
             Self::Sidecar => "sidecar",
         }
     }
+}
+
+/// Per-track first-play readiness declared by the server (ADR-0013 §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackReadiness {
+    Preparing,
+    Partial,
+    Complete,
+}
+
+impl TrackReadiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackProgress {
+    readiness: TrackReadiness,
+    revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +188,8 @@ pub struct SubsStore {
     root: PathBuf,
     /// Serialises extracts so two workers never share the same item tmp paths.
     extract_lock: Mutex<()>,
+    /// In-flight per-track readiness while demux runs (ADR-0013 §11).
+    progress: Mutex<HashMap<(i64, String), TrackProgress>>,
 }
 
 impl SubsStore {
@@ -167,6 +199,7 @@ impl SubsStore {
         Ok(Self {
             root,
             extract_lock: Mutex::new(()),
+            progress: Mutex::new(HashMap::new()),
         })
     }
 
@@ -187,7 +220,90 @@ impl SubsStore {
         path.exists() && fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0
     }
 
+    /// Server-declared readiness for a serveable track. `None` means the track
+    /// is listed but not served (ASS/SSA, image) — caller decides that from
+    /// codec/format before asking.
+    pub fn track_readiness(
+        &self,
+        item_id: i64,
+        track_id: &str,
+        item_subtitle_status: &str,
+    ) -> (TrackReadiness, u64) {
+        if let Some(p) = self
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(item_id, track_id.to_string()))
+            .copied()
+        {
+            return (p.readiness, p.revision);
+        }
+        if self.has_vtt(item_id, track_id) {
+            // Prefer Complete once the item is marked ready; a pending item
+            // with a file on disk is a partial left mid-extract (or after a
+            // crash), which is still serveable.
+            if item_subtitle_status == "ready" {
+                (TrackReadiness::Complete, 1)
+            } else {
+                (TrackReadiness::Partial, 1)
+            }
+        } else {
+            (TrackReadiness::Preparing, 0)
+        }
+    }
+
+    fn set_progress(&self, item_id: i64, track_id: &str, readiness: TrackReadiness, revision: u64) {
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (item_id, track_id.to_string()),
+                TrackProgress {
+                    readiness,
+                    revision,
+                },
+            );
+    }
+
+    fn clear_item_progress(&self, item_id: i64) {
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _), _| *id != item_id);
+    }
+
+    /// Write a growing WebVTT and bump revision when the body grew.
+    fn publish_partial_vtt(&self, item_id: i64, track_id: &str, body: &str) -> Result<(), String> {
+        let dest = self.vtt_path(item_id, track_id);
+        let prev_len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        if (body.len() as u64) <= prev_len && prev_len > 0 {
+            return Ok(());
+        }
+        write_webvtt(&dest, body)?;
+        let next_rev = self
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(item_id, track_id.to_string()))
+            .map(|p| p.revision.saturating_add(1))
+            .unwrap_or(1);
+        self.set_progress(item_id, track_id, TrackReadiness::Partial, next_rev);
+        Ok(())
+    }
+
+    fn mark_complete(&self, item_id: i64, track_id: &str) {
+        let next_rev = self
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(item_id, track_id.to_string()))
+            .map(|p| p.revision.saturating_add(1))
+            .unwrap_or(1);
+        self.set_progress(item_id, track_id, TrackReadiness::Complete, next_rev);
+    }
+
     pub fn remove_item(&self, item_id: i64) -> Result<(), String> {
+        self.clear_item_progress(item_id);
         let dir = self.item_dir(item_id);
         if !dir.exists() {
             return Ok(());
@@ -266,8 +382,158 @@ fn srt_encoder_for_codec(codec: &str) -> &'static str {
     }
 }
 
+/// Input for session-inline subtitle prep (plan item 2). No library extract
+/// required: demux/convert into the session directory.
+#[derive(Debug, Clone)]
+pub struct SessionSubInput {
+    pub track_id: String,
+    pub codec: String,
+    pub stream_index: Option<u32>,
+    pub sidecar_path: Option<PathBuf>,
+}
+
+/// Write growing `subs/{trackId}/full.vtt` (+ `done` marker) under `session_dir`
+/// so HLS can slice 2s WebVTT segments without scan-time pre-extraction.
+pub fn prepare_session_subtitles(
+    src: &Path,
+    session_dir: &Path,
+    tracks: &[SessionSubInput],
+) -> Result<(), String> {
+    if tracks.is_empty() {
+        return Ok(());
+    }
+    let subs_root = session_dir.join("subs");
+    fs::create_dir_all(&subs_root)
+        .map_err(|e| format!("create session subs dir {}: {e}", subs_root.display()))?;
+
+    let mut embedded: Vec<&SessionSubInput> = Vec::new();
+    for t in tracks {
+        let track_dir = subs_root.join(&t.track_id);
+        fs::create_dir_all(&track_dir)
+            .map_err(|e| format!("create {}: {e}", track_dir.display()))?;
+        if let Some(path) = &t.sidecar_path {
+            let bytes = fs::read(path).map_err(|e| {
+                if io_error_is_availability(&e) {
+                    format!("unavailable: read session sidecar {}: {e}", path.display())
+                } else {
+                    format!("read session sidecar {}: {e}", path.display())
+                }
+            })?;
+            let body = if t.codec.eq_ignore_ascii_case("vtt") {
+                let text = decode_subtitle_bytes(&bytes);
+                if text.contains("WEBVTT") {
+                    text
+                } else {
+                    format!("WEBVTT\n\n{text}")
+                }
+            } else {
+                srt_bytes_to_webvtt(&bytes)
+            };
+            write_webvtt(&track_dir.join("full.vtt"), &body)?;
+            touch_done(&track_dir)?;
+        } else if t.stream_index.is_some() {
+            embedded.push(t);
+        } else {
+            tracing::warn!(track_id = %t.track_id, "session subtitle track has no source");
+            touch_done(&track_dir)?;
+        }
+    }
+
+    if !embedded.is_empty() {
+        demux_embedded_into_session(src, &subs_root, &embedded)?;
+    }
+    Ok(())
+}
+
+fn touch_done(track_dir: &Path) -> Result<(), String> {
+    fs::write(track_dir.join("done"), b"")
+        .map_err(|e| format!("write done marker {}: {e}", track_dir.display()))
+}
+
+fn demux_embedded_into_session(
+    src: &Path,
+    subs_root: &Path,
+    tracks: &[&SessionSubInput],
+) -> Result<(), String> {
+    let mut tmp_srts: Vec<(String, PathBuf)> = Vec::with_capacity(tracks.len());
+    let mut cmd = Command::new("ffmpeg");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(src);
+    for t in tracks {
+        let idx = t.stream_index.expect("embedded");
+        let tmp = subs_root.join(&t.track_id).join("tmp.srt");
+        let map = format!("0:{idx}");
+        let encoder = srt_encoder_for_codec(&t.codec);
+        // Growing files need bytes on disk promptly so progressive slicing
+        // can read them mid-demux (Jellyfin's append-only VTT lesson).
+        cmd.args(["-map", &map, "-c:s", encoder, "-flush_packets", "1", "-f", "srt"])
+            .arg(&tmp);
+        tmp_srts.push((t.track_id.clone(), tmp));
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "ffmpeg not found on PATH".into()
+        } else {
+            format!("spawn ffmpeg session subs for {}: {e}", src.display())
+        }
+    })?;
+
+    let mut last_sizes: HashMap<String, u64> = HashMap::new();
+    if let Err(e) = wait_extract_child(&mut child, EXTRACT_TIMEOUT, || {
+        for (track_id, tmp) in &tmp_srts {
+            let Ok(meta) = fs::metadata(tmp) else {
+                continue;
+            };
+            let len = meta.len();
+            if len == 0 {
+                continue;
+            }
+            let prev = last_sizes.get(track_id).copied().unwrap_or(0);
+            if len <= prev {
+                continue;
+            }
+            last_sizes.insert(track_id.clone(), len);
+            let Ok(bytes) = fs::read(tmp) else {
+                continue;
+            };
+            let body = srt_bytes_to_webvtt(&bytes);
+            if body.trim() == "WEBVTT" {
+                continue;
+            }
+            let dest = subs_root.join(track_id).join("full.vtt");
+            let _ = write_webvtt(&dest, &body);
+        }
+    }) {
+        for (_, tmp) in &tmp_srts {
+            let _ = fs::remove_file(tmp);
+        }
+        return Err(format!(
+            "ffmpeg session subtitle demux failed for {}: {e}",
+            src.display()
+        ));
+    }
+
+    for (track_id, tmp) in tmp_srts {
+        let track_dir = subs_root.join(&track_id);
+        let dest = track_dir.join("full.vtt");
+        let bytes = fs::read(&tmp)
+            .map_err(|e| format!("read session srt for {track_id} ({}): {e}", tmp.display()))?;
+        let body = srt_bytes_to_webvtt(&bytes);
+        write_webvtt(&dest, &body)?;
+        let _ = fs::remove_file(&tmp);
+        touch_done(&track_dir)?;
+    }
+    Ok(())
+}
+
 /// Extract/convert every serveable track for one item (ADR-0013). One FFmpeg
 /// demux fills all embedded text tracks; sidecars convert in-process.
+/// Embedded demux publishes growing WebVTT so first play can show cues before
+/// the full demux finishes (ADR-0013 §11).
 pub fn extract_item_subtitles(
     store: &SubsStore,
     item_id: i64,
@@ -309,6 +575,13 @@ pub fn extract_item_subtitles(
     fs::create_dir_all(store.item_dir(item_id))
         .map_err(|e| format!("create subtitle dir for item {item_id}: {e}"))?;
 
+    for s in &embedded {
+        store.set_progress(item_id, &s.track_id(), TrackReadiness::Preparing, 0);
+    }
+    for s in &serveable_sidecars {
+        store.set_progress(item_id, &s.track_id, TrackReadiness::Preparing, 0);
+    }
+
     if !embedded.is_empty() {
         let refs: Vec<&TextSubtitleStream> = embedded.iter().collect();
         extract_embedded_srt_batch(store, item_id, src, &refs)?;
@@ -316,6 +589,7 @@ pub fn extract_item_subtitles(
 
     for s in serveable_sidecars {
         write_sidecar_webvtt(store, item_id, s)?;
+        store.mark_complete(item_id, &s.track_id);
     }
 
     Ok(ExtractOutcome::Ready)
@@ -339,7 +613,7 @@ fn write_sidecar_webvtt(
     sidecar: &SidecarInput,
 ) -> Result<(), String> {
     let bytes = fs::read(&sidecar.path).map_err(|e| {
-        if crate::io_error_is_availability(&e) {
+        if io_error_is_availability(&e) {
             format!(
                 "unavailable: read sidecar subtitle {}: {e}",
                 sidecar.path.display()
@@ -379,7 +653,9 @@ fn extract_embedded_srt_batch(
         let tmp = item_dir.join(format!("e{}.tmp.srt", s.stream_index));
         let map = format!("0:{}", s.stream_index);
         let encoder = srt_encoder_for_codec(&s.codec);
-        cmd.args(["-map", &map, "-c:s", encoder, "-f", "srt"])
+        // Growing files need bytes on disk promptly so partial-publish reads
+        // see them mid-demux (Jellyfin's append-only VTT lesson).
+        cmd.args(["-map", &map, "-c:s", encoder, "-flush_packets", "1", "-f", "srt"])
             .arg(&tmp);
         tmp_srts.push((s.stream_index, tmp));
     }
@@ -391,10 +667,15 @@ fn extract_embedded_srt_batch(
             format!("spawn ffmpeg for {}: {e}", src.display())
         }
     })?;
-    if let Err(e) = wait_extract_child(&mut child, EXTRACT_TIMEOUT) {
+
+    let mut last_sizes: HashMap<u32, u64> = HashMap::new();
+    if let Err(e) = wait_extract_child(&mut child, EXTRACT_TIMEOUT, || {
+        publish_growing_srts(store, item_id, &tmp_srts, &mut last_sizes);
+    }) {
         for (_, tmp) in &tmp_srts {
             let _ = fs::remove_file(tmp);
         }
+        store.clear_item_progress(item_id);
         tracing::warn!(
             path = %src.display(),
             error = %e,
@@ -417,7 +698,9 @@ fn extract_embedded_srt_batch(
                 )
             })?;
             let body = srt_bytes_to_webvtt(&bytes);
-            write_webvtt(&dest, &body)
+            write_webvtt(&dest, &body)?;
+            store.mark_complete(item_id, &track_id);
+            Ok::<(), String>(())
         })();
         let _ = fs::remove_file(&tmp_srt);
         result?;
@@ -425,8 +708,53 @@ fn extract_embedded_srt_batch(
     Ok(())
 }
 
-fn wait_extract_child(child: &mut std::process::Child, timeout: Duration) -> Result<(), String> {
+fn publish_growing_srts(
+    store: &SubsStore,
+    item_id: i64,
+    tmp_srts: &[(u32, PathBuf)],
+    last_sizes: &mut HashMap<u32, u64>,
+) {
+    for (stream_index, tmp_srt) in tmp_srts {
+        let Ok(meta) = fs::metadata(tmp_srt) else {
+            continue;
+        };
+        let len = meta.len();
+        if len == 0 {
+            continue;
+        }
+        let prev = last_sizes.get(stream_index).copied().unwrap_or(0);
+        if len <= prev {
+            continue;
+        }
+        last_sizes.insert(*stream_index, len);
+        let Ok(bytes) = fs::read(tmp_srt) else {
+            continue;
+        };
+        // Trailing incomplete cue is skipped by srt_to_webvtt when timing/text
+        // is truncated mid-block.
+        let body = srt_bytes_to_webvtt(&bytes);
+        if body.trim() == "WEBVTT" {
+            continue;
+        }
+        let track_id = format!("e{stream_index}");
+        if let Err(e) = store.publish_partial_vtt(item_id, &track_id, &body) {
+            tracing::warn!(
+                item_id,
+                track_id = %track_id,
+                error = %e,
+                "partial subtitle publish failed"
+            );
+        }
+    }
+}
+
+fn wait_extract_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    mut on_tick: impl FnMut(),
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
+    let mut next_progress = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
@@ -451,7 +779,13 @@ fn wait_extract_child(child: &mut std::process::Child, timeout: Duration) -> Res
                 let _ = child.wait();
                 return Err(format!("ffmpeg timed out after {timeout:?}"));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                if Instant::now() >= next_progress {
+                    on_tick();
+                    next_progress = Instant::now() + PROGRESS_TICK;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             Err(e) => return Err(format!("wait: {e}")),
         }
     }
@@ -765,6 +1099,27 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_extract_reports_unavailable_when_share_drops(){
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let missing = dir.path().join("gone").join("Movie.en.srt");
+        let err = extract_item_subtitles(
+            &store,
+            8,
+            &video,
+            &[SidecarInput {
+                track_id: "s-en".into(),
+                path: missing,
+                format: "srt".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("unavailable:"), "{err}");
+    }
+
+    #[test]
     fn cleanup_removes_orphan_item_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
@@ -806,5 +1161,101 @@ mod tests {
         let second = fs::read_to_string(store.vtt_path(3, &track)).unwrap();
         assert!(second.contains("WEBVTT"));
         assert_eq!(first.lines().next(), second.lines().next());
+    }
+
+    #[test]
+    fn progressive_partial_bumps_revision_and_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        fs::create_dir_all(store.item_dir(7)).unwrap();
+        store.set_progress(7, "e2", TrackReadiness::Preparing, 0);
+        let (r0, rev0) = store.track_readiness(7, "e2", "pending");
+        assert_eq!(r0, TrackReadiness::Preparing);
+        assert_eq!(rev0, 0);
+
+        let partial = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n";
+        store.publish_partial_vtt(7, "e2", partial).unwrap();
+        let (r1, rev1) = store.track_readiness(7, "e2", "pending");
+        assert_eq!(r1, TrackReadiness::Partial);
+        assert_eq!(rev1, 1);
+        assert!(store.has_vtt(7, "e2"));
+
+        let grown = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n\n00:00:03.000 --> 00:00:04.000\nWorld\n";
+        store.publish_partial_vtt(7, "e2", grown).unwrap();
+        let (r2, rev2) = store.track_readiness(7, "e2", "pending");
+        assert_eq!(r2, TrackReadiness::Partial);
+        assert!(rev2 > rev1);
+
+        // Same length does not bump.
+        store.publish_partial_vtt(7, "e2", grown).unwrap();
+        let (_, rev3) = store.track_readiness(7, "e2", "pending");
+        assert_eq!(rev3, rev2);
+
+        store.mark_complete(7, "e2");
+        let (r4, rev4) = store.track_readiness(7, "e2", "pending");
+        assert_eq!(r4, TrackReadiness::Complete);
+        assert!(rev4 > rev3);
+    }
+
+    #[test]
+    fn readiness_without_progress_map_uses_disk_and_item_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        let (prep, _) = store.track_readiness(1, "e2", "pending");
+        assert_eq!(prep, TrackReadiness::Preparing);
+
+        fs::create_dir_all(store.item_dir(1)).unwrap();
+        write_webvtt(&store.vtt_path(1, "e2"), "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n")
+            .unwrap();
+        let (partial, _) = store.track_readiness(1, "e2", "pending");
+        assert_eq!(partial, TrackReadiness::Partial);
+        let (complete, _) = store.track_readiness(1, "e2", "ready");
+        assert_eq!(complete, TrackReadiness::Complete);
+    }
+
+    #[test]
+    fn session_inline_prep_slices_first_segment_without_scan_extract() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = list_text_subtitles(&corpus).expect("list");
+        assert!(!streams.is_empty());
+        let track = &streams[0];
+        let session = tempfile::tempdir().unwrap();
+        prepare_session_subtitles(
+            &corpus,
+            session.path(),
+            &[SessionSubInput {
+                track_id: track.track_id(),
+                codec: track.codec.clone(),
+                stream_index: Some(track.stream_index),
+                sidecar_path: None,
+            }],
+        )
+        .expect("session prep");
+        let full = session
+            .path()
+            .join("subs")
+            .join(track.track_id())
+            .join("full.vtt");
+        assert!(full.exists(), "expected {}", full.display());
+        assert!(
+            session
+                .path()
+                .join("subs")
+                .join(track.track_id())
+                .join("done")
+                .exists()
+        );
+        let body = fs::read_to_string(&full).unwrap();
+        assert!(body.contains("Nightjar SRT sample"), "{body}");
+        let seg0 = slice_webvtt(&body, 0, 2000);
+        assert!(seg0.contains("\nNightjar SRT sample\n"), "{seg0}");
     }
 }

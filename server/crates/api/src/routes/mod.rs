@@ -2,6 +2,7 @@ pub mod items;
 mod libraries;
 pub mod sessions;
 mod system;
+mod track_ids;
 
 use crate::state::AppState;
 use axum::{
@@ -51,7 +52,7 @@ pub fn router(state: AppState) -> Router {
             get(sessions::playlist),
         )
         .route(
-            "/api/v0/sessions/{session_id}/subs/{asset}",
+            "/api/v0/sessions/{session_id}/subs/{*asset}",
             get(sessions::subtitle_playlist),
         )
         .route(

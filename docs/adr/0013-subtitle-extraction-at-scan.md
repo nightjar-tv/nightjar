@@ -253,16 +253,70 @@ this ADR records that as the reason, and the tests below lock it.
     restarts re-enqueue. It is not a description of first play for a
     title the queue has not reached yet.
 
-11. **First-play captions for a still-`pending` title remain open.**
-    The backfill number does not say what a user waiting on one title
-    experiences. A 10 GB text-bearing title at ~56 MB/s still needs about
-    three minutes of demux before a complete WebVTT exists. The
-    growing-`<track>` experiment (Consequences) asked whether a partial
-    VTT could appear in the player while demux continues. No browser
-    under test picked up cues from an append-in-place file without a
-    track reload. Until a first-play design is chosen (play-triggered
-    extract priority plus preparing UI, or a client that reloads
-    `<track>`), do not treat first-play captions as settled by this ADR.
+11. **First-play captions: play-priority plus client-driven `<track>`
+    reload, chosen.** The growing-`<track>` experiment (Consequences)
+    ruled out append-in-place: no browser under test picks up new cues on
+    an unchanged URL. Two things close first-play instead:
+
+    - **Play-priority.** Starting playback (`playback_info`, session
+      start) on an item whose `subtitle_status` is `pending` calls
+      `LibraryPool::prioritize_extract`, moving that item's extract ahead of
+      the backfill queue. This does not change the backfill wall clock
+      (§10); it changes which title the single serial extract slot works
+      on next.
+    - **Per-track readiness.** `SubtitleTrack` gains `readiness`
+      (`preparing | partial | complete`) and `revision`, server-declared,
+      never inferred client-side from file size or a timer. Extraction
+      publishes a growing sidecar WebVTT under a `partial` readiness as
+      SRT batches land, and flips to `complete` once FFmpeg exits; each
+      publish bumps `revision`. `url` is present once a track is
+      serveable (`partial` or `complete`); absent while `preparing` and
+      for tracks that are listed but never rendered (ASS/SSA, image).
+      `subtitle_status` keeps its item-level meaning (§6); it does not
+      replace this per-track field.
+    - **Client reload, not append-in-place.** Direct-play attaches
+      `<track>` elements from the initial `playback_info` response, then
+      polls the same endpoint only while any track is `preparing` or
+      `partial`. A `revision` increase removes and recreates the changed
+      `<track>` element (a fresh URL, per the experiment's finding — see
+      `web/src/lib/subtitleProgressive.ts`). This closes the gap for
+      direct play. HLS keeps its own path (item 12).
+
+    Not yet run in this session: an in-player dogfood confirming Chrome
+    and Safari actually display growing cues end-to-end through this
+    reload mechanism during a live extract. The per-browser reload
+    mechanics (Firefox's disabled→showing toggle, WebKit's `load` event)
+    are carried over from the experiment above, not re-measured here.
+
+12. **HLS MEDIA for ready tracks: 2s slices from the item store VTT.**
+    Complete text tracks are declared in the master. The subtitle playlist
+    is multi-segment VOD (`subs/{trackId}/segNNN.vtt`) aligned to video
+    `SEGMENT_MS`. Segment bodies are sliced in-process from the scan-time
+    item VTT on disk — no second FFmpeg demux beside the encode (measured
+    failure 2026-07-27: session-inline demux on NAS timed out and Safari
+    blocked start). A single whole-title VTT URI as one EXTINF was also
+    insufficient for Safari/hls.js cue display on dogfood; segmented
+    WebVTT is the delivery shape. Tracks still `preparing` / `partial`
+    are omitted from the master so a cold URI cannot hang start;
+    play-priority extract (§11) fills the store; captions appear on a
+    later session once `complete`. Session-inline demux remains only for
+    fixtures / an explicit cold path that does not contend with encode.
+
+    **Cue timing vs segment windows (corrected 2026-07-27).** Segmenting
+    delivery and truncating cue times are different operations. An early
+    slice clipped each cue's end to the 2s window so the same absolute
+    cue would not appear in every overlapping segment (Safari had
+    double-painted). That conflation is wrong for hls.js: Chrome renders
+    each cue independently and drops the line at the clipped end while
+    dialogue continues. The rule is now start-segment ownership: a cue
+    is emitted only in the segment that contains its start time, with
+    its original start and end untouched, and a stable cue id equal to
+    that start time in milliseconds. Players keep displaying past the
+    segment boundary until the real end. Duplicating the full cue into
+    every overlapping window is rejected (Safari double-paint). Scrub
+    into the middle of a long cue without the start segment loaded is an
+    accepted gap until a separate client seek/reload fix; it is not
+    solved by clipping.
 
 ## Consequences
 
@@ -303,8 +357,9 @@ this ADR records that as the reason, and the tests below lock it.
   | Firefox | No | Yes (cues empty until `mode` toggled `disabled`→`showing`) |
 
   Progressive growing VTT does not give near-immediate first-play
-  captions without client cooperation. The fallback under consideration
-  is play-triggered extract priority plus honest preparing UI (§11).
+  captions without client cooperation. Play-priority plus client-driven
+  `<track>` reload (§11) is the chosen fallback; an in-player Chrome/
+  Safari dogfood of that path has not been run as of this writing.
 - A first extract pass is wall-clock bound by sequential NAS read speed,
   not by pool width: extract is serialised by a process-wide lock (shared
   tmp paths), and subtitle packets are interleaved throughout the

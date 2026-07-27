@@ -246,8 +246,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * One-segment subtitle media playlist for a session track
-         * @description ADR-0010. EXT-X-MEDIA URI target. References the item WebVTT URL for the snapshotted trackId.
+         * Segmented subtitle playlist or WebVTT segment for a session track
+         * @description Plan item 2 / ADR-0013. EXT-X-MEDIA URI target. `asset` is either `{trackId}.m3u8` (multi-segment VOD aligned to the 2s video timeline) or `{trackId}/segNNN.vtt` (cues for that window, sliced from a session-inline demux — no scan-time pre-extraction required).
          */
         get: operations["getSessionSubtitlePlaylist"];
         put?: never;
@@ -335,10 +335,15 @@ export interface components {
          */
         ProbeStatus: "indexed" | "probed" | "error" | "unavailable";
         /**
-         * @description pending = extract queued or in progress; ready = WebVTT on disk; none = no serveable text tracks; error = permanent extract failure; unavailable = mount/IO absence, retriable (ADR-0014).
+         * @description Item-level extract queue state (ADR-0013 / ADR-0014). pending = extract queued or in progress; ready = WebVTT on disk; none = no serveable text tracks; error = permanent extract failure; unavailable = mount/IO absence, retriable. Per-track first-play readiness is SubtitleTrack.readiness, not this field.
          * @enum {string}
          */
         SubtitleStatus: "pending" | "ready" | "none" | "error" | "unavailable";
+        /**
+         * @description Server-declared per-track readiness for serveable text tracks (ADR-0013 §11). preparing = extract not yet writing cues; partial = a growing WebVTT is serveable; complete = final WebVTT. Clients never invent this from file size or a timer. Absent on tracks that are listed but not served (ASS/SSA, image).
+         * @enum {string}
+         */
+        SubtitleTrackReadiness: "preparing" | "partial" | "complete";
         /** @enum {string} */
         ScanJobState: "queued" | "indexing" | "probing" | "completed" | "failed";
         /**
@@ -506,7 +511,13 @@ export interface components {
             sdh: boolean;
             /** @description Absolute ffprobe stream index when source is embedded */
             streamIndex?: number | null;
-            /** @description GET path for the WebVTT body when this track is served. Absent for ASS/SSA and other non-serveable tracks that are still listed. */
+            readiness?: components["schemas"]["SubtitleTrackReadiness"];
+            /**
+             * Format: int64
+             * @description Monotonic growth counter for this track's WebVTT body. Bumps when the server writes more cues (partial) or the final file. Clients that reload on growth compare this field; they do not infer growth from content length.
+             */
+            revision?: number;
+            /** @description GET path for the WebVTT body when this track is served (partial or complete). Absent while preparing, and for ASS/SSA / image tracks that are still listed. */
             url?: string | null;
         };
         /**
@@ -1025,24 +1036,34 @@ export interface operations {
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];
-                /** @description {trackId}.m3u8 (e.g. e2.m3u8, s-en.m3u8) */
+                /** @description `{trackId}.m3u8` or `{trackId}/segNNN.vtt` (e.g. e2.m3u8, e2/seg000.vtt, s-en/seg012.vtt) */
                 asset: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description HLS subtitle media playlist */
+            /** @description HLS subtitle media playlist or WebVTT segment */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/vnd.apple.mpegurl": string;
+                    "text/vtt": string;
                 };
             };
             /** @description Session or track not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Subtitle segment not ready yet (demux still catching up) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

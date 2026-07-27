@@ -22,6 +22,8 @@ pub struct WorkItem {
     pub library_id: i64,
     pub path: PathBuf,
     pub scan_job_id: Option<i64>,
+    /// First-play bump: may run while an index walk holds SMB (ADR-0013 §11).
+    pub priority: bool,
     batch: Option<Arc<ProbeBatchState>>,
 }
 
@@ -33,6 +35,7 @@ impl WorkItem {
             library_id,
             path,
             scan_job_id,
+            priority: false,
             batch: None,
         }
     }
@@ -44,6 +47,7 @@ impl WorkItem {
             library_id,
             path,
             scan_job_id: None,
+            priority: false,
             batch: None,
         }
     }
@@ -89,6 +93,8 @@ pub struct LibraryPool {
     last_index_ms: AtomicU64,
     scan_dirty: Mutex<HashSet<i64>>,
     index_active: AtomicUsize,
+    /// Item ids whose extract worker is running (not merely queued).
+    extracting: Mutex<HashSet<i64>>,
     pub availability: Arc<Availability>,
 }
 
@@ -107,6 +113,7 @@ impl LibraryPool {
             last_index_ms: AtomicU64::new(0),
             scan_dirty: Mutex::new(HashSet::new()),
             index_active: AtomicUsize::new(0),
+            extracting: Mutex::new(HashSet::new()),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -263,6 +270,44 @@ impl LibraryPool {
         queue.extracts.push_back(item);
     }
 
+    /// Move an item's extract to the front of the queue (first-play path).
+    /// No-op when already extracting or already at the front. Does not
+    /// interrupt an in-flight demux. Priority extracts may run while an
+    /// index walk is active so the title being watched is not stuck behind
+    /// a multi-day backfill (ADR-0013 §11).
+    pub fn prioritize_extract(&self, item_id: i64, library_id: i64, path: PathBuf) {
+        if self.availability.pause.is_paused(library_id) {
+            return;
+        }
+        if self
+            .extracting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&item_id)
+        {
+            return;
+        }
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = queue.extracts.iter().position(|w| w.item_id == item_id) {
+            if pos == 0 {
+                if let Some(front) = queue.extracts.front_mut() {
+                    front.priority = true;
+                }
+                self.available.notify_one();
+                return;
+            }
+            if let Some(mut item) = queue.extracts.remove(pos) {
+                item.priority = true;
+                queue.extracts.push_front(item);
+            }
+        } else {
+            let mut item = WorkItem::extract(item_id, library_id, path);
+            item.priority = true;
+            queue.extracts.push_front(item);
+        }
+        self.available.notify_one();
+    }
+
     pub fn enqueue_probe_batch(&self, items: Vec<WorkItem>) -> ProbeBatch {
         let state = Arc::new(ProbeBatchState {
             remaining: Mutex::new(items.len()),
@@ -351,9 +396,13 @@ impl LibraryPool {
                         }
                         break item;
                     }
-                    if self.index_active.load(Ordering::SeqCst) == 0
-                        && let Some(item) = queue.extracts.pop_front()
-                    {
+                    let index_busy = self.index_active.load(Ordering::SeqCst) != 0;
+                    let should_pop = queue
+                        .extracts
+                        .front()
+                        .is_some_and(|front| !index_busy || front.priority);
+                    let next_extract = should_pop.then(|| queue.extracts.pop_front()).flatten();
+                    if let Some(item) = next_extract {
                         if self.availability.pause.is_paused(item.library_id) {
                             continue;
                         }
@@ -469,17 +518,33 @@ impl LibraryPool {
         if self.availability.pause.is_paused(item.library_id) {
             return;
         }
-        let row = match self.db.get_item(item.item_id) {
+        let item_id = item.item_id;
+        {
+            let mut extracting = self.extracting.lock().unwrap_or_else(|e| e.into_inner());
+            extracting.insert(item_id);
+        }
+        let finish = || {
+            self.extracting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&item_id);
+        };
+        let row = match self.db.get_item(item_id) {
             Ok(Some(row)) => row,
-            Ok(None) => return,
+            Ok(None) => {
+                finish();
+                return;
+            }
             Err(e) => {
-                tracing::warn!(item_id = item.item_id, error = %e, "load subtitle item failed");
+                tracing::warn!(item_id, error = %e, "load subtitle item failed");
+                finish();
                 return;
             }
         };
         // Permanent failure: no path to success until the source row is
         // re-upserted (mtime/size change resets status to pending).
         if row.subtitle_status == "error" {
+            finish();
             return;
         }
         let sidecars = match self.db.list_item_sidecars(item.item_id) {
@@ -493,6 +558,7 @@ impl LibraryPool {
                 .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(item_id = item.item_id, error = %e, "load subtitle sidecars failed");
+                finish();
                 return;
             }
         };
@@ -558,6 +624,7 @@ impl LibraryPool {
                 }
             }
         }
+        finish();
     }
 }
 
@@ -579,5 +646,28 @@ mod tests {
 
         assert_eq!(queue.extracts.len(), 1);
         assert_eq!(queue.extracts[0].item_id, 42);
+    }
+
+    #[test]
+    fn prioritize_extract_moves_existing_to_front() {
+        let mut queue = Queue {
+            probes: VecDeque::new(),
+            extracts: VecDeque::new(),
+        };
+        LibraryPool::enqueue_extract_unique(
+            &mut queue,
+            WorkItem::extract(1, 1, PathBuf::from("/a")),
+        );
+        LibraryPool::enqueue_extract_unique(
+            &mut queue,
+            WorkItem::extract(2, 1, PathBuf::from("/b")),
+        );
+        let pos = queue.extracts.iter().position(|w| w.item_id == 2).unwrap();
+        let mut item = queue.extracts.remove(pos).unwrap();
+        item.priority = true;
+        queue.extracts.push_front(item);
+        assert_eq!(queue.extracts[0].item_id, 2);
+        assert!(queue.extracts[0].priority);
+        assert_eq!(queue.extracts[1].item_id, 1);
     }
 }

@@ -389,28 +389,42 @@ paths:
   /api/v0/sessions/{sessionId}/subs/{asset}:
     get:
       operationId: getSessionSubtitlePlaylist
-      summary: One-segment subtitle media playlist for a session track
+      summary: Subtitle media playlist or WebVTT segment for a session track
       description: >
-        ADR-0010. EXT-X-MEDIA URI target. References the item WebVTT URL for
-        the snapshotted trackId.
+        ADR-0010 / ADR-0013. EXT-X-MEDIA URI target. Ready tracks use a
+        multi-segment `{trackId}.m3u8` whose `segNNN.vtt` bodies are sliced
+        from the item store VTT (no session demux). Cold session-inline
+        demux remains for fixtures only; Gate-1 snapshots only declare
+        complete/store tracks.
       parameters:
         - $ref: "#/components/parameters/SessionId"
         - name: asset
           in: path
           required: true
-          description: "{trackId}.m3u8 (e.g. e2.m3u8, s-en.m3u8)"
+          description: >
+            `{trackId}.m3u8` or `{trackId}/segNNN.vtt` (e.g. e2.m3u8,
+            e2/seg000.vtt, s-en/seg012.vtt)
           schema:
             type: string
-            pattern: '^[es][A-Za-z0-9._-]*\.m3u8$'
+            pattern: '^[es][A-Za-z0-9._-]*(?:\.m3u8|/seg[0-9]+\.vtt)$'
       responses:
         "200":
-          description: HLS subtitle media playlist
+          description: HLS subtitle media playlist or WebVTT segment
           content:
             application/vnd.apple.mpegurl:
               schema:
                 type: string
+            text/vtt:
+              schema:
+                type: string
         "404":
           description: Session or track not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Subtitle segment not ready yet (demux still catching up)
           content:
             application/json:
               schema:
@@ -557,9 +571,21 @@ components:
       type: string
       enum: [pending, ready, none, error, unavailable]
       description: >
-        pending = extract queued or in progress; ready = WebVTT on disk;
-        none = no serveable text tracks; error = permanent extract failure;
-        unavailable = mount/IO absence, retriable (ADR-0014).
+        Item-level extract queue state (ADR-0013 / ADR-0014). pending =
+        extract queued or in progress; ready = WebVTT on disk; none = no
+        serveable text tracks; error = permanent extract failure; unavailable
+        = mount/IO absence, retriable. Per-track first-play readiness is
+        SubtitleTrack.readiness, not this field.
+
+    SubtitleTrackReadiness:
+      type: string
+      enum: [preparing, partial, complete]
+      description: >
+        Server-declared per-track readiness for serveable text tracks
+        (ADR-0013 §11). preparing = extract not yet writing cues; partial =
+        a growing WebVTT is serveable; complete = final WebVTT. Clients never
+        invent this from file size or a timer. Absent on tracks that are
+        listed but not served (ASS/SSA, image).
 
     ScanJobState:
       type: string
@@ -916,12 +942,24 @@ components:
           minimum: 0
           nullable: true
           description: Absolute ffprobe stream index when source is embedded
+        readiness:
+          $ref: "#/components/schemas/SubtitleTrackReadiness"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >
+            Monotonic growth counter for this track's WebVTT body. Bumps when
+            the server writes more cues (partial) or the final file. Clients
+            that reload on growth compare this field; they do not infer growth
+            from content length.
         url:
           type: string
           nullable: true
           description: >
-            GET path for the WebVTT body when this track is served. Absent for
-            ASS/SSA and other non-serveable tracks that are still listed.
+            GET path for the WebVTT body when this track is served (partial or
+            complete). Absent while preparing, and for ASS/SSA / image tracks
+            that are still listed.
 
     EncoderStatus:
       type: string
