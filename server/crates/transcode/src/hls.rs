@@ -1,6 +1,12 @@
 //! HLS playback sessions (ADR-0007). A session either stream-copies the
 //! source (remux) or re-encodes it (transcode); the two differ by
 //! [`SessionMode`] and nothing else (ADR-0011).
+//!
+//! Fill-forward: FFmpeg starts at the play land point and encodes toward
+//! EOF. Cooked segments stay on disk for the session lifetime, so scrub
+//! into finished media is a plain file serve. Cold scrub restarts at the
+//! new offset (delay OK), then fills forward again. Encode lead-in is 0 —
+//! do not tax every seek with padding before the land frame.
 
 use super::audio::stereo_downmix_filter;
 use std::collections::HashMap;
@@ -30,15 +36,15 @@ const CATCH_UP_SEGMENTS: u64 = 2;
 const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// Maximum unprimed distance *behind the play land point* (`#EXT-X-START`)
 /// that still counts as start alignment rather than attach prefetch of
-/// `seg000`. Measured from `play_start`, not the encode window: lead-in puts
-/// the window eight segments earlier, and window-relative math treated
-/// `seg000` at a ~40 s switch (12 behind the window, 20 behind play) as
-/// alignment and yanked the encode back to zero.
+/// `seg000`. With encode-at-land (no lead-in), Safari dig-back near the
+/// land point restarts there; farther behind (seg000 on a mid-title
+/// attach) waits without yanking the encode to zero.
 const ALIGN_BEHIND_SEGMENTS: u64 = 16;
-/// Safari requested eight segments before EXT-X-START when switching tracks.
-/// Encoding exactly that span early serves its first request without making
-/// each seek transcode the former 16-segment margin before first frame.
-const ENCODE_LEAD_SEGMENTS: u64 = 8;
+/// Encode starts at the play land point (fill-forward). A non-zero lead
+/// used to absorb Safari dig-back by pre-cooking before land; that taxed
+/// every seek ~16s before first frame. Dig-back is handled by
+/// [`decide_segment_miss`] ALIGN instead.
+const ENCODE_LEAD_SEGMENTS: u64 = 0;
 
 #[derive(Debug)]
 pub enum StartSessionError {
@@ -113,22 +119,19 @@ pub enum SegmentMissAction {
     Restart,
 }
 
-/// Deliberate restart policy for cold regions of a full-title VOD playlist.
+/// Deliberate restart policy for cold regions of a full-title VOD playlist
+/// (fill-forward: encoder runs toward EOF; cooked segs stay on disk).
 ///
 /// - Behind the window: once `primed`, always restart (real scrub back),
 ///   gated by `RESTART_MIN_INTERVAL`. Before that, follow only when the
-///   miss is within `ALIGN_BEHIND_SEGMENTS` of **play_start** (the player
-///   settling near `#EXT-X-START`) — and do it even inside the min
-///   interval, otherwise a fresh mid-title session deadlocks for two
-///   seconds on dig-back past the encode lead-in. Farther behind (attach
-///   prefetch of `seg000`) waits without restart so the encode is not
-///   yanked to zero.
+///   miss is within `ALIGN_BEHIND_SEGMENTS` of **play_start** (player
+///   settling near `#EXT-X-START`). Farther behind (attach prefetch of
+///   `seg000`) waits without restart so the encode is not yanked to zero.
 /// - Ahead: restart only past `CATCH_UP_SEGMENTS` of the cooking band end,
-///   gated by `RESTART_MIN_INTERVAL`. The band end is
-///   `max(frontier, play_start_idx)` so encode lead-in (window starts
-///   before `#EXT-X-START`) does not treat land-point prefetch as a
-///   forward scrub. Frontier is the latest on-disk segment **at or after**
-///   the window start; retained pre-window segments must not count.
+///   gated by `RESTART_MIN_INTERVAL`. Band end is
+///   `max(frontier, play_start_idx)`. Frontier is the latest on-disk
+///   segment at or after the window start; retained pre-window segments
+///   must not count.
 pub fn decide_segment_miss(
     idx: u64,
     window_start_idx: u64,
@@ -199,8 +202,8 @@ struct Session {
     audio: AudioSelection,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
-    /// Encode window start (may lead `play_start_ms` so a client that
-    /// digs a few segments behind EXT-X-START still lands in-window).
+    /// Encode window start. Equals [`Session::play_start_ms`] while
+    /// [`ENCODE_LEAD_SEGMENTS`] is 0 (fill-forward / encode-at-land).
     start_ms: u64,
     /// Client land point for `#EXT-X-START` / seek intent.
     play_start_ms: u64,
@@ -644,9 +647,9 @@ fn restart_at(
     let play_start_ms = align_to_segment(play_ms);
     let start_ms = encode_start_ms(play_start_ms);
     stop_child(&mut session.child);
-    // Gate 2: do not wipe the prior encode window. In-flight segment fetches
-    // (seg1127…) must still hit disk while the new window is cooking. Only
-    // remove the muxer sidecar; ffmpeg -y overwrites init and new seg indices.
+    // Gate 2 / fill-forward: do not wipe prior segments. In-flight fetches
+    // and later scrub-back into cooked media must still hit disk. Only
+    // remove the muxer sidecar; ffmpeg -y overwrites init and new indices.
     let index = session.dir.join("index.m3u8");
     let _ = fs::remove_file(&index);
     let child = spawn_ffmpeg(
@@ -812,9 +815,8 @@ fn align_to_segment(ms: u64) -> u64 {
     (ms / SEGMENT_MS) * SEGMENT_MS
 }
 
-/// Encode a little earlier than the play land point so a client that
-/// requests a few segments behind `#EXT-X-START` (Safari near-start
-/// alignment) hits the cooking window instead of a behind-window miss.
+/// Encode at the play land point. Lead-in is 0 (fill-forward): the first
+/// cooked segment is the one playback needs, not sixteen seconds earlier.
 fn encode_start_ms(play_ms: u64) -> u64 {
     align_to_segment(play_ms.saturating_sub(ENCODE_LEAD_SEGMENTS * SEGMENT_MS))
 }
@@ -1429,8 +1431,8 @@ mod tests {
 
     #[test]
     fn miss_restart_offset_lands_on_requested_segment() {
-        // Invariant: a Restart for segment N aims play at N (encode may
-        // lead by ENCODE_LEAD_SEGMENTS), so the new window contains N.
+        // Restart for segment N aims play at N; with lead-in 0 the encode
+        // window starts at N.
         let cases = [(13u64, 1052u64), (0, 100), (1614, 1052)];
         for (idx, window) in cases {
             let action = decide_segment_miss(
@@ -1444,31 +1446,21 @@ mod tests {
             assert_eq!(action, SegmentMissAction::Restart, "idx={idx}");
             let want_ms = idx * SEGMENT_MS;
             let new_window = encode_start_ms(want_ms) / SEGMENT_MS;
-            assert!(
-                new_window <= idx,
-                "window after restart must contain segment N (idx={idx}, window={new_window})"
-            );
-            assert!(
-                idx - new_window <= ENCODE_LEAD_SEGMENTS,
-                "lead-in must stay within ENCODE_LEAD_SEGMENTS"
-            );
+            assert_eq!(new_window, idx, "encode-at-land: window == N (idx={idx})");
         }
     }
 
     #[test]
-    fn encode_lead_in_covers_measured_safari_dig_back() {
-        assert_eq!(
-            encode_start_ms(1_264_000),
-            1_264_000 - ENCODE_LEAD_SEGMENTS * SEGMENT_MS
-        );
+    fn encode_at_land_no_lead_in() {
+        assert_eq!(encode_start_ms(1_264_000), 1_264_000);
         assert_eq!(encode_start_ms(1_000), 0);
         assert_eq!(encode_start_ms(0), 0);
+        assert_eq!(ENCODE_LEAD_SEGMENTS, 0);
     }
 
-    /// Switch session (fresh POST at mid-title with a new audio config): the
-    /// first real request is Safari's EXT-X-START dig-back, not seg000.
-    /// Encode lead-in must serve it; seg000 must 503 without yanking the
-    /// window back to zero (play-relative ALIGN, ADR-0011).
+    /// Mid-title switch: land segment cooks first (encode-at-land). seg000
+    /// must 503 without yanking to zero. Dig-back behind land restarts via
+    /// ALIGN then serves (fill-forward from the dig point).
     #[test]
     fn switch_session_serves_first_requested_segment() {
         if !ffmpeg_available() {
@@ -1479,10 +1471,9 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
         let duration_ms = 60_000;
-        let play_ms = 40_000; // seg020; encode lead-in → seg012
+        let play_ms = 40_000; // seg020; encode-at-land
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
 
-        // Prior session still holding a cap slot (s9→s10 dogfood pattern).
         let prior = reg
             .start(
                 1,
@@ -1519,28 +1510,23 @@ mod tests {
             "switch land stays at the requested offset: {text}"
         );
 
-        // Capture: attach prefetch of seg000 must not move the window.
-        // Immediate NotReady while FFmpeg is alive; never a silent yank to 0
-        // (which would make the next dig-back miss and look like a 503 storm).
         match reg.asset(&switched, "seg000.m4s") {
             Err(PlaylistError::NotReady) => {}
             other => {
-                // Tiny fixtures may finish the encode before this assert; the
-                // window must still be the mid-title lead-in either way.
                 eprintln!("seg000 after switch playlist: {other:?}");
             }
         }
         assert_eq!(
-            decide_segment_miss(0, 12, 20, None, false, RESTART_MIN_INTERVAL),
+            decide_segment_miss(0, 20, 20, None, false, RESTART_MIN_INTERVAL),
             SegmentMissAction::Wait,
             "seg000 at a 40s switch must not count as start alignment"
         );
 
-        // First real request: dig-back inside lead-in (same as new_session).
+        // Dig-back behind land: ALIGN restarts, then fill-forward serves.
         let bytes = wait_asset(&reg, &switched, "seg013.m4s");
         assert!(
             !bytes.is_empty(),
-            "switch session first dig-back segment must be served without 503-forever"
+            "dig-back segment must be served without 503-forever"
         );
         let land = wait_asset(&reg, &switched, "seg020.m4s");
         assert!(!land.is_empty(), "switch land segment must serve");
@@ -1549,10 +1535,7 @@ mod tests {
         assert!(reg.stop(&switched));
     }
 
-    /// Fresh mid-title session: first segment request behind the play land
-    /// point (Safari EXT-X-START dig-back) must still be served. Encode
-    /// lead-in keeps it in-window; decide_segment_miss tolerance is the
-    /// backup when the dig exceeds the lead-in.
+    /// Fresh mid-title session: encode-at-land cooks seg020 first.
     #[test]
     fn new_session_serves_first_requested_segment() {
         if !ffmpeg_available() {
@@ -1563,7 +1546,7 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
         let duration_ms = 60_000;
-        let play_ms = 40_000; // seg020; encode lead-in → seg012
+        let play_ms = 40_000; // seg020; encode-at-land
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
             .start(
@@ -1580,11 +1563,10 @@ mod tests {
         let text = String::from_utf8_lossy(&playlist);
         assert!(
             text.contains("#EXT-X-START:TIME-OFFSET=40.000,PRECISE=YES"),
-            "play land stays at the requested offset, not the encode lead-in: {text}"
+            "play land is the encode start: {text}"
         );
-        // Seven segments behind play (~Safari dig); still inside lead-in.
-        let bytes = wait_asset(&reg, &id, "seg013.m4s");
-        assert!(!bytes.is_empty(), "first requested segment must be served");
+        let land = wait_asset(&reg, &id, "seg020.m4s");
+        assert!(!land.is_empty(), "land segment must be served");
         assert!(reg.stop(&id));
     }
 

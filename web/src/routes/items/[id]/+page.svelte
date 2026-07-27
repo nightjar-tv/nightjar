@@ -138,7 +138,8 @@
 			probe.mark('old_session_deleted', previous ?? 'none');
 			probe.mark('wait_begin', attachMode);
 			const landIdx = Math.floor(startMs / 2000);
-			const windowIdx = Math.max(0, landIdx - 8);
+			// Encode-at-land (lead-in 0): window start == play land.
+			const windowIdx = landIdx;
 			const ready = await waitForAttachReady(
 				started.playlistUrl,
 				windowIdx,
