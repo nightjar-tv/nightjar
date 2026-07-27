@@ -112,6 +112,27 @@ pub async fn create(
                 ApiError::internal(e)
             }
         })?;
+    // ADR-0004: accept work and return; do not block POST on a cold walk.
+    let db = std::sync::Arc::clone(&state.db);
+    let pool = std::sync::Arc::clone(&state.pool);
+    let library_id = row.id;
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || {
+            nightjar_scanner::start_scan_job(db, pool, library_id)
+        })
+        .await
+        {
+            Ok(Ok(job_id)) => {
+                tracing::info!(library_id, job_id, "scan job accepted on library create")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(library_id, error = %e, "scan on library create failed")
+            }
+            Err(e) => {
+                tracing::warn!(library_id, error = %e, "scan on library create join failed")
+            }
+        }
+    });
     Ok((StatusCode::CREATED, Json(to_dto(row))))
 }
 

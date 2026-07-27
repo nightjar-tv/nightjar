@@ -86,6 +86,8 @@ pub struct LibraryPool {
     queue: Mutex<Queue>,
     available: Condvar,
     walk_caches: Mutex<HashMap<i64, WalkCache>>,
+    /// Longest recent index-pass wall time; used only to know a first index
+    /// has finished so local roots can arm notify.
     last_index_ms: AtomicU64,
     scan_dirty: Mutex<HashSet<i64>>,
     index_active: AtomicUsize,
@@ -139,12 +141,6 @@ impl LibraryPool {
 
     pub fn last_index_duration_ms(&self) -> u64 {
         self.last_index_ms.load(Ordering::Relaxed)
-    }
-
-    pub fn poll_interval(&self) -> Duration {
-        let ms = self.last_index_duration_ms();
-        let secs = (ms.saturating_mul(2) / 1000).max(60);
-        Duration::from_secs(secs)
     }
 
     pub fn with_walk_cache<R>(&self, library_id: i64, f: impl FnOnce(&mut WalkCache) -> R) -> R {
@@ -255,7 +251,14 @@ impl LibraryPool {
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         match item.kind {
             WorkKind::Probe => queue.probes.push_back(item),
-            WorkKind::Extract => queue.extracts.push_back(item),
+            WorkKind::Extract => {
+                // Same-pass enqueue + drain_pending_extracts would otherwise
+                // demux one permanently-failing title twice in a second.
+                if queue.extracts.iter().any(|w| w.item_id == item.item_id) {
+                    return;
+                }
+                queue.extracts.push_back(item);
+            }
         }
         self.available.notify_one();
     }
@@ -474,6 +477,11 @@ impl LibraryPool {
                 return;
             }
         };
+        // Permanent failure: no path to success until the file changes (new
+        // mtime → upsert resets status). Do not burn another demux pass.
+        if row.subtitle_status == "error" {
+            return;
+        }
         let sidecars = match self.db.list_item_sidecars(item.item_id) {
             Ok(rows) => rows
                 .into_iter()

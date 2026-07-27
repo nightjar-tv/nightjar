@@ -1,5 +1,6 @@
 //! Library scanner: index pass, then bounded ffprobe pool (ADR-0004).
 
+mod fs_kind;
 mod pool;
 mod probe;
 mod reachability;

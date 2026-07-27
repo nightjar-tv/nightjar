@@ -135,10 +135,15 @@ this ADR records that as the reason, and the tests below lock it.
       file list and child set; only dirs whose own mtime moved are
       re-listed. Immediate-parent mtime updates when a file is added;
       ancestors need not. This is the steady-state poll path.
-   2. **Interval scales with index duration.**
-      `poll_interval = max(60s, 2 × last_index_duration)`. After a cold
-      ~150 s Movies index the next poll waits ~300 s, so walks cannot
-      pile up.
+   2. **Fixed 60 s poll interval; poll only where notify is untrustworthy.**
+      The earlier `max(60s, 2 × last_index_duration)` never changed the
+      answer for warm walks under 30 s — the floor was the real policy.
+      Poll is the primary mechanism for network-backed roots (SMB/NFS/…):
+      notify can arm successfully there and still miss creates. Local
+      roots poll only until the first index finishes, then move to
+      notify-only. `NIGHTJAR_POLL_ONLY=1` forces poll for every root.
+      `POST /libraries` starts an async scan job immediately (ADR-0004)
+      so a new library does not wait for the next poll tick.
    3. **Dirty follow-up after a busy scan.** `start_scan_job` reuses an
       active job. An fs change that arrives after the walk has already
       passed that directory would otherwise wait for the next poll. The
@@ -163,12 +168,11 @@ this ADR records that as the reason, and the tests below lock it.
       the parent was re-listed (a new `.srt` bumps that dir's mtime). A
       cold cache after restart skips the bulk pass; existing sidecar rows
       stay in the DB.
-   6. **Defer recursive `notify` until the first index pass finishes.**
-      Arming recursive watches on an SMB Movies root during the cold walk
-      competed for metadata IOPS and pushed walks past 15–20 minutes.
-      The watcher polls until `last_index_duration_ms > 0`, then arms
-      notify. `NIGHTJAR_POLL_ONLY=1` keeps notify off for shares where
-      poll alone is preferred.
+   6. **Defer recursive `notify` on local roots until the first index
+      pass finishes.** Arming recursive watches during a cold walk
+      competed for metadata IOPS on SMB; network roots never leave the
+      poll set. Local roots: poll until `last_index_duration_ms > 0`,
+      then notify-only.
 
 9. **Probe and scan-job resume across restarts.** Items left
    `probe_status = indexed` after a process exit are stranded if the pool
