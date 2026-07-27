@@ -3,7 +3,7 @@
 	import { page } from '$app/state';
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
-	import { attachHls, type HlsHandle } from '$lib/hlsPlayer';
+	import { attachHls, parkForSwitch, type HlsHandle } from '$lib/hlsPlayer';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItem'];
@@ -52,8 +52,8 @@
 		return track.channelLayout ? `${name} · ${track.channelLayout}` : name;
 	}
 
-	/** Poll a session playlist until FFmpeg has written its first segment. */
-	async function waitForPlaylist(url: string): Promise<boolean> {
+	/** Poll until FFmpeg has written a servable response (playlist or segment). */
+	async function waitForReady(url: string): Promise<boolean> {
 		for (let i = 0; liveRef.alive && i < 100; i++) {
 			const res = await fetch(url);
 			if (res.ok) return true;
@@ -62,6 +62,10 @@
 			await new Promise((r) => setTimeout(r, 200));
 		}
 		return false;
+	}
+
+	function sessionAssetUrl(playlistUrl: string, name: string): string {
+		return playlistUrl.replace(/\/master\.m3u8$/, `/${name}`);
 	}
 
 	function selectAudio(trackId: string) {
@@ -107,12 +111,24 @@
 		const startMs = Math.max(0, Math.floor(seconds * 1000));
 		const previous = sessionRef.id;
 		switchingAudio = true;
+		// Park immediately so the old track cannot keep playing past the
+		// switch point and then jump backwards when the new session lands.
+		parkForSwitch(videoEl, playerRef.handle);
+		playerRef.handle = null;
+		playlistUrl = null;
 		try {
 			const started = await api.startTranscodeSession(itemId, startMs, trackId);
-			const ready = await waitForPlaylist(started.playlistUrl);
+			const playlistOk = await waitForReady(started.playlistUrl);
+			// Land segment (aligned 2s index) must be servable before cutover
+			// so attach does not sit on a cold 503 at the switch point.
+			const landIdx = Math.floor(startMs / 2000);
+			const landName = `seg${String(landIdx).padStart(3, '0')}.m4s`;
+			const landOk =
+				playlistOk &&
+				(await waitForReady(sessionAssetUrl(started.playlistUrl, landName)));
 			// Never adopt a session the page no longer owns; leaving it for
 			// the idle reaper burns a cap slot for a minute.
-			if (!ready || !liveRef.alive) {
+			if (!landOk || !liveRef.alive) {
 				void api.deleteTranscodeSession(started.sessionId);
 				if (liveRef.alive) error = copy.sessionFailed;
 				return;
@@ -130,7 +146,10 @@
 	}
 
 	const playable = $derived(
-		playback != null && (playback.playbackMethod === 'directPlay' || playlistUrl != null)
+		playback != null &&
+			(playback.playbackMethod === 'directPlay' ||
+				playlistUrl != null ||
+				switchingAudio)
 	);
 
 	// Discovered but not served (ASS/SSA sidecars): say so instead of hiding.
@@ -181,7 +200,7 @@
 					return;
 				}
 				// Wait until init is ready so the VOD playlist is servable.
-				if (await waitForPlaylist(started.playlistUrl)) {
+				if (await waitForReady(started.playlistUrl)) {
 					playlistUrl = started.playlistUrl;
 					preparingSession = false;
 					return;
@@ -296,6 +315,8 @@
 			{#if unrenderedSubtitles}
 				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
 			{/if}
+		{:else if switchingAudio}
+			<p class="preparing" role="status">{copy.switchingAudio}</p>
 		{:else if preparingSession}
 			<p class="preparing" role="status">{copy.preparingSession}</p>
 		{:else if playback.playbackMethod !== 'directPlay'}
@@ -319,9 +340,6 @@
 					</label>
 				{/each}
 			</fieldset>
-			{#if switchingAudio}
-				<p class="preparing" role="status">{copy.switchingAudio}</p>
-			{/if}
 			{#if audioNote}
 				<p class="preparing" role="status">{audioNote}</p>
 			{/if}

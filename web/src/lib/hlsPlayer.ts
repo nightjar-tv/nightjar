@@ -40,6 +40,19 @@ export interface HlsHandle {
 }
 
 /**
+ * Stop audible playback before a session cutover (audio switch). Leaves the
+ * element without a source so the old track cannot keep playing while the
+ * new session cooks — the item page shows a loading state until attach.
+ */
+export function parkForSwitch(video: HTMLVideoElement | null, handle: HlsHandle | null) {
+	handle?.destroy();
+	if (!video) return;
+	video.pause();
+	video.removeAttribute('src');
+	video.load();
+}
+
+/**
  * Attach an HLS VOD playlist.
  *
  * Scrub sequence:
@@ -129,6 +142,7 @@ export function attachHls(
 
 	return {
 		destroy: () => {
+			if (destroyed) return;
 			destroyed = true;
 			video.removeEventListener('seeked', onSeeked);
 			video.removeEventListener('canplay', onCanPlay);
