@@ -299,9 +299,11 @@ async fn wait_playlist(
     let sid = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         // The playlist is held back until FFmpeg writes the init segment.
-        // Cold 1080p software encodes need a couple of seconds; wait up to 5s
-        // so clients see a 200 rather than a thrash of 404s.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Mid-title hardware sessions on a real library can take longer than
+        // 5s to produce the first segment, especially during an audio switch
+        // if the old session has only just been reaped. Match the segment wait
+        // budget so the browser sees one long request instead of repeated 503s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let outcome = match kind {
                 PlaylistKind::Master => hls.master(&sid, start_ms),

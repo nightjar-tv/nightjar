@@ -118,6 +118,10 @@
 		playlistUrl = null;
 		try {
 			const started = await api.startTranscodeSession(itemId, startMs, trackId);
+			// The old session is no longer honest UI once the player is parked.
+			// Reap it now so a hardware encoder slot is not held while the new
+			// session cooks.
+			if (previous) void api.deleteTranscodeSession(previous);
 			const playlistOk = await waitForReady(started.playlistUrl);
 			// Land segment (aligned 2s index) must be servable before cutover
 			// so attach does not sit on a cold 503 at the switch point.
@@ -137,7 +141,6 @@
 			sessionEncoder = started;
 			resumeRef.seconds = startMs / 1000;
 			playlistUrl = started.playlistUrl;
-			if (previous) void api.deleteTranscodeSession(previous);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
