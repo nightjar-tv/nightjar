@@ -138,7 +138,9 @@ this ADR records that as the reason, and the tests below lock it.
    2. **Interval scales with index duration.**
       `poll_interval = max(60s, 2 × last_index_duration)`. After a cold
       ~150 s Movies index the next poll waits ~300 s, so walks cannot
-      pile up.
+      pile up. (Later measurement showed the 2× term never moves the
+      answer for warm walks under 30 s; the floor is the steady-state
+      policy. Interval redesign is a separate brief.)
    3. **Dirty follow-up after a busy scan.** `start_scan_job` reuses an
       active job. An fs change that arrives after the walk has already
       passed that directory would otherwise wait for the next poll. The
@@ -169,6 +171,63 @@ this ADR records that as the reason, and the tests below lock it.
       The watcher polls until `last_index_duration_ms > 0`, then arms
       notify. `NIGHTJAR_POLL_ONLY=1` keeps notify off for shares where
       poll alone is preferred.
+   7. **Parallelise directory re-stat (metadata), not file reads.**
+      Warm walks are latency-bound: one SMB RTT per directory, issued
+      sequentially (~7 ms × 3,046 dirs ≈ 22 s on TV). Concurrent stats
+      hide that latency. This is the opposite of parallel *file* reads
+      (subtitle extract): those move real bytes through one pipe, and
+      more threads make the share worse (the Jellyfin concurrency lesson
+      already in this ADR). Extract stays serial; the walk uses a
+      bounded worker pool. Default **8** workers
+      (`NIGHTJAR_WALK_CONCURRENCY`, clamp 1..=256). Not scaled by CPU
+      core count. Chosen below the measured knee (~16–32 on this link)
+      so a Pi, a Synology, or a rate-limited rclone mount is not pushed
+      to the MacBook Wi-Fi ceiling.
+
+      Serial warm baselines (2026-07-27, before parallel walk; keep for
+      legibility of earlier reasoning), MacBook Air, Wi-Fi 802.11ax,
+      SMB, Nightjar stopped, Movies 1,754 files / 1,770 dirs, TV 23,062
+      / 3,046:
+
+      | Library | Condition | Timings (s) | min / med / max |
+      |---|---|---|---|
+      | Movies | idle warm (serial) | 0.084, 7.941, 12.925, 12.222, 12.412, 14.931 | 0.08 / 12.3 / 14.9 |
+      | TV | idle warm (serial) | 21.292, 22.391, 21.683, 21.506, 21.484, 22.180 | 21.3 / 21.6 / 22.4 |
+      | Movies | cold after remount (serial) | 120.7, 115.7, 129.2, 136.0, 124.1, 127.5 | 115.7 / 125.8 / 136.0 |
+      | TV | cold after remount (serial, n=3) | 723.7, 728.8, 686.7 | 686.7 / 723.7 / 728.8 |
+
+      Concurrency sweep, same host/link, three warm runs each after a
+      serial prime (concurrency 1 is this code's serial path):
+
+      | Library | Conc. | Run timings (s) | median |
+      |---|---:|---|---:|
+      | Movies | 1 | 12.133, 12.916, 11.928 | 12.1 |
+      | Movies | 4 | 0.431, 2.882, 0.471 | 0.47 |
+      | Movies | 8 | 1.664, 0.307, 1.637 | 1.64 |
+      | Movies | 16 | 0.241, 1.066, 0.333 | 0.33 |
+      | Movies | 32 | 0.832, 0.155, 0.780 | 0.78 |
+      | Movies | 64 | 0.181, 0.716, 0.161 | 0.18 |
+      | TV | 1 | 23.089, 21.238, 21.513 | 21.5 |
+      | TV | 4 | 3.060, 2.893, 3.554 | 3.06 |
+      | TV | 8 | 1.733, 1.937, 1.461 | 1.73 |
+      | TV | 16 | 1.215, 0.979, 1.166 | 1.17 |
+      | TV | 32 | 1.046, 0.836, 0.794 | 0.84 |
+      | TV | 64 | 0.922, 0.685, 0.819 | 0.82 |
+
+      Knee: TV gains flatten after ~16 (1.17 s → 0.84 s → 0.82 s). RSS
+      stayed ~25 MB at the high end; no pathological memory spike.
+
+      At default 8, same day: warm during ffmpeg x264 read of an ~8 GB
+      title from the share: Movies 1.9–3.9 s, TV 4.3–7.5 s (ffmpeg still
+      running). Cold after one remount: Movies 7.9–21.9 s (first after
+      remount slowest), TV 146–150 s (was 687–729 s serial). Cold remains
+      file-count-bound; concurrency still helps a lot.
+
+      **Implication for poll scheduling:** TV idle warm at 8 workers is
+      ~1.7 s. A fixed 60 s poll is ~3% duty cycle on this link. Adaptive
+      interval / confidence / backoff machinery is not justified by walk
+      cost alone. SMB-over-Wi-Fi MacBook Air numbers; ethernet and weaker
+      hosts are separate data points.
 
 9. **Probe and scan-job resume across restarts.** Items left
    `probe_status = indexed` after a process exit are stranded if the pool

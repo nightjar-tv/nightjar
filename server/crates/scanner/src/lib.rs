@@ -8,6 +8,10 @@ mod watch;
 
 pub use pool::LibraryPool;
 pub use reachability::{Reachability, allow_delete_missing, check_root};
+pub use walk::{
+    WalkCache, WalkOutcome, walk_concurrency, walk_media_files_cached,
+    walk_media_files_cached_with_concurrency,
+};
 pub use watch::spawn_library_watcher;
 
 use nightjar_core::parse_filename;
