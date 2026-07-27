@@ -211,6 +211,8 @@ struct Session {
     last_restart: Instant,
     /// True after serving at least one segment at or past encode `start_ms`.
     primed: bool,
+    /// Set once the window's first segment lands on disk (playlist-ready).
+    first_segment_ready: bool,
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
@@ -291,6 +293,7 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&dir).map_err(|e| {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
+        let spawn_started = Instant::now();
         let child = spawn_ffmpeg(
             src,
             &dir,
@@ -300,6 +303,7 @@ impl HlsSessionRegistry {
             &self.video_encoder,
         )
         .map_err(StartSessionError::Spawn)?;
+        let spawn_ms = spawn_started.elapsed().as_millis();
         tracing::info!(
             session_id = %id,
             item_id,
@@ -309,6 +313,7 @@ impl HlsSessionRegistry {
             audio_stream = ?audio.stream_index,
             audio_channels = audio.channels,
             encoder = %self.video_encoder,
+            spawn_ms,
             "hls session started"
         );
         sessions.insert(
@@ -327,6 +332,7 @@ impl HlsSessionRegistry {
                 last_access: Instant::now(),
                 last_restart: Instant::now(),
                 primed: false,
+                first_segment_ready: false,
                 failed: None,
                 subtitle_tracks,
             },
@@ -458,6 +464,7 @@ impl HlsSessionRegistry {
         if !session.dir.join(&first).exists() {
             return Err(PlaylistError::NotReady);
         }
+        note_first_segment_ready(session_id, session);
         build(session)
     }
 
@@ -494,6 +501,7 @@ impl HlsSessionRegistry {
                     {
                         session.primed = true;
                     }
+                    note_first_segment_ready(session_id, session);
                     return Ok(bytes);
                 }
                 if let Some(err) = note_child_exit(session) {
@@ -654,6 +662,7 @@ fn restart_at(
     session.failed = None;
     session.last_restart = Instant::now();
     session.primed = false;
+    session.first_segment_ready = false;
     tracing::info!(
         start_ms,
         play_start_ms,
@@ -662,6 +671,36 @@ fn restart_at(
         "hls session seek restart"
     );
     Ok(())
+}
+
+/// Logs once when the encode window's first segment appears. This is the
+/// playlist-ready moment — distinct from client-observed HTTP latency, and
+/// the number that decides whether a timeout bump is papering over encode
+/// startup rather than fixing it.
+fn note_first_segment_ready(session_id: &str, session: &mut Session) {
+    if session.first_segment_ready {
+        return;
+    }
+    let first = segment_name(session.start_ms / SEGMENT_MS);
+    if !session.dir.join(&first).exists() {
+        return;
+    }
+    session.first_segment_ready = true;
+    let elapsed_ms = session.last_restart.elapsed().as_millis();
+    let lead_segments = session
+        .play_start_ms
+        .saturating_sub(session.start_ms)
+        / SEGMENT_MS;
+    tracing::info!(
+        session_id,
+        elapsed_ms,
+        start_ms = session.start_ms,
+        play_start_ms = session.play_start_ms,
+        lead_segments,
+        encoder = %session.video_encoder,
+        path = %session.src.display(),
+        "hls_session_first_segment_ready"
+    );
 }
 
 fn note_child_exit(session: &mut Session) -> Option<String> {
