@@ -502,7 +502,9 @@ struct Session {
     /// When [`Session::pending_play_ms`] was last updated (debounce clock).
     pending_since: Option<Instant>,
     /// Refuse retained behind-play serves until this instant (see
-    /// [`STALE_RETAIN_REFUSE`]). Cleared when elapsed.
+    /// [`STALE_RETAIN_REFUSE`]). Cleared when elapsed, or when the new play
+    /// land appears ([`note_first_segment_ready`]) so Safari is not stuck
+    /// 503-retrying a superseded middle land for the full TTL after cook.
     stale_retain_refuse_until: Option<Instant>,
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
@@ -827,6 +829,8 @@ impl HlsSessionRegistry {
     /// `fetcher` is log-only (optional `njFetcher` query): JS land-ensure /
     /// attach-wait probes set it; Safari's native HLS engine does not. Used
     /// to tell probe traffic from WebKit's own segment GETs in dogfood logs.
+    /// (Native instant-503 while cooking was tried and rejected: broke
+    /// fill-forward prefetch and double-scrub dig-back.)
     pub fn asset(
         &self,
         session_id: &str,
@@ -1407,7 +1411,8 @@ pub fn serve_ok_after_pending_apply(play_before_ms: u64, play_after_ms: u64) -> 
 ///
 /// Near-land dig-back (within [`ENCODE_LEAD_SEGMENTS`]) and anything at/ahead
 /// of play stay servable. Farther behind is the superseded scrub Safari still
-/// GETs after coalesce — refuse only while `guard_active` (TTL), not forever.
+/// GETs after coalesce — refuse only while `guard_active` (TTL until land
+/// ready, or until TTL elapses if land never clears it), not forever.
 pub fn serve_ok_retained_during_stale_guard(
     want_ms: u64,
     play_start_ms: u64,
@@ -1498,6 +1503,10 @@ fn spawn_segment_milestone_watch(
 /// land exists — that left Safari retrying the prior land seg forever
 /// (dogfood: seg415 after scrub to 1188). Far pending may preempt earlier
 /// via [`coalesce_preempt_before_land`] once [`RESTART_MIN_INTERVAL`] elapses.
+///
+/// Clears [`Session::stale_retain_refuse_until`]: the guard protects while the
+/// new land cooks; keeping it for the full TTL after land is ready left Safari
+/// 503-retrying the superseded middle land (~15s) before dig-back (dogfood).
 fn note_first_segment_ready(session_id: &str, session: &mut Session) {
     if session.first_segment_ready {
         return;
@@ -1507,6 +1516,7 @@ fn note_first_segment_ready(session_id: &str, session: &mut Session) {
         return;
     }
     session.first_segment_ready = true;
+    session.stale_retain_refuse_until = None;
     let elapsed_ms = session.last_restart.elapsed().as_millis();
     let lead_segments = session.play_start_ms.saturating_sub(session.start_ms) / SEGMENT_MS;
     tracing::info!(
@@ -2598,7 +2608,45 @@ mod tests {
     }
 
     #[test]
+    fn stale_retain_cleared_when_play_land_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let play_ms = 2_538_000u64;
+        let land = segment_name(play_ms / SEGMENT_MS);
+        fs::write(dir.path().join(&land), b"x").expect("land seg");
+        let mut session = Session {
+            item_id: 1,
+            src: PathBuf::from("/dev/null"),
+            dir: dir.path().to_path_buf(),
+            mode: SessionMode::Transcode,
+            audio: stereo(),
+            video_encoder: "libx264".into(),
+            start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
+            play_start_ms: play_ms,
+            duration_ms: 3_600_000,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: false,
+            first_segment_ready: false,
+            pending_play_ms: None,
+            pending_since: None,
+            stale_retain_refuse_until: Some(Instant::now() + STALE_RETAIN_REFUSE),
+            failed: None,
+            subtitle_tracks: vec![],
+        };
+        note_first_segment_ready("test", &mut session);
+        assert!(session.first_segment_ready);
+        assert!(
+            session.stale_retain_refuse_until.is_none(),
+            "land ready must clear stale guard so Safari is not stuck 503-retrying"
+        );
+    }
+
+    #[test]
     fn stale_retain_guard_refuses_far_behind_only_while_active() {
+        // Lifecycle: armed during cook (refuse far-behind retained); cleared
+        // when play land is ready (note_first_segment_ready) or TTL elapses —
+        // same as guard_active=false so Safari can dig-back after coalesce.
         let play_b = 1_332_000u64;
         let land_a = 910_000u64;
         assert!(
@@ -2607,7 +2655,7 @@ mod tests {
         );
         assert!(
             serve_ok_retained_during_stale_guard(land_a, play_b, false),
-            "after TTL: scrub-back may serve retained"
+            "after land-ready clear / TTL: retained prior land may serve"
         );
         assert!(
             serve_ok_retained_during_stale_guard(play_b, play_b, true),

@@ -11,7 +11,7 @@ import {
 
 /** Slightly above server `SEGMENT_WAIT` (30s) so the server can 503 first. */
 const LAND_SEGMENT_FETCH_MS = 32_000;
-/** Pause between land-ensure attempts so instant 503s do not spin hot. */
+/** Pause between land-ensure attempts so 503 retries do not spin hot. */
 const LAND_ENSURE_BACKOFF_MS = 400;
 /**
  * After the last `seeking` event, wait this long before committing land.
@@ -164,8 +164,8 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
  *    tick (seeked storms). After land-ensure 200: under suppressSeekNotify,
  *    seek to the ensure land (nudge if already there) and `play()`. Do not
  *    remount `src`+#t= on scrub — cold dig-back (~8 segs) exceeds encode
- *    lead (2) and wedges on 503 (dogfood). Industry Safari scrub is
- *    currentTime on a stable HLS src (Jellyfin/Plex).
+ *    lead (2) and wedges on 503 (dogfood). Safari scrub is currentTime on
+ *    a stable HLS src.
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -216,18 +216,111 @@ export function attachHls(
 		lastScrubAtMs = now;
 	};
 
+	const watchRecoverAfterLand = (landT: number) => {
+		const t0 = performance.now();
+		let ticks = 0;
+		let timeupdates = 0;
+		let playings = 0;
+		let waitings = 0;
+		let stalleds = 0;
+		const onTu = () => {
+			timeupdates += 1;
+		};
+		const onPlaying = () => {
+			playings += 1;
+			console.info(
+				`[nj-scrub] event playing +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
+			);
+		};
+		const onWaiting = () => {
+			waitings += 1;
+			console.info(
+				`[nj-scrub] event waiting +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
+			);
+		};
+		const onStalled = () => {
+			stalleds += 1;
+			console.info(
+				`[nj-scrub] event stalled +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
+			);
+		};
+		const onErr = () => {
+			const err = video.error;
+			console.info(
+				`[nj-scrub] event error +${Math.round(performance.now() - t0)}ms code=${err?.code ?? '-'} msg=${err?.message ?? '-'}`
+			);
+		};
+		video.addEventListener('timeupdate', onTu);
+		video.addEventListener('playing', onPlaying);
+		video.addEventListener('waiting', onWaiting);
+		video.addEventListener('stalled', onStalled);
+		video.addEventListener('error', onErr);
+		const bufNear = (ct: number): string => {
+			const b = video.buffered;
+			const parts: string[] = [];
+			for (let i = 0; i < b.length; i++) {
+				const start = b.start(i);
+				const end = b.end(i);
+				if (end < ct - 30 || start > ct + 30) continue;
+				parts.push(`${start.toFixed(1)}-${end.toFixed(1)}`);
+			}
+			return parts.length ? parts.join(',') : '-';
+		};
+		const finish = (advanced: boolean, ct: number) => {
+			video.removeEventListener('timeupdate', onTu);
+			video.removeEventListener('playing', onPlaying);
+			video.removeEventListener('waiting', onWaiting);
+			video.removeEventListener('stalled', onStalled);
+			video.removeEventListener('error', onErr);
+			window.clearInterval(watch);
+			console.info(
+				`[nj-scrub] recover-done advanced=${advanced} ct=${ct.toFixed(2)} +${Math.round(performance.now() - t0)}ms tu=${timeupdates} playing=${playings} waiting=${waitings} stalled=${stalleds}`
+			);
+		};
+		const watch = window.setInterval(() => {
+			if (destroyed) {
+				finish(false, video.currentTime);
+				return;
+			}
+			ticks += 1;
+			const ct = video.currentTime;
+			const advanced = ct >= landT + 0.5;
+			const err = video.error;
+			console.info(
+				`[nj-scrub] recover +${Math.round(performance.now() - t0)}ms ct=${ct.toFixed(2)} land=${landT.toFixed(2)} rs=${video.readyState} ns=${video.networkState} paused=${video.paused} seeking=${video.seeking} advanced=${advanced} tu=${timeupdates} buf=${bufNear(ct)} err=${err?.code ?? '-'}`
+			);
+			if (advanced || ticks >= 120) {
+				finish(advanced, ct);
+			}
+		}, 500);
+	};
+
+	const nudgePlayheadToLand = (seconds: number) => {
+		const t = Math.max(0, seconds);
+		const at = video.currentTime;
+		suppressSeekNotify = true;
+		landRetargetSeconds = t;
+		if (Math.abs(at - t) < 0.05) {
+			video.currentTime = t >= 0.05 ? t - 0.05 : t + 0.05;
+		} else {
+			video.currentTime = t;
+		}
+		void video.play().catch(() => {});
+		watchRecoverAfterLand(t);
+	};
+
 	/**
 	 * Ensure the playhead video segment is cooked. Each GET is a server
-	 * long-poll (up to SEGMENT_WAIT). Instant 503 means "not yet / wait" —
-	 * backoff and ask again until this ensure is superseded (newer scrub
-	 * aborts parent) or destroy. Never a fixed retry cap: that burned both
+	 * long-poll (up to SEGMENT_WAIT). 503 means "not yet / wait" — backoff
+	 * and ask again until this ensure is superseded (newer scrub aborts
+	 * parent) or destroy. Never a fixed retry cap: that burned both
 	 * attempts in milliseconds while the server was still coalescing.
 	 * On success: seek WebKit to the ensure land (suppressSeekNotify) then
 	 * `play()`. Side-channel fetch does not fill Safari's buffer; same-value
 	 * currentTime is a no-op. Do **not** remount `src`+#t= here — measured
 	 * dig-back ~8 segs behind encode start (lead=2) → eternal 503 → black /
-	 * scrubber at 0 (dogfood). Jellyfin/Plex scrub Safari via currentTime on
-	 * a stable HLS src; remount is for stream changes, not scrub.
+	 * scrubber at 0 (dogfood). Safari scrub is currentTime on a stable HLS
+	 * src; remount is for stream changes, not scrub.
 	 *
 	 * Supersede = parent abort only. Do NOT bail because `currentTime` still
 	 * sits on the prior scrub: after scrub→scrub WebKit may still show A's
@@ -283,98 +376,10 @@ export function attachHls(
 							ok = true;
 							const t = Math.max(0, seconds);
 							const at = video.currentTime;
-							suppressSeekNotify = true;
-							landRetargetSeconds = t;
 							console.info(
 								`[nj-scrub] land ready seg=${String(idx).padStart(3, '0')} t=${t.toFixed(2)} at=${at.toFixed(2)} nudge`
 							);
-							if (Math.abs(at - t) < 0.05) {
-								video.currentTime = t >= 0.05 ? t - 0.05 : t + 0.05;
-							} else {
-								video.currentTime = t;
-							}
-							void video.play().catch(() => {});
-							const landT = t;
-							const t0 = performance.now();
-							// Dogfood: native Safari has no hls.js; log HTMLMediaElement
-							// play-state until time advances or ~60s. Prior 5s window
-							// missed late recovery after serialized double-scrub.
-							let ticks = 0;
-							let timeupdates = 0;
-							let playings = 0;
-							let waitings = 0;
-							let stalleds = 0;
-							const onTu = () => {
-								timeupdates += 1;
-							};
-							const onPlaying = () => {
-								playings += 1;
-								console.info(
-									`[nj-scrub] event playing +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
-								);
-							};
-							const onWaiting = () => {
-								waitings += 1;
-								console.info(
-									`[nj-scrub] event waiting +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
-								);
-							};
-							const onStalled = () => {
-								stalleds += 1;
-								console.info(
-									`[nj-scrub] event stalled +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
-								);
-							};
-							const onErr = () => {
-								const err = video.error;
-								console.info(
-									`[nj-scrub] event error +${Math.round(performance.now() - t0)}ms code=${err?.code ?? '-'} msg=${err?.message ?? '-'}`
-								);
-							};
-							video.addEventListener('timeupdate', onTu);
-							video.addEventListener('playing', onPlaying);
-							video.addEventListener('waiting', onWaiting);
-							video.addEventListener('stalled', onStalled);
-							video.addEventListener('error', onErr);
-							const bufNear = (ct: number): string => {
-								const b = video.buffered;
-								const parts: string[] = [];
-								for (let i = 0; i < b.length; i++) {
-									const start = b.start(i);
-									const end = b.end(i);
-									if (end < ct - 30 || start > ct + 30) continue;
-									parts.push(`${start.toFixed(1)}-${end.toFixed(1)}`);
-								}
-								return parts.length ? parts.join(',') : '-';
-							};
-							const finish = (advanced: boolean, ct: number) => {
-								video.removeEventListener('timeupdate', onTu);
-								video.removeEventListener('playing', onPlaying);
-								video.removeEventListener('waiting', onWaiting);
-								video.removeEventListener('stalled', onStalled);
-								video.removeEventListener('error', onErr);
-								window.clearInterval(watch);
-								console.info(
-									`[nj-scrub] recover-done advanced=${advanced} ct=${ct.toFixed(2)} +${Math.round(performance.now() - t0)}ms tu=${timeupdates} playing=${playings} waiting=${waitings} stalled=${stalleds}`
-								);
-							};
-							const watch = window.setInterval(() => {
-								if (destroyed) {
-									finish(false, video.currentTime);
-									return;
-								}
-								ticks += 1;
-								const ct = video.currentTime;
-								const advanced = ct >= landT + 0.5;
-								const err = video.error;
-								console.info(
-									`[nj-scrub] recover +${Math.round(performance.now() - t0)}ms ct=${ct.toFixed(2)} land=${landT.toFixed(2)} rs=${video.readyState} ns=${video.networkState} paused=${video.paused} seeking=${video.seeking} advanced=${advanced} tu=${timeupdates} buf=${bufNear(ct)} err=${err?.code ?? '-'}`
-								);
-								// ~60s at 500ms — covers serialized double-scrub late play.
-								if (advanced || ticks >= 120) {
-									finish(advanced, ct);
-								}
-							}, 500);
+							nudgePlayheadToLand(t);
 							return;
 						}
 						// 404: session gone. 204: no-fill hold ceiling. Else retry.
