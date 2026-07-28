@@ -32,7 +32,7 @@ export function segmentVttName(index: number): string {
 }
 
 /** `segNNN.m4s` — matches `segment_name` in hls.rs. */
-export function segmentM4sName(index: number): string {
+function segmentM4sName(index: number): string {
 	const n = Math.max(0, Math.floor(index));
 	return `seg${String(n).padStart(3, '0')}.m4s`;
 }
@@ -44,7 +44,7 @@ export function sessionBaseFromMaster(playlistBase: string): string {
 	return noQuery.replace(/\/master\.m3u8$/i, '');
 }
 
-export function videoSegmentUrl(sessionBase: string, segmentIndex: number): string {
+function videoSegmentUrl(sessionBase: string, segmentIndex: number): string {
 	return `${sessionBase}/${segmentM4sName(segmentIndex)}`;
 }
 
@@ -52,7 +52,7 @@ export function videoSegmentUrl(sessionBase: string, segmentIndex: number): stri
  * Same segment URL with a log-only `njFetcher` query. Serving ignores it;
  * Safari native HLS never adds it — dogfood logs can tell probe from WebKit.
  */
-export function videoSegmentUrlWithFetcher(
+function videoSegmentUrlWithFetcher(
 	sessionBase: string,
 	segmentIndex: number,
 	fetcher: 'land-ensure' | 'attach-wait'

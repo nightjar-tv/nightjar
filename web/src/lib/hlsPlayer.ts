@@ -29,9 +29,6 @@ const LAND_COMMIT_QUIET_MS = 300;
 const SEEK_SUPPRESS_TIMEOUT_MS = 2_000;
 
 export {
-	needsSubtitleWatch,
-	reloadTextTrackElement,
-	subtitleTrackSrc,
 	watchProgressiveSubtitles
 } from './subtitleProgressive';
 
@@ -172,8 +169,6 @@ export function attachHls(
 	});
 
 	let positionSeconds = (): number => Math.max(0, video.currentTime);
-	/** `performance.now()` of last user scrub (`seeked`); for [nj-scrub] gaps. */
-	let lastScrubAtMs = 0;
 	/** Abort in-flight land-segment ensure when a newer scrub arrives. */
 	let landEnsureAbort: AbortController | null = null;
 	/** Segment index with an in-flight ensure (blocks echo `seeked`). */
@@ -233,94 +228,6 @@ export function attachHls(
 
 	const sessionBase = sessionBaseFromMaster(playlistBase);
 
-	const logScrubRequested = () => {
-		const now = performance.now();
-		const priorMs = lastScrubAtMs > 0 ? Math.round(now - lastScrubAtMs) : null;
-		console.info(
-			`[nj-scrub] scrub requested t=${video.currentTime.toFixed(2)} priorMs=${priorMs ?? 'none'}`
-		);
-		lastScrubAtMs = now;
-	};
-
-	const watchRecoverAfterLand = (landT: number) => {
-		const t0 = performance.now();
-		let ticks = 0;
-		let timeupdates = 0;
-		let playings = 0;
-		let waitings = 0;
-		let stalleds = 0;
-		const onTu = () => {
-			timeupdates += 1;
-		};
-		const onPlaying = () => {
-			playings += 1;
-			console.info(
-				`[nj-scrub] event playing +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
-			);
-		};
-		const onWaiting = () => {
-			waitings += 1;
-			console.info(
-				`[nj-scrub] event waiting +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
-			);
-		};
-		const onStalled = () => {
-			stalleds += 1;
-			console.info(
-				`[nj-scrub] event stalled +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
-			);
-		};
-		const onErr = () => {
-			const err = video.error;
-			console.info(
-				`[nj-scrub] event error +${Math.round(performance.now() - t0)}ms code=${err?.code ?? '-'} msg=${err?.message ?? '-'}`
-			);
-		};
-		video.addEventListener('timeupdate', onTu);
-		video.addEventListener('playing', onPlaying);
-		video.addEventListener('waiting', onWaiting);
-		video.addEventListener('stalled', onStalled);
-		video.addEventListener('error', onErr);
-		const bufNear = (ct: number): string => {
-			const b = video.buffered;
-			const parts: string[] = [];
-			for (let i = 0; i < b.length; i++) {
-				const start = b.start(i);
-				const end = b.end(i);
-				if (end < ct - 30 || start > ct + 30) continue;
-				parts.push(`${start.toFixed(1)}-${end.toFixed(1)}`);
-			}
-			return parts.length ? parts.join(',') : '-';
-		};
-		const finish = (advanced: boolean, ct: number) => {
-			video.removeEventListener('timeupdate', onTu);
-			video.removeEventListener('playing', onPlaying);
-			video.removeEventListener('waiting', onWaiting);
-			video.removeEventListener('stalled', onStalled);
-			video.removeEventListener('error', onErr);
-			window.clearInterval(watch);
-			console.info(
-				`[nj-scrub] recover-done advanced=${advanced} ct=${ct.toFixed(2)} +${Math.round(performance.now() - t0)}ms tu=${timeupdates} playing=${playings} waiting=${waitings} stalled=${stalleds}`
-			);
-		};
-		const watch = window.setInterval(() => {
-			if (destroyed) {
-				finish(false, video.currentTime);
-				return;
-			}
-			ticks += 1;
-			const ct = video.currentTime;
-			const advanced = ct >= landT + 0.5;
-			const err = video.error;
-			console.info(
-				`[nj-scrub] recover +${Math.round(performance.now() - t0)}ms ct=${ct.toFixed(2)} land=${landT.toFixed(2)} rs=${video.readyState} ns=${video.networkState} paused=${video.paused} seeking=${video.seeking} advanced=${advanced} tu=${timeupdates} buf=${bufNear(ct)} err=${err?.code ?? '-'}`
-			);
-			if (advanced || ticks >= 120) {
-				finish(advanced, ct);
-			}
-		}, 500);
-	};
-
 	const nudgePlayheadToLand = (seconds: number) => {
 		const t = Math.max(0, seconds);
 		const at = video.currentTime;
@@ -332,7 +239,6 @@ export function attachHls(
 			video.currentTime = t;
 		}
 		void video.play().catch(() => {});
-		watchRecoverAfterLand(t);
 	};
 
 	/**
@@ -400,12 +306,7 @@ export function attachHls(
 						if (res.status === 200) {
 							if (parent.signal.aborted || destroyed) return;
 							ok = true;
-							const t = Math.max(0, seconds);
-							const at = video.currentTime;
-							console.info(
-								`[nj-scrub] land ready seg=${String(idx).padStart(3, '0')} t=${t.toFixed(2)} at=${at.toFixed(2)} nudge`
-							);
-							nudgePlayheadToLand(t);
+							nudgePlayheadToLand(Math.max(0, seconds));
 							return;
 						}
 						// 404: session gone. 204: no-fill hold ceiling. Else retry.
@@ -724,7 +625,6 @@ export function attachHls(
 		) {
 			return;
 		}
-		logScrubRequested();
 		const startMs = Math.max(0, Math.floor(landAt * 1000));
 		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
 			// Network blip: land-segment ensure still drives the window.
@@ -845,7 +745,6 @@ export function attachHls(
 			noticeNativePlayheadLand();
 			return;
 		}
-		logScrubRequested();
 		if (seekInFlight) return;
 		seekInFlight = true;
 		void (async () => {
