@@ -1,4 +1,5 @@
 import Hls from 'hls.js';
+import { probeEnabled } from './latencyProbe';
 import {
 	parseSubtitleTrackIdsFromMaster,
 	parseWebVttCues,
@@ -14,8 +15,11 @@ export {
 	watchProgressiveSubtitles
 } from './subtitleProgressive';
 
-// Temporary dogfood marker: proves this bundle is what Chrome loaded.
-console.warn('[nj-subs] hlsPlayer module loaded');
+/** `[nj-subs]` diagnostics — same opt-in as latency probe (`?njProbe=1`). */
+function subsProbeOn(): boolean {
+	if (typeof window === 'undefined') return false;
+	return probeEnabled(window.location.search);
+}
 
 /**
  * Exactly two attach backends. The server contract is identical for both
@@ -102,6 +106,7 @@ export function parkForSwitch(video: HTMLVideoElement | null, handle: HlsHandle 
 }
 
 function logSubs(phase: string, detail?: Record<string, unknown>) {
+	if (!subsProbeOn()) return;
 	if (detail) {
 		console.info(`[nj-subs] ${phase}`, detail);
 	} else {
@@ -193,8 +198,32 @@ export function attachHls(
 		for (let i = 0; i < list.length; i++) {
 			const t = list[i];
 			if (!t || t === nativeInjectTrack) continue;
-			t.mode = 'disabled';
+			if (t.mode !== 'disabled') t.mode = 'disabled';
 		}
+	};
+
+	/**
+	 * WebKit DEFAULT/AUTOSELECT keeps flipping the HLS MEDIA track back to
+	 * `showing`, which demotes our inject track (only one subtitle track may
+	 * show). Dogfood: after inject, logs showed `#0 showing | #1 disabled`
+	 * while cues lived on #1. Re-assert only when wrong to avoid change loops.
+	 */
+	const assertInjectModes = () => {
+		if (!nativeInjectMode || !nativeInjectTrack) return;
+		disableHlsTextTracks();
+		const want: TextTrackMode = wantedSubtitle >= 0 ? 'showing' : 'disabled';
+		if (nativeInjectTrack.mode !== want) nativeInjectTrack.mode = want;
+	};
+
+	let injectModeAssertScheduled = false;
+	const scheduleAssertInjectModes = () => {
+		if (injectModeAssertScheduled) return;
+		injectModeAssertScheduled = true;
+		queueMicrotask(() => {
+			injectModeAssertScheduled = false;
+			if (destroyed || !nativeInjectMode) return;
+			assertInjectModes();
+		});
 	};
 
 	const clearInjectCues = (track: TextTrack) => {
@@ -232,12 +261,13 @@ export function attachHls(
 	};
 
 	const ensureInjectTrack = (index: number): TextTrack => {
-		disableHlsTextTracks();
 		if (!nativeInjectTrack) {
 			const src = video.textTracks[index];
+			// Distinct label so WebKit does not merge with the HLS MEDIA track
+			// in the CC menu / DEFAULT group.
 			nativeInjectTrack = video.addTextTrack(
 				'subtitles',
-				src?.label || 'Subtitles',
+				src?.label ? `${src.label} (Nightjar)` : 'Subtitles',
 				src?.language || 'en'
 			);
 			logSubs('native inject track created', {
@@ -245,7 +275,7 @@ export function attachHls(
 				language: nativeInjectTrack.language
 			});
 		}
-		nativeInjectTrack.mode = wantedSubtitle >= 0 ? 'showing' : 'disabled';
+		assertInjectModes();
 		return nativeInjectTrack;
 	};
 
@@ -471,7 +501,7 @@ export function attachHls(
 	const onAddTrack = () => {
 		logNativeTracks('native addtrack', video, { wantedSubtitle });
 		if (nativeInjectMode) {
-			disableHlsTextTracks();
+			scheduleAssertInjectModes();
 			return;
 		}
 		if (wantedSubtitle < 0) applyWantedSubtitle();
@@ -479,6 +509,7 @@ export function attachHls(
 
 	const onTextTrackChange = () => {
 		logNativeTracks('native textTracks change', video, { wantedSubtitle });
+		if (nativeInjectMode) scheduleAssertInjectModes();
 	};
 
 	const onSeeked = () => {

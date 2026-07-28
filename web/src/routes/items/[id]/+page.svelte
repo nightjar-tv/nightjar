@@ -318,7 +318,7 @@
 		if (!video || !url) {
 			return;
 		}
-		console.warn('[nj-subs] item page attaching HLS', url);
+		if (probeOn) console.warn('[nj-subs] item page attaching HLS', url);
 		const handle = attachHls(video, url, resumeRef.seconds);
 		playerRef.handle = handle;
 		return () => {
