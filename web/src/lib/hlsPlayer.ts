@@ -5,8 +5,20 @@ import {
 	parseWebVttCues,
 	segmentIndexAtSeconds,
 	sessionBaseFromMaster,
-	subtitleSegmentUrl
+	subtitleSegmentUrl,
+	videoSegmentUrl
 } from './nativeHlsSubs';
+
+/** Slightly above server `SEGMENT_WAIT` (30s) so the server can 503 first. */
+const LAND_SEGMENT_FETCH_MS = 32_000;
+/** Pause between land-ensure attempts so instant 503s do not spin hot. */
+const LAND_ENSURE_BACKOFF_MS = 400;
+/**
+ * After the last `seeking` event, wait this long before committing land.
+ * Covers scrubber drag (commit on release/settle) and click-scrubs where
+ * `seeked` is skipped. Must not fire on every seeking tick.
+ */
+const LAND_COMMIT_QUIET_MS = 300;
 
 export {
 	needsSubtitleWatch,
@@ -152,12 +164,20 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
  * Attach an HLS VOD playlist.
  *
  * Scrub sequence:
- * 1. User finishes a scrub → `seeked` fires once.
- * 2. hls.js: GET playlist?startMs=T then subtitle `startLoad` reassert.
- * 3. Native Safari: no master?startMs= (segment GETs move the window,
- *    ADR-0011). Captions switch to manual VTT segment fetch + cue inject
- *    because WebKit does not reload EXT-X-MEDIA TextTracks after seek
- *    (ADR-0013).
+ * 1. Land commits on `seeked`, or after `seeking` has been quiet for
+ *    LAND_COMMIT_QUIET_MS (scrubber release / settle). Mid-drag seeking
+ *    ticks do not startMs/ensure — that thrashed FFmpeg on slider drag.
+ * 2. Both backends: GET playlist?startMs=T for land intent.
+ * 3. hls.js: subtitle `startLoad` reassert after startMs.
+ * 4. Native Safari: startMs, then long-poll GET of the playhead
+ *    `segNNN.m4s` (server holds up to SEGMENT_WAIT). On abort/timeout/503,
+ *    backoff briefly and retry the same target until a newer scrub
+ *    supersedes (parent abort) or destroy — never a fixed attempt cap.
+ *    Then VTT cue inject (ADR-0013). Never assign `currentTime` on every
+ *    tick (seeked storms). After land-ensure 200: under suppressSeekNotify,
+ *    nudge `currentTime` off the land then back so WebKit actually seeks and
+ *    refetches — same-value assign is a no-op; full `src`+#t= remount made
+ *    Safari dig-back into uncooked segs (black / reset).
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -184,6 +204,20 @@ export function attachHls(
 	let positionSeconds = (): number => Math.max(0, video.currentTime);
 	/** `performance.now()` of last user scrub (`seeked`); for [nj-scrub] gaps. */
 	let lastScrubAtMs = 0;
+	/** Abort in-flight land-segment ensure when a newer scrub arrives. */
+	let landEnsureAbort: AbortController | null = null;
+	/** Segment index with an in-flight ensure (blocks echo `seeked`). */
+	let landEnsureSegIdx: number | null = null;
+	/** Last segment we successfully ensured (ignore further seeked there). */
+	let landEnsuredSegIdx: number | null = null;
+	/** Debounce timer: commit land after seeking goes quiet (drag release). */
+	let landCommitTimer: ReturnType<typeof setTimeout> | null = null;
+	/**
+	 * After land-ensure 200: first suppressed seeked completes the nudge;
+	 * second applies this land time + play(). null = not retargeting.
+	 */
+	let landRetargetSeconds: number | null = null;
+	const sessionBase = sessionBaseFromMaster(playlistBase);
 
 	const logScrubRequested = () => {
 		const now = performance.now();
@@ -194,8 +228,101 @@ export function attachHls(
 		lastScrubAtMs = now;
 	};
 
+	/**
+	 * Ensure the playhead video segment is cooked. Each GET is a server
+	 * long-poll (up to SEGMENT_WAIT). Instant 503 means "not yet / wait" —
+	 * backoff and ask again until this ensure is superseded (newer scrub
+	 * aborts parent) or destroy. Never a fixed retry cap: that burned both
+	 * attempts in milliseconds while the server was still coalescing.
+	 * On success: nudge-seek to the ensure land (suppressSeekNotify) then
+	 * play — side-channel fetch does not fill Safari's buffer; same-value
+	 * currentTime is a no-op; src+#t= remount digs into uncooked segs.
+	 */
+	const ensureNativeLandSegment = (seconds: number) => {
+		const idx = segmentIndexAtSeconds(seconds);
+		if (
+			landEnsureSegIdx === idx &&
+			landEnsureAbort &&
+			!landEnsureAbort.signal.aborted
+		) {
+			return;
+		}
+		landEnsureAbort?.abort();
+		const parent = new AbortController();
+		landEnsureAbort = parent;
+		landEnsureSegIdx = idx;
+		landRetargetSeconds = null;
+		const url = videoSegmentUrl(sessionBase, idx);
+		void (async () => {
+			let ok = false;
+			const backoff = () =>
+				new Promise<void>((resolve, reject) => {
+					if (parent.signal.aborted) {
+						reject(new DOMException('Aborted', 'AbortError'));
+						return;
+					}
+					const onAbort = () => {
+						window.clearTimeout(timer);
+						reject(new DOMException('Aborted', 'AbortError'));
+					};
+					const timer = window.setTimeout(() => {
+						parent.signal.removeEventListener('abort', onAbort);
+						resolve();
+					}, LAND_ENSURE_BACKOFF_MS);
+					parent.signal.addEventListener('abort', onAbort, { once: true });
+				});
+			try {
+				while (!destroyed && !parent.signal.aborted) {
+					const attemptAc = new AbortController();
+					const onParentAbort = () => attemptAc.abort();
+					parent.signal.addEventListener('abort', onParentAbort);
+					const timer = window.setTimeout(
+						() => attemptAc.abort(),
+						LAND_SEGMENT_FETCH_MS
+					);
+					try {
+						const res = await fetch(url, { signal: attemptAc.signal });
+						if (destroyed || parent.signal.aborted) return;
+						if (res.ok) {
+							ok = true;
+							const t = Math.max(0, seconds);
+							suppressSeekNotify = true;
+							landRetargetSeconds = t;
+							// Off-land by ~one frame so WebKit cannot no-op;
+							// stay inside the same ~2s segment when possible.
+							const nudge = t >= 0.05 ? t - 0.05 : t + 0.05;
+							video.currentTime = nudge;
+							return;
+						}
+						// 404: segment/session gone — stop. Anything else (503,
+						// unexpected): wait and long-poll again.
+						if (res.status === 404) return;
+					} catch {
+						if (destroyed || parent.signal.aborted) return;
+						// Timeout / network abort: new long-poll after backoff.
+					} finally {
+						window.clearTimeout(timer);
+						parent.signal.removeEventListener('abort', onParentAbort);
+					}
+					try {
+						await backoff();
+					} catch {
+						return;
+					}
+				}
+			} finally {
+				if (landEnsureAbort === parent) {
+					landEnsureAbort = null;
+					landEnsureSegIdx = null;
+					if (ok) landEnsuredSegIdx = idx;
+				}
+			}
+		})().catch(() => {
+			// Superseded ensure aborts must not surface as unhandled rejection.
+		});
+	};
+
 	// --- Safari native: post-seek cue injection (ADR-0013) -----------------
-	const sessionBase = sessionBaseFromMaster(playlistBase);
 	let nativeInjectMode = false;
 	let nativeInjectTrack: TextTrack | null = null;
 	let nativeInjectGen = 0;
@@ -443,6 +570,32 @@ export function attachHls(
 		void syncNativeInject(true);
 	};
 
+	/**
+	 * Native land path driven by observed playhead segment, not `seeked` alone
+	 * (Safari often skips seeked on rapid scrub). Same-segment echoes are no-ops.
+	 */
+	const noticeNativePlayheadLand = () => {
+		if (destroyed || hls) return;
+		if (suppressSeekNotify) return;
+		const landAt = positionSeconds();
+		const landIdx = segmentIndexAtSeconds(landAt);
+		if (landEnsuredSegIdx === landIdx) return;
+		if (
+			landEnsureSegIdx === landIdx &&
+			landEnsureAbort &&
+			!landEnsureAbort.signal.aborted
+		) {
+			return;
+		}
+		logScrubRequested();
+		const startMs = Math.max(0, Math.floor(landAt * 1000));
+		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
+			// Network blip: land-segment ensure still drives the window.
+		});
+		ensureNativeLandSegment(landAt);
+		if (wantedSubtitle >= 0) enterNativeInjectMode();
+	};
+
 	const applyWantedSubtitle = () => {
 		if (destroyed) return;
 		if (hls) {
@@ -524,8 +677,17 @@ export function attachHls(
 	};
 
 	const onSeeked = () => {
-		if (destroyed || seekInFlight) return;
+		if (destroyed) return;
 		if (suppressSeekNotify) {
+			if (landRetargetSeconds !== null) {
+				const target = landRetargetSeconds;
+				landRetargetSeconds = null;
+				video.currentTime = target;
+				void video.play().catch(() => {});
+				if (wantedSubtitle >= 0) enterNativeInjectMode();
+				// Keep suppress for this land seeked; clear on the next one.
+				return;
+			}
 			suppressSeekNotify = false;
 			if (hls) reassertHlsSubtitleAfterSeek();
 			else {
@@ -533,12 +695,17 @@ export function attachHls(
 			}
 			return;
 		}
-		// Before any startMs / inject network work — one line for scrub pacing.
-		logScrubRequested();
 		if (!hls) {
-			if (wantedSubtitle >= 0) enterNativeInjectMode();
+			// Scrub settled — commit now; cancel any pending quiet timer.
+			if (landCommitTimer !== null) {
+				clearTimeout(landCommitTimer);
+				landCommitTimer = null;
+			}
+			noticeNativePlayheadLand();
 			return;
 		}
+		logScrubRequested();
+		if (seekInFlight) return;
 		seekInFlight = true;
 		void (async () => {
 			try {
@@ -553,6 +720,21 @@ export function attachHls(
 		})();
 	};
 
+	/**
+	 * During scrubber drag Safari fires `seeking` continuously. Only arm a
+	 * quiet timer — commit land on seeked or after LAND_COMMIT_QUIET_MS with
+	 * no further seeking (release / settle). Do not startMs/ensure per tick.
+	 */
+	const onSeeking = () => {
+		if (destroyed || hls || suppressSeekNotify) return;
+		if (landCommitTimer !== null) clearTimeout(landCommitTimer);
+		landCommitTimer = setTimeout(() => {
+			landCommitTimer = null;
+			if (destroyed || hls || suppressSeekNotify) return;
+			noticeNativePlayheadLand();
+		}, LAND_COMMIT_QUIET_MS);
+	};
+
 	const onCanPlay = () => {
 		if (!destroyed && startAtSeconds > 0) {
 			void video.play().catch(() => {});
@@ -560,6 +742,7 @@ export function attachHls(
 	};
 
 	video.addEventListener('seeked', onSeeked);
+	video.addEventListener('seeking', onSeeking);
 	video.addEventListener('canplay', onCanPlay, { once: true });
 
 	if (backend === 'native-hls') {
@@ -664,9 +847,19 @@ export function attachHls(
 		destroy: () => {
 			if (destroyed) return;
 			destroyed = true;
+			if (landCommitTimer !== null) {
+				clearTimeout(landCommitTimer);
+				landCommitTimer = null;
+			}
+			landEnsureAbort?.abort();
+			landEnsureAbort = null;
+			landEnsureSegIdx = null;
+			landEnsuredSegIdx = null;
+			landRetargetSeconds = null;
 			cancelNativeInject();
 			disarmNativeInjectTimeupdate();
 			video.removeEventListener('seeked', onSeeked);
+			video.removeEventListener('seeking', onSeeking);
 			video.removeEventListener('canplay', onCanPlay);
 			video.textTracks.removeEventListener('addtrack', onAddTrack);
 			video.textTracks.removeEventListener('change', onTextTrackChange);

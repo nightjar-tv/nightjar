@@ -31,11 +31,21 @@ export function segmentVttName(index: number): string {
 	return `seg${String(n).padStart(3, '0')}.vtt`;
 }
 
+/** `segNNN.m4s` — matches `segment_name` in hls.rs. */
+export function segmentM4sName(index: number): string {
+	const n = Math.max(0, Math.floor(index));
+	return `seg${String(n).padStart(3, '0')}.m4s`;
+}
+
 /** Session directory containing `master.m3u8` (no trailing slash). */
 export function sessionBaseFromMaster(playlistBase: string): string {
 	const noHash = playlistBase.split('#')[0] ?? playlistBase;
 	const noQuery = noHash.split('?')[0] ?? noHash;
 	return noQuery.replace(/\/master\.m3u8$/i, '');
+}
+
+export function videoSegmentUrl(sessionBase: string, segmentIndex: number): string {
+	return `${sessionBase}/${segmentM4sName(segmentIndex)}`;
 }
 
 export function subtitleSegmentUrl(

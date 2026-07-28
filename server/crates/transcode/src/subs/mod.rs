@@ -469,8 +469,17 @@ fn demux_embedded_into_session(
         let encoder = srt_encoder_for_codec(&t.codec);
         // Growing files need bytes on disk promptly so progressive slicing
         // can read them mid-demux (Jellyfin's append-only VTT lesson).
-        cmd.args(["-map", &map, "-c:s", encoder, "-flush_packets", "1", "-f", "srt"])
-            .arg(&tmp);
+        cmd.args([
+            "-map",
+            &map,
+            "-c:s",
+            encoder,
+            "-flush_packets",
+            "1",
+            "-f",
+            "srt",
+        ])
+        .arg(&tmp);
         tmp_srts.push((t.track_id.clone(), tmp));
     }
 
@@ -655,8 +664,17 @@ fn extract_embedded_srt_batch(
         let encoder = srt_encoder_for_codec(&s.codec);
         // Growing files need bytes on disk promptly so partial-publish reads
         // see them mid-demux (Jellyfin's append-only VTT lesson).
-        cmd.args(["-map", &map, "-c:s", encoder, "-flush_packets", "1", "-f", "srt"])
-            .arg(&tmp);
+        cmd.args([
+            "-map",
+            &map,
+            "-c:s",
+            encoder,
+            "-flush_packets",
+            "1",
+            "-f",
+            "srt",
+        ])
+        .arg(&tmp);
         tmp_srts.push((s.stream_index, tmp));
     }
 
@@ -1099,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_extract_reports_unavailable_when_share_drops(){
+    fn sidecar_extract_reports_unavailable_when_share_drops() {
         let dir = tempfile::tempdir().unwrap();
         let video = dir.path().join("Movie.mp4");
         fs::write(&video, b"not a real mp4").unwrap();
@@ -1205,8 +1223,11 @@ mod tests {
         assert_eq!(prep, TrackReadiness::Preparing);
 
         fs::create_dir_all(store.item_dir(1)).unwrap();
-        write_webvtt(&store.vtt_path(1, "e2"), "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n")
-            .unwrap();
+        write_webvtt(
+            &store.vtt_path(1, "e2"),
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n",
+        )
+        .unwrap();
         let (partial, _) = store.track_readiness(1, "e2", "pending");
         assert_eq!(partial, TrackReadiness::Partial);
         let (complete, _) = store.track_readiness(1, "e2", "ready");

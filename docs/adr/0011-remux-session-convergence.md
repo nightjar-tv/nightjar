@@ -145,26 +145,37 @@ path iOS/tvOS need).
      and
    - a minimum interval has passed since the last restart on that session,
      and
-   - for requests *behind* the window: either the session is `primed`
-     (real scrub back), or the miss is within `ALIGN_BEHIND_SEGMENTS` of
-     the encode start (player settling near `#EXT-X-START`). Unprimed
-     misses farther behind than that return 503 immediately without
-     restart, so attach prefetch of `seg000` cannot yank a mid-title
-     encode back to zero, while a first request a few segments behind
-     the land point still converges instead of deadlocking.
-   Encode windows lead the play land point by eight segments. The 2026-07-26
-   switch capture measured Safari's first request exactly eight segments
-   behind `#EXT-X-START`; four would not contain that request. A 16-segment
-   lead worked but increased measured seek-to-first-segment time from 1.84 s
-   to 3.93–4.56 s, outside Gate 2's three-second budget. Eight is therefore
-   the measured correctness floor, pending the full Gate 2 timing rerun.
+   - for requests *behind* the window: only when the miss is within
+     `ALIGN_BEHIND_SEGMENTS` of **play_start** (player settling near
+     `#EXT-X-START`) *and* the miss does not retreat a committed land
+     (cooking `play_start` and/or pending from playlist `?startMs=`).
+     Near-ALIGN dig-back behind a deliberate scrub must Wait / 503 without
+     `desire_restart` — otherwise Safari steals pending two segments behind
+     the land, releases the land long-poll, and yanks FFmpeg when the real
+     land finishes. Farther behind returns 503 without restart — attach
+     prefetch of `seg000`, and Safari still probing a *prior* land after a
+     jump (fill-forward leaves retained segs; the next index is a hole)
+     must not yank the encode. Real scrub-back is playlist `?startMs=`.
+     Primed near-land misses still respect `RESTART_MIN_INTERVAL`.
+     `scrub_shaped` (record pending while min-interval is hot) uses the
+     same dig-back gate so it cannot write a retreated pending under Wait.
+   Encode windows lead the play land point by [`ENCODE_LEAD_SEGMENTS`] (2)
+   so Safari dig-back near `#EXT-X-START` hits on-disk segments without
+   retreating a committed `?startMs=` land. A 16-segment lead worked but
+   increased measured seek-to-first-segment time outside Gate 2's budget;
+   zero lead left dig-back 503-forever once pending retreat was blocked.
    Far-ahead restart uses `max(frontier, play_start)` as the band end so
    land-point prefetch inside that lead-in does not thrash-restart the
    encoder.
    In-window cooking continues to wait/503 without restart. Playlist
    `?startMs=` remains an explicit restart signal from the web client's
-   `seeked` handler; native Safari often skips it and hits this segment path
-   instead.
+   `seeked` handler. Native Safari previously often skipped it and hit this
+   segment path instead; after ADR-0013 cue injection, native also sends
+   `?startMs=` on user scrub so land matches the playhead (prefetch segment
+   misses no longer redefine the land). Native startMs is fire-and-forget so
+   rapid `seeked` events are not gated behind an in-flight fetch (the
+   failure mode that had motivated skipping startMs when captions still
+   depended on HLS TEXT reload).
 
 **Not decided here.** Content-addressed multi-window encode (serve any
 range without serial restart) stays deferred as too large; this amendment is

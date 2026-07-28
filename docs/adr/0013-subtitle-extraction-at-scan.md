@@ -342,10 +342,12 @@ this ADR records that as the reason, and the tests below lock it.
     Pattern: when a browser's default subtitle-reload path fails after
     seek, the client drives cues explicitly against the existing
     segmented VTT URLs rather than inventing a third delivery shape.
-    Full rapid-scrub (pre-land double scrub) regression of inject under
-    chaotic encode restarts is deferred pending a separate
-    seek-restart-coalescing fix; overlapping `restart_at` is A/V session
-    debt, not subtitle delivery.
+    Native scrub again sends playlist `?startMs=` for A/V land accuracy
+    (ADR-0011 amendment): inject no longer depends on that fetch completing
+    for captions, and the native handler does not hold `seekInFlight`
+    across startMs so rapid seeked events are not swallowed. Full
+    rapid-scrub soak of inject under chaotic encode restarts remains a
+    separate dogfood check from land-accuracy verify.
 
 ## Consequences
 
