@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"test": "node --experimental-strip-types --test tests/hlsAttachBackend.test.ts",
     "codegen": "openapi-typescript ../api/openapi.yaml -o src/lib/api/schema.d.ts"
   },
   "devDependencies": {
