@@ -1,7 +1,9 @@
 import Hls from 'hls.js';
 import {
+	chooseAttachBackend,
 	seekSuppressOnSeeked,
-	seekSuppressRafMayClear
+	seekSuppressRafMayClear,
+	type AttachBackend
 } from './hlsAttachBackend';
 import { probeEnabled } from './latencyProbe';
 import {
@@ -39,63 +41,37 @@ function subsProbeOn(): boolean {
 	return probeEnabled(window.location.search);
 }
 
-/**
- * Exactly two attach backends. The server contract is identical for both
- * (full-title VOD, 503 while cold regions cook, ADR-0011): no user-agent
- * branching on the server. Differences live only here.
- *
- * - `native-hls`: Apple WebKit (Safari / iOS). Chosen by engine check, not
- *   `canPlayType` alone — Chromium returns `"maybe"` for the HLS MIME and
- *   must not take this path. Hardware path; `#t=` land before first segment.
- *   After a user scrub, captions are injected from `subs/{id}/segNNN.vtt`
- *   (WebKit does not reload EXT-X-MEDIA TextTracks — ADR-0013).
- * - `hls-js`: Chromium / Firefox MSE. Captions: EXT-X-MEDIA SUBTITLES;
- *   scrub uses `startLoad` to retarget the subtitle stream controller.
- */
-type AttachBackend = 'native-hls' | 'hls-js';
-
-export function canPlayNativeHls(video: HTMLVideoElement): boolean {
+function canPlayNativeHls(video: HTMLVideoElement): boolean {
 	return video.canPlayType('application/vnd.apple.mpegurl') !== '';
 }
 
-/**
- * True for Apple WebKit browsers that actually ship HLS (Safari, iOS
- * WebViews). False for Chromium — including Chrome, Edge, and Chrome iOS
- * (`CriOS`) — even when `canPlayType('application/vnd.apple.mpegurl')` is
- * non-empty. Chrome 142+ returns `"maybe"` for that MIME and will take a
- * native path that is not WebKit HLS (no reliable EXT-X-MEDIA text).
- */
-function isAppleWebKitHlsEngine(): boolean {
-	if (typeof navigator === 'undefined') return false;
-	const ua = navigator.userAgent;
-	// Chromium family (desktop + iOS wrappers) must use hls.js when MSE works.
-	if (/Chrom(e|ium)|Edg\/|OPR\/|CriOS|EdgiOS|FxiOS/i.test(ua)) {
-		return false;
-	}
-	// Desktop/iOS Safari, and other Apple WebKit without a Chromium brand.
-	return /Safari/i.test(ua) || /AppleWebKit/i.test(ua);
+/** Debug escape: `?njNativeHls=1` forces native on desktop Apple WebKit. */
+function forceNativeHlsOverride(): boolean {
+	if (typeof window === 'undefined') return false;
+	return new URLSearchParams(window.location.search).get('njNativeHls') === '1';
 }
 
 /**
  * Backend pick is the only client UA/engine fork (ADR-0011: server stays
  * identical). Do not trust `canPlayType` alone — Chromium lies with `"maybe"`.
  *
- * - Apple WebKit + canPlay HLS → native (required on iOS; product path on
- *   desktop Safari).
- * - Else hls.js when MSE is available (Chrome, Firefox, Edge, …).
- * - Else native if canPlayType still claims HLS (odd WebViews).
+ * Decision tree (ADR-0017):
+ * - `?njNativeHls=1` + Apple WebKit canPlay → native (desktop regression hatch)
+ * - iOS/iPadOS Apple WebKit + canPlay → native
+ * - Else hls.js when MSE works (desktop Safari, Chrome, Firefox, …)
+ * - Else native if canPlay still claims HLS (odd WebViews)
  */
 function pickBackend(video: HTMLVideoElement): AttachBackend {
-	if (isAppleWebKitHlsEngine() && canPlayNativeHls(video)) {
-		return 'native-hls';
-	}
-	if (Hls.isSupported()) {
-		return 'hls-js';
-	}
-	if (canPlayNativeHls(video)) {
-		return 'native-hls';
-	}
-	throw new Error('HLS playback is not supported in this browser');
+	const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+	const maxTouchPoints =
+		typeof navigator !== 'undefined' ? navigator.maxTouchPoints || 0 : 0;
+	return chooseAttachBackend({
+		ua,
+		maxTouchPoints,
+		canPlayNativeHls: canPlayNativeHls(video),
+		hlsJsSupported: Hls.isSupported(),
+		forceNativeHls: forceNativeHlsOverride()
+	});
 }
 
 export interface HlsHandle {
@@ -192,7 +168,7 @@ export function attachHls(
 		backend,
 		canPlayType: video.canPlayType('application/vnd.apple.mpegurl'),
 		hlsJsSupported: Hls.isSupported(),
-		appleWebKitHls: isAppleWebKitHlsEngine()
+		forceNativeHls: forceNativeHlsOverride()
 	});
 
 	let positionSeconds = (): number => Math.max(0, video.currentTime);

@@ -44,11 +44,13 @@ on long titles.
    cooking return 503 (retryable), not 404. Segments live under
    `{NIGHTJAR_DATA_DIR}/cache/hls/{sessionId}/`; disk is bounded by session
    idle/stop cleanup of the whole dir.
-6. **Client.** Safari plays HLS natively when
-   `video.canPlayType('application/vnd.apple.mpegurl')` is non-empty. Other
-   browsers use hls.js (Apache-2.0). Seek handling uses the `seeked` event
-   only (not `seeking` ticks). Hand-rolling MSE is well over Rule 4.4;
-   Safari-only would fail Gate 2.
+6. **Client.** iOS/iPadOS Safari (and other iPhone/iPad/iPod WebKit) plays
+   HLS natively when `video.canPlayType('application/vnd.apple.mpegurl')` is
+   non-empty. Desktop Safari and other MSE browsers use hls.js (Apache-2.0);
+   see [ADR-0017](0017-desktop-safari-hlsjs.md). Seek handling uses the
+   `seeked` event only (not `seeking` ticks) on the hls.js path; native
+   iOS also arms a quiet `seeking` timer for land-ensure. Hand-rolling MSE
+   is well over Rule 4.4; iOS-only native would fail Gate 2 on desktop.
 
 ## Consequences
 
