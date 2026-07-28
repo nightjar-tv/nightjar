@@ -181,7 +181,18 @@ export function attachHls(
 		appleWebKitHls: isAppleWebKitHlsEngine()
 	});
 
-	const positionSeconds = (): number => Math.max(0, video.currentTime);
+	let positionSeconds = (): number => Math.max(0, video.currentTime);
+	/** `performance.now()` of last user scrub (`seeked`); for [nj-scrub] gaps. */
+	let lastScrubAtMs = 0;
+
+	const logScrubRequested = () => {
+		const now = performance.now();
+		const priorMs = lastScrubAtMs > 0 ? Math.round(now - lastScrubAtMs) : null;
+		console.info(
+			`[nj-scrub] scrub requested t=${video.currentTime.toFixed(2)} priorMs=${priorMs ?? 'none'}`
+		);
+		lastScrubAtMs = now;
+	};
 
 	// --- Safari native: post-seek cue injection (ADR-0013) -----------------
 	const sessionBase = sessionBaseFromMaster(playlistBase);
@@ -522,6 +533,8 @@ export function attachHls(
 			}
 			return;
 		}
+		// Before any startMs / inject network work — one line for scrub pacing.
+		logScrubRequested();
 		if (!hls) {
 			if (wantedSubtitle >= 0) enterNativeInjectMode();
 			return;

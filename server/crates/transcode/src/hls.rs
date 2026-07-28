@@ -35,6 +35,11 @@ const CATCH_UP_SEGMENTS: u64 = 2;
 /// Safari retried refused segments at one-second intervals. A two-second floor
 /// prevents adjacent prefetch misses from repeatedly moving the encode window.
 const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// After the latest scrub intent while the prior encode has already landed,
+/// wait this quiet period before killing FFmpeg. Rapid scrubs only update
+/// the pending target (dogfood: three `seek restart` lines in ~9s; the last
+/// fired 45ms after the previous `first_segment_ready`).
+const RESTART_COALESCE_QUIET: Duration = Duration::from_millis(400);
 /// Maximum unprimed distance *behind the play land point* (`#EXT-X-START`)
 /// that still counts as start alignment rather than attach prefetch of
 /// `seg000`. With encode-at-land (no lead-in), Safari dig-back near the
@@ -174,6 +179,58 @@ pub fn decide_segment_miss(
     }
 }
 
+/// How a scrub intent interacts with an in-flight or just-landed encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoalesceDesire {
+    /// Already cooking or serving this play land.
+    Nop,
+    /// Record pending; apply when `first_segment_ready` (do not kill yet).
+    HoldInFlight,
+    /// Record pending; apply after [`RESTART_COALESCE_QUIET`] of quiet.
+    HoldDebounce,
+}
+
+/// Classify a scrub toward `want_play_ms` without mutating session state.
+/// Used by [`desire_restart`] and unit tests (three rapid desires → last
+/// pending, one apply).
+pub fn classify_restart_desire(
+    want_play_ms: u64,
+    play_start_ms: u64,
+    encode_start_ms_now: u64,
+    first_segment_ready: bool,
+) -> CoalesceDesire {
+    let aligned = align_to_segment(want_play_ms);
+    if encode_start_ms(aligned) == encode_start_ms_now && aligned == play_start_ms {
+        return CoalesceDesire::Nop;
+    }
+    if !first_segment_ready {
+        CoalesceDesire::HoldInFlight
+    } else {
+        CoalesceDesire::HoldDebounce
+    }
+}
+
+/// Whether a recorded pending play land is due to apply.
+pub fn pending_restart_due(
+    first_segment_ready: bool,
+    pending_play_ms: Option<u64>,
+    pending_quiet_elapsed: Option<Duration>,
+    apply_immediate: bool,
+) -> Option<u64> {
+    let pending = pending_play_ms?;
+    if !first_segment_ready {
+        return None;
+    }
+    if apply_immediate {
+        return Some(pending);
+    }
+    let elapsed = pending_quiet_elapsed?;
+    if elapsed < RESTART_COALESCE_QUIET {
+        return None;
+    }
+    Some(pending)
+}
+
 pub struct HlsSessionRegistry {
     root: PathBuf,
     max_sessions: usize,
@@ -229,6 +286,10 @@ struct Session {
     primed: bool,
     /// Set once the window's first segment lands on disk (playlist-ready).
     first_segment_ready: bool,
+    /// Latest aligned play land requested while coalescing rapid scrubs.
+    pending_play_ms: Option<u64>,
+    /// When [`Session::pending_play_ms`] was last updated (debounce clock).
+    pending_since: Option<Instant>,
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
@@ -352,6 +413,8 @@ impl HlsSessionRegistry {
                 last_restart: Instant::now(),
                 primed: false,
                 first_segment_ready: false,
+                pending_play_ms: None,
+                pending_since: None,
                 failed: None,
                 subtitle_tracks,
             },
@@ -517,8 +580,8 @@ impl HlsSessionRegistry {
             match decide_window_action(aligned, session.play_start_ms, on_disk) {
                 WindowAction::Serve => {}
                 WindowAction::Restart => {
-                    let encoder = session.video_encoder.clone();
-                    restart_at(session, aligned, &encoder)?;
+                    desire_restart(session, aligned);
+                    maybe_apply_pending_restart(session)?;
                 }
             }
         }
@@ -532,6 +595,7 @@ impl HlsSessionRegistry {
             return Err(PlaylistError::NotReady);
         }
         note_first_segment_ready(session_id, session);
+        maybe_apply_pending_restart(session)?;
         build(session)
     }
 
@@ -569,11 +633,14 @@ impl HlsSessionRegistry {
                         session.primed = true;
                     }
                     note_first_segment_ready(session_id, session);
+                    maybe_apply_pending_restart(session)?;
                     return Ok(bytes);
                 }
                 if let Some(err) = note_child_exit(session) {
                     return Err(PlaylistError::Failed(err));
                 }
+                // Debounced scrub intent may become due while we poll.
+                maybe_apply_pending_restart(session)?;
                 if file_name == "init.mp4" {
                     // Rewritten on restart; wait for the new init.
                 } else if let Some(idx) = requested {
@@ -581,6 +648,17 @@ impl HlsSessionRegistry {
                     let play_start = session.play_start_ms / SEGMENT_MS;
                     let latest = latest_segment_in_window(&session.dir, window_start);
                     let since = session.last_restart.elapsed();
+                    let want_ms = idx * SEGMENT_MS;
+                    // Would this miss restart if the min-interval were cool?
+                    // Used so Wait-due-to-interval still records pending.
+                    let scrub_shaped = decide_segment_miss(
+                        idx,
+                        window_start,
+                        play_start,
+                        latest,
+                        session.primed,
+                        RESTART_MIN_INTERVAL,
+                    ) == SegmentMissAction::Restart;
                     match decide_segment_miss(
                         idx,
                         window_start,
@@ -590,16 +668,20 @@ impl HlsSessionRegistry {
                         since,
                     ) {
                         SegmentMissAction::Restart => {
-                            let want_ms = idx * SEGMENT_MS;
-                            // Same encode window is a no-op that only kills
-                            // the cooking encoder (the retained-frontier bug).
-                            if encode_start_ms(want_ms) != session.start_ms {
-                                let encoder = session.video_encoder.clone();
-                                restart_at(session, want_ms, &encoder)?;
-                                deadline = Instant::now() + SEGMENT_WAIT;
+                            desire_restart(session, want_ms);
+                            maybe_apply_pending_restart(session)?;
+                            // Coalesce held the restart (in-flight or debounce).
+                            // Do not burn SEGMENT_WAIT polling the old window.
+                            if session.pending_play_ms.is_some() {
+                                return Err(PlaylistError::NotReady);
                             }
+                            deadline = Instant::now() + SEGMENT_WAIT;
                         }
                         SegmentMissAction::Wait => {
+                            if scrub_shaped {
+                                desire_restart(session, want_ms);
+                            }
+                            maybe_apply_pending_restart(session)?;
                             if session.child.is_none() {
                                 return Err(PlaylistError::NotFound);
                             }
@@ -730,6 +812,10 @@ fn restart_at(
     session.last_restart = Instant::now();
     session.primed = false;
     session.first_segment_ready = false;
+    if session.pending_play_ms == Some(play_start_ms) {
+        session.pending_play_ms = None;
+        session.pending_since = None;
+    }
     tracing::info!(
         start_ms,
         play_start_ms,
@@ -748,6 +834,73 @@ fn restart_at(
         .to_string();
     spawn_segment_milestone_watch(watch_id, watch_dir, start_ms, play_start_ms);
     Ok(())
+}
+
+/// Record scrub intent. In-flight encodes keep cooking until land, then the
+/// latest pending target is applied; after land, rapid intents debounce into
+/// one restart (see [`RESTART_COALESCE_QUIET`]).
+fn desire_restart(session: &mut Session, want_play_ms: u64) {
+    let aligned = align_to_segment(want_play_ms);
+    match classify_restart_desire(
+        aligned,
+        session.play_start_ms,
+        session.start_ms,
+        session.first_segment_ready,
+    ) {
+        CoalesceDesire::Nop => {
+            if session.pending_play_ms == Some(aligned) {
+                session.pending_play_ms = None;
+                session.pending_since = None;
+            }
+        }
+        CoalesceDesire::HoldInFlight => {
+            // Same target: keep the pending clock so land still applies once.
+            if session.pending_play_ms != Some(aligned) {
+                session.pending_play_ms = Some(aligned);
+                session.pending_since = Some(Instant::now());
+                tracing::info!(
+                    pending_play_ms = aligned,
+                    cooking_play_ms = session.play_start_ms,
+                    "hls seek restart coalesced (in flight)"
+                );
+            }
+        }
+        CoalesceDesire::HoldDebounce => {
+            // Same target: do not reset the quiet clock on every 503 retry
+            // (that would never elapse RESTART_COALESCE_QUIET).
+            if session.pending_play_ms != Some(aligned) {
+                session.pending_play_ms = Some(aligned);
+                session.pending_since = Some(Instant::now());
+                tracing::info!(
+                    pending_play_ms = aligned,
+                    play_start_ms = session.play_start_ms,
+                    "hls seek restart coalesced (debounce)"
+                );
+            }
+        }
+    }
+}
+
+fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistError> {
+    let elapsed = session.pending_since.map(|t| t.elapsed());
+    // `pending_since == None` with a pending target means apply immediately
+    // (used right after first_segment_ready for in-flight coalesce).
+    let apply_immediate = session.pending_play_ms.is_some() && session.pending_since.is_none();
+    let Some(pending) = pending_restart_due(
+        session.first_segment_ready,
+        session.pending_play_ms,
+        elapsed,
+        apply_immediate,
+    ) else {
+        return Ok(());
+    };
+    session.pending_play_ms = None;
+    session.pending_since = None;
+    if encode_start_ms(pending) == session.start_ms && pending == session.play_start_ms {
+        return Ok(());
+    }
+    let encoder = session.video_encoder.clone();
+    restart_at(session, pending, &encoder)
 }
 
 /// Polls the session dir and emits one log line per encode milestone so
@@ -849,6 +1002,18 @@ fn note_first_segment_ready(session_id: &str, session: &mut Session) {
         path = %session.src.display(),
         "hls_session_first_segment_ready"
     );
+    // Scrubs that arrived while this encode was landing: apply latest now
+    // (do not wait for debounce quiet — the client already waited on land).
+    if session.pending_play_ms.is_some() {
+        session.pending_since = None;
+        if let Err(e) = maybe_apply_pending_restart(session) {
+            session.failed = Some(match e {
+                PlaylistError::Failed(msg) => msg,
+                PlaylistError::NotFound => "pending seek restart: not found".into(),
+                PlaylistError::NotReady => "pending seek restart: not ready".into(),
+            });
+        }
+    }
 }
 
 fn note_child_exit(session: &mut Session) -> Option<String> {
@@ -1608,6 +1773,71 @@ mod tests {
             let new_window = encode_start_ms(want_ms) / SEGMENT_MS;
             assert_eq!(new_window, idx, "encode-at-land: window == N (idx={idx})");
         }
+    }
+
+    /// Dogfood incident timing: three scrub intents (1084s → 1840s → 2454s)
+    /// while the first encode is still landing. Only the last pending applies
+    /// when ready — one follow-up restart, not three racing kills.
+    #[test]
+    fn rapid_restart_intents_coalesce_to_last_target() {
+        let targets = [1_084_000u64, 1_840_000, 2_454_000];
+        let mut play = 0u64;
+        let mut encode = 0u64;
+        let mut ready = false;
+        let mut pending: Option<u64> = None;
+        let mut apply_count = 0u32;
+
+        for &want in &targets {
+            let phase = classify_restart_desire(want, play, encode, ready);
+            assert_eq!(phase, CoalesceDesire::HoldInFlight, "want={want}");
+            pending = Some(align_to_segment(want));
+        }
+        assert_eq!(pending, Some(2_454_000));
+
+        // First encode lands at the initial scrub target.
+        ready = true;
+        play = 1_084_000;
+        encode = encode_start_ms(play);
+        let due = pending_restart_due(ready, pending, None, true);
+        assert_eq!(due, Some(2_454_000));
+        // Apply once to the last intent.
+        if let Some(p) = due {
+            apply_count += 1;
+            play = p;
+            encode = encode_start_ms(p);
+            pending = None;
+        }
+        assert_eq!(apply_count, 1);
+        assert_eq!(play, 2_454_000);
+        assert_eq!(encode, 2_454_000);
+
+        // Debounce after land: three quick intents → one apply after quiet.
+        ready = true;
+        let burst = [2_500_000u64, 2_600_000, 2_700_000];
+        for &want in &burst {
+            assert_eq!(
+                classify_restart_desire(want, play, encode, ready),
+                CoalesceDesire::HoldDebounce
+            );
+            pending = Some(align_to_segment(want));
+        }
+        assert_eq!(
+            pending_restart_due(
+                ready,
+                pending,
+                Some(Duration::from_millis(100)),
+                false
+            ),
+            None,
+            "quiet not elapsed"
+        );
+        let due2 = pending_restart_due(
+            ready,
+            pending,
+            Some(RESTART_COALESCE_QUIET),
+            false,
+        );
+        assert_eq!(due2, Some(2_700_000));
     }
 
     #[test]
