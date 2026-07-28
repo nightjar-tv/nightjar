@@ -42,6 +42,11 @@ const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// the pending target (dogfood: three `seek restart` lines in ~9s; the last
 /// fired 45ms after the previous `first_segment_ready`).
 const RESTART_COALESCE_QUIET: Duration = Duration::from_millis(400);
+/// After a seek restart, refuse retained segments behind the new play land
+/// for this long. Serving them paints the prior scrub keyframe (dogfood:
+/// seg455/1110/1762 200 after B applied). Forever-refuse wedges Safari on
+/// A's URI; a short TTL covers cook+retarget then restores scrub-back.
+const STALE_RETAIN_REFUSE: Duration = Duration::from_secs(15);
 /// Maximum unprimed distance *behind the play land point* (`#EXT-X-START`)
 /// that still counts as start alignment rather than attach prefetch of
 /// `seg000`. Farther behind waits without yanking the encode to zero.
@@ -363,6 +368,9 @@ struct Session {
     pending_play_ms: Option<u64>,
     /// When [`Session::pending_play_ms`] was last updated (debounce clock).
     pending_since: Option<Instant>,
+    /// Refuse retained behind-play serves until this instant (see
+    /// [`STALE_RETAIN_REFUSE`]). Cleared when elapsed.
+    stale_retain_refuse_until: Option<Instant>,
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
@@ -488,6 +496,7 @@ impl HlsSessionRegistry {
                 first_segment_ready: false,
                 pending_play_ms: None,
                 pending_since: None,
+                stale_retain_refuse_until: None,
                 failed: None,
                 subtitle_tracks,
             },
@@ -765,8 +774,13 @@ impl HlsSessionRegistry {
                         }
                     }
                 }
-                // Retained prior-window segments are served immediately.
+                // Retained prior-window segments are served immediately —
+                // unless pending apply moves the play land during this
+                // request, or a short post-restart guard is still active for
+                // segs behind the new play (dogfood: late A-land 200 flash /
+                // wedge). After the TTL, scrub-back into cooked media works.
                 if let Ok(bytes) = fs::read(session.dir.join(&file_name)) {
+                    let play_before = session.play_start_ms;
                     if let Some(idx) = requested
                         && idx >= session.start_ms / SEGMENT_MS
                     {
@@ -774,6 +788,26 @@ impl HlsSessionRegistry {
                     }
                     note_first_segment_ready(session_id, session);
                     maybe_apply_pending_restart(session)?;
+                    if !serve_ok_after_pending_apply(play_before, session.play_start_ms) {
+                        return Err(PlaylistError::NotReady);
+                    }
+                    if let Some(idx) = requested {
+                        let guard = match session.stale_retain_refuse_until {
+                            Some(until) if Instant::now() < until => true,
+                            Some(_) => {
+                                session.stale_retain_refuse_until = None;
+                                false
+                            }
+                            None => false,
+                        };
+                        if !serve_ok_retained_during_stale_guard(
+                            idx * SEGMENT_MS,
+                            session.play_start_ms,
+                            guard,
+                        ) {
+                            return Err(PlaylistError::NotReady);
+                        }
+                    }
                     return Ok(bytes);
                 }
                 if let Some(err) = note_child_exit(session) {
@@ -1000,6 +1034,7 @@ fn restart_at(
     session.last_restart = Instant::now();
     session.primed = false;
     session.first_segment_ready = false;
+    session.stale_retain_refuse_until = Some(Instant::now() + STALE_RETAIN_REFUSE);
     if session.pending_play_ms == Some(play_start_ms) {
         session.pending_play_ms = None;
         session.pending_since = None;
@@ -1084,11 +1119,42 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
     };
     session.pending_play_ms = None;
     session.pending_since = None;
+    // Re-read play/encode after clearing pending — same lock section, but
+    // do not act on a pending snapshot if we already cook that land.
     if encode_start_ms(pending) == session.start_ms && pending == session.play_start_ms {
         return Ok(());
     }
     let encoder = session.video_encoder.clone();
     restart_at(session, pending, &encoder)
+}
+
+/// Whether bytes read for a segment request may still be returned after
+/// [`note_first_segment_ready`] / [`maybe_apply_pending_restart`].
+///
+/// If `play_start_ms` moved, the bytes belong to the pre-apply land and
+/// must not be returned as a success for this wait (503 → client retries
+/// against the new window). Pure helper for the serve path and tests.
+pub fn serve_ok_after_pending_apply(play_before_ms: u64, play_after_ms: u64) -> bool {
+    play_before_ms == play_after_ms
+}
+
+/// Whether a retained on-disk segment may be served while the post-restart
+/// stale guard is active.
+///
+/// Near-land dig-back (within [`ENCODE_LEAD_SEGMENTS`]) and anything at/ahead
+/// of play stay servable. Farther behind is the superseded scrub Safari still
+/// GETs after coalesce — refuse only while `guard_active` (TTL), not forever.
+pub fn serve_ok_retained_during_stale_guard(
+    want_ms: u64,
+    play_start_ms: u64,
+    guard_active: bool,
+) -> bool {
+    if !guard_active {
+        return true;
+    }
+    let want = align_to_segment(want_ms);
+    let play = align_to_segment(play_start_ms);
+    want + ENCODE_LEAD_SEGMENTS * SEGMENT_MS >= play
 }
 
 /// Polls the session dir and emits one log line per encode milestone so
@@ -2119,6 +2185,50 @@ mod tests {
             pending_waiter_action(Some(land), far_ahead_want),
             PendingWaiterAction::Release,
             "pending far behind want: real supersede, release"
+        );
+    }
+
+    #[test]
+    fn refuse_serve_when_pending_apply_moved_play_land() {
+        let land_a = 622_000u64;
+        let land_b = 1_078_000u64;
+        assert!(
+            serve_ok_after_pending_apply(land_a, land_a),
+            "same land: serve retained/cooked bytes"
+        );
+        assert!(
+            !serve_ok_after_pending_apply(land_a, land_b),
+            "play moved during request: do not return prior-land bytes"
+        );
+    }
+
+    #[test]
+    fn stale_retain_guard_refuses_far_behind_only_while_active() {
+        let play_b = 1_332_000u64;
+        let land_a = 910_000u64;
+        assert!(
+            !serve_ok_retained_during_stale_guard(land_a, play_b, true),
+            "prior land during guard: refuse"
+        );
+        assert!(
+            serve_ok_retained_during_stale_guard(land_a, play_b, false),
+            "after TTL: scrub-back may serve retained"
+        );
+        assert!(
+            serve_ok_retained_during_stale_guard(play_b, play_b, true),
+            "exact play land: serve"
+        );
+        assert!(
+            serve_ok_retained_during_stale_guard(
+                play_b - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
+                play_b,
+                true
+            ),
+            "lead dig-back: serve"
+        );
+        assert!(
+            serve_ok_retained_during_stale_guard(play_b + SEGMENT_MS, play_b, true),
+            "ahead of play: serve"
         );
     }
 

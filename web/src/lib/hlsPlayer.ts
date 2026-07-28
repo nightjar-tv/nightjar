@@ -175,9 +175,10 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
  *    supersedes (parent abort) or destroy — never a fixed attempt cap.
  *    Then VTT cue inject (ADR-0013). Never assign `currentTime` on every
  *    tick (seeked storms). After land-ensure 200: under suppressSeekNotify,
- *    nudge `currentTime` off the land then back so WebKit actually seeks and
- *    refetches — same-value assign is a no-op; full `src`+#t= remount made
- *    Safari dig-back into uncooked segs (black / reset).
+ *    seek to the ensure land (nudge if already there) and `play()`. Do not
+ *    remount `src`+#t= on scrub — cold dig-back (~8 segs) exceeds encode
+ *    lead (2) and wedges on 503 (dogfood). Industry Safari scrub is
+ *    currentTime on a stable HLS src (Jellyfin/Plex).
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -234,9 +235,16 @@ export function attachHls(
 	 * backoff and ask again until this ensure is superseded (newer scrub
 	 * aborts parent) or destroy. Never a fixed retry cap: that burned both
 	 * attempts in milliseconds while the server was still coalescing.
-	 * On success: nudge-seek to the ensure land (suppressSeekNotify) then
-	 * play — side-channel fetch does not fill Safari's buffer; same-value
-	 * currentTime is a no-op; src+#t= remount digs into uncooked segs.
+	 * On success: seek WebKit to the ensure land (suppressSeekNotify) then
+	 * `play()`. Side-channel fetch does not fill Safari's buffer; same-value
+	 * currentTime is a no-op. Do **not** remount `src`+#t= here — measured
+	 * dig-back ~8 segs behind encode start (lead=2) → eternal 503 → black /
+	 * scrubber at 0 (dogfood). Jellyfin/Plex scrub Safari via currentTime on
+	 * a stable HLS src; remount is for stream changes, not scrub.
+	 *
+	 * Supersede = parent abort only. Do NOT bail because `currentTime` still
+	 * sits on the prior scrub: after scrub→scrub WebKit may still show A's
+	 * time while this ensure is for B — that check skipped the retarget.
 	 */
 	const ensureNativeLandSegment = (seconds: number) => {
 		const idx = segmentIndexAtSeconds(seconds);
@@ -284,14 +292,21 @@ export function attachHls(
 						const res = await fetch(url, { signal: attemptAc.signal });
 						if (destroyed || parent.signal.aborted) return;
 						if (res.ok) {
+							if (parent.signal.aborted || destroyed) return;
 							ok = true;
 							const t = Math.max(0, seconds);
+							const at = video.currentTime;
 							suppressSeekNotify = true;
 							landRetargetSeconds = t;
-							// Off-land by ~one frame so WebKit cannot no-op;
-							// stay inside the same ~2s segment when possible.
-							const nudge = t >= 0.05 ? t - 0.05 : t + 0.05;
-							video.currentTime = nudge;
+							console.info(
+								`[nj-scrub] land ready seg=${String(idx).padStart(3, '0')} t=${t.toFixed(2)} at=${at.toFixed(2)} nudge`
+							);
+							if (Math.abs(at - t) < 0.05) {
+								video.currentTime = t >= 0.05 ? t - 0.05 : t + 0.05;
+							} else {
+								video.currentTime = t;
+							}
+							void video.play().catch(() => {});
 							return;
 						}
 						// 404: segment/session gone — stop. Anything else (503,
@@ -375,6 +390,12 @@ export function attachHls(
 
 	const cancelNativeInject = () => {
 		nativeInjectGen += 1;
+		// Clear immediately so a later sync(true) await cannot race with
+		// timeupdate leaving prior-land cues on screen (dogfood: stacked
+		// captions after scrub nudge until the next line).
+		if (nativeInjectTrack) clearInjectCues(nativeInjectTrack);
+		nativeLoadedSegs.clear();
+		disableHlsTextTracks();
 	};
 
 	const ensureNativeTrackIds = async (): Promise<string[]> => {
@@ -483,6 +504,23 @@ export function attachHls(
 		let injected = 0;
 		for (const cue of cues) {
 			try {
+				const existing = track.cues;
+				if (existing) {
+					let dup = false;
+					for (let i = 0; i < existing.length; i++) {
+						const c = existing[i];
+						if (
+							c &&
+							Math.abs(c.startTime - cue.startSec) < 0.05 &&
+							Math.abs(c.endTime - cue.endSec) < 0.05 &&
+							c.text === cue.text
+						) {
+							dup = true;
+							break;
+						}
+					}
+					if (dup) continue;
+				}
 				const vtt = new VTTCue(cue.startSec, cue.endSec, cue.text);
 				if (cue.id) vtt.id = cue.id;
 				track.addCue(vtt);
@@ -559,6 +597,7 @@ export function attachHls(
 	const enterNativeInjectMode = () => {
 		if (nativeInjectMode) {
 			cancelNativeInject();
+			assertInjectModes();
 			void syncNativeInject(true);
 			return;
 		}
@@ -684,7 +723,10 @@ export function attachHls(
 				landRetargetSeconds = null;
 				video.currentTime = target;
 				void video.play().catch(() => {});
-				if (wantedSubtitle >= 0) enterNativeInjectMode();
+				if (wantedSubtitle >= 0) {
+					enterNativeInjectMode();
+					assertInjectModes();
+				}
 				// Keep suppress for this land seeked; clear on the next one.
 				return;
 			}
