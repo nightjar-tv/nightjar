@@ -7,6 +7,7 @@ import {
 } from './hlsAttachBackend';
 import { probeEnabled } from './latencyProbe';
 import {
+	applyAbsoluteCueTimesFromVtt,
 	parseSubtitleTrackIdsFromMaster,
 	parseWebVttCues,
 	segmentIndexAtSeconds,
@@ -85,11 +86,19 @@ export interface HlsHandle {
 
 function logSubs(phase: string, detail?: Record<string, unknown>) {
 	if (!subsProbeOn()) return;
-	if (detail) {
-		console.info(`[nj-subs] ${phase}`, detail);
-	} else {
+	// One string — Safari collapses a second-arg object to "Object".
+	if (!detail) {
 		console.info(`[nj-subs] ${phase}`);
+		return;
 	}
+	const flat = Object.entries(detail)
+		.map(([k, v]) => {
+			if (v === null || v === undefined) return `${k}=null`;
+			if (typeof v === 'object') return `${k}=${JSON.stringify(v)}`;
+			return `${k}=${String(v)}`;
+		})
+		.join(' ');
+	console.info(`[nj-subs] ${phase} ${flat}`);
 }
 
 function logSubtitleState(phase: string, hls: Hls) {
@@ -127,6 +136,68 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
 }
 
 /**
+ * hls.js SubtitleStreamController keeps `tracksBuffered` across seeks so a
+ * later startLoad can believe the playhead is already covered. Clear that
+ * map + subtitle fragment-tracker entries before retargeting.
+ * Coupled to hls.js 1.6 controller shape; probe if upgrading major.
+ */
+function clearHlsSubtitleBufferedState(hls: Hls): void {
+	type SubCtrl = {
+		tracksBuffered?: Array<Array<{ start: number; end: number }>>;
+		fragmentTracker?: {
+			removeFragmentsInRange: (start: number, end: number, type: string) => void;
+		};
+	};
+	const controllers = (hls as unknown as { networkControllers?: SubCtrl[] })
+		.networkControllers;
+	if (!controllers) return;
+	for (const c of controllers) {
+		if (!Array.isArray(c.tracksBuffered)) continue;
+		for (let i = 0; i < c.tracksBuffered.length; i++) {
+			c.tracksBuffered[i] = [];
+		}
+		c.fragmentTracker?.removeFragmentsInRange(
+			0,
+			Number.POSITIVE_INFINITY,
+			'subtitle'
+		);
+	}
+}
+
+/** Subtitle SC only — `hls.startLoad` also restarts the main A/V loader. */
+function startHlsSubtitleLoad(hls: Hls, positionSec: number): boolean {
+	type SubCtrl = {
+		tracksBuffered?: unknown;
+		startLoad?: (pos: number, skipSeek?: boolean) => void;
+	};
+	const controllers = (hls as unknown as { networkControllers?: SubCtrl[] })
+		.networkControllers;
+	if (!controllers) return false;
+	let found = false;
+	for (const c of controllers) {
+		if (!Array.isArray(c.tracksBuffered)) continue;
+		c.startLoad?.(positionSec, true);
+		found = true;
+	}
+	return found;
+}
+
+function clearVideoSubtitleCues(video: HTMLVideoElement): void {
+	const list = video.textTracks;
+	for (let i = 0; i < list.length; i++) {
+		const track = list[i];
+		if (!track) continue;
+		if (track.kind !== 'subtitles' && track.kind !== 'captions') continue;
+		const cues = track.cues;
+		if (!cues?.length) continue;
+		for (let j = cues.length - 1; j >= 0; j--) {
+			const cue = cues[j];
+			if (cue) track.removeCue(cue);
+		}
+	}
+}
+
+/**
  * Attach an HLS VOD playlist.
  *
  * Scrub sequence:
@@ -134,18 +205,17 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
  *    LAND_COMMIT_QUIET_MS (scrubber release / settle). Mid-drag seeking
  *    ticks do not startMs/ensure — that thrashed FFmpeg on slider drag.
  * 2. Both backends: GET playlist?startMs=T for land intent.
- * 3. hls.js: subtitle `startLoad` reassert after startMs.
- * 4. Native Safari: startMs, then long-poll GET of the playhead
+ * 3. hls.js: subtitle retarget after every settled seeked (fire-and-forget
+ *    startMs — do not gate on in-flight fetch; that swallowed double-scrub
+ *    reasserts). Clears hls.js subtitle buffered state then startLoad.
+ * 4. Native (iOS/iPadOS): startMs, then long-poll GET of the playhead
  *    `segNNN.m4s` (server holds up to SEGMENT_WAIT). On abort/timeout/503,
  *    backoff briefly and retry the same target until a newer scrub
  *    supersedes (parent abort) or destroy — never a fixed attempt cap.
- *    Then VTT cue inject (ADR-0013). Never assign `currentTime` on every
- *    tick (seeked storms). After land-ensure 200: under seek suppress,
-
- *    seek to the ensure land (nudge if already there) and `play()`. Do not
- *    remount `src`+#t= on scrub — cold dig-back (~8 segs) exceeds encode
- *    lead (2) and wedges on 503 (dogfood). Safari scrub is currentTime on
- *    a stable HLS src.
+ *    Then VTT cue inject (ADR-0013). After land-ensure 200: under seek
+ *    suppress, seek to the ensure land (nudge if already there) and
+ *    `play()`. Do not remount `src`+#t= on scrub. Desktop Safari uses
+ *    hls.js (ADR-0017).
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -154,11 +224,21 @@ export function attachHls(
 ): HlsHandle {
 	let hls: Hls | null = null;
 	let destroyed = false;
-	let seekInFlight = false;
-	// First land after a mid-title attach is not a user scrub.
+	/**
+	 * Seek-notify suppress generation. Non-zero = ignore user scrub handlers.
+	 * Bumped on each arm so a stale rAF/timeout cannot clear a newer suppress.
+	 * Replaces a boolean that could stick true if `currentTime = t` fired no
+	 * seeked (same-value / no-op path).
+	 */
+	let seekSuppressGen = 0;
+	let seekSuppressTimeout: ReturnType<typeof setTimeout> | null = null;
 	// Applied when MEDIA tracks appear (never assign while length === 0 —
 	// that clears hls.js selectDefaultTrack and can leave zero fetches).
 	let wantedSubtitle = 0;
+	/** Probe: only log subtitle FRAG lines until this time (after seek reassert). */
+	let fragProbeUntilMs = 0;
+	/** Last subtitle reassert segment — echo seeked at same land must not wipe cues. */
+	let lastSubtitleReassertSeg = -1;
 
 	const backend = pickBackend(video);
 	logSubs('backend', {
@@ -181,11 +261,11 @@ export function attachHls(
 	 * After land-ensure 200: first suppressed seeked completes the nudge;
 	 * second applies this land time + play(). null = not retargeting.
 	 */
-	let seekSuppressGen = 0;
-	let seekSuppressTimeout: ReturnType<typeof setTimeout> | null = null;
 	let landRetargetSeconds: number | null = null;
+	const sessionBase = sessionBaseFromMaster(playlistBase);
 
 	const seekSuppressActive = () => seekSuppressGen !== 0;
+
 	const clearSeekSuppress = () => {
 		seekSuppressGen = 0;
 		landRetargetSeconds = null;
@@ -194,6 +274,7 @@ export function attachHls(
 			seekSuppressTimeout = null;
 		}
 	};
+
 	const armSeekSuppress = () => {
 		seekSuppressGen += 1;
 		const gen = seekSuppressGen;
@@ -225,8 +306,6 @@ export function attachHls(
 	};
 
 	if (startAtSeconds > 0) armSeekSuppress();
-
-	const sessionBase = sessionBaseFromMaster(playlistBase);
 
 	const nudgePlayheadToLand = (seconds: number) => {
 		const t = Math.max(0, seconds);
@@ -512,7 +591,7 @@ export function attachHls(
 							c &&
 							Math.abs(c.startTime - cue.startSec) < 0.05 &&
 							Math.abs(c.endTime - cue.endSec) < 0.05 &&
-							c.text === cue.text
+							(c as VTTCue).text === cue.text
 						) {
 							dup = true;
 							break;
@@ -609,8 +688,9 @@ export function attachHls(
 	};
 
 	/**
-	 * Native land path driven by observed playhead segment, not `seeked` alone
-	 * (Safari often skips seeked on rapid scrub). Same-segment echoes are no-ops.
+	 * Native land path: startMs + land-ensure + nudge. Driven by observed
+	 * playhead segment, not `seeked` alone (Safari often skips seeked on
+	 * rapid scrub). Same-segment echoes are no-ops.
 	 */
 	const noticeNativePlayheadLand = () => {
 		if (destroyed || hls) return;
@@ -686,17 +766,29 @@ export function attachHls(
 		if (destroyed || !hls || wantedSubtitle < 0) return;
 		const idx = Math.min(wantedSubtitle, Math.max(0, hls.subtitleTracks.length - 1));
 		const t = video.currentTime;
-		logSubs('seek reassert hls.js', { idx, currentTime: t });
-		hls.subtitleTrack = -1;
-		requestAnimationFrame(() => {
-			if (destroyed || !hls || wantedSubtitle < 0) return;
-			hls.subtitleDisplay = true;
-			hls.subtitleTrack = idx;
-			// startLoad(position, skipSeek): subtitle SC resets nextLoadPosition
-			// and ticks; skipSeek avoids yanking the main timeline to config start.
-			hls.startLoad(t, true);
-			logSubs('seek startLoad subtitles', { currentTime: t });
+		const seg = Math.floor(t / 2);
+		// Echo seeked (land nudge / cook settle) at the same 2s land must not
+		// clear cues mid-FRAG — dogfood: reassert @548.03 then @548.13 wiped paint.
+		if (seg === lastSubtitleReassertSeg) {
+			logSubs('seek reassert skip same-seg', { seg, currentTime: t });
+			return;
+		}
+		lastSubtitleReassertSeg = seg;
+		logSubs('seek reassert hls.js', {
+			idx,
+			currentTime: t,
+			subtitleTrack: hls.subtitleTrack,
+			trackCount: hls.subtitleTracks.length
 		});
+		fragProbeUntilMs = Date.now() + 8000;
+		clearVideoSubtitleCues(video);
+		clearHlsSubtitleBufferedState(hls);
+		hls.subtitleDisplay = true;
+		hls.subtitleTrack = idx;
+		if (!startHlsSubtitleLoad(hls, t)) {
+			hls.startLoad(t, true);
+		}
+		logSubs('seek startLoad subtitles', { currentTime: t, idx });
 	};
 
 	const onAddTrack = () => {
@@ -745,25 +837,20 @@ export function attachHls(
 			noticeNativePlayheadLand();
 			return;
 		}
-		if (seekInFlight) return;
-		seekInFlight = true;
-		void (async () => {
-			try {
-				const startMs = Math.max(0, Math.floor(positionSeconds() * 1000));
-				await fetch(`${playlistBase}?startMs=${startMs}`);
-			} catch {
-				// Network blip: the player retries the segment fetch itself.
-			} finally {
-				seekInFlight = false;
-				reassertHlsSubtitleAfterSeek();
-			}
-		})();
+		// Fire-and-forget like native (ADR-0013): awaiting startMs gated rapid
+		// seeked events and skipped subtitle reassert on double scrub.
+		const startMs = Math.max(0, Math.floor(positionSeconds() * 1000));
+		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
+			// Network blip: the player retries the segment fetch itself.
+		});
+		reassertHlsSubtitleAfterSeek();
 	};
 
 	/**
 	 * During scrubber drag Safari fires `seeking` continuously. Only arm a
 	 * quiet timer — commit land on seeked or after LAND_COMMIT_QUIET_MS with
 	 * no further seeking (release / settle). Do not startMs/ensure per tick.
+	 * Native path only (iOS/iPadOS); hls.js has no land-ensure.
 	 */
 	const onSeeking = () => {
 		if (destroyed || hls || seekSuppressActive()) return;
@@ -839,39 +926,78 @@ export function attachHls(
 				hls?.recoverMediaError();
 			}
 		});
-		hls.on(Hls.Events.MANIFEST_PARSED, () => {
-			if (!hls) return;
-			logSubtitleState('manifest parsed', hls);
-			// tracksInGroup is often still empty here; do not assign.
+		// Product: after hls.js appends subtitle cues, restore title-absolute
+		// times from the wire VTT (sticky load-cycle baseline — ADR-0013).
+		hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
+			if (destroyed || data.frag?.type !== 'subtitle') return;
+			const payload = data.payload;
+			if (!payload || (payload as ArrayBuffer).byteLength === 0) return;
+			let text: string;
+			try {
+				text = new TextDecoder('utf-8').decode(payload as ArrayBuffer);
+			} catch {
+				return;
+			}
+			const track = [...video.textTracks].find(
+				(t) =>
+					(t.kind === 'subtitles' || t.kind === 'captions') &&
+					t.mode !== 'disabled'
+			);
+			if (!track) return;
+			const fixed = applyAbsoluteCueTimesFromVtt(track, text);
+			if (subsProbeOn() && Date.now() <= fragProbeUntilMs) {
+				const parsed = parseWebVttCues(text);
+				const rawFirst = parsed[0]?.startSec;
+				const id = parsed[0]?.id;
+				const after = id ? track.cues?.getCueById(id) : null;
+				logSubs('FRAG cue absolute restore', {
+					sn: data.frag.sn,
+					fragStart: Number(data.frag.start.toFixed(3)),
+					rawFirstStart:
+						rawFirst !== undefined ? Number(rawFirst.toFixed(3)) : null,
+					trackStartAfter: after ? Number(after.startTime.toFixed(3)) : null,
+					fixed,
+					currentTime: Number(video.currentTime.toFixed(3))
+				});
+			}
 		});
+		// Probe-only listeners: same gate as logSubs (`?njProbe=1`). Product
+		// path only needs SUBTITLE_TRACKS_UPDATED → applyWantedSubtitle.
+		if (subsProbeOn()) {
+			hls.on(Hls.Events.MANIFEST_PARSED, () => {
+				if (!hls) return;
+				logSubtitleState('manifest parsed', hls);
+			});
+			hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (_e, data) => {
+				logSubs('track switch', {
+					id: data.id,
+					url: data.url ?? null,
+					name: data.name ?? null
+				});
+			});
+			hls.on(Hls.Events.SUBTITLE_TRACK_LOADING, (_e, data) => {
+				logSubs('LOADING subtitle playlist', { url: data.url, id: data.id });
+			});
+			hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, (_e, data) => {
+				logSubs('LOADED subtitle playlist', {
+					id: data.id,
+					fragments: data.details?.fragments?.length ?? null
+				});
+			});
+			hls.on(Hls.Events.FRAG_LOADING, (_e, data) => {
+				if (data.frag?.type !== 'subtitle') return;
+				if (Date.now() > fragProbeUntilMs) return;
+				logSubs('FRAG loading', {
+					sn: data.frag.sn,
+					start: data.frag.start,
+					url: data.frag.url ?? null
+				});
+			});
+		}
 		hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
 			if (!hls) return;
 			logSubtitleState('tracks updated', hls);
 			applyWantedSubtitle();
-		});
-		hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (_e, data) => {
-			logSubs('track switch', { id: data.id, url: data.url ?? null, name: data.name ?? null });
-		});
-		hls.on(Hls.Events.SUBTITLE_TRACK_LOADING, (_e, data) => {
-			logSubs('LOADING subtitle playlist', { url: data.url, id: data.id });
-		});
-		hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, (_e, data) => {
-			logSubs('LOADED subtitle playlist', {
-				id: data.id,
-				fragments: data.details?.fragments?.length ?? null
-			});
-		});
-		hls.on(Hls.Events.FRAG_LOADING, (_e, data) => {
-			if (data.frag?.type !== 'subtitle') return;
-			logSubs('FRAG loading', {
-				sn: data.frag.sn,
-				start: data.frag.start,
-				url: data.frag.url ?? null
-			});
-		});
-		hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
-			if (data.frag?.type !== 'subtitle') return;
-			logSubs('FRAG loaded', { sn: data.frag.sn, start: data.frag.start });
 		});
 		hls.loadSource(playlistBase);
 		hls.attachMedia(video);
@@ -891,11 +1017,11 @@ export function attachHls(
 				clearTimeout(landCommitTimer);
 				landCommitTimer = null;
 			}
+			clearSeekSuppress();
 			landEnsureAbort?.abort();
 			landEnsureAbort = null;
 			landEnsureSegIdx = null;
 			landEnsuredSegIdx = null;
-			clearSeekSuppress();
 			cancelNativeInject();
 			disarmNativeInjectTimeupdate();
 			video.removeEventListener('seeked', onSeeked);

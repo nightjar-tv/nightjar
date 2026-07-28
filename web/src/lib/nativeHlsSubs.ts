@@ -1,9 +1,19 @@
 /**
- * Safari native-HLS post-seek subtitle helpers.
+ * Shared WebVTT helpers for HLS subtitle segments (ADR-0013).
  *
- * WebKit does not reliably reload EXT-X-MEDIA TextTrack cues after a seek
- * (ADR-0013). After the first user scrub we fetch the same 2s VTT slices the
- * server already serves and inject them onto a client TextTrack.
+ * Wire shape is the same for both attach backends: title-absolute cues in
+ * `subs/{trackId}/segNNN.vtt`, stable cue id = start ms.
+ *
+ * Native (iOS/iPadOS): WebKit does not reliably reload EXT-X-MEDIA TextTrack
+ * cues after a seek. After the first scrub we fetch those slices and inject
+ * onto a client TextTrack.
+ *
+ * hls.js (desktop Safari / Chrome / …): do not trust parsed cue times after
+ * a mid-title load. hls.js freezes a load-cycle baseline (≈ first frag
+ * start of that cycle) and adds it to every cue; per-frag `−frag.start`
+ * only cancels the first frag and piles the rest. After each subtitle
+ * FRAG_LOADED, `applyAbsoluteCueTimesFromVtt` overwrites TextTrack times
+ * from the fetched VTT by cue id.
  *
  * SEGMENT_MS must match server/crates/transcode/src/hls.rs.
  */
@@ -52,7 +62,7 @@ function videoSegmentUrl(sessionBase: string, segmentIndex: number): string {
  * Same segment URL with a log-only `njFetcher` query. Serving ignores it;
  * Safari native HLS never adds it — dogfood logs can tell probe from WebKit.
  */
-function videoSegmentUrlWithFetcher(
+export function videoSegmentUrlWithFetcher(
 	sessionBase: string,
 	segmentIndex: number,
 	fetcher: 'land-ensure' | 'attach-wait'
@@ -169,4 +179,34 @@ export function parseWebVttCues(body: string): ParsedVttCue[] {
 		});
 	}
 	return cues;
+}
+
+/**
+ * hls.js may append title-absolute Nightjar cues with a sticky load-cycle
+ * baseline added (dogfood 2026-07-29: displayed ≈ raw + firstFragStart).
+ * Rewrite TextTrack times from the wire VTT (stable cue id = start ms).
+ * No-op when hls left times correct (baseline 0). Returns how many cues changed.
+ */
+export function applyAbsoluteCueTimesFromVtt(
+	track: TextTrack,
+	body: string
+): number {
+	const list = track.cues;
+	if (!list) return 0;
+	let fixed = 0;
+	for (const raw of parseWebVttCues(body)) {
+		if (!raw.id) continue;
+		const cue = list.getCueById(raw.id);
+		if (!cue) continue;
+		if (
+			Math.abs(cue.startTime - raw.startSec) < 0.001 &&
+			Math.abs(cue.endTime - raw.endSec) < 0.001
+		) {
+			continue;
+		}
+		cue.startTime = raw.startSec;
+		cue.endTime = raw.endSec;
+		fixed += 1;
+	}
+	return fixed;
 }

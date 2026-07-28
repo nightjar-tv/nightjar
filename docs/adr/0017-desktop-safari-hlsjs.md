@@ -82,9 +82,12 @@ protocol by client.
   Apple WebKit), including iPadOS versions that spoof a Macintosh UA.
   That is new UA surface and ongoing maintenance (treat like a dependency:
   justify the predicates, keep them narrow, test the matrix).
-- **Subtitle gate: open.** Desktop Safari now defaults to hls.js; mid-title
-  scrub captions on that path must still be verified before calling the
-  product default done. Native cue-inject stays native-only (iOS/iPadOS).
+- **Subtitle gate: closed (2026-07-29).** Founder dogfood on the product
+  hls.js path (desktop Safari + Chrome): mid-title scrub, continue playing,
+  and further scrubs show captions with TextTrack times matching wire
+  absolute (`applyAbsoluteCueTimesFromVtt` after subtitle `FRAG_LOADED`;
+  ADR-0013 sticky-baseline note). Native cue-inject stays native-only
+  (iOS/iPadOS).
 - Desktop Safari loses the native HLS hardware path for this web product
   surface; iOS/tvOS native requirements are unchanged.
 - Opt-in `?njNativeHls=1` forces native on desktop Apple WebKit for
