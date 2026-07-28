@@ -1,4 +1,8 @@
 import Hls from 'hls.js';
+import {
+	seekSuppressOnSeeked,
+	seekSuppressRafMayClear
+} from './hlsAttachBackend';
 import { probeEnabled } from './latencyProbe';
 import {
 	parseSubtitleTrackIdsFromMaster,
@@ -19,6 +23,8 @@ const LAND_ENSURE_BACKOFF_MS = 400;
  * `seeked` is skipped. Must not fire on every seeking tick.
  */
 const LAND_COMMIT_QUIET_MS = 300;
+/** If land-retarget seeked never arrives, clear suppress (stuck-flag safety). */
+const SEEK_SUPPRESS_TIMEOUT_MS = 2_000;
 
 export {
 	needsSubtitleWatch,
@@ -161,7 +167,8 @@ function logNativeTracks(phase: string, video: HTMLVideoElement, extra?: Record<
  *    backoff briefly and retry the same target until a newer scrub
  *    supersedes (parent abort) or destroy — never a fixed attempt cap.
  *    Then VTT cue inject (ADR-0013). Never assign `currentTime` on every
- *    tick (seeked storms). After land-ensure 200: under suppressSeekNotify,
+ *    tick (seeked storms). After land-ensure 200: under seek suppress,
+
  *    seek to the ensure land (nudge if already there) and `play()`. Do not
  *    remount `src`+#t= on scrub — cold dig-back (~8 segs) exceeds encode
  *    lead (2) and wedges on 503 (dogfood). Safari scrub is currentTime on
@@ -176,7 +183,6 @@ export function attachHls(
 	let destroyed = false;
 	let seekInFlight = false;
 	// First land after a mid-title attach is not a user scrub.
-	let suppressSeekNotify = startAtSeconds > 0;
 	// Applied when MEDIA tracks appear (never assign while length === 0 —
 	// that clears hls.js selectDefaultTrack and can leave zero fetches).
 	let wantedSubtitle = 0;
@@ -204,7 +210,51 @@ export function attachHls(
 	 * After land-ensure 200: first suppressed seeked completes the nudge;
 	 * second applies this land time + play(). null = not retargeting.
 	 */
+	let seekSuppressGen = 0;
+	let seekSuppressTimeout: ReturnType<typeof setTimeout> | null = null;
 	let landRetargetSeconds: number | null = null;
+
+	const seekSuppressActive = () => seekSuppressGen !== 0;
+	const clearSeekSuppress = () => {
+		seekSuppressGen = 0;
+		landRetargetSeconds = null;
+		if (seekSuppressTimeout !== null) {
+			window.clearTimeout(seekSuppressTimeout);
+			seekSuppressTimeout = null;
+		}
+	};
+	const armSeekSuppress = () => {
+		seekSuppressGen += 1;
+		const gen = seekSuppressGen;
+		if (seekSuppressTimeout !== null) {
+			window.clearTimeout(seekSuppressTimeout);
+			seekSuppressTimeout = null;
+		}
+		// Double-rAF: clear one-shot suppress if seeked never arrives.
+		// Mid land-retarget keeps suppress until seeked or timeout.
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				if (
+					!seekSuppressRafMayClear(
+						gen,
+						seekSuppressGen,
+						landRetargetSeconds !== null
+					)
+				) {
+					if (gen === seekSuppressGen && landRetargetSeconds !== null) {
+						seekSuppressTimeout = window.setTimeout(() => {
+							if (gen === seekSuppressGen) clearSeekSuppress();
+						}, SEEK_SUPPRESS_TIMEOUT_MS);
+					}
+					return;
+				}
+				clearSeekSuppress();
+			});
+		});
+	};
+
+	if (startAtSeconds > 0) armSeekSuppress();
+
 	const sessionBase = sessionBaseFromMaster(playlistBase);
 
 	const logScrubRequested = () => {
@@ -298,7 +348,7 @@ export function attachHls(
 	const nudgePlayheadToLand = (seconds: number) => {
 		const t = Math.max(0, seconds);
 		const at = video.currentTime;
-		suppressSeekNotify = true;
+		armSeekSuppress();
 		landRetargetSeconds = t;
 		if (Math.abs(at - t) < 0.05) {
 			video.currentTime = t >= 0.05 ? t - 0.05 : t + 0.05;
@@ -315,7 +365,7 @@ export function attachHls(
 	 * and ask again until this ensure is superseded (newer scrub aborts
 	 * parent) or destroy. Never a fixed retry cap: that burned both
 	 * attempts in milliseconds while the server was still coalescing.
-	 * On success: seek WebKit to the ensure land (suppressSeekNotify) then
+	 * On success: seek WebKit to the ensure land (seek suppress) then
 	 * `play()`. Side-channel fetch does not fill Safari's buffer; same-value
 	 * currentTime is a no-op. Do **not** remount `src`+#t= here — measured
 	 * dig-back ~8 segs behind encode start (lead=2) → eternal 503 → black /
@@ -687,7 +737,7 @@ export function attachHls(
 	 */
 	const noticeNativePlayheadLand = () => {
 		if (destroyed || hls) return;
-		if (suppressSeekNotify) return;
+		if (seekSuppressActive()) return;
 		const landAt = positionSeconds();
 		const landIdx = segmentIndexAtSeconds(landAt);
 		if (landEnsuredSegIdx === landIdx) return;
@@ -789,8 +839,9 @@ export function attachHls(
 
 	const onSeeked = () => {
 		if (destroyed) return;
-		if (suppressSeekNotify) {
-			if (landRetargetSeconds !== null) {
+		if (seekSuppressActive()) {
+			const step = seekSuppressOnSeeked(landRetargetSeconds !== null);
+			if (step.applyLand && landRetargetSeconds !== null) {
 				const target = landRetargetSeconds;
 				landRetargetSeconds = null;
 				video.currentTime = target;
@@ -802,7 +853,7 @@ export function attachHls(
 				// Keep suppress for this land seeked; clear on the next one.
 				return;
 			}
-			suppressSeekNotify = false;
+			if (step.clearSuppress) clearSeekSuppress();
 			if (hls) reassertHlsSubtitleAfterSeek();
 			else {
 				logNativeTracks('seek suppress — attach land', video, { wantedSubtitle });
@@ -840,11 +891,11 @@ export function attachHls(
 	 * no further seeking (release / settle). Do not startMs/ensure per tick.
 	 */
 	const onSeeking = () => {
-		if (destroyed || hls || suppressSeekNotify) return;
+		if (destroyed || hls || seekSuppressActive()) return;
 		if (landCommitTimer !== null) clearTimeout(landCommitTimer);
 		landCommitTimer = setTimeout(() => {
 			landCommitTimer = null;
-			if (destroyed || hls || suppressSeekNotify) return;
+			if (destroyed || hls || seekSuppressActive()) return;
 			noticeNativePlayheadLand();
 		}, LAND_COMMIT_QUIET_MS);
 	};
@@ -969,7 +1020,7 @@ export function attachHls(
 			landEnsureAbort = null;
 			landEnsureSegIdx = null;
 			landEnsuredSegIdx = null;
-			landRetargetSeconds = null;
+			clearSeekSuppress();
 			cancelNativeInject();
 			disarmNativeInjectTimeupdate();
 			video.removeEventListener('seeked', onSeeked);
