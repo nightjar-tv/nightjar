@@ -80,10 +80,10 @@ pub enum StartSessionError {
 pub enum PlaylistError {
     NotFound,
     NotReady,
-    /// Abandoned-segment hold reached [`IDLE_TIMEOUT`] while the session
-    /// still exists. Mapped to HTTP 204 (empty) — open experiment choice:
-    /// not 4xx/5xx so Safari does not see an application-level media
-    /// failure after a long hold. Session teardown uses [`NotFound`].
+    /// Abandoned / superseded miss hold reached [`IDLE_TIMEOUT`] while the
+    /// session still exists. Mapped to empty HTTP 204 (ADR-0011 §7): not
+    /// 4xx/5xx so Safari does not see an application-level media failure
+    /// after a long hold. Session teardown uses [`NotFound`].
     AbandonedHoldEnded,
     Failed(String),
 }
@@ -638,7 +638,6 @@ impl HlsSessionRegistry {
             },
         );
         drop(sessions);
-        spawn_segment_milestone_watch(id.clone(), dir, start_ms, play_start_ms);
         Ok(id)
     }
 
@@ -677,7 +676,16 @@ impl HlsSessionRegistry {
         start_ms: Option<u64>,
     ) -> Result<Vec<u8>, PlaylistError> {
         self.with_ready_session(session_id, start_ms, |session| {
-            Ok(build_playlist(session.duration_ms, session.play_start_ms))
+            let bytes = build_playlist(session.duration_ms, session.play_start_ms);
+            log_playlist_serve(
+                session_id,
+                "index.m3u8",
+                start_ms,
+                session.play_start_ms,
+                session.pending_play_ms,
+                &bytes,
+            );
+            Ok(bytes)
         })
     }
 
@@ -689,7 +697,16 @@ impl HlsSessionRegistry {
         start_ms: Option<u64>,
     ) -> Result<Vec<u8>, PlaylistError> {
         self.with_ready_session(session_id, start_ms, |session| {
-            Ok(build_master(&session.subtitle_tracks))
+            let bytes = build_master(&session.subtitle_tracks);
+            log_playlist_serve(
+                session_id,
+                "master.m3u8",
+                start_ms,
+                session.play_start_ms,
+                session.pending_play_ms,
+                &bytes,
+            );
+            Ok(bytes)
         })
     }
 
@@ -907,6 +924,8 @@ impl HlsSessionRegistry {
         // Once this request has claimed a land via desire_restart, a later
         // pending move to a different land ends the *fill* wait — enter
         // no-fill hold (not 503) so Safari never sees an app-level error.
+        // (Immediate 204 on supersede was tried and rejected: wedged native
+        // post-nudge on doubles — zero segment GETs after middle 204.)
         let mut holding_for_land = false;
         // No-fill hold: abandoned miss or superseded land waiter. Open until
         // IDLE_TIMEOUT / session teardown — no 503/404 while alive.
@@ -943,6 +962,14 @@ impl HlsSessionRegistry {
                     .get_mut(session_id)
                     .ok_or(PlaylistError::NotFound)?;
                 session.last_access = Instant::now();
+                if let Some(err) = session.failed.clone() {
+                    return Err(PlaylistError::Failed(err));
+                }
+                // Notice cooking play-land even when this GET is for another
+                // URI. Middle land-ensure may enter no-fill before a 200 on
+                // that URI; final land-ensure must still flip
+                // first_segment_ready so coalesced pending applies.
+                note_first_segment_ready(session_id, session);
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
@@ -984,7 +1011,12 @@ impl HlsSessionRegistry {
                     }
                     note_first_segment_ready(session_id, session);
                     maybe_apply_pending_restart(session)?;
-                    if !serve_ok_after_pending_apply(play_before, session.play_start_ms) {
+                    let want_ms = requested.map(|idx| idx * SEGMENT_MS);
+                    if !serve_ok_after_pending_apply(
+                        play_before,
+                        session.play_start_ms,
+                        want_ms,
+                    ) {
                         return Err(PlaylistError::NotReady);
                     }
                     if let Some(idx) = requested {
@@ -1297,16 +1329,6 @@ fn restart_at(
         path = %session.src.display(),
         "hls session seek restart"
     );
-    let watch_dir = session.dir.clone();
-    // session_id is not in Session; callers log via restart fields. Milestone
-    // watch uses a synthetic id from the directory name.
-    let watch_id = session
-        .dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    spawn_segment_milestone_watch(watch_id, watch_dir, start_ms, play_start_ms);
     Ok(())
 }
 
@@ -1399,11 +1421,22 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
 /// Whether bytes read for a segment request may still be returned after
 /// [`note_first_segment_ready`] / [`maybe_apply_pending_restart`].
 ///
-/// If `play_start_ms` moved, the bytes belong to the pre-apply land and
-/// must not be returned as a success for this wait (503 → client retries
-/// against the new window). Pure helper for the serve path and tests.
-pub fn serve_ok_after_pending_apply(play_before_ms: u64, play_after_ms: u64) -> bool {
-    play_before_ms == play_after_ms
+/// If `play_start_ms` moved away from this request's land, the bytes belong
+/// to the pre-apply window — 503 so the client retries. If play moved *to*
+/// this request's land (`want_ms`), the bytes are the new land and must
+/// still 200 (land-ensure for the final scrub). Pure helper for serve + tests.
+pub fn serve_ok_after_pending_apply(
+    play_before_ms: u64,
+    play_after_ms: u64,
+    want_ms: Option<u64>,
+) -> bool {
+    if play_before_ms == play_after_ms {
+        return true;
+    }
+    match want_ms {
+        Some(want) => align_to_segment(want) == align_to_segment(play_after_ms),
+        None => false,
+    }
 }
 
 /// Whether a retained on-disk segment may be served while the post-restart
@@ -1426,77 +1459,6 @@ pub fn serve_ok_retained_during_stale_guard(
     want + encode_lead_segments() * SEGMENT_MS >= play
 }
 
-/// Polls the session dir and emits one log line per encode milestone so
-/// latency investigations can separate seek, first segment, lead-in, and
-/// land without inferring from client 503s. Investigation-only: does not
-/// change session behaviour.
-fn spawn_segment_milestone_watch(
-    session_id: String,
-    dir: PathBuf,
-    start_ms: u64,
-    play_start_ms: u64,
-) {
-    std::thread::Builder::new()
-        .name(format!("hls-milestones-{session_id}"))
-        .spawn(move || {
-            let t0 = Instant::now();
-            let window = start_ms / SEGMENT_MS;
-            let land = play_start_ms / SEGMENT_MS;
-            let mut seen_init = false;
-            let mut next = window;
-            let deadline = Instant::now() + Duration::from_secs(120);
-            while Instant::now() < deadline {
-                if !seen_init && dir.join("init.mp4").exists() {
-                    seen_init = true;
-                    tracing::info!(
-                        session_id = %session_id,
-                        elapsed_ms = t0.elapsed().as_millis(),
-                        start_ms,
-                        play_start_ms,
-                        "hls_milestone_init"
-                    );
-                }
-                while next <= land {
-                    let name = segment_name(next);
-                    let path = dir.join(&name);
-                    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    let kind = if next == window {
-                        "first_window"
-                    } else if next == land {
-                        "land"
-                    } else {
-                        "lead_in"
-                    };
-                    tracing::info!(
-                        session_id = %session_id,
-                        elapsed_ms = t0.elapsed().as_millis(),
-                        segment = %name,
-                        segment_idx = next,
-                        kind,
-                        start_ms,
-                        play_start_ms,
-                        "hls_milestone_segment"
-                    );
-                    next += 1;
-                }
-                if next > land && seen_init {
-                    tracing::info!(
-                        session_id = %session_id,
-                        elapsed_ms = t0.elapsed().as_millis(),
-                        start_ms,
-                        play_start_ms,
-                        "hls_milestone_land_complete"
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        })
-        .ok();
-}
-
 /// Logs once when the **play land** segment appears (not merely the lead-in
 /// first window). Pending scrub apply waits for this when the new target is
 /// near the cooking land so a coalesced restart does not yank before that
@@ -1507,6 +1469,10 @@ fn spawn_segment_milestone_watch(
 /// Clears [`Session::stale_retain_refuse_until`]: the guard protects while the
 /// new land cooks; keeping it for the full TTL after land is ready left Safari
 /// 503-retrying the superseded middle land (~15s) before dig-back (dogfood).
+///
+/// Called from playlist serve and from every `asset_wait` poll — not only when
+/// the requested URI is the cooking land. Middle waiters may enter no-fill
+/// before a 200 on that URI; final land-ensure must still notice.
 fn note_first_segment_ready(session_id: &str, session: &mut Session) {
     if session.first_segment_ready {
         return;
@@ -1608,6 +1574,49 @@ fn latest_segment_in_window(dir: &Path, window_start: u64) -> Option<u64> {
 /// "segNNN.m4s" -> NNN; None for init.mp4.
 fn segment_index(name: &str) -> Option<u64> {
     name.strip_prefix("seg")?.strip_suffix(".m4s")?.parse().ok()
+}
+
+/// Dogfood: what EXT-X-START / session land was when a playlist was served.
+/// Full index bodies are huge (every seg URI); log header lines only.
+fn log_playlist_serve(
+    session_id: &str,
+    resource: &str,
+    req_start_ms: Option<u64>,
+    play_start_ms: u64,
+    pending_play_ms: Option<u64>,
+    bytes: &[u8],
+) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut ext_x_start: Option<f64> = None;
+    let mut head_lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if head_lines.len() < 14 && (line.starts_with('#') || line.is_empty()) {
+            head_lines.push(line);
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-START:TIME-OFFSET=") {
+            let offset = rest.split(',').next().unwrap_or(rest);
+            ext_x_start = offset.parse().ok();
+        }
+        if !line.starts_with('#') && !line.is_empty() {
+            // First media URI — stop header capture.
+            if head_lines.len() < 14 {
+                head_lines.push(line);
+            }
+            break;
+        }
+    }
+    let head = head_lines.join("|");
+    tracing::info!(
+        session_id,
+        resource,
+        req_start_ms,
+        play_start_ms,
+        pending_play_ms,
+        ext_x_start_s = ext_x_start,
+        play_land_seg = play_start_ms / SEGMENT_MS,
+        head = %head,
+        "hls playlist serve"
+    );
 }
 
 /// Full-title VOD media playlist (ADR-0011 amendment).
@@ -2598,12 +2607,20 @@ mod tests {
         let land_a = 622_000u64;
         let land_b = 1_078_000u64;
         assert!(
-            serve_ok_after_pending_apply(land_a, land_a),
+            serve_ok_after_pending_apply(land_a, land_a, Some(land_a)),
             "same land: serve retained/cooked bytes"
         );
         assert!(
-            !serve_ok_after_pending_apply(land_a, land_b),
+            !serve_ok_after_pending_apply(land_a, land_b, Some(land_a)),
             "play moved during request: do not return prior-land bytes"
+        );
+        assert!(
+            serve_ok_after_pending_apply(land_a, land_b, Some(land_b)),
+            "play moved to this request's land: land-ensure must still 200"
+        );
+        assert!(
+            !serve_ok_after_pending_apply(land_a, land_b, None),
+            "non-segment asset: play move refuses"
         );
     }
 
@@ -2801,6 +2818,7 @@ mod tests {
 
     /// While a waiter holds for land A, a newer scrub moves pending to B.
     /// A must not 503: enter no-fill hold, then end on session teardown.
+    /// (Immediate 204 on supersede rejected: wedged Safari native on doubles.)
     #[test]
     fn held_segment_waiter_no_fill_when_pending_moves() {
         if !ffmpeg_available() {
@@ -2863,6 +2881,56 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "should not wait full IDLE_TIMEOUT after stop; elapsed={elapsed:?}"
+        );
+    }
+
+    /// Double scrub: final land-ensure alone must notice cooking land on disk
+    /// and apply pending (no middle GET).
+    #[test]
+    fn final_land_waiter_applies_pending_when_cooking_land_appears() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 120);
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        // Start already cooking land A (20s). Do not GET A's land URI.
+        let id = reg
+            .start(1, &src, 20_000, 120_000, SessionMode::Transcode, stereo(), vec![])
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let s = sessions.get(&id).unwrap();
+            assert_eq!(s.play_start_ms, 20_000);
+            assert!(!s.first_segment_ready);
+        }
+
+        // Final land-ensure for B (40s, near — land gate, no preempt).
+        // Wait loop must notice A's land file and apply pending.
+        let reg_b = Arc::clone(&reg);
+        let id_b = id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let result = reg_b.asset(&id_b, "seg020.m4s", Some("land-ensure"));
+            let _ = tx.send((result, t0.elapsed()));
+        });
+
+        let (result, elapsed) = rx
+            .recv_timeout(Duration::from_secs(90))
+            .expect("final land-ensure must complete");
+        assert!(
+            matches!(result, Ok(ref b) if !b.is_empty()),
+            "final land must 200 after pending apply, got {:?} in {elapsed:?}",
+            result.as_ref().map(|b| b.len()).map_err(|e| format!("{e:?}"))
+        );
+        let sessions = reg.sessions.lock().unwrap();
+        let s = sessions.get(&id).unwrap();
+        assert_eq!(
+            s.play_start_ms, 40_000,
+            "pending B must have applied without a middle-land GET"
         );
     }
 

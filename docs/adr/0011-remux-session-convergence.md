@@ -147,17 +147,29 @@ path iOS/tvOS need).
    holes stay **503** / no restart (same as before the amendment). Far
    preempt and client playhead timing remain separate levers.
 
-   **Rejected experiment (2026-07-28, same day).** Long-poll hold on
-   abandoned misses (Jellyfin-style: no 503/404 while the session lives,
-   ceiling `IDLE_TIMEOUT`, then empty 204) — motivated by Netflix
-   never-missing segments, Jellyfin block-forever, and Apple forum
-   "penalty box after fragment HTTP errors." Dogfood double-scrub on
-   muxed Safari: land segment 200, `currentTime` at target, recover
-   watch `advanced=false`, picture never left the pre-scrub frame.
-   **Did not restore playback.** Status / hold shape on the abandoned
-   URI is not a sufficient fix for this wedge under full-title VOD +
-   distance preempt. Do not treat "avoid application errors on abandoned
-   GETs" as the proven path without new evidence.
+   **Settled: abandoned / superseded miss status shape.** A segment GET
+   that will not be filled on the current encode trajectory (abandoned
+   after preempt, or a land-waiter superseded by a newer pending land)
+   enters a **no-fill hold**: no 503/404 while the session lives. When
+   the hold reaches `IDLE_TIMEOUT` (or the session is torn down mid-hold),
+   the request ends with empty **HTTP 204**. That is product policy, not
+   an open experiment — Safari must not see an application-level media
+   failure on a URI the encode will never produce. Session teardown of a
+   dead session remains **404** (`NotFound`), distinct from this ceiling.
+
+   **Rejected (do not revive): immediate 204 on supersede.** Ending the
+   wait the instant pending moves, with 204 before the hold ceiling, wedged
+   native Safari on double-scrubs (zero further segment GETs after the
+   middle 204). No-fill hold first; 204 only at the ceiling.
+
+   **Not a scrub-wedge proof (2026-07-28).** The same hold/ceiling shape
+   was first tried as the sole fix for a double-scrub picture stall under
+   full-title VOD + distance preempt. Dogfood: land segment 200,
+   `currentTime` at target, recover watch `advanced=false`, picture never
+   left the pre-scrub frame. Status shape alone did not restore playback.
+   Keep the contract above for abandoned-URI hygiene; do not relitigate it
+   as if it were the proven scrub fix (coalesce, land-ensure, ADR-0017
+   attach backend, and related levers are separate).
 
 8. **Restart triggers are deliberate, not incidental.** Safari prefetched
    ~50 segments on a cold attach in the capture; an unguarded "any miss

@@ -441,7 +441,7 @@ fn map_playlist_err(session_id: &str, err: PlaylistError) -> ApiResult<Response>
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!("playlist for session {session_id} not ready yet"),
         }),
-        // Abandoned hold ceiling (asset path); playlists should not hit this.
+        // Asset-path hold ceiling (ADR-0011 §7); playlists should not hit this.
         PlaylistError::AbandonedHoldEnded => {
             let mut res = Response::new(Body::empty());
             *res.status_mut() = StatusCode::NO_CONTENT;
@@ -509,8 +509,7 @@ pub async fn asset(
                 message: format!("asset {asset} for session {session_id} not ready yet"),
             })
         }
-        // Abandoned miss hold ceiling: empty 204 — open experiment choice so
-        // Safari never sees 4xx/5xx for this URI while the session lived.
+        // Abandoned / superseded hold ceiling: empty 204 (ADR-0011 §7).
         Err(PlaylistError::AbandonedHoldEnded) => {
             log_hls_client_req(&session_id, &asset, None, 204, fetcher_ref);
             let mut res = Response::new(Body::empty());

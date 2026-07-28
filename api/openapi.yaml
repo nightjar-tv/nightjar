@@ -449,7 +449,7 @@ paths:
             Log-only client marker. Serving ignores this. JS land-ensure and
             attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's
             native HLS engine does not. Distinguishes probe traffic from
-            WebKit segment GETs in dogfood logs without changing 200/503
+            WebKit segment GETs in dogfood logs without changing 200/503/204
             behaviour.
           schema:
             type: string
@@ -462,6 +462,12 @@ paths:
               schema:
                 type: string
                 format: binary
+        "204":
+          description: >
+            Abandoned or superseded segment GET held with no fill until the
+            session idle ceiling while the session lived; empty body
+            (ADR-0011). Not an application error. Distinct from DELETE
+            session 204.
         "404":
           description: Session or asset not found
           content:
