@@ -2,11 +2,13 @@
 //! source (remux) or re-encodes it (transcode); the two differ by
 //! [`SessionMode`] and nothing else (ADR-0011).
 //!
-//! Fill-forward: FFmpeg starts at the play land point and encodes toward
-//! EOF. Cooked segments stay on disk for the session lifetime, so scrub
-//! into finished media is a plain file serve. Cold scrub restarts at the
-//! new offset (delay OK), then fills forward again. Encode lead-in is 0 —
-//! do not tax every seek with padding before the land frame.
+//! Fill-forward: FFmpeg starts [`ENCODE_LEAD_SEGMENTS`] before the play
+//! land (`#EXT-X-START`) and encodes toward EOF. Cooked segments stay on
+//! disk for the session lifetime, so scrub into finished media is a plain
+//! file serve. Cold scrub restarts at the new offset (delay OK), then fills
+//! forward again. Lead-in is 2 (not 0): Safari digs back ~1–2 segs near
+//! land after a scrub; lead 0 left those misses 503 forever once dig-back
+//! pending retreat was blocked (ADR-0011).
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
@@ -58,6 +60,16 @@ const ALIGN_BEHIND_SEGMENTS: u64 = 16;
 /// without taxing every seek by a full ALIGN window.
 const ENCODE_LEAD_SEGMENTS: u64 = 2;
 
+/// Runtime lead-in. Default [`ENCODE_LEAD_SEGMENTS`]. Override with
+/// `NIGHTJAR_ENCODE_LEAD_SEGMENTS` for local land-time / dig-back experiments
+/// only — not a shipped config surface.
+fn encode_lead_segments() -> u64 {
+    std::env::var("NIGHTJAR_ENCODE_LEAD_SEGMENTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ENCODE_LEAD_SEGMENTS)
+}
+
 #[derive(Debug)]
 pub enum StartSessionError {
     CapFull,
@@ -68,6 +80,11 @@ pub enum StartSessionError {
 pub enum PlaylistError {
     NotFound,
     NotReady,
+    /// Abandoned-segment hold reached [`IDLE_TIMEOUT`] while the session
+    /// still exists. Mapped to HTTP 204 (empty) — open experiment choice:
+    /// not 4xx/5xx so Safari does not see an application-level media
+    /// failure after a long hold. Session teardown uses [`NotFound`].
+    AbandonedHoldEnded,
     Failed(String),
 }
 
@@ -189,7 +206,8 @@ pub fn decide_segment_miss(
 pub enum CoalesceDesire {
     /// Already cooking or serving this play land.
     Nop,
-    /// Record pending; apply when `first_segment_ready` (do not kill yet).
+    /// Record pending; apply when cooking land is ready, or earlier when
+    /// [`coalesce_preempt_before_land`] allows (far pending + min interval).
     HoldInFlight,
     /// Record pending; apply after [`RESTART_COALESCE_QUIET`] of quiet.
     HoldDebounce,
@@ -216,14 +234,33 @@ pub fn classify_restart_desire(
 }
 
 /// Whether a recorded pending play land is due to apply.
+///
+/// When the cooking land is not ready yet, apply only if
+/// [`coalesce_preempt_before_land`] says the pending target is far outside
+/// the near-land band, and [`RESTART_MIN_INTERVAL`] has elapsed since the
+/// last restart (anti-thrash on the preempt path only — not a substitute
+/// for the land gate). Near pending must still wait for the cooking land
+/// (dogfood: seg415 after scrub to 1188 — yank before land left Safari
+/// retrying the prior URI).
+///
+/// Dogfood isolation: `NIGHTJAR_DISABLE_PREEMPT=1` forces the non-preempt
+/// branch (always wait for cooking land) without removing preempt code.
 pub fn pending_restart_due(
     first_segment_ready: bool,
     pending_play_ms: Option<u64>,
     pending_quiet_elapsed: Option<Duration>,
     apply_immediate: bool,
+    cooking_play_ms: u64,
+    since_last_restart: Duration,
 ) -> Option<u64> {
     let pending = pending_play_ms?;
     if !first_segment_ready {
+        if !disable_preempt()
+            && coalesce_preempt_before_land(cooking_play_ms, pending)
+            && since_last_restart >= RESTART_MIN_INTERVAL
+        {
+            return Some(pending);
+        }
         return None;
     }
     if apply_immediate {
@@ -234,6 +271,102 @@ pub fn pending_restart_due(
         return None;
     }
     Some(pending)
+}
+
+/// `NIGHTJAR_DISABLE_PREEMPT=1` (or `true`/`yes`): never preempt before land.
+fn disable_preempt() -> bool {
+    matches!(
+        std::env::var("NIGHTJAR_DISABLE_PREEMPT").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+/// Optional pause after kill before the next FFmpeg spawn (`restart_at`).
+/// `NIGHTJAR_RESTART_SPAWN_GAP_MS` — distinct from [`RESTART_MIN_INTERVAL`]
+/// (decision gate). Used to probe whether rapid dual-init boundaries wedge
+/// Safari while keeping preempt's fast target selection.
+fn restart_spawn_gap() -> Option<Duration> {
+    let ms: u64 = std::env::var("NIGHTJAR_RESTART_SPAWN_GAP_MS")
+        .ok()?
+        .parse()
+        .ok()?;
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
+
+/// Far pending may abandon an in-flight cook before its land exists.
+///
+/// "Far" means more than [`ALIGN_BEHIND_SEGMENTS`] from the cooking play land
+/// — outside the near-land dig-back / settle band. Near retargets must still
+/// wait for the cooking land (dogfood: seg415 after scrub to 1188). This is
+/// stricter than [`pending_waiter_action`] Release alone: a one-segment
+/// forward pending also Releases waiters but must not yank before land.
+pub fn coalesce_preempt_before_land(cooking_play_ms: u64, pending_play_ms: u64) -> bool {
+    let cooking = align_to_segment(cooking_play_ms);
+    let pending = align_to_segment(pending_play_ms);
+    if pending == cooking {
+        return false;
+    }
+    let segs = if pending > cooking {
+        (pending - cooking) / SEGMENT_MS
+    } else {
+        (cooking - pending) / SEGMENT_MS
+    };
+    segs > ALIGN_BEHIND_SEGMENTS
+}
+
+/// Missing segment that current policy will not [`desire_restart`] toward:
+/// behind the encode window (abandoned / superseded prior land), or otherwise
+/// never filled without a fresh `?startMs=`. Callers **hold** the connection
+/// instead of 503/404 while the session lives.
+pub fn segment_miss_unreachable(
+    want_ms: u64,
+    cooking_play_ms: u64,
+    pending_play_ms: Option<u64>,
+    window_start_ms: u64,
+    play_start_ms: u64,
+    latest_on_disk: Option<u64>,
+    primed: bool,
+) -> bool {
+    let want = align_to_segment(want_ms);
+    let idx = want / SEGMENT_MS;
+    let window = window_start_ms / SEGMENT_MS;
+    let play = play_start_ms / SEGMENT_MS;
+
+    // Playlist scrub pending this exact land — about to cook.
+    if pending_play_ms.is_some_and(|p| align_to_segment(p) == want) {
+        return false;
+    }
+
+    // Behind encode window: lead-in / fill-forward will not write this index.
+    // (Dig-back within ALIGN of a *new* play can still be behind that play's
+    // window — that is abandoned, not in-window dig-back.)
+    if idx < window {
+        return true;
+    }
+
+    // In-window dig-back near committed land: lead-in may still write it.
+    if digback_behind_committed(cooking_play_ms, pending_play_ms, want) {
+        return false;
+    }
+
+    let cool = decide_segment_miss(
+        idx,
+        window,
+        play,
+        latest_on_disk,
+        primed,
+        RESTART_MIN_INTERVAL,
+    );
+    if cool == SegmentMissAction::Restart {
+        return false;
+    }
+
+    // idx >= window and Wait: fill-forward will produce it.
+    false
 }
 
 /// Segment-miss desire that only nudges an existing pending land a few
@@ -278,12 +411,12 @@ pub fn digback_behind_committed(
     (committed - want) / SEGMENT_MS <= ALIGN_BEHIND_SEGMENTS
 }
 
-/// Whether a long-poll for `want_play_ms` should keep holding or release now.
+/// Whether a long-poll for `want_play_ms` should keep holding for fill or
+/// treat the want as superseded (pending moved to a different scrub).
 ///
-/// Matches playlist wait: hold until the land segment cooks. If pending moves
-/// to a **different** scrub (ahead, or far behind), release with 503 so a
-/// stale connection does not sit through `SEGMENT_WAIT`. Dig-back pending a
-/// few segments *behind* this land holds — do not starve the deliberate land
+/// Superseded waiters use the no-fill hold (same as abandoned misses): no
+/// 503/404 while the session lives. Dig-back pending a few segments *behind*
+/// this land still counts as Hold — do not starve the deliberate land
 /// waiter for a near-ALIGN steal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingWaiterAction {
@@ -470,6 +603,7 @@ impl HlsSessionRegistry {
             item_id,
             start_ms,
             play_start_ms,
+            encode_lead_segments = encode_lead_segments(),
             mode = ?mode,
             audio_stream = ?audio.stream_index,
             audio_channels = audio.channels,
@@ -689,18 +823,29 @@ impl HlsSessionRegistry {
     /// Logs terminal outcomes here (not only in the HTTP route after
     /// `.await`) so a client-aborted long-poll that still finishes cooking
     /// is visible as `hls asset ready` without a matching route 200.
-    pub fn asset(&self, session_id: &str, name: &str) -> Result<Vec<u8>, PlaylistError> {
+    ///
+    /// `fetcher` is log-only (optional `njFetcher` query): JS land-ensure /
+    /// attach-wait probes set it; Safari's native HLS engine does not. Used
+    /// to tell probe traffic from WebKit's own segment GETs in dogfood logs.
+    pub fn asset(
+        &self,
+        session_id: &str,
+        name: &str,
+        fetcher: Option<&str>,
+    ) -> Result<Vec<u8>, PlaylistError> {
         let t0 = Instant::now();
         let result = self.asset_wait(session_id, name);
         // Always log not-ready/fail. Log ready only when we waited (long-poll /
         // cook) so aborted holds show up even if the HTTP route never runs;
         // skip hot-path disk hits (route 200 is enough).
         let waited = t0.elapsed() > Duration::from_millis(100);
+        let fetcher = fetcher.unwrap_or("-");
         match &result {
             Ok(bytes) if waited => {
                 tracing::info!(
                     session_id,
                     asset = %name,
+                    fetcher,
                     bytes = bytes.len(),
                     waited_ms = t0.elapsed().as_millis(),
                     "hls asset ready"
@@ -711,17 +856,33 @@ impl HlsSessionRegistry {
                 tracing::info!(
                     session_id,
                     asset = %name,
+                    fetcher,
                     waited_ms = t0.elapsed().as_millis(),
                     "hls asset not ready"
                 );
             }
             Err(PlaylistError::NotFound) => {
-                tracing::info!(session_id, asset = %name, "hls asset not found");
+                tracing::info!(
+                    session_id,
+                    asset = %name,
+                    fetcher,
+                    "hls asset not found"
+                );
+            }
+            Err(PlaylistError::AbandonedHoldEnded) => {
+                tracing::info!(
+                    session_id,
+                    asset = %name,
+                    fetcher,
+                    waited_ms = t0.elapsed().as_millis(),
+                    "hls asset abandoned hold ended"
+                );
             }
             Err(PlaylistError::Failed(err)) => {
                 tracing::warn!(
                     session_id,
                     asset = %name,
+                    fetcher,
                     error = %err,
                     "hls asset failed"
                 );
@@ -740,9 +901,34 @@ impl HlsSessionRegistry {
         };
         let mut deadline = Instant::now() + SEGMENT_WAIT;
         // Once this request has claimed a land via desire_restart, a later
-        // pending move to a different land releases the hold (503) instead of
-        // burning SEGMENT_WAIT for a superseded scrub.
+        // pending move to a different land ends the *fill* wait — enter
+        // no-fill hold (not 503) so Safari never sees an app-level error.
         let mut holding_for_land = false;
+        // No-fill hold: abandoned miss or superseded land waiter. Open until
+        // IDLE_TIMEOUT / session teardown — no 503/404 while alive.
+        let mut holding_no_fill = false;
+        let enter_no_fill = |reason: &str,
+                             session_id: &str,
+                             file_name: &str,
+                             session: &Session,
+                             holding_no_fill: &mut bool,
+                             holding_for_land: &mut bool,
+                             deadline: &mut Instant| {
+            if !*holding_no_fill {
+                *holding_no_fill = true;
+                *holding_for_land = false;
+                *deadline = Instant::now() + IDLE_TIMEOUT;
+                tracing::info!(
+                    session_id,
+                    asset = %file_name,
+                    play_start_ms = session.play_start_ms,
+                    pending_play_ms = session.pending_play_ms,
+                    hold_ms = IDLE_TIMEOUT.as_millis(),
+                    reason,
+                    "hls asset no-fill hold"
+                );
+            }
+        };
         loop {
             {
                 let mut sessions = self
@@ -759,18 +945,24 @@ impl HlsSessionRegistry {
                 if let Some(idx) = requested {
                     let want_ms = idx * SEGMENT_MS;
                     // Holding for this land and a newer scrub retargeted pending
-                    // (or already applied a different land): release before we
-                    // maybe_apply (which would clear pending) or serve a stale file.
+                    // (or already applied a different land): same fate as
+                    // abandoned — content will not arrive on this trajectory.
                     if holding_for_land {
-                        if pending_waiter_action(session.pending_play_ms, want_ms)
+                        let superseded = pending_waiter_action(session.pending_play_ms, want_ms)
                             == PendingWaiterAction::Release
-                        {
-                            return Err(PlaylistError::NotReady);
-                        }
-                        if session.pending_play_ms.is_none()
-                            && align_to_segment(session.play_start_ms) != align_to_segment(want_ms)
-                        {
-                            return Err(PlaylistError::NotReady);
+                            || (session.pending_play_ms.is_none()
+                                && align_to_segment(session.play_start_ms)
+                                    != align_to_segment(want_ms));
+                        if superseded {
+                            enter_no_fill(
+                                "superseded",
+                                session_id,
+                                &file_name,
+                                session,
+                                &mut holding_no_fill,
+                                &mut holding_for_land,
+                                &mut deadline,
+                            );
                         }
                     }
                 }
@@ -823,94 +1015,138 @@ impl HlsSessionRegistry {
                     let latest = latest_segment_in_window(&session.dir, window_start);
                     let since = session.last_restart.elapsed();
                     let want_ms = idx * SEGMENT_MS;
-                    // Would this miss restart if the min-interval were cool?
-                    // Used so Wait-due-to-interval still records pending.
-                    let scrub_shaped = decide_segment_miss(
-                        idx,
-                        window_start,
-                        play_start,
-                        latest,
-                        session.primed,
-                        RESTART_MIN_INTERVAL,
-                    ) == SegmentMissAction::Restart;
-                    match decide_segment_miss(
-                        idx,
-                        window_start,
-                        play_start,
-                        latest,
-                        session.primed,
-                        since,
-                    ) {
-                        SegmentMissAction::Restart => {
-                            if prefetch_advances_pending(session.pending_play_ms, want_ms) {
-                                // Keep the startMs (or prior) pending land;
-                                // do not yank forward to a prefetch seg.
-                                return Err(PlaylistError::NotReady);
-                            }
-                            if digback_behind_committed(
-                                session.play_start_ms,
-                                session.pending_play_ms,
-                                want_ms,
-                            ) {
-                                // Near-ALIGN dig-back must not retreat a
-                                // committed / pending startMs land. Lead-in
-                                // may still produce this seg — long-poll
-                                // without desire_restart. If pending moved to
-                                // a *different* scrub, release (do not hang).
-                                if pending_waiter_action(session.pending_play_ms, want_ms)
-                                    == PendingWaiterAction::Release
-                                {
-                                    return Err(PlaylistError::NotReady);
-                                }
-                                if session.pending_play_ms.is_none()
-                                    && align_to_segment(session.play_start_ms)
-                                        != align_to_segment(want_ms)
-                                {
-                                    return Err(PlaylistError::NotReady);
-                                }
-                            } else {
-                                desire_restart(session, want_ms);
-                                holding_for_land = true;
-                                maybe_apply_pending_restart(session)?;
-                                // Pending matches this seg (or restart already
-                                // applied): long-poll like playlist wait until
-                                // the file lands.
-                                deadline = Instant::now() + SEGMENT_WAIT;
-                            }
+
+                    if holding_no_fill
+                        || segment_miss_unreachable(
+                            want_ms,
+                            session.play_start_ms,
+                            session.pending_play_ms,
+                            session.start_ms,
+                            session.play_start_ms,
+                            latest,
+                            session.primed,
+                        )
+                    {
+                        if !holding_no_fill {
+                            enter_no_fill(
+                                "abandoned",
+                                session_id,
+                                &file_name,
+                                session,
+                                &mut holding_no_fill,
+                                &mut holding_for_land,
+                                &mut deadline,
+                            );
                         }
-                        SegmentMissAction::Wait => {
-                            // scrub_shaped: still record pending when live
-                            // decision is Wait only because min-interval is
-                            // hot — but never for dig-back behind committed.
-                            if scrub_shaped
-                                && !prefetch_advances_pending(session.pending_play_ms, want_ms)
-                                && !digback_behind_committed(
+                        // Stay in loop until file appears, session gone, or
+                        // IDLE_TIMEOUT → AbandonedHoldEnded (204).
+                    } else {
+                        // Would this miss restart if the min-interval were cool?
+                        // Used so Wait-due-to-interval still records pending.
+                        let scrub_shaped = decide_segment_miss(
+                            idx,
+                            window_start,
+                            play_start,
+                            latest,
+                            session.primed,
+                            RESTART_MIN_INTERVAL,
+                        ) == SegmentMissAction::Restart;
+                        match decide_segment_miss(
+                            idx,
+                            window_start,
+                            play_start,
+                            latest,
+                            session.primed,
+                            since,
+                        ) {
+                            SegmentMissAction::Restart => {
+                                if prefetch_advances_pending(session.pending_play_ms, want_ms) {
+                                    // Keep the startMs (or prior) pending land;
+                                    // do not yank forward to a prefetch seg.
+                                    return Err(PlaylistError::NotReady);
+                                }
+                                if digback_behind_committed(
                                     session.play_start_ms,
                                     session.pending_play_ms,
                                     want_ms,
-                                )
-                            {
-                                desire_restart(session, want_ms);
-                                holding_for_land = true;
+                                ) {
+                                    // Near-ALIGN dig-back must not retreat a
+                                    // committed / pending startMs land. Lead-in
+                                    // may still produce this seg — long-poll
+                                    // without desire_restart.
+                                    if pending_waiter_action(session.pending_play_ms, want_ms)
+                                        == PendingWaiterAction::Release
+                                    {
+                                        // Pending moved to a different scrub —
+                                        // same no-fill hold as abandoned.
+                                        enter_no_fill(
+                                            "superseded",
+                                            session_id,
+                                            &file_name,
+                                            session,
+                                            &mut holding_no_fill,
+                                            &mut holding_for_land,
+                                            &mut deadline,
+                                        );
+                                    } else if session.pending_play_ms.is_none()
+                                        && align_to_segment(session.play_start_ms)
+                                            != align_to_segment(want_ms)
+                                    {
+                                        // Dig-back with no pending: encoder will
+                                        // not restart toward this want; lead-in
+                                        // may still write it. Instant 503 so the
+                                        // player retries — not a superseded
+                                        // pending (leave as NotReady).
+                                        return Err(PlaylistError::NotReady);
+                                    }
+                                } else {
+                                    desire_restart(session, want_ms);
+                                    holding_for_land = true;
+                                    maybe_apply_pending_restart(session)?;
+                                    // Pending matches this seg (or restart already
+                                    // applied): long-poll like playlist wait until
+                                    // the file lands.
+                                    deadline = Instant::now() + SEGMENT_WAIT;
+                                }
                             }
-                            maybe_apply_pending_restart(session)?;
-                            if pending_waiter_action(session.pending_play_ms, want_ms)
-                                == PendingWaiterAction::Release
-                            {
-                                return Err(PlaylistError::NotReady);
-                            }
-                            if session.child.is_none() {
-                                return Err(PlaylistError::NotFound);
-                            }
-                            // Far behind play land (stale prior scrub / attach
-                            // prefetch of seg000): never burn SEGMENT_WAIT —
-                            // dogfood showed 30s holds on seg530 after land B.
-                            // Near dig-back before primed: 503 immediately so
-                            // the player retries; lead-in will appear on disk.
-                            if idx < window_start {
-                                let behind_play = play_start.saturating_sub(idx);
-                                if behind_play > ALIGN_BEHIND_SEGMENTS || !session.primed {
-                                    return Err(PlaylistError::NotReady);
+                            SegmentMissAction::Wait => {
+                                // scrub_shaped: still record pending when live
+                                // decision is Wait only because min-interval is
+                                // hot — but never for dig-back behind committed.
+                                if scrub_shaped
+                                    && !prefetch_advances_pending(session.pending_play_ms, want_ms)
+                                    && !digback_behind_committed(
+                                        session.play_start_ms,
+                                        session.pending_play_ms,
+                                        want_ms,
+                                    )
+                                {
+                                    desire_restart(session, want_ms);
+                                    holding_for_land = true;
+                                }
+                                maybe_apply_pending_restart(session)?;
+                                if pending_waiter_action(session.pending_play_ms, want_ms)
+                                    == PendingWaiterAction::Release
+                                {
+                                    enter_no_fill(
+                                        "superseded",
+                                        session_id,
+                                        &file_name,
+                                        session,
+                                        &mut holding_no_fill,
+                                        &mut holding_for_land,
+                                        &mut deadline,
+                                    );
+                                } else if session.child.is_none() {
+                                    return Err(PlaylistError::NotFound);
+                                } else if idx < window_start {
+                                    // Far behind should be abandoned (no-fill).
+                                    // Near dig-back before primed: 503 so the
+                                    // player retries; lead-in will appear on disk.
+                                    let behind_play = play_start.saturating_sub(idx);
+                                    if behind_play > ALIGN_BEHIND_SEGMENTS || !session.primed {
+                                        return Err(PlaylistError::NotReady);
+                                    }
                                 }
                             }
                         }
@@ -918,6 +1154,9 @@ impl HlsSessionRegistry {
                 }
             }
             if Instant::now() >= deadline {
+                if holding_no_fill {
+                    return Err(PlaylistError::AbandonedHoldEnded);
+                }
                 return Err(PlaylistError::NotReady);
             }
             std::thread::sleep(SEGMENT_POLL);
@@ -1013,6 +1252,14 @@ fn restart_at(
     let play_start_ms = align_to_segment(play_ms);
     let start_ms = encode_start_ms(play_start_ms);
     stop_child(&mut session.child);
+    if let Some(gap) = restart_spawn_gap() {
+        tracing::info!(
+            gap_ms = gap.as_millis(),
+            play_start_ms,
+            "hls restart spawn gap (NIGHTJAR_RESTART_SPAWN_GAP_MS)"
+        );
+        std::thread::sleep(gap);
+    }
     // Gate 2 / fill-forward: do not wipe prior segments. In-flight fetches
     // and later scrub-back into cooked media must still hit disk. Only
     // remove the muxer sidecar; ffmpeg -y overwrites init and new indices.
@@ -1059,9 +1306,9 @@ fn restart_at(
     Ok(())
 }
 
-/// Record scrub intent. In-flight encodes keep cooking until land, then the
-/// latest pending target is applied; after land, rapid intents debounce into
-/// one restart (see [`RESTART_COALESCE_QUIET`]).
+/// Record scrub intent. In-flight encodes keep cooking until land (or a far
+/// pending preempts after [`RESTART_MIN_INTERVAL`]); after land, rapid intents
+/// debounce into one restart (see [`RESTART_COALESCE_QUIET`]).
 fn desire_restart(session: &mut Session, want_play_ms: u64) {
     let aligned = align_to_segment(want_play_ms);
     match classify_restart_desire(
@@ -1109,20 +1356,37 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
     // `pending_since == None` with a pending target means apply immediately
     // (used right after first_segment_ready for in-flight coalesce).
     let apply_immediate = session.pending_play_ms.is_some() && session.pending_since.is_none();
+    let ready = session.first_segment_ready;
+    let cooking = session.play_start_ms;
+    let since = session.last_restart.elapsed();
     let Some(pending) = pending_restart_due(
-        session.first_segment_ready,
+        ready,
         session.pending_play_ms,
         elapsed,
         apply_immediate,
+        cooking,
+        since,
     ) else {
         return Ok(());
     };
+    let preempt_before_land = !ready
+        && !disable_preempt()
+        && coalesce_preempt_before_land(cooking, pending)
+        && since >= RESTART_MIN_INTERVAL;
     session.pending_play_ms = None;
     session.pending_since = None;
     // Re-read play/encode after clearing pending — same lock section, but
     // do not act on a pending snapshot if we already cook that land.
     if encode_start_ms(pending) == session.start_ms && pending == session.play_start_ms {
         return Ok(());
+    }
+    if preempt_before_land {
+        tracing::info!(
+            pending_play_ms = pending,
+            cooking_play_ms = cooking,
+            since_last_restart_ms = since.as_millis(),
+            "hls seek restart preempted (before land)"
+        );
     }
     let encoder = session.video_encoder.clone();
     restart_at(session, pending, &encoder)
@@ -1154,7 +1418,7 @@ pub fn serve_ok_retained_during_stale_guard(
     }
     let want = align_to_segment(want_ms);
     let play = align_to_segment(play_start_ms);
-    want + ENCODE_LEAD_SEGMENTS * SEGMENT_MS >= play
+    want + encode_lead_segments() * SEGMENT_MS >= play
 }
 
 /// Polls the session dir and emits one log line per encode milestone so
@@ -1229,9 +1493,11 @@ fn spawn_segment_milestone_watch(
 }
 
 /// Logs once when the **play land** segment appears (not merely the lead-in
-/// first window). Pending scrub apply waits for this so a coalesced restart
-/// does not yank before the cooking land exists — that left Safari retrying
-/// the prior land seg forever (dogfood: seg415 after scrub to 1188).
+/// first window). Pending scrub apply waits for this when the new target is
+/// near the cooking land so a coalesced restart does not yank before that
+/// land exists — that left Safari retrying the prior land seg forever
+/// (dogfood: seg415 after scrub to 1188). Far pending may preempt earlier
+/// via [`coalesce_preempt_before_land`] once [`RESTART_MIN_INTERVAL`] elapses.
 fn note_first_segment_ready(session_id: &str, session: &mut Session) {
     if session.first_segment_ready {
         return;
@@ -1262,6 +1528,9 @@ fn note_first_segment_ready(session_id: &str, session: &mut Session) {
                 PlaylistError::Failed(msg) => msg,
                 PlaylistError::NotFound => "pending seek restart: not found".into(),
                 PlaylistError::NotReady => "pending seek restart: not ready".into(),
+                PlaylistError::AbandonedHoldEnded => {
+                    "pending seek restart: abandoned hold ended".into()
+                }
             });
         }
     }
@@ -1293,10 +1562,10 @@ fn align_to_segment(ms: u64) -> u64 {
     (ms / SEGMENT_MS) * SEGMENT_MS
 }
 
-/// Encode at the play land point. Lead-in is 0 (fill-forward): the first
-/// cooked segment is the one playback needs, not sixteen seconds earlier.
+/// Encode window start for a play land: [`encode_lead_segments`] before the
+/// aligned play point (Safari dig-back; see module docs / ADR-0011).
 fn encode_start_ms(play_ms: u64) -> u64 {
-    align_to_segment(play_ms.saturating_sub(ENCODE_LEAD_SEGMENTS * SEGMENT_MS))
+    align_to_segment(play_ms.saturating_sub(encode_lead_segments() * SEGMENT_MS))
 }
 
 fn segment_name(index: u64) -> String {
@@ -1782,7 +2051,7 @@ mod tests {
 
     fn wait_asset(reg: &HlsSessionRegistry, id: &str, name: &str) -> Vec<u8> {
         for _ in 0..150 {
-            match reg.asset(id, name) {
+            match reg.asset(id, name, None) {
                 Ok(bytes) => return bytes,
                 Err(PlaylistError::NotReady) => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -2073,7 +2342,7 @@ mod tests {
         ready = true;
         play = 1_084_000;
         encode = encode_start_ms(play);
-        let due = pending_restart_due(ready, pending, None, true);
+        let due = pending_restart_due(ready, pending, None, true, play, RESTART_MIN_INTERVAL);
         assert_eq!(due, Some(2_454_000));
         // Apply once to the last intent.
         if let Some(p) = due {
@@ -2098,12 +2367,138 @@ mod tests {
             pending = Some(align_to_segment(want));
         }
         assert_eq!(
-            pending_restart_due(ready, pending, Some(Duration::from_millis(100)), false),
+            pending_restart_due(
+                ready,
+                pending,
+                Some(Duration::from_millis(100)),
+                false,
+                play,
+                RESTART_MIN_INTERVAL,
+            ),
             None,
             "quiet not elapsed"
         );
-        let due2 = pending_restart_due(ready, pending, Some(RESTART_COALESCE_QUIET), false);
+        let due2 = pending_restart_due(
+            ready,
+            pending,
+            Some(RESTART_COALESCE_QUIET),
+            false,
+            play,
+            RESTART_MIN_INTERVAL,
+        );
         assert_eq!(due2, Some(2_700_000));
+    }
+
+    /// Dogfood seg415 after scrub to 1188: yank before the cooking *play land*
+    /// exists left Safari retrying the prior land URI forever. Ready must mean
+    /// the play-land segment, not the encode-window first segment. Near pending
+    /// must not preempt before that land exists.
+    #[test]
+    fn seg415_near_pending_must_not_preempt_before_cooking_land() {
+        // Scrub to 1188s; encode lead puts first_window two segs earlier.
+        let cooking_play = 1_188_000u64;
+        let encode = encode_start_ms(cooking_play);
+        assert_eq!(encode, 1_184_000, "lead-in before land");
+        assert_ne!(
+            encode / SEGMENT_MS,
+            cooking_play / SEGMENT_MS,
+            "first window index is not the play land (old ready bug)"
+        );
+        // Prior land Safari was still probing (seg415).
+        let prior_land = 415 * SEGMENT_MS;
+        assert_eq!(prior_land, 830_000);
+
+        // Near retarget while cooking 1188 — inside ALIGN band, must not preempt.
+        let near_fwd = cooking_play + SEGMENT_MS;
+        let near_back = cooking_play - SEGMENT_MS;
+        let edge = cooking_play + ALIGN_BEHIND_SEGMENTS * SEGMENT_MS;
+        assert!(
+            !coalesce_preempt_before_land(cooking_play, near_fwd),
+            "near forward must not abandon cooking land"
+        );
+        assert!(
+            !coalesce_preempt_before_land(cooking_play, near_back),
+            "near behind must not abandon cooking land"
+        );
+        assert!(
+            !coalesce_preempt_before_land(cooking_play, edge),
+            "exactly ALIGN_BEHIND segs is still near"
+        );
+        assert_eq!(
+            pending_restart_due(
+                false,
+                Some(near_fwd),
+                None,
+                false,
+                cooking_play,
+                RESTART_MIN_INTERVAL,
+            ),
+            None,
+            "near pending before land: no apply (seg415 protection)"
+        );
+        // Even with apply_immediate and a cool restart clock: still blocked.
+        assert_eq!(
+            pending_restart_due(
+                false,
+                Some(near_fwd),
+                None,
+                true,
+                cooking_play,
+                RESTART_MIN_INTERVAL * 2,
+            ),
+            None
+        );
+        // Land ready → near pending may apply (debounce/immediate path).
+        assert_eq!(
+            pending_restart_due(
+                true,
+                Some(near_fwd),
+                None,
+                true,
+                cooking_play,
+                RESTART_MIN_INTERVAL,
+            ),
+            Some(near_fwd)
+        );
+    }
+
+    /// Rapid B then far C while B still cooking: after RESTART_MIN_INTERVAL,
+    /// C preempts without waiting for B's land (Bug 1 third gate). Middle
+    /// cook must not block the third target for a full land.
+    #[test]
+    fn far_pending_preempts_before_land_after_min_interval() {
+        let land_b = 1_494_000u64;
+        let land_c = 2_070_000u64;
+        assert!(
+            coalesce_preempt_before_land(land_b, land_c),
+            "far C: beyond ALIGN_BEHIND from B"
+        );
+        // Too soon after B's restart: anti-thrash holds preempt.
+        assert_eq!(
+            pending_restart_due(
+                false,
+                Some(land_c),
+                Some(Duration::from_millis(470)),
+                false,
+                land_b,
+                Duration::from_millis(470),
+            ),
+            None,
+            "preempt still gated by RESTART_MIN_INTERVAL"
+        );
+        // Interval elapsed, B's land still missing: apply C.
+        assert_eq!(
+            pending_restart_due(
+                false,
+                Some(land_c),
+                Some(Duration::from_millis(470)),
+                false,
+                land_b,
+                RESTART_MIN_INTERVAL,
+            ),
+            Some(land_c),
+            "far C applies before B land once interval cools"
+        );
     }
 
     /// Prefetch seg ahead of an existing pending land must not advance it.
@@ -2270,14 +2665,7 @@ mod tests {
         let play = window;
         // Near behind → Restart when cool (scrub_shaped true).
         assert_eq!(
-            decide_segment_miss(
-                idx,
-                window,
-                play,
-                Some(window),
-                true,
-                RESTART_MIN_INTERVAL,
-            ),
+            decide_segment_miss(idx, window, play, Some(window), true, RESTART_MIN_INTERVAL,),
             SegmentMissAction::Restart
         );
         assert!(
@@ -2286,10 +2674,50 @@ mod tests {
         );
         // Hot min-interval → Wait, but scrub_shaped still true — same dig-back gate.
         assert_eq!(
-            decide_segment_miss(idx, window, play, Some(window), true, Duration::from_millis(0)),
+            decide_segment_miss(
+                idx,
+                window,
+                play,
+                Some(window),
+                true,
+                Duration::from_millis(0)
+            ),
             SegmentMissAction::Wait
         );
         assert!(digback_behind_committed(cooking, None, dig));
+    }
+
+    /// Abandoned miss predicate: far behind / prior land → hold path; dig-back
+    /// and pending land stay reachable (503 cook / desire).
+    #[test]
+    fn segment_miss_unreachable_table() {
+        let cooking = 1_482_000u64;
+        let window_ms = encode_start_ms(cooking);
+        let play = cooking;
+        let latest = Some(window_ms / SEGMENT_MS);
+        let prior = 473 * SEGMENT_MS;
+        let far = cooking - (ALIGN_BEHIND_SEGMENTS + 1) * SEGMENT_MS;
+        let dig = cooking - 2 * SEGMENT_MS;
+        let in_window = window_ms;
+        let ahead = cooking + (CATCH_UP_SEGMENTS + 2) * SEGMENT_MS;
+
+        let cases: &[(&str, u64, Option<u64>, bool, bool)] = &[
+            ("far behind no pending", far, None, true, true),
+            ("prior land after jump", prior, None, true, true),
+            ("attach-shaped seg000", 0, None, true, true),
+            ("near dig-back", dig, None, true, false),
+            ("pending exact land", prior, Some(prior), true, false),
+            ("in-window fill-forward", in_window, None, true, false),
+            ("cool restart ahead", ahead, None, true, false),
+            ("unprimed far still unreachable", far, None, false, true),
+        ];
+        for &(name, want, pending, primed, expect_unreachable) in cases {
+            assert_eq!(
+                segment_miss_unreachable(want, cooking, pending, window_ms, play, latest, primed),
+                expect_unreachable,
+                "{name}"
+            );
+        }
     }
 
     /// Dogfood: coalesce used to 503 the land seg immediately and rely on
@@ -2314,7 +2742,7 @@ mod tests {
         let t0 = Instant::now();
         // Far past the few seconds of fill-forward from start — forces restart + hold.
         let bytes = reg
-            .asset(&id, "seg020.m4s")
+            .asset(&id, "seg020.m4s", None)
             .expect("land seg must 200 on the holding request");
         assert!(!bytes.is_empty());
         assert!(
@@ -2324,9 +2752,9 @@ mod tests {
     }
 
     /// While a waiter holds for land A, a newer scrub moves pending to B.
-    /// The A waiter must 503 quickly — not sit until SEGMENT_WAIT.
+    /// A must not 503: enter no-fill hold, then end on session teardown.
     #[test]
-    fn held_segment_waiter_releases_when_pending_moves() {
+    fn held_segment_waiter_no_fill_when_pending_moves() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -2347,38 +2775,47 @@ mod tests {
         let id_hold = id.clone();
         std::thread::spawn(move || {
             let t0 = Instant::now();
-            let result = reg_hold.asset(&id_hold, "seg020.m4s");
+            let result = reg_hold.asset(&id_hold, "seg020.m4s", None);
             let _ = tx.send((result, t0.elapsed()));
         });
-        // Keep retargeting pending so the hold thread cannot finish encode
-        // before observing a mismatched pending (avoids claim/supersede races).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let _ = reg.playlist(&id, Some(50_000));
+        // Retarget far ahead so supersede is outside ALIGN dig-back of land.
+        let probe_until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < probe_until {
+            let _ = reg.playlist(&id, Some(200_000));
             match rx.try_recv() {
                 Ok((first, elapsed)) => {
                     assert!(
-                        matches!(first, Err(PlaylistError::NotReady)),
-                        "stale land waiter must release when pending moves, got {:?}",
-                        first.as_ref().map(|b| b.len())
+                        !matches!(first, Err(PlaylistError::NotReady)),
+                        "superseded land waiter must not 503: {:?} elapsed={elapsed:?}",
+                        first
+                            .as_ref()
+                            .map(|b| b.len())
+                            .map_err(|e| format!("{e:?}"))
                     );
-                    assert!(
-                        elapsed < Duration::from_secs(5),
-                        "must not burn SEGMENT_WAIT after supersede; elapsed={elapsed:?}"
-                    );
+                    // Land cooked before supersede stuck (fast fixture) — ok.
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
-                        panic!("hold thread did not finish within 5s");
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     panic!("hold thread disconnected without sending");
                 }
             }
         }
+        assert!(reg.stop(&id), "teardown must end the no-fill hold");
+        let (result, elapsed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hold must end after session stop");
+        assert!(
+            matches!(result, Err(PlaylistError::NotFound)),
+            "teardown ends hold with NotFound, got {:?}",
+            result.as_ref().map(|b| b.len())
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "should not wait full IDLE_TIMEOUT after stop; elapsed={elapsed:?}"
+        );
     }
 
     #[test]
@@ -2443,7 +2880,7 @@ mod tests {
             "switch land stays at the requested offset: {text}"
         );
 
-        match reg.asset(&switched, "seg000.m4s") {
+        match reg.asset(&switched, "seg000.m4s", None) {
             Err(PlaylistError::NotReady) => {}
             other => {
                 eprintln!("seg000 after switch playlist: {other:?}");
@@ -2459,7 +2896,7 @@ mod tests {
         // Real scrub-back is playlist ?startMs=.
         let dig_ms = 13 * SEGMENT_MS;
         assert!(digback_behind_committed(play_ms, None, dig_ms));
-        match reg.asset(&switched, "seg013.m4s") {
+        match reg.asset(&switched, "seg013.m4s", None) {
             Err(PlaylistError::NotReady) => {}
             Ok(_) => panic!("dig-back must not cook a retreated window"),
             Err(e) => panic!("unexpected dig-back error: {e:?}"),
@@ -2538,7 +2975,7 @@ mod tests {
         let text = String::from_utf8_lossy(&playlist);
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{text}");
         assert!(text.contains("#EXT-X-ENDLIST"), "{text}");
-        assert!(reg.asset(&id, "seg000.m4s").is_ok());
+        assert!(reg.asset(&id, "seg000.m4s", None).is_ok());
         assert!(reg.stop(&id));
         assert!(matches!(
             reg.playlist(&id, None),
@@ -2695,7 +3132,7 @@ mod tests {
             })
         );
         wait_playlist(&reg, &id);
-        assert!(reg.asset(&id, "seg000.m4s").is_ok());
+        assert!(reg.asset(&id, "seg000.m4s", None).is_ok());
         reg.stop(&id);
     }
 
@@ -2721,7 +3158,7 @@ mod tests {
             )
             .unwrap();
         wait_playlist(&reg, &id);
-        let early = reg.asset(&id, "seg000.m4s").expect("early segment");
+        let early = reg.asset(&id, "seg000.m4s", None).expect("early segment");
         // Move the window forward; prior segment must still be readable.
         for _ in 0..100 {
             match reg.playlist(&id, Some(2000)) {
@@ -2731,10 +3168,10 @@ mod tests {
             }
         }
         let still = reg
-            .asset(&id, "seg000.m4s")
+            .asset(&id, "seg000.m4s", None)
             .expect("retained segment must not 404 after seek");
         assert_eq!(early.len(), still.len());
-        assert!(reg.asset(&id, "seg001.m4s").is_ok());
+        assert!(reg.asset(&id, "seg001.m4s", None).is_ok());
         reg.stop(&id);
     }
 

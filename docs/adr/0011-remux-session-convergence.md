@@ -129,12 +129,35 @@ path iOS/tvOS need).
 
 7. **Out-of-window segment requests are load-bearing 503s, not 404s.**
    A segment the current encode window has not produced (and that is not
-   retained on disk from a prior window) returns **503** while the session
-   restarts at that offset and the segment cooks — the same retry contract
-   already used for not-yet-ready in-window segments (ADR-0007 §5). 404
-   means the session is gone or the name is illegal. Under a full-title
-   VOD claim, 503 is the normal path for scrub/prefetch into a cold region,
-   not an edge case. Clients must retry; giving up on 404 is wrong here.
+   retained on disk from a prior window) returns **503** — the same retry
+   contract already used for not-yet-ready in-window segments (ADR-0007 §5).
+   Under a full-title VOD claim, 503 is the normal path for scrub/prefetch
+   into a cold region. Clients must retry; giving up on 404 is wrong.
+
+   **Rejected amendment (2026-07-28).** Mapping "policy will not
+   `desire_restart` toward this index" misses to **404** (to silence
+   forever-503 console noise on abandoned prior-land URIs after preempt)
+   is reverted. Dogfood on muxed A+V Safari showed a **worse failure than
+   the one it fixed**: stalled playback with no recovery, not merely
+   continued retries. The useful claim for later readers is not "404 failed
+   to stop GETs" and not a blanket "404 is unsafe." It is: **repeated
+   errors on a segment Safari still considers in-window may wedge the
+   pipeline, independent of which status code caused them.** Do not reopen
+   404-scoping as if status were the actual variable. Unreachable cold
+   holes stay **503** / no restart (same as before the amendment). Far
+   preempt and client playhead timing remain separate levers.
+
+   **Rejected experiment (2026-07-28, same day).** Long-poll hold on
+   abandoned misses (Jellyfin-style: no 503/404 while the session lives,
+   ceiling `IDLE_TIMEOUT`, then empty 204) — motivated by Netflix
+   never-missing segments, Jellyfin block-forever, and Apple forum
+   "penalty box after fragment HTTP errors." Dogfood double-scrub on
+   muxed Safari: land segment 200, `currentTime` at target, recover
+   watch `advanced=false`, picture never left the pre-scrub frame.
+   **Did not restore playback.** Status / hold shape on the abandoned
+   URI is not a sufficient fix for this wedge under full-title VOD +
+   distance preempt. Do not treat "avoid application errors on abandoned
+   GETs" as the proven path without new evidence.
 
 8. **Restart triggers are deliberate, not incidental.** Safari prefetched
    ~50 segments on a cold attach in the capture; an unguarded "any miss

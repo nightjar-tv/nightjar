@@ -442,6 +442,18 @@ paths:
           schema:
             type: string
             pattern: '^(init\.mp4|seg[0-9]+\.m4s)$'
+        - name: njFetcher
+          in: query
+          required: false
+          description: >
+            Log-only client marker. Serving ignores this. JS land-ensure and
+            attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's
+            native HLS engine does not. Distinguishes probe traffic from
+            WebKit segment GETs in dogfood logs without changing 200/503
+            behaviour.
+          schema:
+            type: string
+            maxLength: 32
       responses:
         "200":
           description: Segment bytes

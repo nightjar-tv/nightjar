@@ -246,8 +246,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Segmented subtitle playlist or WebVTT segment for a session track
-         * @description Plan item 2 / ADR-0013. EXT-X-MEDIA URI target. `asset` is either `{trackId}.m3u8` (multi-segment VOD aligned to the 2s video timeline) or `{trackId}/segNNN.vtt` (cues for that window, sliced from a session-inline demux — no scan-time pre-extraction required).
+         * Subtitle media playlist or WebVTT segment for a session track
+         * @description ADR-0010 / ADR-0013. EXT-X-MEDIA URI target. Ready tracks use a multi-segment `{trackId}.m3u8` whose `segNNN.vtt` bodies are sliced from the item store VTT (no session demux). Cold session-inline demux remains for fixtures only; Gate-1 snapshots only declare complete/store tracks.
          */
         get: operations["getSessionSubtitlePlaylist"];
         put?: never;
@@ -1075,7 +1075,10 @@ export interface operations {
     };
     getSessionAsset: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Log-only client marker. Serving ignores this. JS land-ensure and attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503 behaviour. */
+                njFetcher?: string;
+            };
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];

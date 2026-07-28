@@ -160,11 +160,9 @@ pub async fn playback_info(
     // First-play: bump this title's extract ahead of the background drain so
     // progressive cues can start while the user is watching (ADR-0013 §11).
     if row.subtitle_status == "pending" {
-        state.pool.prioritize_extract(
-            row.id,
-            row.library_id,
-            std::path::PathBuf::from(&row.path),
-        );
+        state
+            .pool
+            .prioritize_extract(row.id, row.library_id, std::path::PathBuf::from(&row.path));
     }
 
     Ok(Json(PlaybackInfoDto {
@@ -282,10 +280,15 @@ struct ServeableTrack {
 
 /// Readiness-aware DTO for a track the server can actually serve (embedded
 /// text or a convertible sidecar). `url` only appears once cues exist.
-fn serveable_track_dto(state: &AppState, row: &MediaItemRow, t: ServeableTrack) -> SubtitleTrackDto {
-    let (readiness, revision) = state
-        .subs
-        .track_readiness(row.id, &t.track_id, &row.subtitle_status);
+fn serveable_track_dto(
+    state: &AppState,
+    row: &MediaItemRow,
+    t: ServeableTrack,
+) -> SubtitleTrackDto {
+    let (readiness, revision) =
+        state
+            .subs
+            .track_readiness(row.id, &t.track_id, &row.subtitle_status);
     let url = match readiness {
         TrackReadiness::Preparing => None,
         TrackReadiness::Partial | TrackReadiness::Complete => Some(format!(

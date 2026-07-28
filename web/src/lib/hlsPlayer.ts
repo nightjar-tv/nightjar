@@ -6,7 +6,7 @@ import {
 	segmentIndexAtSeconds,
 	sessionBaseFromMaster,
 	subtitleSegmentUrl,
-	videoSegmentUrl
+	videoSegmentUrlWithFetcher
 } from './nativeHlsSubs';
 
 /** Slightly above server `SEGMENT_WAIT` (30s) so the server can 503 first. */
@@ -102,19 +102,6 @@ export interface HlsHandle {
 	 * item page Subtitles control drives this.
 	 */
 	setSubtitleTrack: (index: number) => void;
-}
-
-/**
- * Stop audible playback before a session cutover (audio switch). Leaves the
- * element without a source so the old track cannot keep playing while the
- * new session cooks — the item page shows a loading state until attach.
- */
-export function parkForSwitch(video: HTMLVideoElement | null, handle: HlsHandle | null) {
-	handle?.destroy();
-	if (!video) return;
-	video.pause();
-	video.removeAttribute('src');
-	video.load();
 }
 
 function logSubs(phase: string, detail?: Record<string, unknown>) {
@@ -260,7 +247,7 @@ export function attachHls(
 		landEnsureAbort = parent;
 		landEnsureSegIdx = idx;
 		landRetargetSeconds = null;
-		const url = videoSegmentUrl(sessionBase, idx);
+		const url = videoSegmentUrlWithFetcher(sessionBase, idx, 'land-ensure');
 		void (async () => {
 			let ok = false;
 			const backoff = () =>
@@ -291,7 +278,7 @@ export function attachHls(
 					try {
 						const res = await fetch(url, { signal: attemptAc.signal });
 						if (destroyed || parent.signal.aborted) return;
-						if (res.ok) {
+						if (res.status === 200) {
 							if (parent.signal.aborted || destroyed) return;
 							ok = true;
 							const t = Math.max(0, seconds);
@@ -307,11 +294,91 @@ export function attachHls(
 								video.currentTime = t;
 							}
 							void video.play().catch(() => {});
+							const landT = t;
+							const t0 = performance.now();
+							// Dogfood: native Safari has no hls.js; log HTMLMediaElement
+							// play-state until time advances or ~60s. Prior 5s window
+							// missed late recovery after serialized double-scrub.
+							let ticks = 0;
+							let timeupdates = 0;
+							let playings = 0;
+							let waitings = 0;
+							let stalleds = 0;
+							const onTu = () => {
+								timeupdates += 1;
+							};
+							const onPlaying = () => {
+								playings += 1;
+								console.info(
+									`[nj-scrub] event playing +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
+								);
+							};
+							const onWaiting = () => {
+								waitings += 1;
+								console.info(
+									`[nj-scrub] event waiting +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
+								);
+							};
+							const onStalled = () => {
+								stalleds += 1;
+								console.info(
+									`[nj-scrub] event stalled +${Math.round(performance.now() - t0)}ms ct=${video.currentTime.toFixed(2)} rs=${video.readyState} ns=${video.networkState}`
+								);
+							};
+							const onErr = () => {
+								const err = video.error;
+								console.info(
+									`[nj-scrub] event error +${Math.round(performance.now() - t0)}ms code=${err?.code ?? '-'} msg=${err?.message ?? '-'}`
+								);
+							};
+							video.addEventListener('timeupdate', onTu);
+							video.addEventListener('playing', onPlaying);
+							video.addEventListener('waiting', onWaiting);
+							video.addEventListener('stalled', onStalled);
+							video.addEventListener('error', onErr);
+							const bufNear = (ct: number): string => {
+								const b = video.buffered;
+								const parts: string[] = [];
+								for (let i = 0; i < b.length; i++) {
+									const start = b.start(i);
+									const end = b.end(i);
+									if (end < ct - 30 || start > ct + 30) continue;
+									parts.push(`${start.toFixed(1)}-${end.toFixed(1)}`);
+								}
+								return parts.length ? parts.join(',') : '-';
+							};
+							const finish = (advanced: boolean, ct: number) => {
+								video.removeEventListener('timeupdate', onTu);
+								video.removeEventListener('playing', onPlaying);
+								video.removeEventListener('waiting', onWaiting);
+								video.removeEventListener('stalled', onStalled);
+								video.removeEventListener('error', onErr);
+								window.clearInterval(watch);
+								console.info(
+									`[nj-scrub] recover-done advanced=${advanced} ct=${ct.toFixed(2)} +${Math.round(performance.now() - t0)}ms tu=${timeupdates} playing=${playings} waiting=${waitings} stalled=${stalleds}`
+								);
+							};
+							const watch = window.setInterval(() => {
+								if (destroyed) {
+									finish(false, video.currentTime);
+									return;
+								}
+								ticks += 1;
+								const ct = video.currentTime;
+								const advanced = ct >= landT + 0.5;
+								const err = video.error;
+								console.info(
+									`[nj-scrub] recover +${Math.round(performance.now() - t0)}ms ct=${ct.toFixed(2)} land=${landT.toFixed(2)} rs=${video.readyState} ns=${video.networkState} paused=${video.paused} seeking=${video.seeking} advanced=${advanced} tu=${timeupdates} buf=${bufNear(ct)} err=${err?.code ?? '-'}`
+								);
+								// ~60s at 500ms — covers serialized double-scrub late play.
+								if (advanced || ticks >= 120) {
+									finish(advanced, ct);
+								}
+							}, 500);
 							return;
 						}
-						// 404: segment/session gone — stop. Anything else (503,
-						// unexpected): wait and long-poll again.
-						if (res.status === 404) return;
+						// 404: session gone. 204: no-fill hold ceiling. Else retry.
+						if (res.status === 404 || res.status === 204) return;
 					} catch {
 						if (destroyed || parent.signal.aborted) return;
 						// Timeout / network abort: new long-poll after backoff.

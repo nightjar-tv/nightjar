@@ -5,7 +5,6 @@
 	import { copy } from '$lib/copy';
 	import {
 		attachHls,
-		parkForSwitch,
 		watchProgressiveSubtitles,
 		type HlsHandle
 	} from '$lib/hlsPlayer';
@@ -84,8 +83,13 @@
 
 	/** Poll until FFmpeg has written a servable response (playlist or segment). */
 	async function waitForReady(url: string): Promise<boolean> {
+		// Tag .m4s side-channel polls so dogfood logs can tell them from
+		// Safari's own native segment GETs (same URL, no query).
+		const fetchUrl = /\.m4s(?:\?|$)/i.test(url)
+			? `${url}${url.includes('?') ? '&' : '?'}njFetcher=attach-wait`
+			: url;
 		for (let i = 0; liveRef.alive && i < 100; i++) {
-			const res = await fetch(url);
+			const res = await fetch(fetchUrl);
 			if (res.ok) return true;
 			// Gone for good (deleted / never created). 503 means still cooking.
 			if (res.status === 404) return false;
@@ -135,7 +139,10 @@
 
 	/** Sessions: a fresh session at the current position, then drop the old
 	 *  one. Init and prior segments carry the old audio config, so this is
-	 *  never a window move inside the seek path (ADR-0012). */
+	 *  never a window move inside the seek path (ADR-0012). Cook the new
+	 *  land while the old session keeps playing, then cut over — park-then-
+	 *  wait made every switch feel like a reload even when server land was
+	 *  fast. */
 	async function switchSessionAudio(trackId: string) {
 		const seconds = playerRef.handle?.positionSeconds() ?? videoEl?.currentTime ?? 0;
 		const startMs = Math.max(0, Math.floor(seconds * 1000));
@@ -144,22 +151,13 @@
 		const unspy = probe.installFetchSpy();
 		probe.mark('switch_requested', `startMs=${startMs} mode=${attachMode}`);
 		switchingAudio = true;
-		// Park immediately so the old track cannot keep playing past the
-		// switch point and then jump backwards when the new session lands.
-		parkForSwitch(videoEl, playerRef.handle);
-		playerRef.handle = null;
-		playlistUrl = null;
 		try {
 			const started = await api.startTranscodeSession(itemId, startMs, trackId);
 			probe.mark('session_post_ok', started.sessionId);
-			// The old session is no longer honest UI once the player is parked.
-			// Reap it now so a hardware encoder slot is not held while the new
-			// session cooks.
-			if (previous) void api.deleteTranscodeSession(previous);
-			probe.mark('old_session_deleted', previous ?? 'none');
 			probe.mark('wait_begin', attachMode);
 			const landIdx = Math.floor(startMs / 2000);
-			// Encode-at-land (lead-in 0): window start == play land.
+			// Land wait only needs the play-land segment; encode lead-in (2)
+			// cooks behind it on the server without changing this gate.
 			const windowIdx = landIdx;
 			const ready = await waitForAttachReady(
 				started.playlistUrl,
@@ -175,12 +173,19 @@
 				if (liveRef.alive) error = copy.sessionFailed;
 				return;
 			}
+			resumeRef.seconds = startMs / 1000;
 			sessionRef.id = started.sessionId;
 			sessionEncoder = started;
-			resumeRef.seconds = startMs / 1000;
 			probe.mark('attach', started.playlistUrl);
 			if (videoEl) probe.wireVideo(videoEl);
+			// Swap playlist: $effect destroys the old handle and attaches.
+			// Old session stays alive until after cutover so playback does
+			// not go black while the new land cooks.
 			playlistUrl = started.playlistUrl;
+			if (previous && previous !== started.sessionId) {
+				void api.deleteTranscodeSession(previous);
+				probe.mark('old_session_deleted', previous);
+			}
 			if (probeOn) {
 				// Defer summary until after first frame likely lands.
 				setTimeout(() => {
@@ -412,12 +417,14 @@
 			{#if unrenderedSubtitles}
 				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
 			{/if}
-		{:else if switchingAudio}
-			<p class="preparing" role="status">{copy.switchingAudio}</p>
 		{:else if preparingSession}
 			<p class="preparing" role="status">{copy.preparingSession}</p>
 		{:else if playback.playbackMethod !== 'directPlay'}
 			<p class="error">{copy.sessionFailed}</p>
+		{/if}
+
+		{#if switchingAudio}
+			<p class="preparing" role="status">{copy.switchingAudio}</p>
 		{/if}
 
 		{#if playable && playlistUrl && hlsSubtitleTracks.length > 0}

@@ -48,6 +48,20 @@ export function videoSegmentUrl(sessionBase: string, segmentIndex: number): stri
 	return `${sessionBase}/${segmentM4sName(segmentIndex)}`;
 }
 
+/**
+ * Same segment URL with a log-only `njFetcher` query. Serving ignores it;
+ * Safari native HLS never adds it — dogfood logs can tell probe from WebKit.
+ */
+export function videoSegmentUrlWithFetcher(
+	sessionBase: string,
+	segmentIndex: number,
+	fetcher: 'land-ensure' | 'attach-wait'
+): string {
+	const base = videoSegmentUrl(sessionBase, segmentIndex);
+	const sep = base.includes('?') ? '&' : '?';
+	return `${base}${sep}njFetcher=${fetcher}`;
+}
+
 export function subtitleSegmentUrl(
 	sessionBase: string,
 	trackId: string,
