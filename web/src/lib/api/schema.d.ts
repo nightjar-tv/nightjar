@@ -1076,7 +1076,7 @@ export interface operations {
     getSessionAsset: {
         parameters: {
             query?: {
-                /** @description Log-only client marker. Serving ignores this. JS land-ensure and attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503 behaviour. */
+                /** @description Log-only client marker. Serving ignores this. JS land-ensure and attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503/204 behaviour. */
                 njFetcher?: string;
             };
             header?: never;
@@ -1096,6 +1096,13 @@ export interface operations {
                 content: {
                     "application/octet-stream": string;
                 };
+            };
+            /** @description Abandoned or superseded segment GET held with no fill until the session idle ceiling while the session lived; empty body (ADR-0011). Not an application error. Distinct from DELETE session 204. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Session or asset not found */
             404: {
