@@ -8,7 +8,9 @@ mod lang;
 mod slice;
 mod srt;
 
-pub use discover::{DiscoveredSidecar, discover_sidecars};
+pub use discover::{
+    DiscoveredSidecar, SidecarDirCache, discover_sidecars, discover_sidecars_cached,
+};
 pub use lang::{container_stream_language, normalize_language};
 pub use slice::{slice_webvtt, webvtt_max_cue_end_ms};
 pub use srt::{decode_subtitle_bytes, srt_to_webvtt};

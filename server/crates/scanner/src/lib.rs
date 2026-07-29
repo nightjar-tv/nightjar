@@ -106,6 +106,8 @@ fn run_scan_job(
         let mut pending_upserts: Vec<UpsertItem> = Vec::with_capacity(INDEX_BATCH);
         let mut pending_were_existing: Vec<bool> = Vec::with_capacity(INDEX_BATCH);
         let mut probe_queue = Vec::new();
+        // One listing per parent for the whole index job (flat 10k dirs).
+        let mut sidecar_dirs = nightjar_transcode::SidecarDirCache::default();
 
         let flush = |db: &Db,
                      pool: &LibraryPool,
@@ -114,7 +116,8 @@ fn run_scan_job(
                      were_existing: &mut Vec<bool>,
                      probe_queue: &mut Vec<pool::WorkItem>,
                      added: &mut u32,
-                     updated: &mut u32|
+                     updated: &mut u32,
+                     sidecar_dirs: &mut nightjar_transcode::SidecarDirCache|
          -> Result<(), String> {
             if pending.is_empty() {
                 return Ok(());
@@ -135,7 +138,7 @@ fn run_scan_job(
                 ));
                 // New or replaced media: discover sidecars now so we do not need a
                 // full-library rediscovery after every cold walk.
-                match associate_sidecars(db, id, &paths[i]) {
+                match associate_sidecars(db, id, &paths[i], sidecar_dirs) {
                     Ok(true) => {
                         db.mark_items_subtitle_pending(&[id])?;
                         pool.enqueue(pool::WorkItem::extract(id, library_id, paths[i].clone()));
@@ -200,6 +203,7 @@ fn run_scan_job(
                             &mut probe_queue,
                             &mut added,
                             &mut updated,
+                            &mut sidecar_dirs,
                         )?;
                     }
                 }
@@ -215,6 +219,7 @@ fn run_scan_job(
             &mut probe_queue,
             &mut added,
             &mut updated,
+            &mut sidecar_dirs,
         )?;
 
         let root_after = check_root(root);
@@ -275,7 +280,7 @@ fn run_scan_job(
                     continue;
                 }
                 sidecar_checked += 1;
-                match associate_sidecars(db, item_id, &file.path) {
+                match associate_sidecars(db, item_id, &file.path, &mut sidecar_dirs) {
                     Ok(true) => {
                         db.mark_items_subtitle_pending(&[item_id])?;
                         pool.enqueue(pool::WorkItem::extract(
@@ -357,8 +362,13 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn associate_sidecars(db: &Db, item_id: i64, video_path: &Path) -> Result<bool, String> {
-    let found = nightjar_transcode::discover_sidecars(video_path)?;
+fn associate_sidecars(
+    db: &Db,
+    item_id: i64,
+    video_path: &Path,
+    cache: &mut nightjar_transcode::SidecarDirCache,
+) -> Result<bool, String> {
+    let found = nightjar_transcode::discover_sidecars_cached(video_path, Some(cache))?;
     let rows: Vec<nightjar_db::SidecarRow> = found
         .into_iter()
         .map(|s| nightjar_db::SidecarRow {

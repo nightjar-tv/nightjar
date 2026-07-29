@@ -19,9 +19,9 @@ pub use hwaccel::{
     probe_h264_encoders_arc, select_preferred,
 };
 pub use subs::{
-    DiscoveredSidecar, ExtractOutcome, SessionSubInput, SidecarInput, SubsStore,
+    DiscoveredSidecar, ExtractOutcome, SessionSubInput, SidecarDirCache, SidecarInput, SubsStore,
     SubtitleSourceKind, TextSubtitleStream, TrackReadiness, decode_subtitle_bytes,
-    discover_sidecars, extract_item_subtitles, io_error_is_availability,
+    discover_sidecars, discover_sidecars_cached, extract_item_subtitles, io_error_is_availability,
     is_serveable_sidecar_format, is_text_subtitle_codec, list_text_subtitles, normalize_language,
     prepare_session_subtitles, slice_webvtt, srt_to_webvtt, stored_webvtt, webvtt_max_cue_end_ms,
 };

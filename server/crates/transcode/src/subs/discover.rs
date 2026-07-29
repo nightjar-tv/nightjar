@@ -1,6 +1,7 @@
 //! Filesystem sidecar discovery beside a video file (ADR-0010).
 
 use super::lang::normalize_language;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -21,9 +22,37 @@ pub struct DiscoveredSidecar {
     pub size_bytes: i64,
 }
 
+/// Memoizes subtitle-extension listings per directory for one scan job.
+///
+/// Cold index of a flat library calls discovery once per media file. Without
+/// this cache each call re-reads the parent (O(n²) on a 10k-file folder —
+/// Gate 1 bench_10k hangs for minutes).
+#[derive(Default)]
+pub struct SidecarDirCache {
+    dirs: HashMap<PathBuf, Vec<CachedSidecarFile>>,
+    is_dir: HashMap<PathBuf, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSidecarFile {
+    path: PathBuf,
+    file_stem: String,
+    format: String,
+    mtime_ms: i64,
+    size_bytes: i64,
+}
+
 /// Discover subtitle sidecars for `video_path` in its directory and in
 /// `Subs/` / `Subtitles/` siblings. Does not create media items.
 pub fn discover_sidecars(video_path: &Path) -> Result<Vec<DiscoveredSidecar>, String> {
+    discover_sidecars_cached(video_path, None)
+}
+
+/// Same as [`discover_sidecars`], reusing directory listings in `cache`.
+pub fn discover_sidecars_cached(
+    video_path: &Path,
+    mut cache: Option<&mut SidecarDirCache>,
+) -> Result<Vec<DiscoveredSidecar>, String> {
     let parent = video_path
         .parent()
         .ok_or_else(|| format!("video has no parent: {}", video_path.display()))?;
@@ -33,11 +62,11 @@ pub fn discover_sidecars(video_path: &Path) -> Result<Vec<DiscoveredSidecar>, St
         .ok_or_else(|| format!("video stem not utf-8: {}", video_path.display()))?;
 
     let mut out = Vec::new();
-    scan_dir(parent, stem, None, &mut out)?;
+    scan_dir(parent, stem, None, &mut out, cache.as_deref_mut())?;
     for sub in SUB_DIRS {
         let dir = parent.join(sub);
-        if dir.is_dir() {
-            scan_dir(&dir, stem, Some(sub), &mut out)?;
+        if cached_is_dir(&dir, cache.as_deref_mut()) {
+            scan_dir(&dir, stem, Some(sub), &mut out, cache.as_deref_mut())?;
         }
     }
     // Movie.en.srt and Movie.en.vtt share track_id s-en (the id carries no
@@ -73,19 +102,44 @@ fn format_rank(format: &str) -> u8 {
     }
 }
 
-fn scan_dir(
+fn cached_is_dir(dir: &Path, cache: Option<&mut SidecarDirCache>) -> bool {
+    if let Some(cache) = cache {
+        if let Some(v) = cache.is_dir.get(dir) {
+            return *v;
+        }
+        let v = dir.is_dir();
+        cache.is_dir.insert(dir.to_path_buf(), v);
+        v
+    } else {
+        dir.is_dir()
+    }
+}
+
+fn list_sidecar_files(
     dir: &Path,
-    video_stem: &str,
-    dir_token: Option<&str>,
-    out: &mut Vec<DiscoveredSidecar>,
-) -> Result<(), String> {
+    cache: Option<&mut SidecarDirCache>,
+) -> Result<Vec<CachedSidecarFile>, String> {
+    if let Some(cache) = cache.as_ref()
+        && let Some(cached) = cache.dirs.get(dir)
+    {
+        return Ok(cached.clone());
+    }
+    let listed = read_sidecar_files(dir)?;
+    if let Some(cache) = cache {
+        cache.dirs.insert(dir.to_path_buf(), listed.clone());
+    }
+    Ok(listed)
+}
+
+fn read_sidecar_files(dir: &Path) -> Result<Vec<CachedSidecarFile>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(path = %dir.display(), error = %e, "skip unreadable subtitle dir");
-            return Ok(());
+            return Ok(Vec::new());
         }
     };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -101,10 +155,10 @@ fn scan_dir(
         if !SIDE_EXTS.iter().any(|x| *x == ext) {
             continue;
         }
-        let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Some(parsed) = parse_sidecar_stem(video_stem, file_stem, dir_token) else {
+        let Some(file_stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str().map(|s| s.to_string()))
+        else {
             continue;
         };
         let meta = match entry.metadata() {
@@ -120,15 +174,38 @@ fn scan_dir(
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        out.push(CachedSidecarFile {
+            path,
+            file_stem,
+            format: ext,
+            mtime_ms,
+            size_bytes: meta.len() as i64,
+        });
+    }
+    Ok(out)
+}
+
+fn scan_dir(
+    dir: &Path,
+    video_stem: &str,
+    dir_token: Option<&str>,
+    out: &mut Vec<DiscoveredSidecar>,
+    cache: Option<&mut SidecarDirCache>,
+) -> Result<(), String> {
+    let listed = list_sidecar_files(dir, cache)?;
+    for entry in listed {
+        let Some(parsed) = parse_sidecar_stem(video_stem, &entry.file_stem, dir_token) else {
+            continue;
+        };
         out.push(DiscoveredSidecar {
             track_id: parsed.track_id,
-            path,
-            format: ext,
+            path: entry.path,
+            format: entry.format,
             language: parsed.language,
             forced: parsed.forced,
             sdh: parsed.sdh,
-            mtime_ms,
-            size_bytes: meta.len() as i64,
+            mtime_ms: entry.mtime_ms,
+            size_bytes: entry.size_bytes,
         });
     }
     Ok(())
@@ -282,5 +359,34 @@ mod tests {
         assert!(ids.contains(&"s-en"), "{ids:?}");
         assert!(ids.contains(&"s-Subs.en"), "{ids:?}");
         assert!(!ids.iter().any(|id| id.contains("Other")));
+    }
+
+    #[test]
+    fn dir_cache_lists_each_parent_once() {
+        let dir = tempdir().unwrap();
+        // Flat folder like Gate 1 bench_10k: many videos, few sidecars.
+        for i in 0..200 {
+            File::create(dir.path().join(format!("item_{i:05}.mp4"))).unwrap();
+        }
+        File::create(dir.path().join("item_00001.en.srt")).unwrap();
+
+        let mut cache = SidecarDirCache::default();
+        for i in 0..200 {
+            let video = dir.path().join(format!("item_{i:05}.mp4"));
+            let found = discover_sidecars_cached(&video, Some(&mut cache)).unwrap();
+            if i == 1 {
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].track_id, "s-en");
+            } else {
+                assert!(found.is_empty(), "i={i} found={found:?}");
+            }
+        }
+        assert_eq!(
+            cache.dirs.len(),
+            1,
+            "parent dir must be listed once, not once per video"
+        );
+        // Subs/Subtitles probes are also cached (false here).
+        assert_eq!(cache.is_dir.len(), 2);
     }
 }
