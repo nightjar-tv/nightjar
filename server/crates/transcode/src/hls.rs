@@ -1051,10 +1051,9 @@ impl HlsSessionRegistry {
                             // Near supersede still uses no-fill (lead dig-back).
                             let far = match session.pending_play_ms {
                                 Some(p) => coalesce_preempt_before_land(want_ms, p),
-                                None => coalesce_preempt_before_land(
-                                    want_ms,
-                                    session.play_start_ms,
-                                ),
+                                None => {
+                                    coalesce_preempt_before_land(want_ms, session.play_start_ms)
+                                }
                             };
                             if far {
                                 tracing::info!(
@@ -2615,10 +2614,7 @@ mod tests {
         assert_eq!(apply_count, 1);
         assert_eq!(play, 2_454_000);
         assert_eq!(encode, encode_start_ms(2_454_000));
-        assert_eq!(
-            encode,
-            2_454_000 - ENCODE_LEAD_SEGMENTS * SEGMENT_MS
-        );
+        assert_eq!(encode, 2_454_000 - ENCODE_LEAD_SEGMENTS * SEGMENT_MS);
 
         // Debounce after land: three quick intents → one apply after quiet.
         ready = true;
@@ -3215,8 +3211,7 @@ mod tests {
             match rx.try_recv() {
                 Ok((first, elapsed)) => {
                     assert!(
-                        matches!(first, Err(PlaylistError::NotReady))
-                            || matches!(first, Ok(_)),
+                        matches!(first, Err(PlaylistError::NotReady)) || matches!(first, Ok(_)),
                         "superseded behind-window hold: 503 after new land, or 200 if A cooked first; got {:?} elapsed={elapsed:?}",
                         first
                             .as_ref()
