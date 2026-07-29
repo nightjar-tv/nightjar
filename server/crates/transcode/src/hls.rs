@@ -3211,7 +3211,7 @@ mod tests {
             match rx.try_recv() {
                 Ok((first, elapsed)) => {
                     assert!(
-                        matches!(first, Err(PlaylistError::NotReady)) || matches!(first, Ok(_)),
+                        matches!(first, Err(PlaylistError::NotReady)) || first.is_ok(),
                         "superseded behind-window hold: 503 after new land, or 200 if A cooked first; got {:?} elapsed={elapsed:?}",
                         first
                             .as_ref()
