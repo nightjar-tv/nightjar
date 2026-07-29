@@ -54,11 +54,13 @@ const STALE_RETAIN_REFUSE: Duration = Duration::from_secs(15);
 /// `seg000`. Farther behind waits without yanking the encode to zero.
 const ALIGN_BEHIND_SEGMENTS: u64 = 16;
 /// Encode starts this many segments before the play land (`#EXT-X-START`).
-/// Safari digs back ~1–2 segs near land after a scrub; with lead 0 those
-/// misses 503 forever once [`digback_behind_committed`] blocks pending
-/// retreat. Two matches [`CATCH_UP_SEGMENTS`] and covers dogfood dig-back
-/// without taxing every seek by a full ALIGN window.
-const ENCODE_LEAD_SEGMENTS: u64 = 2;
+/// Safari digs back ~1–2 segs near land after a currentTime scrub; with lead 0
+/// those misses 503 forever once [`digback_behind_committed`] blocks pending
+/// retreat. Post-land `#t=` reload (init refresh after seek-restart) digs
+/// ~8 segs behind EXT-X-START when PRECISE=YES (dogfood: seg121 at land 258).
+/// Lead must cover that dig-back or ranges stay empty after land-ensure 200.
+/// Do not drop PRECISE to shrink dig-back — size the lead instead (ADR-0011).
+const ENCODE_LEAD_SEGMENTS: u64 = 8;
 
 /// Runtime lead-in. Default [`ENCODE_LEAD_SEGMENTS`]. Override with
 /// `NIGHTJAR_ENCODE_LEAD_SEGMENTS` for local land-time / dig-back experiments
@@ -235,7 +237,7 @@ pub fn classify_restart_desire(
 
 /// Whether a recorded pending play land is due to apply.
 ///
-/// When the cooking land is not ready yet, apply only if
+/// When the cooking land is not ready yet, apply only if `allow_preempt`,
 /// [`coalesce_preempt_before_land`] says the pending target is far outside
 /// the near-land band, and [`RESTART_MIN_INTERVAL`] has elapsed since the
 /// last restart (anti-thrash on the preempt path only — not a substitute
@@ -243,8 +245,8 @@ pub fn classify_restart_desire(
 /// (dogfood: seg415 after scrub to 1188 — yank before land left Safari
 /// retrying the prior URI).
 ///
-/// Dogfood isolation: `NIGHTJAR_DISABLE_PREEMPT=1` forces the non-preempt
-/// branch (always wait for cooking land) without removing preempt code.
+/// `allow_preempt` mirrors [`disable_preempt`]: unset leaves preempt **on**.
+/// Pass `!disable_preempt()` from production callers.
 pub fn pending_restart_due(
     first_segment_ready: bool,
     pending_play_ms: Option<u64>,
@@ -252,10 +254,11 @@ pub fn pending_restart_due(
     apply_immediate: bool,
     cooking_play_ms: u64,
     since_last_restart: Duration,
+    allow_preempt: bool,
 ) -> Option<u64> {
     let pending = pending_play_ms?;
     if !first_segment_ready {
-        if !disable_preempt()
+        if allow_preempt
             && coalesce_preempt_before_land(cooking_play_ms, pending)
             && since_last_restart >= RESTART_MIN_INTERVAL
         {
@@ -274,11 +277,24 @@ pub fn pending_restart_due(
 }
 
 /// `NIGHTJAR_DISABLE_PREEMPT=1` (or `true`/`yes`): never preempt before land.
+/// Unset (and any value other than an explicit disable) leaves preempt **on** —
+/// the polarity measured as scrub-before-play pass under Config D.
 fn disable_preempt() -> bool {
     matches!(
         std::env::var("NIGHTJAR_DISABLE_PREEMPT").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "YES")
     )
+}
+
+/// Whether [`restart_at`] may `stop_child` while the cooking encode is still
+/// unfinished. Land-ready always kills (land-then-yank). Before land, a
+/// cooking-land waiter blocks kill so dig-back can still see mid bytes;
+/// zero waiters keep far-scrub preempt speed.
+///
+/// Pure helper for unit tests — production uses the same predicate under the
+/// session mutex immediately before `stop_child`.
+pub fn may_kill_cooking_encode(first_segment_ready: bool, cooking_land_waiter_count: u32) -> bool {
+    first_segment_ready || cooking_land_waiter_count == 0
 }
 
 /// Optional pause after kill before the next FFmpeg spawn (`restart_at`).
@@ -316,6 +332,37 @@ pub fn coalesce_preempt_before_land(cooking_play_ms: u64, pending_play_ms: u64) 
         (cooking - pending) / SEGMENT_MS
     };
     segs > ALIGN_BEHIND_SEGMENTS
+}
+
+/// Whether a no-fill hold on `want_ms` should end with 503 once the committed
+/// play land is ready. Land-ensure 200 does not fill WebKit's buffer; a held
+/// dig-back GET can leave the player seeking with zero native land fetches
+/// (desktop-native single scrub: seg126 held while land-ensure got seg129).
+///
+/// Release when the want will never fill under the new encode window
+/// (`want` behind `encode_window_start_ms`), or when it is **far** behind
+/// play. Near dig-back still inside the lead-in window stays held — lead
+/// may still write it. Ahead-of-play / attach-window misses must not use
+/// this path (that 503'd in-flight land-ensure while play was still 0).
+pub fn no_fill_release_for_new_land(
+    want_ms: u64,
+    play_start_ms: u64,
+    first_segment_ready: bool,
+    encode_window_start_ms: u64,
+) -> bool {
+    if !first_segment_ready {
+        return false;
+    }
+    let want = align_to_segment(want_ms);
+    let play = align_to_segment(play_start_ms);
+    if want >= play {
+        return false;
+    }
+    let window = align_to_segment(encode_window_start_ms);
+    if want < window {
+        return true;
+    }
+    coalesce_preempt_before_land(want, play)
 }
 
 /// Missing segment that current policy will not [`desire_restart`] toward:
@@ -509,6 +556,12 @@ struct Session {
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
+    /// Refcount of in-flight [`HlsSessionRegistry::asset_wait`] calls keyed by
+    /// aligned want_ms. Used to defer preempt kill while a client still holds
+    /// the cooking land (native dig-back / land-ensure).
+    segment_waiters: HashMap<u64, u32>,
+    /// Avoid log spam while polls re-hit deferred preempt before land.
+    preempt_defer_logged: bool,
 }
 
 impl HlsSessionRegistry {
@@ -635,6 +688,8 @@ impl HlsSessionRegistry {
                 stale_retain_refuse_until: None,
                 failed: None,
                 subtitle_tracks,
+                segment_waiters: HashMap::new(),
+                preempt_defer_logged: false,
             },
         );
         drop(sessions);
@@ -920,6 +975,11 @@ impl HlsSessionRegistry {
             Some(idx) => (segment_name(idx), Some(idx)),
             None => (name.to_string(), None),
         };
+        // Register before the poll loop so a concurrent preempt sees this
+        // waiter under the same mutex as stop_child (see restart_at).
+        let _segment_waiter = requested.and_then(|idx| {
+            SegmentWaiterGuard::attach(&self.sessions, session_id, idx * SEGMENT_MS)
+        });
         let mut deadline = Instant::now() + SEGMENT_WAIT;
         // Once this request has claimed a land via desire_restart, a later
         // pending move to a different land ends the *fill* wait — enter
@@ -985,6 +1045,28 @@ impl HlsSessionRegistry {
                                 && align_to_segment(session.play_start_ms)
                                     != align_to_segment(want_ms));
                         if superseded {
+                            // Far retarget: 503 immediately so WebKit drops the
+                            // mid dig-back. No-fill hold here left native with
+                            // land-ensure 200 and zero land GETs (desktop N=5).
+                            // Near supersede still uses no-fill (lead dig-back).
+                            let far = match session.pending_play_ms {
+                                Some(p) => coalesce_preempt_before_land(want_ms, p),
+                                None => coalesce_preempt_before_land(
+                                    want_ms,
+                                    session.play_start_ms,
+                                ),
+                            };
+                            if far {
+                                tracing::info!(
+                                    session_id,
+                                    asset = %file_name,
+                                    play_start_ms = session.play_start_ms,
+                                    pending_play_ms = session.pending_play_ms,
+                                    want_ms,
+                                    "hls asset superseded far — 503 (no hold)"
+                                );
+                                return Err(PlaylistError::NotReady);
+                            }
                             enter_no_fill(
                                 "superseded",
                                 session_id,
@@ -1012,11 +1094,7 @@ impl HlsSessionRegistry {
                     note_first_segment_ready(session_id, session);
                     maybe_apply_pending_restart(session)?;
                     let want_ms = requested.map(|idx| idx * SEGMENT_MS);
-                    if !serve_ok_after_pending_apply(
-                        play_before,
-                        session.play_start_ms,
-                        want_ms,
-                    ) {
+                    if !serve_ok_after_pending_apply(play_before, session.play_start_ms, want_ms) {
                         return Err(PlaylistError::NotReady);
                     }
                     if let Some(idx) = requested {
@@ -1073,6 +1151,20 @@ impl HlsSessionRegistry {
                                 &mut holding_for_land,
                                 &mut deadline,
                             );
+                        } else if no_fill_release_for_new_land(
+                            want_ms,
+                            session.play_start_ms,
+                            session.first_segment_ready,
+                            session.start_ms,
+                        ) {
+                            tracing::info!(
+                                session_id,
+                                asset = %file_name,
+                                play_start_ms = session.play_start_ms,
+                                want_ms,
+                                "hls asset no-fill release (new land ready)"
+                            );
+                            return Err(PlaylistError::NotReady);
                         }
                         // Stay in loop until file appears, session gone, or
                         // IDLE_TIMEOUT → AbandonedHoldEnded (204).
@@ -1280,13 +1372,81 @@ impl EncoderKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartAtOutcome {
+    Applied,
+    /// Cooking land still unfinished and an asset_wait holds it — leave the
+    /// encoder alone so mid bytes can land; caller must keep pending.
+    DeferredLandWaiter,
+}
+
 fn restart_at(
     session: &mut Session,
     play_ms: u64,
     video_encoder: &str,
-) -> Result<(), PlaylistError> {
+) -> Result<RestartAtOutcome, PlaylistError> {
     let play_start_ms = align_to_segment(play_ms);
     let start_ms = encode_start_ms(play_start_ms);
+    let prior_play = session.play_start_ms;
+    let prior_ready = session.first_segment_ready;
+    let cooking_land = align_to_segment(prior_play);
+    let cooking_waiters = session
+        .segment_waiters
+        .get(&cooking_land)
+        .copied()
+        .unwrap_or(0);
+    // Gate immediately before kill, under the same sessions mutex that
+    // SegmentWaiterGuard attach/drop uses — check-then-kill is atomic vs
+    // concurrent waiter attach for this process.
+    if !may_kill_cooking_encode(prior_ready, cooking_waiters) {
+        if !session.preempt_defer_logged {
+            session.preempt_defer_logged = true;
+            tracing::info!(
+                prior_play_start_ms = prior_play,
+                prior_first_segment_ready = prior_ready,
+                cooking_land_waiters = cooking_waiters,
+                new_play_start_ms = play_start_ms,
+                "hls seek restart_at: defer kill (cooking land waiter)"
+            );
+        }
+        return Ok(RestartAtOutcome::DeferredLandWaiter);
+    }
+    session.preempt_defer_logged = false;
+    let had_child = session.child.is_some();
+    // Snapshot all waiters at kill time — correlates attach/drop races on
+    // double-scrub sticks (cooking land may be 0 while another want_ms holds).
+    let waiters_snapshot: String = {
+        let mut parts: Vec<String> = session
+            .segment_waiters
+            .iter()
+            .map(|(ms, n)| format!("{ms}:{n}"))
+            .collect();
+        parts.sort();
+        if parts.is_empty() {
+            "-".into()
+        } else {
+            parts.join(",")
+        }
+    };
+    if !prior_ready && cooking_waiters == 0 {
+        tracing::info!(
+            prior_play_start_ms = prior_play,
+            cooking_land_ms = cooking_land,
+            cooking_land_waiters = cooking_waiters,
+            segment_waiters = %waiters_snapshot,
+            new_play_start_ms = play_start_ms,
+            "hls seek restart_at: preempt kill before land (no cooking waiter)"
+        );
+    }
+    tracing::info!(
+        prior_play_start_ms = prior_play,
+        prior_first_segment_ready = prior_ready,
+        killing_encoder = had_child,
+        cooking_land_waiters = cooking_waiters,
+        segment_waiters = %waiters_snapshot,
+        new_play_start_ms = play_start_ms,
+        "hls seek restart_at: stop prior encode"
+    );
     stop_child(&mut session.child);
     if let Some(gap) = restart_spawn_gap() {
         tracing::info!(
@@ -1329,7 +1489,7 @@ fn restart_at(
         path = %session.src.display(),
         "hls session seek restart"
     );
-    Ok(())
+    Ok(RestartAtOutcome::Applied)
 }
 
 /// Record scrub intent. In-flight encodes keep cooking until land (or a far
@@ -1385,6 +1545,7 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
     let ready = session.first_segment_ready;
     let cooking = session.play_start_ms;
     let since = session.last_restart.elapsed();
+    let allow_preempt = !disable_preempt();
     let Some(pending) = pending_restart_due(
         ready,
         session.pending_play_ms,
@@ -1392,30 +1553,45 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
         apply_immediate,
         cooking,
         since,
+        allow_preempt,
     ) else {
         return Ok(());
     };
-    let preempt_before_land = !ready
-        && !disable_preempt()
-        && coalesce_preempt_before_land(cooking, pending)
-        && since >= RESTART_MIN_INTERVAL;
-    session.pending_play_ms = None;
-    session.pending_since = None;
-    // Re-read play/encode after clearing pending — same lock section, but
-    // do not act on a pending snapshot if we already cook that land.
+    // Do not clear pending before restart_at: a deferred land-waiter kill
+    // must leave the far target recorded for land-then-yank.
     if encode_start_ms(pending) == session.start_ms && pending == session.play_start_ms {
+        session.pending_play_ms = None;
+        session.pending_since = None;
         return Ok(());
     }
-    if preempt_before_land {
-        tracing::info!(
-            pending_play_ms = pending,
-            cooking_play_ms = cooking,
-            since_last_restart_ms = since.as_millis(),
-            "hls seek restart preempted (before land)"
-        );
-    }
+    let preempt_before_land = !ready
+        && allow_preempt
+        && coalesce_preempt_before_land(cooking, pending)
+        && since >= RESTART_MIN_INTERVAL;
     let encoder = session.video_encoder.clone();
-    restart_at(session, pending, &encoder)
+    match restart_at(session, pending, &encoder)? {
+        RestartAtOutcome::DeferredLandWaiter => {
+            // restart_at already logged once per defer streak.
+            Ok(())
+        }
+        RestartAtOutcome::Applied => {
+            if preempt_before_land {
+                tracing::info!(
+                    pending_play_ms = pending,
+                    cooking_play_ms = cooking,
+                    since_last_restart_ms = since.as_millis(),
+                    "hls seek restart preempted (before land)"
+                );
+            }
+            // restart_at clears pending when it matches the new play; clear
+            // any leftover (e.g. already applied path).
+            if session.pending_play_ms == Some(pending) {
+                session.pending_play_ms = None;
+                session.pending_since = None;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Whether bytes read for a segment request may still be returned after
@@ -1642,6 +1818,9 @@ fn build_playlist(duration_ms: u64, start_ms: u64) -> Vec<u8> {
          #EXT-X-MAP:URI=\"init.mp4\"\n"
     );
     if start_ms > 0 {
+        // PRECISE=YES is the correct EXT-X-START contract. A temporary
+        // removal (shallower dig-back under post-land `#t=`) was dropped once
+        // ENCODE_LEAD_SEGMENTS covers the measured ~8-seg hole (ADR-0011).
         let _ = writeln!(
             out,
             "#EXT-X-START:TIME-OFFSET={:.3},PRECISE=YES",
@@ -1977,6 +2156,69 @@ fn stop_child(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
         let _ = c.kill();
         let _ = c.wait();
+    }
+}
+
+/// Holds a refcount on `Session::segment_waiters` for one asset_wait call.
+/// Attach and Drop take the registry mutex — the same lock `restart_at` holds
+/// when deciding whether to `stop_child`, so waiter presence and kill are
+/// mutually exclusive (no check-then-kill race against concurrent attach).
+struct SegmentWaiterGuard<'a> {
+    sessions: &'a Mutex<HashMap<String, Session>>,
+    session_id: String,
+    want_ms: u64,
+}
+
+impl<'a> SegmentWaiterGuard<'a> {
+    fn attach(
+        sessions: &'a Mutex<HashMap<String, Session>>,
+        session_id: &str,
+        want_ms: u64,
+    ) -> Option<Self> {
+        let mut guard = sessions.lock().ok()?;
+        let session = guard.get_mut(session_id)?;
+        let count = session.segment_waiters.entry(want_ms).or_insert(0);
+        *count += 1;
+        tracing::info!(
+            session_id,
+            want_ms,
+            waiter_count = *count,
+            cooking_play_ms = session.play_start_ms,
+            pending_play_ms = session.pending_play_ms,
+            "hls segment waiter attach"
+        );
+        Some(Self {
+            sessions,
+            session_id: session_id.to_string(),
+            want_ms,
+        })
+    }
+}
+
+impl Drop for SegmentWaiterGuard<'_> {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.sessions.lock() else {
+            return;
+        };
+        let Some(session) = guard.get_mut(&self.session_id) else {
+            return;
+        };
+        let Some(count) = session.segment_waiters.get_mut(&self.want_ms) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        let after = *count;
+        if after == 0 {
+            session.segment_waiters.remove(&self.want_ms);
+        }
+        tracing::info!(
+            session_id = %self.session_id,
+            want_ms = self.want_ms,
+            waiter_count = after,
+            cooking_play_ms = session.play_start_ms,
+            pending_play_ms = session.pending_play_ms,
+            "hls segment waiter drop"
+        );
     }
 }
 
@@ -2361,7 +2603,7 @@ mod tests {
         ready = true;
         play = 1_084_000;
         encode = encode_start_ms(play);
-        let due = pending_restart_due(ready, pending, None, true, play, RESTART_MIN_INTERVAL);
+        let due = pending_restart_due(ready, pending, None, true, play, RESTART_MIN_INTERVAL, true);
         assert_eq!(due, Some(2_454_000));
         // Apply once to the last intent.
         if let Some(p) = due {
@@ -2373,7 +2615,10 @@ mod tests {
         assert_eq!(apply_count, 1);
         assert_eq!(play, 2_454_000);
         assert_eq!(encode, encode_start_ms(2_454_000));
-        assert_eq!(encode, 2_450_000);
+        assert_eq!(
+            encode,
+            2_454_000 - ENCODE_LEAD_SEGMENTS * SEGMENT_MS
+        );
 
         // Debounce after land: three quick intents → one apply after quiet.
         ready = true;
@@ -2393,6 +2638,7 @@ mod tests {
                 false,
                 play,
                 RESTART_MIN_INTERVAL,
+                true
             ),
             None,
             "quiet not elapsed"
@@ -2404,6 +2650,7 @@ mod tests {
             false,
             play,
             RESTART_MIN_INTERVAL,
+            true,
         );
         assert_eq!(due2, Some(2_700_000));
     }
@@ -2414,10 +2661,14 @@ mod tests {
     /// must not preempt before that land exists.
     #[test]
     fn seg415_near_pending_must_not_preempt_before_cooking_land() {
-        // Scrub to 1188s; encode lead puts first_window two segs earlier.
+        // Scrub to 1188s; encode lead puts first_window ENCODE_LEAD segs earlier.
         let cooking_play = 1_188_000u64;
         let encode = encode_start_ms(cooking_play);
-        assert_eq!(encode, 1_184_000, "lead-in before land");
+        assert_eq!(
+            encode,
+            cooking_play - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
+            "lead-in before land"
+        );
         assert_ne!(
             encode / SEGMENT_MS,
             cooking_play / SEGMENT_MS,
@@ -2451,6 +2702,7 @@ mod tests {
                 false,
                 cooking_play,
                 RESTART_MIN_INTERVAL,
+                true
             ),
             None,
             "near pending before land: no apply (seg415 protection)"
@@ -2464,6 +2716,7 @@ mod tests {
                 true,
                 cooking_play,
                 RESTART_MIN_INTERVAL * 2,
+                true
             ),
             None
         );
@@ -2476,6 +2729,7 @@ mod tests {
                 true,
                 cooking_play,
                 RESTART_MIN_INTERVAL,
+                true
             ),
             Some(near_fwd)
         );
@@ -2501,6 +2755,7 @@ mod tests {
                 false,
                 land_b,
                 Duration::from_millis(470),
+                true
             ),
             None,
             "preempt still gated by RESTART_MIN_INTERVAL"
@@ -2514,9 +2769,114 @@ mod tests {
                 false,
                 land_b,
                 RESTART_MIN_INTERVAL,
+                true
             ),
             Some(land_c),
             "far C applies before B land once interval cools"
+        );
+        // Product default (allow_preempt=false): far pending stays held until land.
+        assert_eq!(
+            pending_restart_due(
+                false,
+                Some(land_c),
+                Some(Duration::from_millis(470)),
+                false,
+                land_b,
+                RESTART_MIN_INTERVAL,
+                false,
+            ),
+            None,
+            "allow_preempt=false never preempts before cooking land"
+        );
+    }
+
+    #[test]
+    fn no_fill_releases_far_mid_once_new_land_ready() {
+        let mid = 258_000u64;
+        let land = 748_000u64;
+        // Jump land: encode window at land − lead (2 segs).
+        let window = land - ENCODE_LEAD_SEGMENTS * SEGMENT_MS;
+        assert!(
+            !no_fill_release_for_new_land(mid, land, false, window),
+            "still cooking: keep no-fill hold"
+        );
+        assert!(
+            no_fill_release_for_new_land(mid, land, true, window),
+            "far mid after land ready: 503 so WebKit leaves dig-back"
+        );
+        assert!(
+            !no_fill_release_for_new_land(land, land, true, window),
+            "want is the play land: do not release"
+        );
+        assert!(
+            !no_fill_release_for_new_land(land, 0, true, 0),
+            "ahead of attach play: must not 503 land-ensure"
+        );
+        // Near but still inside lead-in: may still be written — keep hold.
+        let in_lead = land - SEGMENT_MS;
+        assert!(
+            in_lead >= window,
+            "test setup: in_lead must be inside encode window"
+        );
+        assert!(
+            !no_fill_release_for_new_land(in_lead, land, true, window),
+            "near dig-back inside lead stays held"
+        );
+        // Single-scrub dogfood: dig-back one seg behind encode start (behind
+        // window) while land is only a few segs ahead — must release.
+        let single_land = 258_000u64;
+        let single_window = single_land - ENCODE_LEAD_SEGMENTS * SEGMENT_MS;
+        let behind_window = single_window - SEGMENT_MS;
+        assert!(
+            no_fill_release_for_new_land(behind_window, single_land, true, single_window),
+            "behind encode window after land ready: release even if near play"
+        );
+    }
+
+    /// Waiter on cooking land blocks preempt kill; no waiter matches today's
+    /// preempt-on immediate kill. Land-ready always may kill (land-then-yank).
+    #[test]
+    fn waiter_gates_kill_before_land() {
+        assert!(
+            may_kill_cooking_encode(false, 0),
+            "no waiter: preempt-on may kill before land"
+        );
+        assert!(
+            !may_kill_cooking_encode(false, 1),
+            "waiter present: must not kill before land"
+        );
+        assert!(
+            !may_kill_cooking_encode(false, 3),
+            "any positive waiter count blocks kill"
+        );
+        assert!(
+            may_kill_cooking_encode(true, 1),
+            "land ready: kill allowed even with waiter (land-then-yank)"
+        );
+        assert!(
+            may_kill_cooking_encode(true, 0),
+            "land ready + no waiter: kill allowed"
+        );
+        // pending_restart_due still selects far C when allow_preempt; the
+        // kill gate is separate (restart_at / may_kill_cooking_encode).
+        let land_b = 1_494_000u64;
+        let land_c = 2_070_000u64;
+        assert_eq!(
+            pending_restart_due(
+                false,
+                Some(land_c),
+                Some(Duration::from_millis(470)),
+                false,
+                land_b,
+                RESTART_MIN_INTERVAL,
+                true,
+            ),
+            Some(land_c),
+            "due decision unchanged when a waiter may later defer the kill"
+        );
+        assert!(
+            !may_kill_cooking_encode(false, 1),
+            "same due pending must still defer kill while waiter holds B's land"
         );
     }
 
@@ -2650,6 +3010,8 @@ mod tests {
             stale_retain_refuse_until: Some(Instant::now() + STALE_RETAIN_REFUSE),
             failed: None,
             subtitle_tracks: vec![],
+            segment_waiters: HashMap::new(),
+            preempt_defer_logged: false,
         };
         note_first_segment_ready("test", &mut session);
         assert!(session.first_segment_ready);
@@ -2817,8 +3179,10 @@ mod tests {
     }
 
     /// While a waiter holds for land A, a newer scrub moves pending to B.
-    /// A must not 503: enter no-fill hold, then end on session teardown.
-    /// (Immediate 204 on supersede rejected: wedged Safari native on doubles.)
+    /// Once B's encode window is ready, a behind-window hold on A must 503
+    /// (`no_fill_release_for_new_land`) so WebKit leaves dig-back — not sit
+    /// until teardown (desktop-native single scrub: held mid, zero land GETs).
+    /// Immediate 204 on supersede stays rejected (wedged Safari on doubles).
     #[test]
     fn held_segment_waiter_no_fill_when_pending_moves() {
         if !ffmpeg_available() {
@@ -2845,20 +3209,21 @@ mod tests {
             let _ = tx.send((result, t0.elapsed()));
         });
         // Retarget far ahead so supersede is outside ALIGN dig-back of land.
-        let probe_until = Instant::now() + Duration::from_secs(2);
+        let probe_until = Instant::now() + Duration::from_secs(15);
         while Instant::now() < probe_until {
             let _ = reg.playlist(&id, Some(200_000));
             match rx.try_recv() {
                 Ok((first, elapsed)) => {
                     assert!(
-                        !matches!(first, Err(PlaylistError::NotReady)),
-                        "superseded land waiter must not 503: {:?} elapsed={elapsed:?}",
+                        matches!(first, Err(PlaylistError::NotReady))
+                            || matches!(first, Ok(_)),
+                        "superseded behind-window hold: 503 after new land, or 200 if A cooked first; got {:?} elapsed={elapsed:?}",
                         first
                             .as_ref()
                             .map(|b| b.len())
                             .map_err(|e| format!("{e:?}"))
                     );
-                    // Land cooked before supersede stuck (fast fixture) — ok.
+                    let _ = reg.stop(&id);
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -2869,19 +3234,8 @@ mod tests {
                 }
             }
         }
-        assert!(reg.stop(&id), "teardown must end the no-fill hold");
-        let (result, elapsed) = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("hold must end after session stop");
-        assert!(
-            matches!(result, Err(PlaylistError::NotFound)),
-            "teardown ends hold with NotFound, got {:?}",
-            result.as_ref().map(|b| b.len())
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "should not wait full IDLE_TIMEOUT after stop; elapsed={elapsed:?}"
-        );
+        let _ = reg.stop(&id);
+        panic!("hold did not finish within 15s after supersede");
     }
 
     /// Double scrub: final land-ensure alone must notice cooking land on disk
@@ -2898,7 +3252,15 @@ mod tests {
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         // Start already cooking land A (20s). Do not GET A's land URI.
         let id = reg
-            .start(1, &src, 20_000, 120_000, SessionMode::Transcode, stereo(), vec![])
+            .start(
+                1,
+                &src,
+                20_000,
+                120_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+            )
             .unwrap();
         {
             let sessions = reg.sessions.lock().unwrap();
@@ -2924,7 +3286,10 @@ mod tests {
         assert!(
             matches!(result, Ok(ref b) if !b.is_empty()),
             "final land must 200 after pending apply, got {:?} in {elapsed:?}",
-            result.as_ref().map(|b| b.len()).map_err(|e| format!("{e:?}"))
+            result
+                .as_ref()
+                .map(|b| b.len())
+                .map_err(|e| format!("{e:?}"))
         );
         let sessions = reg.sessions.lock().unwrap();
         let s = sessions.get(&id).unwrap();
@@ -2936,12 +3301,13 @@ mod tests {
 
     #[test]
     fn encode_start_includes_lead_before_play() {
-        assert_eq!(ENCODE_LEAD_SEGMENTS, 2);
-        assert_eq!(encode_start_ms(1_264_000), 1_260_000);
+        assert_eq!(ENCODE_LEAD_SEGMENTS, 8);
+        assert_eq!(encode_start_ms(1_264_000), 1_248_000);
         assert_eq!(encode_start_ms(1_000), 0);
         assert_eq!(encode_start_ms(0), 0);
         assert_eq!(encode_start_ms(4_000), 0);
-        assert_eq!(encode_start_ms(6_000), 2_000);
+        assert_eq!(encode_start_ms(16_000), 0);
+        assert_eq!(encode_start_ms(18_000), 2_000);
     }
 
     /// Mid-title switch: encode starts lead before land. seg000 must 503
@@ -3008,11 +3374,11 @@ mod tests {
             "seg000 at a 40s switch must not count as start alignment"
         );
 
-        // Near-ALIGN dig-back behind committed land must not restart (steal).
-        // Real scrub-back is playlist ?startMs=.
-        let dig_ms = 13 * SEGMENT_MS;
+        // Behind encode window (lead=8 at play 40s → window from seg12): must
+        // not restart / cook a retreated land. Real scrub-back is ?startMs=.
+        let dig_ms = 5 * SEGMENT_MS;
         assert!(digback_behind_committed(play_ms, None, dig_ms));
-        match reg.asset(&switched, "seg013.m4s", None) {
+        match reg.asset(&switched, "seg005.m4s", None) {
             Err(PlaylistError::NotReady) => {}
             Ok(_) => panic!("dig-back must not cook a retreated window"),
             Err(e) => panic!("unexpected dig-back error: {e:?}"),

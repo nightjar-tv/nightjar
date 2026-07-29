@@ -147,13 +147,39 @@ path iOS/tvOS need).
    holes stay **503** / no restart (same as before the amendment). Far
    preempt and client playhead timing remain separate levers.
 
+   **Preempt polarity and fix (a) (2026-07-29).** Product default remains
+   preempt **on** when `NIGHTJAR_DISABLE_PREEMPT` is unset (HEAD
+   `disable_preempt` / `matches!` polarity). Explicit `=1` / `true` / `yes`
+   disables preempt for investigation. A short-lived worktree flip to
+   unset→off is reverted: scrub-before-play under that polarity failed
+   Safari flat across leads 3–7; the validated Config D path used preempt on.
+
+   Same-build mid-URI mechanism (item 33, A then B while A cooking) still
+   stands: preempt-on can kill A's encoder before A's land exists; mid stays
+   no-fill until IDLE → empty **204**. **Fix (a) chosen:** far preempt may
+   still select, but `restart_at` defers `stop_child` while a cooking-land
+   segment waiter is held (`may_kill_cooking_encode` / `segment_waiters`).
+   Land-ready still kills (land-then-yank). Fix (b) not taken.
+
+   Fix (a) targets **mid-playback double-scrub under preempt-on** (kill
+   before mid land). Scrub-before-play ablation under preempt-on passed
+   5/5 both engines with the waiter gate forced always-kill; that harness
+   does not exercise fix (a)'s purpose. **Owed before treating the stack as
+fully confirmed:** mid-playback double-scrub N≥5 on the preempt-on
+mechanism probe (engine-agnostic mid-URI startMs A=258s then B=748s,
+GAP=300ms) with fix (a) on.
+Verified on the current stack: N=5 passing, and a second confirmation
+batch also passing. In each trial, the mid-uri GET ended as HTTP 503
+with waited_ms ~0.6–1.7s, and final-land ended as HTTP 200; no
+`abandoned hold ended` / HTTP 204 teardown events occurred.
+
    **Settled: abandoned / superseded miss status shape.** A segment GET
    that will not be filled on the current encode trajectory (abandoned
    after preempt, or a land-waiter superseded by a newer pending land)
    enters a **no-fill hold**: no 503/404 while the session lives. When
    the hold reaches `IDLE_TIMEOUT` (or the session is torn down mid-hold),
    the request ends with empty **HTTP 204**. That is product policy, not
-   an open experiment — Safari must not see an application-level media
+   an open experiment. Safari must not see an application-level media
    failure on a URI the encode will never produce. Session teardown of a
    dead session remains **404** (`NotFound`), distinct from this ceiling.
 
@@ -194,11 +220,27 @@ path iOS/tvOS need).
      Primed near-land misses still respect `RESTART_MIN_INTERVAL`.
      `scrub_shaped` (record pending while min-interval is hot) uses the
      same dig-back gate so it cannot write a retreated pending under Wait.
-   Encode windows lead the play land point by [`ENCODE_LEAD_SEGMENTS`] (2)
-   so Safari dig-back near `#EXT-X-START` hits on-disk segments without
-   retreating a committed `?startMs=` land. A 16-segment lead worked but
+   Encode windows lead the play land point by [`ENCODE_LEAD_SEGMENTS`]
+   **(8)** so Safari dig-back near `#EXT-X-START` (including post-land
+   `#t=` reload under `PRECISE=YES`, ADR-0017 amendment) hits on-disk
+   segments without retreating a committed `?startMs=` land. Binary search
+   under the corrected stack (preempt on, PRECISE=YES, post-land `#t=`):
+   dual-engine scrub-before-play fails Safari at lead 5/6/7 (Chrome 5/5);
+   lead **8** is the minimum where both engines hit 5/5, confirmed with a
+   second N=5 batch both engines. A 16-segment lead previously worked but
    increased measured seek-to-first-segment time outside Gate 2's budget;
    zero lead left dig-back 503-forever once pending retreat was blocked.
+   **Gate 2 concurrent-session / land-time cost at lead=8 is still
+   unmeasured**; do not treat 8 as budget-proven, only as the scrub-before-play
+   dual-engine floor for this title/harness.
+
+   **`PRECISE=YES` restored (couple with lead).** `#EXT-X-START` keeps
+   `PRECISE=YES`. A temporary PRECISE removal shrank dig-back under post-land
+   `#t=` when lead was too short; that was a workaround for insufficient lead
+   depth, not a preferred playlist contract. With lead sized to 8, PRECISE
+   returns. Do not re-remove PRECISE to paper over dig-back without first
+   checking whether lead covers the measured hole.
+
    Far-ahead restart uses `max(frontier, play_start)` as the band end so
    land-point prefetch inside that lead-in does not thrash-restart the
    encoder.

@@ -201,21 +201,24 @@ function clearVideoSubtitleCues(video: HTMLVideoElement): void {
  * Attach an HLS VOD playlist.
  *
  * Scrub sequence:
- * 1. Land commits on `seeked`, or after `seeking` has been quiet for
- *    LAND_COMMIT_QUIET_MS (scrubber release / settle). Mid-drag seeking
- *    ticks do not startMs/ensure — that thrashed FFmpeg on slider drag.
- * 2. Both backends: GET playlist?startMs=T for land intent.
+ * 1. Native: `?startMs=` on every `seeking` (server coalesces pending). Must
+ *    beat Safari's dig-back GETs — a 300ms quiet before startMs let dig-back
+ *    restart the encode to mid (252) before land (258), then yank twice;
+ *    buffer stayed at [0,24] while seeking stuck at land.
+ * 2. Native land-ensure commits after `seeking`/`seeked` quiet for
+ *    LAND_COMMIT_QUIET_MS (release / settle). Mid-drag must not each ensure.
  * 3. hls.js: subtitle retarget after every settled seeked (fire-and-forget
  *    startMs — do not gate on in-flight fetch; that swallowed double-scrub
  *    reasserts). Clears hls.js subtitle buffered state then startLoad.
- * 4. Native (iOS/iPadOS): startMs, then long-poll GET of the playhead
+ * 4. Native (iOS/iPadOS): after quiet, long-poll GET of the playhead
  *    `segNNN.m4s` (server holds up to SEGMENT_WAIT). On abort/timeout/503,
  *    backoff briefly and retry the same target until a newer scrub
  *    supersedes (parent abort) or destroy — never a fixed attempt cap.
- *    Then VTT cue inject (ADR-0013). After land-ensure 200: under seek
- *    suppress, seek to the ensure land (nudge if already there) and
- *    `play()`. Do not remount `src`+#t= on scrub. Desktop Safari uses
- *    hls.js (ADR-0017).
+ *    Then VTT cue inject (ADR-0013). After land-ensure 200: re-assign the
+ *    same master URL with `#t=` under seek suppress so native reloads init
+ *    after seek-restart (MAP URI unchanged; attach-time init is stale).
+ *    Not a scrub remount into an unready hole — only after land bytes exist.
+ *    Desktop Safari uses hls.js (ADR-0017).
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -309,10 +312,21 @@ export function attachHls(
 
 	const nudgePlayheadToLand = (seconds: number) => {
 		const t = Math.max(0, seconds);
-		const at = video.currentTime;
 		armSeekSuppress();
 		landRetargetSeconds = t;
-		if (Math.abs(at - t) < 0.05) {
+		// Side-channel land-ensure does not fill WebKit's buffer. After a
+		// seek restart, init.mp4 is rewritten under the same MAP URI while
+		// Safari still holds the attach-time init — demux of new segs fails
+		// and buffered ranges stay at the pre-scrub head (dogfood: [0,24]
+		// while seeking stuck at land). Re-assigning the same master with
+		// #t= reloads the native pipeline on this session URL (not a new
+		// POST) so init+land segs bind. Measured: ranges jump to land and
+		// currentTime advances. Do not use #t= as the scrub itself (before
+		// land ready) — that remounts into an unready hole.
+		const base = (video.currentSrc || video.src).split('#')[0];
+		if (base) {
+			video.src = `${base}#t=${t}`;
+		} else if (Math.abs(video.currentTime - t) < 0.05) {
 			video.currentTime = t >= 0.05 ? t - 0.05 : t + 0.05;
 		} else {
 			video.currentTime = t;
@@ -326,12 +340,10 @@ export function attachHls(
 	 * and ask again until this ensure is superseded (newer scrub aborts
 	 * parent) or destroy. Never a fixed retry cap: that burned both
 	 * attempts in milliseconds while the server was still coalescing.
-	 * On success: seek WebKit to the ensure land (seek suppress) then
-	 * `play()`. Side-channel fetch does not fill Safari's buffer; same-value
-	 * currentTime is a no-op. Do **not** remount `src`+#t= here — measured
-	 * dig-back ~8 segs behind encode start (lead=2) → eternal 503 → black /
-	 * scrubber at 0 (dogfood). Safari scrub is currentTime on a stable HLS
-	 * src; remount is for stream changes, not scrub.
+	 * On success: [`nudgePlayheadToLand`] (post-land `#t=` under seek
+	 * suppress — ADR-0017 amendment). Side-channel fetch does not fill
+	 * Safari's buffer. Do **not** remount before land-ensure 200: that
+	 * remounts into an unready hole (lead dig-back / black / scrubber at 0).
 	 *
 	 * Supersede = parent abort only. Do NOT bail because `currentTime` still
 	 * sits on the prior scrub: after scrub→scrub WebKit may still show A's
@@ -687,10 +699,29 @@ export function attachHls(
 		void syncNativeInject(true);
 	};
 
+	/** Last startMs we told the server — skip identical echoes. */
+	let lastStartMsSent: number | null = null;
+
 	/**
-	 * Native land path: startMs + land-ensure + nudge. Driven by observed
+	 * Record scrub intent immediately. Safari dig-back GETs race a quiet
+	 * timer; without pending startMs the server treats mid as a forward
+	 * restart and cooks the wrong land.
+	 */
+	const notifyNativeStartMs = () => {
+		if (destroyed || hls || seekSuppressActive()) return;
+		const startMs = Math.max(0, Math.floor(positionSeconds() * 1000));
+		if (lastStartMsSent === startMs) return;
+		lastStartMsSent = startMs;
+		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
+			// Network blip: land-segment ensure still drives the window.
+		});
+	};
+
+	/**
+	 * Native land-ensure + nudge after scrub settle. Driven by observed
 	 * playhead segment, not `seeked` alone (Safari often skips seeked on
-	 * rapid scrub). Same-segment echoes are no-ops.
+	 * rapid scrub). Same-segment echoes are no-ops. startMs is sent earlier
+	 * from `notifyNativeStartMs` on seeking.
 	 */
 	const noticeNativePlayheadLand = () => {
 		if (destroyed || hls) return;
@@ -705,10 +736,7 @@ export function attachHls(
 		) {
 			return;
 		}
-		const startMs = Math.max(0, Math.floor(landAt * 1000));
-		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
-			// Network blip: land-segment ensure still drives the window.
-		});
+		notifyNativeStartMs();
 		ensureNativeLandSegment(landAt);
 		if (wantedSubtitle >= 0) enterNativeInjectMode();
 	};
@@ -805,6 +833,25 @@ export function attachHls(
 		if (nativeInjectMode) scheduleAssertInjectModes();
 	};
 
+	/**
+	 * Native land commit after scrub settle. Both `seeking` and `seeked` only
+	 * arm this quiet timer — do not commit on seeked alone. Immediate seeked
+	 * commit raced scrub-before-play (A startMs/ensure, then B) and left
+	 * WebKit stuck seeking at B after mid dig-back (desktop-native N=7).
+	 */
+	const armNativeLandCommitQuiet = () => {
+		if (destroyed || hls || seekSuppressActive()) return;
+		if (landCommitTimer !== null) clearTimeout(landCommitTimer);
+		landCommitTimer = setTimeout(() => {
+			landCommitTimer = null;
+			if (destroyed || hls || seekSuppressActive()) return;
+			// Commit even if seeking is still true: WebKit often stays
+			// seeking until land segments arrive; withholding startMs
+			// deadlocks scrub-before-play (encode never follows playhead).
+			noticeNativePlayheadLand();
+		}, LAND_COMMIT_QUIET_MS);
+	};
+
 	const onSeeked = () => {
 		if (destroyed) return;
 		if (seekSuppressActive()) {
@@ -829,12 +876,7 @@ export function attachHls(
 			return;
 		}
 		if (!hls) {
-			// Scrub settled — commit now; cancel any pending quiet timer.
-			if (landCommitTimer !== null) {
-				clearTimeout(landCommitTimer);
-				landCommitTimer = null;
-			}
-			noticeNativePlayheadLand();
+			armNativeLandCommitQuiet();
 			return;
 		}
 		// Fire-and-forget like native (ADR-0013): awaiting startMs gated rapid
@@ -847,19 +889,13 @@ export function attachHls(
 	};
 
 	/**
-	 * During scrubber drag Safari fires `seeking` continuously. Only arm a
-	 * quiet timer — commit land on seeked or after LAND_COMMIT_QUIET_MS with
-	 * no further seeking (release / settle). Do not startMs/ensure per tick.
-	 * Native path only (iOS/iPadOS); hls.js has no land-ensure.
+	 * During scrubber drag Safari fires `seeking` continuously. startMs on
+	 * every tick (coalesced server-side). Land-ensure only after quiet
+	 * (release / settle). Native path only; hls.js has no land-ensure.
 	 */
 	const onSeeking = () => {
-		if (destroyed || hls || seekSuppressActive()) return;
-		if (landCommitTimer !== null) clearTimeout(landCommitTimer);
-		landCommitTimer = setTimeout(() => {
-			landCommitTimer = null;
-			if (destroyed || hls || seekSuppressActive()) return;
-			noticeNativePlayheadLand();
-		}, LAND_COMMIT_QUIET_MS);
+		notifyNativeStartMs();
+		armNativeLandCommitQuiet();
 	};
 
 	const onCanPlay = () => {

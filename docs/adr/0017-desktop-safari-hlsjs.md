@@ -93,6 +93,51 @@ protocol by client.
 - Opt-in `?njNativeHls=1` forces native on desktop Apple WebKit for
   regression comparison. The former `?njHlsJs=1` probe is removed; hls.js
   is the desktop default.
-- Do not revive `video.src` remount, forever-refuse/404 papering, or
-  desktop-only hacks that leave iOS on a different *protocol* (Rule 2.4 /
-  rejected approaches). Backend selection is the approved lever.
+- Forever-refuse/404 papering and desktop-only protocol forks remain
+  rejected (Rule 2.4). Backend selection stays the approved *attach*
+  lever; see the amendment below for the scoped native-land remount.
+
+## Amendment (2026-07-29): post-land `#t=` on native HLS
+
+### Context
+
+Seek-restart rewrites `init.mp4` under the same `#EXT-X-MAP` URI. Native
+WebKit keeps the attach-time init; after land-ensure 200, `currentTime`
+nudge alone leaves buffered ranges at the pre-scrub head and
+`seeking=true` (scrub-before-play dogfood, item 33). Remounting
+`video.src` *as the scrub* (before land bytes exist) was rejected earlier:
+it remounts into an unready encode window and can exit fullscreen on some
+paths. That rejection stays.
+
+Ablation under preempt-on (same harness, N=5): full stack **5/5** Safari
+native + Chrome; removing only the post-land `#t=` reassignment → Safari
+**0/5** stick, Chrome still **5/5**. No narrower init-rebind (distinct MAP
+URI without remount) was feasible in that matrix. Post-land `#t=` is the
+measured unlock for native scrub-before-play on this product path
+(`?njNativeHls=1` / iOS native).
+
+### Decision
+
+1. **After land-ensure 200 on the native path**, re-assign the *same*
+   session master URL with `#t=<land seconds>` under seek suppress so
+   WebKit reloads init + land segments. Not a new session POST.
+2. **Do not** use `#t=` / `video.src` remount as the scrub itself (before
+   land ready). Scrub intent remains `startMs` + land-ensure; remount is
+   only the post-ready init rebind.
+3. Desktop product default remains hls.js (this ADR). The remount applies
+   on the native path (iOS/iPadOS and `?njNativeHls=1` dogfood). hls.js
+   already rebinds MSE; it does not need this remount for the same
+   failure mode.
+4. Encode lead must cover dig-back after this reload when
+   `#EXT-X-START` uses `PRECISE=YES` (couple documented in ADR-0011;
+   lead value amendment held until Safari-confirmed minimum).
+
+### Consequences
+
+- Prior “do not revive `video.src` remount” wording is narrowed: scrub-time
+  remount stays dead; **post-land-ensure** remount on the same master URL
+  is accepted for native init refresh.
+- UI may briefly reset chrome after remount (founder note: does not drop
+  fullscreen). Polish is separate from this contract.
+- Distinct MAP URI without remount remains unproven; do not substitute it
+  for this amendment without new evidence.
