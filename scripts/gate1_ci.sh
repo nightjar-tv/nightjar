@@ -79,8 +79,12 @@ for _ in range(runs):
         raise SystemExit("health never became ready")
 median = statistics.median(samples)
 print(f"startup_ms samples={samples} median={median:.0f} min={min(samples)} max={max(samples)}")
-if median > 500:
-    raise SystemExit(f"FAIL: median startup {median:.0f}ms > 500ms over {runs} runs")
+# Phase 1 budget was 500ms. ADR-0009 verify-encodes at process start (short
+# lavfi encodes per advertised H.264 candidate); CI Linux medians land ~550ms
+# with that probe. Gate on 1500ms so the smoke still catches multi-second
+# regressions without fighting the accepted startup cost.
+if median > 1500:
+    raise SystemExit(f"FAIL: median startup {median:.0f}ms > 1500ms over {runs} runs")
 PY
 
 NIGHTJAR_DATA_DIR="$DATA" NIGHTJAR_PORT="$PORT" "$BIN" >"$LOG" 2>&1 &
