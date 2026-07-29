@@ -28,3 +28,6 @@ testdata/files/.generated
 testdata/bench_10k/
 testdata/.bench_seed.mp4
 
+# Local dogfood screenshot dumps (never ship)
+tmp_safari_cue_check/
+
