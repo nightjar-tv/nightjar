@@ -101,8 +101,11 @@
 		<header>
 			<h1>{library.name}</h1>
 			<p class="path">{library.path}</p>
+			{#if !library.reachable}
+				<p class="error" role="alert">{copy.folderUnreachable(library.path)}</p>
+			{/if}
 			<button type="button" onclick={scan} disabled={scanning}>
-				{scanning ? 'Scanning…' : 'Scan library'}
+				{scanning ? 'Scanning…' : library.reachable ? 'Scan library' : copy.rescan}
 			</button>
 			{#if scanning}
 				<p class="scan">{copy.scanInProgress}</p>
@@ -115,19 +118,23 @@
 		{#if items.length === 0}
 			<p class="empty">No items yet. Run a scan.</p>
 		{:else}
-			<p class="hint">{copy.phase1Hint}</p>
+			<p class="hint">{copy.badgeHint}</p>
 			<ul class="grid">
 				{#each items as item (item.id)}
 					<li>
 						<a href="/items/{item.id}">
 							<span class="row">
 								<span class="title">{item.title}</span>
-								{#if item.directPlay}
-									<span class="badge ok">browser</span>
-								{:else if item.probeStatus === 'indexed'}
+								{#if item.probeStatus === 'indexed'}
 									<span class="badge">probing…</span>
 								{:else if item.scanError || item.probeStatus === 'error'}
 									<span class="badge bad">probe error</span>
+								{:else if item.playbackMethod === 'directPlay'}
+									<span class="badge ok">browser</span>
+								{:else if item.playbackMethod === 'remux'}
+									<span class="badge ok">remux</span>
+								{:else if item.playbackMethod === 'transcode'}
+									<span class="badge">transcode</span>
 								{:else}
 									<span class="badge">needs transcode</span>
 								{/if}

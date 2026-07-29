@@ -520,6 +520,7 @@ dependencies = [
  "nightjar-core",
  "nightjar-db",
  "nightjar-scanner",
+ "nightjar-transcode",
  "rust-embed",
  "serde",
  "serde_json",
@@ -553,6 +554,7 @@ version = "0.0.1"
 dependencies = [
  "nightjar-core",
  "nightjar-db",
+ "nightjar-transcode",
  "notify",
  "notify-debouncer-mini",
  "serde",
@@ -564,6 +566,12 @@ dependencies = [
 [[package]]
 name = "nightjar-transcode"
 version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "notify"

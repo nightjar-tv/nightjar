@@ -31,7 +31,7 @@ export interface paths {
         /** List all libraries */
         get: operations["listLibraries"];
         put?: never;
-        /** Create a library pointing at a local folder */
+        /** Create a library and enqueue its first scan (ADR-0015) */
         post: operations["createLibrary"];
         delete?: never;
         options?: never;
@@ -131,8 +131,25 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Direct-play capability and stream URL for an item */
+        /** Playback method and delivery URL for an item */
         get: operations["getPlaybackInfo"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/items/{itemId}/subtitles/{trackId}.vtt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** WebVTT for one text subtitle track (ADR-0010) */
+        get: operations["getSubtitleVtt"];
         put?: never;
         post?: never;
         delete?: never;
@@ -148,8 +165,145 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Direct-play byte stream (supports HTTP Range) */
+        /**
+         * Byte stream for playback (supports HTTP Range)
+         * @description Serves the original file for directPlay items. Remux and transcode items are delivered as HLS sessions (ADR-0011).
+         */
         get: operations["streamItem"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/items/{itemId}/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start an HLS playback session for an item
+         * @description ADR-0011. Returns 202 with sessionId and playlistUrl. Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Each POST creates a session; seek with ?startMs= on the playlist restarts that session in place. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+         */
+        post: operations["startTranscodeSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/master.m3u8": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * HLS master playlist for a playback session
+         * @description ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start points here. Seek via startMs uses the same window-move rules as the media playlist.
+         */
+        get: operations["getSessionMasterPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/index.m3u8": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * HLS media playlist for a playback session
+         * @description Media playlist path is stable (ADR-0008). Segment URIs are relative init.mp4 / segNNN.m4s. Also accepts startMs for seek.
+         */
+        get: operations["getSessionPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/subs/{asset}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subtitle media playlist or WebVTT segment for a session track
+         * @description ADR-0010 / ADR-0013. EXT-X-MEDIA URI target. Ready tracks use a multi-segment `{trackId}.m3u8` whose `segNNN.vtt` bodies are sliced from the item store VTT (no session demux). Cold session-inline demux remains for fixtures only; Gate-1 snapshots only declare complete/store tracks.
+         */
+        get: operations["getSessionSubtitlePlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/{asset}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** HLS init segment or media segment for a session */
+        get: operations["getSessionAsset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Stop a playback session and reap its FFmpeg process */
+        delete: operations["deleteTranscodeSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/system/transcode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Verified H.264 encode capabilities for this process
+         * @description Startup detection-by-verification (ADR-0009). Each candidate is verified | failed | unavailable with a reason when not verified. preferredH264Encoder is what new HLS sessions use for -c:v.
+         */
+        get: operations["getTranscodeCapabilities"];
         put?: never;
         post?: never;
         delete?: never;
@@ -176,12 +330,41 @@ export interface components {
         /** @enum {string} */
         MediaKind: "movie" | "episode" | "unknown";
         /**
-         * @description indexed = walk+filename done, codecs pending; probed = ffprobe ok; error = ffprobe failed (see scanError).
+         * @description indexed = walk+filename done, codecs pending; probed = ffprobe ok; error = permanent ffprobe/parse failure (see scanError); unavailable = mount/IO absence, retriable (ADR-0014).
          * @enum {string}
          */
-        ProbeStatus: "indexed" | "probed" | "error";
+        ProbeStatus: "indexed" | "probed" | "error" | "unavailable";
+        /**
+         * @description Item-level extract queue state (ADR-0013 / ADR-0014). pending = extract queued or in progress; ready = WebVTT on disk; none = no serveable text tracks; error = permanent extract failure; unavailable = mount/IO absence, retriable. Per-track first-play readiness is SubtitleTrack.readiness, not this field.
+         * @enum {string}
+         */
+        SubtitleStatus: "pending" | "ready" | "none" | "error" | "unavailable";
+        /**
+         * @description Server-declared per-track readiness for serveable text tracks (ADR-0013 §11). preparing = extract not yet writing cues; partial = a growing WebVTT is serveable; complete = final WebVTT. Clients never invent this from file size or a timer. Absent on tracks that are listed but not served (ASS/SSA, image).
+         * @enum {string}
+         */
+        SubtitleTrackReadiness: "preparing" | "partial" | "complete";
         /** @enum {string} */
         ScanJobState: "queued" | "indexing" | "probing" | "completed" | "failed";
+        /**
+         * @description directPlay = browser plays the original file; remux = same codecs in a container the client cannot open, delivered as a stream-copy HLS session; transcode = needs re-encoding, delivered as an encoding HLS session. Pending or failed probes report transcode.
+         * @enum {string}
+         */
+        PlaybackMethod: "directPlay" | "remux" | "transcode";
+        TranscodeSession: {
+            sessionId: string;
+            /** Format: int64 */
+            itemId: number;
+            /** @description Path to the HLS master playlist for this session (master.m3u8). The media playlist remains at index.m3u8 (ADR-0008). */
+            playlistUrl: string;
+            /** @description FFmpeg encoder currently used by this session, or "copy" when the session stream-copies video (remux). */
+            videoEncoder: string;
+            /**
+             * @description Whether videoEncoder is a hardware encoder, a software encoder, or a stream copy.
+             * @enum {string}
+             */
+            encoderKind: "hardware" | "software" | "copy";
+        };
         Library: {
             /** Format: int64 */
             id: number;
@@ -190,11 +373,29 @@ export interface components {
             kind: components["schemas"]["LibraryKind"];
             /** Format: int64 */
             itemCount: number;
+            /** @description False when the library root is not reachable (unmounted share, missing path). Work is paused until it returns (ADR-0014). */
+            reachable: boolean;
         };
         CreateLibraryRequest: {
             name: string;
             path: string;
             kind: components["schemas"]["LibraryKind"];
+        };
+        /** @description Library row plus the scan job enqueued on create (ADR-0015). */
+        CreateLibraryResponse: {
+            /** Format: int64 */
+            id: number;
+            name: string;
+            path: string;
+            kind: components["schemas"]["LibraryKind"];
+            /** Format: int64 */
+            itemCount: number;
+            reachable: boolean;
+            /**
+             * Format: int64
+             * @description Async scan job started for this library.
+             */
+            jobId: number;
         };
         MediaItem: {
             /** Format: int64 */
@@ -217,11 +418,9 @@ export interface components {
             /** Format: int64 */
             sizeBytes: number;
             probeStatus: components["schemas"]["ProbeStatus"];
+            subtitleStatus: components["schemas"]["SubtitleStatus"];
             scanError?: string | null;
-            /** @description Phase 1 browser-safe direct play (H.264 + AAC in MP4). False means needsTranscode; Phase 2 will remux/transcode. False while probeStatus is indexed. */
-            directPlay: boolean;
-            /** @description Inverse of directPlay for Phase 1; kept explicit for clients. */
-            needsTranscode: boolean;
+            playbackMethod: components["schemas"]["PlaybackMethod"];
         };
         ScanJobAccepted: {
             /** Format: int64 */
@@ -257,18 +456,89 @@ export interface components {
         PlaybackInfo: {
             /** Format: int64 */
             itemId: number;
-            /** @description Phase 1 browser-safe whitelist (H.264 + AAC in MP4) */
-            directPlay: boolean;
-            needsTranscode: boolean;
-            /** @description Why direct play is or is not available */
-            reason?: string;
-            streamUrl: string;
+            playbackMethod: components["schemas"]["PlaybackMethod"];
+            /** @description Why the decision engine chose this method */
+            reason: string;
+            /** @description Present only when playbackMethod is directPlay */
+            streamUrl?: string;
+            /** @description Present when playbackMethod is remux or transcode. POST here to start an HLS session (ADR-0011). */
+            sessionsUrl?: string;
+            /** @description Source MIME for directPlay; application/vnd.apple.mpegurl for session playback. */
             mimeType: string;
             /** Format: int64 */
             durationMs?: number | null;
             container?: string | null;
             videoCodec?: string | null;
             audioCodec?: string | null;
+            /** @description Audio tracks in the source (ADR-0012). Listed the same way for directPlay, remux, and transcode: the client asks for a trackId and never reasons about the delivery path to find tracks. Direct play switches client-side; sessions take audioTrackId at start. */
+            audioTracks?: components["schemas"]["AudioTrack"][];
+            subtitleStatus: components["schemas"]["SubtitleStatus"];
+            /** @description Text subtitle tracks (ADR-0010 / ADR-0013). Embedded and filesystem sidecars share one shape; differ by source. url is present only when the WebVTT file is already extracted. Listed the same way for directPlay, remux, and transcode. */
+            subtitleTracks?: components["schemas"]["SubtitleTrack"][];
+        };
+        AudioTrack: {
+            /** @description Stable id `e{streamIndex}`, the same scheme as embedded subtitles (ADR-0010 / ADR-0012). */
+            trackId: string;
+            /** @description Source codec (aac, ac3, eac3, dts, ...) */
+            codec: string;
+            /** @description Normalised ISO 639-1 when known; null if unlabelled */
+            language?: string | null;
+            /** @description Channel count. Tracks above the client ceiling are downmixed to stereo by the session with an explicit pan matrix. */
+            channels: number;
+            /** @description FFmpeg layout name (stereo, 5.1, 7.1, ...) when reported */
+            channelLayout?: string | null;
+            /** @description Optional title tag from the container (e.g. Commentary) */
+            label?: string | null;
+            /** @description Container default disposition. Exactly one track is default: the flagged one, else the first. */
+            default: boolean;
+            /** @description Absolute ffprobe stream index */
+            streamIndex: number;
+        };
+        SubtitleTrack: {
+            /** @description Stable id used in the VTT URL. Embedded `e{N}`; sidecar `s` / `s-{suffix}` from the filename (ADR-0010). */
+            trackId: string;
+            /** @enum {string} */
+            source: "embedded" | "sidecar";
+            /** @description Source codec or sidecar format (subrip, srt, vtt, ass, ...) */
+            codec: string;
+            /** @description Normalised ISO 639-1 when known; null if unlabelled */
+            language?: string | null;
+            /** @description Optional title tag from the container (embedded) */
+            label?: string | null;
+            /** @description Forced-subtitle flag (selection differs from full dialogue) */
+            forced: boolean;
+            /** @description SDH / hearing-impaired flag from the sidecar name */
+            sdh: boolean;
+            /** @description Absolute ffprobe stream index when source is embedded */
+            streamIndex?: number | null;
+            readiness?: components["schemas"]["SubtitleTrackReadiness"];
+            /**
+             * Format: int64
+             * @description Monotonic growth counter for this track's WebVTT body. Bumps when the server writes more cues (partial) or the final file. Clients that reload on growth compare this field; they do not infer growth from content length.
+             */
+            revision?: number;
+            /** @description GET path for the WebVTT body when this track is served (partial or complete). Absent while preparing, and for ASS/SSA / image tracks that are still listed. */
+            url?: string | null;
+        };
+        /**
+         * @description verified = short encode+demux succeeded; failed = advertised but verify failed; unavailable = not in this ffmpeg build.
+         * @enum {string}
+         */
+        EncoderStatus: "verified" | "failed" | "unavailable";
+        EncoderCandidate: {
+            /** @description FFmpeg encoder name (e.g. libx264, h264_videotoolbox) */
+            name: string;
+            /** @description Backend family (software, videotoolbox, nvenc, qsv, vaapi, ...) */
+            backend: string;
+            status: components["schemas"]["EncoderStatus"];
+            /** @description Required when status is not verified; null when verified */
+            reason?: string | null;
+        };
+        TranscodeCapabilities: {
+            ffmpegVersion?: string | null;
+            /** @description Encoder name used for new HLS sessions (-c:v) */
+            preferredH264Encoder: string;
+            encoders: components["schemas"]["EncoderCandidate"][];
         };
     };
     responses: never;
@@ -276,6 +546,7 @@ export interface components {
         LibraryId: number;
         ItemId: number;
         JobId: number;
+        SessionId: string;
     };
     requestBodies: never;
     headers: never;
@@ -338,13 +609,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Created */
+            /** @description Library created and scan job accepted. The walk runs asynchronously (ADR-0004); poll GET /scan-jobs/{jobId} for progress. */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Library"];
+                    "application/json": components["schemas"]["CreateLibraryResponse"];
                 };
             };
             /** @description Invalid request */
@@ -546,6 +817,39 @@ export interface operations {
             };
         };
     };
+    getSubtitleVtt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+                /** @description Stable track id (ADR-0010): `e{streamIndex}` for embedded, `s` / `s-{suffix}` for filesystem sidecars. */
+                trackId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebVTT body */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/vtt": string;
+                };
+            };
+            /** @description Item or serveable subtitle track not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     streamItem: {
         parameters: {
             query?: never;
@@ -586,12 +890,286 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            /** @description Item needs an HLS session; POST /api/v0/items/{itemId}/sessions */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description Range not satisfiable */
             416: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    startTranscodeSession: {
+        parameters: {
+            query?: {
+                /** @description Encode window start in milliseconds (default 0) */
+                startMs?: number;
+                /** @description Audio track to map, from playbackInfo.audioTracks (ADR-0012). Defaults to the flagged default track, else the first. Switching audio starts a new session at the current position and DELETEs the old one. */
+                audioTrackId?: string;
+            };
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session started for this item */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscodeSession"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Item direct plays, or is not ready for a session */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Session cap full; retry shortly */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionMasterPlaylist: {
+        parameters: {
+            query?: {
+                /** @description Encode window start; a change restarts this session there */
+                startMs?: number;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS master playlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                };
+            };
+            /** @description Session not found or playlist not ready yet */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionPlaylist: {
+        parameters: {
+            query?: {
+                /** @description Encode window start; a change restarts this session there */
+                startMs?: number;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS playlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                };
+            };
+            /** @description Session not found or playlist not ready yet */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionSubtitlePlaylist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                /** @description `{trackId}.m3u8` or `{trackId}/segNNN.vtt` (e.g. e2.m3u8, e2/seg000.vtt, s-en/seg012.vtt) */
+                asset: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS subtitle media playlist or WebVTT segment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                    "text/vtt": string;
+                };
+            };
+            /** @description Session or track not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Subtitle segment not ready yet (demux still catching up) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionAsset: {
+        parameters: {
+            query?: {
+                /** @description Log-only client marker. Serving ignores this. JS land-ensure and attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503/204 behaviour. */
+                njFetcher?: string;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                asset: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Segment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Abandoned or superseded segment GET held with no fill until the session idle ceiling while the session lived; empty body (ADR-0011). Not an application error. Distinct from DELETE session 204. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Session or asset not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Segment not on disk yet (encoder still cooking). Retryable; do not treat as a permanent miss. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deleteTranscodeSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stopped (or already gone) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTranscodeCapabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Capability readout */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscodeCapabilities"];
+                };
             };
         };
     };

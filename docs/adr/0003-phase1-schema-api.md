@@ -19,9 +19,12 @@ direct play. Schema and `/v0` shapes are expensive to undo (Rule 6.1).
 4. **API prefix `/api/v0`.** Additive within v0; breaking changes require `/v1`
    (Rule 2.3 when frozen). OpenAPI is the source of truth; the web client is
    generated from it.
-5. **Direct play only.** `playback-info` reports container/codecs and a stream
-   URL; remux/transcode are Phase 2. Unplayable probes surface as structured
-   `scan_error` / playback reasons, never crashes.
+5. **Direct play only.** *Superseded by ADR-0006 (2026-07-25), which adds
+   remux delivery and replaces the `directPlay`/`needsTranscode` fields with
+   `playbackMethod`.* Original decision: `playback-info` reports
+   container/codecs and a stream URL; remux/transcode are Phase 2. Unplayable
+   probes still surface as structured `scan_error` / playback reasons, never
+   crashes.
 6. Library kinds are `movies` | `shows`. Item kinds are `movie` | `episode` |
    `unknown` from filename parse; metadata matching is Phase 3.
 

@@ -1,4 +1,5 @@
 use crate::migrate;
+use crate::status::{parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -21,6 +22,8 @@ pub struct LibraryRow {
     pub path: String,
     pub kind: String,
     pub item_count: i64,
+    /// ADR-0014: false when the library root is not reachable.
+    pub reachable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,10 +42,14 @@ pub struct MediaItemRow {
     pub container: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    pub audio_channels: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub probe_status: String,
     pub scan_error: Option<String>,
+    pub subtitle_status: String,
+    pub subtitle_source_mtime_ms: Option<i64>,
+    pub subtitle_source_size_bytes: Option<i64>,
 }
 
 /// Index-pass upsert: codecs left null, probe_status = indexed.
@@ -65,6 +72,7 @@ pub struct ProbeUpdate {
     pub container: Option<String>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    pub audio_channels: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub probe_status: String,
@@ -87,6 +95,20 @@ pub struct ScanJobRow {
     pub error_message: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+}
+
+/// Filesystem subtitle sidecar stored at index time (ADR-0010).
+#[derive(Debug, Clone)]
+pub struct SidecarRow {
+    pub media_item_id: i64,
+    pub track_id: String,
+    pub path: String,
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+    pub format: String,
+    pub language: Option<String>,
+    pub forced: bool,
+    pub sdh: bool,
 }
 
 impl Db {
@@ -124,6 +146,7 @@ impl Db {
             path: lib.path.clone(),
             kind: lib.kind.clone(),
             item_count: 0,
+            reachable: true,
         })
     }
 
@@ -132,21 +155,14 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT l.id, l.name, l.path, l.kind,
-                        (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id)
+                        (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id),
+                        l.reachable
                  FROM libraries l
                  ORDER BY l.name COLLATE NOCASE",
             )
             .map_err(|e| format!("prepare list libraries: {e}"))?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(LibraryRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    kind: r.get(3)?,
-                    item_count: r.get(4)?,
-                })
-            })
+            .query_map([], map_library)
             .map_err(|e| format!("query libraries: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("read libraries: {e}"))
@@ -156,21 +172,34 @@ impl Db {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT l.id, l.name, l.path, l.kind,
-                    (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id)
+                    (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id),
+                    l.reachable
              FROM libraries l WHERE l.id = ?1",
             [id],
-            |r| {
-                Ok(LibraryRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    kind: r.get(3)?,
-                    item_count: r.get(4)?,
-                })
-            },
+            map_library,
         )
         .optional()
         .map_err(|e| format!("get library {id}: {e}"))
+    }
+
+    pub fn set_library_reachable(&self, library_id: i64, reachable: bool) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE libraries SET reachable = ?2 WHERE id = ?1",
+            params![library_id, reachable as i64],
+        )
+        .map_err(|e| format!("set library {library_id} reachable: {e}"))?;
+        Ok(())
+    }
+
+    pub fn count_items(&self, library_id: i64) -> Result<i64, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM media_items WHERE library_id = ?1",
+            [library_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("count items for library {library_id}: {e}"))
     }
 
     pub fn list_items(&self, library_id: i64) -> Result<Vec<MediaItemRow>, String> {
@@ -179,7 +208,9 @@ impl Db {
             .prepare(
                 "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
-                        audio_codec, width, height, probe_status, scan_error
+                        audio_codec, audio_channels, width, height, probe_status,
+                        scan_error, subtitle_status, subtitle_source_mtime_ms,
+                        subtitle_source_size_bytes
                  FROM media_items
                  WHERE library_id = ?1
                  ORDER BY title COLLATE NOCASE, season, episode",
@@ -197,7 +228,9 @@ impl Db {
         conn.query_row(
             "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                     year, season, episode, duration_ms, container, video_codec,
-                    audio_codec, width, height, probe_status, scan_error
+                    audio_codec, audio_channels, width, height, probe_status,
+                    scan_error, subtitle_status, subtitle_source_mtime_ms,
+                    subtitle_source_size_bytes
              FROM media_items WHERE id = ?1",
             [id],
             map_item,
@@ -217,6 +250,23 @@ impl Db {
         .map_err(|e| format!("item mtime: {e}"))
     }
 
+    /// id, mtime_ms, probe_status for one library path.
+    pub fn item_index_row(
+        &self,
+        library_id: i64,
+        path: &str,
+    ) -> Result<Option<(i64, i64, String)>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, mtime_ms, probe_status FROM media_items
+             WHERE library_id = ?1 AND path = ?2",
+            params![library_id, path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| format!("item index row: {e}"))
+    }
+
     /// Upsert index-pass rows in one transaction. Returns item ids in input order.
     pub fn upsert_items_indexed(
         &self,
@@ -234,11 +284,13 @@ impl Db {
                     "INSERT INTO media_items (
                         library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
-                        audio_codec, width, height, probe_status, scan_error, probed_at
+                        audio_codec, audio_channels, width, height, probe_status,
+                        scan_error, probed_at
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6,
                         ?7, ?8, ?9, NULL, NULL, NULL,
-                        NULL, NULL, NULL, 'indexed', NULL, NULL
+                        NULL, NULL, NULL, NULL, 'indexed',
+                        NULL, NULL
                      )
                      ON CONFLICT(library_id, path) DO UPDATE SET
                         mtime_ms = excluded.mtime_ms,
@@ -252,11 +304,15 @@ impl Db {
                         container = NULL,
                         video_codec = NULL,
                         audio_codec = NULL,
+                        audio_channels = NULL,
                         width = NULL,
                         height = NULL,
                         probe_status = 'indexed',
                         scan_error = NULL,
-                        probed_at = NULL",
+                        probed_at = NULL,
+                        subtitle_status = 'pending',
+                        subtitle_source_mtime_ms = NULL,
+                        subtitle_source_size_bytes = NULL",
                 )
                 .map_err(|e| format!("prepare index upsert: {e}"))?;
             for item in items {
@@ -291,6 +347,7 @@ impl Db {
     }
 
     pub fn apply_probe_update(&self, update: &ProbeUpdate) -> Result<(), String> {
+        let status = parse_probe_status(&update.probe_status)?;
         let conn = self.lock()?;
         conn.execute(
             "UPDATE media_items SET
@@ -298,10 +355,11 @@ impl Db {
                 container = ?3,
                 video_codec = ?4,
                 audio_codec = ?5,
-                width = ?6,
-                height = ?7,
-                probe_status = ?8,
-                scan_error = ?9,
+                audio_channels = ?6,
+                width = ?7,
+                height = ?8,
+                probe_status = ?9,
+                scan_error = ?10,
                 probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
@@ -310,9 +368,10 @@ impl Db {
                 update.container,
                 update.video_codec,
                 update.audio_codec,
+                update.audio_channels,
                 update.width,
                 update.height,
-                update.probe_status,
+                status,
                 update.scan_error,
             ],
         )
@@ -320,16 +379,147 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_missing(&self, library_id: i64, keep_paths: &[String]) -> Result<usize, String> {
+    pub fn set_subtitle_status(
+        &self,
+        item_id: i64,
+        status: &str,
+        source_mtime_ms: Option<i64>,
+        source_size_bytes: Option<i64>,
+    ) -> Result<(), String> {
+        let status = parse_subtitle_status(status)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE media_items SET
+                subtitle_status = ?2,
+                subtitle_source_mtime_ms = ?3,
+                subtitle_source_size_bytes = ?4
+             WHERE id = ?1",
+            params![item_id, status, source_mtime_ms, source_size_bytes],
+        )
+        .map_err(|e| format!("set subtitle status for item {item_id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Reset availability failures so the pool can re-drain them (ADR-0014).
+    pub fn requeue_unavailable_for_library(
+        &self,
+        library_id: i64,
+    ) -> Result<(usize, usize), String> {
+        let conn = self.lock()?;
+        let probes = conn
+            .execute(
+                "UPDATE media_items SET probe_status = 'indexed', scan_error = NULL
+                 WHERE library_id = ?1 AND probe_status = 'unavailable'",
+                [library_id],
+            )
+            .map_err(|e| format!("requeue unavailable probes: {e}"))?;
+        let extracts = conn
+            .execute(
+                "UPDATE media_items SET subtitle_status = 'pending',
+                    subtitle_source_mtime_ms = NULL, subtitle_source_size_bytes = NULL
+                 WHERE library_id = ?1 AND subtitle_status = 'unavailable'",
+                [library_id],
+            )
+            .map_err(|e| format!("requeue unavailable extracts: {e}"))?;
+        Ok((probes, extracts))
+    }
+
+    /// Items that never finished probing (e.g. process restart mid-scan).
+    /// Returns (item_id, path, library_id).
+    pub fn list_indexed_unprobed(&self) -> Result<Vec<(i64, String, i64)>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, library_id FROM media_items
+                 WHERE probe_status = 'indexed'
+                 ORDER BY id",
+            )
+            .map_err(|e| format!("prepare indexed unprobed: {e}"))?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| format!("list indexed unprobed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read indexed unprobed: {e}"))
+    }
+
+    /// Returns (item_id, path, mtime_ms, size_bytes, library_id).
+    #[allow(clippy::type_complexity)]
+    pub fn list_pending_subtitle_items(&self) -> Result<Vec<(i64, String, i64, i64, i64)>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, mtime_ms, size_bytes, library_id FROM media_items
+                 WHERE subtitle_status = 'pending'
+                    OR (subtitle_status = 'ready' AND (
+                        subtitle_source_mtime_ms IS NOT mtime_ms
+                        OR subtitle_source_size_bytes IS NOT size_bytes
+                    ))",
+            )
+            .map_err(|e| format!("prepare pending subtitle items: {e}"))?;
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .map_err(|e| format!("list pending subtitle items: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read pending subtitle items: {e}"))
+    }
+
+    pub fn list_all_item_ids(&self) -> Result<Vec<i64>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM media_items")
+            .map_err(|e| format!("prepare item ids: {e}"))?;
+        stmt.query_map([], |r| r.get(0))
+            .map_err(|e| format!("list item ids: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read item ids: {e}"))
+    }
+
+    pub fn mark_items_subtitle_pending(&self, ids: &[i64]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin subtitle pending update: {e}"))?;
+        let mut stmt = tx
+            .prepare(
+                "UPDATE media_items SET subtitle_status = 'pending',
+                    subtitle_source_mtime_ms = NULL, subtitle_source_size_bytes = NULL
+                 WHERE id = ?1",
+            )
+            .map_err(|e| format!("prepare subtitle pending update: {e}"))?;
+        for id in ids {
+            stmt.execute([id])
+                .map_err(|e| format!("mark subtitle pending for item {id}: {e}"))?;
+        }
+        drop(stmt);
+        tx.commit()
+            .map_err(|e| format!("commit subtitle pending update: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_missing(
+        &self,
+        library_id: i64,
+        keep_paths: &[String],
+    ) -> Result<Vec<i64>, String> {
         let conn = self.lock()?;
         if keep_paths.is_empty() {
-            let n = conn
-                .execute(
-                    "DELETE FROM media_items WHERE library_id = ?1",
-                    [library_id],
-                )
-                .map_err(|e| format!("delete all items: {e}"))?;
-            return Ok(n);
+            let mut stmt = conn
+                .prepare("SELECT id FROM media_items WHERE library_id = ?1")
+                .map_err(|e| format!("prepare deleted items: {e}"))?;
+            let ids = stmt
+                .query_map([library_id], |r| r.get(0))
+                .map_err(|e| format!("list deleted items: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read deleted items: {e}"))?;
+            conn.execute(
+                "DELETE FROM media_items WHERE library_id = ?1",
+                [library_id],
+            )
+            .map_err(|e| format!("delete all items: {e}"))?;
+            return Ok(ids);
         }
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS keep_paths (path TEXT PRIMARY KEY);
@@ -345,15 +535,133 @@ impl Db {
                     .map_err(|e| format!("insert keep path: {e}"))?;
             }
         }
-        let n = conn
-            .execute(
-                "DELETE FROM media_items
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM media_items
                  WHERE library_id = ?1
                    AND path NOT IN (SELECT path FROM keep_paths)",
-                [library_id],
             )
-            .map_err(|e| format!("delete missing: {e}"))?;
-        Ok(n)
+            .map_err(|e| format!("prepare deleted items: {e}"))?;
+        let ids = stmt
+            .query_map([library_id], |r| r.get(0))
+            .map_err(|e| format!("list deleted items: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read deleted items: {e}"))?;
+        conn.execute(
+            "DELETE FROM media_items
+             WHERE library_id = ?1
+               AND path NOT IN (SELECT path FROM keep_paths)",
+            [library_id],
+        )
+        .map_err(|e| format!("delete missing: {e}"))?;
+        Ok(ids)
+    }
+
+    /// Replace all sidecar rows for one media item (index-pass association).
+    pub fn replace_item_sidecars(
+        &self,
+        media_item_id: i64,
+        sidecars: &[SidecarRow],
+    ) -> Result<bool, String> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin sidecar replace: {e}"))?;
+        let existing: Vec<SidecarRow> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                            format, language, forced, sdh
+                     FROM media_item_sidecars WHERE media_item_id = ?1 ORDER BY track_id",
+                )
+                .map_err(|e| format!("prepare existing sidecars: {e}"))?;
+            stmt.query_map([media_item_id], map_sidecar)
+                .map_err(|e| format!("list existing sidecars: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read existing sidecars: {e}"))?
+        };
+        let changed = existing.len() != sidecars.len()
+            || existing.iter().zip(sidecars).any(|(a, b)| {
+                a.track_id != b.track_id
+                    || a.path != b.path
+                    || a.mtime_ms != b.mtime_ms
+                    || a.size_bytes != b.size_bytes
+                    || a.format != b.format
+                    || a.language != b.language
+                    || a.forced != b.forced
+                    || a.sdh != b.sdh
+            });
+        tx.execute(
+            "DELETE FROM media_item_sidecars WHERE media_item_id = ?1",
+            [media_item_id],
+        )
+        .map_err(|e| format!("clear sidecars for item {media_item_id}: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO media_item_sidecars (
+                        media_item_id, track_id, path, mtime_ms, size_bytes,
+                        format, language, forced, sdh
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .map_err(|e| format!("prepare sidecar insert: {e}"))?;
+            for s in sidecars {
+                stmt.execute(params![
+                    media_item_id,
+                    s.track_id,
+                    s.path,
+                    s.mtime_ms,
+                    s.size_bytes,
+                    s.format,
+                    s.language,
+                    s.forced as i64,
+                    s.sdh as i64,
+                ])
+                .map_err(|e| format!("insert sidecar {}: {e}", s.track_id))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit sidecar replace: {e}"))?;
+        Ok(changed)
+    }
+
+    pub fn list_item_sidecars(&self, media_item_id: i64) -> Result<Vec<SidecarRow>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                        format, language, forced, sdh
+                 FROM media_item_sidecars
+                 WHERE media_item_id = ?1
+                 ORDER BY track_id",
+            )
+            .map_err(|e| format!("prepare list sidecars: {e}"))?;
+        let rows = stmt
+            .query_map([media_item_id], map_sidecar)
+            .map_err(|e| format!("list sidecars for item {media_item_id}: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("map sidecar: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_item_sidecar(
+        &self,
+        media_item_id: i64,
+        track_id: &str,
+    ) -> Result<Option<SidecarRow>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                    format, language, forced, sdh
+             FROM media_item_sidecars
+             WHERE media_item_id = ?1 AND track_id = ?2",
+            params![media_item_id, track_id],
+            map_sidecar,
+        )
+        .optional()
+        .map_err(|e| format!("get sidecar {track_id} for item {media_item_id}: {e}"))
     }
 
     pub fn create_scan_job(&self, library_id: i64) -> Result<i64, String> {
@@ -379,6 +687,23 @@ impl Db {
         )
         .optional()
         .map_err(|e| format!("active scan job: {e}"))
+    }
+
+    /// Mark in-flight scan jobs failed. A process exit leaves rows in
+    /// queued/indexing/probing with no worker; reusing them blocks new scans.
+    pub fn fail_stale_scan_jobs(&self) -> Result<usize, String> {
+        let conn = self.lock()?;
+        let n = conn
+            .execute(
+                "UPDATE scan_jobs SET
+                    state = 'failed',
+                    error_message = 'scan interrupted by process restart',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE state IN ('queued', 'indexing', 'probing')",
+                [],
+            )
+            .map_err(|e| format!("fail stale scan jobs: {e}"))?;
+        Ok(n)
     }
 
     pub fn get_scan_job(&self, job_id: i64) -> Result<Option<ScanJobRow>, String> {
@@ -483,6 +808,18 @@ impl Db {
     }
 }
 
+fn map_library(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRow> {
+    let reachable_i: i64 = r.get(5)?;
+    Ok(LibraryRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        kind: r.get(3)?,
+        item_count: r.get(4)?,
+        reachable: reachable_i != 0,
+    })
+}
+
 fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
     Ok(MediaItemRow {
         id: r.get(0)?,
@@ -499,10 +836,14 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         container: r.get(11)?,
         video_codec: r.get(12)?,
         audio_codec: r.get(13)?,
-        width: r.get(14)?,
-        height: r.get(15)?,
-        probe_status: r.get(16)?,
-        scan_error: r.get(17)?,
+        audio_channels: r.get(14)?,
+        width: r.get(15)?,
+        height: r.get(16)?,
+        probe_status: r.get(17)?,
+        scan_error: r.get(18)?,
+        subtitle_status: r.get(19)?,
+        subtitle_source_mtime_ms: r.get(20)?,
+        subtitle_source_size_bytes: r.get(21)?,
     })
 }
 
@@ -522,5 +863,21 @@ fn map_scan_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobRow> {
         error_message: r.get(11)?,
         started_at: r.get(12)?,
         finished_at: r.get(13)?,
+    })
+}
+
+fn map_sidecar(r: &rusqlite::Row<'_>) -> rusqlite::Result<SidecarRow> {
+    let forced: i64 = r.get(7)?;
+    let sdh: i64 = r.get(8)?;
+    Ok(SidecarRow {
+        media_item_id: r.get(0)?,
+        track_id: r.get(1)?,
+        path: r.get(2)?,
+        mtime_ms: r.get(3)?,
+        size_bytes: r.get(4)?,
+        format: r.get(5)?,
+        language: r.get(6)?,
+        forced: forced != 0,
+        sdh: sdh != 0,
     })
 }

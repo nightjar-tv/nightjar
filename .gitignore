@@ -1,6 +1,7 @@
 # Byte-compiled / build
 **/target/
 web/node_modules/
+scripts/.tools/
 web/build/
 web/.svelte-kit/
 web/.vite/

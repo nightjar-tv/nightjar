@@ -1,10 +1,11 @@
 openapi: 3.1.0
 info:
   title: Nightjar API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Public API contract. Server handlers and the web client are built against
-    this file. Phase 1 (v0): libraries, items, playback info, direct-play stream.
+    this file. v0: libraries, items, playback info, direct-play streams, and
+    HLS playback sessions (ADR-0011).
   license:
     name: GPL-3.0-only
 servers:
@@ -42,7 +43,7 @@ paths:
                       $ref: "#/components/schemas/Library"
     post:
       operationId: createLibrary
-      summary: Create a library pointing at a local folder
+      summary: Create a library and enqueue its first scan (ADR-0015)
       requestBody:
         required: true
         content:
@@ -51,11 +52,13 @@ paths:
               $ref: "#/components/schemas/CreateLibraryRequest"
       responses:
         "201":
-          description: Created
+          description: >
+            Library created and scan job accepted. The walk runs asynchronously
+            (ADR-0004); poll GET /scan-jobs/{jobId} for progress.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Library"
+                $ref: "#/components/schemas/CreateLibraryResponse"
         "400":
           description: Invalid request
           content:
@@ -172,7 +175,7 @@ paths:
   /api/v0/items/{itemId}/playback-info:
     get:
       operationId: getPlaybackInfo
-      summary: Direct-play capability and stream URL for an item
+      summary: Playback method and delivery URL for an item
       parameters:
         - $ref: "#/components/parameters/ItemId"
       responses:
@@ -189,10 +192,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/items/{itemId}/subtitles/{trackId}.vtt:
+    get:
+      operationId: getSubtitleVtt
+      summary: WebVTT for one text subtitle track (ADR-0010)
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+        - name: trackId
+          in: path
+          required: true
+          description: >
+            Stable track id (ADR-0010): `e{streamIndex}` for embedded,
+            `s` / `s-{suffix}` for filesystem sidecars.
+          schema:
+            type: string
+            pattern: '^[es]([A-Za-z0-9._-]*)$'
+      responses:
+        "200":
+          description: WebVTT body
+          content:
+            text/vtt:
+              schema:
+                type: string
+        "404":
+          description: Item or serveable subtitle track not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/items/{itemId}/stream:
     get:
       operationId: streamItem
-      summary: Direct-play byte stream (supports HTTP Range)
+      summary: Byte stream for playback (supports HTTP Range)
+      description: >
+        Serves the original file for directPlay items. Remux and transcode
+        items are delivered as HLS sessions (ADR-0011).
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: Range
@@ -221,8 +256,264 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "415":
+          description: Item needs an HLS session; POST /api/v0/items/{itemId}/sessions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "416":
           description: Range not satisfiable
+
+  /api/v0/items/{itemId}/sessions:
+    post:
+      operationId: startTranscodeSession
+      summary: Start an HLS playback session for an item
+      description: >
+        ADR-0011. Returns 202 with sessionId and playlistUrl. Remux items get
+        a stream-copy session, transcode items a re-encoding one; the shape is
+        identical. Each POST creates a session; seek with ?startMs= on the
+        playlist restarts that session in place. Concurrent sessions are capped
+        via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+        - name: startMs
+          in: query
+          required: false
+          description: Encode window start in milliseconds (default 0)
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: audioTrackId
+          in: query
+          required: false
+          description: >
+            Audio track to map, from playbackInfo.audioTracks (ADR-0012).
+            Defaults to the flagged default track, else the first. Switching
+            audio starts a new session at the current position and DELETEs the
+            old one.
+          schema:
+            type: string
+            pattern: '^e[0-9]+$'
+      responses:
+        "202":
+          description: Session started for this item
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscodeSession"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: Item direct plays, or is not ready for a session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Session cap full; retry shortly
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/master.m3u8:
+    get:
+      operationId: getSessionMasterPlaylist
+      summary: HLS master playlist for a playback session
+      description: >
+        ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8)
+        and optional SUBTITLES group. playlistUrl from session start points
+        here. Seek via startMs uses the same window-move rules as the media
+        playlist.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: startMs
+          in: query
+          required: false
+          description: Encode window start; a change restarts this session there
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: HLS master playlist
+          content:
+            application/vnd.apple.mpegurl:
+              schema:
+                type: string
+        "404":
+          description: Session not found or playlist not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/index.m3u8:
+    get:
+      operationId: getSessionPlaylist
+      summary: HLS media playlist for a playback session
+      description: >
+        Media playlist path is stable (ADR-0008). Segment URIs are relative
+        init.mp4 / segNNN.m4s. Also accepts startMs for seek.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: startMs
+          in: query
+          required: false
+          description: Encode window start; a change restarts this session there
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: HLS playlist
+          content:
+            application/vnd.apple.mpegurl:
+              schema:
+                type: string
+        "404":
+          description: Session not found or playlist not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/subs/{asset}:
+    get:
+      operationId: getSessionSubtitlePlaylist
+      summary: Subtitle media playlist or WebVTT segment for a session track
+      description: >
+        ADR-0010 / ADR-0013. EXT-X-MEDIA URI target. Ready tracks use a
+        multi-segment `{trackId}.m3u8` whose `segNNN.vtt` bodies are sliced
+        from the item store VTT (no session demux). Cold session-inline
+        demux remains for fixtures only; Gate-1 snapshots only declare
+        complete/store tracks.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: asset
+          in: path
+          required: true
+          description: >
+            `{trackId}.m3u8` or `{trackId}/segNNN.vtt` (e.g. e2.m3u8,
+            e2/seg000.vtt, s-en/seg012.vtt)
+          schema:
+            type: string
+            pattern: '^[es][A-Za-z0-9._-]*(?:\.m3u8|/seg[0-9]+\.vtt)$'
+      responses:
+        "200":
+          description: HLS subtitle media playlist or WebVTT segment
+          content:
+            application/vnd.apple.mpegurl:
+              schema:
+                type: string
+            text/vtt:
+              schema:
+                type: string
+        "404":
+          description: Session or track not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Subtitle segment not ready yet (demux still catching up)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/{asset}:
+    get:
+      operationId: getSessionAsset
+      summary: HLS init segment or media segment for a session
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: asset
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^(init\.mp4|seg[0-9]+\.m4s)$'
+        - name: njFetcher
+          in: query
+          required: false
+          description: >
+            Log-only client marker. Serving ignores this. JS land-ensure and
+            attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's
+            native HLS engine does not. Distinguishes probe traffic from
+            WebKit segment GETs in dogfood logs without changing 200/503/204
+            behaviour.
+          schema:
+            type: string
+            maxLength: 32
+      responses:
+        "200":
+          description: Segment bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "204":
+          description: >
+            Abandoned or superseded segment GET held with no fill until the
+            session idle ceiling while the session lived; empty body
+            (ADR-0011). Not an application error. Distinct from DELETE
+            session 204.
+        "404":
+          description: Session or asset not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: >
+            Segment not on disk yet (encoder still cooking). Retryable; do not
+            treat as a permanent miss.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}:
+    delete:
+      operationId: deleteTranscodeSession
+      summary: Stop a playback session and reap its FFmpeg process
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "204":
+          description: Stopped (or already gone)
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/system/transcode:
+    get:
+      operationId: getTranscodeCapabilities
+      summary: Verified H.264 encode capabilities for this process
+      description: >
+        Startup detection-by-verification (ADR-0009). Each candidate is
+        verified | failed | unavailable with a reason when not verified.
+        preferredH264Encoder is what new HLS sessions use for -c:v.
+      responses:
+        "200":
+          description: Capability readout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscodeCapabilities"
 
 components:
   parameters:
@@ -250,6 +541,13 @@ components:
         type: integer
         format: int64
         minimum: 1
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
 
   schemas:
     Health:
@@ -281,18 +579,74 @@ components:
 
     ProbeStatus:
       type: string
-      enum: [indexed, probed, error]
+      enum: [indexed, probed, error, unavailable]
       description: >
         indexed = walk+filename done, codecs pending; probed = ffprobe ok;
-        error = ffprobe failed (see scanError).
+        error = permanent ffprobe/parse failure (see scanError);
+        unavailable = mount/IO absence, retriable (ADR-0014).
+
+    SubtitleStatus:
+      type: string
+      enum: [pending, ready, none, error, unavailable]
+      description: >
+        Item-level extract queue state (ADR-0013 / ADR-0014). pending =
+        extract queued or in progress; ready = WebVTT on disk; none = no
+        serveable text tracks; error = permanent extract failure; unavailable
+        = mount/IO absence, retriable. Per-track first-play readiness is
+        SubtitleTrack.readiness, not this field.
+
+    SubtitleTrackReadiness:
+      type: string
+      enum: [preparing, partial, complete]
+      description: >
+        Server-declared per-track readiness for serveable text tracks
+        (ADR-0013 §11). preparing = extract not yet writing cues; partial =
+        a growing WebVTT is serveable; complete = final WebVTT. Clients never
+        invent this from file size or a timer. Absent on tracks that are
+        listed but not served (ASS/SSA, image).
 
     ScanJobState:
       type: string
       enum: [queued, indexing, probing, completed, failed]
 
+    PlaybackMethod:
+      type: string
+      enum: [directPlay, remux, transcode]
+      description: >
+        directPlay = browser plays the original file; remux = same codecs in a
+        container the client cannot open, delivered as a stream-copy HLS
+        session; transcode = needs re-encoding, delivered as an encoding HLS
+        session. Pending or failed probes report transcode.
+
+    TranscodeSession:
+      type: object
+      required: [sessionId, itemId, playlistUrl, videoEncoder, encoderKind]
+      properties:
+        sessionId:
+          type: string
+        itemId:
+          type: integer
+          format: int64
+        playlistUrl:
+          type: string
+          description: >
+            Path to the HLS master playlist for this session (master.m3u8).
+            The media playlist remains at index.m3u8 (ADR-0008).
+        videoEncoder:
+          type: string
+          description: >
+            FFmpeg encoder currently used by this session, or "copy" when the
+            session stream-copies video (remux).
+        encoderKind:
+          type: string
+          enum: [hardware, software, copy]
+          description: >
+            Whether videoEncoder is a hardware encoder, a software encoder, or
+            a stream copy.
+
     Library:
       type: object
-      required: [id, name, path, kind, itemCount]
+      required: [id, name, path, kind, itemCount, reachable]
       properties:
         id:
           type: integer
@@ -306,6 +660,11 @@ components:
         itemCount:
           type: integer
           format: int64
+        reachable:
+          type: boolean
+          description: >
+            False when the library root is not reachable (unmounted share,
+            missing path). Work is paused until it returns (ADR-0014).
 
     CreateLibraryRequest:
       type: object
@@ -320,9 +679,34 @@ components:
         kind:
           $ref: "#/components/schemas/LibraryKind"
 
+    CreateLibraryResponse:
+      type: object
+      required: [id, name, path, kind, itemCount, reachable, jobId]
+      description: >
+        Library row plus the scan job enqueued on create (ADR-0015).
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        path:
+          type: string
+        kind:
+          $ref: "#/components/schemas/LibraryKind"
+        itemCount:
+          type: integer
+          format: int64
+        reachable:
+          type: boolean
+        jobId:
+          type: integer
+          format: int64
+          description: Async scan job started for this library.
+
     MediaItem:
       type: object
-      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, directPlay, needsTranscode]
+      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, subtitleStatus, playbackMethod]
       properties:
         id:
           type: integer
@@ -369,18 +753,13 @@ components:
           format: int64
         probeStatus:
           $ref: "#/components/schemas/ProbeStatus"
+        subtitleStatus:
+          $ref: "#/components/schemas/SubtitleStatus"
         scanError:
           type: string
           nullable: true
-        directPlay:
-          type: boolean
-          description: >
-            Phase 1 browser-safe direct play (H.264 + AAC in MP4). False means
-            needsTranscode; Phase 2 will remux/transcode. False while probeStatus
-            is indexed.
-        needsTranscode:
-          type: boolean
-          description: Inverse of directPlay for Phase 1; kept explicit for clients.
+        playbackMethod:
+          $ref: "#/components/schemas/PlaybackMethod"
 
     ScanJobAccepted:
       type: object
@@ -449,23 +828,29 @@ components:
 
     PlaybackInfo:
       type: object
-      required: [itemId, directPlay, needsTranscode, streamUrl, mimeType]
+      required: [itemId, playbackMethod, reason, mimeType, subtitleStatus]
       properties:
         itemId:
           type: integer
           format: int64
-        directPlay:
-          type: boolean
-          description: Phase 1 browser-safe whitelist (H.264 + AAC in MP4)
-        needsTranscode:
-          type: boolean
+        playbackMethod:
+          $ref: "#/components/schemas/PlaybackMethod"
         reason:
           type: string
-          description: Why direct play is or is not available
+          description: Why the decision engine chose this method
         streamUrl:
           type: string
+          description: Present only when playbackMethod is directPlay
+        sessionsUrl:
+          type: string
+          description: >
+            Present when playbackMethod is remux or transcode. POST here to
+            start an HLS session (ADR-0011).
         mimeType:
           type: string
+          description: >
+            Source MIME for directPlay; application/vnd.apple.mpegurl for
+            session playback.
         durationMs:
           type: integer
           format: int64
@@ -479,3 +864,156 @@ components:
         audioCodec:
           type: string
           nullable: true
+        audioTracks:
+          type: array
+          description: >
+            Audio tracks in the source (ADR-0012). Listed the same way for
+            directPlay, remux, and transcode: the client asks for a trackId
+            and never reasons about the delivery path to find tracks. Direct
+            play switches client-side; sessions take audioTrackId at start.
+          items:
+            $ref: "#/components/schemas/AudioTrack"
+        subtitleStatus:
+          $ref: "#/components/schemas/SubtitleStatus"
+        subtitleTracks:
+          type: array
+          description: >
+            Text subtitle tracks (ADR-0010 / ADR-0013). Embedded and filesystem
+            sidecars share one shape; differ by source. url is present only
+            when the WebVTT file is already extracted. Listed the same way for
+            directPlay, remux, and transcode.
+          items:
+            $ref: "#/components/schemas/SubtitleTrack"
+
+    AudioTrack:
+      type: object
+      required: [trackId, codec, channels, default, streamIndex]
+      properties:
+        trackId:
+          type: string
+          description: >
+            Stable id `e{streamIndex}`, the same scheme as embedded subtitles
+            (ADR-0010 / ADR-0012).
+          pattern: '^e[0-9]+$'
+        codec:
+          type: string
+          description: Source codec (aac, ac3, eac3, dts, ...)
+        language:
+          type: string
+          nullable: true
+          description: Normalised ISO 639-1 when known; null if unlabelled
+        channels:
+          type: integer
+          minimum: 1
+          description: >
+            Channel count. Tracks above the client ceiling are downmixed to
+            stereo by the session with an explicit pan matrix.
+        channelLayout:
+          type: string
+          nullable: true
+          description: FFmpeg layout name (stereo, 5.1, 7.1, ...) when reported
+        label:
+          type: string
+          nullable: true
+          description: Optional title tag from the container (e.g. Commentary)
+        default:
+          type: boolean
+          description: >
+            Container default disposition. Exactly one track is default: the
+            flagged one, else the first.
+        streamIndex:
+          type: integer
+          minimum: 0
+          description: Absolute ffprobe stream index
+
+    SubtitleTrack:
+      type: object
+      required: [trackId, source, codec, forced, sdh]
+      properties:
+        trackId:
+          type: string
+          description: >
+            Stable id used in the VTT URL. Embedded `e{N}`; sidecar `s` /
+            `s-{suffix}` from the filename (ADR-0010).
+        source:
+          type: string
+          enum: [embedded, sidecar]
+        codec:
+          type: string
+          description: Source codec or sidecar format (subrip, srt, vtt, ass, ...)
+        language:
+          type: string
+          nullable: true
+          description: Normalised ISO 639-1 when known; null if unlabelled
+        label:
+          type: string
+          nullable: true
+          description: Optional title tag from the container (embedded)
+        forced:
+          type: boolean
+          description: Forced-subtitle flag (selection differs from full dialogue)
+        sdh:
+          type: boolean
+          description: SDH / hearing-impaired flag from the sidecar name
+        streamIndex:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Absolute ffprobe stream index when source is embedded
+        readiness:
+          $ref: "#/components/schemas/SubtitleTrackReadiness"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >
+            Monotonic growth counter for this track's WebVTT body. Bumps when
+            the server writes more cues (partial) or the final file. Clients
+            that reload on growth compare this field; they do not infer growth
+            from content length.
+        url:
+          type: string
+          nullable: true
+          description: >
+            GET path for the WebVTT body when this track is served (partial or
+            complete). Absent while preparing, and for ASS/SSA / image tracks
+            that are still listed.
+
+    EncoderStatus:
+      type: string
+      enum: [verified, failed, unavailable]
+      description: >
+        verified = short encode+demux succeeded; failed = advertised but
+        verify failed; unavailable = not in this ffmpeg build.
+
+    EncoderCandidate:
+      type: object
+      required: [name, backend, status]
+      properties:
+        name:
+          type: string
+          description: FFmpeg encoder name (e.g. libx264, h264_videotoolbox)
+        backend:
+          type: string
+          description: Backend family (software, videotoolbox, nvenc, qsv, vaapi, ...)
+        status:
+          $ref: "#/components/schemas/EncoderStatus"
+        reason:
+          type: string
+          nullable: true
+          description: Required when status is not verified; null when verified
+
+    TranscodeCapabilities:
+      type: object
+      required: [preferredH264Encoder, encoders]
+      properties:
+        ffmpegVersion:
+          type: string
+          nullable: true
+        preferredH264Encoder:
+          type: string
+          description: Encoder name used for new HLS sessions (-c:v)
+        encoders:
+          type: array
+          items:
+            $ref: "#/components/schemas/EncoderCandidate"

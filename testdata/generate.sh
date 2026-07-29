@@ -95,6 +95,36 @@ gen h264_aac_srt_mkv.mkv \
   -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -c:s srt -shortest
 rm -f "$SRT"
 
+# 9b. Sidecar .en.srt beside a video (ADR-0010)
+SIDE_DIR="$OUT/sidecar_beside"
+mkdir -p "$SIDE_DIR"
+echo "→ sidecar_beside/Movie.mp4 + Movie.en.srt"
+"$FFMPEG" -y -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest \
+  "$SIDE_DIR/Movie.mp4"
+cat > "$SIDE_DIR/Movie.en.srt" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar sidecar SRT
+EOF
+
+# 9c. Sidecar under Subs/ sibling directory
+SUBS_FIX="$OUT/sidecar_subs_dir"
+mkdir -p "$SUBS_FIX/Subs"
+echo "→ sidecar_subs_dir/Show.mp4 + Subs/Show.en.srt"
+"$FFMPEG" -y -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest \
+  "$SUBS_FIX/Show.mp4"
+cat > "$SUBS_FIX/Subs/Show.en.srt" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar Subs-dir SRT
+EOF
+
 # 10. 7.1 AAC channel layout
 gen h264_aac_71_mp4.mp4 \
   -f lavfi -i "testsrc=size=1280x720:rate=24:duration=2" \
@@ -202,6 +232,41 @@ gen hevc_hdr10_mp4.mp4 \
   -c:v libx265 -pix_fmt yuv420p10le -tag:v hvc1 \
   -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
   -c:a aac -ac 2 -shortest
+
+# 23. Two AAC stereo tracks tagged eng/spa (ADR-0012 multi-track switch)
+gen h264_aac_multilang_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=2" \
+  -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 \
+  -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa -shortest
+
+# 24. Main + commentary. Unlabelled second tracks are how commentary ships;
+# the label comes from the title tag, not the language.
+gen h264_aac_commentary_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -f lavfi -i "sine=frequency=220:sample_rate=48000:duration=2" \
+  -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 \
+  -metadata:s:a:0 language=eng -metadata:s:a:0 title="Main" \
+  -metadata:s:a:1 language=eng -metadata:s:a:1 title="Commentary" \
+  -disposition:a:0 default -disposition:a:1 0 -shortest
+
+# 25. 6.0 FLAC (no LFE). Same channel count as 5.1; pan table must not apply
+# (ADR-0012 falls back to -ac 2 with a warning).
+gen h264_flac_60_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "anullsrc=channel_layout=6.0:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a flac -shortest
+
+# 26. 5.1(side) AC3. AAC strips this layout tag; AC3 keeps it so the fallback
+# path is reachable from inventory (ADR-0012).
+gen h264_ac3_51side_mkv.mkv \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "anullsrc=channel_layout=5.1(side):sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -c:a ac3 -shortest
 
 # Optional multi-GB open-ended Range stress (never commit; gitignored)
 if [[ "${LARGE:-}" == "1" ]]; then

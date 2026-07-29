@@ -17,6 +17,19 @@ pub struct LibraryDto {
     pub path: String,
     pub kind: String,
     pub item_count: i64,
+    pub reachable: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLibraryResponse {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub item_count: i64,
+    pub reachable: bool,
+    pub job_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -81,7 +94,7 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<Json<LibrariesResp
 pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateLibraryRequest>,
-) -> ApiResult<(StatusCode, Json<LibraryDto>)> {
+) -> ApiResult<(StatusCode, Json<CreateLibraryResponse>)> {
     let name = body.name.trim();
     let path = body.path.trim();
     if name.is_empty() || path.is_empty() {
@@ -111,7 +124,26 @@ pub async fn create(
                 ApiError::internal(e)
             }
         })?;
-    Ok((StatusCode::CREATED, Json(to_dto(row))))
+    let db = std::sync::Arc::clone(&state.db);
+    let pool = std::sync::Arc::clone(&state.pool);
+    let library_id = row.id;
+    let job_id =
+        tokio::task::spawn_blocking(move || nightjar_scanner::request_scan(db, pool, library_id))
+            .await
+            .map_err(|e| ApiError::internal(format!("scan on create join: {e}")))?
+            .map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateLibraryResponse {
+            id: row.id,
+            name: row.name,
+            path: row.path,
+            kind: row.kind,
+            item_count: row.item_count,
+            reachable: row.reachable,
+            job_id,
+        }),
+    ))
 }
 
 pub async fn get(
@@ -131,8 +163,9 @@ pub async fn scan(
     Path(library_id): Path<i64>,
 ) -> ApiResult<(StatusCode, Json<ScanJobAcceptedDto>)> {
     let db = std::sync::Arc::clone(&state.db);
+    let pool = std::sync::Arc::clone(&state.pool);
     let job_id =
-        tokio::task::spawn_blocking(move || nightjar_scanner::start_scan_job(db, library_id))
+        tokio::task::spawn_blocking(move || nightjar_scanner::request_scan(db, pool, library_id))
             .await
             .map_err(|e| ApiError::internal(format!("scan start join: {e}")))?
             .map_err(|e| {
@@ -191,6 +224,7 @@ fn to_dto(row: nightjar_db::LibraryRow) -> LibraryDto {
         path: row.path,
         kind: row.kind,
         item_count: row.item_count,
+        reachable: row.reachable,
     }
 }
 

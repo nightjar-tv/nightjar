@@ -1,5 +1,5 @@
-# Media Server — Engineering Constitution
-**Status: LOCKED. Changes require unanimous team approval and a written ADR.**
+# Nightjar — Engineering Constitution
+**Status: LOCKED. Changes require unanimous team approval and a commit message explaining what prompted the change.**
 This document governs all humans and LLMs contributing to this project. When in doubt, the answer is NO.
 
 ---
@@ -29,9 +29,9 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 ## 3. Scope Rules (v1 lock)
 
-**IN scope:** library scan, metadata (TMDB/TVDB), direct play, remux, hardware transcode, HLS, multi-user auth, watch state/resume, web UI, Android/Android TV, Apple TV/iOS, Tizen/webOS web wrappers.
+**IN scope:** library scan, metadata (TMDB/TVDB), direct play, remux, hardware transcode, HLS, multi-user auth, watch state/resume, text subtitles (embedded and sidecar, served as WebVTT), image-subtitle burn-in, web UI, Android/Android TV, iOS, tvOS subject to the timeboxed spike and go/no-go in ADR-0001, Tizen/webOS web wrappers.
 
-**OUT of scope for v1 — auto-reject any PR, issue, or suggestion containing:** Live TV, DVR, plugins/extension system, music/photo libraries, federation/multi-server, cloud sync, social features, recommendations/ML, themes beyond light/dark.
+**OUT of scope for v1 — auto-reject any PR, issue, or suggestion containing:** Live TV, DVR, plugins/extension system, music/photo libraries, federation/multi-server, cloud sync, social features, recommendations/ML, themes beyond light/dark, restyling image subtitles.
 
 **Rule 3.1** — Scope additions require a shipped v1 first. There are no exceptions for "small" features.
 **Rule 3.2** — Every feature request gets one of three labels: `v1`, `post-v1`, `never`. Nothing stays unlabeled.
@@ -45,6 +45,9 @@ This document governs all humans and LLMs contributing to this project. When in 
 **Rule 4.5 — Delete before you add.** PRs that add a feature should identify what complexity they remove or why net complexity is justified.
 **Rule 4.6 — Dogfooding is mandatory.** Main branch runs as the team's real household media server. If you won't run it at home, don't merge it.
 **Rule 4.7 — No speculative abstraction.** No traits, generics, or config options for hypothetical future needs. Abstract on the second concrete use case, not the first.
+**Rule 4.8 — Incomplete, never provisional.** A slice may do less than the final product, but it may not be built on a design we expect to replace. If the honest description of a slice is "this works for now and we will redo it," stop and design the real thing first. Fewer features is fine; a placeholder architecture is not. Do not hide one behind a "provisional", "temporary", or "good enough for now" label that quietly becomes permanent.
+**Rule 4.9 — Data shapes before writers.** Any on-disk or on-wire shape that is expensive to change (segment duration, keyframe cadence, cache keys, schema columns, URL paths that clients bookmark) is decided in an ADR before the code that writes it. Illustration: a frame-count `-g 48` looked like a 2-second GOP until a 60 fps source made segments 0.8s; locking a time-based interval in ADR-0008 is the kind of decision this rule requires up front. The same value was also expressed twice in different units, and the playlist's `TARGETDURATION` disagreed with the encoder's actual segment length until `SEGMENT_MS` became the single owner. Duplicated expressions of one data shape are the same class of bug as choosing the shape badly.
+**Rule 4.11 — One concept, one path.** Two things that mean the same to a user are one type with one code path, distinguished by a field, not two implementations that coexist because they arrived in different weeks. An embedded subtitle and a sidecar subtitle are both a subtitle. A remux and a transcode are both a playback session. When a new case arrives, the question is which field it adds, not which branch it needs. If unifying is genuinely wrong, the ADR says why rather than leaving the fork unexplained.
 
 ## 5. LLM-Specific Rules
 
@@ -58,7 +61,7 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 **Rule 6.1 — ADRs for irreversible decisions.** Any decision that's expensive to undo (schema, API shape, protocol choice) gets a one-page Architecture Decision Record before code.
 **Rule 6.2 — One owner per subsystem.** Transcoding, metadata, API, player core, clients — each has exactly one accountable owner.
-**Rule 6.3 — Quarterly rule review.** This document is reviewed once per quarter. Rules can be amended then, and only then, with unanimous agreement.
+**Rule 6.3 — Quarterly rule read-through.** Once per quarter, read this document as a whole for overlap and contradiction, including whether Rules 4.5, 4.7, and 4.11 still say distinct things. Rules may be amended at any time with unanimous agreement when the reasoning is recorded in the commit message.
 **Rule 6.4 — The escape hatch.** If a rule is genuinely blocking shipping, write the ADR explaining why, get unanimous sign-off, and amend the rule — don't violate it silently.
 **Rule 6.5 — Git.** Branching, commits, PRs, and history hygiene are defined in [docs/GIT_RULES.md](docs/GIT_RULES.md).
 

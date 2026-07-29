@@ -24,6 +24,22 @@ that reads like a careful senior engineer wrote it.
   codebase beats your preferred style, always.
 - If the task is ambiguous, ask ONE clarifying question or state your assumption
   in one line and proceed. Never generate three alternative implementations.
+- Before changing playback behaviour (session start, playlist shape, segment
+  status codes, seek/restart rules, player attach): capture the client's ordered
+  request sequence from attach through the action under test. Do not speculate
+  with playlist or player edits until that trace exists. One capture beats
+  multiple guessing commits.
+- **Hardest client binds (enforces Rule 2.4 / one path).** A playback or scrub
+  fix is not done if it only works on the founder desktop (or only on MSE)
+  while iOS / native Apple WebKit on the same product path stays broken or
+  gets a different attach backend. Do not remount `video.src` to clear a stuck
+  scrub (exits fullscreen). Do not route only desktop Safari to hls.js so Mac
+  dogfood passes. If the honest fix cannot land on the binding client, stop
+  and say so — cite Rule 2.4 / Rule 4.8; do not invent a desktop-shaped escape.
+- **Rejected approaches stay dead.** If this chat or dogfood already rejected a
+  scrub approach (src remount, forever-refuse/404 papering, etc.), do not
+  revive it to clear the latest log. Stop or ask; a new ADR with new evidence
+  is required before that approach returns (Rule 5.1 / Rule 6.1).
 
 ## 1. Stack boundaries (hard, from ENGINEERING_RULES.md §1–2)
 
@@ -131,6 +147,8 @@ that reads like a careful senior engineer wrote it.
   (Rule 2.1).
 - Flutter: playback goes through the shared player core FFI, never a platform
   video plugin (Rule 2.4).
+- Web HLS: do not change `pickBackend` / native-vs-hls.js to make founder
+  desktop dogfood pass while iOS stays on another path (Rule 2.4).
 - Accessibility floor is non-negotiable: keyboard/D-pad focus visible, labels
   on controls, reduced-motion respected. TV UIs must be operable by arrows +
   enter alone.
@@ -147,6 +165,12 @@ that reads like a careful senior engineer wrote it.
   it's the local pattern.
 - When you cut a corner for any reason, say exactly which corner, in the
   response, not in a code comment.
+- After a playback dogfood failure: stop or ask — do not chain desktop-only
+  workarounds. That is a Rule 2.4 / Rule 4.8 violation dressed as iteration.
+- **ENGINEERING_RULES.md is LOCKED.** Never edit it unless the human explicitly
+  asks to amend the constitution with unanimous approval and a commit message
+  that explains what prompted the change. "Add a Cursor rule" is not permission
+  to touch the constitution.
 
 # The test for every generated diff: would the subsystem owner merge this
 # without being able to tell a human didn't write it, and without finding

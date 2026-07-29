@@ -3,6 +3,13 @@ use rusqlite::Connection;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_scan_jobs.sql")),
+    (3, include_str!("../migrations/003_subtitle_sidecars.sql")),
+    (4, include_str!("../migrations/004_audio_channels.sql")),
+    (5, include_str!("../migrations/005_subtitle_status.sql")),
+    (
+        6,
+        include_str!("../migrations/006_library_availability.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -26,11 +33,38 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         if version <= current {
             continue;
         }
+        let before_items = if version == 6 {
+            count_table(conn, "media_items")?
+        } else {
+            0
+        };
+        let before_sidecars = if version == 6 {
+            count_table(conn, "media_item_sidecars")?
+        } else {
+            0
+        };
+
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("begin migration {version}: {e}"))?;
         tx.execute_batch(sql)
             .map_err(|e| format!("apply migration {version}: {e}"))?;
+
+        if version == 6 {
+            let after_items = count_table(&tx, "media_items")?;
+            let after_sidecars = count_table(&tx, "media_item_sidecars")?;
+            if after_items != before_items {
+                return Err(format!(
+                    "migration 6 aborted: media_items count {before_items} -> {after_items}"
+                ));
+            }
+            if after_sidecars != before_sidecars {
+                return Err(format!(
+                    "migration 6 aborted: media_item_sidecars count {before_sidecars} -> {after_sidecars}"
+                ));
+            }
+        }
+
         tx.execute(
             "INSERT INTO schema_migrations (version) VALUES (?1)",
             [version],
@@ -41,6 +75,11 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         tracing::info!(version, "applied database migration");
     }
     Ok(())
+}
+
+fn count_table(conn: &Connection, table: &str) -> Result<i64, String> {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .map_err(|e| format!("count {table}: {e}"))
 }
 
 #[cfg(test)]
@@ -61,7 +100,115 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 6);
+        let has_reachable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('libraries') WHERE name = 'reachable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_reachable, 1);
         migrate(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn upgrades_a_populated_db_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(3) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY NOT NULL,
+                     applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
+                 INSERT INTO schema_migrations (version) VALUES ({version});"
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let channels: Option<i64> = conn
+            .query_row("SELECT audio_channels FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(channels, None, "existing rows carry a null channel count");
+        let status: String = conn
+            .query_row("SELECT subtitle_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "pending");
+        let reachable: i64 = conn
+            .query_row("SELECT reachable FROM libraries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reachable, 1);
+    }
+
+    #[test]
+    fn migration_6_resets_opaque_errors_and_keeps_row_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(5) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, probe_status, scan_error, subtitle_status
+             ) VALUES
+               (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie', 'error', 'ffprobe failed for /tmp/t/a.mkv: ', 'error'),
+               (1, '/tmp/t/b.mkv', 1, 2, 'B', 'movie', 'probed', NULL, 'ready');
+             INSERT INTO media_item_sidecars (
+                media_item_id, track_id, path, mtime_ms, size_bytes, format
+             ) VALUES (1, 's-en', '/tmp/t/a.en.srt', 1, 2, 'srt');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 2);
+        let sidecars: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_sidecars", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sidecars, 1);
+        let probe: String = conn
+            .query_row(
+                "SELECT probe_status FROM media_items WHERE path LIKE '%a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(probe, "indexed");
+        let sub: String = conn
+            .query_row(
+                "SELECT subtitle_status FROM media_items WHERE path LIKE '%a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub, "pending");
+        conn.execute(
+            "UPDATE media_items SET probe_status = 'unavailable', subtitle_status = 'unavailable'
+             WHERE path LIKE '%a.mkv'",
+            [],
+        )
+        .unwrap();
     }
 }

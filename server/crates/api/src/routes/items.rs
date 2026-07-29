@@ -2,10 +2,17 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
+    http::{HeaderValue, StatusCode, header},
+    response::Response,
 };
-use nightjar_core::decide_direct_play;
-use nightjar_db::MediaItemRow;
+use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
+use nightjar_db::{MediaItemRow, SidecarRow};
+use nightjar_transcode::{
+    TrackReadiness, is_serveable_sidecar_format, list_audio_tracks, list_text_subtitles,
+    stored_webvtt,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -36,20 +43,61 @@ pub struct MediaItemDto {
     pub height: Option<i32>,
     pub size_bytes: i64,
     pub probe_status: String,
+    pub subtitle_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_error: Option<String>,
-    pub direct_play: bool,
-    pub needs_transcode: bool,
+    pub playback_method: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackDto {
+    pub track_id: String,
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub channels: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub default: bool,
+    pub stream_index: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleTrackDto {
+    pub track_id: String,
+    pub source: &'static str,
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub forced: bool,
+    pub sdh: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_index: Option<u32>,
+    /// Present for serveable text tracks only (ADR-0013 §11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackInfoDto {
     pub item_id: i64,
-    pub direct_play: bool,
-    pub needs_transcode: bool,
+    pub playback_method: &'static str,
     pub reason: String,
-    pub stream_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions_url: Option<String>,
     pub mime_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
@@ -59,6 +107,11 @@ pub struct PlaybackInfoDto {
     pub video_codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_codec: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio_tracks: Vec<AudioTrackDto>,
+    pub subtitle_status: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subtitle_tracks: Vec<SubtitleTrackDto>,
 }
 
 pub async fn get(
@@ -82,37 +135,230 @@ pub async fn playback_info(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let decision = decide_direct_play(
-        &row.path,
-        row.container.as_deref(),
-        row.video_codec.as_deref(),
-        row.audio_codec.as_deref(),
-        row.scan_error.as_deref(),
-        &row.probe_status,
-    );
+    let decision = decide(&row);
+
+    // Remux and transcode both play through a session; only direct play is
+    // served from the file itself (ADR-0011).
+    let (stream_url, sessions_url) = match decision.method {
+        PlaybackMethod::DirectPlay => (Some(format!("/api/v0/items/{item_id}/stream")), None),
+        PlaybackMethod::Remux | PlaybackMethod::Transcode => {
+            (None, Some(format!("/api/v0/items/{item_id}/sessions")))
+        }
+    };
+
+    let subtitle_tracks = subtitle_tracks_for(&state, &row).unwrap_or_else(|e| {
+        tracing::warn!(item_id, error = %e, "subtitle list failed");
+        Vec::new()
+    });
+    // Listed the same for every method: the client asks for a track and never
+    // reasons about delivery to find one (ADR-0012).
+    let audio_tracks = audio_tracks_for(&row).unwrap_or_else(|e| {
+        tracing::warn!(item_id, error = %e, "audio track list failed");
+        Vec::new()
+    });
+
+    // First-play: bump this title's extract ahead of the background drain so
+    // progressive cues can start while the user is watching (ADR-0013 §11).
+    if row.subtitle_status == "pending" {
+        state
+            .pool
+            .prioritize_extract(row.id, row.library_id, std::path::PathBuf::from(&row.path));
+    }
+
     Ok(Json(PlaybackInfoDto {
         item_id: row.id,
-        direct_play: decision.direct_play,
-        needs_transcode: decision.needs_transcode,
+        playback_method: decision.method.as_str(),
         reason: decision.reason,
-        stream_url: format!("/api/v0/items/{item_id}/stream"),
+        stream_url,
+        sessions_url,
         mime_type: decision.mime_type,
         duration_ms: row.duration_ms,
-        container: row.container,
-        video_codec: row.video_codec,
-        audio_codec: row.audio_codec,
+        container: row.container.clone(),
+        video_codec: row.video_codec.clone(),
+        audio_codec: row.audio_codec.clone(),
+        audio_tracks,
+        subtitle_status: row.subtitle_status.clone(),
+        subtitle_tracks,
     }))
 }
 
-pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
-    let decision = decide_direct_play(
+pub async fn subtitle_vtt(
+    State(state): State<AppState>,
+    Path((item_id, asset)): Path<(i64, String)>,
+) -> ApiResult<Response> {
+    let track_id = asset
+        .strip_suffix(".vtt")
+        .filter(|id| super::track_ids::is_valid_track_id(id))
+        .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?
+        .to_string();
+    let row = state
+        .db
+        .get_item(item_id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
+
+    // ADR-0013: playback never extracts; serve a stored file or 404.
+    let path = stored_webvtt(&state.subs, item_id, &track_id).map_err(ApiError::not_found)?;
+
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ApiError::internal(format!("read subtitle {}: {e}", path.display())))?;
+    let (readiness, _) = state
+        .subs
+        .track_readiness(item_id, &track_id, &row.subtitle_status);
+    // A growing partial must not be cached: the next GET needs the newer body.
+    let cache = match readiness {
+        TrackReadiness::Complete if row.subtitle_status == "ready" => "private, max-age=3600",
+        _ => "private, no-cache",
+    };
+    let mut res = Response::new(Body::from(bytes));
+    *res.status_mut() = StatusCode::OK;
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/vtt; charset=utf-8"),
+    );
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    Ok(res)
+}
+
+pub(crate) fn audio_tracks_for(row: &MediaItemRow) -> Result<Vec<AudioTrackDto>, String> {
+    let tracks = list_audio_tracks(std::path::Path::new(&row.path))?
+        .into_iter()
+        .map(|a| AudioTrackDto {
+            track_id: a.track_id(),
+            codec: a.codec,
+            language: a.language,
+            channels: a.channels,
+            channel_layout: a.channel_layout,
+            label: a.title,
+            default: a.is_default,
+            stream_index: a.stream_index,
+        })
+        .collect();
+    Ok(tracks)
+}
+
+pub(crate) fn subtitle_tracks_for(
+    state: &AppState,
+    row: &MediaItemRow,
+) -> Result<Vec<SubtitleTrackDto>, String> {
+    let mut tracks = Vec::new();
+    let src = std::path::Path::new(&row.path);
+    for s in list_text_subtitles(src)? {
+        tracks.push(serveable_track_dto(
+            state,
+            row,
+            ServeableTrack {
+                track_id: s.track_id(),
+                source: "embedded",
+                codec: s.codec,
+                language: s.language,
+                label: s.title,
+                forced: false,
+                sdh: false,
+                stream_index: Some(s.stream_index),
+            },
+        ));
+    }
+    for s in state.db.list_item_sidecars(row.id)? {
+        tracks.push(sidecar_to_dto(state, row, &s));
+    }
+    Ok(tracks)
+}
+
+struct ServeableTrack {
+    track_id: String,
+    source: &'static str,
+    codec: String,
+    language: Option<String>,
+    label: Option<String>,
+    forced: bool,
+    sdh: bool,
+    stream_index: Option<u32>,
+}
+
+/// Readiness-aware DTO for a track the server can actually serve (embedded
+/// text or a convertible sidecar). `url` only appears once cues exist.
+fn serveable_track_dto(
+    state: &AppState,
+    row: &MediaItemRow,
+    t: ServeableTrack,
+) -> SubtitleTrackDto {
+    let (readiness, revision) =
+        state
+            .subs
+            .track_readiness(row.id, &t.track_id, &row.subtitle_status);
+    let url = match readiness {
+        TrackReadiness::Preparing => None,
+        TrackReadiness::Partial | TrackReadiness::Complete => Some(format!(
+            "/api/v0/items/{}/subtitles/{}.vtt",
+            row.id, t.track_id
+        )),
+    };
+    SubtitleTrackDto {
+        url,
+        readiness: Some(readiness.as_str()),
+        revision: Some(revision),
+        track_id: t.track_id,
+        source: t.source,
+        codec: t.codec,
+        language: t.language,
+        label: t.label,
+        forced: t.forced,
+        sdh: t.sdh,
+        stream_index: t.stream_index,
+    }
+}
+
+fn sidecar_to_dto(state: &AppState, row: &MediaItemRow, s: &SidecarRow) -> SubtitleTrackDto {
+    if is_serveable_sidecar_format(&s.format) {
+        return serveable_track_dto(
+            state,
+            row,
+            ServeableTrack {
+                track_id: s.track_id.clone(),
+                source: "sidecar",
+                codec: s.format.clone(),
+                language: s.language.clone(),
+                label: None,
+                forced: s.forced,
+                sdh: s.sdh,
+                stream_index: None,
+            },
+        );
+    }
+    // Listed but not served (ASS/SSA, image): no readiness (ADR-0013 honesty path).
+    SubtitleTrackDto {
+        url: None,
+        readiness: None,
+        revision: None,
+        track_id: s.track_id.clone(),
+        source: "sidecar",
+        codec: s.format.clone(),
+        language: s.language.clone(),
+        label: None,
+        forced: s.forced,
+        sdh: s.sdh,
+        stream_index: None,
+    }
+}
+
+pub fn decide(row: &MediaItemRow) -> PlaybackDecision {
+    decide_playback(
         &row.path,
         row.container.as_deref(),
         row.video_codec.as_deref(),
         row.audio_codec.as_deref(),
+        row.audio_channels.and_then(|c| u32::try_from(c).ok()),
         row.scan_error.as_deref(),
         &row.probe_status,
-    );
+        &BROWSER_V0,
+    )
+}
+
+pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
+    let decision = decide(&row);
     MediaItemDto {
         id: row.id,
         library_id: row.library_id,
@@ -130,8 +376,8 @@ pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
         height: row.height,
         size_bytes: row.size_bytes,
         probe_status: row.probe_status,
+        subtitle_status: row.subtitle_status,
         scan_error: row.scan_error,
-        direct_play: decision.direct_play,
-        needs_transcode: decision.needs_transcode,
+        playback_method: decision.method.as_str(),
     }
 }

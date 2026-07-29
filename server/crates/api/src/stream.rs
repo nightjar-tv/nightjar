@@ -1,4 +1,5 @@
 use crate::error::{ApiError, ApiResult};
+use crate::routes::items::decide;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -6,7 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use nightjar_core::mime_for_path;
+use nightjar_core::{PlaybackMethod, mime_for_path};
 use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -22,13 +23,33 @@ pub async fn stream_item(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
+    let decision = decide(&row);
 
-    let path = std::path::PathBuf::from(&row.path);
+    match decision.method {
+        PlaybackMethod::DirectPlay => {
+            let path = std::path::PathBuf::from(&row.path);
+            let mime = mime_for_path(&row.path);
+            serve_file(path, mime, &headers).await
+        }
+        PlaybackMethod::Remux | PlaybackMethod::Transcode => Err(ApiError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: format!(
+                "item {item_id} needs an HLS session; POST /api/v0/items/{item_id}/sessions: {}",
+                decision.reason
+            ),
+        }),
+    }
+}
+
+async fn serve_file(
+    path: std::path::PathBuf,
+    mime: String,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| ApiError::internal(format!("stat {}: {e}", path.display())))?;
     let file_size = meta.len();
-    let mime = mime_for_path(&row.path);
 
     let range = headers
         .get(header::RANGE)
