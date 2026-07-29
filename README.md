@@ -54,7 +54,7 @@ streaming with HTTP Range, HLS playback sessions for everything else (stream
 copy when only the container is wrong, software re-encode otherwise), text
 subtitles as WebVTT, embedded web UI. Single-user, no auth.
 
-Not built yet: image-subtitle burn-in, multi-user, watch
+Not built yet: multi-user, watch
 state/resume, metadata providers, official app clients. See the ADRs under `docs/adr/` for decisions
 already locked, and [ENGINEERING_RULES.md](ENGINEERING_RULES.md) for v1 scope
 (Live TV, DVR, plugins, and music are out).

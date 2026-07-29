@@ -10,8 +10,8 @@ use axum::{
 use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
-    TrackReadiness, is_serveable_sidecar_format, list_audio_tracks, list_text_subtitles,
-    stored_webvtt,
+    TrackReadiness, is_burn_in_sidecar_format, is_serveable_sidecar_format, list_audio_tracks,
+    list_burn_in_subtitles, list_text_subtitles, stored_webvtt,
 };
 use serde::Serialize;
 
@@ -79,6 +79,8 @@ pub struct SubtitleTrackDto {
     pub sdh: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_index: Option<u32>,
+    /// soft | burnIn (ADR-0018).
+    pub render: &'static str,
     /// Present for serveable text tracks only (ADR-0013 §11).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness: Option<&'static str>,
@@ -136,16 +138,6 @@ pub async fn playback_info(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
     let decision = decide(&row);
-
-    // Remux and transcode both play through a session; only direct play is
-    // served from the file itself (ADR-0011).
-    let (stream_url, sessions_url) = match decision.method {
-        PlaybackMethod::DirectPlay => (Some(format!("/api/v0/items/{item_id}/stream")), None),
-        PlaybackMethod::Remux | PlaybackMethod::Transcode => {
-            (None, Some(format!("/api/v0/items/{item_id}/sessions")))
-        }
-    };
-
     let subtitle_tracks = subtitle_tracks_for(&state, &row).unwrap_or_else(|e| {
         tracing::warn!(item_id, error = %e, "subtitle list failed");
         Vec::new()
@@ -156,6 +148,26 @@ pub async fn playback_info(
         tracing::warn!(item_id, error = %e, "audio track list failed");
         Vec::new()
     });
+
+    // Remux and transcode both play through a session; only direct play is
+    // served from the file itself (ADR-0011). sessionsUrl still appears on
+    // DirectPlay when a track selection can force encode (ADR-0012 / ADR-0018).
+    let max_channels = BROWSER_V0.max_audio_channels.unwrap_or(u32::MAX);
+    let selection_may_need_session = subtitle_tracks.iter().any(|t| t.render == "burnIn")
+        || audio_tracks.iter().any(|a| a.channels > max_channels);
+    let (stream_url, sessions_url) = match decision.method {
+        PlaybackMethod::DirectPlay => (
+            Some(format!("/api/v0/items/{item_id}/stream")),
+            if selection_may_need_session {
+                Some(format!("/api/v0/items/{item_id}/sessions"))
+            } else {
+                None
+            },
+        ),
+        PlaybackMethod::Remux | PlaybackMethod::Transcode => {
+            (None, Some(format!("/api/v0/items/{item_id}/sessions")))
+        }
+    };
 
     // First-play: bump this title's extract ahead of the background drain so
     // progressive cues can start while the user is watching (ADR-0013 §11).
@@ -261,6 +273,18 @@ pub(crate) fn subtitle_tracks_for(
             },
         ));
     }
+    for s in list_burn_in_subtitles(src)? {
+        tracks.push(burn_in_track_dto(ServeableTrack {
+            track_id: s.track_id(),
+            source: "embedded",
+            codec: s.codec,
+            language: s.language,
+            label: s.title,
+            forced: false,
+            sdh: false,
+            stream_index: Some(s.stream_index),
+        }));
+    }
     for s in state.db.list_item_sidecars(row.id)? {
         tracks.push(sidecar_to_dto(state, row, &s));
     }
@@ -308,6 +332,24 @@ fn serveable_track_dto(
         forced: t.forced,
         sdh: t.sdh,
         stream_index: t.stream_index,
+        render: "soft",
+    }
+}
+
+fn burn_in_track_dto(t: ServeableTrack) -> SubtitleTrackDto {
+    SubtitleTrackDto {
+        url: None,
+        readiness: None,
+        revision: None,
+        track_id: t.track_id,
+        source: t.source,
+        codec: t.codec,
+        language: t.language,
+        label: t.label,
+        forced: t.forced,
+        sdh: t.sdh,
+        stream_index: t.stream_index,
+        render: "burnIn",
     }
 }
 
@@ -328,11 +370,20 @@ fn sidecar_to_dto(state: &AppState, row: &MediaItemRow, s: &SidecarRow) -> Subti
             },
         );
     }
-    // Listed but not served (ASS/SSA, image): no readiness (ADR-0013 honesty path).
-    SubtitleTrackDto {
-        url: None,
-        readiness: None,
-        revision: None,
+    if is_burn_in_sidecar_format(&s.format) {
+        return burn_in_track_dto(ServeableTrack {
+            track_id: s.track_id.clone(),
+            source: "sidecar",
+            codec: s.format.clone(),
+            language: s.language.clone(),
+            label: None,
+            forced: s.forced,
+            sdh: s.sdh,
+            stream_index: None,
+        });
+    }
+    // Unknown sidecar format: listed without delivery path.
+    burn_in_track_dto(ServeableTrack {
         track_id: s.track_id.clone(),
         source: "sidecar",
         codec: s.format.clone(),
@@ -341,7 +392,7 @@ fn sidecar_to_dto(state: &AppState, row: &MediaItemRow, s: &SidecarRow) -> Subti
         forced: s.forced,
         sdh: s.sdh,
         stream_index: None,
-    }
+    })
 }
 
 pub fn decide(row: &MediaItemRow) -> PlaybackDecision {

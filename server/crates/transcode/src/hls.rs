@@ -12,7 +12,8 @@
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
-    SessionSubInput, prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms,
+    BurnInSelection, SessionSubInput, prepare_session_subtitles, slice_webvtt,
+    webvtt_max_cue_end_ms,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -114,7 +115,7 @@ pub struct AudioSelection {
 }
 
 impl AudioSelection {
-    fn needs_downmix(&self) -> bool {
+    pub fn needs_downmix(&self) -> bool {
         self.channels > self.max_channels
     }
 }
@@ -528,6 +529,9 @@ struct Session {
     dir: PathBuf,
     mode: SessionMode,
     audio: AudioSelection,
+    /// Burn-in baked into this session's encode (ADR-0018). Seek restarts
+    /// keep the same selection; switching burn-in is a fresh POST.
+    burn_in: Option<BurnInSelection>,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
     /// Encode window start. [`encode_start_ms`] of [`Session::play_start_ms`]
@@ -611,8 +615,8 @@ impl HlsSessionRegistry {
 
     /// Starts a session at `start_ms` (aligned). Every call creates its own
     /// session; seeking restarts that session in place (ADR-0011). Switching
-    /// audio does not: it starts a fresh session (ADR-0012).
-    /// `subtitle_tracks` is snapshotted here and never revisited.
+    /// audio or burn-in does not: it starts a fresh session (ADR-0012 /
+    /// ADR-0018). `subtitle_tracks` is snapshotted here and never revisited.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
@@ -623,6 +627,7 @@ impl HlsSessionRegistry {
         mode: SessionMode,
         audio: AudioSelection,
         subtitle_tracks: Vec<HlsSubtitleTrack>,
+        burn_in: Option<BurnInSelection>,
     ) -> Result<String, StartSessionError> {
         let play_start_ms = align_to_segment(start_ms);
         let start_ms = encode_start_ms(play_start_ms);
@@ -647,6 +652,7 @@ impl HlsSessionRegistry {
             mode,
             audio.clone(),
             &self.video_encoder,
+            burn_in.as_ref(),
         )
         .map_err(StartSessionError::Spawn)?;
         // Only cold (non-store) tracks need a session demux. Ready tracks
@@ -662,6 +668,7 @@ impl HlsSessionRegistry {
             mode = ?mode,
             audio_stream = ?audio.stream_index,
             audio_channels = audio.channels,
+            burn_in = burn_in.as_ref().map(|b| b.track_id.as_str()),
             encoder = %self.video_encoder,
             spawn_ms,
             "hls session started"
@@ -674,6 +681,7 @@ impl HlsSessionRegistry {
                 dir: dir.clone(),
                 mode,
                 audio,
+                burn_in,
                 video_encoder: self.video_encoder.clone(),
                 start_ms,
                 play_start_ms,
@@ -1467,6 +1475,7 @@ fn restart_at(
         session.mode,
         session.audio.clone(),
         video_encoder,
+        session.burn_in.as_ref(),
     )
     .map_err(PlaylistError::Failed)?;
     session.child = Some(child);
@@ -2008,12 +2017,19 @@ fn spawn_ffmpeg(
     mode: SessionMode,
     audio: AudioSelection,
     video_encoder: &str,
+    burn_in: Option<&BurnInSelection>,
 ) -> Result<Child, String> {
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
     let start_number = (start_ms / SEGMENT_MS).to_string();
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
     let force_kf = format!("expr:gte(t,n_forced*{segment_secs})");
     let hls_time = format!("{segment_secs}");
+    // Burn-in always re-encodes video (ADR-0018).
+    let mode = if burn_in.is_some() {
+        SessionMode::Transcode
+    } else {
+        mode
+    };
     let mut cmd = Command::new("ffmpeg");
     cmd.current_dir(dir)
         .stdin(Stdio::null())
@@ -2026,6 +2042,13 @@ fn spawn_ffmpeg(
         cmd.args(["-ss", &start_secs]);
     }
     cmd.arg("-i").arg(src);
+    // Sidecar burn-in is a second input so overlay can map [1:s:0] (ADR-0018).
+    if let Some(path) = burn_in.and_then(|b| b.sidecar_path.as_ref()) {
+        if start_ms > 0 {
+            cmd.args(["-ss", &start_secs]);
+        }
+        cmd.arg("-i").arg(path);
+    }
     if start_ms > 0 {
         // Keep output timestamps absolute so mid-title segments land at their
         // playlist position instead of restarting the clock at zero.
@@ -2035,7 +2058,6 @@ fn spawn_ffmpeg(
         Some(index) => format!("0:{index}"),
         None => "0:a:0?".to_string(),
     };
-    cmd.args(["-map", "0:v:0", "-map", &audio_map]);
     let downmix = if audio.needs_downmix() {
         let filter = stereo_downmix_filter(audio.channels, audio.channel_layout.as_deref());
         if filter.is_none() {
@@ -2050,6 +2072,18 @@ fn spawn_ffmpeg(
     } else {
         None
     };
+
+    let sdr_chain =
+        "sidedata=delete,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709";
+    let burn_overlay = burn_in.and_then(burn_in_overlay_graph);
+    if let Some(ref complex) = burn_overlay {
+        let full = format!("{complex},{sdr_chain}[vout]");
+        cmd.args(["-filter_complex", &full]);
+        cmd.args(["-map", "[vout]", "-map", &audio_map]);
+    } else {
+        cmd.args(["-map", "0:v:0", "-map", &audio_map]);
+    }
+
     match mode {
         // Hybrid: the codecs already copy and only the channel layout forces
         // work, so video still copies while audio is encoded (ADR-0012).
@@ -2077,11 +2111,12 @@ fn spawn_ffmpeg(
             // Safari native HLS rejects that (Chrome/hls.js is more forgiving).
             // Color flags alone are not enough on videotoolbox — strip side
             // data and force BT.709 through setparams.
+            if burn_overlay.is_none() {
+                cmd.args(["-map_metadata", "-1", "-vf", sdr_chain]);
+            } else {
+                cmd.args(["-map_metadata", "-1"]);
+            }
             cmd.args([
-                "-map_metadata",
-                "-1",
-                "-vf",
-                "sidedata=delete,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
                 "-colorspace",
                 "bt709",
                 "-color_primaries",
@@ -2138,6 +2173,16 @@ fn spawn_ffmpeg(
             format!("spawn ffmpeg for {}: {e}", src.display())
         }
     })
+}
+
+/// Overlay graph prefix for burn-in (ADR-0018). SDR chain and `[vout]` label
+/// are appended by the caller. Embedded uses `0:s:N`; sidecar is input 1.
+fn burn_in_overlay_graph(burn: &BurnInSelection) -> Option<String> {
+    if burn.sidecar_path.is_some() {
+        return Some("[0:v:0][1:s:0]overlay".into());
+    }
+    let ordinal = burn.subtitle_ordinal?;
+    Some(format!("[0:v:0][0:s:{ordinal}]overlay"))
 }
 
 /// Stereo AAC for the mapped track. With a matrix, `pan` does the mixdown;
@@ -2237,6 +2282,7 @@ fn is_safe_asset(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BurnInKind;
     use std::process::Command;
 
     fn ffmpeg_available() -> bool {
@@ -2992,6 +3038,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             mode: SessionMode::Transcode,
             audio: stereo(),
+            burn_in: None,
             video_encoder: "libx264".into(),
             start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
             play_start_ms: play_ms,
@@ -3156,7 +3203,16 @@ mod tests {
         make_fixture_secs(&src, 60);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
-            .start(1, &src, 0, 60_000, SessionMode::Transcode, stereo(), vec![])
+            .start(
+                1,
+                &src,
+                0,
+                60_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+            )
             .unwrap();
         wait_playlist(&reg, &id);
         let _ = wait_asset(&reg, &id, "seg000.m4s");
@@ -3190,7 +3246,16 @@ mod tests {
         make_fixture_secs(&src, 60);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
-            .start(1, &src, 0, 60_000, SessionMode::Transcode, stereo(), vec![])
+            .start(
+                1,
+                &src,
+                0,
+                60_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+            )
             .unwrap();
         wait_playlist(&reg, &id);
         let _ = wait_asset(&reg, &id, "seg000.m4s");
@@ -3255,6 +3320,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         {
@@ -3330,6 +3396,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &prior);
@@ -3348,6 +3415,7 @@ mod tests {
                     max_channels: 2,
                 },
                 vec![],
+                None,
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &switched);
@@ -3407,6 +3475,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &id);
@@ -3439,6 +3508,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -3502,6 +3572,7 @@ mod tests {
                     codec: track.codec.clone(),
                     item_vtt_path: None,
                 }],
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -3550,6 +3621,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         let b = reg
@@ -3561,6 +3633,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         assert_ne!(a, b);
@@ -3572,7 +3645,8 @@ mod tests {
                 FIXTURE_MS,
                 SessionMode::Transcode,
                 stereo(),
-                vec![]
+                vec![],
+                None
             ),
             Err(StartSessionError::CapFull)
         ));
@@ -3599,7 +3673,16 @@ mod tests {
         let reg =
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "no_such_encoder").unwrap();
         let id = reg
-            .start(1, &src, 0, FIXTURE_MS, SessionMode::Copy, stereo(), vec![])
+            .start(
+                1,
+                &src,
+                0,
+                FIXTURE_MS,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                None,
+            )
             .unwrap();
         assert_eq!(
             reg.encoder(&id),
@@ -3632,6 +3715,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -3693,7 +3777,7 @@ mod tests {
     ) -> PathBuf {
         let enc = dir.join("enc");
         fs::create_dir_all(&enc).unwrap();
-        let mut child = spawn_ffmpeg(src, &enc, 0, mode, audio, encoder).unwrap();
+        let mut child = spawn_ffmpeg(src, &enc, 0, mode, audio, encoder, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if child.try_wait().ok().flatten().is_some() {
@@ -3977,6 +4061,7 @@ mod tests {
                     codec: "subrip".into(),
                     item_vtt_path: Some(vtt),
                 }],
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4066,8 +4151,16 @@ mod tests {
             }
             let enc = dir.path().join(name);
             fs::create_dir_all(&enc).unwrap();
-            let mut child =
-                spawn_ffmpeg(src, &enc, 0, SessionMode::Transcode, stereo(), "libx264").unwrap();
+            let mut child = spawn_ffmpeg(
+                src,
+                &enc,
+                0,
+                SessionMode::Transcode,
+                stereo(),
+                "libx264",
+                None,
+            )
+            .unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
                 if child.try_wait().ok().flatten().is_some() {
@@ -4140,5 +4233,164 @@ mod tests {
                 "{name}: missing IDR at {segment_s}s ({key_pts:?})"
             );
         }
+    }
+
+    #[test]
+    fn burn_in_overlay_graph_embedded_and_sidecar() {
+        let embedded = BurnInSelection {
+            track_id: "e2".into(),
+            kind: BurnInKind::Ass,
+            stream_index: Some(2),
+            subtitle_ordinal: Some(0),
+            sidecar_path: None,
+        };
+        assert_eq!(
+            burn_in_overlay_graph(&embedded).as_deref(),
+            Some("[0:v:0][0:s:0]overlay")
+        );
+        let side = BurnInSelection {
+            track_id: "s-en".into(),
+            kind: BurnInKind::Ass,
+            stream_index: None,
+            subtitle_ordinal: None,
+            sidecar_path: Some(PathBuf::from("/tmp/a.ass")),
+        };
+        assert_eq!(
+            burn_in_overlay_graph(&side).as_deref(),
+            Some("[0:v:0][1:s:0]overlay")
+        );
+    }
+
+    #[test]
+    fn burn_in_ass_session_produces_segments() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_ass_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_burn_in_subtitles(&corpus).expect("list");
+        let burn = streams
+            .iter()
+            .find(|s| s.kind == BurnInKind::Ass)
+            .expect("ass track");
+        let selection = BurnInSelection {
+            track_id: burn.track_id(),
+            kind: BurnInKind::Ass,
+            stream_index: Some(burn.stream_index),
+            subtitle_ordinal: Some(burn.subtitle_ordinal),
+            sidecar_path: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &corpus,
+                0,
+                2000,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                Some(selection),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let s = sessions.get(&id).unwrap();
+            assert_eq!(s.mode, SessionMode::Copy);
+            assert!(s.burn_in.is_some());
+        }
+        wait_playlist(&reg, &id);
+        let _ = wait_asset(&reg, &id, "init.mp4");
+        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        reg.stop(&id);
+    }
+
+    #[test]
+    fn burn_in_sidecar_ass_session_produces_segments() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("movie.mp4");
+        make_fixture_secs(&src, 2);
+        let ass = dir.path().join("movie.ass");
+        fs::write(
+            &ass,
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Sidecar ASS\n",
+        )
+        .unwrap();
+        let selection = BurnInSelection {
+            track_id: "s-en".into(),
+            kind: BurnInKind::Ass,
+            stream_index: None,
+            subtitle_ordinal: None,
+            sidecar_path: Some(ass),
+        };
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                2000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                Some(selection),
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        reg.stop(&id);
+    }
+
+    #[test]
+    fn burn_in_pgs_session_produces_segments() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_pgs_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_burn_in_subtitles(&corpus).expect("list");
+        let burn = streams
+            .iter()
+            .find(|s| s.kind == BurnInKind::Pgs)
+            .expect("pgs track");
+        let selection = BurnInSelection {
+            track_id: burn.track_id(),
+            kind: BurnInKind::Pgs,
+            stream_index: Some(burn.stream_index),
+            subtitle_ordinal: Some(burn.subtitle_ordinal),
+            sidecar_path: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &corpus,
+                0,
+                2000,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                Some(selection),
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        reg.stop(&id);
     }
 }

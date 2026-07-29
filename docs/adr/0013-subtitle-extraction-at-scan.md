@@ -458,8 +458,8 @@ this ADR records that as the reason, and the tests below lock it.
 - ADR-0010 §2–6, §8–11 (track identity, WebVTT delivery, sidecar
   discovery, API shape, HLS MEDIA skin) stand. Only the cache and the
   playback trigger are replaced.
-- Image / ASS burn-in remains later Phase 2 work; those tracks stay listed
-  without `url`.
+- Image / ASS burn-in is [ADR-0018](0018-subtitle-burn-in.md): listed with
+  `render: burnIn`, no WebVTT `url`, selected at session start.
 - Directory-mtime polling can miss an add if the SMB server fails to bump
   the immediate parent mtime; the scaled full cold walk after process
   restart still heals that. Do not raise the poll frequency to compensate.

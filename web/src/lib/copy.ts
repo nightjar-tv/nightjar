@@ -13,9 +13,10 @@ export const copy = {
 		'All playback sessions are in use. Close another player tab and try again.',
 	sessionFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
 	badgeHint:
-		'Badges: browser plays directly, remux and transcode start a playback session when you open the item. Text subtitles (SRT and similar) use the Subtitles control on the item page; ASS and image subs are not available yet.',
+		'Badges: browser plays directly, remux and transcode start a playback session when you open the item. Text subtitles (SRT and similar) use the Subtitles control. ASS and image (PGS) tracks burn into the video when you select them — that starts a session even on titles that otherwise play in the browser.',
 	subtitlesPreparing: 'Subtitles are being prepared.',
 	subtitlesFoundNotRendered: 'Subtitle files found but not rendered yet:',
+	burnInNeedsSession: 'This subtitle track is burned into the video and needs a playback session.',
 	audioTrack: 'Audio track',
 	subtitleTrack: 'Subtitles',
 	subtitleOff: 'Off',
