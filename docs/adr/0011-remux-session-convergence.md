@@ -180,7 +180,12 @@ B's preempt decision. In every trial, server logs show
 `cooking_land_waiters=1` before the final land request. Mid-uri still
 ended as HTTP 503 with waited_ms ~6.1s; final-land ended as HTTP 200
 in 9/10 trials (the single `final-land` 503 had no
-`abandoned hold ended` / HTTP 204 teardown events).
+`abandoned hold ended` / HTTP 204 teardown events). In that
+failing trial, `final-land` remained `asset not ready` and never
+reached `asset ready` before the probe session stopped, so this
+is a timing-sensitive final-land readiness degradation distinct
+from the abandoned-hold teardown. Follow up whether a client
+retry after a brief additional wait resolves to HTTP 200.
 
 This is real mechanism evidence: fix (a) can be made to fire reliably
 when a cooking-land waiter is actually present at decision time.
