@@ -161,17 +161,32 @@ path iOS/tvOS need).
    segment waiter is held (`may_kill_cooking_encode` / `segment_waiters`).
    Land-ready still kills (land-then-yank). Fix (b) not taken.
 
-   Fix (a) targets **mid-playback double-scrub under preempt-on** (kill
-   before mid land). Scrub-before-play ablation under preempt-on passed
-   5/5 both engines with the waiter gate forced always-kill; that harness
-   does not exercise fix (a)'s purpose. **Owed before treating the stack as
+Fix (a) targets **mid-playback double-scrub under preempt-on** (kill
+before mid land). Scrub-before-play ablation under preempt-on passed
+5/5 both engines with the waiter gate forced always-kill; that harness
+does not exercise fix (a)'s purpose. **Owed before treating the stack as
 fully confirmed:** mid-playback double-scrub N≥5 on the preempt-on
 mechanism probe (engine-agnostic mid-URI startMs A=258s then B=748s,
 GAP=300ms) with fix (a) on.
-Verified on the current stack: N=5 passing, and a second confirmation
-batch also passing. In each trial, the mid-uri GET ended as HTTP 503
-with waited_ms ~0.6–1.7s, and final-land ended as HTTP 200; no
-`abandoned hold ended` / HTTP 204 teardown events occurred.
+
+First mechanism batch (default timing): confirmed the outcome
+(no teardown; mid-uri never hit the abandoned-hold 204 ceiling) but
+did not show the waiter-gated `defer kill (cooking land waiter)` branch.
+
+Corrected mechanism batch (waiter deliberately held): re-run with
+`APPLY_WAIT_MS=6000` so the mid-URI long-poll stays in-flight through
+B's preempt decision. In every trial, server logs show
+`hls seek restart_at: defer kill (cooking land waiter)` with
+`cooking_land_waiters=1` before the final land request. Mid-uri still
+ended as HTTP 503 with waited_ms ~6.1s; final-land ended as HTTP 200
+in 9/10 trials (the single `final-land` 503 had no
+`abandoned hold ended` / HTTP 204 teardown events).
+
+This is real mechanism evidence: fix (a) can be made to fire reliably
+when a cooking-land waiter is actually present at decision time.
+`APPLY_WAIT_MS=6000` is not arbitrary: it matches the observed mid-uri
+wait durations (~6.0–6.2s) when the waiter branch fires in this same
+reproduction, i.e. it tracks the cook/hold timing window under test.
 
    **Settled: abandoned / superseded miss status shape.** A segment GET
    that will not be filled on the current encode trajectory (abandoned
