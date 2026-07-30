@@ -273,19 +273,21 @@ pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Resul
             dest.display()
         )
     })?;
-    let elapsed = started.elapsed();
-    let elapsed_ms = elapsed.as_millis() as u64;
-    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-    let src_mib_s = (src_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+    // Load-bearing for cold-path wait estimates (ADR-0018 / ADR-0019): the
+    // product rolls `src_mib_per_s` into the viewer's range. Field names and
+    // `info` level are the contract — not temporary instrumentation.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let elapsed_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
+    let src_mib_per_s = (src_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
     tracing::info!(
-        path = %src.display(),
+        src = %src.display(),
         stream_index,
         dest = %dest.display(),
         src_bytes,
         track_bytes,
         elapsed_ms,
-        src_mib_per_s = format!("{src_mib_s:.2}"),
-        "ASS burn extract finished"
+        src_mib_per_s,
+        "ass_burn_extract_finished"
     );
     Ok(())
 }

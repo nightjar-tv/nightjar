@@ -278,6 +278,73 @@ if [[ "${LARGE:-}" == "1" ]]; then
     "$OUT/large-open-ended-range.mp4"
 fi
 
+# Soak scrub resume fixture (scripts/soak_scrub.sh). HEVC forces Transcode
+# (Rule 4.3 / first-scrub characterisation). Same file: soft SRT + ASS + PGS.
+# Gitignored; regenerate with SOAK=1. Duration must clear ALIGN_BEHIND (32s)
+# and leave room for far-ahead seeks past the encode head.
+if [[ "${SOAK:-}" == "1" ]]; then
+  SOAK_DUR="${SOAK_DUR:-180}"
+  echo "→ soak_scrub_hevc_aac_subs_mkv.mkv (${SOAK_DUR}s, gitignored)"
+  SOAK_ASS="$OUT/_soak.ass"
+  SOAK_SRT="$OUT/_soak.srt"
+  SOAK_SUP="$OUT/_soak.sup"
+  cat > "$SOAK_ASS" <<EOF
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,soak ASS t0
+Dialogue: 0,0:00:40.00,0:00:50.00,Default,,0,0,0,,soak ASS mid
+Dialogue: 0,0:02:00.00,0:02:10.00,Default,,0,0,0,,soak ASS late
+EOF
+  cat > "$SOAK_SRT" <<EOF
+1
+00:00:00,000 --> 00:00:05,000
+soak SRT t0
+
+2
+00:00:40,000 --> 00:00:50,000
+soak SRT mid
+
+3
+00:02:00,000 --> 00:02:10,000
+soak SRT late
+EOF
+  python3 - "$SOAK_SUP" <<'PY'
+import struct, sys
+path = sys.argv[1]
+def seg(pts90, typ, payload: bytes) -> bytes:
+    return b"PG" + struct.pack(">II", pts90, 0) + bytes([typ]) + struct.pack(">H", len(payload)) + payload
+pcs = struct.pack(">HHBHBBb", 640, 360, 0x10, 0, 0x00, 0, 0)
+wds = bytes([1]) + struct.pack(">BHHHH", 0, 0, 0, 1, 1)
+pds = bytes([0, 0])
+open(path, "wb").write(seg(0, 0x16, pcs) + seg(0, 0x17, wds) + seg(0, 0x14, pds) + seg(0, 0x80, b""))
+PY
+  # Moderate bitrate so encode lags seeks without a delay-injection knob
+  # (Rule 4.7). Throttle further via THROTTLE_BPS in soak_scrub.sh.
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -f lavfi -i "testsrc=size=640x360:rate=24:duration=${SOAK_DUR}" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=${SOAK_DUR}" \
+    -i "$SOAK_SRT" -i "$SOAK_ASS" -i "$SOAK_SUP" \
+    -map 0:v:0 -map 1:a:0 -map 2:0 -map 3:0 -map 4:0 \
+    -c:v libx265 -pix_fmt yuv420p -tag:v hvc1 -b:v 4M \
+    -c:a aac -ac 2 \
+    -c:s:0 srt -c:s:1 ass -c:s:2 copy \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="soft" \
+    -metadata:s:s:1 language=eng -metadata:s:s:1 title="ass" \
+    -metadata:s:s:2 language=eng -metadata:s:s:2 title="pgs" \
+    -t "$SOAK_DUR" \
+    "$OUT/soak_scrub_hevc_aac_subs_mkv.mkv"
+  rm -f "$SOAK_ASS" "$SOAK_SRT" "$SOAK_SUP"
+fi
+
 # Optional >4GB file for 32-bit offset bugs (gitignored). Valid moov at start, then
 # sparse-extend past 4 GiB so Range requests past 2^32 exercise 64-bit offsets.
 if [[ "${OVER4GB:-}" == "1" ]]; then

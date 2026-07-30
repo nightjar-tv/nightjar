@@ -1,0 +1,214 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Spike C burn splice</title>
+</head>
+<body>
+<video id="v" controls playsinline muted></video>
+<script src="/hls.min.js"></script>
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const master = params.get("master") || "master_nodisc.m3u8";
+  const spliceS = Number(params.get("spliceS") || "6");
+  const engine = params.get("engine") || "hlsjs"; // hlsjs | native
+  const t0 = performance.now();
+  const events = [];
+  const reqs = [];
+  const push = (kind, detail) => {
+    events.push({
+      kind,
+      ms: Math.round(performance.now() - t0),
+      detail: detail || null,
+    });
+  };
+
+  const v = document.getElementById("v");
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    const res = await origFetch(input, init);
+    const name = String(url).split("/").pop().split("?")[0];
+    if (/\.(m4s|mp4|m3u8)$/.test(name)) {
+      reqs.push({
+        ms: Math.round(performance.now() - t0),
+        status: res.status,
+        resource: name,
+      });
+    }
+    return res;
+  };
+
+  // Native Safari may use XHR / media element loader; also watch Performance.
+  const observePerf = () => {
+    try {
+      const entries = performance.getEntriesByType("resource");
+      for (const e of entries) {
+        const name = e.name.split("/").pop().split("?")[0];
+        if (!/\.(m4s|mp4|m3u8)$/.test(name)) continue;
+        if (reqs.some((r) => r.resource === name && Math.abs(r.ms - e.startTime) < 5)) {
+          continue;
+        }
+        reqs.push({
+          ms: Math.round(e.startTime),
+          status: 200,
+          resource: name,
+          via: "perf",
+        });
+      }
+    } catch (_) {}
+  };
+
+  let hls = null;
+  const attach = () => {
+    const url = new URL(master, location.href).href;
+    if (engine === "native" || !window.Hls || !Hls.isSupported()) {
+      push("attach", { engine: "native", url });
+      v.src = url;
+    } else {
+      push("attach", { engine: "hlsjs", url });
+      hls = new Hls({
+        enableWorker: false,
+        maxBufferHole: 1.5,
+        fragLoadingTimeOut: 8000,
+        manifestLoadingTimeOut: 8000,
+        levelLoadingTimeOut: 8000,
+      });
+      hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+        const f = data.frag;
+        push("FRAG_LOADED", {
+          sn: f.sn,
+          start: f.start,
+          url: f.url ? f.url.split("/").pop() : null,
+        });
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        push("ERROR", {
+          type: data.type,
+          details: data.details,
+          fatal: data.fatal,
+        });
+      });
+      hls.loadSource(url);
+      hls.attachMedia(v);
+    }
+    v.muted = true;
+    v.play().catch((e) => push("play_reject", { error: String(e) }));
+  };
+
+  const waitUntil = async (pred, timeoutMs, label) => {
+    const start = Date.now();
+    let lastT = v.currentTime;
+    let lastProgress = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      observePerf();
+      if (pred()) return { ok: true };
+      if (v.currentTime > lastT + 0.05) {
+        lastT = v.currentTime;
+        lastProgress = Date.now();
+      } else if (Date.now() - lastProgress > 3500 && v.currentTime > 0.2) {
+        push("stall", {
+          at: v.currentTime,
+          readyState: v.readyState,
+          label,
+        });
+        return { ok: false, reason: "stall", at: v.currentTime };
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return {
+      ok: false,
+      reason: "timeout",
+      at: v.currentTime,
+      label,
+    };
+  };
+
+  window.__SPIKE = {
+    events,
+    reqs,
+    run: async () => {
+      attach();
+      push("run_start", { spliceS, master, engine });
+
+      const started = await waitUntil(
+        () => v.currentTime > 0.4 && v.readyState >= 2,
+        15000,
+        "start",
+      );
+      if (!started.ok) {
+        return {
+          crossed: false,
+          uninterrupted: false,
+          start: started,
+          events,
+          reqs,
+          currentTime: v.currentTime,
+        };
+      }
+      push("playing", { t: v.currentTime });
+
+      // Cross the splice (+1.5s past the boundary).
+      const target = spliceS + 1.5;
+      const crossed = await waitUntil(
+        () => v.currentTime >= target && !v.seeking,
+        25000,
+        "cross_splice",
+      );
+      observePerf();
+      const tAfterCross = v.currentTime;
+      const fatal = events.some(
+        (e) => e.kind === "ERROR" && e.detail && e.detail.fatal,
+      );
+      const stalled = events.some((e) => e.kind === "stall");
+
+      // Backward seek into pre-splice (no burn pixels on those segs).
+      const backTarget = Math.max(0.5, spliceS - 2.5);
+      push("seek_back_intent", { backTarget });
+      v.currentTime = backTarget;
+      const back = await waitUntil(
+        () => Math.abs(v.currentTime - backTarget) < 0.75 && !v.seeking && v.readyState >= 2,
+        12000,
+        "seek_back",
+      );
+      observePerf();
+
+      // Which segment resources were requested after the splice crossing?
+      const crossMs = events.find((e) => e.kind === "playing")?.ms ?? 0;
+      const postCrossReqs = reqs.filter((r) => r.ms >= crossMs);
+      const preSegReReq = postCrossReqs.filter((r) => {
+        const m = /^seg(\d+)\.m4s$/.exec(r.resource);
+        if (!m) return false;
+        return Number(m[1]) < Math.floor(spliceS / 2);
+      });
+
+      // After seek-back, did we re-fetch pre-splice segs?
+      const seekIntent = events.find((e) => e.kind === "seek_back_intent");
+      const afterSeek = seekIntent
+        ? reqs.filter((r) => r.ms >= seekIntent.ms)
+        : [];
+      const seekBackSegReqs = afterSeek.filter((r) => /^seg\d+\.m4s$/.test(r.resource));
+
+      return {
+        crossed: crossed.ok,
+        uninterrupted: crossed.ok && !fatal && !stalled,
+        start: started,
+        cross: crossed,
+        seekBack: back,
+        seekBackOk: back.ok,
+        tAfterCross,
+        fatal,
+        stalled,
+        preSegReReqAfterCross: preSegReReq.map((r) => r.resource),
+        seekBackSegReqs: seekBackSegReqs.map((r) => r.resource),
+        events,
+        reqs,
+        currentTime: v.currentTime,
+      };
+    },
+  };
+})();
+</script>
+</body>
+</html>
