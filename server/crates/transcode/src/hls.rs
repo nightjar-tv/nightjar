@@ -12,15 +12,15 @@
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
-    BurnInSelection, SessionSubInput, prepare_session_subtitles, slice_webvtt,
-    webvtt_max_cue_end_ms,
+    BurnInKind, BurnInSelection, SessionSubInput, extract_embedded_ass, prepare_session_subtitles,
+    slice_webvtt, webvtt_max_cue_end_ms,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_SESSIONS: usize = 3;
@@ -631,7 +631,7 @@ impl HlsSessionRegistry {
     ) -> Result<String, StartSessionError> {
         let play_start_ms = align_to_segment(start_ms);
         let start_ms = encode_start_ms(play_start_ms);
-        let mut sessions = self
+        let sessions = self
             .sessions
             .lock()
             .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
@@ -644,7 +644,13 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&dir).map_err(|e| {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
+        // Release before ASS demux / ffmpeg spawn so a multi-minute NAS extract
+        // does not freeze every other HLS request on this lock.
+        drop(sessions);
+
         let spawn_started = Instant::now();
+        let burn_in =
+            prepare_ass_burn_file(src, &dir, burn_in).map_err(StartSessionError::Spawn)?;
         let child = spawn_ffmpeg(
             src,
             &dir,
@@ -673,6 +679,10 @@ impl HlsSessionRegistry {
             spawn_ms,
             "hls session started"
         );
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
         sessions.insert(
             id.clone(),
             Session {
@@ -700,7 +710,6 @@ impl HlsSessionRegistry {
                 preempt_defer_logged: false,
             },
         );
-        drop(sessions);
         Ok(id)
     }
 
@@ -1468,6 +1477,9 @@ fn restart_at(
     // remove the muxer sidecar; ffmpeg -y overwrites init and new indices.
     let index = session.dir.join("index.m3u8");
     let _ = fs::remove_file(&index);
+    let burn_in = prepare_ass_burn_file(&session.src, &session.dir, session.burn_in.clone())
+        .map_err(PlaylistError::Failed)?;
+    session.burn_in = burn_in;
     let child = spawn_ffmpeg(
         &session.src,
         &session.dir,
@@ -2042,13 +2054,6 @@ fn spawn_ffmpeg(
         cmd.args(["-ss", &start_secs]);
     }
     cmd.arg("-i").arg(src);
-    // Sidecar burn-in is a second input so overlay can map [1:s:0] (ADR-0018).
-    if let Some(path) = burn_in.and_then(|b| b.sidecar_path.as_ref()) {
-        if start_ms > 0 {
-            cmd.args(["-ss", &start_secs]);
-        }
-        cmd.arg("-i").arg(path);
-    }
     if start_ms > 0 {
         // Keep output timestamps absolute so mid-title segments land at their
         // playlist position instead of restarting the clock at zero.
@@ -2075,8 +2080,17 @@ fn spawn_ffmpeg(
 
     let sdr_chain =
         "sidedata=delete,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709";
-    let burn_overlay = burn_in.and_then(burn_in_overlay_graph);
-    if let Some(ref complex) = burn_overlay {
+    // ASS uses libass `-vf` filters; PGS uses overlay `filter_complex`
+    // (ADR-0018). Never overlay text ASS — sub2video draws blank.
+    if let Some(burn) = burn_in {
+        ensure_libass_for_ass(burn.kind, ffmpeg_has_libass_filters())?;
+    }
+    let pgs_overlay = burn_in.and_then(pgs_overlay_graph);
+    let ass_vf = match burn_in {
+        Some(burn) if burn.kind == BurnInKind::Ass => Some(ass_burn_vf(burn, start_ms)?),
+        _ => None,
+    };
+    if let Some(ref complex) = pgs_overlay {
         let full = format!("{complex},{sdr_chain}[vout]");
         cmd.args(["-filter_complex", &full]);
         cmd.args(["-map", "[vout]", "-map", &audio_map]);
@@ -2111,10 +2125,14 @@ fn spawn_ffmpeg(
             // Safari native HLS rejects that (Chrome/hls.js is more forgiving).
             // Color flags alone are not enough on videotoolbox — strip side
             // data and force BT.709 through setparams.
-            if burn_overlay.is_none() {
-                cmd.args(["-map_metadata", "-1", "-vf", sdr_chain]);
-            } else {
+            if pgs_overlay.is_some() {
                 cmd.args(["-map_metadata", "-1"]);
+            } else {
+                let vf = match ass_vf.as_deref() {
+                    Some(ass) => format!("{ass},{sdr_chain}"),
+                    None => sdr_chain.to_string(),
+                };
+                cmd.args(["-map_metadata", "-1", "-vf", &vf]);
             }
             cmd.args([
                 "-colorspace",
@@ -2175,11 +2193,131 @@ fn spawn_ffmpeg(
     })
 }
 
-/// Overlay graph prefix for burn-in (ADR-0018). SDR chain and `[vout]` label
-/// are appended by the caller. Embedded uses `0:s:N`; sidecar is input 1.
-fn burn_in_overlay_graph(burn: &BurnInSelection) -> Option<String> {
-    if burn.sidecar_path.is_some() {
-        return Some("[0:v:0][1:s:0]overlay".into());
+/// Error when ASS burn is requested but FFmpeg lacks libass filters.
+const LIBASS_REQUIRED: &str =
+    "ASS/SSA burn-in requires FFmpeg built with libass (ass and subtitles filters)";
+
+/// Fail closed for ASS burn when libass filters are absent (ADR-0018).
+fn ensure_libass_for_ass(kind: BurnInKind, has_libass: bool) -> Result<(), String> {
+    if kind == BurnInKind::Ass && !has_libass {
+        Err(LIBASS_REQUIRED.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// True when `ffmpeg -filters` lists both `ass` and `subtitles`.
+fn libass_filters_listed(filters_text: &str) -> bool {
+    let mut has_ass = false;
+    let mut has_subtitles = false;
+    for line in filters_text.lines() {
+        match line.split_whitespace().nth(1) {
+            Some("ass") => has_ass = true,
+            Some("subtitles") => has_subtitles = true,
+            _ => {}
+        }
+    }
+    has_ass && has_subtitles
+}
+
+/// Cached probe of the host FFmpeg filter list for libass.
+fn ffmpeg_has_libass_filters() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let output = match Command::new("ffmpeg")
+            .args(["-hide_banner", "-filters"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        // ffmpeg writes the filter table to stdout; some builds mix help on stderr.
+        let text = if output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stderr)
+        } else {
+            String::from_utf8_lossy(&output.stdout)
+        };
+        libass_filters_listed(&text)
+    })
+}
+
+/// Escape a filesystem path for an FFmpeg filter option value.
+fn escape_ffmpeg_filter_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\\' | ':' | '\'' | '[' | ']' | ',' | ';' | ' ' | '(' | ')' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Ensure embedded ASS burn-in has a local `.ass` path (ADR-0018).
+/// Sidecar and PGS selections pass through unchanged. Reuses an existing
+/// session extract on seek restart.
+fn prepare_ass_burn_file(
+    src: &Path,
+    session_dir: &Path,
+    burn_in: Option<BurnInSelection>,
+) -> Result<Option<BurnInSelection>, String> {
+    let Some(mut burn) = burn_in else {
+        return Ok(None);
+    };
+    if burn.kind != BurnInKind::Ass || burn.sidecar_path.is_some() {
+        return Ok(Some(burn));
+    }
+    let stream_index = burn
+        .stream_index
+        .ok_or_else(|| "embedded ASS burn-in missing stream_index".to_string())?;
+    let dest = session_dir.join(format!("burn_{}.ass", burn.track_id));
+    let reuse = fs::metadata(&dest).ok().is_some_and(|m| m.len() > 0);
+    if !reuse {
+        tracing::info!(
+            path = %src.display(),
+            track_id = %burn.track_id,
+            stream_index,
+            dest = %dest.display(),
+            "extracting embedded ASS for burn-in"
+        );
+        extract_embedded_ass(src, stream_index, &dest)?;
+    }
+    burn.sidecar_path = Some(dest);
+    Ok(Some(burn))
+}
+
+/// libass `-vf` fragment for ASS/SSA burn-in (ADR-0018).
+/// Always `ass=<local path>` — embedded tracks are demuxed first by
+/// [`prepare_ass_burn_file`]. Mid-window `-ss` before `-i` resets frame PTS
+/// to ~0; wrap with setpts so libass still matches absolute cue times, then
+/// restore PTS for the muxer.
+fn ass_burn_vf(burn: &BurnInSelection, start_ms: u64) -> Result<String, String> {
+    if burn.kind != BurnInKind::Ass {
+        return Err("ass_burn_vf called for non-ASS burn-in".into());
+    }
+    let path = burn
+        .sidecar_path
+        .as_ref()
+        .ok_or_else(|| "ASS burn-in missing local .ass path (extract first)".to_string())?;
+    let core = format!("ass={}", escape_ffmpeg_filter_path(path));
+    if start_ms == 0 {
+        return Ok(core);
+    }
+    let start_secs = start_ms as f64 / 1000.0;
+    Ok(format!(
+        "setpts=PTS+{start_secs}/TB,{core},setpts=PTS-{start_secs}/TB"
+    ))
+}
+
+/// PGS overlay graph prefix (ADR-0018). SDR chain and `[vout]` are appended
+/// by the caller. Embedded uses `0:s:N`.
+fn pgs_overlay_graph(burn: &BurnInSelection) -> Option<String> {
+    if burn.kind != BurnInKind::Pgs {
+        return None;
     }
     let ordinal = burn.subtitle_ordinal?;
     Some(format!("[0:v:0][0:s:{ordinal}]overlay"))
@@ -4236,18 +4374,81 @@ mod tests {
     }
 
     #[test]
-    fn burn_in_overlay_graph_embedded_and_sidecar() {
-        let embedded = BurnInSelection {
-            track_id: "e2".into(),
-            kind: BurnInKind::Ass,
-            stream_index: Some(2),
-            subtitle_ordinal: Some(0),
-            sidecar_path: None,
+    fn escape_ffmpeg_filter_path_escapes_colon() {
+        let escaped = escape_ffmpeg_filter_path(Path::new("/Volumes/NAS:share/a.ass"));
+        assert!(escaped.contains(r"\:"), "{escaped}");
+    }
+
+    #[test]
+    fn libass_filters_listed_requires_ass_and_subtitles() {
+        let with = "\
+ .. overlay           VV->V      Overlay a video source on top of the input.
+ .. ass               V->V       Render ASS subtitles onto input video using the libass library.
+ .. subtitles         V->V       Render text subtitles onto input video using the libass library.
+";
+        assert!(libass_filters_listed(with));
+        let without_ass = "\
+ .. overlay           VV->V      Overlay a video source on top of the input.
+ .. subtitles         V->V       Render text subtitles onto input video using the libass library.
+";
+        assert!(!libass_filters_listed(without_ass));
+        let without_both = "\
+ .. overlay           VV->V      Overlay a video source on top of the input.
+";
+        assert!(!libass_filters_listed(without_both));
+    }
+
+    #[test]
+    fn libass_filters_listed_live_ffmpeg_and_stripped() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let output = Command::new("ffmpeg")
+            .args(["-hide_banner", "-filters"])
+            .output()
+            .expect("ffmpeg -filters");
+        let text = if output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        } else {
+            String::from_utf8_lossy(&output.stdout).into_owned()
         };
-        assert_eq!(
-            burn_in_overlay_graph(&embedded).as_deref(),
-            Some("[0:v:0][0:s:0]overlay")
+        // Equipped host (this dogfood machine): both filters present.
+        // Lacking host: strip those lines from the same real table shape.
+        let live = libass_filters_listed(&text);
+        let stripped: String = text
+            .lines()
+            .filter(|line| {
+                !matches!(
+                    line.split_whitespace().nth(1),
+                    Some("ass") | Some("subtitles")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !libass_filters_listed(&stripped),
+            "stripping ass/subtitles from live -filters must fail closed"
         );
+        if live {
+            assert!(
+                ensure_libass_for_ass(BurnInKind::Ass, live).is_ok()
+                    && ensure_libass_for_ass(BurnInKind::Ass, false).is_err()
+            );
+        } else {
+            assert!(ensure_libass_for_ass(BurnInKind::Ass, live).is_err());
+        }
+    }
+
+    #[test]
+    fn ensure_libass_for_ass_fails_closed_without_filters() {
+        assert!(ensure_libass_for_ass(BurnInKind::Ass, false).is_err());
+        assert!(ensure_libass_for_ass(BurnInKind::Ass, true).is_ok());
+        assert!(ensure_libass_for_ass(BurnInKind::Pgs, false).is_ok());
+    }
+
+    #[test]
+    fn ass_burn_vf_embedded_and_sidecar() {
         let side = BurnInSelection {
             track_id: "s-en".into(),
             kind: BurnInKind::Ass,
@@ -4255,9 +4456,148 @@ mod tests {
             subtitle_ordinal: None,
             sidecar_path: Some(PathBuf::from("/tmp/a.ass")),
         };
+        assert_eq!(ass_burn_vf(&side, 0).unwrap(), "ass=/tmp/a.ass");
+        let mid = ass_burn_vf(&side, 10_000).unwrap();
+        assert!(
+            mid.starts_with("setpts=PTS+10/TB,ass=") && mid.ends_with(",setpts=PTS-10/TB"),
+            "{mid}"
+        );
+        let spaced = BurnInSelection {
+            track_id: "s-en".into(),
+            kind: BurnInKind::Ass,
+            stream_index: None,
+            subtitle_ordinal: None,
+            sidecar_path: Some(PathBuf::from("/tmp/The Movie (2007)/a.ass")),
+        };
+        let vf = ass_burn_vf(&spaced, 0).unwrap();
+        assert!(
+            vf.contains(r"\(") && vf.contains(r"\)") && vf.contains(r"\ "),
+            "{vf}"
+        );
+        assert!(
+            ass_burn_vf(
+                &BurnInSelection {
+                    track_id: "e2".into(),
+                    kind: BurnInKind::Ass,
+                    stream_index: Some(2),
+                    subtitle_ordinal: Some(0),
+                    sidecar_path: None,
+                },
+                0
+            )
+            .is_err()
+        );
+        assert!(pgs_overlay_graph(&side).is_none());
+    }
+
+    #[test]
+    fn pgs_overlay_graph_embedded_only() {
+        let pgs = BurnInSelection {
+            track_id: "e3".into(),
+            kind: BurnInKind::Pgs,
+            stream_index: Some(3),
+            subtitle_ordinal: Some(0),
+            sidecar_path: None,
+        };
         assert_eq!(
-            burn_in_overlay_graph(&side).as_deref(),
-            Some("[0:v:0][1:s:0]overlay")
+            pgs_overlay_graph(&pgs).as_deref(),
+            Some("[0:v:0][0:s:0]overlay")
+        );
+    }
+
+    fn rgb24_abs_diff(a: &[u8], b: &[u8]) -> u64 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum()
+    }
+
+    fn ffmpeg_rgb24_frame(src: &Path, vf: Option<&str>, ss_ms: u64) -> Vec<u8> {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        if ss_ms > 0 {
+            cmd.args(["-ss", &format!("{:.3}", ss_ms as f64 / 1000.0)]);
+        }
+        cmd.arg("-i").arg(src).args(["-an", "-frames:v", "1"]);
+        if let Some(vf) = vf {
+            cmd.args(["-vf", vf]);
+        }
+        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+        let out = cmd.output().expect("spawn ffmpeg");
+        assert!(
+            out.status.success(),
+            "ffmpeg frame failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    #[test]
+    fn burn_in_ass_corpus_changes_pixels() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        if !ffmpeg_has_libass_filters() {
+            eprintln!("skipping: host ffmpeg lacks libass filters");
+            return;
+        }
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_ass_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_burn_in_subtitles(&corpus).expect("list");
+        let burn = streams
+            .iter()
+            .find(|s| s.kind == BurnInKind::Ass)
+            .expect("ass track");
+        let dir = tempfile::tempdir().unwrap();
+        let extracted = dir.path().join("burn_e.ass");
+        crate::extract_embedded_ass(&corpus, burn.stream_index, &extracted).expect("extract");
+        let selection = BurnInSelection {
+            track_id: burn.track_id(),
+            kind: BurnInKind::Ass,
+            stream_index: Some(burn.stream_index),
+            subtitle_ordinal: Some(burn.subtitle_ordinal),
+            sidecar_path: Some(extracted.clone()),
+        };
+        let vf = ass_burn_vf(&selection, 0).unwrap();
+        assert!(vf.starts_with("ass="), "{vf}");
+        let plain = ffmpeg_rgb24_frame(&corpus, None, 0);
+        let burned = ffmpeg_rgb24_frame(&corpus, Some(&vf), 0);
+        let diff = rgb24_abs_diff(&plain, &burned);
+        assert!(
+            diff > 100_000,
+            "embedded ASS burn should change pixels; diff_sum={diff}"
+        );
+
+        // Sidecar path: extract ASS, burn via ass=
+        let side = dir.path().join("track.ass");
+        let extract = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&corpus)
+            .args(["-map", "0:s:0", "-c", "copy"])
+            .arg(&side)
+            .output()
+            .unwrap();
+        assert!(extract.status.success());
+        let side_sel = BurnInSelection {
+            track_id: "s-en".into(),
+            kind: BurnInKind::Ass,
+            stream_index: None,
+            subtitle_ordinal: None,
+            sidecar_path: Some(side),
+        };
+        let side_vf = ass_burn_vf(&side_sel, 0).unwrap();
+        assert!(side_vf.starts_with("ass="), "{side_vf}");
+        let side_burned = ffmpeg_rgb24_frame(&corpus, Some(&side_vf), 0);
+        let side_diff = rgb24_abs_diff(&plain, &side_burned);
+        assert!(
+            side_diff > 100_000,
+            "sidecar ASS burn should change pixels; diff_sum={side_diff}"
         );
     }
 
@@ -4265,6 +4605,10 @@ mod tests {
     fn burn_in_ass_session_produces_segments() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        if !ffmpeg_has_libass_filters() {
+            eprintln!("skipping: host ffmpeg lacks libass filters");
             return;
         }
         let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4317,6 +4661,10 @@ mod tests {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
         }
+        if !ffmpeg_has_libass_filters() {
+            eprintln!("skipping: host ffmpeg lacks libass filters");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("movie.mp4");
         make_fixture_secs(&src, 2);
@@ -4349,6 +4697,42 @@ mod tests {
         wait_playlist(&reg, &id);
         let _ = wait_asset(&reg, &id, "seg000.m4s");
         reg.stop(&id);
+    }
+
+    #[test]
+    fn burn_in_ass_mid_start_matches_late_cue() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        if !ffmpeg_has_libass_filters() {
+            eprintln!("skipping: host ffmpeg lacks libass filters");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("movie.mp4");
+        make_fixture_secs(&src, 15);
+        let ass = dir.path().join("late.ass");
+        fs::write(
+            &ass,
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 240\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:10.00,0:00:12.00,Default,,0,0,0,,LATE CUE\n",
+        )
+        .unwrap();
+        let selection = BurnInSelection {
+            track_id: "s-en".into(),
+            kind: BurnInKind::Ass,
+            stream_index: None,
+            subtitle_ordinal: None,
+            sidecar_path: Some(ass.clone()),
+        };
+        let vf = ass_burn_vf(&selection, 10_000).unwrap();
+        let plain = ffmpeg_rgb24_frame(&src, None, 10_000);
+        let burned = ffmpeg_rgb24_frame(&src, Some(&vf), 10_000);
+        let diff = rgb24_abs_diff(&plain, &burned);
+        assert!(
+            diff > 10_000,
+            "mid-start ASS burn must show late cue; diff_sum={diff} vf={vf}"
+        );
     }
 
     #[test]

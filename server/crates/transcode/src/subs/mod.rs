@@ -33,6 +33,11 @@ const BURN_IN_CODECS: &[&str] = &["ass", "ssa", "hdmv_pgs_subtitle"];
 /// Kill a runaway extract rather than leave ffmpeg demuxing forever on a NAS.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// ASS burn-in demux can take many minutes on a large NAS remux (full interleaved
+/// read). Longer than text extract: session start waits for a local `.ass` so
+/// libass does not re-open the container at filter init (ADR-0018).
+const ASS_BURN_EXTRACT_TIMEOUT: Duration = Duration::from_secs(1800);
+
 /// How often to publish a growing WebVTT while FFmpeg demuxes (ADR-0013 §11).
 const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
@@ -130,7 +135,7 @@ impl SubtitleRender {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BurnInKind {
-    /// ASS / SSA via libass (`subtitles=` / `ass=`).
+    /// ASS / SSA via libass (`ass=` on a local file).
     Ass,
     /// Bitmap PGS via overlay.
     Pgs,
@@ -205,6 +210,67 @@ pub fn is_serveable_sidecar_format(format: &str) -> bool {
 
 pub fn is_burn_in_sidecar_format(format: &str) -> bool {
     matches!(format.to_ascii_lowercase().as_str(), "ass" | "ssa")
+}
+
+/// Demux one embedded ASS/SSA stream to a local `.ass` for libass burn-in.
+///
+/// `subtitles=<src>:si=N` re-opens the container and demuxes every cue before
+/// the first frame — on a multi-GB NAS title that stalls HLS for the whole
+/// demux. A local file lets `ass=` start encoding immediately after this copy.
+pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create ASS burn dir {}: {e}", parent.display()))?;
+    }
+    let tmp = dest.with_extension("tmp.ass");
+    let map = format!("0:{stream_index}");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(src)
+        .args(["-map", &map, "-c:s", "copy", "-flush_packets", "1"])
+        .arg(&tmp);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "ffmpeg not found on PATH".into()
+        } else {
+            format!("spawn ffmpeg ASS extract for {}: {e}", src.display())
+        }
+    })?;
+
+    if let Err(e) = wait_extract_child(&mut child, ASS_BURN_EXTRACT_TIMEOUT, || {}) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "ASS burn extract failed for {} stream {stream_index}: {e}",
+            src.display()
+        ));
+    }
+
+    let meta = fs::metadata(&tmp).map_err(|e| {
+        format!(
+            "ASS burn extract wrote no file for {} stream {stream_index}: {e}",
+            src.display()
+        )
+    })?;
+    if meta.len() == 0 {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "ASS burn extract empty for {} stream {stream_index}",
+            src.display()
+        ));
+    }
+    fs::rename(&tmp, dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "publish ASS burn file {} -> {}: {e}",
+            tmp.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn probe_subtitle_streams(src: &Path) -> Result<Vec<FfSubStream>, String> {

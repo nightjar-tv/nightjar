@@ -47,19 +47,35 @@ remains a shared follow-up with the item player UI.
    is a fresh POST at `startMs` plus DELETE of the prior session — the
    same model as audio. Seek restart must not carry burn-in switches.
 
-5. **FFmpeg graphs.** Burn-in uses one `filter_complex` overlay of the
-   subtitle stream onto video, then the existing SDR
-   `sidedata=delete,setparams=…` chain on the filtered video:
-   - Embedded ASS/SSA/PGS: `[0:v:0][0:s:N]overlay,…[vout]` (`N` = subtitle
-     ordinal among subtitle streams).
-   - Sidecar ASS/SSA: second `-i` on the sidecar file, then
-     `[0:v:0][1:s:0]overlay,…[vout]`.
-   Mid-window seek applies `-ss` to each burn input the same way as the
-   main media input. Host fonts still matter for ASS text rendering through
-   the decoder (not bundled; Rule 1.2). Missing fonts fail closed to a
-   failed session, not a silent blank burn. FFmpeg builds without the
-   optional `subtitles`/`ass` libass filters are fine — overlay does not
-   need them.
+5. **FFmpeg graphs.** Burn-in is one user concept (`render: burnIn`) but
+   two encode graphs. Unifying on one filter is wrong (Rule 4.11):
+   - **ASS/SSA** need libass. Overlay/`sub2video` leaves ASS as
+     non-bitmap even when libass is built in — silent blank burn. The
+     working path is `-vf ass=<path>,…` (sidecar path, or a demuxed
+     `.ass`). Never `subtitles=<src>:si=N` — that re-opens the container
+     and demuxes every cue before the first frame, which stalls HLS on
+     large/NAS remuxes. Paths are escaped for filter syntax (including
+     spaces and parentheses). Mid-window `-ss` before `-i` resets frame
+     PTS to ~0; wrap libass with `setpts=PTS+start/TB,…,setpts=PTS-start/TB`
+     so absolute cue times still match, then restore PTS for
+     `-output_ts_offset`.
+   - **PGS** is already bitmap. `[0:v:0][0:s:N]overlay` streams from the
+     same demux as video; no extract file, no libass, no setpts wrap —
+     subtitle packets seek with the same `-ss`.
+
+   Both compose with the existing SDR `sidedata=delete,setparams=…` chain
+   (one graph, not two competing `-vf` flags). Host fonts are a fontconfig
+   dependency for ASS (not bundled; Rule 1.2). FFmpeg without `ass`/
+   `subtitles` fails closed on ASS burn-in, never falls back to overlay.
+
+   **ASS file provenance (Rule 4.8 / 4.9).** This slice demuxes embedded
+   ASS into the ephemeral HLS session dir (`burn_{trackId}.ass`) at
+   session start and reuses it on seek restart. That path is a way
+   station: it does not introduce a durable on-disk or on-wire shape.
+   [ADR-0019](0019-ass-burn-extract-at-scan.md) supersedes it with
+   scan-time extract to `{NIGHTJAR_DATA_DIR}/subs/{itemId}/{trackId}.ass`.
+   The encode graph (`ass=`) stays; only when and where the file is
+   written changes.
 
 6. **Corpus.** Existing `h264_aac_ass_mkv.mkv` and `h264_aac_pgs_mkv.mkv`.
    The PGS fixture is a minimal synthetic SUP (ffprobe-friendly); CI
@@ -74,4 +90,6 @@ re-encodes video. Soft text and burn-in tracks on the same title remain
 independently selectable. Mid-play client restart choreography for audio
 and burn-in is one shared follow-up, not duplicated per feature.
 
-ADR-0010 / ADR-0013 “burn-in later” notes are superseded by this ADR.
+Session-dir ASS demux is superseded by ADR-0019 once scan-time burn
+extract lands. ADR-0010 / ADR-0013 “burn-in later” notes are superseded
+by this ADR.
