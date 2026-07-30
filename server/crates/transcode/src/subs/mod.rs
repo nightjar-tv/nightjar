@@ -224,6 +224,8 @@ pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Resul
     }
     let tmp = dest.with_extension("tmp.ass");
     let map = format!("0:{stream_index}");
+    let src_bytes = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let started = Instant::now();
     let mut cmd = Command::new("ffmpeg");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -262,6 +264,7 @@ pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Resul
             src.display()
         ));
     }
+    let track_bytes = meta.len();
     fs::rename(&tmp, dest).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!(
@@ -270,6 +273,20 @@ pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Resul
             dest.display()
         )
     })?;
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let src_mib_s = (src_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+    tracing::info!(
+        path = %src.display(),
+        stream_index,
+        dest = %dest.display(),
+        src_bytes,
+        track_bytes,
+        elapsed_ms,
+        src_mib_per_s = format!("{src_mib_s:.2}"),
+        "ASS burn extract finished"
+    );
     Ok(())
 }
 
