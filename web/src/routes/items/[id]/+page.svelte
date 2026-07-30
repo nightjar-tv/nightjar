@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
+	import SubtitleSwitcher from '$lib/components/SubtitleSwitcher.svelte';
 	import {
 		attachHls,
 		watchProgressiveSubtitles,
@@ -14,13 +15,17 @@
 		probeEnabled,
 		type AttachMode
 	} from '$lib/latencyProbe';
+	import {
+		isHlsSelectable,
+		isSoftReady,
+		selectionNeedsBurnIn
+	} from '$lib/subtitleSwitcher';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItem'];
 	type PlaybackInfo = components['schemas']['PlaybackInfo'];
 	type TranscodeSession = components['schemas']['TranscodeSession'];
 	type AudioTrack = components['schemas']['AudioTrack'];
-	type SubtitleTrack = components['schemas']['SubtitleTrack'];
 	// Not in lib.dom: only Safari exposes the media element track list today.
 	type BrowserAudioTracks = { length: number; [index: number]: { enabled: boolean } };
 
@@ -33,10 +38,15 @@
 	);
 	let preparingSession = $state(false);
 	let switchingAudio = $state(false);
+	let switchingSubtitles = $state(false);
 	let audioNote = $state<string | null>(null);
 	let selectedAudioTrackId = $state<string | null>(null);
-	/** HLS captions index into session MEDIA tracks; -1 = off. */
-	let selectedSubtitleIndex = $state(0);
+	/** Selected inventory trackId; null = Off. */
+	let selectedSubtitleTrackId = $state<string | null>(null);
+	/** ASS/SSA only: on = burn-in, off = house-styled WebVTT. */
+	let originalStyling = $state(false);
+	/** Burn-in track active on the current session (ADR-0018). */
+	let burningSubtitleTrackId = $state<string | null>(null);
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	// Mutable holder so onMount cleanup / pagehide always DELETE the live
 	// session even if the $state read in a stale closure is still null.
@@ -49,13 +59,18 @@
 	// Read by every await loop so an unmount mid-flight stops the loop and
 	// reaps whatever it already started.
 	const liveRef = { alive: true };
+	/** True when playbackInfo opened as DirectPlay (burn-in may start a session). */
+	const openedAsDirectPlay = { value: false };
 
 	const itemId = $derived(Number(page.params.id));
 	const audioTracks = $derived(playback?.audioTracks ?? []);
-	/** Tracks the HLS master can advertise (ready store VTT only). */
-	const hlsSubtitleTracks = $derived(
-		(playback?.subtitleTracks ?? []).filter((t) => t.readiness === 'complete' && t.url)
-	);
+	/** Full inventory — one row per track (Rule 4.11), soft and burn-in together. */
+	const subtitleTracks = $derived(playback?.subtitleTracks ?? []);
+	/**
+	 * HLS master MEDIA order (complete + url only). Must match
+	 * sessions.rs snapshot_hls_tracks — not partial soft tracks.
+	 */
+	const hlsSubtitleTracks = $derived(subtitleTracks.filter((t) => isHlsSelectable(t)));
 	// Investigation: ?njAttach=land|first|two and ?njProbe=1 (see latencyProbe.ts).
 	const attachMode = $derived(attachModeFromSearch(page.url.search));
 	const probeOn = $derived(probeEnabled(page.url.search));
@@ -72,13 +87,66 @@
 		return track.channelLayout ? `${name} · ${track.channelLayout}` : name;
 	}
 
-	function subtitleTrackLabel(track: SubtitleTrack): string {
-		return track.label ?? track.language ?? track.trackId;
+	function resumePlayback(video: HTMLVideoElement) {
+		void video.play().catch(() => {
+			/* autoplay block — user can press play */
+		});
 	}
 
-	function selectSubtitle(index: number) {
-		selectedSubtitleIndex = index;
-		playerRef.handle?.setSubtitleTrack(index);
+	function applySoftSubtitle(trackId: string | null) {
+		const handle = playerRef.handle;
+		if (playlistUrl && handle) {
+			if (trackId == null) {
+				handle.setSubtitleTrack(-1);
+				return;
+			}
+			const idx = hlsSubtitleTracks.findIndex((t) => t.trackId === trackId);
+			handle.setSubtitleTrack(idx >= 0 ? idx : -1);
+			return;
+		}
+		const video = videoEl;
+		if (!video) return;
+		for (const node of video.querySelectorAll('track')) {
+			const el = node as HTMLTrackElement;
+			const id = el.getAttribute('data-track-id');
+			const tt = el.track;
+			if (!tt) continue;
+			const on = trackId != null && id === trackId;
+			if (on) {
+				// Firefox often needs a mode toggle before cues paint.
+				tt.mode = 'hidden';
+				tt.mode = 'showing';
+			} else {
+				tt.mode = 'disabled';
+			}
+		}
+	}
+
+	function onSubtitleSelect(trackId: string | null) {
+		selectedSubtitleTrackId = trackId;
+		void applySubtitleSelection(trackId);
+	}
+
+	async function applySubtitleSelection(trackId: string | null) {
+		if (trackId == null) {
+			await endBurnInIfNeeded();
+			applySoftSubtitle(null);
+			return;
+		}
+		const track = subtitleTracks.find((t) => t.trackId === trackId);
+		if (!track) return;
+		if (selectionNeedsBurnIn(track, originalStyling)) {
+			applySoftSubtitle(null);
+			await startOrSwitchBurnIn(track.trackId);
+			return;
+		}
+		// Soft on an HLS session: only complete tracks are in the master.
+		if (playlistUrl && !isHlsSelectable(track) && track.render === 'soft') {
+			applySoftSubtitle(null);
+			return;
+		}
+		await endBurnInIfNeeded();
+		applySoftSubtitle(track.trackId);
 	}
 
 	/** Poll until FFmpeg has written a servable response (playlist or segment). */
@@ -138,26 +206,34 @@
 	}
 
 	/** Sessions: a fresh session at the current position, then drop the old
-	 *  one. Init and prior segments carry the old audio config, so this is
-	 *  never a window move inside the seek path (ADR-0012). Cook the new
-	 *  land while the old session keeps playing, then cut over — park-then-
+	 *  one. Init and prior segments carry the old audio/burn config, so this is
+	 *  never a window move inside the seek path (ADR-0012 / ADR-0018). Cook the
+	 *  new land while the old session keeps playing, then cut over — park-then-
 	 *  wait made every switch feel like a reload even when server land was
 	 *  fast. */
-	async function switchSessionAudio(trackId: string) {
+	async function restartSession(opts: {
+		audioTrackId?: string | null;
+		subtitleTrackId?: string | null;
+		busy: 'audio' | 'subtitles';
+	}) {
 		const seconds = playerRef.handle?.positionSeconds() ?? videoEl?.currentTime ?? 0;
 		const startMs = Math.max(0, Math.floor(seconds * 1000));
 		const previous = sessionRef.id;
 		const probe = new LatencyProbe(attachMode, probeOn);
 		const unspy = probe.installFetchSpy();
 		probe.mark('switch_requested', `startMs=${startMs} mode=${attachMode}`);
-		switchingAudio = true;
+		if (opts.busy === 'audio') switchingAudio = true;
+		else switchingSubtitles = true;
 		try {
-			const started = await api.startTranscodeSession(itemId, startMs, trackId);
+			const started = await api.startTranscodeSession(
+				itemId,
+				startMs,
+				opts.audioTrackId ?? selectedAudioTrackId ?? undefined,
+				opts.subtitleTrackId ?? undefined
+			);
 			probe.mark('session_post_ok', started.sessionId);
 			probe.mark('wait_begin', attachMode);
 			const landIdx = Math.floor(startMs / 2000);
-			// Land wait only needs the play-land segment; encode lead-in (2)
-			// cooks behind it on the server without changing this gate.
 			const windowIdx = landIdx;
 			const ready = await waitForAttachReady(
 				started.playlistUrl,
@@ -166,38 +242,74 @@
 				attachMode,
 				probe
 			);
-			// Never adopt a session the page no longer owns; leaving it for
-			// the idle reaper burns a cap slot for a minute.
 			if (!ready || !liveRef.alive) {
 				void api.deleteTranscodeSession(started.sessionId);
 				if (liveRef.alive) error = copy.sessionFailed;
-				return;
+				return false;
 			}
 			resumeRef.seconds = startMs / 1000;
 			sessionRef.id = started.sessionId;
 			sessionEncoder = started;
+			burningSubtitleTrackId = opts.subtitleTrackId ?? null;
 			probe.mark('attach', started.playlistUrl);
 			if (videoEl) probe.wireVideo(videoEl);
-			// Swap playlist: $effect destroys the old handle and attaches.
-			// Old session stays alive until after cutover so playback does
-			// not go black while the new land cooks.
 			playlistUrl = started.playlistUrl;
 			if (previous && previous !== started.sessionId) {
 				void api.deleteTranscodeSession(previous);
 				probe.mark('old_session_deleted', previous);
 			}
 			if (probeOn) {
-				// Defer summary until after first frame likely lands.
 				setTimeout(() => {
 					console.info('[nj-probe-summary]', JSON.stringify(probe.summary()));
 				}, 8000);
 			}
+			return true;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+			return false;
 		} finally {
 			unspy();
 			switchingAudio = false;
+			switchingSubtitles = false;
 		}
+	}
+
+	async function startOrSwitchBurnIn(trackId: string) {
+		if (burningSubtitleTrackId === trackId && playlistUrl) return;
+		await restartSession({
+			subtitleTrackId: trackId,
+			busy: 'subtitles'
+		});
+	}
+
+	/** Leave burn-in: restore DirectPlay when that was the open path, else
+	 *  restart the session without subtitleTrackId. */
+	async function endBurnInIfNeeded() {
+		if (!burningSubtitleTrackId) return;
+		if (openedAsDirectPlay.value && playback?.streamUrl) {
+			const seconds = playerRef.handle?.positionSeconds() ?? videoEl?.currentTime ?? 0;
+			resumeRef.seconds = seconds;
+			releaseSession();
+			playlistUrl = null;
+			burningSubtitleTrackId = null;
+			return;
+		}
+		if (!sessionRef.id) {
+			burningSubtitleTrackId = null;
+			return;
+		}
+		await restartSession({
+			subtitleTrackId: null,
+			busy: 'subtitles'
+		});
+	}
+
+	async function switchSessionAudio(trackId: string) {
+		await restartSession({
+			audioTrackId: trackId,
+			subtitleTrackId: burningSubtitleTrackId,
+			busy: 'audio'
+		});
 	}
 
 	/** Investigation attach gate: land (shipped), first window seg, or two segs. */
@@ -232,22 +344,14 @@
 		playback != null &&
 			(playback.playbackMethod === 'directPlay' ||
 				playlistUrl != null ||
-				switchingAudio)
-	);
-
-	// Listed but not served (ASS/SSA): readiness absent. Preparing tracks have
-	// readiness without url — do not call those "not rendered".
-	const unrenderedSubtitles = $derived(
-		(playback?.subtitleTracks ?? [])
-			.filter((t) => !t.url && t.readiness == null)
-			.map((t) => `${t.language ?? t.trackId} (${t.codec})`)
-			.join(', ')
+				switchingAudio ||
+				switchingSubtitles)
 	);
 
 	const subtitlesPreparing = $derived(
-		(playback?.subtitleTracks ?? []).some((t) => t.readiness === 'preparing') ||
+		subtitleTracks.some((t) => t.readiness === 'preparing') ||
 			(playback?.subtitleStatus === 'pending' &&
-				!(playback?.subtitleTracks ?? []).some((t) => t.url))
+				!subtitleTracks.some((t) => t.url))
 	);
 
 	// Stable while readiness changes so the watcher is not torn down on every poll.
@@ -269,8 +373,15 @@
 		(async () => {
 			item = await api.getItem(itemId);
 			playback = await api.getPlaybackInfo(itemId);
+			openedAsDirectPlay.value = playback.playbackMethod === 'directPlay';
 			selectedAudioTrackId =
 				playback.audioTracks?.find((t) => t.default)?.trackId ?? null;
+			const tracks = playback.subtitleTracks ?? [];
+			const softFirst =
+				playback.playbackMethod === 'directPlay'
+					? tracks.find((t) => isSoftReady(t))
+					: tracks.find((t) => isHlsSelectable(t));
+			selectedSubtitleTrackId = softFirst?.trackId ?? null;
 
 			// Remux and transcode both play through a session (ADR-0011).
 			if (playback.playbackMethod !== 'directPlay') {
@@ -317,6 +428,9 @@
 		};
 	});
 
+	// Attach only when the playlist URL changes. Subtitle selection must not
+	// be a dependency here — reading selectedSubtitleTrackId in this effect
+	// destroyed hls.js on every soft switch and left playback stopped.
 	$effect(() => {
 		const video = videoEl;
 		const url = playlistUrl;
@@ -326,10 +440,37 @@
 		if (probeOn) console.warn('[nj-subs] item page attaching HLS', url);
 		const handle = attachHls(video, url, resumeRef.seconds);
 		playerRef.handle = handle;
+		untrack(() => {
+			const softId =
+				burningSubtitleTrackId != null ? null : selectedSubtitleTrackId;
+			if (softId && hlsSubtitleTracks.some((t) => t.trackId === softId)) {
+				const idx = hlsSubtitleTracks.findIndex((t) => t.trackId === softId);
+				handle.setSubtitleTrack(idx >= 0 ? idx : -1);
+			} else {
+				handle.setSubtitleTrack(-1);
+			}
+		});
+		resumePlayback(video);
 		return () => {
 			playerRef.handle = null;
 			handle.destroy();
 		};
+	});
+
+	// Restore DirectPlay land after leaving a burn-in session.
+	$effect(() => {
+		const video = videoEl;
+		if (!video || playlistUrl || !playback?.streamUrl) return;
+		const land = resumeRef.seconds;
+		if (land <= 0) return;
+		const onMeta = () => {
+			if (Math.abs(video.currentTime - land) > 0.5) {
+				video.currentTime = land;
+			}
+			resumePlayback(video);
+		};
+		if (video.readyState >= 1) onMeta();
+		else video.addEventListener('loadedmetadata', onMeta, { once: true });
 	});
 
 	// Direct-play progressive `<track>` reload (ADR-0013 §11). HLS captions
@@ -351,7 +492,15 @@
 			isAlive: () => liveRef.alive,
 			onPlaybackInfo: (next) => {
 				playback = next;
+				untrack(() => {
+					if (selectedSubtitleTrackId && !burningSubtitleTrackId) {
+						applySoftSubtitle(selectedSubtitleTrackId);
+					}
+				});
 			}
+		});
+		untrack(() => {
+			if (selectedSubtitleTrackId) applySoftSubtitle(selectedSubtitleTrackId);
 		});
 		return () => handle.destroy();
 	});
@@ -395,14 +544,11 @@
 			<!-- svelte-ignore a11y_media_has_caption -->
 			<video bind:this={videoEl} controls playsinline></video>
 			{#if subtitlesPreparing}
-				<p class="preparing">{copy.subtitlesPreparing}</p>
-			{/if}
-			{#if unrenderedSubtitles}
-				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
+				<p class="preparing" role="status">{copy.subtitlesPreparing}</p>
 			{/if}
 		{:else if playable && playback.streamUrl}
 			{#if subtitlesPreparing}
-				<p class="preparing">{copy.subtitlesPreparing}</p>
+				<p class="preparing" role="status">{copy.subtitlesPreparing}</p>
 			{/if}
 			<!-- svelte-ignore a11y_media_has_caption (language subtitles are not captions; tracks attached by watchProgressiveSubtitles) -->
 			<video
@@ -414,9 +560,6 @@
 			>
 				Your browser cannot play this file directly.
 			</video>
-			{#if unrenderedSubtitles}
-				<p class="preparing">{copy.subtitlesFoundNotRendered} {unrenderedSubtitles}</p>
-			{/if}
 		{:else if preparingSession}
 			<p class="preparing" role="status">{copy.preparingSession}</p>
 		{:else if playback.playbackMethod !== 'directPlay'}
@@ -426,33 +569,18 @@
 		{#if switchingAudio}
 			<p class="preparing" role="status">{copy.switchingAudio}</p>
 		{/if}
+		{#if switchingSubtitles}
+			<p class="preparing" role="status">{copy.switchingSubtitles}</p>
+		{/if}
 
-		{#if playable && playlistUrl && hlsSubtitleTracks.length > 0}
-			<fieldset class="tracks">
-				<legend>{copy.subtitleTrack}</legend>
-				<label>
-					<input
-						type="radio"
-						name="subtitle-track"
-						value="-1"
-						checked={selectedSubtitleIndex < 0}
-						onchange={() => selectSubtitle(-1)}
-					/>
-					{copy.subtitleOff}
-				</label>
-				{#each hlsSubtitleTracks as track, i (track.trackId)}
-					<label>
-						<input
-							type="radio"
-							name="subtitle-track"
-							value={i}
-							checked={selectedSubtitleIndex === i}
-							onchange={() => selectSubtitle(i)}
-						/>
-						{subtitleTrackLabel(track)}
-					</label>
-				{/each}
-			</fieldset>
+		{#if playable && subtitleTracks.length > 0}
+			<SubtitleSwitcher
+				tracks={subtitleTracks}
+				selectedTrackId={selectedSubtitleTrackId}
+				bind:originalStyling
+				disabled={switchingAudio || switchingSubtitles}
+				onSelect={onSubtitleSelect}
+			/>
 		{/if}
 
 		{#if playable && audioTracks.length > 1}
@@ -465,7 +593,7 @@
 							name="audio-track"
 							value={track.trackId}
 							checked={track.trackId === selectedAudioTrackId}
-							disabled={switchingAudio}
+							disabled={switchingAudio || switchingSubtitles}
 							onchange={() => selectAudio(track.trackId)}
 						/>
 						{audioTrackLabel(track)}
@@ -510,6 +638,15 @@
 		margin-top: 1.5rem;
 		background: #000;
 		border-radius: 8px;
+	}
+	/* House subtitle styling (V1_PLAN Phase 2 item 7). Opaque night box —
+	   light moth text fails contrast on bright scenes (~1.4:1) without it.
+	   Platform caption prefs still win where the browser applies them. */
+	:global(video::cue) {
+		font-family: 'Instrument Sans', system-ui, sans-serif;
+		font-size: 1.125rem;
+		color: var(--moth);
+		background-color: var(--night);
 	}
 	.error {
 		color: var(--dusk);
