@@ -340,7 +340,7 @@ export interface components {
          */
         SubtitleStatus: "pending" | "ready" | "none" | "error" | "unavailable";
         /**
-         * @description Server-declared per-track readiness for serveable text tracks (ADR-0013 §11). preparing = extract not yet writing cues; partial = a growing WebVTT is serveable; complete = final WebVTT. Clients never invent this from file size or a timer. Absent on tracks that are listed but not served (ASS/SSA, image).
+         * @description Server-declared per-track readiness for serveable text tracks (ADR-0013 §11). preparing = extract not yet writing cues; partial = a growing WebVTT is serveable; complete = final WebVTT. Clients never invent this from file size or a timer. Absent on burnIn tracks (ADR-0018).
          * @enum {string}
          */
         SubtitleTrackReadiness: "preparing" | "partial" | "complete";
@@ -473,7 +473,7 @@ export interface components {
             /** @description Audio tracks in the source (ADR-0012). Listed the same way for directPlay, remux, and transcode: the client asks for a trackId and never reasons about the delivery path to find tracks. Direct play switches client-side; sessions take audioTrackId at start. */
             audioTracks?: components["schemas"]["AudioTrack"][];
             subtitleStatus: components["schemas"]["SubtitleStatus"];
-            /** @description Text subtitle tracks (ADR-0010 / ADR-0013). Embedded and filesystem sidecars share one shape; differ by source. url is present only when the WebVTT file is already extracted. Listed the same way for directPlay, remux, and transcode. */
+            /** @description Subtitle tracks (ADR-0010 / ADR-0013 / ADR-0018). Soft text and burn-in (ASS/SSA/PGS) share one shape; differ by render. Soft tracks expose url when WebVTT is extracted; burnIn tracks are selected via subtitleTrackId on session start. Listed the same way for directPlay, remux, and transcode. */
             subtitleTracks?: components["schemas"]["SubtitleTrack"][];
         };
         AudioTrack: {
@@ -494,8 +494,13 @@ export interface components {
             /** @description Absolute ffprobe stream index */
             streamIndex: number;
         };
+        /**
+         * @description soft = WebVTT delivery (ADR-0010 / ADR-0013). burnIn = pixels burned into the video encode when selected via subtitleTrackId (ADR-0018).
+         * @enum {string}
+         */
+        SubtitleRender: "soft" | "burnIn";
         SubtitleTrack: {
-            /** @description Stable id used in the VTT URL. Embedded `e{N}`; sidecar `s` / `s-{suffix}` from the filename (ADR-0010). */
+            /** @description Stable id used in the VTT URL or burn-in selection. Embedded `e{N}`; sidecar `s` / `s-{suffix}` from the filename (ADR-0010). */
             trackId: string;
             /** @enum {string} */
             source: "embedded" | "sidecar";
@@ -511,13 +516,14 @@ export interface components {
             sdh: boolean;
             /** @description Absolute ffprobe stream index when source is embedded */
             streamIndex?: number | null;
+            render: components["schemas"]["SubtitleRender"];
             readiness?: components["schemas"]["SubtitleTrackReadiness"];
             /**
              * Format: int64
-             * @description Monotonic growth counter for this track's WebVTT body. Bumps when the server writes more cues (partial) or the final file. Clients that reload on growth compare this field; they do not infer growth from content length.
+             * @description Monotonic growth counter for this track's WebVTT body. Bumps when the server writes more cues (partial) or the final file. Clients that reload on growth compare this field; they do not infer growth from content length. Absent for burnIn tracks.
              */
             revision?: number;
-            /** @description GET path for the WebVTT body when this track is served (partial or complete). Absent while preparing, and for ASS/SSA / image tracks that are still listed. */
+            /** @description GET path for the WebVTT body when this track is soft and served (partial or complete). Absent while preparing, and for burnIn tracks (ADR-0018). */
             url?: string | null;
         };
         /**
@@ -913,8 +919,10 @@ export interface operations {
             query?: {
                 /** @description Encode window start in milliseconds (default 0) */
                 startMs?: number;
-                /** @description Audio track to map, from playbackInfo.audioTracks (ADR-0012). Defaults to the flagged default track, else the first. Switching audio starts a new session at the current position and DELETEs the old one. */
+                /** @description Audio track to map, from playbackInfo.audioTracks (ADR-0012). Defaults to the flagged default track, else the first. Switching audio starts a new session at the current position and DELETEs the old one. On an otherwise DirectPlay title, an over-ceiling track starts a hybrid session (ADR-0012 / ADR-0018). */
                 audioTrackId?: string;
+                /** @description Burn-in subtitle track from playbackInfo.subtitleTracks with render=burnIn (ADR-0018). Soft (WebVTT) tracks are selected via MEDIA / track elements, not this param. Switching burn-in starts a new session at the current position and DELETEs the old one. Selecting burn-in on a DirectPlay title starts a transcode session. */
+                subtitleTrackId?: string;
             };
             header?: never;
             path: {
@@ -942,7 +950,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Item direct plays, or is not ready for a session */
+            /** @description Item direct plays without a track selection that requires encode, or is not ready for a session */
             415: {
                 headers: {
                     [name: string]: unknown;

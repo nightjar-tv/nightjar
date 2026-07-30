@@ -11,8 +11,8 @@ use axum::{
 use nightjar_core::{BROWSER_V0, PlaybackMethod};
 use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
-    AudioSelection, HlsSubtitleTrack, PlaylistError, SessionMode, StartSessionError,
-    list_audio_tracks,
+    AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, PlaylistError, SessionMode,
+    StartSessionError, burn_in_kind_for_codec, list_audio_tracks, list_burn_in_subtitles,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -56,6 +56,7 @@ pub struct TranscodeSessionDto {
 pub struct StartQuery {
     pub start_ms: Option<u64>,
     pub audio_track_id: Option<String>,
+    pub subtitle_track_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,19 +89,6 @@ pub async fn start(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
     let decision = decide(&row);
-    let mode = match decision.method {
-        PlaybackMethod::Remux => SessionMode::Copy,
-        PlaybackMethod::Transcode => SessionMode::Transcode,
-        PlaybackMethod::DirectPlay => {
-            return Err(ApiError {
-                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                message: format!(
-                    "item {item_id} does not need a session: {}",
-                    decision.reason
-                ),
-            });
-        }
-    };
     if row.probe_status != "probed" {
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -116,6 +104,30 @@ pub async fn start(
             ),
         });
     };
+
+    let audio = resolve_audio(&row, query.audio_track_id.as_deref())?;
+    let burn_in = resolve_burn_in(&state, &row, query.subtitle_track_id.as_deref())?;
+
+    // DirectPlay is allowed when a track selection requires encode work the
+    // progressive path cannot do (ADR-0012 hybrid / ADR-0018 burn-in).
+    let needs_encode_selection = burn_in.is_some() || audio.needs_downmix();
+    let mut mode = match decision.method {
+        PlaybackMethod::Remux => SessionMode::Copy,
+        PlaybackMethod::Transcode => SessionMode::Transcode,
+        PlaybackMethod::DirectPlay if needs_encode_selection => SessionMode::Transcode,
+        PlaybackMethod::DirectPlay => {
+            return Err(ApiError {
+                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                message: format!(
+                    "item {item_id} does not need a session: {}",
+                    decision.reason
+                ),
+            });
+        }
+    };
+    if burn_in.is_some() {
+        mode = SessionMode::Transcode;
+    }
 
     let subtitle_tracks = match subtitle_tracks_for(&state, &row) {
         Ok(tracks) => match snapshot_hls_tracks(&state, &row, &tracks) {
@@ -139,8 +151,6 @@ pub async fn start(
             .prioritize_extract(row.id, row.library_id, std::path::PathBuf::from(&row.path));
     }
 
-    let audio = resolve_audio(&row, query.audio_track_id.as_deref())?;
-
     let start_ms = query.start_ms.unwrap_or(0);
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
@@ -155,6 +165,7 @@ pub async fn start(
             mode,
             audio,
             tracks_for_start,
+            burn_in,
         )
     })
     .await
@@ -228,6 +239,67 @@ fn resolve_audio(row: &MediaItemRow, requested: Option<&str>) -> Result<AudioSel
             max_channels,
         },
     })
+}
+
+/// Burn-in track for this session (ADR-0018). Soft track ids are rejected.
+fn resolve_burn_in(
+    state: &AppState,
+    row: &MediaItemRow,
+    requested: Option<&str>,
+) -> Result<Option<BurnInSelection>, ApiError> {
+    let Some(id) = requested else {
+        return Ok(None);
+    };
+    let tracks = subtitle_tracks_for(state, row).map_err(ApiError::internal)?;
+    let track = tracks.iter().find(|t| t.track_id == id).ok_or_else(|| {
+        ApiError::not_found(format!("subtitle track {id} not found for item {}", row.id))
+    })?;
+    if track.render != "burnIn" {
+        return Err(ApiError::not_found(format!(
+            "subtitle track {id} is not a burn-in track"
+        )));
+    }
+    let kind = burn_in_kind_for_codec(&track.codec).ok_or_else(|| {
+        ApiError::not_found(format!(
+            "subtitle track {id} codec {} is not burnable",
+            track.codec
+        ))
+    })?;
+    if track.source == "sidecar" {
+        let sidecars = state
+            .db
+            .list_item_sidecars(row.id)
+            .map_err(ApiError::internal)?;
+        let path = sidecars
+            .iter()
+            .find(|s| s.track_id == id)
+            .map(|s| std::path::PathBuf::from(&s.path))
+            .ok_or_else(|| {
+                ApiError::not_found(format!("sidecar path for burn-in track {id} missing"))
+            })?;
+        return Ok(Some(BurnInSelection {
+            track_id: id.to_string(),
+            kind: BurnInKind::Ass,
+            stream_index: None,
+            subtitle_ordinal: None,
+            sidecar_path: Some(path),
+        }));
+    }
+    let embedded =
+        list_burn_in_subtitles(std::path::Path::new(&row.path)).map_err(ApiError::internal)?;
+    let stream = embedded
+        .iter()
+        .find(|s| s.track_id() == id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("embedded burn-in track {id} missing from probe"))
+        })?;
+    Ok(Some(BurnInSelection {
+        track_id: id.to_string(),
+        kind,
+        stream_index: Some(stream.stream_index),
+        subtitle_ordinal: Some(stream.subtitle_ordinal),
+        sidecar_path: None,
+    }))
 }
 
 fn stored_channels(row: &MediaItemRow) -> u32 {

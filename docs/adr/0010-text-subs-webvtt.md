@@ -105,9 +105,11 @@ pass (Rule 6.1 / 4.9).
 
 ## Consequences
 
-ASS/PGS dialogue remains invisible until burn-in. Probing embedded subtitle
-streams on every playback-info adds a short ffprobe; acceptable for v0. Cache
-files are not swept on item delete yet (orphan VTTs age under the cap).
+ASS/PGS burn-in is decided in [ADR-0018](0018-subtitle-burn-in.md): listed
+with `render: burnIn`, selected via `subtitleTrackId` on session start.
+Probing embedded subtitle streams on every playback-info adds a short
+ffprobe; acceptable for v0. Cache files are not swept on item delete yet
+(orphan VTTs age under the cap).
 External NFO / artwork sidecars are Phase 3 metadata-import work, not this
 slice. SRT files that are not UTF-8 are decoded with a Windows-1252 fallback
 after a strict UTF-8 attempt so a bad encoding fails closed to legible text

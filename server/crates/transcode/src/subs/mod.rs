@@ -27,8 +27,16 @@ use std::time::{Duration, Instant};
 /// Codecs we can convert to WebVTT without burn-in.
 const TEXT_SUB_CODECS: &[&str] = &["subrip", "srt", "webvtt", "mov_text", "text"];
 
+/// Codecs that need burn-in (ADR-0018). Soft WebVTT extract is not possible.
+const BURN_IN_CODECS: &[&str] = &["ass", "ssa", "hdmv_pgs_subtitle"];
+
 /// Kill a runaway extract rather than leave ffmpeg demuxing forever on a NAS.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// ASS burn-in demux can take many minutes on a large NAS remux (full interleaved
+/// read). Longer than text extract: session start waits for a local `.ass` so
+/// libass does not re-open the container at filter init (ADR-0018).
+const ASS_BURN_EXTRACT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// How often to publish a growing WebVTT while FFmpeg demuxes (ADR-0013 §11).
 const PROGRESS_TICK: Duration = Duration::from_millis(500);
@@ -109,6 +117,59 @@ impl TextSubtitleStream {
     }
 }
 
+/// How a listed subtitle track is delivered (ADR-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleRender {
+    Soft,
+    BurnIn,
+}
+
+impl SubtitleRender {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::BurnIn => "burnIn",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurnInKind {
+    /// ASS / SSA via libass (`ass=` on a local file).
+    Ass,
+    /// Bitmap PGS via overlay.
+    Pgs,
+}
+
+/// One burn-in track for session encode (ADR-0018).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurnInSelection {
+    pub track_id: String,
+    pub kind: BurnInKind,
+    /// Absolute ffprobe stream index when embedded.
+    pub stream_index: Option<u32>,
+    /// 0-based index among all subtitle streams (`si=` / `0:s:N`).
+    pub subtitle_ordinal: Option<u32>,
+    pub sidecar_path: Option<PathBuf>,
+}
+
+/// Embedded burn-in stream discovered by ffprobe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurnInSubtitleStream {
+    pub stream_index: u32,
+    pub subtitle_ordinal: u32,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub kind: BurnInKind,
+}
+
+impl BurnInSubtitleStream {
+    pub fn track_id(&self) -> String {
+        format!("e{}", self.stream_index)
+    }
+}
+
 /// Filesystem sidecar input for a scan-time extract job.
 #[derive(Debug, Clone)]
 pub struct SidecarInput {
@@ -130,12 +191,108 @@ pub fn is_text_subtitle_codec(codec: &str) -> bool {
     TEXT_SUB_CODECS.iter().any(|t| *t == c)
 }
 
+pub fn is_burn_in_codec(codec: &str) -> bool {
+    let c = codec.to_ascii_lowercase();
+    BURN_IN_CODECS.iter().any(|t| *t == c)
+}
+
+pub fn burn_in_kind_for_codec(codec: &str) -> Option<BurnInKind> {
+    match codec.to_ascii_lowercase().as_str() {
+        "ass" | "ssa" => Some(BurnInKind::Ass),
+        "hdmv_pgs_subtitle" => Some(BurnInKind::Pgs),
+        _ => None,
+    }
+}
+
 pub fn is_serveable_sidecar_format(format: &str) -> bool {
     matches!(format.to_ascii_lowercase().as_str(), "srt" | "vtt")
 }
 
-/// Lists text subtitle streams in `src`. Image/ASS tracks are skipped.
-pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String> {
+pub fn is_burn_in_sidecar_format(format: &str) -> bool {
+    matches!(format.to_ascii_lowercase().as_str(), "ass" | "ssa")
+}
+
+/// Demux one embedded ASS/SSA stream to a local `.ass` for libass burn-in.
+///
+/// `subtitles=<src>:si=N` re-opens the container and demuxes every cue before
+/// the first frame — on a multi-GB NAS title that stalls HLS for the whole
+/// demux. A local file lets `ass=` start encoding immediately after this copy.
+pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create ASS burn dir {}: {e}", parent.display()))?;
+    }
+    let tmp = dest.with_extension("tmp.ass");
+    let map = format!("0:{stream_index}");
+    let src_bytes = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let started = Instant::now();
+    let mut cmd = Command::new("ffmpeg");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(src)
+        .args(["-map", &map, "-c:s", "copy", "-flush_packets", "1"])
+        .arg(&tmp);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "ffmpeg not found on PATH".into()
+        } else {
+            format!("spawn ffmpeg ASS extract for {}: {e}", src.display())
+        }
+    })?;
+
+    if let Err(e) = wait_extract_child(&mut child, ASS_BURN_EXTRACT_TIMEOUT, || {}) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "ASS burn extract failed for {} stream {stream_index}: {e}",
+            src.display()
+        ));
+    }
+
+    let meta = fs::metadata(&tmp).map_err(|e| {
+        format!(
+            "ASS burn extract wrote no file for {} stream {stream_index}: {e}",
+            src.display()
+        )
+    })?;
+    if meta.len() == 0 {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "ASS burn extract empty for {} stream {stream_index}",
+            src.display()
+        ));
+    }
+    let track_bytes = meta.len();
+    fs::rename(&tmp, dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "publish ASS burn file {} -> {}: {e}",
+            tmp.display(),
+            dest.display()
+        )
+    })?;
+    // Load-bearing for cold-path wait estimates (ADR-0018 / ADR-0019): the
+    // product rolls `src_mib_per_s` into the viewer's range. Field names and
+    // `info` level are the contract — not temporary instrumentation.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let elapsed_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
+    let src_mib_per_s = (src_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+    tracing::info!(
+        src = %src.display(),
+        stream_index,
+        dest = %dest.display(),
+        src_bytes,
+        track_bytes,
+        elapsed_ms,
+        src_mib_per_s,
+        "ass_burn_extract_finished"
+    );
+    Ok(())
+}
+
+fn probe_subtitle_streams(src: &Path) -> Result<Vec<FfSubStream>, String> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -165,8 +322,13 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
     }
     let parsed: FfprobeSubs = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("parse ffprobe json for {}: {e}", src.display()))?;
+    Ok(parsed.streams.unwrap_or_default())
+}
+
+/// Lists text subtitle streams in `src`. Image/ASS tracks are skipped.
+pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String> {
     let mut out = Vec::new();
-    for stream in parsed.streams.unwrap_or_default() {
+    for stream in probe_subtitle_streams(src)? {
         let codec = stream.codec_name.unwrap_or_default();
         if !is_text_subtitle_codec(&codec) {
             continue;
@@ -181,6 +343,32 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
             codec,
             title: tags.title.filter(|s| !s.is_empty()),
         });
+    }
+    Ok(out)
+}
+
+/// Lists ASS/SSA/PGS streams that need burn-in (ADR-0018).
+pub fn list_burn_in_subtitles(src: &Path) -> Result<Vec<BurnInSubtitleStream>, String> {
+    let mut out = Vec::new();
+    let mut ordinal = 0u32;
+    for stream in probe_subtitle_streams(src)? {
+        let codec = stream.codec_name.unwrap_or_default();
+        let Some(index) = stream.index else {
+            ordinal = ordinal.saturating_add(1);
+            continue;
+        };
+        if let Some(kind) = burn_in_kind_for_codec(&codec) {
+            let tags = stream.tags.unwrap_or_default();
+            out.push(BurnInSubtitleStream {
+                stream_index: index,
+                subtitle_ordinal: ordinal,
+                codec,
+                language: container_stream_language(tags.language),
+                title: tags.title.filter(|s| !s.is_empty()),
+                kind,
+            });
+        }
+        ordinal = ordinal.saturating_add(1);
     }
     Ok(out)
 }
@@ -906,6 +1094,39 @@ mod tests {
         assert!(is_text_subtitle_codec("mov_text"));
         assert!(!is_text_subtitle_codec("ass"));
         assert!(!is_text_subtitle_codec("hdmv_pgs_subtitle"));
+        assert!(is_burn_in_codec("ass"));
+        assert!(is_burn_in_codec("ssa"));
+        assert!(is_burn_in_codec("hdmv_pgs_subtitle"));
+        assert_eq!(burn_in_kind_for_codec("ass"), Some(BurnInKind::Ass));
+        assert_eq!(
+            burn_in_kind_for_codec("hdmv_pgs_subtitle"),
+            Some(BurnInKind::Pgs)
+        );
+        assert!(!is_burn_in_sidecar_format("srt"));
+        assert!(is_burn_in_sidecar_format("ass"));
+    }
+
+    #[test]
+    fn lists_ass_and_pgs_corpus_as_burn_in() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let ass = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_ass_mkv.mkv");
+        let streams = list_burn_in_subtitles(&ass).expect("list ass");
+        assert!(
+            streams.iter().any(|s| s.kind == BurnInKind::Ass),
+            "{streams:?}"
+        );
+        assert!(list_text_subtitles(&ass).unwrap().is_empty());
+
+        let pgs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_pgs_mkv.mkv");
+        let streams = list_burn_in_subtitles(&pgs).expect("list pgs");
+        assert!(
+            streams.iter().any(|s| s.kind == BurnInKind::Pgs),
+            "{streams:?}"
+        );
     }
 
     #[test]
