@@ -227,7 +227,7 @@ export interface paths {
         };
         /**
          * HLS media playlist for a producer run
-         * @description Assembled from the session-global time-keyed segment map (ADR-0020). Segment URIs are session-root relative (`../seg_<ms>.m4s`). EVENT while cooking; ENDLIST at that run's EOF. EXT-X-START is window-relative.
+         * @description Assembled from the session-global time-keyed segment map (ADR-0020). Segment URIs are session-root relative (`../../seg_<ms>.m4s` from `/runs/{runId}/index.m3u8`). EVENT while cooking; ENDLIST at that run's EOF. EXT-X-START is window-relative.
          */
         get: operations["getSessionPlaylist"];
         put?: never;
@@ -1191,7 +1191,7 @@ export interface operations {
     getSessionAsset: {
         parameters: {
             query?: {
-                /** @description Log-only client marker. Serving ignores this. JS land-ensure and attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503/204 behaviour. */
+                /** @description Log-only client marker. Serving ignores this. Attach-wait probes may set it (`attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503/204 behaviour. Far scrub is POST /seek (ADR-0020) — clients must not poke segment URIs to force cooking. */
                 njFetcher?: string;
             };
             header?: never;
