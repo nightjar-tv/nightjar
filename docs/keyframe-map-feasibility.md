@@ -40,6 +40,14 @@ index,” which is a cheap sample on the dogfood library before any ADR.
 
 Byte offsets for seek land come free from the same `index_entries` source.
 
+**Framing for wall-clock estimates.** A multi-hour number is fine if the
+pass is **one-time** (or incremental on mtime/size change) and **resumable**
+on a self-hosted server. It is not fine as a cost paid on every full
+rescan. Say which before the estimate reads as a blocker. A timed-seek
+proxy on 2026-07-31 suggested ~half the library may need a walk fallback —
+that figure is not quotable until replaced by a direct Cues/`stss` /
+`index_entries` read.
+
 ## Gating experiment: can we predict cut boundaries?
 
 Recording keyframes is not enough for a full-title playlist. The unproven

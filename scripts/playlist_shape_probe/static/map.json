@@ -1,0 +1,281 @@
+{
+  "title_duration_s": 1325.575,
+  "runs": {
+    "run_a": {
+      "target": 4,
+      "segs": [
+        {
+          "ffmpeg_name": "seg005.m4s",
+          "uri": "seg_00000008008.m4s",
+          "start_ms": 8008,
+          "extinf_s": 4.004,
+          "sidx_ms": 8008.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg006.m4s",
+          "uri": "seg_00000012011.m4s",
+          "start_ms": 12011,
+          "extinf_s": 4.004,
+          "sidx_ms": 12011.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg007.m4s",
+          "uri": "seg_00000016015.m4s",
+          "start_ms": 16015,
+          "extinf_s": 4.004,
+          "sidx_ms": 16015.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg008.m4s",
+          "uri": "seg_00000020019.m4s",
+          "start_ms": 20019,
+          "extinf_s": 4.004,
+          "sidx_ms": 20019.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg009.m4s",
+          "uri": "seg_00000024023.m4s",
+          "start_ms": 24023,
+          "extinf_s": 4.004,
+          "sidx_ms": 24023.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg010.m4s",
+          "uri": "seg_00000028027.m4s",
+          "start_ms": 28027,
+          "extinf_s": 4.004,
+          "sidx_ms": 28027.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg011.m4s",
+          "uri": "seg_00000032031.m4s",
+          "start_ms": 32031,
+          "extinf_s": 4.004,
+          "sidx_ms": 32031.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg012.m4s",
+          "uri": "seg_00000036035.m4s",
+          "start_ms": 36035,
+          "extinf_s": 4.004,
+          "sidx_ms": 36035.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg013.m4s",
+          "uri": "seg_00000040039.m4s",
+          "start_ms": 40039,
+          "extinf_s": 4.004,
+          "sidx_ms": 40039.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg014.m4s",
+          "uri": "seg_00000044043.m4s",
+          "start_ms": 44043,
+          "extinf_s": 0.459,
+          "sidx_ms": 44043.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg015.m4s",
+          "uri": "seg_00000044502.m4s",
+          "start_ms": 44502,
+          "extinf_s": 2.294,
+          "sidx_ms": 44502.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg016.m4s",
+          "uri": "seg_00000046796.m4s",
+          "start_ms": 46796,
+          "extinf_s": 1.251,
+          "sidx_ms": 46796.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg017.m4s",
+          "uri": "seg_00000048047.m4s",
+          "start_ms": 48047,
+          "extinf_s": 2.009,
+          "sidx_ms": 48047.0,
+          "gate_ok": true
+        }
+      ],
+      "init_uri": "init_run_a.mp4"
+    },
+    "run_b": {
+      "target": 4,
+      "segs": [
+        {
+          "ffmpeg_name": "seg300.m4s",
+          "uri": "seg_00000597597.m4s",
+          "start_ms": 597597,
+          "extinf_s": 3.003,
+          "sidx_ms": 597597.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg301.m4s",
+          "uri": "seg_00000600599.m4s",
+          "start_ms": 600599,
+          "extinf_s": 2.961,
+          "sidx_ms": 600599.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg302.m4s",
+          "uri": "seg_00000603561.m4s",
+          "start_ms": 603561,
+          "extinf_s": 1.043,
+          "sidx_ms": 603561.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg303.m4s",
+          "uri": "seg_00000604603.m4s",
+          "start_ms": 604603,
+          "extinf_s": 4.004,
+          "sidx_ms": 604603.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg304.m4s",
+          "uri": "seg_00000608607.m4s",
+          "start_ms": 608607,
+          "extinf_s": 2.92,
+          "sidx_ms": 608607.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg305.m4s",
+          "uri": "seg_00000611527.m4s",
+          "start_ms": 611527,
+          "extinf_s": 1.084,
+          "sidx_ms": 611527.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg306.m4s",
+          "uri": "seg_00000612611.m4s",
+          "start_ms": 612611,
+          "extinf_s": 4.004,
+          "sidx_ms": 612611.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg307.m4s",
+          "uri": "seg_00000616615.m4s",
+          "start_ms": 616615,
+          "extinf_s": 1.71,
+          "sidx_ms": 616615.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg308.m4s",
+          "uri": "seg_00000618325.m4s",
+          "start_ms": 618325,
+          "extinf_s": 1.668,
+          "sidx_ms": 618325.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg309.m4s",
+          "uri": "seg_00000619994.m4s",
+          "start_ms": 619994,
+          "extinf_s": 0.626,
+          "sidx_ms": 619994.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg310.m4s",
+          "uri": "seg_00000620619.m4s",
+          "start_ms": 620619,
+          "extinf_s": 1.835,
+          "sidx_ms": 620619.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg311.m4s",
+          "uri": "seg_00000622454.m4s",
+          "start_ms": 622454,
+          "extinf_s": 2.169,
+          "sidx_ms": 622454.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg312.m4s",
+          "uri": "seg_00000624623.m4s",
+          "start_ms": 624623,
+          "extinf_s": 2.044,
+          "sidx_ms": 624623.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg313.m4s",
+          "uri": "seg_00000626667.m4s",
+          "start_ms": 626667,
+          "extinf_s": 1.626,
+          "sidx_ms": 626667.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg314.m4s",
+          "uri": "seg_00000628294.m4s",
+          "start_ms": 628294,
+          "extinf_s": 0.334,
+          "sidx_ms": 628294.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg315.m4s",
+          "uri": "seg_00000628627.m4s",
+          "start_ms": 628627,
+          "extinf_s": 2.461,
+          "sidx_ms": 628627.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg316.m4s",
+          "uri": "seg_00000631088.m4s",
+          "start_ms": 631088,
+          "extinf_s": 1.543,
+          "sidx_ms": 631088.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg317.m4s",
+          "uri": "seg_00000632631.m4s",
+          "start_ms": 632631,
+          "extinf_s": 4.004,
+          "sidx_ms": 632631.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg318.m4s",
+          "uri": "seg_00000636635.m4s",
+          "start_ms": 636635,
+          "extinf_s": 2.586,
+          "sidx_ms": 636635.0,
+          "gate_ok": true
+        },
+        {
+          "ffmpeg_name": "seg319.m4s",
+          "uri": "seg_00000639221.m4s",
+          "start_ms": 639221,
+          "extinf_s": 0.861,
+          "sidx_ms": 639221.0,
+          "gate_ok": true
+        }
+      ],
+      "init_uri": "init_run_b.mp4"
+    }
+  }
+}

@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Playlist shape probe</title>
+  <style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; max-width: 960px; }
+    video { width: 100%; max-width: 720px; background: #111; }
+    button, select { margin: 4px 4px 4px 0; }
+    #log { white-space: pre-wrap; font: 12px/1.35 ui-monospace, monospace;
+           background: #f4f4f4; padding: 8px; max-height: 320px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Playlist shape probe</h1>
+  <p>
+    Title duration (UI bar): <span id="titleDur"></span>s.
+    Seekable from player: <span id="seekable">—</span>.
+    currentTime: <span id="ct">—</span>.
+  </p>
+  <p>
+    Engine:
+    <select id="engine">
+      <option value="hlsjs">hls.js</option>
+      <option value="native">Safari native</option>
+    </select>
+    Shape:
+    <select id="shape">
+      <option value="a">A — mutate EVENT same URI</option>
+      <option value="b">B — fresh EVENT URI per land</option>
+      <option value="c">C — fresh VOD+ENDLIST URI per land</option>
+    </select>
+    <button id="attach">Attach land A</button>
+    <button id="seekFar">Seek to land B time (~600s)</button>
+    <button id="seekNear">Seek within land A (~20s)</button>
+    <button id="mutate">Mutate A→B (shape A only)</button>
+    <button id="switchB">Switch playlist URI to land B (B/C)</button>
+    <button id="dump">Dump JSON</button>
+  </p>
+  <video id="v" controls playsinline></video>
+  <div id="log"></div>
+  <script src="hls.min.js"></script>
+  <script>
+(function () {
+  const TITLE_DURATION_S = 1325.575;
+  const LAND_B_S = 600;
+  const LAND_A_NEAR_S = 20;
+  document.getElementById("titleDur").textContent = TITLE_DURATION_S.toFixed(3);
+
+  const v = document.getElementById("v");
+  const logEl = document.getElementById("log");
+  const events = [];
+  const t0 = performance.now();
+  let hls = null;
+
+  function log(kind, detail) {
+    const row = { ms: Math.round(performance.now() - t0), kind, detail: detail || null };
+    events.push(row);
+    logEl.textContent += JSON.stringify(row) + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function seekableSummary() {
+    const ranges = [];
+    for (let i = 0; i < v.seekable.length; i++) {
+      ranges.push([v.seekable.start(i), v.seekable.end(i)]);
+    }
+    return { duration: v.duration, seekable: ranges, currentTime: v.currentTime };
+  }
+
+  function tick() {
+    const s = seekableSummary();
+    document.getElementById("seekable").textContent = JSON.stringify(s.seekable);
+    document.getElementById("ct").textContent = String(s.currentTime);
+  }
+  setInterval(tick, 250);
+
+  ["loadedmetadata", "durationchange", "seeked", "playing", "pause", "waiting", "error"].forEach((ev) => {
+    v.addEventListener(ev, () => {
+      const detail = seekableSummary();
+      if (ev === "error" && v.error) detail.mediaError = { code: v.error.code, message: v.error.message };
+      log(ev, detail);
+    });
+  });
+
+  function destroyHls() {
+    if (hls) { hls.destroy(); hls = null; }
+    v.removeAttribute("src");
+    v.load();
+  }
+
+  function playlistFor(shape, land) {
+    if (shape === "a") return "shape_a_event.m3u8";
+    if (shape === "b") return land === "b" ? "shape_b_land_b.m3u8" : "shape_b_land_a.m3u8";
+    return land === "b" ? "shape_c_land_b.m3u8" : "shape_c_land_a.m3u8";
+  }
+
+  function attach(land) {
+    const engine = document.getElementById("engine").value;
+    const shape = document.getElementById("shape").value;
+    const url = new URL(playlistFor(shape, land), location.href).href;
+    destroyHls();
+    log("attach", { engine, shape, land, url });
+    if (engine === "native") {
+      v.src = url;
+      v.play().catch((e) => log("play_reject", String(e)));
+      return;
+    }
+    if (!window.Hls || !Hls.isSupported()) {
+      log("hls_unsupported", null);
+      return;
+    }
+    hls = new Hls({ enableWorker: true });
+    hls.on(Hls.Events.ERROR, (_, data) => log("hls_error", data));
+    hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => log("hls_manifest", { levels: data.levels && data.levels.length }));
+    hls.loadSource(url);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      v.play().catch((e) => log("play_reject", String(e)));
+    });
+  }
+
+  function seekTo(seconds) {
+    const before = seekableSummary();
+    log("seek_request", { seconds, before });
+    try {
+      v.currentTime = seconds;
+    } catch (e) {
+      log("seek_throw", String(e));
+    }
+    setTimeout(() => log("seek_after_250ms", seekableSummary()), 250);
+    setTimeout(() => log("seek_after_1500ms", seekableSummary()), 1500);
+  }
+
+  document.getElementById("attach").onclick = () => attach("a");
+  document.getElementById("seekFar").onclick = () => seekTo(LAND_B_S);
+  document.getElementById("seekNear").onclick = () => seekTo(LAND_A_NEAR_S);
+  document.getElementById("mutate").onclick = async () => {
+    const res = await fetch("/mutate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ region: "b" }),
+    });
+    log("mutate_response", await res.json());
+    // Force playlist reload without changing URI (native + hls.js)
+    if (hls) {
+      hls.loadSource(new URL("shape_a_event.m3u8", location.href).href);
+    } else {
+      // native: re-assign same src to coax reload
+      const url = v.currentSrc || new URL("shape_a_event.m3u8", location.href).href;
+      v.src = url;
+      v.load();
+      v.play().catch((e) => log("play_reject", String(e)));
+    }
+  };
+  document.getElementById("switchB").onclick = () => attach("b");
+  document.getElementById("dump").onclick = () => {
+    const blob = new Blob([JSON.stringify(events, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "playlist_shape_events.json";
+    a.click();
+    log("dump", { n: events.length });
+  };
+
+  // Auto-attach when ?auto=1&engine=&shape=
+  const params = new URLSearchParams(location.search);
+  if (params.get("engine")) document.getElementById("engine").value = params.get("engine");
+  if (params.get("shape")) document.getElementById("shape").value = params.get("shape");
+  if (params.get("auto") === "1") attach("a");
+})();
+  </script>
+</body>
+</html>
