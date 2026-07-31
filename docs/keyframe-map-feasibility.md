@@ -3,11 +3,14 @@
 - Status: note only (ready to become an ADR; no schema, no code)
 - Date: 2026-07-31
 
-One artifact keeps answering four separate questions: trickplay thumbnails,
+One artifact keeps answering five separate questions: trickplay thumbnails,
 damaged-file detection (8519-class truncated indexes), restart latency (skip
-probe, byte-offset seek, deterministic `-segment_times`), and publishing a
-full-title playlist whose names and `EXTINF` are true. That pattern usually
-means a missing piece, not an optimisation.
+probe, byte-offset seek, deterministic `-segment_times`), publishing a
+full-title playlist whose names and `EXTINF` are true, and an **instant
+damage banner** (usable extent known at scan time instead of ~56 s after a
+hung mid-title EOF — the user's first experience of a damaged title today
+is a stall, then an explanation). That pattern usually means a missing
+piece, not an optimisation.
 
 ## What the map is
 
@@ -43,31 +46,35 @@ Byte offsets for seek land come free from the same `index_entries` source.
 **Framing for wall-clock estimates.** A multi-hour number is fine if the
 pass is **one-time** (or incremental on mtime/size change) and **resumable**
 on a self-hosted server. It is not fine as a cost paid on every full
-rescan. Say which before the estimate reads as a blocker. A timed-seek
-proxy on 2026-07-31 suggested ~half the library may need a walk fallback —
-that figure is not quotable until replaced by a direct Cues/`stss` /
-`index_entries` read.
+rescan. Say which before the estimate reads as a blocker.
 
-## Gating experiment: can we predict cut boundaries?
+Direct Cues/`stss` sample (2026-07-31, n=250): index present 86.0%,
+truncated 2.0%, packet-walk fallback 16.0%. Full-library one-time header
+parse @ p50 ≈ 10.07 h (incremental on mtime/size; not per-rescan). See
+`nightjar-meta/notes/index-availability-direct-2026-07-31.*`. The earlier
+timed-seek proxy (32.4% / 50.4% / ~22.4 h) is superseded — do not quote it.
+At 2% truncated, the 8519-class is on the order of ~500 items in a 25k
+library, not ~8,000.
 
-Recording keyframes is not enough for a full-title playlist. The unproven
-step is whether FFmpeg’s HLS cut rule is a pure function of the keyframe
-list and `hls_time`.
+**House rule.** Never derive a rate from a timing proxy when a direct read
+exists. This week a timed 90% seek, a 0.9 fps `setState` path, and two
+contradictory far-scrub runs each produced a quotable wrong number. Direct
+container reads (Cues / `stss` / `index_entries`) settle integrity; timing
+instruments settle latency.
 
-From measured copy runs the rule looks deterministic: cut at the first
-keyframe at or after `hls_time` has elapsed since the previous cut.
-Elementary with ~10.4s GOPs and `hls_time` 2 cut at every keyframe; Rick
-and Morty at `hls_time` 10 packed 5–8 keyframes per segment.
+## Gating experiment: dictated cuts, not prediction
 
-**Gating test (no encoding, no server, about an hour):** take the keyframe
-lists for those two titles, simulate the cut rule offline, and compare the
-predicted segment start times to the boundaries those titles actually
-produced. If simulation matches production, full-title playlists can return
-with honest time-keyed names. If it does not, the map still buys land,
-damage, trickplay, and offsets — but not pre-declared full-title `EXTINF`.
+Recording keyframes is not enough for a full-title playlist. `-hls_time` is
+a heuristic; the residual short-GOP packing question only matters if
+dictated cuts fail. The gate is therefore:
 
-That single test decides whether full-title comes back. Run it before the
-ADR commits to playlist shape.
+1. Were the requested cut times actual keyframes? (Elementary 10.4s GOP is
+   the binding case — if they were not mapped KFs, a miss is expected.)
+2. Does production `-f hls` honour `-segment_times` in copy mode? A yes on
+   `-f segment` does not transfer. If HLS ignores the list, the fallback is
+   `-f segment` writing fMP4 with our own playlist (already generated).
+
+No further cut-rule prediction work until those two answers land.
 
 ## Honest full-title, cook-on-miss, and native scrubbing
 
@@ -122,8 +129,8 @@ return:
   compensation) can go — native `seekable` is the title again.
 - Much of the cook-window / land-ensure polling shrinks to “map says land
   L; wait for first real segment at L” (or miss-hold on the listed URI).
-- Damage UI keys off map usable-extent instead of discovering empty EOF
-  mid-title after a hung seek.
+- Damage UI keys off map usable-extent at session start — banner is instant
+  instead of painting after a ~56 s empty-EOF hang (8512 measured).
 - Trickplay samples mapped times; restart skips emergency probe when
   offsets exist.
 
@@ -132,12 +139,15 @@ depth-sensitive hops (ADR-0008 note).
 
 ## Recommendation
 
-1. Sample how many dogfood-library files lack a usable container index
-   (defines scan cost and 8519 coverage).
-2. Run the cut-rule simulation on Elementary + Rick and Morty (gating).
-3. ADR: map storage + index-first scan write + session land from map;
-   revive cook-on-miss with the “justification returning” framing; full-
-   title playlist only if step 2 passes.
+1. ~~Sample index availability~~ — direct Cues/`stss`: 2% truncated, 16%
+   walk fallback; scan is one-time/incremental.
+2. Confirm Elementary dictated times were real keyframes; then test
+   `-f hls` + `-segment_times` in copy mode. Full-title only if that path
+   (or `-f segment` + own playlist) is honest.
+3. ADR: map storage + index-first scan write + session land from map +
+   scan-time usable extent (instant damage banner); revive cook-on-miss
+   with the “justification returning” framing; full-title only if step 2
+   passes.
 4. Trickplay after the map exists.
 
 No code in this note.
