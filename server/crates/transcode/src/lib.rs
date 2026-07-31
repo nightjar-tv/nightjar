@@ -5,13 +5,14 @@
 
 mod audio;
 mod hls;
+mod hls_segment_map;
 mod hwaccel;
 mod subs;
 
 pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
     AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PlaylistError,
-    SegmentMissAction, SessionEncoder, SessionMode, StartSessionError, WindowAction,
+    SegmentMissAction, SessionEncoder, SessionMode, SessionView, StartSessionError, WindowAction,
     decide_segment_miss, decide_window_action,
 };
 pub use hwaccel::{

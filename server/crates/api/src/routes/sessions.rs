@@ -49,6 +49,9 @@ pub struct TranscodeSessionDto {
     pub playlist_url: String,
     pub video_encoder: String,
     pub encoder_kind: &'static str,
+    pub landed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usable_extent_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -61,8 +64,8 @@ pub struct StartQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PlaylistQuery {
-    pub start_ms: Option<u64>,
+pub struct SeekQuery {
+    pub start_ms: u64,
 }
 
 /// Log-only marker on segment GETs (`njFetcher`). Serving ignores it.
@@ -76,6 +79,18 @@ pub struct AssetQuery {
 enum PlaylistKind {
     Master,
     Media,
+}
+
+fn dto_from_view(view: nightjar_transcode::SessionView) -> TranscodeSessionDto {
+    TranscodeSessionDto {
+        session_id: view.session_id,
+        item_id: view.item_id,
+        playlist_url: view.playlist_url,
+        video_encoder: view.video_encoder,
+        encoder_kind: view.encoder_kind.as_str(),
+        landed_ms: view.landed_ms,
+        usable_extent_ms: view.usable_extent_ms,
+    }
 }
 
 pub async fn start(
@@ -173,20 +188,11 @@ pub async fn start(
 
     match started {
         Ok(session_id) => {
-            let encoder = hls.encoder(&session_id).ok_or_else(|| {
-                ApiError::internal(format!("session {session_id} disappeared after start"))
+            let view = hls.view(&session_id).map_err(|e| {
+                ApiError::internal(format!("session {session_id} view after start: {e:?}"))
             })?;
             log_hls_client_req(&session_id, "POST /sessions", Some(start_ms), 202, None);
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(TranscodeSessionDto {
-                    playlist_url: format!("/api/v0/sessions/{session_id}/master.m3u8"),
-                    session_id,
-                    item_id,
-                    video_encoder: encoder.name,
-                    encoder_kind: encoder.kind.as_str(),
-                }),
-            ))
+            Ok((StatusCode::ACCEPTED, Json(dto_from_view(view))))
         }
         Err(StartSessionError::CapFull) => {
             log_hls_client_req("-", "POST /sessions", Some(start_ms), 503, None);
@@ -364,20 +370,88 @@ fn snapshot_hls_tracks(
     Ok(out)
 }
 
-pub async fn master(
+pub async fn get(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    Query(query): Query<PlaylistQuery>,
+) -> ApiResult<Json<TranscodeSessionDto>> {
+    let hls = Arc::clone(&state.hls);
+    let sid = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || hls.view(&sid))
+        .await
+        .map_err(|e| ApiError::internal(format!("hls view task: {e}")))?;
+    match result {
+        Ok(view) => {
+            log_hls_client_req(&session_id, "GET /sessions", None, 200, None);
+            Ok(Json(dto_from_view(view)))
+        }
+        Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
+            "session {session_id} not found"
+        ))),
+        Err(PlaylistError::Failed(e)) => Err(ApiError::internal(e)),
+        Err(other) => Err(ApiError::internal(format!("{other:?}"))),
+    }
+}
+
+pub async fn seek(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SeekQuery>,
+) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
+    let hls = Arc::clone(&state.hls);
+    let sid = session_id.clone();
+    let start_ms = query.start_ms;
+    let result = tokio::task::spawn_blocking(move || hls.seek(&sid, start_ms))
+        .await
+        .map_err(|e| ApiError::internal(format!("hls seek task: {e}")))?;
+    match result {
+        Ok(view) => {
+            log_hls_client_req(&session_id, "POST /seek", Some(start_ms), 202, None);
+            Ok((StatusCode::ACCEPTED, Json(dto_from_view(view))))
+        }
+        Err(PlaylistError::NotFound) => Err(ApiError::not_found(format!(
+            "session {session_id} not found"
+        ))),
+        Err(PlaylistError::Failed(e)) => Err(ApiError::internal(e)),
+        Err(other) => Err(ApiError::internal(format!("seek failed: {other:?}"))),
+    }
+}
+
+pub async fn master(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, u64)>,
 ) -> ApiResult<Response> {
-    wait_playlist(state, session_id, query.start_ms, PlaylistKind::Master).await
+    wait_playlist(state, session_id, run_id, PlaylistKind::Master).await
 }
 
 pub async fn playlist(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Query(query): Query<PlaylistQuery>,
+    Path((session_id, run_id)): Path<(String, u64)>,
 ) -> ApiResult<Response> {
-    wait_playlist(state, session_id, query.start_ms, PlaylistKind::Media).await
+    wait_playlist(state, session_id, run_id, PlaylistKind::Media).await
+}
+
+pub async fn run_init(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, u64)>,
+) -> ApiResult<Response> {
+    let hls = Arc::clone(&state.hls);
+    let sid = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || hls.run_asset(&sid, run_id, "init.mp4"))
+        .await
+        .map_err(|e| ApiError::internal(format!("hls run init task: {e}")))?;
+    match result {
+        Ok(bytes) => {
+            log_hls_client_req(&session_id, "init.mp4", None, 200, None);
+            let mut res = Response::new(Body::from(bytes));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            res.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            Ok(res)
+        }
+        Err(e) => map_playlist_err(&session_id, e),
+    }
 }
 
 pub async fn subtitle_playlist(
@@ -447,13 +521,13 @@ pub async fn subtitle_playlist(
 async fn wait_playlist(
     state: AppState,
     session_id: String,
-    start_ms: Option<u64>,
+    run_id: u64,
     kind: PlaylistKind,
 ) -> ApiResult<Response> {
     let hls = Arc::clone(&state.hls);
     let sid = session_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // The playlist is held back until FFmpeg writes the init segment.
+        // The playlist is held back until the map has at least one segment.
         // Mid-title hardware sessions on a real library can take longer than
         // 5s to produce the first segment, especially during an audio switch
         // if the old session has only just been reaped. Match SEGMENT_WAIT in
@@ -461,8 +535,8 @@ async fn wait_playlist(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let outcome = match kind {
-                PlaylistKind::Master => hls.master(&sid, start_ms),
-                PlaylistKind::Media => hls.playlist(&sid, start_ms),
+                PlaylistKind::Master => hls.master(&sid, run_id),
+                PlaylistKind::Media => hls.playlist(&sid, run_id),
             };
             match outcome {
                 Err(PlaylistError::NotReady) if std::time::Instant::now() < deadline => {
@@ -481,7 +555,7 @@ async fn wait_playlist(
                 PlaylistKind::Master => "master.m3u8",
                 PlaylistKind::Media => "index.m3u8",
             };
-            log_hls_client_req(&session_id, resource, start_ms, 200, None);
+            log_hls_client_req(&session_id, resource, None, 200, None);
             m3u8_ok(bytes)
         }
         Err(e) => {
@@ -495,7 +569,7 @@ async fn wait_playlist(
                 PlaylistError::AbandonedHoldEnded => 204,
                 PlaylistError::Failed(_) => 500,
             };
-            log_hls_client_req(&session_id, resource, start_ms, status, None);
+            log_hls_client_req(&session_id, resource, None, status, None);
             map_playlist_err(&session_id, e)
         }
     }

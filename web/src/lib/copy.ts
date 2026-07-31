@@ -22,5 +22,24 @@ export const copy = {
 	subtitleOff: 'Off',
 	switchingAudio: 'Switching audio track…',
 	audioSwitchUnsupported:
-		'This browser cannot switch audio tracks on a file it plays directly.'
+		'This browser cannot switch audio tracks on a file it plays directly.',
+	titleDamagedUsable: (usableSec: number, claimedSec: number) =>
+		`This file looks damaged. Playback works through about ${formatClock(usableSec)} of the claimed ${formatClock(claimedSec)}.`,
+	/** Accessible name for the title-time scrub control (ADR-0020). */
+	scrubPosition: 'Position',
+	/** Fullscreen the player container (keeps our scrub bar). */
+	playerFullscreen: 'Fullscreen',
+	playerExitFullscreen: 'Exit fullscreen'
 };
+
+/** Clock for durations / scrub labels (`m:ss` or `h:mm:ss`). */
+export function formatClock(totalSec: number): string {
+	const s = Math.max(0, Math.floor(totalSec));
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	const sec = s % 60;
+	if (h > 0) {
+		return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+	}
+	return `${m}:${String(sec).padStart(2, '0')}`;
+}

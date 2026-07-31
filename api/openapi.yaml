@@ -270,11 +270,12 @@ paths:
       operationId: startTranscodeSession
       summary: Start an HLS playback session for an item
       description: >
-        ADR-0011. Returns 202 with sessionId and playlistUrl. Remux items get
-        a stream-copy session, transcode items a re-encoding one; the shape is
-        identical. Each POST creates a session; seek with ?startMs= on the
-        playlist restarts that session in place. Concurrent sessions are capped
-        via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+        ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl
+        (per-run master under /runs/{runId}/master.m3u8). Remux items get a
+        stream-copy session, transcode items a re-encoding one; the shape is
+        identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=,
+        which returns a fresh playlistUrl. Concurrent sessions are capped via
+        NIGHTJAR_HLS_MAX_SESSIONS (default 3).
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: startMs
@@ -337,25 +338,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /api/v0/sessions/{sessionId}/master.m3u8:
+  /api/v0/sessions/{sessionId}/runs/{runId}/master.m3u8:
     get:
       operationId: getSessionMasterPlaylist
-      summary: HLS master playlist for a playback session
+      summary: HLS master playlist for a producer run
       description: >
-        ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8)
-        and optional SUBTITLES group. playlistUrl from session start points
-        here. Seek via startMs uses the same window-move rules as the media
-        playlist.
+        ADR-0020. Declares the single video rendition (index.m3u8) and optional
+        SUBTITLES group. playlistUrl from session start / seek points here.
+        Far seek is POST /seek, not a startMs query on this URI.
       parameters:
         - $ref: "#/components/parameters/SessionId"
-        - name: startMs
-          in: query
-          required: false
-          description: Encode window start; a change restarts this session there
-          schema:
-            type: integer
-            format: int64
-            minimum: 0
+        - $ref: "#/components/parameters/RunId"
       responses:
         "200":
           description: HLS master playlist
@@ -364,38 +357,73 @@ paths:
               schema:
                 type: string
         "404":
-          description: Session not found or playlist not ready yet
+          description: Session or run not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Playlist not ready yet (no mapped segments)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /api/v0/sessions/{sessionId}/index.m3u8:
+  /api/v0/sessions/{sessionId}/runs/{runId}/index.m3u8:
     get:
       operationId: getSessionPlaylist
-      summary: HLS media playlist for a playback session
+      summary: HLS media playlist for a producer run
       description: >
-        Media playlist path is stable (ADR-0008). Segment URIs are relative
-        init.mp4 / segNNN.m4s. Also accepts startMs for seek.
+        Assembled from the session-global time-keyed segment map (ADR-0020).
+        Segment URIs are session-root relative (`../../seg_<ms>.m4s` from
+        `/runs/{runId}/index.m3u8`). EVENT while
+        cooking; ENDLIST at that run's EOF. EXT-X-START is window-relative.
       parameters:
         - $ref: "#/components/parameters/SessionId"
-        - name: startMs
-          in: query
-          required: false
-          description: Encode window start; a change restarts this session there
-          schema:
-            type: integer
-            format: int64
-            minimum: 0
+        - $ref: "#/components/parameters/RunId"
       responses:
         "200":
-          description: HLS playlist
+          description: HLS media playlist
           content:
             application/vnd.apple.mpegurl:
               schema:
                 type: string
         "404":
-          description: Session not found or playlist not ready yet
+          description: Session or run not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Playlist not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/sessions/{sessionId}/runs/{runId}/init.mp4:
+    get:
+      operationId: getSessionRunInit
+      summary: fMP4 init segment for a producer run
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Init segment bytes
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Session or run not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Init not ready yet
           content:
             application/json:
               schema:
@@ -456,16 +484,17 @@ paths:
           required: true
           schema:
             type: string
-            pattern: '^(init\.mp4|seg[0-9]+\.m4s)$'
+            pattern: '^(init\.mp4|seg_[0-9]{11}\.m4s)$'
         - name: njFetcher
           in: query
           required: false
           description: >
-            Log-only client marker. Serving ignores this. JS land-ensure and
-            attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's
-            native HLS engine does not. Distinguishes probe traffic from
-            WebKit segment GETs in dogfood logs without changing 200/503/204
-            behaviour.
+            Log-only client marker. Serving ignores this. Attach-wait probes
+            may set it (`attach-wait`); Safari's native HLS engine does not.
+            Distinguishes probe traffic from WebKit segment GETs in dogfood
+            logs without changing 200/503/204 behaviour. Far scrub is
+            POST /seek (ADR-0020) — clients must not poke segment URIs to
+            force cooking.
           schema:
             type: string
             maxLength: 32
@@ -498,7 +527,60 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/sessions/{sessionId}/seek:
+    post:
+      operationId: seekTranscodeSession
+      summary: Far scrub — new producer run and playlist URI
+      description: >
+        ADR-0020. Applies startMs, starts a new run when needed, and returns
+        the fresh playlistUrl. Clients must swap the player source to that URI
+        (hls.js loadSource / Safari native re-attach). Track selections do not
+        survive the swap; re-apply after attach.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - name: startMs
+          in: query
+          required: true
+          description: Title-absolute play land in milliseconds
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "202":
+          description: Seek applied (or already at this land)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscodeSession"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/sessions/{sessionId}:
+    get:
+      operationId: getTranscodeSession
+      summary: Current session snapshot
+      description: >
+        playlistUrl, landedMs, and usableExtentMs when known (ADR-0020).
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Session snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscodeSession"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     delete:
       operationId: deleteTranscodeSession
       summary: Stop a playback session and reap its FFmpeg process
@@ -563,6 +645,14 @@ components:
       schema:
         type: string
         minLength: 1
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
 
   schemas:
     Health:
@@ -635,7 +725,7 @@ components:
 
     TranscodeSession:
       type: object
-      required: [sessionId, itemId, playlistUrl, videoEncoder, encoderKind]
+      required: [sessionId, itemId, playlistUrl, videoEncoder, encoderKind, landedMs]
       properties:
         sessionId:
           type: string
@@ -645,8 +735,9 @@ components:
         playlistUrl:
           type: string
           description: >
-            Path to the HLS master playlist for this session (master.m3u8).
-            The media playlist remains at index.m3u8 (ADR-0008).
+            Path to the current run's HLS master playlist
+            (/sessions/{id}/runs/{runId}/master.m3u8). Fresh URI per far seek
+            (ADR-0020).
         videoEncoder:
           type: string
           description: >
@@ -658,6 +749,21 @@ components:
           description: >
             Whether videoEncoder is a hardware encoder, a software encoder, or
             a stream copy.
+        landedMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >
+            Producer-observed land (first mapped segment start for the current
+            run), title-absolute milliseconds.
+        usableExtentMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >
+            When a producer reaches EOF materially short of the container's
+            claimed duration, the usable media end in milliseconds. Absent when
+            unknown or undamaged.
 
     Library:
       type: object

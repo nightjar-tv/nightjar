@@ -26,6 +26,10 @@ assert.equal(
 	'/api/v0/sessions/s1'
 );
 assert.equal(
+	sessionBaseFromMaster('/api/v0/sessions/s1/runs/3/master.m3u8#t=10'),
+	'/api/v0/sessions/s1'
+);
+assert.equal(
 	subtitleSegmentUrl('/api/v0/sessions/s1', 't0', 60),
 	'/api/v0/sessions/s1/subs/t0/seg060.vtt'
 );

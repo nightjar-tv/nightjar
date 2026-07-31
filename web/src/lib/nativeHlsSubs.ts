@@ -18,7 +18,8 @@
  * SEGMENT_MS must match server/crates/transcode/src/hls.rs.
  */
 
-/** Locked to the HLS video segment length (ADR-0008 / ADR-0013). */
+/** Locked subtitle VTT window (ADR-0010 / ADR-0020). Video segments are
+ * time-keyed and are not derived from this constant. */
 export const SEGMENT_MS = 2000;
 
 export type ParsedVttCue = {
@@ -29,7 +30,7 @@ export type ParsedVttCue = {
 	id?: string;
 };
 
-/** Title-absolute segment index for a playhead (same math as the server). */
+/** Title-absolute subtitle segment index for a playhead. */
 export function segmentIndexAtSeconds(seconds: number): number {
 	const ms = Math.max(0, Math.floor(seconds * 1000));
 	return Math.floor(ms / SEGMENT_MS);
@@ -41,35 +42,18 @@ export function segmentVttName(index: number): string {
 	return `seg${String(n).padStart(3, '0')}.vtt`;
 }
 
-/** `segNNN.m4s` — matches `segment_name` in hls.rs. */
-function segmentM4sName(index: number): string {
-	const n = Math.max(0, Math.floor(index));
-	return `seg${String(n).padStart(3, '0')}.m4s`;
-}
-
-/** Session directory containing `master.m3u8` (no trailing slash). */
+/** Session directory containing assets (no trailing slash). Strips per-run master. */
 export function sessionBaseFromMaster(playlistBase: string): string {
 	const noHash = playlistBase.split('#')[0] ?? playlistBase;
 	const noQuery = noHash.split('?')[0] ?? noHash;
-	return noQuery.replace(/\/master\.m3u8$/i, '');
+	return noQuery
+		.replace(/\/runs\/\d+\/master\.m3u8$/i, '')
+		.replace(/\/master\.m3u8$/i, '');
 }
 
-function videoSegmentUrl(sessionBase: string, segmentIndex: number): string {
-	return `${sessionBase}/${segmentM4sName(segmentIndex)}`;
-}
-
-/**
- * Same segment URL with a log-only `njFetcher` query. Serving ignores it;
- * Safari native HLS never adds it — dogfood logs can tell probe from WebKit.
- */
-export function videoSegmentUrlWithFetcher(
-	sessionBase: string,
-	segmentIndex: number,
-	fetcher: 'land-ensure' | 'attach-wait'
-): string {
-	const base = videoSegmentUrl(sessionBase, segmentIndex);
-	const sep = base.includes('?') ? '&' : '?';
-	return `${base}${sep}njFetcher=${fetcher}`;
+export function sessionIdFromPlaylist(playlistBase: string): string | null {
+	const m = sessionBaseFromMaster(playlistBase).match(/\/sessions\/([^/]+)$/);
+	return m?.[1] ?? null;
 }
 
 export function subtitleSegmentUrl(
@@ -91,7 +75,9 @@ export function parseSubtitleTrackIdsFromMaster(masterBody: string): string[] {
 		if (!line.startsWith('#EXT-X-MEDIA:') || !line.includes('TYPE=SUBTITLES')) {
 			continue;
 		}
-		const m = /URI="subs\/([^"/]+)\.m3u8"/.exec(line);
+		const m = /URI="(?:(?:\.\.\/)*|\/api\/v0\/sessions\/[^/]+\/)subs\/([^"/]+)\.m3u8"/.exec(
+			line
+		);
 		if (m?.[1]) ids.push(m[1]);
 	}
 	return ids;
@@ -182,30 +168,37 @@ export function parseWebVttCues(body: string): ParsedVttCue[] {
 }
 
 /**
- * hls.js may append title-absolute Nightjar cues with a sticky load-cycle
- * baseline added (dogfood 2026-07-29: displayed ≈ raw + firstFragStart).
- * Rewrite TextTrack times from the wire VTT (stable cue id = start ms).
- * No-op when hls left times correct (baseline 0). Returns how many cues changed.
+ * Rewrite TextTrack cue times from the wire VTT (stable cue id = start ms).
+ *
+ * Wire cues are title-absolute. The media element is window-relative after a
+ * mid-title land (ADR-0020): pass the **current** `landedMs` so painted times
+ * are `title − land`. At land 0 this matches the wire. Also undoes hls.js
+ * sticky load-cycle baseline (dogfood: displayed ≈ raw + firstFragStart).
+ * Returns how many cues changed.
  */
 export function applyAbsoluteCueTimesFromVtt(
 	track: TextTrack,
-	body: string
+	body: string,
+	landedMs = 0
 ): number {
 	const list = track.cues;
 	if (!list) return 0;
+	const landSec = Math.max(0, landedMs) / 1000;
 	let fixed = 0;
 	for (const raw of parseWebVttCues(body)) {
 		if (!raw.id) continue;
 		const cue = list.getCueById(raw.id);
 		if (!cue) continue;
+		const start = Math.max(0, raw.startSec - landSec);
+		const end = Math.max(start, raw.endSec - landSec);
 		if (
-			Math.abs(cue.startTime - raw.startSec) < 0.001 &&
-			Math.abs(cue.endTime - raw.endSec) < 0.001
+			Math.abs(cue.startTime - start) < 0.001 &&
+			Math.abs(cue.endTime - end) < 0.001
 		) {
 			continue;
 		}
-		cue.startTime = raw.startSec;
-		cue.endTime = raw.endSec;
+		cue.startTime = start;
+		cue.endTime = end;
 		fixed += 1;
 	}
 	return fixed;

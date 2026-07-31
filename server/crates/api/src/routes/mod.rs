@@ -7,7 +7,7 @@ mod track_ids;
 use crate::state::AppState;
 use axum::{
     Json, Router,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use serde::Serialize;
 
@@ -44,22 +44,30 @@ pub fn router(state: AppState) -> Router {
             get(crate::stream::stream_item),
         )
         .route(
-            "/api/v0/sessions/{session_id}/master.m3u8",
+            "/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8",
             get(sessions::master),
         )
         .route(
-            "/api/v0/sessions/{session_id}/index.m3u8",
+            "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
             get(sessions::playlist),
+        )
+        .route(
+            "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
+            get(sessions::run_init),
         )
         .route(
             "/api/v0/sessions/{session_id}/subs/{*asset}",
             get(sessions::subtitle_playlist),
         )
+        .route("/api/v0/sessions/{session_id}/seek", post(sessions::seek))
+        .route(
+            "/api/v0/sessions/{session_id}",
+            get(sessions::get).delete(sessions::delete),
+        )
         .route(
             "/api/v0/sessions/{session_id}/{asset}",
             get(sessions::asset),
         )
-        .route("/api/v0/sessions/{session_id}", delete(sessions::delete))
         .with_state(state)
 }
 

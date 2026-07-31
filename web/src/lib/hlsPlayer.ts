@@ -6,26 +6,26 @@ import {
 	type AttachBackend
 } from './hlsAttachBackend';
 import { probeEnabled } from './latencyProbe';
+import { api } from './api/client';
+import {
+	mediaSecondsFromTitle,
+	mediaTimeInProducedWindow,
+	titleSecondsFromMedia
+} from './hlsTimeline';
 import {
 	applyAbsoluteCueTimesFromVtt,
 	parseSubtitleTrackIdsFromMaster,
 	parseWebVttCues,
 	segmentIndexAtSeconds,
 	sessionBaseFromMaster,
-	subtitleSegmentUrl,
-	videoSegmentUrlWithFetcher
+	sessionIdFromPlaylist,
+	subtitleSegmentUrl
 } from './nativeHlsSubs';
 
 /** Slightly above server `SEGMENT_WAIT` (30s) so the server can 503 first. */
 const LAND_SEGMENT_FETCH_MS = 32_000;
 /** Pause between land-ensure attempts so 503 retries do not spin hot. */
 const LAND_ENSURE_BACKOFF_MS = 400;
-/**
- * After the last `seeking` event, wait this long before committing land.
- * Covers scrubber drag (commit on release/settle) and click-scrubs where
- * `seeked` is skipped. Must not fire on every seeking tick.
- */
-const LAND_COMMIT_QUIET_MS = 300;
 /** If land-retarget seeked never arrives, clear suppress (stuck-flag safety). */
 const SEEK_SUPPRESS_TIMEOUT_MS = 2_000;
 
@@ -74,8 +74,15 @@ function pickBackend(video: HTMLVideoElement): AttachBackend {
 
 export interface HlsHandle {
 	destroy: () => void;
-	/** Title-absolute playback position in seconds. */
+	/** Title-absolute playback position in seconds (live `landedMs` + media). */
 	positionSeconds: () => number;
+	/**
+	 * Scrub to a title-absolute time. In-window → `currentTime`; otherwise
+	 * POST /seek and swap the playlist URI (ADR-0020). Resolves when the
+	 * land is applied (or immediately on the in-window path).
+	 */
+	seekToTitleSeconds: (titleSeconds: number) => Promise<void>;
+
 	/**
 	 * Enable HLS/native text track `index`, or `-1` to turn captions off.
 	 * Chrome MSE does not list HLS TEXT tracks in the native CC menu; the
@@ -198,27 +205,21 @@ function clearVideoSubtitleCues(video: HTMLVideoElement): void {
 }
 
 /**
- * Attach an HLS VOD playlist.
+ * Attach an HLS EVENT playlist (ADR-0020).
  *
- * Scrub sequence:
- * 1. Native: `?startMs=` on every `seeking` (server coalesces pending). Must
- *    beat Safari's dig-back GETs — a 300ms quiet before startMs let dig-back
- *    restart the encode to mid (252) before land (258), then yank twice;
- *    buffer stayed at [0,24] while seeking stuck at land.
- * 2. Native land-ensure commits after `seeking`/`seeked` quiet for
- *    LAND_COMMIT_QUIET_MS (release / settle). Mid-drag must not each ensure.
- * 3. hls.js: subtitle retarget after every settled seeked (fire-and-forget
- *    startMs — do not gate on in-flight fetch; that swallowed double-scrub
- *    reasserts). Clears hls.js subtitle buffered state then startLoad.
- * 4. Native (iOS/iPadOS): after quiet, long-poll GET of the playhead
- *    `segNNN.m4s` (server holds up to SEGMENT_WAIT). On abort/timeout/503,
- *    backoff briefly and retry the same target until a newer scrub
- *    supersedes (parent abort) or destroy — never a fixed attempt cap.
- *    Then VTT cue inject (ADR-0013). After land-ensure 200: re-assign the
- *    same master URL with `#t=` under seek suppress so native reloads init
- *    after seek-restart (MAP URI unchanged; attach-time init is stale).
- *    Not a scrub remount into an unready hole — only after land bytes exist.
- *    Desktop Safari uses hls.js (ADR-0017).
+ * Media element time is window-relative: `currentTime` 0 is the run land, not
+ * title 0. Title position is `landedMs/1000 + currentTime`. `landedMs` mutates
+ * on every run swap — never cache it at first attach for position/scrub/subs.
+ *
+ * Far scrub: POST /sessions/{id}/seek → fresh playlistUri → source swap.
+ * In-window scrub: set `currentTime` only. Title scrub UI calls
+ * `seekToTitleSeconds`; native control seeks stay media-relative and do not
+ * POST.
+ *
+ * Subtitles: wire VTT is title-absolute; paint times are media-relative
+ * (`title − land`). Segment index uses title seconds. After mid-title land,
+ * cue inject covers both backends (hls.js media time would otherwise load
+ * the wrong full-title subtitle frags).
  */
 export function attachHls(
 	video: HTMLVideoElement,
@@ -251,21 +252,28 @@ export function attachHls(
 		forceNativeHls: forceNativeHlsOverride()
 	});
 
-	let positionSeconds = (): number => Math.max(0, video.currentTime);
-	/** Abort in-flight land-segment ensure when a newer scrub arrives. */
-	let landEnsureAbort: AbortController | null = null;
-	/** Segment index with an in-flight ensure (blocks echo `seeked`). */
-	let landEnsureSegIdx: number | null = null;
-	/** Last segment we successfully ensured (ignore further seeked there). */
-	let landEnsuredSegIdx: number | null = null;
-	/** Debounce timer: commit land after seeking goes quiet (drag release). */
-	let landCommitTimer: ReturnType<typeof setTimeout> | null = null;
 	/**
-	 * After land-ensure 200: first suppressed seeked completes the nudge;
-	 * second applies this land time + play(). null = not retargeting.
+	 * Producer land for the **current** run (title-absolute ms). Updated on
+	 * every seek response — do not close over attach-time only.
+	 */
+	let landedMs = Math.max(0, Math.floor(startAtSeconds * 1000));
+	let positionSeconds = (): number =>
+		titleSecondsFromMedia(video.currentTime, landedMs);
+	/** Abort in-flight far-seek when a newer scrub arrives. */
+	let landEnsureAbort: AbortController | null = null;
+	/** startMs with an in-flight seek (blocks identical echoes). */
+	let landEnsureSegIdx: number | null = null;
+	/** Last startMs we successfully sought to. */
+	let landEnsuredSegIdx: number | null = null;
+	/**
+	 * After source swap / land nudge: first suppressed seeked completes the
+	 * nudge; second applies this media time + play(). null = not retargeting.
 	 */
 	let landRetargetSeconds: number | null = null;
-	const sessionBase = sessionBaseFromMaster(playlistBase);
+	let currentPlaylist = playlistBase;
+	let sessionBase = sessionBaseFromMaster(currentPlaylist);
+	/** Last startMs we told the seek API — skip identical echoes. */
+	let lastStartMsSent: number | null = null;
 
 	const seekSuppressActive = () => seekSuppressGen !== 0;
 
@@ -285,8 +293,6 @@ export function attachHls(
 			window.clearTimeout(seekSuppressTimeout);
 			seekSuppressTimeout = null;
 		}
-		// Double-rAF: clear one-shot suppress if seeked never arrives.
-		// Mid land-retarget keeps suppress until seeked or timeout.
 		requestAnimationFrame(() => {
 			requestAnimationFrame(() => {
 				if (
@@ -308,25 +314,11 @@ export function attachHls(
 		});
 	};
 
-	if (startAtSeconds > 0) armSeekSuppress();
-
-	const nudgePlayheadToLand = (seconds: number) => {
-		const t = Math.max(0, seconds);
+	const nudgePlayheadToMedia = (mediaSeconds: number) => {
+		const t = Math.max(0, mediaSeconds);
 		armSeekSuppress();
 		landRetargetSeconds = t;
-		// Side-channel land-ensure does not fill WebKit's buffer. After a
-		// seek restart, init.mp4 is rewritten under the same MAP URI while
-		// Safari still holds the attach-time init — demux of new segs fails
-		// and buffered ranges stay at the pre-scrub head (dogfood: [0,24]
-		// while seeking stuck at land). Re-assigning the same master with
-		// #t= reloads the native pipeline on this session URL (not a new
-		// POST) so init+land segs bind. Measured: ranges jump to land and
-		// currentTime advances. Do not use #t= as the scrub itself (before
-		// land ready) — that remounts into an unready hole.
-		const base = (video.currentSrc || video.src).split('#')[0];
-		if (base) {
-			video.src = `${base}#t=${t}`;
-		} else if (Math.abs(video.currentTime - t) < 0.05) {
+		if (Math.abs(video.currentTime - t) < 0.05) {
 			video.currentTime = t >= 0.05 ? t - 0.05 : t + 0.05;
 		} else {
 			video.currentTime = t;
@@ -335,99 +327,113 @@ export function attachHls(
 	};
 
 	/**
-	 * Ensure the playhead video segment is cooked. Each GET is a server
-	 * long-poll (up to SEGMENT_WAIT). 503 means "not yet / wait" — backoff
-	 * and ask again until this ensure is superseded (newer scrub aborts
-	 * parent) or destroy. Never a fixed retry cap: that burned both
-	 * attempts in milliseconds while the server was still coalescing.
-	 * On success: [`nudgePlayheadToLand`] (post-land `#t=` under seek
-	 * suppress — ADR-0017 amendment). Side-channel fetch does not fill
-	 * Safari's buffer. Do **not** remount before land-ensure 200: that
-	 * remounts into an unready hole (lead dig-back / black / scrubber at 0).
-	 *
-	 * Supersede = parent abort only. Do NOT bail because `currentTime` still
-	 * sits on the prior scrub: after scrub→scrub WebKit may still show A's
-	 * time while this ensure is for B — that check skipped the retarget.
+	 * Far scrub (ADR-0020): session seek API → fresh playlist URI → source
+	 * swap. Clients must not construct segment URLs. Track selections are
+	 * re-applied after the swap. New run media time starts at 0.
 	 */
-	const ensureNativeLandSegment = (seconds: number) => {
-		const idx = segmentIndexAtSeconds(seconds);
+	const swapToPlaylist = (url: string, nextLandedMs: number) => {
+		landedMs = Math.max(0, Math.floor(nextLandedMs));
+		currentPlaylist = url;
+		sessionBase = sessionBaseFromMaster(url);
+		nativeTrackIds = null;
+		nativeTrackIdsPromise = null;
+		const wanted = wantedSubtitle;
+		if (hls) {
+			hls.loadSource(url);
+			hls.startLoad(0);
+			// loadSource leaves the element paused; without play() far scrub
+			// shows a land frame and never resumes (dogfood item 33).
+			void video.play().catch(() => {});
+		} else {
+			armSeekSuppress();
+			landRetargetSeconds = 0;
+			video.src = url;
+			void video.play().catch(() => {});
+		}
+		wantedSubtitle = wanted;
+		if (landedMs > 0 && wantedSubtitle >= 0) {
+			enterNativeInjectMode();
+		} else {
+			applyWantedSubtitle();
+		}
+	};
+
+	const seekToTitleSeconds = (titleSeconds: number): Promise<void> => {
+		if (destroyed) return Promise.resolve();
+		const startMs = Math.max(0, Math.floor(titleSeconds * 1000));
+		const landSec = Math.max(0, landedMs) / 1000;
+		const media = mediaSecondsFromTitle(titleSeconds, landedMs);
+		// Fast path only inside the current run's produced media. A title
+		// before `landedMs` clamps media to 0 and must POST /seek — otherwise
+		// scrub-back stays stuck at the land (dogfood: 600 → 120).
+		const beforeLand = titleSeconds + 0.05 < landSec;
 		if (
-			landEnsureSegIdx === idx &&
+			!beforeLand &&
+			mediaTimeInProducedWindow(
+				media,
+				video.seekable,
+				video.buffered,
+				video.duration
+			)
+		) {
+			nudgePlayheadToMedia(media);
+			if (wantedSubtitle >= 0 && landedMs > 0) enterNativeInjectMode();
+			else if (hls && wantedSubtitle >= 0) reassertHlsSubtitleAfterSeek();
+			return Promise.resolve();
+		}
+		if (lastStartMsSent === startMs) return Promise.resolve();
+		lastStartMsSent = startMs;
+		const sid = sessionIdFromPlaylist(currentPlaylist);
+		if (!sid) return Promise.resolve();
+		if (
+			landEnsureSegIdx === startMs &&
 			landEnsureAbort &&
 			!landEnsureAbort.signal.aborted
 		) {
-			return;
+			return Promise.resolve();
 		}
 		landEnsureAbort?.abort();
 		const parent = new AbortController();
 		landEnsureAbort = parent;
-		landEnsureSegIdx = idx;
+		landEnsureSegIdx = startMs;
 		landRetargetSeconds = null;
-		const url = videoSegmentUrlWithFetcher(sessionBase, idx, 'land-ensure');
-		void (async () => {
-			let ok = false;
-			const backoff = () =>
-				new Promise<void>((resolve, reject) => {
-					if (parent.signal.aborted) {
-						reject(new DOMException('Aborted', 'AbortError'));
-						return;
-					}
-					const onAbort = () => {
-						window.clearTimeout(timer);
-						reject(new DOMException('Aborted', 'AbortError'));
-					};
-					const timer = window.setTimeout(() => {
-						parent.signal.removeEventListener('abort', onAbort);
-						resolve();
-					}, LAND_ENSURE_BACKOFF_MS);
-					parent.signal.addEventListener('abort', onAbort, { once: true });
-				});
+		// Stop the live run's reload timer before teardown so hls.js does not
+		// keep GETting runs/{old}/index.m3u8 into 404 (measured: exact URL).
+		if (hls) {
 			try {
-				while (!destroyed && !parent.signal.aborted) {
-					const attemptAc = new AbortController();
-					const onParentAbort = () => attemptAc.abort();
-					parent.signal.addEventListener('abort', onParentAbort);
-					const timer = window.setTimeout(
-						() => attemptAc.abort(),
-						LAND_SEGMENT_FETCH_MS
-					);
-					try {
-						const res = await fetch(url, { signal: attemptAc.signal });
-						if (destroyed || parent.signal.aborted) return;
-						if (res.status === 200) {
-							if (parent.signal.aborted || destroyed) return;
-							ok = true;
-							nudgePlayheadToLand(Math.max(0, seconds));
-							return;
-						}
-						// 404: session gone. 204: no-fill hold ceiling. Else retry.
-						if (res.status === 404 || res.status === 204) return;
-					} catch {
-						if (destroyed || parent.signal.aborted) return;
-						// Timeout / network abort: new long-poll after backoff.
-					} finally {
-						window.clearTimeout(timer);
-						parent.signal.removeEventListener('abort', onParentAbort);
-					}
-					try {
-						await backoff();
-					} catch {
-						return;
-					}
+				hls.stopLoad();
+			} catch {
+				// ignore
+			}
+		}
+		return (async () => {
+			try {
+				const view = await api.seekTranscodeSession(sid, startMs);
+				if (destroyed || parent.signal.aborted) return;
+				const deadline = Date.now() + LAND_SEGMENT_FETCH_MS;
+				const indexUrl = view.playlistUrl.replace(/master\.m3u8$/i, 'index.m3u8');
+				while (!destroyed && !parent.signal.aborted && Date.now() < deadline) {
+					// Wait for media playlist, not only master — master can 200
+					// while index is still NotReady after a run swap.
+					const res = await fetch(indexUrl, { signal: parent.signal });
+					if (res.ok) break;
+					await new Promise((r) => setTimeout(r, LAND_ENSURE_BACKOFF_MS));
 				}
+				if (destroyed || parent.signal.aborted) return;
+				landEnsuredSegIdx = startMs;
+				swapToPlaylist(view.playlistUrl, view.landedMs);
+			} catch {
+				// Network / abort: next scrub retries.
 			} finally {
 				if (landEnsureAbort === parent) {
 					landEnsureAbort = null;
 					landEnsureSegIdx = null;
-					if (ok) landEnsuredSegIdx = idx;
 				}
 			}
-		})().catch(() => {
-			// Superseded ensure aborts must not surface as unhandled rejection.
-		});
+		})();
 	};
 
-	// --- Safari native: post-seek cue injection (ADR-0013) -----------------
+		// --- Safari native: post-seek cue injection (ADR-0013) -----------------
 	let nativeInjectMode = false;
 	let nativeInjectTrack: TextTrack | null = null;
 	let nativeInjectGen = 0;
@@ -492,7 +498,7 @@ export function attachHls(
 		if (nativeTrackIds) return nativeTrackIds;
 		if (!nativeTrackIdsPromise) {
 			nativeTrackIdsPromise = (async () => {
-				const res = await fetch(playlistBase.split('#')[0] ?? playlistBase);
+				const res = await fetch(currentPlaylist.split('#')[0] ?? currentPlaylist);
 				if (!res.ok) {
 					throw new Error(`master fetch ${res.status}`);
 				}
@@ -591,9 +597,12 @@ export function attachHls(
 			return;
 		}
 
+		const landSec = Math.max(0, landedMs) / 1000;
 		let injected = 0;
 		for (const cue of cues) {
 			try {
+				const start = Math.max(0, cue.startSec - landSec);
+				const end = Math.max(start, cue.endSec - landSec);
 				const existing = track.cues;
 				if (existing) {
 					let dup = false;
@@ -601,8 +610,8 @@ export function attachHls(
 						const c = existing[i];
 						if (
 							c &&
-							Math.abs(c.startTime - cue.startSec) < 0.05 &&
-							Math.abs(c.endTime - cue.endSec) < 0.05 &&
+							Math.abs(c.startTime - start) < 0.05 &&
+							Math.abs(c.endTime - end) < 0.05 &&
 							(c as VTTCue).text === cue.text
 						) {
 							dup = true;
@@ -611,7 +620,7 @@ export function attachHls(
 					}
 					if (dup) continue;
 				}
-				const vtt = new VTTCue(cue.startSec, cue.endSec, cue.text);
+				const vtt = new VTTCue(start, end, cue.text);
 				if (cue.id) vtt.id = cue.id;
 				track.addCue(vtt);
 				injected += 1;
@@ -653,18 +662,21 @@ export function attachHls(
 		}
 
 		const track = ensureInjectTrack(idx);
+		const titleSec = titleSecondsFromMedia(video.currentTime, landedMs);
 		if (reset) {
 			clearInjectCues(track);
 			nativeLoadedSegs.clear();
 			logSubs('native inject reset for scrub', {
 				t: video.currentTime,
+				titleSec,
+				landedMs,
 				trackId
 			});
 		} else {
 			pruneInjectCues(track, video.currentTime - 30);
 		}
 
-		const seg = segmentIndexAtSeconds(video.currentTime);
+		const seg = segmentIndexAtSeconds(titleSec);
 		await fetchAndInjectSegment(track, trackId, seg, gen);
 		await fetchAndInjectSegment(track, trackId, seg + 1, gen);
 	};
@@ -699,51 +711,18 @@ export function attachHls(
 		void syncNativeInject(true);
 	};
 
-	/** Last startMs we told the server — skip identical echoes. */
-	let lastStartMsSent: number | null = null;
-
-	/**
-	 * Record scrub intent immediately. Safari dig-back GETs race a quiet
-	 * timer; without pending startMs the server treats mid as a forward
-	 * restart and cooks the wrong land.
-	 */
-	const notifyNativeStartMs = () => {
-		if (destroyed || hls || seekSuppressActive()) return;
-		const startMs = Math.max(0, Math.floor(positionSeconds() * 1000));
-		if (lastStartMsSent === startMs) return;
-		lastStartMsSent = startMs;
-		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
-			// Network blip: land-segment ensure still drives the window.
-		});
-	};
-
-	/**
-	 * Native land-ensure + nudge after scrub settle. Driven by observed
-	 * playhead segment, not `seeked` alone (Safari often skips seeked on
-	 * rapid scrub). Same-segment echoes are no-ops. startMs is sent earlier
-	 * from `notifyNativeStartMs` on seeking.
-	 */
-	const noticeNativePlayheadLand = () => {
-		if (destroyed || hls) return;
-		if (seekSuppressActive()) return;
-		const landAt = positionSeconds();
-		const landIdx = segmentIndexAtSeconds(landAt);
-		if (landEnsuredSegIdx === landIdx) return;
-		if (
-			landEnsureSegIdx === landIdx &&
-			landEnsureAbort &&
-			!landEnsureAbort.signal.aborted
-		) {
-			return;
-		}
-		notifyNativeStartMs();
-		ensureNativeLandSegment(landAt);
-		if (wantedSubtitle >= 0) enterNativeInjectMode();
-	};
-
 	const applyWantedSubtitle = () => {
 		if (destroyed) return;
 		if (hls) {
+			if (landedMs > 0 && wantedSubtitle >= 0) {
+				// Full-title subtitle playlist is title-timed; media is window-
+				// relative — inject by title index (same as native after scrub).
+				hls.subtitleDisplay = false;
+				hls.subtitleTrack = -1;
+				if (!nativeInjectMode) enterNativeInjectMode();
+				else void syncNativeInject(true);
+				return;
+			}
 			if (hls.subtitleTracks.length === 0) {
 				logSubtitleState('skip select — no tracks yet', hls);
 				return;
@@ -789,9 +768,13 @@ export function attachHls(
 		logNativeTracks('native apply', video, { wantedSubtitle });
 	};
 
-	/** hls.js only: retarget subtitle fragments after scrub. */
+	/** hls.js only: retarget subtitle fragments after in-window scrub. */
 	const reassertHlsSubtitleAfterSeek = () => {
 		if (destroyed || !hls || wantedSubtitle < 0) return;
+		if (landedMs > 0) {
+			enterNativeInjectMode();
+			return;
+		}
 		const idx = Math.min(wantedSubtitle, Math.max(0, hls.subtitleTracks.length - 1));
 		const t = video.currentTime;
 		const seg = Math.floor(t / 2);
@@ -833,25 +816,6 @@ export function attachHls(
 		if (nativeInjectMode) scheduleAssertInjectModes();
 	};
 
-	/**
-	 * Native land commit after scrub settle. Both `seeking` and `seeked` only
-	 * arm this quiet timer — do not commit on seeked alone. Immediate seeked
-	 * commit raced scrub-before-play (A startMs/ensure, then B) and left
-	 * WebKit stuck seeking at B after mid dig-back (desktop-native N=7).
-	 */
-	const armNativeLandCommitQuiet = () => {
-		if (destroyed || hls || seekSuppressActive()) return;
-		if (landCommitTimer !== null) clearTimeout(landCommitTimer);
-		landCommitTimer = setTimeout(() => {
-			landCommitTimer = null;
-			if (destroyed || hls || seekSuppressActive()) return;
-			// Commit even if seeking is still true: WebKit often stays
-			// seeking until land segments arrive; withholding startMs
-			// deadlocks scrub-before-play (encode never follows playhead).
-			noticeNativePlayheadLand();
-		}, LAND_COMMIT_QUIET_MS);
-	};
-
 	const onSeeked = () => {
 		if (destroyed) return;
 		if (seekSuppressActive()) {
@@ -861,77 +825,47 @@ export function attachHls(
 				landRetargetSeconds = null;
 				video.currentTime = target;
 				void video.play().catch(() => {});
-				if (wantedSubtitle >= 0) {
+				if (wantedSubtitle >= 0 && landedMs > 0) {
 					enterNativeInjectMode();
 					assertInjectModes();
+				} else if (hls && wantedSubtitle >= 0) {
+					reassertHlsSubtitleAfterSeek();
 				}
-				// Keep suppress for this land seeked; clear on the next one.
 				return;
 			}
 			if (step.clearSuppress) clearSeekSuppress();
-			if (hls) reassertHlsSubtitleAfterSeek();
-			else {
+			if (hls && landedMs === 0) reassertHlsSubtitleAfterSeek();
+			else if (wantedSubtitle >= 0 && landedMs > 0) {
+				enterNativeInjectMode();
+			} else {
 				logNativeTracks('seek suppress — attach land', video, { wantedSubtitle });
 			}
 			return;
 		}
-		if (!hls) {
-			armNativeLandCommitQuiet();
-			return;
-		}
-		// Fire-and-forget like native (ADR-0013): awaiting startMs gated rapid
-		// seeked events and skipped subtitle reassert on double scrub.
-		const startMs = Math.max(0, Math.floor(positionSeconds() * 1000));
-		void fetch(`${playlistBase}?startMs=${startMs}`).catch(() => {
-			// Network blip: the player retries the segment fetch itself.
-		});
-		reassertHlsSubtitleAfterSeek();
-	};
-
-	/**
-	 * During scrubber drag Safari fires `seeking` continuously. startMs on
-	 * every tick (coalesced server-side). Land-ensure only after quiet
-	 * (release / settle). Native path only; hls.js has no land-ensure.
-	 */
-	const onSeeking = () => {
-		notifyNativeStartMs();
-		armNativeLandCommitQuiet();
+		// In-window media scrub (native control or prior currentTime set):
+		// refresh cues only — do not POST /seek from element time.
+		if (hls) reassertHlsSubtitleAfterSeek();
+		else if (wantedSubtitle >= 0 && landedMs > 0) enterNativeInjectMode();
 	};
 
 	const onCanPlay = () => {
-		if (!destroyed && startAtSeconds > 0) {
-			void video.play().catch(() => {});
-		}
+		if (destroyed) return;
+		void video.play().catch(() => {});
+		if (landedMs > 0 && wantedSubtitle >= 0) enterNativeInjectMode();
 	};
 
 	video.addEventListener('seeked', onSeeked);
-	video.addEventListener('seeking', onSeeking);
 	video.addEventListener('canplay', onCanPlay, { once: true });
 
 	if (backend === 'native-hls') {
 		logSubs('native-hls attach — filter console for [nj-subs]');
-		// Media fragment asks Safari to begin at the offset before any
-		// segment fetch. loadedmetadata + currentTime is a backup only.
-		video.src =
-			startAtSeconds > 0 ? `${playlistBase}#t=${startAtSeconds}` : playlistBase;
-		if (startAtSeconds > 0) {
-			video.addEventListener(
-				'loadedmetadata',
-				() => {
-					if (!destroyed && Math.abs(video.currentTime - startAtSeconds) > 1) {
-						video.currentTime = startAtSeconds;
-					}
-					logNativeTracks('native loadedmetadata', video, { wantedSubtitle });
-				},
-				{ once: true }
-			);
-		} else {
-			video.addEventListener(
-				'loadedmetadata',
-				() => logNativeTracks('native loadedmetadata', video, { wantedSubtitle }),
-				{ once: true }
-			);
-		}
+		// Window-relative: session already lands at landedMs; no title #t=.
+		video.src = playlistBase;
+		video.addEventListener(
+			'loadedmetadata',
+			() => logNativeTracks('native loadedmetadata', video, { wantedSubtitle }),
+			{ once: true }
+		);
 		// Do not force mode=showing on attach: master DEFAULT=YES already
 		// enables the track. Forcing showing on an auto-selected HLS track
 		// has been seen to paint cues twice in Safari.
@@ -941,7 +875,7 @@ export function attachHls(
 		hls = new Hls({
 			enableWorker: true,
 			maxBufferHole: 1.5,
-			startPosition: startAtSeconds > 0 ? startAtSeconds : -1
+			startPosition: -1
 		});
 		logSubs('hls.js attach — filter console for [nj-subs]');
 		hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -980,7 +914,7 @@ export function attachHls(
 					t.mode !== 'disabled'
 			);
 			if (!track) return;
-			const fixed = applyAbsoluteCueTimesFromVtt(track, text);
+			const fixed = applyAbsoluteCueTimesFromVtt(track, text, landedMs);
 			if (subsProbeOn() && Date.now() <= fragProbeUntilMs) {
 				const parsed = parseWebVttCues(text);
 				const rawFirst = parsed[0]?.startSec;
@@ -1049,10 +983,6 @@ export function attachHls(
 		destroy: () => {
 			if (destroyed) return;
 			destroyed = true;
-			if (landCommitTimer !== null) {
-				clearTimeout(landCommitTimer);
-				landCommitTimer = null;
-			}
 			clearSeekSuppress();
 			landEnsureAbort?.abort();
 			landEnsureAbort = null;
@@ -1061,7 +991,6 @@ export function attachHls(
 			cancelNativeInject();
 			disarmNativeInjectTimeupdate();
 			video.removeEventListener('seeked', onSeeked);
-			video.removeEventListener('seeking', onSeeking);
 			video.removeEventListener('canplay', onCanPlay);
 			video.textTracks.removeEventListener('addtrack', onAddTrack);
 			video.textTracks.removeEventListener('change', onTextTrackChange);
@@ -1078,6 +1007,7 @@ export function attachHls(
 			video.load();
 		},
 		positionSeconds,
+		seekToTitleSeconds,
 		setSubtitleTrack
 	};
 }

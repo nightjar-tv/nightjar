@@ -52,15 +52,16 @@ function wallIso() {
   return new Date().toISOString();
 }
 
-function segName(i) {
-  return `seg${String(i).padStart(3, "0")}.m4s`;
+function timeKeyedName(startMs) {
+  return `seg_${String(startMs).padStart(11, "0")}.m4s`;
 }
 
-async function waitSeg(sessionId, idx, timeoutMs = 45000) {
+/** Wait for a time-keyed segment URI (from playlist / known land ms). */
+async function waitListedSeg(sessionId, startMs, timeoutMs = 45000) {
   // One long-poll ≈ SEGMENT_WAIT (30s). Abort spam never sees a 200 that
   // arrives at second 3 of a hold, and burned the 100s trial wall before
   // the player ran.
-  const url = `${BASE}/api/v0/sessions/${sessionId}/${segName(idx)}`;
+  const url = `${BASE}/api/v0/sessions/${sessionId}/${timeKeyedName(startMs)}`;
   const t0 = Date.now();
   let lastStatus = 0;
   let attempt = 0;
@@ -72,14 +73,16 @@ async function waitSeg(sessionId, idx, timeoutMs = 45000) {
     attempt += 1;
     const slice = Math.min(35000, left);
     process.stderr.write(
-      `  waitSeg ${segName(idx)} attempt=${attempt} slice=${slice}ms\n`,
+      `  waitSeg ${timeKeyedName(startMs)} attempt=${attempt} slice=${slice}ms\n`,
     );
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(slice) });
       lastStatus = res.status;
       if (res.ok) {
         await res.arrayBuffer();
-        process.stderr.write(`  waitSeg ${segName(idx)} ok in ${Date.now() - t0}ms\n`);
+        process.stderr.write(
+          `  waitSeg ${timeKeyedName(startMs)} ok in ${Date.now() - t0}ms\n`,
+        );
         return { ok: true, status: res.status, ms: Date.now() - t0 };
       }
       if (res.status === 404) {
@@ -91,6 +94,21 @@ async function waitSeg(sessionId, idx, timeoutMs = 45000) {
       await sleep(200);
     }
   }
+}
+
+async function firstListedStartMs(masterUrl) {
+  const indexUrl = masterUrl.replace(/\/master\.m3u8(?:\?.*)?$/i, "/index.m3u8");
+  const res = await fetch(indexUrl, { signal: AbortSignal.timeout(5000) }).catch(
+    () => null,
+  );
+  if (!res || !res.ok) return null;
+  const text = await res.text();
+  for (const line of text.split("\n")) {
+    const name = line.trim().replace(/^\.\.\//, "");
+    const m = /^seg_(\d{11})\.m4s$/.exec(name);
+    if (m) return Number(m[1]);
+  }
+  return null;
 }
 
 function cellSubtitleTrackId() {
@@ -227,10 +245,15 @@ async function main() {
     }
 
     const landIdxAttach = Math.floor(attachStartMs / SEGMENT_MS);
-    const windowIdx = Math.max(0, landIdxAttach - 8);
-    process.stderr.write(`  phase=first_seg idx=${windowIdx}\n`);
-    const first = await waitSeg(sessionId, windowIdx, 45000);
-    mark("first_seg", { idx: windowIdx, ...first });
+    const encodeStartMs = Math.max(
+      0,
+      Math.floor(attachStartMs / SEGMENT_MS) * SEGMENT_MS - 8 * SEGMENT_MS,
+    );
+    process.stderr.write(`  phase=first_seg startMs=${encodeStartMs}\n`);
+    let firstStart = await firstListedStartMs(masterUrl);
+    if (firstStart == null) firstStart = encodeStartMs;
+    const first = await waitListedSeg(sessionId, firstStart, 45000);
+    mark("first_seg", { startMs: firstStart, ...first });
     if (!first.ok) {
       writeFileSync(
         OUT,
@@ -256,10 +279,10 @@ async function main() {
     if (AXIS === "behind_head") {
       // One segment past land is enough to call the head "ahead"; keep this
       // short so the player still fits under the trial wall.
-      const aheadIdx = landIdxAttach + 1;
-      process.stderr.write(`  phase=encoder_head_seg idx=${aheadIdx}\n`);
-      const cooked = await waitSeg(sessionId, aheadIdx, 40000);
-      mark("encoder_head_seg", { idx: aheadIdx, ...cooked });
+      const aheadMs = landIdxAttach * SEGMENT_MS + SEGMENT_MS;
+      process.stderr.write(`  phase=encoder_head_seg startMs=${aheadMs}\n`);
+      const cooked = await waitListedSeg(sessionId, aheadMs, 40000);
+      mark("encoder_head_seg", { startMs: aheadMs, ...cooked });
     }
 
     process.stderr.write(`  phase=client_run\n`);
@@ -355,6 +378,7 @@ const hls = new Hls({
   manifestLoadingTimeOut: 8000,
   levelLoadingTimeOut: 8000,
 });
+window.__njHls = hls;
 hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
   const f = data.frag;
   push('FRAG_LOADED', {
@@ -398,18 +422,27 @@ async function selectSoft() {
 async function scrubTo(targetS) {
   push('scrub_intent', { targetS });
   const startMs = Math.max(0, Math.floor(targetS * 1000));
-  const startMsUrl = ${JSON.stringify(masterUrl)} + '?startMs=' + startMs;
+  const seekUrl = ${JSON.stringify(BASE)} + '/api/v0/sessions/' + ${JSON.stringify(sessionId)} + '/seek?startMs=' + startMs;
   const t = Math.round(performance.now() - t0);
   const wall = new Date(wall0 + t).toISOString();
   let status = 0;
+  let newPlaylist = null;
   try {
-    const res = await origFetch(startMsUrl, { signal: AbortSignal.timeout(5000) });
+    const res = await origFetch(seekUrl, { method: 'POST', signal: AbortSignal.timeout(5000) });
     status = res.status;
+    if (res.ok) {
+      const body = await res.json();
+      newPlaylist = body.playlistUrl ? (${JSON.stringify(BASE)} + body.playlistUrl) : null;
+    }
   } catch (_) {
     status = 0;
   }
-  reqs.push({ ms: t, wall, status, resource: 'master.m3u8', startMs });
-  push('client_req_startMs', { status, startMs });
+  reqs.push({ ms: t, wall, status, resource: 'seek', startMs });
+  push('client_req_seek', { status, startMs, playlistUrl: newPlaylist });
+  if (newPlaylist && window.__njHls) {
+    window.__njHls.loadSource(newPlaylist);
+    window.__njHls.startLoad(targetS);
+  }
   v.currentTime = targetS;
   await playBrief();
 }
@@ -440,20 +473,20 @@ async function runInner() {
   }
   push('pre_scrub', snap());
   await scrubTo(${scrubS});
-  const landIdx = Math.floor(${scrubMs} / ${SEGMENT_MS});
+  const landMs = Math.floor(${scrubMs} / ${SEGMENT_MS}) * ${SEGMENT_MS};
   const landUrl = ${JSON.stringify(BASE)} + '/api/v0/sessions/' + ${JSON.stringify(sessionId)} + '/' +
-    ('seg' + String(landIdx).padStart(3, '0') + '.m4s');
+    ('seg_' + String(landMs).padStart(11, '0') + '.m4s');
   const landDeadline = performance.now() + ${RESUME_WAIT_MS};
   let landStatus = null;
   while (performance.now() < landDeadline) {
     landStatus = await probe(landUrl, 2000);
     if (landStatus === 200) {
-      push('land_seg_ok', { idx: landIdx, status: landStatus });
+      push('land_seg_ok', { startMs: landMs, status: landStatus });
       break;
     }
     await new Promise((r) => setTimeout(r, 150));
   }
-  if (landStatus !== 200) push('land_seg_miss', { idx: landIdx, status: landStatus });
+  if (landStatus !== 200) push('land_seg_miss', { startMs: landMs, status: landStatus });
 
   const tLand = v.currentTime;
   push('post_land', snap());

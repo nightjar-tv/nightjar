@@ -44,6 +44,12 @@ on long titles.
    cooking return 503 (retryable), not 404. Segments live under
    `{NIGHTJAR_DATA_DIR}/cache/hls/{sessionId}/`; disk is bounded by session
    idle/stop cleanup of the whole dir.
+
+   **Amended by [ADR-0020](0020-copy-mode-segment-boundaries.md):**
+   playlists follow the producer (EVENT while cooking, real EXTINF,
+   time-keyed URIs via a per-run map). Each producer run gets a distinct
+   playlist URI; far scrub is `?startMs=` plus attach to that URI, not a
+   synthetic full-title grid.
 6. **Client.** iOS/iPadOS Safari (and other iPhone/iPad/iPod WebKit) plays
    HLS natively when `video.canPlayType('application/vnd.apple.mpegurl')` is
    non-empty. Desktop Safari and other MSE browsers use hls.js (Apache-2.0);

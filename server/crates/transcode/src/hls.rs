@@ -2,13 +2,18 @@
 //! source (remux) or re-encodes it (transcode); the two differ by
 //! [`SessionMode`] and nothing else (ADR-0011).
 //!
-//! Fill-forward: FFmpeg starts [`ENCODE_LEAD_SEGMENTS`] before the play
-//! land (`#EXT-X-START`) and encodes toward EOF. Cooked segments stay on
-//! disk for the session lifetime, so scrub into finished media is a plain
-//! file serve. Cold scrub restarts at the new offset (delay OK), then fills
-//! forward again. Lead-in is 2 (not 0): Safari digs back ~1–2 segs near
-//! land after a scrub; lead 0 left those misses 503 forever once dig-back
-//! pending retreat was blocked (ADR-0011).
+//! ADR-0020: producer-owned boundaries. Each encode/copy run writes into
+//! `run_<n>/`; a session-global time-keyed map (`seg_<ms:011>.m4s`) is the
+//! serve truth. Playlists are assembled from that map (EVENT while cooking,
+//! ENDLIST at run EOF) under a fresh URI per run. Clients seek via
+//! `POST /sessions/{id}/seek?startMs=` → fresh `playlistUrl`, not by
+//! mutating one VOD or poking segment URIs.
+//!
+//! Fill-forward: FFmpeg starts at the play land ([`ENCODE_LEAD_SEGMENTS`] is
+//! 0 under producer-truth playlists; the old Safari dig-back lead fitted the
+//! synthetic full-title VOD and does not carry). Mapped segments from prior
+//! runs stay on disk so scrub-back is a plain file serve. Per-run dirs count
+//! against [`SESSION_RUN_CACHE_BUDGET_BYTES`]; oldest finished runs evict.
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
@@ -26,16 +31,24 @@ use std::time::{Duration, Instant};
 const DEFAULT_MAX_SESSIONS: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
-/// Locked HLS segment duration (ADR-0008). Future renditions must match this
-/// value and the matching forced-keyframe interval.
+/// Per-session on-disk budget for run dirs (ADR-0020 §12). Oldest finished
+/// (non-current) runs are evicted first when exceeded. Override with
+/// `NIGHTJAR_HLS_SESSION_CACHE_BYTES` for local experiments only.
+const SESSION_RUN_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// EOF this far short of probed duration → record usable extent (damaged).
+const USABLE_SHORTFALL_MS: u64 = 30_000;
+/// Locked HLS segment duration for **transcode** force-IDR / subtitle VTT
+/// grid (ADR-0008 / ADR-0010). Copy segment durations come from the producer.
 const SEGMENT_MS: u64 = 2000;
 /// How long a segment or init fetch may block before returning 503. Mid-title
 /// hardware transcodes on a NAS library can exceed 15s (dogfood: ~16s to
 /// seg1098 after a Chrome seek on Up 1080p).
 const SEGMENT_WAIT: Duration = Duration::from_secs(30);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
-/// Safari's sequential prefetch reaches two segments beyond the current
-/// on-disk frontier; farther requests are treated as a scrub.
+/// Still justified under producer-truth: EVENT playlists list segments the
+/// producer is still writing; Safari prefetches ~two past the on-disk
+/// frontier. Those GETs Wait (cook), they do not scrub. Far scrub is
+/// `POST /seek`, not a segment miss past this band.
 const CATCH_UP_SEGMENTS: u64 = 2;
 /// Safari retried refused segments at one-second intervals. A two-second floor
 /// prevents adjacent prefetch misses from repeatedly moving the encode window.
@@ -45,32 +58,56 @@ const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// the pending target (dogfood: three `seek restart` lines in ~9s; the last
 /// fired 45ms after the previous `first_segment_ready`).
 const RESTART_COALESCE_QUIET: Duration = Duration::from_millis(400);
-/// After a seek restart, refuse retained segments behind the new play land
-/// for this long. Serving them paints the prior scrub keyframe (dogfood:
-/// seg455/1110/1762 200 after B applied). Forever-refuse wedges Safari on
-/// A's URI; a short TTL covers cook+retarget then restores scrub-back.
+/// Re-derived under ADR-0020: after `POST /seek` + source swap, in-flight
+/// GETs for mapped segments behind the new play land can still arrive. Serving
+/// them paints the prior scrub keyframe. Short TTL covers cook+retarget; then
+/// scrub-back via the global map is a plain file serve again. Not the old
+/// "Safari 503-retrying a superseded full-title land" band.
 const STALE_RETAIN_REFUSE: Duration = Duration::from_secs(15);
-/// Maximum unprimed distance *behind the play land point* (`#EXT-X-START`)
-/// that still counts as start alignment rather than attach prefetch of
-/// `seg000`. Farther behind waits without yanking the encode to zero.
-const ALIGN_BEHIND_SEGMENTS: u64 = 16;
-/// Encode starts this many segments before the play land (`#EXT-X-START`).
-/// Safari digs back ~1–2 segs near land after a currentTime scrub; with lead 0
-/// those misses 503 forever once [`digback_behind_committed`] blocks pending
-/// retreat. Post-land `#t=` reload (init refresh after seek-restart) digs
-/// ~8 segs behind EXT-X-START when PRECISE=YES (dogfood: seg121 at land 258).
-/// Lead must cover that dig-back or ranges stay empty after land-ensure 200.
-/// Do not drop PRECISE to shrink dig-back — size the lead instead (ADR-0011).
-const ENCODE_LEAD_SEGMENTS: u64 = 8;
+/// Deleted under ADR-0020. Was the dig-back band for unlisted-but-requested
+/// segments on the synthetic full-title VOD. Producer-truth playlists do not
+/// list those URIs; far scrub is `POST /seek`. Kept as 0 so coalesce "far"
+/// means any different pending land (see [`coalesce_preempt_before_land`]).
+const ALIGN_BEHIND_SEGMENTS: u64 = 0;
+/// Encode lead before play land. **0** under ADR-0020: the value 8 existed
+/// so Safari dig-back behind `#EXT-X-START` on the synthetic full-title VOD
+/// still hit lead-in files. That playlist is gone; window-relative START is
+/// 0 and clients seek via the session API. Do not carry 8 as "still
+/// meaningful as time." Override `NIGHTJAR_ENCODE_LEAD_SEGMENTS` only for
+/// local experiments — not a shipped config surface.
+const ENCODE_LEAD_SEGMENTS: u64 = 0;
 
-/// Runtime lead-in. Default [`ENCODE_LEAD_SEGMENTS`]. Override with
-/// `NIGHTJAR_ENCODE_LEAD_SEGMENTS` for local land-time / dig-back experiments
-/// only — not a shipped config surface.
+/// Runtime lead-in. Default [`ENCODE_LEAD_SEGMENTS`].
 fn encode_lead_segments() -> u64 {
     std::env::var("NIGHTJAR_ENCODE_LEAD_SEGMENTS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(ENCODE_LEAD_SEGMENTS)
+}
+
+fn session_run_cache_budget_bytes() -> u64 {
+    std::env::var("NIGHTJAR_HLS_SESSION_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_RUN_CACHE_BUDGET_BYTES)
+}
+
+/// Sum of bytes under every `run_*` dir in a session cache directory.
+fn session_disk_bytes(session_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(session_dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("run_") {
+            total = total.saturating_add(dir_tree_bytes(&entry.path()));
+        }
+    }
+    total
 }
 
 #[derive(Debug)]
@@ -151,57 +188,32 @@ pub enum SegmentMissAction {
     Restart,
 }
 
-/// Deliberate restart policy for cold regions of a full-title VOD playlist
-/// (fill-forward: encoder runs toward EOF; cooked segs stay on disk).
+/// Deliberate miss policy under ADR-0020 producer-truth playlists.
 ///
-/// - Behind the window: restart only when the miss is within
-///   `ALIGN_BEHIND_SEGMENTS` of **play_start** (player settling near
-///   `#EXT-X-START`). Farther behind waits without restart — attach
-///   prefetch of `seg000`, and after a jump land Safari still probing the
-///   *previous* region (retained segs + holes) must not yank the encode.
-///   Real scrub-back is playlist `?startMs=` (ADR-0011 / ADR-0013). When
-///   primed and near play_start, gate on `RESTART_MIN_INTERVAL`; unprimed
-///   dig-back bypasses the interval so create's `last_restart` cannot
-///   deadlock.
-/// - Ahead: restart only past `CATCH_UP_SEGMENTS` of the cooking band end,
-///   gated by `RESTART_MIN_INTERVAL`. Band end is
-///   `max(frontier, play_start_idx)`. Frontier is the latest on-disk
-///   segment at or after the window start; retained pre-window segments
-///   must not count.
+/// Segment GETs never move the encode window. Far scrub is
+/// `POST /sessions/{id}/seek`. A miss is always Wait: listed-but-not-ready
+/// cooks under fill-forward; unlisted URIs are 404'd by the asset path once
+/// unreachable. The old behind-play Restart band ([`ALIGN_BEHIND_SEGMENTS`])
+/// and ahead-of-frontier Restart past [`CATCH_UP_SEGMENTS`] fitted WebKit
+/// requesting URIs the synthetic full-title VOD listed but the producer
+/// never wrote — that playlist is gone.
 pub fn decide_segment_miss(
-    idx: u64,
-    window_start_idx: u64,
-    play_start_idx: u64,
-    latest_on_disk: Option<u64>,
+    want_ms: u64,
+    window_start_ms: u64,
+    play_start_ms: u64,
+    latest_on_disk_ms: Option<u64>,
     primed: bool,
     since_last_restart: Duration,
 ) -> SegmentMissAction {
-    if idx < window_start_idx {
-        let behind_play = play_start_idx.saturating_sub(idx);
-        if behind_play > ALIGN_BEHIND_SEGMENTS {
-            return SegmentMissAction::Wait;
-        }
-        if primed && since_last_restart < RESTART_MIN_INTERVAL {
-            return SegmentMissAction::Wait;
-        }
-        // Near play land: follow (unprimed bypasses min-interval so create's
-        // last_restart does not 503-deadlock dig-back past the lead-in).
-        return SegmentMissAction::Restart;
-    }
-    if since_last_restart < RESTART_MIN_INTERVAL {
-        return SegmentMissAction::Wait;
-    }
-    let frontier = latest_on_disk
-        .filter(|&l| l >= window_start_idx)
-        .unwrap_or(window_start_idx);
-    // Lead-in encodes before play_start; requests near EXT-X-START are still
-    // in the cooking band, not a scrub past the land point.
-    let band_end = frontier.max(play_start_idx);
-    if idx > band_end.saturating_add(CATCH_UP_SEGMENTS) {
-        SegmentMissAction::Restart
-    } else {
-        SegmentMissAction::Wait
-    }
+    let _ = (
+        want_ms,
+        window_start_ms,
+        play_start_ms,
+        latest_on_disk_ms,
+        primed,
+        since_last_restart,
+    );
+    SegmentMissAction::Wait
 }
 
 /// How a scrub intent interacts with an in-flight or just-landed encode.
@@ -316,11 +328,9 @@ fn restart_spawn_gap() -> Option<Duration> {
 
 /// Far pending may abandon an in-flight cook before its land exists.
 ///
-/// "Far" means more than [`ALIGN_BEHIND_SEGMENTS`] from the cooking play land
-/// — outside the near-land dig-back / settle band. Near retargets must still
-/// wait for the cooking land (dogfood: seg415 after scrub to 1188). This is
-/// stricter than [`pending_waiter_action`] Release alone: a one-segment
-/// forward pending also Releases waiters but must not yank before land.
+/// Under ADR-0020 [`ALIGN_BEHIND_SEGMENTS`] is 0 (dig-back band deleted), so
+/// any different pending land is "far" and may preempt. Near-identical
+/// retargets (same aligned ms) still wait for the cooking land.
 pub fn coalesce_preempt_before_land(cooking_play_ms: u64, pending_play_ms: u64) -> bool {
     let cooking = align_to_segment(cooking_play_ms);
     let pending = align_to_segment(pending_play_ms);
@@ -376,13 +386,11 @@ pub fn segment_miss_unreachable(
     pending_play_ms: Option<u64>,
     window_start_ms: u64,
     play_start_ms: u64,
-    latest_on_disk: Option<u64>,
+    latest_on_disk_ms: Option<u64>,
     primed: bool,
 ) -> bool {
     let want = align_to_segment(want_ms);
-    let idx = want / SEGMENT_MS;
-    let window = window_start_ms / SEGMENT_MS;
-    let play = play_start_ms / SEGMENT_MS;
+    let window = align_to_segment(window_start_ms);
 
     // Playlist scrub pending this exact land — about to cook.
     if pending_play_ms.is_some_and(|p| align_to_segment(p) == want) {
@@ -392,7 +400,7 @@ pub fn segment_miss_unreachable(
     // Behind encode window: lead-in / fill-forward will not write this index.
     // (Dig-back within ALIGN of a *new* play can still be behind that play's
     // window — that is abandoned, not in-window dig-back.)
-    if idx < window {
+    if want < window {
         return true;
     }
 
@@ -402,10 +410,10 @@ pub fn segment_miss_unreachable(
     }
 
     let cool = decide_segment_miss(
-        idx,
+        want,
         window,
-        play,
-        latest_on_disk,
+        play_start_ms,
+        latest_on_disk_ms,
         primed,
         RESTART_MIN_INTERVAL,
     );
@@ -413,7 +421,7 @@ pub fn segment_miss_unreachable(
         return false;
     }
 
-    // idx >= window and Wait: fill-forward will produce it.
+    // In window and Wait: fill-forward will produce it.
     false
 }
 
@@ -436,12 +444,10 @@ pub fn prefetch_advances_pending(pending_play_ms: Option<u64>, want_play_ms: u64
     (want - pending) / SEGMENT_MS <= CATCH_UP_SEGMENTS
 }
 
-/// Segment miss behind the committed land (cooking play and/or pending) by
-/// at most [`ALIGN_BEHIND_SEGMENTS`] is Safari dig-back near `#EXT-X-START`,
-/// not a scrub. Returns true when the miss must **not** call [`desire_restart`].
-///
-/// Real scrub-back is playlist `?startMs=` ([`decide_window_action`]). Behind
-/// mirror of [`prefetch_advances_pending`].
+/// Segment miss behind the committed land (cooking play and/or pending).
+/// Under ADR-0020 any behind-committed GET is dig-back / stale — do not call
+/// [`desire_restart`] (far scrub is `POST /seek`). The old
+/// [`ALIGN_BEHIND_SEGMENTS`] near-band is deleted with the synthetic VOD.
 pub fn digback_behind_committed(
     cooking_play_ms: u64,
     pending_play_ms: Option<u64>,
@@ -453,10 +459,7 @@ pub fn digback_behind_committed(
         Some(p) => align_to_segment(p).max(cooking),
         None => cooking,
     };
-    if want >= committed {
-        return false;
-    }
-    (committed - want) / SEGMENT_MS <= ALIGN_BEHIND_SEGMENTS
+    want < committed
 }
 
 /// Whether a long-poll for `want_play_ms` should keep holding for fill or
@@ -472,6 +475,11 @@ pub enum PendingWaiterAction {
     Release,
 }
 
+/// Whether a long-poll for `want_play_ms` should keep holding for fill or
+/// treat the want as superseded (pending moved to a different scrub).
+///
+/// Exact pending match Holds. Any other want Releases — the old ALIGN near
+/// band for dig-back pending is gone with producer-truth playlists.
 pub fn pending_waiter_action(
     pending_play_ms: Option<u64>,
     want_play_ms: u64,
@@ -482,12 +490,10 @@ pub fn pending_waiter_action(
     let pending = align_to_segment(pending);
     let want = align_to_segment(want_play_ms);
     if pending == want {
-        return PendingWaiterAction::Hold;
+        PendingWaiterAction::Hold
+    } else {
+        PendingWaiterAction::Release
     }
-    if pending < want && (want - pending) / SEGMENT_MS <= ALIGN_BEHIND_SEGMENTS {
-        return PendingWaiterAction::Hold;
-    }
-    PendingWaiterAction::Release
 }
 
 pub struct HlsSessionRegistry {
@@ -534,19 +540,31 @@ struct Session {
     burn_in: Option<BurnInSelection>,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
-    /// Encode window start. [`encode_start_ms`] of [`Session::play_start_ms`]
-    /// (lead-in before `#EXT-X-START` when [`ENCODE_LEAD_SEGMENTS`] > 0).
+    /// Encode window start for the current run (`-ss` / lead-in).
     start_ms: u64,
-    /// Client land point for `#EXT-X-START` / seek intent.
+    /// Client land point / seek intent (title-absolute).
     play_start_ms: u64,
+    /// Producer-observed land (first mapped segment start after the latest
+    /// run began). Exposed on the session API (ADR-0020).
+    landed_ms: u64,
+    /// Lazy usable extent when EOF is materially short of [`Self::duration_ms`].
+    usable_extent_ms: Option<u64>,
     duration_ms: u64,
+    /// Current producer run id; playlist URI is per-run (ADR-0020).
+    current_run_id: u64,
+    /// Next run id to allocate on restart.
+    next_run_id: u64,
+    /// Session-global time-keyed segment map (ADR-0020).
+    segment_map: crate::hls_segment_map::SegmentMap,
+    /// True after the current run's ffmpeg exited successfully (ENDLIST).
+    current_run_eof: bool,
     child: Option<Child>,
     last_access: Instant,
     /// Last encode-window restart (create counts as one) for the min-interval guard.
     last_restart: Instant,
     /// True after serving at least one segment at or past encode `start_ms`.
     primed: bool,
-    /// Set once the window's first segment lands on disk (playlist-ready).
+    /// Set once the play land is present in the segment map.
     first_segment_ready: bool,
     /// Latest aligned play land requested while coalescing rapid scrubs.
     pending_play_ms: Option<u64>,
@@ -566,6 +584,311 @@ struct Session {
     segment_waiters: HashMap<u64, u32>,
     /// Avoid log spam while polls re-hit deferred preempt before land.
     preempt_defer_logged: bool,
+}
+
+/// Snapshot returned by start / seek / get (ADR-0020 wire fields).
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub session_id: String,
+    pub item_id: i64,
+    pub playlist_url: String,
+    pub video_encoder: String,
+    pub encoder_kind: EncoderKind,
+    pub landed_ms: u64,
+    pub usable_extent_ms: Option<u64>,
+    pub run_id: u64,
+}
+
+fn playlist_url_for(session_id: &str, run_id: u64) -> String {
+    format!("/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8")
+}
+
+fn run_dir(session: &Session) -> PathBuf {
+    session.dir.join(format!("run_{}", session.current_run_id))
+}
+
+fn sync_segment_map(session: &mut Session) {
+    let index_path = run_dir(session).join("index.m3u8");
+    let Ok(text) = fs::read_to_string(&index_path) else {
+        return;
+    };
+    if let Err(e) = crate::hls_segment_map::ingest_run_index(
+        &mut session.segment_map,
+        &session.dir,
+        session.current_run_id,
+        &text,
+    ) {
+        tracing::warn!(
+            run_id = session.current_run_id,
+            error = %e,
+            "hls map ingest failed"
+        );
+    }
+}
+
+/// Re-read every `run_*/index.m3u8` so scrub-back map hits see prior runs
+/// even if the current run's index is empty after stop_child.
+fn sync_all_run_indexes(session: &mut Session) {
+    let Ok(entries) = fs::read_dir(&session.dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id_str) = name.strip_prefix("run_") else {
+            continue;
+        };
+        let Ok(run_id) = id_str.parse::<u64>() else {
+            continue;
+        };
+        let index_path = entry.path().join("index.m3u8");
+        let Ok(text) = fs::read_to_string(&index_path) else {
+            continue;
+        };
+        if let Err(e) = crate::hls_segment_map::ingest_run_index(
+            &mut session.segment_map,
+            &session.dir,
+            run_id,
+            &text,
+        ) {
+            tracing::warn!(run_id, error = %e, "hls map ingest failed (all-runs sync)");
+        }
+    }
+}
+
+fn latest_mapped_start_in_window(
+    map: &crate::hls_segment_map::SegmentMap,
+    window_start_ms: u64,
+) -> Option<u64> {
+    map.iter_ordered()
+        .rev()
+        .find(|s| s.start_ms >= window_start_ms)
+        .map(|s| s.start_ms)
+}
+
+fn current_run_has_mapped_segment(session: &Session) -> bool {
+    let in_playlist_window = |s: &crate::hls_segment_map::MappedSegment| {
+        s.start_ms.saturating_add(s.duration_ms) > session.start_ms
+    };
+    if session
+        .segment_map
+        .iter_ordered()
+        .any(|s| s.run_id == session.current_run_id && in_playlist_window(s))
+    {
+        return true;
+    }
+    // Duplicate-write stop: fresh run id with no new producer bytes; playlist
+    // is assembled from the global map (prior runs).
+    session.child.is_none() && session.segment_map.iter_ordered().any(in_playlist_window)
+}
+
+fn first_current_run_start(session: &Session) -> Option<u64> {
+    let in_playlist_window = |s: &crate::hls_segment_map::MappedSegment| {
+        s.start_ms.saturating_add(s.duration_ms) > session.start_ms
+    };
+    if let Some(ms) = session
+        .segment_map
+        .iter_ordered()
+        .find(|s| s.run_id == session.current_run_id && in_playlist_window(s))
+        .map(|s| s.start_ms)
+    {
+        return Some(ms);
+    }
+    session
+        .segment_map
+        .iter_ordered()
+        .find(|s| in_playlist_window(s))
+        .map(|s| s.start_ms)
+}
+
+fn build_run_media_playlist(session_id: &str, session: &Session) -> Vec<u8> {
+    let window = session.start_ms;
+    // ADR-0020: never list a URI whose bytes are gone. Eviction updates the
+    // map, but defend in depth so a race cannot reintroduce listed-404.
+    let segs: Vec<&crate::hls_segment_map::MappedSegment> = session
+        .segment_map
+        .iter_ordered()
+        .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
+        .filter(|s| session.dir.join(&s.rel_path).is_file())
+        .collect();
+    // Path-absolute URIs (ADR-0008): run-dir depth cannot break resolution.
+    let init_uri = format!(
+        "/api/v0/sessions/{session_id}/runs/{}/init.mp4",
+        session.current_run_id
+    );
+    let bytes =
+        crate::hls_segment_map::build_map_playlist(&segs, &init_uri, session.current_run_eof);
+    with_session_absolute_segment_uris(session_id, &bytes)
+}
+
+/// Rewrite bare `seg_<ms>.m4s` lines to path-absolute session asset URLs.
+/// Relative `../` climbs were the cutover failure class under `/runs/{n}/`.
+fn with_session_absolute_segment_uris(session_id: &str, playlist: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(playlist);
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.lines() {
+        if let Some(ms) = crate::hls_segment_map::parse_time_keyed_segment_name(line) {
+            out.push_str(&format!(
+                "/api/v0/sessions/{session_id}/{}",
+                crate::hls_segment_map::time_keyed_segment_name(ms)
+            ));
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
+fn dir_tree_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            total = total.saturating_add(dir_tree_bytes(&p));
+        } else if let Ok(meta) = entry.metadata() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Per-run cache eviction (ADR-0020 §12). Map is authoritative:
+/// - Prefer orphan run dirs (no map refs) so scrub-back stays a file serve.
+/// - When a referenced run must go, `remove_run` before unlinking.
+/// - Zero-byte dirs are reaped quietly — not budget evictions.
+fn maybe_evict_finished_runs(session: &mut Session) {
+    reap_empty_finished_run_dirs(session);
+    let budget = session_run_cache_budget_bytes();
+    loop {
+        let total = session_disk_bytes(&session.dir);
+        if total <= budget {
+            return;
+        }
+        let referenced = session.segment_map.referenced_run_ids();
+        let mut orphans: Vec<(u64, u64)> = Vec::new();
+        let mut referenced_finished: Vec<(u64, u64)> = Vec::new();
+        let Ok(entries) = fs::read_dir(&session.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id_str) = name.strip_prefix("run_") else {
+                continue;
+            };
+            let Ok(id) = id_str.parse::<u64>() else {
+                continue;
+            };
+            if id == session.current_run_id {
+                continue;
+            }
+            let bytes = dir_tree_bytes(&entry.path());
+            if bytes == 0 {
+                continue;
+            }
+            if referenced.contains(&id) {
+                referenced_finished.push((id, bytes));
+            } else {
+                orphans.push((id, bytes));
+            }
+        }
+        orphans.sort_by_key(|(id, _)| *id);
+        referenced_finished.sort_by_key(|(id, _)| *id);
+        let victim = orphans
+            .first()
+            .copied()
+            .or_else(|| referenced_finished.first().copied());
+        let Some((victim_id, victim_bytes)) = victim else {
+            return;
+        };
+        let path = session.dir.join(format!("run_{victim_id}"));
+        let had_map_refs = session.segment_map.run_is_referenced(victim_id);
+        // Drop map entries before unlinking so serve never sees a mapped
+        // path whose file is already gone.
+        session.segment_map.remove_run(victim_id);
+        if let Err(e) = fs::remove_dir_all(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "hls run eviction failed"
+            );
+            return;
+        }
+        let after = session_disk_bytes(&session.dir);
+        tracing::info!(
+            run_id = victim_id,
+            evicted_bytes = victim_bytes,
+            had_map_refs,
+            orphan = !had_map_refs,
+            session_disk_bytes_before = total,
+            session_disk_bytes = after,
+            budget_bytes = budget,
+            session_dir = %session.dir.display(),
+            "hls evicted finished run (cache budget)"
+        );
+    }
+}
+
+/// Remove finished run directories that hold no bytes. Not a budget eviction.
+fn reap_empty_finished_run_dirs(session: &mut Session) {
+    let Ok(entries) = fs::read_dir(&session.dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id_str) = name.strip_prefix("run_") else {
+            continue;
+        };
+        let Ok(id) = id_str.parse::<u64>() else {
+            continue;
+        };
+        if id == session.current_run_id {
+            continue;
+        }
+        if dir_tree_bytes(&entry.path()) > 0 {
+            continue;
+        }
+        if session.segment_map.run_is_referenced(id) {
+            session.segment_map.remove_run(id);
+        }
+        let _ = fs::remove_dir_all(entry.path());
+    }
+}
+
+fn session_view(session_id: &str, session: &Session) -> SessionView {
+    let encoder_kind = if session.mode == SessionMode::Copy && session.burn_in.is_none() {
+        EncoderKind::Copy
+    } else if session.video_encoder == "libx264" {
+        EncoderKind::Software
+    } else {
+        EncoderKind::Hardware
+    };
+    SessionView {
+        session_id: session_id.to_string(),
+        item_id: session.item_id,
+        playlist_url: playlist_url_for(session_id, session.current_run_id),
+        video_encoder: if session.mode == SessionMode::Copy && session.burn_in.is_none() {
+            "copy".into()
+        } else {
+            session.video_encoder.clone()
+        },
+        encoder_kind,
+        landed_ms: session.landed_ms,
+        usable_extent_ms: session.usable_extent_ms,
+        run_id: session.current_run_id,
+    }
 }
 
 impl HlsSessionRegistry {
@@ -644,6 +967,11 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&dir).map_err(|e| {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
+        let run_id = 0u64;
+        let run_dir = dir.join(format!("run_{run_id}"));
+        fs::create_dir_all(&run_dir).map_err(|e| {
+            StartSessionError::Spawn(format!("create run dir {}: {e}", run_dir.display()))
+        })?;
         // Release before ASS demux / ffmpeg spawn so a multi-minute NAS extract
         // does not freeze every other HLS request on this lock.
         drop(sessions);
@@ -653,7 +981,7 @@ impl HlsSessionRegistry {
             prepare_ass_burn_file(src, &dir, burn_in).map_err(StartSessionError::Spawn)?;
         let child = spawn_ffmpeg(
             src,
-            &dir,
+            &run_dir,
             start_ms,
             mode,
             audio.clone(),
@@ -670,6 +998,7 @@ impl HlsSessionRegistry {
             item_id,
             start_ms,
             play_start_ms,
+            run_id,
             encode_lead_segments = encode_lead_segments(),
             mode = ?mode,
             audio_stream = ?audio.stream_index,
@@ -695,7 +1024,13 @@ impl HlsSessionRegistry {
                 video_encoder: self.video_encoder.clone(),
                 start_ms,
                 play_start_ms,
+                landed_ms: play_start_ms,
+                usable_extent_ms: None,
                 duration_ms,
+                current_run_id: run_id,
+                next_run_id: 1,
+                segment_map: crate::hls_segment_map::SegmentMap::default(),
+                current_run_eof: false,
                 child: Some(child),
                 last_access: Instant::now(),
                 last_restart: Instant::now(),
@@ -740,19 +1075,15 @@ impl HlsSessionRegistry {
         })
     }
 
-    /// Returns the VOD media playlist (`index.m3u8`). `start_ms` is seek
-    /// intent: a divergent offset restarts this session in place.
-    pub fn playlist(
-        &self,
-        session_id: &str,
-        start_ms: Option<u64>,
-    ) -> Result<Vec<u8>, PlaylistError> {
-        self.with_ready_session(session_id, start_ms, |session| {
-            let bytes = build_playlist(session.duration_ms, session.play_start_ms);
+    /// Returns the media playlist for `run_id` (ADR-0020). `start_ms` on
+    /// this path is ignored for seek — use [`Self::seek`].
+    pub fn playlist(&self, session_id: &str, run_id: u64) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, run_id, |session| {
+            let bytes = build_run_media_playlist(session_id, session);
             log_playlist_serve(
                 session_id,
                 "index.m3u8",
-                start_ms,
+                None,
                 session.play_start_ms,
                 session.pending_play_ms,
                 &bytes,
@@ -761,25 +1092,107 @@ impl HlsSessionRegistry {
         })
     }
 
-    /// Returns the HLS master playlist (`master.m3u8`). Same seek semantics as
-    /// [`playlist`]; media URI stays `index.m3u8` (ADR-0008 additive).
-    pub fn master(
-        &self,
-        session_id: &str,
-        start_ms: Option<u64>,
-    ) -> Result<Vec<u8>, PlaylistError> {
-        self.with_ready_session(session_id, start_ms, |session| {
-            let bytes = build_master(&session.subtitle_tracks);
+    /// Returns the HLS master playlist for `run_id`. Media and subtitle URIs
+    /// are path-absolute under `/api/v0/sessions/…` (ADR-0008).
+    pub fn master(&self, session_id: &str, run_id: u64) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, run_id, |session| {
+            let bytes = build_master(session_id, run_id, &session.subtitle_tracks);
             log_playlist_serve(
                 session_id,
                 "master.m3u8",
-                start_ms,
+                None,
                 session.play_start_ms,
                 session.pending_play_ms,
                 &bytes,
             );
             Ok(bytes)
         })
+    }
+
+    /// Apply a far scrub: new producer run + fresh playlist URI (ADR-0020).
+    pub fn seek(&self, session_id: &str, start_ms: u64) -> Result<SessionView, PlaylistError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| PlaylistError::Failed("hls registry lock poisoned".into()))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or(PlaylistError::NotFound)?;
+        session.last_access = Instant::now();
+        if let Some(err) = session.failed.clone() {
+            return Err(PlaylistError::Failed(err));
+        }
+        let aligned = align_to_segment(start_ms);
+        if aligned == session.play_start_ms {
+            sync_segment_map(session);
+            return Ok(session_view(session_id, session));
+        }
+        let enc = session.video_encoder.clone();
+        match restart_at(session, aligned, &enc)? {
+            RestartAtOutcome::Applied => {
+                maybe_evict_finished_runs(session);
+            }
+            RestartAtOutcome::DeferredLandWaiter => {
+                // Keep intent; client can poll view until the run advances.
+                session.pending_play_ms = Some(aligned);
+                session.pending_since = Some(Instant::now());
+            }
+        }
+        Ok(session_view(session_id, session))
+    }
+
+    /// Current session wire snapshot (playlist URL, landed, usable extent).
+    pub fn view(&self, session_id: &str) -> Result<SessionView, PlaylistError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| PlaylistError::Failed("hls registry lock poisoned".into()))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or(PlaylistError::NotFound)?;
+        session.last_access = Instant::now();
+        let _ = note_child_exit(session);
+        sync_segment_map(session);
+        Ok(session_view(session_id, session))
+    }
+
+    /// Init (or other run-local file) under `run_<n>/`.
+    pub fn run_asset(
+        &self,
+        session_id: &str,
+        run_id: u64,
+        name: &str,
+    ) -> Result<Vec<u8>, PlaylistError> {
+        if name != "init.mp4" {
+            return Err(PlaylistError::NotFound);
+        }
+        let deadline = Instant::now() + SEGMENT_WAIT;
+        loop {
+            {
+                let mut sessions = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| PlaylistError::Failed("hls registry lock poisoned".into()))?;
+                let session = sessions
+                    .get_mut(session_id)
+                    .ok_or(PlaylistError::NotFound)?;
+                session.last_access = Instant::now();
+                if let Some(err) = session.failed.clone() {
+                    return Err(PlaylistError::Failed(err));
+                }
+                let path = session.dir.join(format!("run_{run_id}")).join("init.mp4");
+                if let Ok(bytes) = fs::read(&path) {
+                    return Ok(bytes);
+                }
+                if let Some(err) = note_child_exit(session) {
+                    return Err(PlaylistError::Failed(err));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(PlaylistError::NotReady);
+            }
+            std::thread::sleep(SEGMENT_POLL);
+        }
     }
 
     /// Multi-segment subtitle media playlist for a snapshotted track (plan item 2).
@@ -804,8 +1217,8 @@ impl HlsSessionRegistry {
             return Err(PlaylistError::NotFound);
         }
         // Hold until video is ready so clients attach media + subs together.
-        let first = segment_name(session.start_ms / SEGMENT_MS);
-        if !session.dir.join(&first).exists() {
+        sync_segment_map(session);
+        if !current_run_has_mapped_segment(session) {
             if let Some(err) = note_child_exit(session) {
                 return Err(PlaylistError::Failed(err));
             }
@@ -859,7 +1272,7 @@ impl HlsSessionRegistry {
     fn with_ready_session<F>(
         &self,
         session_id: &str,
-        start_ms: Option<u64>,
+        run_id: u64,
         build: F,
     ) -> Result<Vec<u8>, PlaylistError>
     where
@@ -877,28 +1290,22 @@ impl HlsSessionRegistry {
         if let Some(err) = session.failed.clone() {
             return Err(PlaylistError::Failed(err));
         }
-
-        if let Some(ms) = start_ms {
-            let aligned = align_to_segment(ms);
-            let on_disk = session
-                .dir
-                .join(segment_name(aligned / SEGMENT_MS))
-                .exists();
-            match decide_window_action(aligned, session.play_start_ms, on_disk) {
-                WindowAction::Serve => {}
-                WindowAction::Restart => {
-                    desire_restart(session, aligned);
-                    maybe_apply_pending_restart(session)?;
-                }
-            }
+        if run_id != session.current_run_id {
+            return Err(PlaylistError::NotFound);
         }
 
         if let Some(err) = note_child_exit(session) {
             return Err(PlaylistError::Failed(err));
         }
 
-        let first = segment_name(session.start_ms / SEGMENT_MS);
-        if !session.dir.join(&first).exists() {
+        sync_segment_map(session);
+        if !current_run_has_mapped_segment(session) {
+            // Producer EOF with nothing in-window (damaged mid-title land):
+            // serve empty ENDLIST playlists so the client can read
+            // usableExtentMs instead of hanging on master 503.
+            if session.current_run_eof {
+                return build(session);
+            }
             return Err(PlaylistError::NotReady);
         }
         note_first_segment_ready(session_id, session);
@@ -988,24 +1395,14 @@ impl HlsSessionRegistry {
         if !is_safe_asset(name) {
             return Err(PlaylistError::NotFound);
         }
-        let (file_name, requested) = match segment_index(name) {
-            Some(idx) => (segment_name(idx), Some(idx)),
-            None => (name.to_string(), None),
-        };
+        let file_name = name.to_string();
+        let requested_ms = crate::hls_segment_map::parse_time_keyed_segment_name(name);
         // Register before the poll loop so a concurrent preempt sees this
         // waiter under the same mutex as stop_child (see restart_at).
-        let _segment_waiter = requested.and_then(|idx| {
-            SegmentWaiterGuard::attach(&self.sessions, session_id, idx * SEGMENT_MS)
-        });
+        let _segment_waiter =
+            requested_ms.and_then(|ms| SegmentWaiterGuard::attach(&self.sessions, session_id, ms));
         let mut deadline = Instant::now() + SEGMENT_WAIT;
-        // Once this request has claimed a land via desire_restart, a later
-        // pending move to a different land ends the *fill* wait — enter
-        // no-fill hold (not 503) so Safari never sees an app-level error.
-        // (Immediate 204 on supersede was tried and rejected: wedged native
-        // post-nudge on doubles — zero segment GETs after middle 204.)
         let mut holding_for_land = false;
-        // No-fill hold: abandoned miss or superseded land waiter. Open until
-        // IDLE_TIMEOUT / session teardown — no 503/404 while alive.
         let mut holding_no_fill = false;
         let enter_no_fill = |reason: &str,
                              session_id: &str,
@@ -1042,78 +1439,86 @@ impl HlsSessionRegistry {
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
-                // Notice cooking play-land even when this GET is for another
-                // URI. Middle land-ensure may enter no-fill before a 200 on
-                // that URI; final land-ensure must still flip
-                // first_segment_ready so coalesced pending applies.
                 note_first_segment_ready(session_id, session);
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
-                if let Some(idx) = requested {
-                    let want_ms = idx * SEGMENT_MS;
-                    // Holding for this land and a newer scrub retargeted pending
-                    // (or already applied a different land): same fate as
-                    // abandoned — content will not arrive on this trajectory.
-                    if holding_for_land {
-                        let superseded = pending_waiter_action(session.pending_play_ms, want_ms)
-                            == PendingWaiterAction::Release
-                            || (session.pending_play_ms.is_none()
-                                && align_to_segment(session.play_start_ms)
-                                    != align_to_segment(want_ms));
-                        if superseded {
-                            // Far retarget: 503 immediately so WebKit drops the
-                            // mid dig-back. No-fill hold here left native with
-                            // land-ensure 200 and zero land GETs (desktop N=5).
-                            // Near supersede still uses no-fill (lead dig-back).
-                            let far = match session.pending_play_ms {
-                                Some(p) => coalesce_preempt_before_land(want_ms, p),
-                                None => {
-                                    coalesce_preempt_before_land(want_ms, session.play_start_ms)
-                                }
-                            };
-                            if far {
-                                tracing::info!(
-                                    session_id,
-                                    asset = %file_name,
-                                    play_start_ms = session.play_start_ms,
-                                    pending_play_ms = session.pending_play_ms,
-                                    want_ms,
-                                    "hls asset superseded far — 503 (no hold)"
-                                );
-                                return Err(PlaylistError::NotReady);
-                            }
-                            enter_no_fill(
-                                "superseded",
+                if let Some(want_ms) = requested_ms
+                    && holding_for_land
+                {
+                    let superseded = pending_waiter_action(session.pending_play_ms, want_ms)
+                        == PendingWaiterAction::Release
+                        || (session.pending_play_ms.is_none()
+                            && align_to_segment(session.play_start_ms)
+                                != align_to_segment(want_ms));
+                    if superseded {
+                        let far = match session.pending_play_ms {
+                            Some(p) => coalesce_preempt_before_land(want_ms, p),
+                            None => coalesce_preempt_before_land(want_ms, session.play_start_ms),
+                        };
+                        if far {
+                            tracing::info!(
                                 session_id,
-                                &file_name,
-                                session,
-                                &mut holding_no_fill,
-                                &mut holding_for_land,
-                                &mut deadline,
+                                asset = %file_name,
+                                play_start_ms = session.play_start_ms,
+                                pending_play_ms = session.pending_play_ms,
+                                want_ms,
+                                "hls asset superseded far — 503 (no hold)"
                             );
+                            return Err(PlaylistError::NotReady);
                         }
+                        enter_no_fill(
+                            "superseded",
+                            session_id,
+                            &file_name,
+                            session,
+                            &mut holding_no_fill,
+                            &mut holding_for_land,
+                            &mut deadline,
+                        );
                     }
                 }
-                // Retained prior-window segments are served immediately —
-                // unless pending apply moves the play land during this
-                // request, or a short post-restart guard is still active for
-                // segs behind the new play (dogfood: late A-land 200 flash /
-                // wedge). After the TTL, scrub-back into cooked media works.
-                if let Ok(bytes) = fs::read(session.dir.join(&file_name)) {
+
+                let resolved = if file_name == "init.mp4" {
+                    fs::read(run_dir(session).join("init.mp4")).ok()
+                } else if let Some(ms) = requested_ms {
+                    sync_segment_map(session);
+                    match session.segment_map.get(ms) {
+                        Some(seg) => {
+                            let abs = session.dir.join(&seg.rel_path);
+                            match fs::read(&abs) {
+                                Ok(bytes) => Some(bytes),
+                                Err(_) => {
+                                    // Map entry without bytes — drop this key
+                                    // so we never keep advertising a dead URI.
+                                    session.segment_map.remove_start(ms);
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(bytes) = resolved {
                     let play_before = session.play_start_ms;
-                    if let Some(idx) = requested
-                        && idx >= session.start_ms / SEGMENT_MS
+                    if let Some(ms) = requested_ms
+                        && ms >= session.start_ms
                     {
                         session.primed = true;
                     }
                     note_first_segment_ready(session_id, session);
                     maybe_apply_pending_restart(session)?;
-                    let want_ms = requested.map(|idx| idx * SEGMENT_MS);
-                    if !serve_ok_after_pending_apply(play_before, session.play_start_ms, want_ms) {
+                    if !serve_ok_after_pending_apply(
+                        play_before,
+                        session.play_start_ms,
+                        requested_ms,
+                    ) {
                         return Err(PlaylistError::NotReady);
                     }
-                    if let Some(idx) = requested {
+                    if let Some(ms) = requested_ms {
                         let guard = match session.stale_retain_refuse_until {
                             Some(until) if Instant::now() < until => true,
                             Some(_) => {
@@ -1122,11 +1527,7 @@ impl HlsSessionRegistry {
                             }
                             None => false,
                         };
-                        if !serve_ok_retained_during_stale_guard(
-                            idx * SEGMENT_MS,
-                            session.play_start_ms,
-                            guard,
-                        ) {
+                        if !serve_ok_retained_during_stale_guard(ms, session.play_start_ms, guard) {
                             return Err(PlaylistError::NotReady);
                         }
                     }
@@ -1135,16 +1536,14 @@ impl HlsSessionRegistry {
                 if let Some(err) = note_child_exit(session) {
                     return Err(PlaylistError::Failed(err));
                 }
-                // Debounced scrub intent may become due while we poll.
                 maybe_apply_pending_restart(session)?;
                 if file_name == "init.mp4" {
                     // Rewritten on restart; wait for the new init.
-                } else if let Some(idx) = requested {
-                    let window_start = session.start_ms / SEGMENT_MS;
-                    let play_start = session.play_start_ms / SEGMENT_MS;
-                    let latest = latest_segment_in_window(&session.dir, window_start);
+                } else if let Some(want_ms) = requested_ms {
+                    let window_start = session.start_ms;
+                    let play_start = session.play_start_ms;
+                    let latest = latest_segment_in_window(&session.segment_map, window_start);
                     let since = session.last_restart.elapsed();
-                    let want_ms = idx * SEGMENT_MS;
 
                     if holding_no_fill
                         || segment_miss_unreachable(
@@ -1182,13 +1581,9 @@ impl HlsSessionRegistry {
                             );
                             return Err(PlaylistError::NotReady);
                         }
-                        // Stay in loop until file appears, session gone, or
-                        // IDLE_TIMEOUT → AbandonedHoldEnded (204).
                     } else {
-                        // Would this miss restart if the min-interval were cool?
-                        // Used so Wait-due-to-interval still records pending.
                         let scrub_shaped = decide_segment_miss(
-                            idx,
+                            want_ms,
                             window_start,
                             play_start,
                             latest,
@@ -1196,7 +1591,7 @@ impl HlsSessionRegistry {
                             RESTART_MIN_INTERVAL,
                         ) == SegmentMissAction::Restart;
                         match decide_segment_miss(
-                            idx,
+                            want_ms,
                             window_start,
                             play_start,
                             latest,
@@ -1205,8 +1600,6 @@ impl HlsSessionRegistry {
                         ) {
                             SegmentMissAction::Restart => {
                                 if prefetch_advances_pending(session.pending_play_ms, want_ms) {
-                                    // Keep the startMs (or prior) pending land;
-                                    // do not yank forward to a prefetch seg.
                                     return Err(PlaylistError::NotReady);
                                 }
                                 if digback_behind_committed(
@@ -1214,15 +1607,9 @@ impl HlsSessionRegistry {
                                     session.pending_play_ms,
                                     want_ms,
                                 ) {
-                                    // Near-ALIGN dig-back must not retreat a
-                                    // committed / pending startMs land. Lead-in
-                                    // may still produce this seg — long-poll
-                                    // without desire_restart.
                                     if pending_waiter_action(session.pending_play_ms, want_ms)
                                         == PendingWaiterAction::Release
                                     {
-                                        // Pending moved to a different scrub —
-                                        // same no-fill hold as abandoned.
                                         enter_no_fill(
                                             "superseded",
                                             session_id,
@@ -1236,27 +1623,16 @@ impl HlsSessionRegistry {
                                         && align_to_segment(session.play_start_ms)
                                             != align_to_segment(want_ms)
                                     {
-                                        // Dig-back with no pending: encoder will
-                                        // not restart toward this want; lead-in
-                                        // may still write it. Instant 503 so the
-                                        // player retries — not a superseded
-                                        // pending (leave as NotReady).
                                         return Err(PlaylistError::NotReady);
                                     }
                                 } else {
                                     desire_restart(session, want_ms);
                                     holding_for_land = true;
                                     maybe_apply_pending_restart(session)?;
-                                    // Pending matches this seg (or restart already
-                                    // applied): long-poll like playlist wait until
-                                    // the file lands.
                                     deadline = Instant::now() + SEGMENT_WAIT;
                                 }
                             }
                             SegmentMissAction::Wait => {
-                                // scrub_shaped: still record pending when live
-                                // decision is Wait only because min-interval is
-                                // hot — but never for dig-back behind committed.
                                 if scrub_shaped
                                     && !prefetch_advances_pending(session.pending_play_ms, want_ms)
                                     && !digback_behind_committed(
@@ -1283,14 +1659,10 @@ impl HlsSessionRegistry {
                                     );
                                 } else if session.child.is_none() {
                                     return Err(PlaylistError::NotFound);
-                                } else if idx < window_start {
-                                    // Far behind should be abandoned (no-fill).
-                                    // Near dig-back before primed: 503 so the
-                                    // player retries; lead-in will appear on disk.
-                                    let behind_play = play_start.saturating_sub(idx);
-                                    if behind_play > ALIGN_BEHIND_SEGMENTS || !session.primed {
-                                        return Err(PlaylistError::NotReady);
-                                    }
+                                } else if want_ms < window_start {
+                                    // Producer-truth: URI behind the cooking
+                                    // window was never listed for this run.
+                                    return Err(PlaylistError::NotFound);
                                 }
                             }
                         }
@@ -1464,6 +1836,55 @@ fn restart_at(
         "hls seek restart_at: stop prior encode"
     );
     stop_child(&mut session.child);
+    sync_segment_map(session);
+    sync_all_run_indexes(session);
+    // Duplicate-write stop: scrub-back (or re-land) into media the global map
+    // already holds — mint a fresh playlist URI, copy init, do not re-encode.
+    if let Some(mapped) = map_segment_covering(session, play_start_ms) {
+        let src_run = mapped.run_id;
+        let run_id = session.next_run_id;
+        session.next_run_id += 1;
+        let new_dir = session.dir.join(format!("run_{run_id}"));
+        fs::create_dir_all(&new_dir).map_err(|e| {
+            PlaylistError::Failed(format!("create run dir {}: {e}", new_dir.display()))
+        })?;
+        let init_src = session.dir.join(format!("run_{src_run}/init.mp4"));
+        let init_dst = new_dir.join("init.mp4");
+        if init_src.exists() {
+            fs::copy(&init_src, &init_dst).map_err(|e| {
+                PlaylistError::Failed(format!(
+                    "copy init {} -> {}: {e}",
+                    init_src.display(),
+                    init_dst.display()
+                ))
+            })?;
+        }
+        session.current_run_id = run_id;
+        session.current_run_eof = true;
+        session.start_ms = play_start_ms;
+        session.play_start_ms = play_start_ms;
+        session.landed_ms = mapped.start_ms;
+        session.failed = None;
+        session.last_restart = Instant::now();
+        session.primed = true;
+        session.first_segment_ready = true;
+        session.stale_retain_refuse_until = None;
+        if session.pending_play_ms == Some(play_start_ms) {
+            session.pending_play_ms = None;
+            session.pending_since = None;
+        }
+        maybe_evict_finished_runs(session);
+        tracing::info!(
+            play_start_ms,
+            run_id,
+            src_run_id = src_run,
+            mapped_start_ms = mapped.start_ms,
+            session_disk_bytes = session_disk_bytes(&session.dir),
+            path = %session.src.display(),
+            "hls session seek map hit (duplicate-write stop)"
+        );
+        return Ok(RestartAtOutcome::Applied);
+    }
     if let Some(gap) = restart_spawn_gap() {
         tracing::info!(
             gap_ms = gap.as_millis(),
@@ -1472,17 +1893,20 @@ fn restart_at(
         );
         std::thread::sleep(gap);
     }
-    // Gate 2 / fill-forward: do not wipe prior segments. In-flight fetches
-    // and later scrub-back into cooked media must still hit disk. Only
-    // remove the muxer sidecar; ffmpeg -y overwrites init and new indices.
-    let index = session.dir.join("index.m3u8");
-    let _ = fs::remove_file(&index);
+    // Gate 2 / fill-forward: do not wipe prior run dirs. Scrub-back into
+    // mapped media is a plain file serve (ADR-0020 global map). New producer
+    // output goes in a fresh run_* directory.
+    let run_id = session.next_run_id;
+    session.next_run_id += 1;
+    let run_dir = session.dir.join(format!("run_{run_id}"));
+    fs::create_dir_all(&run_dir)
+        .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
     let burn_in = prepare_ass_burn_file(&session.src, &session.dir, session.burn_in.clone())
         .map_err(PlaylistError::Failed)?;
     session.burn_in = burn_in;
     let child = spawn_ffmpeg(
         &session.src,
-        &session.dir,
+        &run_dir,
         start_ms,
         session.mode,
         session.audio.clone(),
@@ -1491,8 +1915,11 @@ fn restart_at(
     )
     .map_err(PlaylistError::Failed)?;
     session.child = Some(child);
+    session.current_run_id = run_id;
+    session.current_run_eof = false;
     session.start_ms = start_ms;
     session.play_start_ms = play_start_ms;
+    session.landed_ms = play_start_ms;
     session.failed = None;
     session.last_restart = Instant::now();
     session.primed = false;
@@ -1502,14 +1929,44 @@ fn restart_at(
         session.pending_play_ms = None;
         session.pending_since = None;
     }
+    maybe_evict_finished_runs(session);
     tracing::info!(
         start_ms,
         play_start_ms,
+        run_id,
+        session_disk_bytes = session_disk_bytes(&session.dir),
         encoder = video_encoder,
         path = %session.src.display(),
         "hls session seek restart"
     );
     Ok(RestartAtOutcome::Applied)
+}
+
+/// Mapped segment that already covers title-absolute `play_ms`.
+///
+/// Producer sidx can land a few tens of ms after `-ss` (dogfood: start 80 for
+/// play 0). Treat the first mapped segment at or after `play` that starts
+/// before `play + 2*SEGMENT_MS` as a hit so scrub-back does not re-encode.
+fn map_segment_covering(
+    session: &Session,
+    play_ms: u64,
+) -> Option<crate::hls_segment_map::MappedSegment> {
+    let play = align_to_segment(play_ms);
+    if let Some(exact) = session.segment_map.get(play) {
+        return Some(exact.clone());
+    }
+    if let Some(s) = session.segment_map.iter_ordered().find(|s| {
+        let end = s.start_ms.saturating_add(s.duration_ms.max(1));
+        s.start_ms <= play && play < end
+    }) {
+        return Some(s.clone());
+    }
+    let slack = SEGMENT_MS.saturating_mul(2);
+    session
+        .segment_map
+        .iter_ordered()
+        .find(|s| s.start_ms >= play && s.start_ms < play.saturating_add(slack))
+        .cloned()
 }
 
 /// Record scrub intent. In-flight encodes keep cooking until land (or a far
@@ -1670,23 +2127,29 @@ pub fn serve_ok_retained_during_stale_guard(
 /// the requested URI is the cooking land. Middle waiters may enter no-fill
 /// before a 200 on that URI; final land-ensure must still notice.
 fn note_first_segment_ready(session_id: &str, session: &mut Session) {
+    sync_segment_map(session);
     if session.first_segment_ready {
         return;
     }
-    let land = segment_name(session.play_start_ms / SEGMENT_MS);
-    if !session.dir.join(&land).exists() {
+    if !current_run_has_mapped_segment(session) {
         return;
+    }
+    if let Some(landed) = first_current_run_start(session) {
+        session.landed_ms = landed;
     }
     session.first_segment_ready = true;
     session.stale_retain_refuse_until = None;
     let elapsed_ms = session.last_restart.elapsed().as_millis();
-    let lead_segments = session.play_start_ms.saturating_sub(session.start_ms) / SEGMENT_MS;
+    let lead_ms = session.play_start_ms.saturating_sub(session.start_ms);
+    let disk_bytes = session_disk_bytes(&session.dir);
     tracing::info!(
         session_id,
         elapsed_ms,
         start_ms = session.start_ms,
         play_start_ms = session.play_start_ms,
-        lead_segments,
+        landed_ms = session.landed_ms,
+        lead_ms,
+        session_disk_bytes = disk_bytes,
         encoder = %session.video_encoder,
         path = %session.src.display(),
         "hls_session_first_segment_ready"
@@ -1717,8 +2180,7 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
             Some(msg)
         }
         Ok(Some(_)) => {
-            // Encoder reached the end of the file; segments stay servable.
-            session.child = None;
+            apply_run_eof(session);
             None
         }
         Ok(None) => None,
@@ -1727,6 +2189,31 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
             session.failed = Some(msg.clone());
             Some(msg)
         }
+    }
+}
+
+/// Producer reached EOF: mark ENDLIST and record usable extent when the
+/// farthest mapped end (or 0 if nothing was written) is materially short of
+/// claimed duration. Empty map at a mid-title land is still damage — clients
+/// must see usableExtentMs instead of hanging on master 503.
+fn apply_run_eof(session: &mut Session) {
+    session.child = None;
+    session.current_run_eof = true;
+    sync_segment_map(session);
+    let end = session
+        .segment_map
+        .iter_ordered()
+        .next_back()
+        .map(|last| last.start_ms.saturating_add(last.duration_ms))
+        .unwrap_or(0);
+    if session.duration_ms.saturating_sub(end) > USABLE_SHORTFALL_MS {
+        session.usable_extent_ms = Some(end);
+        tracing::info!(
+            usable_extent_ms = end,
+            duration_ms = session.duration_ms,
+            run_id = session.current_run_id,
+            "hls usable extent recorded (EOF short of claimed duration)"
+        );
     }
 }
 
@@ -1740,36 +2227,12 @@ fn encode_start_ms(play_ms: u64) -> u64 {
     align_to_segment(play_ms.saturating_sub(encode_lead_segments() * SEGMENT_MS))
 }
 
-fn segment_name(index: u64) -> String {
-    format!("seg{index:03}.m4s")
-}
-
-/// Highest `segNNN.m4s` index at or after `window_start` in `dir`.
-/// Retained segments from an earlier encode window must not count as the
-/// live frontier: otherwise an in-window miss looks far-ahead of those
-/// stale indices and restarts at the same offset forever.
-fn latest_segment_in_window(dir: &Path, window_start: u64) -> Option<u64> {
-    let mut best: Option<u64> = None;
-    let Ok(entries) = fs::read_dir(dir) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if let Some(idx) = segment_index(name)
-            && idx >= window_start
-        {
-            best = Some(best.map_or(idx, |b| b.max(idx)));
-        }
-    }
-    best
-}
-
-/// "segNNN.m4s" -> NNN; None for init.mp4.
-fn segment_index(name: &str) -> Option<u64> {
-    name.strip_prefix("seg")?.strip_suffix(".m4s")?.parse().ok()
+/// Highest mapped segment start at or after `window_start_ms`.
+fn latest_segment_in_window(
+    map: &crate::hls_segment_map::SegmentMap,
+    window_start_ms: u64,
+) -> Option<u64> {
+    latest_mapped_start_in_window(map, window_start_ms)
 }
 
 /// Dogfood: what EXT-X-START / session land was when a playlist was served.
@@ -1809,67 +2272,21 @@ fn log_playlist_serve(
         play_start_ms,
         pending_play_ms,
         ext_x_start_s = ext_x_start,
-        play_land_seg = play_start_ms / SEGMENT_MS,
+        play_land_ms = play_start_ms,
         head = %head,
         "hls playlist serve"
     );
 }
 
-/// Full-title VOD media playlist (ADR-0011 amendment).
-///
-/// Lists every segment from `seg000` through the probed duration so the
-/// scrubber is title-absolute. `start_ms` only sets `#EXT-X-START` for the
-/// preferred land point; cold regions return 503 while a guarded restart
-/// cooks them. The playlist does not omit pre-window indices.
-fn build_playlist(duration_ms: u64, start_ms: u64) -> Vec<u8> {
-    use std::fmt::Write;
-    let full = duration_ms / SEGMENT_MS;
-    let rem_ms = duration_ms % SEGMENT_MS;
-    let segment_secs = SEGMENT_MS as f64 / 1000.0;
-    // TARGETDURATION is an integer number of seconds (HLS); ceil so a
-    // non-whole SEGMENT_MS still validates.
-    let target = segment_secs.ceil() as u64;
-    let mut out = format!(
-        "#EXTM3U\n\
-         #EXT-X-VERSION:7\n\
-         #EXT-X-TARGETDURATION:{target}\n\
-         #EXT-X-PLAYLIST-TYPE:VOD\n\
-         #EXT-X-MEDIA-SEQUENCE:0\n\
-         #EXT-X-MAP:URI=\"init.mp4\"\n"
-    );
-    if start_ms > 0 {
-        // PRECISE=YES is the correct EXT-X-START contract. A temporary
-        // removal (shallower dig-back under post-land `#t=`) was dropped once
-        // ENCODE_LEAD_SEGMENTS covers the measured ~8-seg hole (ADR-0011).
-        let _ = writeln!(
-            out,
-            "#EXT-X-START:TIME-OFFSET={:.3},PRECISE=YES",
-            start_ms as f64 / 1000.0
-        );
-    }
-    for i in 0..full {
-        let _ = writeln!(out, "#EXTINF:{segment_secs:.6},\n{}", segment_name(i));
-    }
-    if rem_ms > 0 {
-        let _ = writeln!(
-            out,
-            "#EXTINF:{:.6},\n{}",
-            rem_ms as f64 / 1000.0,
-            segment_name(full)
-        );
-    }
-    out.push_str("#EXT-X-ENDLIST\n");
-    out.into_bytes()
-}
-
 /// Master playlist: one video variant + optional SUBTITLES group (ADR-0010).
-/// Media URI stays relative `index.m3u8` (ADR-0008).
+/// Media and subtitle URIs are path-absolute under `/api/v0/sessions/…`
+/// so run-directory depth cannot break client resolution (ADR-0008).
 ///
 /// CODECS is omitted on purpose: a wrong value (we previously advertised
 /// Main@L3.1 while VideoToolbox emits High@L4.0) makes Safari native HLS
 /// refuse the variant outright. Better no hint than a lying one; the init
 /// segment carries the real codec string.
-fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
+fn build_master(session_id: &str, run_id: u64, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
     use std::fmt::Write;
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     if !tracks.is_empty() {
@@ -1882,7 +2299,7 @@ fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
             let mut line = format!(
                 "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",\
                  LANGUAGE=\"{lang}\",DEFAULT={default},AUTOSELECT={autoselect},\
-                 FORCED={forced},URI=\"subs/{}.m3u8\"",
+                 FORCED={forced},URI=\"/api/v0/sessions/{session_id}/subs/{}.m3u8\"",
                 t.track_id
             );
             if t.sdh {
@@ -1896,13 +2313,19 @@ fn build_master(tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
     } else {
         out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000\n");
     }
-    out.push_str("index.m3u8\n");
+    let _ = writeln!(
+        out,
+        "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8"
+    );
     out.into_bytes()
 }
 
-/// Subtitle media playlist for one snapshotted track: always 2s VOD segments
-/// aligned to the video timeline. Segment bodies come from the item store
-/// VTT ([`HlsSubtitleTrack::item_vtt_path`]) or session-inline demux.
+/// Subtitle media playlist for one snapshotted track.
+///
+/// ADR-0020 §10 / ADR-0010: VTT stays on the fixed 2s index grid (`segNNN.vtt`)
+/// even though video URIs are time-keyed (`seg_<ms:011>.m4s`). Do not "align"
+/// subtitle segment names to producer video boundaries — cue slicing is
+/// title-time on SEGMENT_MS, independent of copy GOP cuts.
 fn build_subtitle_playlist_for(track: &HlsSubtitleTrack, duration_ms: u64) -> Vec<u8> {
     build_segmented_subtitle_playlist(&track.track_id, duration_ms)
 }
@@ -2055,8 +2478,11 @@ fn spawn_ffmpeg(
     }
     cmd.arg("-i").arg(src);
     if start_ms > 0 {
-        // Keep output timestamps absolute so mid-title segments land at their
-        // playlist position instead of restarting the clock at zero.
+        // ADR-0020: load-bearing under copy. Does not rewrite tfdt/trun (those
+        // stay segment-local at 0); it stamps title-absolute time into the
+        // init `elst` empty-edit and each fragment's `sidx.earliest_presentation_time`,
+        // which the session map uses as the wire key. Removing or moving this
+        // flag silently reintroduces zero-based / mislabelled segment times.
         cmd.args(["-output_ts_offset", &start_secs]);
     }
     let audio_map = match audio.stream_index {
@@ -2180,8 +2606,8 @@ fn spawn_ffmpeg(
         "seg%03d.m4s",
         "-start_number",
         &start_number,
-        // ffmpeg's own playlist is never served; ours is generated from the
-        // probed duration (VOD). This file just keeps the muxer happy.
+        // Muxer index is ingested into the session-global time-keyed map
+        // (ADR-0020); clients never fetch this file.
         "index.m3u8",
     ]);
     cmd.spawn().map_err(|e| {
@@ -2408,13 +2834,7 @@ fn is_safe_asset(name: &str) -> bool {
     if name == "init.mp4" {
         return true;
     }
-    let Some(rest) = name.strip_prefix("seg") else {
-        return false;
-    };
-    let Some(num) = rest.strip_suffix(".m4s") else {
-        return false;
-    };
-    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
+    crate::hls_segment_map::parse_time_keyed_segment_name(name).is_some()
 }
 
 #[cfg(test)]
@@ -2481,29 +2901,49 @@ mod tests {
     }
 
     fn wait_playlist(reg: &HlsSessionRegistry, id: &str) -> Vec<u8> {
-        for _ in 0..100 {
-            match reg.playlist(id, None) {
+        wait_playlist_run(reg, id, 0)
+    }
+
+    fn wait_playlist_run(reg: &HlsSessionRegistry, id: &str, run_id: u64) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match reg.playlist(id, run_id) {
                 Ok(bytes) => return bytes,
-                Err(PlaylistError::NotReady) => {
-                    std::thread::sleep(Duration::from_millis(100));
+                Err(PlaylistError::NotReady) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) => panic!("playlist error: {e:?}"),
+                Err(e) => panic!("playlist: {e:?}"),
             }
         }
-        panic!("playlist not ready in time");
+    }
+
+    /// First time-keyed segment URI listed in a media playlist body.
+    fn first_listed_seg(playlist: &[u8]) -> String {
+        for line in String::from_utf8_lossy(playlist).lines() {
+            let base = line.rsplit('/').next().unwrap_or(line);
+            if crate::hls_segment_map::parse_time_keyed_segment_name(base).is_some() {
+                return base.to_string();
+            }
+        }
+        panic!("no time-keyed segment in playlist");
+    }
+
+    fn wait_first_listed_asset(reg: &HlsSessionRegistry, id: &str) -> Vec<u8> {
+        let pl = wait_playlist(reg, id);
+        wait_asset(reg, id, &first_listed_seg(&pl))
     }
 
     fn wait_asset(reg: &HlsSessionRegistry, id: &str, name: &str) -> Vec<u8> {
-        for _ in 0..150 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             match reg.asset(id, name, None) {
                 Ok(bytes) => return bytes,
-                Err(PlaylistError::NotReady) => {
-                    std::thread::sleep(Duration::from_millis(100));
+                Err(PlaylistError::NotReady) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) => panic!("asset {name} error: {e:?}"),
+                Err(e) => panic!("asset {name}: {e:?}"),
             }
         }
-        panic!("asset {name} not ready in time");
     }
 
     #[test]
@@ -2546,117 +2986,26 @@ mod tests {
     fn segment_miss_decision_table() {
         let cool = RESTART_MIN_INTERVAL;
         let hot = Duration::from_millis(0);
-        // (name, idx, window_start_idx, play_start_idx, latest, primed, since, expected)
+        // ADR-0020: segment GETs never Restart. Far scrub is POST /seek.
         let cases = [
             (
-                "unprimed far behind waits (attach prefetch of seg000)",
+                "behind window waits (no dig-back restart)",
                 0,
                 600,
                 616,
                 None,
                 false,
                 cool,
-                SegmentMissAction::Wait,
             ),
+            ("near behind play waits", 0, 4, 4, Some(10), true, cool),
             (
-                "unprimed mid-title seg000 waits (play-relative, not window)",
-                0,
-                12,
-                20,
-                None,
-                false,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "unprimed dig past lead-in follows play land",
-                632,
-                640,
-                648,
-                None,
-                false,
-                cool,
-                SegmentMissAction::Restart,
-            ),
-            (
-                "unprimed dig past lead-in bypasses create min-interval",
-                632,
-                640,
-                648,
-                None,
-                false,
-                hot,
-                SegmentMissAction::Restart,
-            ),
-            (
-                "unprimed behind at tolerance follows",
-                632,
-                640,
-                648,
-                None,
-                false,
-                cool,
-                SegmentMissAction::Restart,
-            ),
-            (
-                "unprimed behind past tolerance waits (seg000-class prefetch)",
-                631,
-                640,
-                648,
-                None,
-                false,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "primed near behind play restarts (settle)",
-                0,
-                4,
-                4,
-                Some(10),
-                true,
-                cool,
-                SegmentMissAction::Restart,
-            ),
-            (
-                "primed near behind within min interval waits",
-                0,
-                4,
-                4,
-                Some(10),
-                true,
-                hot,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "primed far behind play waits (stale post-jump hole)",
-                490,
-                729,
-                729,
-                Some(740),
-                true,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "primed far behind at prior land waits (dogfood scrub-scrub)",
-                491,
-                729,
-                729,
-                Some(740),
-                true,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "far ahead of play band restarts",
+                "far ahead of frontier waits (seek API owns scrub)",
                 20,
                 4,
                 4,
                 Some(10),
                 true,
                 cool,
-                SegmentMissAction::Restart,
             ),
             (
                 "near frontier waits (cooking)",
@@ -2666,99 +3015,52 @@ mod tests {
                 Some(10),
                 true,
                 cool,
-                SegmentMissAction::Wait,
             ),
             (
-                "far ahead within min interval waits",
+                "hot restart interval still waits",
                 20,
                 4,
                 4,
                 Some(10),
                 true,
                 hot,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "retained pre-window latest does not fake far-ahead",
-                1052,
-                1052,
-                1052,
-                Some(7),
-                false,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "in-window cooking waits when frontier is window start",
-                1052,
-                1052,
-                1052,
-                None,
-                false,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "lead-in band near EXT-X-START waits (no thrash restart)",
-                656,
-                648,
-                664,
-                None,
-                false,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "lead-in band at play land waits",
-                664,
-                648,
-                664,
-                Some(650),
-                false,
-                cool,
-                SegmentMissAction::Wait,
-            ),
-            (
-                "past play land by more than catch-up restarts",
-                670,
-                648,
-                664,
-                Some(650),
-                false,
-                cool,
-                SegmentMissAction::Restart,
             ),
         ];
-        for (name, idx, window, play, latest, primed, since, expected) in cases {
+        for (name, idx, window, play, latest, primed, since) in cases {
             assert_eq!(
-                decide_segment_miss(idx, window, play, latest, primed, since),
-                expected,
+                decide_segment_miss(
+                    idx * SEGMENT_MS,
+                    window * SEGMENT_MS,
+                    play * SEGMENT_MS,
+                    latest.map(|l| l * SEGMENT_MS),
+                    primed,
+                    since,
+                ),
+                SegmentMissAction::Wait,
                 "{name}"
             );
         }
     }
 
     #[test]
-    fn miss_restart_offset_lands_on_requested_segment() {
-        // Near-land behind misses still Restart; encode aims lead before N.
-        // Far-behind primed misses Wait now (stale post-jump) — scrub-back is startMs.
+    fn miss_never_restarts_encode_from_segment_get() {
         let cases = [(1040u64, 1052u64), (0u64, 4u64), (1610u64, 1614u64)];
         for (idx, window) in cases {
             let action = decide_segment_miss(
-                idx,
-                window,
-                window,
-                Some(window),
+                idx * SEGMENT_MS,
+                window * SEGMENT_MS,
+                window * SEGMENT_MS,
+                Some(window * SEGMENT_MS),
                 true,
                 RESTART_MIN_INTERVAL,
             );
-            assert_eq!(action, SegmentMissAction::Restart, "idx={idx}");
+            assert_eq!(action, SegmentMissAction::Wait, "idx={idx}");
             let want_ms = idx * SEGMENT_MS;
             let new_window = encode_start_ms(want_ms) / SEGMENT_MS;
             assert_eq!(
                 new_window,
                 idx.saturating_sub(ENCODE_LEAD_SEGMENTS),
-                "encode lead before land N (idx={idx})"
+                "encode_start still defined for seek path"
             );
         }
     }
@@ -2835,45 +3137,24 @@ mod tests {
         assert_eq!(due2, Some(2_700_000));
     }
 
-    /// Dogfood seg415 after scrub to 1188: yank before the cooking *play land*
-    /// exists left Safari retrying the prior land URI forever. Ready must mean
-    /// the play-land segment, not the encode-window first segment. Near pending
-    /// must not preempt before that land exists.
+    /// ADR-0020: lead is 0, so encode window start equals play land. Any
+    /// different pending land is "far" (ALIGN dig-back band deleted) and may
+    /// preempt after RESTART_MIN_INTERVAL; same-land pending never preempts.
     #[test]
-    fn seg415_near_pending_must_not_preempt_before_cooking_land() {
-        // Scrub to 1188s; encode lead puts first_window ENCODE_LEAD segs earlier.
+    fn pending_preempt_policy_under_producer_truth() {
         let cooking_play = 1_188_000u64;
-        let encode = encode_start_ms(cooking_play);
-        assert_eq!(
-            encode,
-            cooking_play - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
-            "lead-in before land"
+        assert_eq!(encode_start_ms(cooking_play), cooking_play);
+        assert!(
+            !coalesce_preempt_before_land(cooking_play, cooking_play),
+            "same land is not preempt"
         );
-        assert_ne!(
-            encode / SEGMENT_MS,
-            cooking_play / SEGMENT_MS,
-            "first window index is not the play land (old ready bug)"
-        );
-        // Prior land Safari was still probing (seg415).
-        let prior_land = 415 * SEGMENT_MS;
-        assert_eq!(prior_land, 830_000);
-
-        // Near retarget while cooking 1188 — inside ALIGN band, must not preempt.
         let near_fwd = cooking_play + SEGMENT_MS;
-        let near_back = cooking_play - SEGMENT_MS;
-        let edge = cooking_play + ALIGN_BEHIND_SEGMENTS * SEGMENT_MS;
         assert!(
-            !coalesce_preempt_before_land(cooking_play, near_fwd),
-            "near forward must not abandon cooking land"
+            coalesce_preempt_before_land(cooking_play, near_fwd),
+            "any different land is preempt-eligible"
         );
-        assert!(
-            !coalesce_preempt_before_land(cooking_play, near_back),
-            "near behind must not abandon cooking land"
-        );
-        assert!(
-            !coalesce_preempt_before_land(cooking_play, edge),
-            "exactly ALIGN_BEHIND segs is still near"
-        );
+        // Before cooking land is ready: far pending may apply only after
+        // RESTART_MIN_INTERVAL (see far_pending_preempts_before_land…).
         assert_eq!(
             pending_restart_due(
                 false,
@@ -2881,13 +3162,12 @@ mod tests {
                 None,
                 false,
                 cooking_play,
-                RESTART_MIN_INTERVAL,
+                Duration::from_millis(0),
                 true
             ),
             None,
-            "near pending before land: no apply (seg415 protection)"
+            "hot clock: no preempt"
         );
-        // Even with apply_immediate and a cool restart clock: still blocked.
         assert_eq!(
             pending_restart_due(
                 false,
@@ -2898,9 +3178,10 @@ mod tests {
                 RESTART_MIN_INTERVAL * 2,
                 true
             ),
-            None
+            Some(near_fwd),
+            "cool clock + far pending: preempt"
         );
-        // Land ready → near pending may apply (debounce/immediate path).
+        // Land ready → pending may apply.
         assert_eq!(
             pending_restart_due(
                 true,
@@ -2974,8 +3255,9 @@ mod tests {
     fn no_fill_releases_far_mid_once_new_land_ready() {
         let mid = 258_000u64;
         let land = 748_000u64;
-        // Jump land: encode window at land − lead (2 segs).
+        // lead=0 ⇒ encode window == play land.
         let window = land - ENCODE_LEAD_SEGMENTS * SEGMENT_MS;
+        assert_eq!(window, land);
         assert!(
             !no_fill_release_for_new_land(mid, land, false, window),
             "still cooking: keep no-fill hold"
@@ -2990,26 +3272,13 @@ mod tests {
         );
         assert!(
             !no_fill_release_for_new_land(land, 0, true, 0),
-            "ahead of attach play: must not 503 land-ensure"
+            "ahead of attach play: must not 503"
         );
-        // Near but still inside lead-in: may still be written — keep hold.
-        let in_lead = land - SEGMENT_MS;
+        // Behind window (lead=0: one seg behind land) → release.
+        let behind_window = land - SEGMENT_MS;
         assert!(
-            in_lead >= window,
-            "test setup: in_lead must be inside encode window"
-        );
-        assert!(
-            !no_fill_release_for_new_land(in_lead, land, true, window),
-            "near dig-back inside lead stays held"
-        );
-        // Single-scrub dogfood: dig-back one seg behind encode start (behind
-        // window) while land is only a few segs ahead — must release.
-        let single_land = 258_000u64;
-        let single_window = single_land - ENCODE_LEAD_SEGMENTS * SEGMENT_MS;
-        let behind_window = single_window - SEGMENT_MS;
-        assert!(
-            no_fill_release_for_new_land(behind_window, single_land, true, single_window),
-            "behind encode window after land ready: release even if near play"
+            no_fill_release_for_new_land(behind_window, land, true, window),
+            "behind encode window after land ready: release"
         );
     }
 
@@ -3121,22 +3390,16 @@ mod tests {
         );
         assert_eq!(
             pending_waiter_action(Some(land), land + SEGMENT_MS),
-            PendingWaiterAction::Hold,
-            "dig-back pending one seg behind land: keep holding"
-        );
-        assert_eq!(
-            pending_waiter_action(Some(land), land + 2 * SEGMENT_MS),
-            PendingWaiterAction::Hold,
-            "dig-back pending two segs behind land: keep holding"
+            PendingWaiterAction::Release,
+            "any non-exact want is superseded"
         );
         assert_eq!(
             pending_waiter_action(Some(land + 20_000), land),
             PendingWaiterAction::Release,
             "pending is a different scrub ahead"
         );
-        let far_ahead_want = land + (ALIGN_BEHIND_SEGMENTS + 1) * SEGMENT_MS;
         assert_eq!(
-            pending_waiter_action(Some(land), far_ahead_want),
+            pending_waiter_action(Some(land), land + 60_000),
             PendingWaiterAction::Release,
             "pending far behind want: real supersede, release"
         );
@@ -3168,8 +3431,6 @@ mod tests {
     fn stale_retain_cleared_when_play_land_ready() {
         let dir = tempfile::tempdir().expect("tempdir");
         let play_ms = 2_538_000u64;
-        let land = segment_name(play_ms / SEGMENT_MS);
-        fs::write(dir.path().join(&land), b"x").expect("land seg");
         let mut session = Session {
             item_id: 1,
             src: PathBuf::from("/dev/null"),
@@ -3180,7 +3441,13 @@ mod tests {
             video_encoder: "libx264".into(),
             start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
             play_start_ms: play_ms,
+            landed_ms: play_ms,
+            usable_extent_ms: None,
             duration_ms: 3_600_000,
+            current_run_id: 0,
+            next_run_id: 1,
+            segment_map: crate::hls_segment_map::SegmentMap::default(),
+            current_run_eof: false,
             child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
@@ -3194,6 +3461,14 @@ mod tests {
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
         };
+        session
+            .segment_map
+            .insert(crate::hls_segment_map::MappedSegment {
+                start_ms: play_ms,
+                duration_ms: SEGMENT_MS,
+                run_id: 0,
+                rel_path: PathBuf::from("run_0/seg000.m4s"),
+            });
         note_first_segment_ready("test", &mut session);
         assert!(session.first_segment_ready);
         assert!(
@@ -3236,11 +3511,13 @@ mod tests {
     }
 
     #[test]
-    fn digback_behind_committed_blocks_near_land_steal() {
-        // Dogfood: cooking 1482000, Safari asks 1478000 (2 segs behind).
+    fn digback_behind_committed_blocks_behind_land_steal() {
+        // Any want behind committed is dig-back (no segment-path restart).
         let cooking = 1_482_000u64;
         let dig = 1_478_000u64;
+        let far = cooking - 60_000;
         assert!(digback_behind_committed(cooking, None, dig));
+        assert!(digback_behind_committed(cooking, None, far));
         assert!(
             !digback_behind_committed(cooking, None, cooking),
             "same land is not dig-back"
@@ -3249,11 +3526,7 @@ mod tests {
             !digback_behind_committed(cooking, None, cooking + SEGMENT_MS),
             "ahead is not dig-back"
         );
-        // Far behind committed is not dig-back (far-behind Wait in decide_segment_miss).
-        let far = cooking - (ALIGN_BEHIND_SEGMENTS + 1) * SEGMENT_MS;
-        assert!(!digback_behind_committed(cooking, None, far));
 
-        // Coalesce: cooking B, pending C — dig-back relative to C must not retreat.
         let cooking_b = 1_054_000u64;
         let pending_c = 1_482_000u64;
         assert!(digback_behind_committed(cooking_b, Some(pending_c), dig));
@@ -3263,7 +3536,7 @@ mod tests {
         );
     }
 
-    /// scrub_shaped must not retreat committed land (same gate as Restart arm).
+    /// Segment miss never Restarts; dig-back still blocks desire_restart.
     #[test]
     fn scrub_shaped_digback_must_not_desire() {
         let cooking = 1_482_000u64;
@@ -3271,28 +3544,21 @@ mod tests {
         let idx = dig / SEGMENT_MS;
         let window = cooking / SEGMENT_MS;
         let play = window;
-        // Near behind → Restart when cool (scrub_shaped true).
         assert_eq!(
-            decide_segment_miss(idx, window, play, Some(window), true, RESTART_MIN_INTERVAL,),
-            SegmentMissAction::Restart
+            decide_segment_miss(
+                idx * SEGMENT_MS,
+                window * SEGMENT_MS,
+                play * SEGMENT_MS,
+                Some(window * SEGMENT_MS),
+                true,
+                RESTART_MIN_INTERVAL,
+            ),
+            SegmentMissAction::Wait
         );
         assert!(
             digback_behind_committed(cooking, None, dig),
             "asset_wait must skip desire_restart for this miss"
         );
-        // Hot min-interval → Wait, but scrub_shaped still true — same dig-back gate.
-        assert_eq!(
-            decide_segment_miss(
-                idx,
-                window,
-                play,
-                Some(window),
-                true,
-                Duration::from_millis(0)
-            ),
-            SegmentMissAction::Wait
-        );
-        assert!(digback_behind_committed(cooking, None, dig));
     }
 
     /// Abandoned miss predicate: far behind / prior land → hold path; dig-back
@@ -3304,19 +3570,26 @@ mod tests {
         let play = cooking;
         let latest = Some(window_ms / SEGMENT_MS);
         let prior = 473 * SEGMENT_MS;
-        let far = cooking - (ALIGN_BEHIND_SEGMENTS + 1) * SEGMENT_MS;
+        let far = cooking - 60_000;
         let dig = cooking - 2 * SEGMENT_MS;
         let in_window = window_ms;
         let ahead = cooking + (CATCH_UP_SEGMENTS + 2) * SEGMENT_MS;
 
+        // lead=0 ⇒ window == cooking; any behind-window miss is unreachable.
         let cases: &[(&str, u64, Option<u64>, bool, bool)] = &[
             ("far behind no pending", far, None, true, true),
             ("prior land after jump", prior, None, true, true),
             ("attach-shaped seg000", 0, None, true, true),
-            ("near dig-back", dig, None, true, false),
+            ("behind land dig-back", dig, None, true, true),
             ("pending exact land", prior, Some(prior), true, false),
             ("in-window fill-forward", in_window, None, true, false),
-            ("cool restart ahead", ahead, None, true, false),
+            (
+                "ahead of frontier (seek owns scrub)",
+                ahead,
+                None,
+                true,
+                false,
+            ),
             ("unprimed far still unreachable", far, None, false, true),
         ];
         for &(name, want, pending, primed, expect_unreachable) in cases {
@@ -3328,8 +3601,8 @@ mod tests {
         }
     }
 
-    /// Dogfood: coalesce used to 503 the land seg immediately and rely on
-    /// Safari retry. Hold until ready on the same connection instead.
+    /// ADR-0020: far scrub is POST /seek, not a segment GET. Seek then hold
+    /// the land segment until the new run cooks it.
     #[test]
     fn scrub_segment_hold_returns_200_on_same_request() {
         if !ffmpeg_available() {
@@ -3353,19 +3626,122 @@ mod tests {
             )
             .unwrap();
         wait_playlist(&reg, &id);
-        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        let _ = wait_first_listed_asset(&reg, &id);
         std::thread::sleep(RESTART_MIN_INTERVAL);
 
+        let view = reg.seek(&id, 40_000).expect("seek");
+        assert_ne!(view.run_id, 0, "fresh run after far seek");
         let t0 = Instant::now();
-        // Far past the few seconds of fill-forward from start — forces restart + hold.
         let bytes = reg
-            .asset(&id, "seg020.m4s", None)
-            .expect("land seg must 200 on the holding request");
+            .asset(&id, "seg_00000040000.m4s", None)
+            .expect("land seg must 200 after seek");
         assert!(!bytes.is_empty());
         assert!(
             t0.elapsed() < SEGMENT_WAIT,
             "should finish within SEGMENT_WAIT"
         );
+    }
+
+    /// ADR-0020: producer-truth runs have no dig-back lead before their land.
+    #[test]
+    fn lead_zero_digback_before_land_is_not_covered() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 60);
+        let land_ms = 40_000;
+        assert_eq!(ENCODE_LEAD_SEGMENTS, 0);
+        assert_eq!(encode_start_ms(land_ms), land_ms);
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                land_ms,
+                60_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let land = crate::hls_segment_map::time_keyed_segment_name(land_ms);
+        assert!(!wait_asset(&reg, &id, &land).is_empty());
+
+        let digback = crate::hls_segment_map::time_keyed_segment_name(land_ms - SEGMENT_MS);
+        let t0 = Instant::now();
+        match reg.asset(&id, &digback, None) {
+            Err(PlaylistError::NotFound) | Err(PlaylistError::NotReady) => {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(5),
+                    "dig-back before land must fail quickly"
+                );
+            }
+            Ok(_) => panic!("dig-back must not cook a retreated window"),
+            Err(e) => panic!("unexpected dig-back error: {e:?}"),
+        }
+    }
+
+    /// ADR-0020: a segment miss cannot make a new far-ahead producer run.
+    #[test]
+    fn segment_miss_without_seek_cannot_cook_far_ahead() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 60);
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                60_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+            )
+            .unwrap();
+        let playlist = wait_playlist(&reg, &id);
+        let _ = wait_asset(&reg, &id, &first_listed_seg(&playlist));
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+
+        let land_ms = 40_000;
+        let land = crate::hls_segment_map::time_keyed_segment_name(land_ms);
+        assert!(
+            !String::from_utf8_lossy(&playlist).contains(&land),
+            "far-ahead segment must not already be listed"
+        );
+        let t0 = Instant::now();
+        match reg.asset(&id, &land, None) {
+            Err(PlaylistError::NotReady) | Err(PlaylistError::AbandonedHoldEnded) => {
+                assert!(
+                    t0.elapsed() < SEGMENT_WAIT + Duration::from_secs(3),
+                    "far-ahead miss must return around SEGMENT_WAIT"
+                );
+            }
+            Err(PlaylistError::NotFound) => {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(5),
+                    "unlisted far-ahead miss must return quickly"
+                );
+            }
+            Ok(_) => panic!("segment miss must not cook a far-ahead land"),
+            Err(e) => panic!("unexpected far-ahead error: {e:?}"),
+        }
+
+        let view = reg.seek(&id, land_ms).expect("seek");
+        assert_ne!(view.run_id, 0, "seek starts a new producer run");
+        let seek_playlist = wait_playlist_run(&reg, &id, view.run_id);
+        let seek_land = first_listed_seg(&seek_playlist);
+        assert!(!wait_asset(&reg, &id, &seek_land).is_empty());
     }
 
     /// While a waiter holds for land A, a newer scrub moves pending to B.
@@ -3396,7 +3772,7 @@ mod tests {
             )
             .unwrap();
         wait_playlist(&reg, &id);
-        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        let _ = wait_first_listed_asset(&reg, &id);
         std::thread::sleep(RESTART_MIN_INTERVAL);
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3404,13 +3780,14 @@ mod tests {
         let id_hold = id.clone();
         std::thread::spawn(move || {
             let t0 = Instant::now();
-            let result = reg_hold.asset(&id_hold, "seg020.m4s", None);
+            let result = reg_hold.asset(&id_hold, "seg_00000040000.m4s", None);
             let _ = tx.send((result, t0.elapsed()));
         });
-        // Retarget far ahead so supersede is outside ALIGN dig-back of land.
+        // Retarget within the fixture so the new run can land (EOF on a
+        // past-duration seek never flips first_segment_ready).
         let probe_until = Instant::now() + Duration::from_secs(15);
         while Instant::now() < probe_until {
-            let _ = reg.playlist(&id, Some(200_000));
+            let _ = reg.seek(&id, 50_000);
             match rx.try_recv() {
                 Ok((first, elapsed)) => {
                     assert!(
@@ -3436,8 +3813,8 @@ mod tests {
         panic!("hold did not finish within 15s after supersede");
     }
 
-    /// Double scrub: final land-ensure alone must notice cooking land on disk
-    /// and apply pending (no middle GET).
+    /// ADR-0020: far scrub is seek API. Pending apply from a second seek
+    /// while land A cooks; land B segment then 200s from the new run.
     #[test]
     fn final_land_waiter_applies_pending_when_cooking_land_appears() {
         if !ffmpeg_available() {
@@ -3448,7 +3825,6 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 120);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
-        // Start already cooking land A (20s). Do not GET A's land URI.
         let id = reg
             .start(
                 1,
@@ -3468,45 +3844,38 @@ mod tests {
             assert!(!s.first_segment_ready);
         }
 
-        // Final land-ensure for B (40s, near — land gate, no preempt).
-        // Wait loop must notice A's land file and apply pending.
-        let reg_b = Arc::clone(&reg);
-        let id_b = id.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let t0 = Instant::now();
-            let result = reg_b.asset(&id_b, "seg020.m4s", Some("land-ensure"));
-            let _ = tx.send((result, t0.elapsed()));
-        });
-
-        let (result, elapsed) = rx
-            .recv_timeout(Duration::from_secs(90))
-            .expect("final land-ensure must complete");
-        assert!(
-            matches!(result, Ok(ref b) if !b.is_empty()),
-            "final land must 200 after pending apply, got {:?} in {elapsed:?}",
-            result
-                .as_ref()
-                .map(|b| b.len())
-                .map_err(|e| format!("{e:?}"))
-        );
+        // Seek to B while A may still be cooking (may defer if land waiter).
+        let _ = reg.seek(&id, 40_000).expect("seek B");
+        // Drive readiness: playlist/asset poll notices land and applies pending.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let _ = reg.playlist(&id, reg.view(&id).map(|v| v.run_id).unwrap_or(0));
+            let sessions = reg.sessions.lock().unwrap();
+            let s = sessions.get(&id).unwrap();
+            if s.play_start_ms == 40_000 && s.first_segment_ready {
+                break;
+            }
+            drop(sessions);
+            if Instant::now() >= deadline {
+                panic!("pending B did not apply within 90s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let bytes = wait_asset(&reg, &id, "seg_00000040000.m4s");
+        assert!(!bytes.is_empty());
         let sessions = reg.sessions.lock().unwrap();
-        let s = sessions.get(&id).unwrap();
-        assert_eq!(
-            s.play_start_ms, 40_000,
-            "pending B must have applied without a middle-land GET"
-        );
+        assert_eq!(sessions.get(&id).unwrap().play_start_ms, 40_000);
     }
 
     #[test]
     fn encode_start_includes_lead_before_play() {
-        assert_eq!(ENCODE_LEAD_SEGMENTS, 8);
-        assert_eq!(encode_start_ms(1_264_000), 1_248_000);
+        assert_eq!(ENCODE_LEAD_SEGMENTS, 0);
+        assert_eq!(encode_start_ms(1_264_000), 1_264_000);
         assert_eq!(encode_start_ms(1_000), 0);
         assert_eq!(encode_start_ms(0), 0);
-        assert_eq!(encode_start_ms(4_000), 0);
-        assert_eq!(encode_start_ms(16_000), 0);
-        assert_eq!(encode_start_ms(18_000), 2_000);
+        assert_eq!(encode_start_ms(4_000), 4_000);
+        assert_eq!(encode_start_ms(16_000), 16_000);
+        assert_eq!(encode_start_ms(18_000), 18_000);
     }
 
     /// Mid-title switch: encode starts lead before land. seg000 must 503
@@ -3559,32 +3928,30 @@ mod tests {
         let playlist = wait_playlist(&reg, &switched);
         let text = String::from_utf8_lossy(&playlist);
         assert!(
-            text.contains("#EXT-X-START:TIME-OFFSET=40.000,PRECISE=YES"),
-            "switch land stays at the requested offset: {text}"
+            text.contains("#EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES"),
+            "EXT-X-START is window-relative (ADR-0020): {text}"
         );
-
-        match reg.asset(&switched, "seg000.m4s", None) {
-            Err(PlaylistError::NotReady) => {}
-            other => {
-                eprintln!("seg000 after switch playlist: {other:?}");
-            }
-        }
+        let land = first_listed_seg(&playlist);
+        assert!(
+            !wait_asset(&reg, &switched, &land).is_empty(),
+            "play-land segment servable"
+        );
         assert_eq!(
-            decide_segment_miss(0, 20, 20, None, false, RESTART_MIN_INTERVAL),
+            decide_segment_miss(0, 40_000, 40_000, None, false, RESTART_MIN_INTERVAL),
             SegmentMissAction::Wait,
-            "seg000 at a 40s switch must not count as start alignment"
+            "seg at t=0 behind a 40s window must wait"
         );
 
-        // Behind encode window (lead=8 at play 40s → window from seg12): must
-        // not restart / cook a retreated land. Real scrub-back is ?startMs=.
+        // Behind encode window: unlisted under producer-truth → 404, not a
+        // retreated cook. Real scrub-back is POST /seek.
         let dig_ms = 5 * SEGMENT_MS;
         assert!(digback_behind_committed(play_ms, None, dig_ms));
-        match reg.asset(&switched, "seg005.m4s", None) {
-            Err(PlaylistError::NotReady) => {}
+        match reg.asset(&switched, "seg_00000010000.m4s", None) {
+            Err(PlaylistError::NotFound) | Err(PlaylistError::NotReady) => {}
             Ok(_) => panic!("dig-back must not cook a retreated window"),
             Err(e) => panic!("unexpected dig-back error: {e:?}"),
         }
-        let land = wait_asset(&reg, &switched, "seg020.m4s");
+        let land = wait_asset(&reg, &switched, "seg_00000040000.m4s");
         assert!(!land.is_empty(), "switch land segment must serve");
 
         assert!(reg.stop(&prior));
@@ -3619,10 +3986,10 @@ mod tests {
         let playlist = wait_playlist(&reg, &id);
         let text = String::from_utf8_lossy(&playlist);
         assert!(
-            text.contains("#EXT-X-START:TIME-OFFSET=40.000,PRECISE=YES"),
-            "play land is the encode start: {text}"
+            text.contains("#EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES"),
+            "EXT-X-START is window-relative (ADR-0020): {text}"
         );
-        let land = wait_asset(&reg, &id, "seg020.m4s");
+        let land = wait_asset(&reg, &id, "seg_00000040000.m4s");
         assert!(!land.is_empty(), "land segment must be served");
         assert!(reg.stop(&id));
     }
@@ -3658,14 +4025,12 @@ mod tests {
         );
         let playlist = wait_playlist(&reg, &id);
         let text = String::from_utf8_lossy(&playlist);
-        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{text}");
-        assert!(text.contains("#EXT-X-ENDLIST"), "{text}");
-        assert!(reg.asset(&id, "seg000.m4s", None).is_ok());
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{text}");
+        assert!(text.contains("#EXT-X-START:TIME-OFFSET=0.000"), "{text}");
+        let land = first_listed_seg(&playlist);
+        assert!(reg.asset(&id, &land, None).is_ok(), "land={land}");
         assert!(reg.stop(&id));
-        assert!(matches!(
-            reg.playlist(&id, None),
-            Err(PlaylistError::NotFound)
-        ));
+        assert!(matches!(reg.playlist(&id, 0), Err(PlaylistError::NotFound)));
     }
 
     /// Session-inline demux with no scan-time extract: the video segment and
@@ -3789,10 +4154,7 @@ mod tests {
             Err(StartSessionError::CapFull)
         ));
         assert!(reg.stop(&a));
-        assert!(matches!(
-            reg.playlist(&a, None),
-            Err(PlaylistError::NotFound)
-        ));
+        assert!(matches!(reg.playlist(&a, 0), Err(PlaylistError::NotFound)));
         wait_playlist(&reg, &b);
         reg.stop(&b);
     }
@@ -3830,7 +4192,10 @@ mod tests {
             })
         );
         wait_playlist(&reg, &id);
-        assert!(reg.asset(&id, "seg000.m4s", None).is_ok());
+        assert!(
+            reg.asset(&id, &first_listed_seg(&wait_playlist(&reg, &id)), None)
+                .is_ok()
+        );
         reg.stop(&id);
     }
 
@@ -3857,20 +4222,33 @@ mod tests {
             )
             .unwrap();
         wait_playlist(&reg, &id);
-        let early = reg.asset(&id, "seg000.m4s", None).expect("early segment");
+        let early_name = first_listed_seg(&wait_playlist(&reg, &id));
+        let early = reg.asset(&id, &early_name, None).expect("early segment");
         // Move the window forward; prior segment must still be readable.
         for _ in 0..100 {
-            match reg.playlist(&id, Some(2000)) {
+            match reg.seek(&id, 2000) {
                 Ok(_) => break,
                 Err(PlaylistError::NotReady) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => panic!("seek: {e:?}"),
             }
         }
         let still = reg
-            .asset(&id, "seg000.m4s", None)
+            .asset(&id, &early_name, None)
             .expect("retained segment must not 404 after seek");
         assert_eq!(early.len(), still.len());
-        assert!(reg.asset(&id, "seg001.m4s", None).is_ok());
+        let _ = wait_playlist_run(&reg, &id, 1);
+        assert!(reg.asset(&id, &early_name, None).is_ok());
+        // Scrub-back to already-mapped media: duplicate-write stop (no ffmpeg).
+        let view = reg.seek(&id, 0).expect("seek back");
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let s = sessions.get(&id).unwrap();
+            assert!(s.first_segment_ready, "expected map-hit ready");
+            assert!(s.child.is_none(), "map hit must not spawn ffmpeg");
+            assert_eq!(s.play_start_ms, 0);
+        }
+        assert!(reg.asset(&id, &early_name, None).is_ok());
+        assert!(view.run_id >= 2, "fresh playlist URI even on map hit");
         reg.stop(&id);
     }
 
@@ -4068,36 +4446,6 @@ mod tests {
     }
 
     #[test]
-    fn vod_playlist_covers_full_duration() {
-        let text = String::from_utf8(build_playlist(5000, 0)).unwrap();
-        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
-        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"));
-        assert!(text.ends_with("#EXT-X-ENDLIST\n"));
-        assert_eq!(text.matches(".m4s").count(), 3, "{text}");
-    }
-
-    #[test]
-    fn mid_window_playlist_is_full_title_with_start_tag() {
-        let text = String::from_utf8(build_playlist(10_000, 4_000)).unwrap();
-        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{text}");
-        assert!(
-            text.contains("#EXT-X-START:TIME-OFFSET=4.000,PRECISE=YES"),
-            "{text}"
-        );
-        assert!(text.contains("seg000.m4s"), "{text}");
-        assert!(text.contains("seg002.m4s"), "{text}");
-        assert!(!text.contains("EXT-X-GAP"), "{text}");
-        assert_eq!(text.matches(".m4s").count(), 5, "{text}");
-    }
-
-    #[test]
-    fn zero_start_playlist_has_no_start_tag() {
-        let text = String::from_utf8(build_playlist(5000, 0)).unwrap();
-        assert!(!text.contains("EXT-X-START"), "{text}");
-        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{text}");
-    }
-
-    #[test]
     fn master_playlist_declares_subtitle_group() {
         let tracks = vec![
             HlsSubtitleTrack {
@@ -4127,12 +4475,12 @@ mod tests {
                 item_vtt_path: None,
             },
         ];
-        let text = String::from_utf8(build_master(&tracks)).unwrap();
+        let text = String::from_utf8(build_master("s1", 0, &tracks)).unwrap();
         assert!(text.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"));
         assert!(text.contains("GROUP-ID=\"subs\""));
-        assert!(text.contains("URI=\"subs/e2.m3u8\""));
+        assert!(text.contains("URI=\"/api/v0/sessions/s1/subs/e2.m3u8\""));
         assert!(text.contains("SUBTITLES=\"subs\""));
-        assert!(text.contains("\nindex.m3u8\n"));
+        assert!(text.contains("\n/api/v0/sessions/s1/runs/0/index.m3u8\n"));
         assert!(
             text.contains("CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog\"")
         );
@@ -4142,11 +4490,11 @@ mod tests {
 
     #[test]
     fn master_without_tracks_has_no_subtitles_attr() {
-        let text = String::from_utf8(build_master(&[])).unwrap();
+        let text = String::from_utf8(build_master("s1", 0, &[])).unwrap();
         assert!(!text.contains("EXT-X-MEDIA"));
         assert!(!text.contains("SUBTITLES="));
         assert!(!text.contains("CODECS="), "{text}");
-        assert!(text.contains("\nindex.m3u8\n"));
+        assert!(text.contains("\n/api/v0/sessions/s1/runs/0/index.m3u8\n"));
     }
 
     #[test]
@@ -4218,26 +4566,15 @@ mod tests {
     /// Segment count and boundaries mirror the video VOD playlist so a
     /// player's segment index maps to the same subtitle window.
     #[test]
-    fn subtitle_media_playlist_matches_video_segment_count() {
-        for duration_ms in [4000u64, 5000, 90_000] {
-            let video = String::from_utf8(build_playlist(duration_ms, 0)).unwrap();
-            let subs =
-                String::from_utf8(build_segmented_subtitle_playlist("e2", duration_ms)).unwrap();
-            assert_eq!(
-                video.matches(".m4s").count(),
-                subs.matches(".vtt").count(),
-                "duration_ms={duration_ms}"
-            );
-        }
-    }
-
-    #[test]
     fn asset_name_allowlist() {
         assert!(is_safe_asset("init.mp4"));
-        assert!(is_safe_asset("seg000.m4s"));
+        assert!(is_safe_asset("seg_00000008000.m4s"));
+        assert!(!is_safe_asset("seg000.m4s"));
         assert!(!is_safe_asset("../etc/passwd"));
-        assert_eq!(segment_index("seg042.m4s"), Some(42));
-        assert_eq!(segment_index("init.mp4"), None);
+        assert_eq!(
+            crate::hls_segment_map::parse_time_keyed_segment_name("seg_00000008000.m4s"),
+            Some(8000)
+        );
     }
 
     /// Keyframe PTS must land on SEGMENT_MS boundaries regardless of source
@@ -4651,7 +4988,7 @@ mod tests {
         }
         wait_playlist(&reg, &id);
         let _ = wait_asset(&reg, &id, "init.mp4");
-        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        let _ = wait_first_listed_asset(&reg, &id);
         reg.stop(&id);
     }
 
@@ -4695,7 +5032,7 @@ mod tests {
             )
             .unwrap();
         wait_playlist(&reg, &id);
-        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        let _ = wait_first_listed_asset(&reg, &id);
         reg.stop(&id);
     }
 
@@ -4774,7 +5111,365 @@ mod tests {
             )
             .unwrap();
         wait_playlist(&reg, &id);
-        let _ = wait_asset(&reg, &id, "seg000.m4s");
+        let _ = wait_first_listed_asset(&reg, &id);
         reg.stop(&id);
+    }
+
+    /// Segment URIs in the media playlist are path-absolute under the session
+    /// root so run-directory depth cannot break resolution (ADR-0008).
+    #[test]
+    fn media_playlist_segment_uris_are_session_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let run0 = dir.path().join("run_0");
+        fs::create_dir_all(&run0).unwrap();
+        let seg_rel = PathBuf::from("run_0/seg_disk.m4s");
+        fs::write(dir.path().join(&seg_rel), [0u8; 64]).unwrap();
+        let mut map = crate::hls_segment_map::SegmentMap::default();
+        map.insert(crate::hls_segment_map::MappedSegment {
+            start_ms: 21,
+            duration_ms: 2002,
+            run_id: 0,
+            rel_path: seg_rel,
+        });
+        let session = Session {
+            item_id: 33,
+            src: PathBuf::from("/dev/null"),
+            dir: dir.path().to_path_buf(),
+            mode: SessionMode::Copy,
+            audio: stereo(),
+            burn_in: None,
+            video_encoder: "copy".into(),
+            start_ms: 0,
+            play_start_ms: 0,
+            landed_ms: 21,
+            usable_extent_ms: None,
+            duration_ms: 60_000,
+            current_run_id: 0,
+            next_run_id: 1,
+            segment_map: map,
+            current_run_eof: false,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: false,
+            first_segment_ready: false,
+            pending_play_ms: None,
+            pending_since: None,
+            stale_retain_refuse_until: None,
+            failed: None,
+            subtitle_tracks: vec![],
+            segment_waiters: HashMap::new(),
+            preempt_defer_logged: false,
+        };
+        let pl = build_run_media_playlist("s1", &session);
+        let text = String::from_utf8_lossy(&pl);
+        let uri = text
+            .lines()
+            .find(|l| l.contains("seg_"))
+            .expect("listed segment URI");
+        assert_eq!(
+            uri, "/api/v0/sessions/s1/seg_00000000021.m4s",
+            "must be path-absolute under the session"
+        );
+        assert!(
+            text.contains("#EXT-X-MAP:URI=\"/api/v0/sessions/s1/runs/0/init.mp4\""),
+            "MAP URI must be path-absolute, got {text}"
+        );
+    }
+
+    /// Client-shaped link walk: master → media → MAP → first segment, each
+    /// hop resolved the way a browser resolves relative HLS URIs, then served
+    /// as real bytes (not string-only checks). Locks the relative-URI class
+    /// that produced three cutover defects (segment depth, sub climb, and the
+    /// mistaken "master points at session-root index" hypothesis — master is
+    /// per-run, so bare `index.m3u8` is correct; this walk fails if that ever
+    /// moves without updating the media URI).
+    #[test]
+    fn session_hls_link_walk_resolves_to_real_bytes() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 12);
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                12_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let _ = wait_first_listed_asset(&reg, &id);
+        let view = reg.view(&id).expect("view");
+        walk_run_playlist_chain(&reg, &id, view.run_id, &view.playlist_url);
+
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+        let after = reg.seek(&id, 4_000).expect("seek");
+        assert_ne!(after.run_id, view.run_id, "seek must mint a fresh run");
+        // Hold until the new run's media playlist lists a segment, then walk.
+        let pl = wait_playlist_run(&reg, &id, after.run_id);
+        let _ = wait_asset(&reg, &id, &first_listed_seg(&pl));
+        walk_run_playlist_chain(&reg, &id, after.run_id, &after.playlist_url);
+        reg.stop(&id);
+    }
+
+    /// Resolve `relative` against an absolute path URL (no scheme), the same
+    /// way `urljoin` / browsers resolve HLS playlist references.
+    fn resolve_hls_uri(base_url: &str, relative: &str) -> String {
+        if relative.starts_with('/') {
+            return relative.to_string();
+        }
+        let base_dir = base_url
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .unwrap_or(base_url);
+        let mut parts: Vec<&str> = base_dir.split('/').filter(|p| !p.is_empty()).collect();
+        for seg in relative.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        format!("/{}", parts.join("/"))
+    }
+
+    fn walk_run_playlist_chain(reg: &HlsSessionRegistry, id: &str, run_id: u64, master_url: &str) {
+        assert!(
+            master_url.ends_with(&format!("/runs/{run_id}/master.m3u8")),
+            "playlistUrl must be per-run master, got {master_url}"
+        );
+        let master = reg.master(id, run_id).expect("master bytes");
+        let master_text = String::from_utf8_lossy(&master);
+        assert!(master_text.starts_with("#EXTM3U"), "{master_text}");
+        let media_rel = master_text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .expect("master must list a media playlist URI");
+        // Content types match the HTTP layer (sessions.rs): playlists →
+        // application/vnd.apple.mpegurl; init → video/mp4; segments →
+        // video/iso.segment. Asserted here as path→kind, bytes below.
+        assert!(
+            media_rel.ends_with(".m3u8") || media_rel == "index.m3u8",
+            "media playlist URI must be m3u8, got {media_rel}"
+        );
+        let media_url = resolve_hls_uri(master_url, media_rel);
+        assert_eq!(
+            media_url,
+            format!("/api/v0/sessions/{id}/runs/{run_id}/index.m3u8"),
+            "master must emit path-absolute media playlist URI"
+        );
+        // Dead class: session-root index must not be what the master points at.
+        assert_ne!(
+            media_url,
+            format!("/api/v0/sessions/{id}/index.m3u8"),
+            "session-root index is not on the wire"
+        );
+
+        let media = reg.playlist(id, run_id).expect("media playlist");
+        let media_text = String::from_utf8_lossy(&media);
+        assert!(media_text.contains("#EXTINF:"), "{media_text}");
+        let map_uri = media_text
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("#EXT-X-MAP:URI=\"")
+                    .map(|rest| rest.trim_end_matches('"').to_string())
+            })
+            .expect("EXT-X-MAP");
+        let init_url = resolve_hls_uri(&media_url, &map_uri);
+        assert_eq!(
+            init_url,
+            format!("/api/v0/sessions/{id}/runs/{run_id}/init.mp4")
+        );
+        let init = reg
+            .run_asset(id, run_id, "init.mp4")
+            .expect("init.mp4 bytes");
+        assert!(
+            init.len() > 8 && &init[4..8] == b"ftyp",
+            "init must be fMP4"
+        );
+
+        let seg_rel = media_text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("seg_") && l.ends_with(".m4s"))
+            .expect("first segment URI")
+            .to_string();
+        let seg_url = resolve_hls_uri(&media_url, &seg_rel);
+        assert!(
+            seg_url.starts_with(&format!("/api/v0/sessions/{id}/seg_")),
+            "segment must resolve to session-root asset route, got {seg_url} from {seg_rel}"
+        );
+        let seg_name = seg_url.rsplit('/').next().expect("seg name");
+        let seg = reg.asset(id, seg_name, None).expect("segment bytes");
+        assert!(!seg.is_empty(), "first listed segment must have bytes");
+    }
+
+    /// Empty mid-title EOF must record usable extent (even with an empty map)
+    /// so clients see damage instead of hanging on master 503 (DEF-8519 mask).
+    #[test]
+    fn empty_eof_records_usable_extent_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let run0 = dir.path().join("run_0");
+        fs::create_dir_all(&run0).unwrap();
+        let mut session = Session {
+            item_id: 8519,
+            src: PathBuf::from("/dev/null"),
+            dir: dir.path().to_path_buf(),
+            mode: SessionMode::Copy,
+            audio: stereo(),
+            burn_in: None,
+            video_encoder: "copy".into(),
+            start_ms: 1_014_000,
+            play_start_ms: 1_014_000,
+            landed_ms: 1_014_000,
+            usable_extent_ms: None,
+            duration_ms: 1_354_496,
+            current_run_id: 0,
+            next_run_id: 1,
+            segment_map: crate::hls_segment_map::SegmentMap::default(),
+            current_run_eof: false,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: false,
+            first_segment_ready: false,
+            pending_play_ms: None,
+            pending_since: None,
+            stale_retain_refuse_until: None,
+            failed: None,
+            subtitle_tracks: vec![],
+            segment_waiters: HashMap::new(),
+            preempt_defer_logged: false,
+        };
+        apply_run_eof(&mut session);
+        assert!(session.current_run_eof);
+        assert_eq!(
+            session.usable_extent_ms,
+            Some(0),
+            "empty map + mid-title EOF → usableExtentMs=0"
+        );
+        let pl = build_run_media_playlist("s1", &session);
+        let text = String::from_utf8_lossy(&pl);
+        assert!(text.contains("#EXT-X-ENDLIST"), "empty ENDLIST for clients");
+        assert!(
+            !text.contains("seg_"),
+            "no listed URIs when nothing is on disk"
+        );
+    }
+
+    /// Eviction: orphans first; map-referenced run survives while orphans
+    /// remain; after a referenced eviction the map no longer points at gone
+    /// files; playlist never lists missing bytes.
+    #[test]
+    fn eviction_map_authoritative_orphans_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path();
+        // run_0: referenced map bytes (large)
+        let run0 = session_dir.join("run_0");
+        fs::create_dir_all(&run0).unwrap();
+        let seg_path = run0.join("seg.m4s");
+        fs::write(&seg_path, vec![0u8; 50_000]).unwrap();
+        // run_1: orphan (no map refs) with bytes
+        let run1 = session_dir.join("run_1");
+        fs::create_dir_all(&run1).unwrap();
+        fs::write(run1.join("init.mp4"), vec![0u8; 10_000]).unwrap();
+        // run_2: empty finished (noise)
+        let run2 = session_dir.join("run_2");
+        fs::create_dir_all(&run2).unwrap();
+        // run_3: current (small)
+        let run3 = session_dir.join("run_3");
+        fs::create_dir_all(&run3).unwrap();
+        fs::write(run3.join("init.mp4"), vec![0u8; 100]).unwrap();
+
+        let mut map = crate::hls_segment_map::SegmentMap::default();
+        map.insert(crate::hls_segment_map::MappedSegment {
+            start_ms: 0,
+            duration_ms: 2000,
+            run_id: 0,
+            rel_path: PathBuf::from("run_0/seg.m4s"),
+        });
+
+        let mut session = Session {
+            item_id: 1,
+            src: PathBuf::from("/dev/null"),
+            dir: session_dir.to_path_buf(),
+            mode: SessionMode::Transcode,
+            audio: stereo(),
+            burn_in: None,
+            video_encoder: "libx264".into(),
+            start_ms: 0,
+            play_start_ms: 0,
+            landed_ms: 0,
+            usable_extent_ms: None,
+            duration_ms: 60_000,
+            current_run_id: 3,
+            next_run_id: 4,
+            segment_map: map,
+            current_run_eof: true,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: true,
+            first_segment_ready: true,
+            pending_play_ms: None,
+            pending_since: None,
+            stale_retain_refuse_until: None,
+            failed: None,
+            subtitle_tracks: vec![],
+            segment_waiters: HashMap::new(),
+            preempt_defer_logged: false,
+        };
+
+        // Budget between orphan (10k) and total (~60k): one eviction of orphan.
+        // SAFETY: single-threaded test; restore below.
+        unsafe {
+            std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "55000");
+        }
+        maybe_evict_finished_runs(&mut session);
+        assert!(!run1.exists(), "orphan run_1 must be evicted first");
+        assert!(
+            run0.exists() && session.segment_map.run_is_referenced(0),
+            "map-referenced run_0 must survive while orphans remain"
+        );
+        assert!(!run2.exists(), "empty run_2 reaped quietly");
+        assert!(
+            session
+                .dir
+                .join(&session.segment_map.get(0).unwrap().rel_path)
+                .is_file(),
+            "mapped file still on disk"
+        );
+
+        // Force referenced eviction: budget below run_0 size.
+        unsafe {
+            std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "1000");
+        }
+        maybe_evict_finished_runs(&mut session);
+        assert!(!run0.exists(), "referenced run evicted under hard pressure");
+        assert!(
+            !session.segment_map.run_is_referenced(0),
+            "map must drop entries before/with delete"
+        );
+        let pl = build_run_media_playlist("s1", &session);
+        assert!(
+            !String::from_utf8_lossy(&pl).contains("seg_"),
+            "playlist must not list URIs whose files are gone"
+        );
+        unsafe {
+            std::env::remove_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES");
+        }
     }
 }
