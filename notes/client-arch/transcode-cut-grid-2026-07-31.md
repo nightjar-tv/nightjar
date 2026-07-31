@@ -45,14 +45,14 @@ GOP packing. It is not the copy-mode multi-second failure mode.
 
 ## Verdict
 
-**Yes for the load-bearing case.** Mid-start forced-IDR boundaries match the
-uniform grid (0 / 192 at 50 ms). An honest full-title playlist is publishable
-for transcode sessions; the scrubbing ceiling lifts on the bandwidth session
-path (remote), where it still matters.
+**Held outcome.** Mid-start forced-IDR boundaries match the uniform grid
+(0 / 192 at 50 ms). Honest full-title playlists are publishable for the
+bandwidth-transcode session path: full seekable range, native scrubbers, no
+client compensation. The copy-mode scrubbing ceiling does not apply here.
 
-Start=0 carries a sub-100 ms cumulative skew. Treat as a known priming offset
-to absorb in playlist `EXTINF` / tolerance, not as a reason to keep producer-
-truth windowing for transcode.
+Start=0 carries a sub-100 ms cumulative skew (max |Δ| ≈ 59 ms). Not a
+blocker. Two easy answers: publish the measured first-segment start as the
+first `EXTINF`, or set `#EXT-X-START` to the real media start.
 
 Raw: `notes/client-arch/transcode-cut-grid-2026-07-31.json`.
 Instrument: `scripts/t1c_transcode_cut_grid.py`.

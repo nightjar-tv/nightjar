@@ -1,7 +1,7 @@
 # Client engine bake-off
 
-Status: Step 1 (compatibility) + 1b (bandwidth) + 1c (transcode grid) reported.
-Profile-shape ADR (Step 2) and ABR throttle test (Step 3) not started.
+Status: Steps 1 / 1b / 1c held. Step 2 (profile ADR + N100 capacity) and
+Step 3 (ABR throttle) not started.
 Date: 2026-07-31
 
 Framing: decision note for Phase 4 player architecture (engine vs platform
@@ -158,11 +158,15 @@ codecs outside the floor. Not a session tax.
 
 ## Step 1b — Bandwidth shape
 
-Bitrate is **not stored** per item. Cost to add: one format-only ffprobe field
-at scan (header read, not a packet walk), plus a migration column. On this
-corpus, `ffprobe format.bit_rate` equals `size_bytes × 8 / duration_ms` at
-ratio **1.000** (n=30 sample), so the distribution below is that format rate
-without a multi-hour NAS walk. Instrument: `scripts/t1b_bitrate_shape.py`.
+Bitrate is **not stored** per item. Today's filter is `size_bytes × 8 /
+duration_ms`, which matches `ffprobe format.bit_rate` at ratio **1.000** on a
+30-file sample (FFmpeg derives the same number when the container has no
+declared rate). Fine for a library histogram; wrong as a permanent gate: a
+title with a quiet 90 minutes and a loud 10 is misjudged either way. When the
+profile ADR lands, store `format.bit_rate` from a header-only ffprobe at scan
+(migration column + probe field; not a packet walk).
+
+Instrument: `scripts/t1b_bitrate_shape.py`.
 Raw: `notes/client-arch/bitrate-shape-2026-07-31.json`.
 
 n = **24 842** (probed, positive duration/size, excluding `/testdata/`).
@@ -208,19 +212,22 @@ p50=34.5 all above 15 Mbps.
 | Compatibility-transcode | codecs/containers the client cannot decode | Library property; counted once. Engine → ~0%. |
 | Bandwidth-transcode | titles above the link ceiling | Scales with **concurrent remote viewers** and the chosen ceiling. At 8 Mbps on this library: **21.2%**. At 15 Mbps: **2.0%**. |
 
-Compatibility going to zero does not make sessions rare for remote. Gate 2
-CPU sizing depends on the bandwidth number and concurrency, not on the 100%
-directPlay headline.
+Compatibility going to zero does not make sessions rare for remote. The
+**ceiling choice is the decision**, not an implementation detail:
 
-At an 8 Mbps advisory remote ceiling, sessions are common enough that
-restart-latency and transcode capacity stay first-class. At 15 Mbps they are
-an exception (~2%). The profile ADR (Step 2) has to pick the v1 ceiling
-knowing local-vs-remote detection is Phase 3 and any remote cap is advisory
-until then (ADR-0008 §6).
+| Default / Auto ceiling | Library share forced to bandwidth-transcode |
+|---|---:|
+| 4 Mbps | **49%** — half the library is a session |
+| 8 Mbps | **21%** — common path for remote |
+| 15 Mbps | **2%** — sessions are a genuine exception |
+| 25 Mbps | **0.2%** |
+
+Say that out loud in the profile ADR. Picking the Auto default picks the CPU
+load.
 
 ---
 
-## Step 1c — Transcode cut predictability
+## Step 1c — Transcode cut predictability (hold this)
 
 Instrument: `scripts/t1c_transcode_cut_grid.py` (forced-IDR grid vs sidx,
 not the copy-mode KF predictor). Titles: Elementary 3x05, Rick and Morty
@@ -234,14 +241,15 @@ mid-title. `hls_time` ∈ {2, 10}. Production-like `-force_key_frames` +
 | **mid-start only** | **0 / 192** | **0.000** |
 | start=0 only | 18 / 99 | 0.182 |
 
-Start=0 residual is ~21 ms at seg0 drifting ~2 ms/seg (max |Δ| ≈ 59 ms in a
-40 s window). Priming/timebase, not GOP packing. Mid-title is clean at 50 ms
-on every shape and both `hls_time` values.
+**Held outcome:** zero mismatches on 192 mid-start cases means honest
+full-title playlists are publishable for the only session path that survives
+under an engine (bandwidth-transcode). Full seekable range, native scrubbers
+working, no client compensation. The copy-mode scrubbing ceiling from this
+week does **not** apply to the architecture we are moving to.
 
-**Verdict:** the scrubbing ceiling **lifts for transcode sessions** on the
-load-bearing case (mid-title / far seek). An honest full-title playlist is
-publishable for forced-IDR transcode. Absorb start=0 sub-100 ms skew in
-tolerance; do not keep producer-truth windowing for transcode because of it.
+Start=0 at max |Δ| ≈ 59 ms is priming skew, not a blocker. Two easy answers:
+measure the actual first-segment start and publish it as the first `EXTINF`,
+or set `#EXT-X-START` to the real media start.
 
 Detail: `notes/client-arch/transcode-cut-grid-2026-07-31.md`.
 
@@ -255,20 +263,15 @@ Detail: `notes/client-arch/transcode-cut-grid-2026-07-31.md`.
   (T1). Container-remux for AVPlayer is optional architecture, not destiny.
 - Path: ship Phase 4 on a Matroska-capable engine (libmpv / Rule 2.4). Do not
   treat Apple AVPlayer as the product path for the household library.
+- Transcode sessions get honest full-title playlists (1c). Native scrubbers
+  work on the path that remains.
 
 **What it does not settle**
 
-- Bandwidth: at **8 Mbps**, **21.2%** of the library still needs a session if
-  that is the remote ceiling; at **15 Mbps**, **2.0%**. Sessions remain the
-  remote/bitrate path. Gate 2 CPU sizing follows this axis and concurrency.
+- Bandwidth: ceiling choice sets whether sessions are 49% / 21% / 2% of the
+  library. Sessions remain the remote/bitrate path.
 - ABR quality under libmpv on a throttled multi-variant playlist (Step 3):
   the only scenario that partially reopens platform players.
-
-**Scrubbing ceiling (1c)**
-
-- Lifts for **transcode** sessions (honest full-title grid; mid-start 0/192).
-- Remains for **copy/remux** (ADR-0020 producer-truth). Under an engine,
-  copy/remux is no longer the common LAN path; bandwidth-transcode is.
 
 **Server consequence**
 
@@ -278,24 +281,44 @@ Detail: `notes/client-arch/transcode-cut-grid-2026-07-31.md`.
   engine playback. Refiled in `notes/session-latency-and-disk-backlog.md`.
   Do not fully demote it; remote viewers are least tolerant of a multi-
   second seek.
-- Keyframe-map slice and ADR-0020 stand.
+- Keyframe-map slice and ADR-0020 stand. Copy/remux keeps producer-truth
+  windowing; under an engine that path is no longer the common LAN case.
 
-**Still open (before calling architecture fully settled)**
+### Step 2 — Profile ADR (requirements locked from this bake-off)
 
-1. **Step 2 — profile ADR:** add bitrate, resolution, HDR to
-   `ClientCapabilityProfile` (one ADR). Wire shape + DB fields before writers
-   (Rule 4.9). Cover v1 advisory ceiling without Phase 3 local/remote detect;
-   interaction with Auto/High/Original (ADR-0008 §1); `decide_playback` reason
-   when only bitrate fails (transcode, copyable audio).
-2. **Step 3 — ABR under engine:** libmpv/`media_kit` vs hls.js on the same
-   multi-variant playlist under throttle. Only reopen of platform players.
-3. T2/T3/T4 confirmation on a laptop prototype when Phase 4 starts.
+One ADR covering bitrate, resolution, and HDR on `ClientCapabilityProfile`
+(ADR-0008 §6 / V1_PLAN Phase 2). Wire shape and DB fields before writers
+(Rule 4.9), including a real `format.bit_rate` column from scan-time header
+probe — do not ship size×8/duration as the permanent gate.
 
-**Phase 4 / ADR-0020**
+The ADR must reckon with:
+
+1. **Remote is not one number.** A phone on LTE and a laptop on fibre both
+   look "remote." A single ceiling either transcodes needlessly or does not
+   help. Phase 3 local-versus-remote detection does not erase that; even
+   "remote" needs a policy, not one magic Mbps.
+2. **v1 ceiling is user-chosen** through Auto / High / Original (ADR-0008
+   §1). Local-versus-remote detection is Phase 3; until then any remote cap
+   is advisory. The **Auto default** is what actually sets CPU load. State
+   explicitly: **15 Mbps as Auto default → sessions ~2% (exception);
+   4 Mbps → ~49% (half the library is a transcode).**
+3. **`decide_playback` when only bitrate fails:** transcode with copyable
+   audio, own reason string (not "video codec unsupported").
+4. **N100 capacity measurement (add to Step 2, before calling Gate 2 sized):**
+   how many concurrent bandwidth transcodes an Intel N100 sustains at the
+   chosen Auto target (1080p). Gate 2 already asks for three simultaneous
+   1080p; 21% or 2% of playback is what lands there depending on the
+   ceiling. Convert the percentage into a hardware answer.
+
+### Step 3 — still open
+
+libmpv / `media_kit` vs hls.js on the same multi-variant playlist under
+throttle. Only partial reopen of platform players.
+
+### Phase 4 / ADR-0020
 
 - Phase 4 player-core matches the constitution. ADR-0001 should be accepted
   on that basis.
-- ADR-0020 stands for every session that still runs.
-- If Step 2 picks ~8 Mbps as the remote advisory floor, treat Gate 2
-  concurrent-transcode capacity as a first-class follow-on. If it picks
-  ~15 Mbps, bandwidth sessions are ~2% and capacity pressure is lower.
+- ADR-0020 stands for copy/remux sessions. Transcode may publish honest
+  full-title playlists (1c).
+- T2/T3/T4 confirmation on a laptop prototype when Phase 4 starts.
