@@ -105,7 +105,7 @@ if index_s > budget:
     raise SystemExit(1)
 print(f"PASS {index_s:.1f}s (budget {budget}s)")
 
-# Wait for probe phase to finish; throughput is reported, not gated.
+# Wait for probe phase to finish; floored metric (ADR-0004), not the index gate.
 while job["state"] not in ("completed", "failed"):
     time.sleep(0.2)
     job = get(f"http://127.0.0.1:{port}/api/v0/scan-jobs/{job_id}")

@@ -33,7 +33,8 @@ Probe throughput from a bounded ffprobe worker pool is tracked. The 10k harness
 reports files/sec and fails below `PROBE_FLOOR_FPS` (default 50 files/sec;
 measured about 156 on an M-series MacBook, 2026-07). The floor is deliberately
 loose. It exists to catch a change that halves probe speed, not to benchmark
-hardware. Record a Pi-calibrated floor when the Gate 1 hardware run happens.
+hardware. CI may set a lower value (e.g. 40) when shared runners sit near the
+default. Record a Pi-calibrated floor when the Gate 1 hardware run happens.
 
 This aligns the gate with the copy deck promise.
 

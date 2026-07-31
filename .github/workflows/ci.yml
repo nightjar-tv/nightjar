@@ -103,4 +103,7 @@ jobs:
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
           SCAN_BUDGET_S: "60"
+          # ADR-0004: floor catches half-speed regressions, not runner jitter.
+          # ubuntu-latest often sits ~50 files/sec; 40 still fails a true halving.
+          PROBE_FLOOR_FPS: "40"
         run: ./scripts/gate1_scan_10k.sh
