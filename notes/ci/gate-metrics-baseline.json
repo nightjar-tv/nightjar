@@ -1,0 +1,9 @@
+{
+  "note": "Refresh from a green main gate1 job (scripts/ci_benchmark_summary.py). Placeholder until the first CI artifact is copied here.",
+  "startupMedianMs": null,
+  "idleRssMbWithLibrary": null,
+  "index10kSeconds": null,
+  "rescanSeconds": null,
+  "probeFilesPerSec": null,
+  "releaseBinaryBytes": null
+}

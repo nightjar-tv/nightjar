@@ -81,22 +81,22 @@
     {
       "path": "files/h264_aac_multilang_mkv.mkv",
       "tags": ["aac", "multi-track", "audio", "mkv"],
-      "expect": "two audio tracks listed as e1/e2 with language en and es; first is default; session start takes audioTrackId (ADR-0012)"
+      "expect": "remux (HLS copy session); two audio tracks listed as e1/e2 with language en and es; first is default; session start takes audioTrackId (ADR-0012)"
     },
     {
       "path": "files/h264_aac_commentary_mkv.mkv",
       "tags": ["aac", "multi-track", "commentary", "mkv"],
-      "expect": "main track flagged default; commentary reachable by trackId and labelled from its title tag (ADR-0012)"
+      "expect": "remux (HLS copy session); main track flagged default; commentary reachable by trackId and labelled from its title tag (ADR-0012)"
     },
     {
       "path": "files/h264_flac_60_mkv.mkv",
       "tags": ["flac", "6.0", "downmix-fallback", "mkv"],
-      "expect": "session with -ac 2 fallback: 6.0 shares a channel count with 5.1 but not the pan index map (ADR-0012)"
+      "expect": "needs transcode (FLAC); session uses -ac 2 fallback: 6.0 shares a channel count with 5.1 but not the pan index map (ADR-0012)"
     },
     {
       "path": "files/h264_ac3_51side_mkv.mkv",
       "tags": ["ac3", "5.1(side)", "downmix-fallback", "mkv"],
-      "expect": "session with -ac 2 fallback: 5.1(side) is over ceiling and outside the pan tables (ADR-0012)"
+      "expect": "needs transcode (AC3); session uses -ac 2 fallback: 5.1(side) is over ceiling and outside the pan tables (ADR-0012)"
     },
     {
       "path": "files/h264_eac3_mp4.mp4",
@@ -111,7 +111,7 @@
     {
       "path": "files/broken_moov.mp4",
       "tags": ["broken-moov", "hostile"],
-      "expect": "structured scan_error; no crash"
+      "expect": "needs transcode; structured scan_error; no crash"
     },
     {
       "path": "files/vp9_opus_webm.webm",
