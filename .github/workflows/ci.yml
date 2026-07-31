@@ -111,8 +111,14 @@ jobs:
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
         run: |
-          python3 scripts/ci_benchmark_summary.py /tmp/gate1_ci.txt /tmp/gate1_scan.txt notes/ci/gate-metrics-baseline.json \
-            | tee /tmp/gate-metrics.json
+          # Baseline is optional until notes/ci/gate-metrics-baseline.json is
+          # seeded from a green main run (notes/ci/README.md). Missing file →
+          # "no baseline" in the summary; do not invent null placeholders.
+          args=(/tmp/gate1_ci.txt /tmp/gate1_scan.txt)
+          if [[ -f notes/ci/gate-metrics-baseline.json ]]; then
+            args+=(notes/ci/gate-metrics-baseline.json)
+          fi
+          python3 scripts/ci_benchmark_summary.py "${args[@]}" | tee /tmp/gate-metrics.json
       - uses: actions/upload-artifact@v4
         with:
           name: gate-metrics

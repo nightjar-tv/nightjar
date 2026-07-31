@@ -31,7 +31,12 @@ Software `libx264` is always tier 1: every supported host can fall back to it.
 
 Gate 2 still requires at least one VAAPI machine and one QSV or NVENC machine in
 tier 1 before the gate can close. Today only VideoToolbox and software meet
-that bar.
+that bar. The household Unraid box is the intended VAAPI + QSV host: verify
+`GET /api/v0/system/transcode` shows those encoders verified, and confirm the
+iGPU is enabled in BIOS if a discrete Arc (or other) GPU is also present —
+BIOS often disables the iGPU in that setup and QSV disappears. Remaining
+hardware to acquire for Gate 2 / Phase 2 entry: Intel N100 (concurrent 1080p
+capacity) and Pi 4 (ADR-0005 scan carry).
 
 ## What detection reports
 

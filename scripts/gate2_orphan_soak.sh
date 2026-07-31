@@ -2,12 +2,24 @@
 # Gate 2 orphan soak: churn sessions for HOURS (default 48) and assert no
 # leftover FFmpeg children whose cmdline still names this Nightjar data dir.
 #
-# Usage:
+# Sequencing: run only after ADR-0020 (PR #11) is on the binary under test.
+# Soaking pre-0020 session code measures a lifecycle about to be replaced.
+#
+# Host: prefer the Unraid (or other always-on) box. A sleeping laptop aborts
+# the wall-clock run; nohup does not survive sleep. Unraid is also closer to
+# a real deployment than founder desktop.
+#
+# Usage (on Unraid, post-#11 build):
 #   BASE=http://127.0.0.1:8096 HOURS=48 ./scripts/gate2_orphan_soak.sh
 #
-# Writes notes/gate2/orphan-soak-<stamp>.log and a final JSON summary beside it.
-# Exit 0 only if the soak completed with zero orphan samples at the end and
-# never saw an orphan count rise after a quiet reap window.
+# Every INTERVAL_S sample appends one JSON line to
+# notes/gate2/orphan-soak-<stamp>.jsonl with the scheduled ffmpeg process
+# count (after DELETE + short reap wait). That series distinguishes a leak
+# that appears and gets reaped from one that accumulates. The .log is human
+# tail; the JSONL is the Gate 2 artifact.
+#
+# Exit 0 only if the soak completed with final count 0 and no sticky orphan
+# after an extra quiet window.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,6 +31,7 @@ OUT_DIR="${OUT_DIR:-$ROOT/notes/gate2}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/orphan-soak-$STAMP.log"
+SERIES="$OUT_DIR/orphan-soak-$STAMP.jsonl"
 SUMMARY="$OUT_DIR/orphan-soak-$STAMP.json"
 
 DATA_DIR="${NIGHTJAR_DATA_DIR:-$HOME/nightjar-data}"
@@ -26,13 +39,28 @@ END_EPOCH=$(( $(date +%s) + HOURS * 3600 ))
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
 
-ffmpeg_orphans() {
-  # Children whose argv still references the Nightjar HLS cache / data dir.
+ffmpeg_matching() {
+  # Nightjar-owned FFmpeg: argv still references this data dir.
   pgrep -lf '[f]fmpeg' 2>/dev/null | grep -F "$DATA_DIR" || true
 }
 
-orphan_count() {
-  ffmpeg_orphans | wc -l | tr -d ' '
+ffmpeg_count() {
+  ffmpeg_matching | wc -l | tr -d ' '
+}
+
+record_sample() {
+  # Always write the scheduled count — zeros matter as much as spikes.
+  local sample="$1" churns="$2" count="$3" phase="$4"
+  python3 -c "
+import json, time
+print(json.dumps({
+  'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+  'sample': int('$sample'),
+  'churns': int('$churns'),
+  'ffmpegCount': int('$count'),
+  'phase': '$phase',
+}))
+" >>"$SERIES"
 }
 
 pick_item() {
@@ -67,11 +95,13 @@ if [[ -z "$ITEM" ]]; then
   exit 1
 fi
 
-log "start hours=$HOURS interval=${INTERVAL_S}s item=$ITEM data_dir=$DATA_DIR base=$BASE"
-MAX_ORPHANS=0
+log "start hours=$HOURS interval=${INTERVAL_S}s item=$ITEM data_dir=$DATA_DIR base=$BASE series=$SERIES"
+log "prerequisite: binary must include ADR-0020 (PR #11); host should not sleep"
+MAX_FFMPEG=0
 SAMPLES=0
 CHURNS=0
 FAIL=0
+SPIKE_SAMPLES=0
 
 while (( $(date +%s) < END_EPOCH )); do
   SAMPLES=$((SAMPLES + 1))
@@ -93,29 +123,39 @@ except Exception:
     else
       curl -sf -o /dev/null "$BASE/api/v0/sessions/$sid/master.m3u8" || true
     fi
+    # Count while a session may still hold FFmpeg (transient is OK).
+    live="$(ffmpeg_count)"
+    record_sample "$SAMPLES" "$CHURNS" "$live" "post_attach"
+    if (( live > MAX_FFMPEG )); then MAX_FFMPEG=$live; fi
+
     sleep 2
     curl -sf -X DELETE "$BASE/api/v0/sessions/$sid" -o /dev/null || true
   else
     log "WARN: session create failed body=${body:0:200}"
+    record_sample "$SAMPLES" "$CHURNS" "$(ffmpeg_count)" "create_failed"
   fi
 
-  # Allow idle reaper a beat, then sample.
+  # Allow idle reaper a beat, then scheduled post-reap sample.
   sleep 5
-  n="$(orphan_count)"
-  if (( n > MAX_ORPHANS )); then MAX_ORPHANS=$n; fi
+  n="$(ffmpeg_count)"
+  if (( n > MAX_FFMPEG )); then MAX_FFMPEG=$n; fi
+  record_sample "$SAMPLES" "$CHURNS" "$n" "post_reap"
+  log "sample=$SAMPLES churns=$CHURNS ffmpeg_post_reap=$n"
+
   if (( n > 0 )); then
-    log "orphan_sample count=$n"
-    ffmpeg_orphans | tee -a "$LOG" || true
-    # One more quiet window — reaper may still be within idle grace.
+    SPIKE_SAMPLES=$((SPIKE_SAMPLES + 1))
+    ffmpeg_matching | tee -a "$LOG" || true
+    # Extra quiet window — reaper may still be within idle grace.
     sleep 30
-    n2="$(orphan_count)"
+    n2="$(ffmpeg_count)"
+    record_sample "$SAMPLES" "$CHURNS" "$n2" "post_reap_quiet"
     if (( n2 > 0 )); then
       log "FAIL sticky_orphans count=$n2"
       FAIL=1
-      ffmpeg_orphans | tee -a "$LOG" || true
+      ffmpeg_matching | tee -a "$LOG" || true
+    else
+      log "transient_reaped was=$n now=0 (not sticky)"
     fi
-  else
-    log "ok sample=$SAMPLES churns=$CHURNS orphans=0"
   fi
 
   remaining=$(( END_EPOCH - $(date +%s) ))
@@ -123,7 +163,8 @@ except Exception:
   sleep "$INTERVAL_S"
 done
 
-final="$(orphan_count)"
+final="$(ffmpeg_count)"
+record_sample "$SAMPLES" "$CHURNS" "$final" "final"
 python3 - <<PY | tee "$SUMMARY"
 import json
 print(json.dumps({
@@ -132,17 +173,19 @@ print(json.dumps({
   "base": "$BASE",
   "itemId": int("$ITEM"),
   "dataDir": "$DATA_DIR",
+  "seriesPath": "$SERIES",
   "samples": $SAMPLES,
   "churns": $CHURNS,
-  "maxOrphansObserved": $MAX_ORPHANS,
-  "finalOrphans": $final,
+  "maxFfmpegObserved": $MAX_FFMPEG,
+  "postReapSpikeSamples": $SPIKE_SAMPLES,
+  "finalFfmpeg": $final,
   "fail": bool($FAIL) or $final > 0,
 }, indent=2))
 PY
 
 if (( FAIL != 0 )) || (( final > 0 )); then
-  log "FAIL final_orphans=$final"
+  log "FAIL final_ffmpeg=$final"
   exit 1
 fi
-log "PASS final_orphans=0 max_observed=$MAX_ORPHANS"
+log "PASS final_ffmpeg=0 max_observed=$MAX_FFMPEG post_reap_spikes=$SPIKE_SAMPLES"
 exit 0

@@ -79,6 +79,11 @@ Before calling Gate 2 sized, measure how many concurrent 1080p transcodes an
 Intel N100 sustains at the Auto target this profile ADR implies. Record the
 number next to the Gate 2 checklist; do not guess from `NIGHTJAR_HLS_MAX_SESSIONS`.
 
+Hardware long pole for Gate 2 / Phase 2 entry (after Unraid): **N100** (this
+measure) and **Pi 4** (ADR-0005 scan carry). Unraid covers VAAPI and QSV for
+the support matrix — confirm the box's iGPU is actually enabled in BIOS before
+counting QSV (a discrete Arc card sometimes leaves the iGPU off).
+
 ## Alternatives considered
 
 **Server-guessed profiles from User-Agent.** Rejected: Tizen/webOS model-year
@@ -100,4 +105,6 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   counted.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
-- N100 measurement remains a hardware task on the Gate 2 long pole.
+- N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4
+  for the scan carry). Unraid is the VAAPI/QSV verification host once iGPU
+  enablement is confirmed.
