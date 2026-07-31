@@ -179,26 +179,42 @@ pub fn sidx_video_earliest_ms(seg: &[u8]) -> Result<u64, String> {
     Err("no video sidx".into())
 }
 
+/// When mid-start encode stamps title-absolute `sidx` (FFmpeg 7+/8 with
+/// `-output_ts_offset`), first earliest ≈ `encode_start_ms`. Ubuntu apt 6.1
+/// still emits encode-relative sidx from 0 despite that flag — shift onto the
+/// encode window so time-keyed URIs stay title-absolute (ADR-0020).
+pub fn sidx_title_offset_ms(encode_start_ms: u64, first_sidx_ms: u64) -> u64 {
+    if encode_start_ms > 0 && first_sidx_ms < encode_start_ms / 2 {
+        encode_start_ms
+    } else {
+        0
+    }
+}
+
 /// Ingest one producer run's `index.m3u8` into `map`.
 ///
-/// For each EXTINF entry, reads the segment file, requires
-/// `sidx.earliest ≈ cumulative EXTINF start` (within 1 ms), and inserts a
+/// For each EXTINF entry, reads the segment file, requires contiguous
+/// `sidx` timeline (within 1 ms after any title offset), and inserts a
 /// time-keyed map entry. Disagreement skips that segment (hard failure to
 /// publish — never map wrong content).
+///
+/// `encode_start_ms` is the run's `-ss` / window start (written beside the
+/// producer files). Used only to detect encode-relative sidx on older FFmpeg.
 pub fn ingest_run_index(
     map: &mut SegmentMap,
     session_dir: &Path,
     run_id: u64,
     index_text: &str,
+    encode_start_ms: u64,
 ) -> Result<usize, String> {
     let entries = parse_ffmpeg_index(index_text)?;
     let run_rel = PathBuf::from(format!("run_{run_id}"));
     let mut inserted = 0usize;
     // FFmpeg EXTINF starts are relative to the first packet after seek; with
-    // -output_ts_offset the sidx carries title-absolute time. We trust sidx
-    // for the key and EXTINF only for duration; gate checks sidx against the
-    // running title-absolute timeline implied by successive sidx values.
+    // a working `-output_ts_offset` the sidx carries title-absolute time. We
+    // trust (possibly offset) sidx for the key and EXTINF only for duration.
     let mut prev_end_ms: Option<u64> = None;
+    let mut title_offset_ms: Option<u64> = None;
     for entry in entries {
         let rel = run_rel.join(&entry.file_name);
         let abs = session_dir.join(&rel);
@@ -208,16 +224,30 @@ pub fn ingest_run_index(
         if duration_ms == 0 {
             continue;
         }
-        // Gate: after the first segment, sidx should equal the previous end
-        // within one millisecond (contiguous producer output). The first
-        // segment defines the land; its sidx is the authority for start_ms.
+        let offset = *title_offset_ms.get_or_insert_with(|| {
+            let off = sidx_title_offset_ms(encode_start_ms, sidx_ms);
+            if off > 0 {
+                tracing::info!(
+                    run_id,
+                    encode_start_ms,
+                    first_sidx_ms = sidx_ms,
+                    title_offset_ms = off,
+                    "hls map: encode-relative sidx; applying title offset"
+                );
+            }
+            off
+        });
+        let start_ms = sidx_ms.saturating_add(offset);
+        // Gate: after the first segment, wire starts should equal the previous
+        // end within one millisecond (contiguous producer output).
         if let Some(expect) = prev_end_ms {
-            let delta = sidx_ms.abs_diff(expect);
+            let delta = start_ms.abs_diff(expect);
             if delta > 1 {
                 tracing::warn!(
                     run_id,
                     file = %entry.file_name,
                     sidx_ms,
+                    start_ms,
                     expect_ms = expect,
                     delta_ms = delta,
                     "hls map-build gate: sidx disagrees with EXTINF timeline; skipping"
@@ -225,7 +255,6 @@ pub fn ingest_run_index(
                 continue;
             }
         }
-        let start_ms = sidx_ms;
         map.insert(MappedSegment {
             start_ms,
             duration_ms,
@@ -285,6 +314,74 @@ mod tests {
         assert_eq!(parse_time_keyed_segment_name(&name), Some(1_277_151));
         assert_eq!(parse_time_keyed_segment_name("seg042.m4s"), None);
         assert_eq!(parse_time_keyed_segment_name("seg_1277151.m4s"), None);
+    }
+
+    #[test]
+    fn sidx_title_offset_detects_encode_relative() {
+        assert_eq!(sidx_title_offset_ms(40_000, 0), 40_000);
+        assert_eq!(sidx_title_offset_ms(2_000, 0), 2_000);
+        assert_eq!(sidx_title_offset_ms(40_000, 40_000), 0);
+        assert_eq!(sidx_title_offset_ms(40_000, 40_080), 0);
+        assert_eq!(sidx_title_offset_ms(0, 0), 0);
+    }
+
+    /// Minimal fMP4 with a video (ref_id=1) sidx v0; timescale 1000 → ms.
+    fn fake_sidx_seg(earliest_ms: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 20];
+        body[4..8].copy_from_slice(&1u32.to_be_bytes());
+        body[8..12].copy_from_slice(&1000u32.to_be_bytes());
+        body[12..16].copy_from_slice(&earliest_ms.to_be_bytes());
+        let size = (8 + body.len()) as u32;
+        let mut out = Vec::with_capacity(size as usize);
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(b"sidx");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn ingest_offsets_relative_sidx_onto_encode_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run_0");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("seg020.m4s"), fake_sidx_seg(0)).unwrap();
+        fs::write(run.join("seg021.m4s"), fake_sidx_seg(2000)).unwrap();
+        let index = "\
+#EXTM3U
+#EXTINF:2.000000,
+seg020.m4s
+#EXTINF:2.000000,
+seg021.m4s
+#EXT-X-ENDLIST
+";
+        let mut map = SegmentMap::default();
+        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(map.get(40_000).unwrap().duration_ms, 2000);
+        assert_eq!(map.get(42_000).unwrap().duration_ms, 2000);
+        assert!(map.get(0).is_none());
+    }
+
+    #[test]
+    fn ingest_keeps_absolute_sidx_unshifted() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run_0");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("seg020.m4s"), fake_sidx_seg(40_000)).unwrap();
+        fs::write(run.join("seg021.m4s"), fake_sidx_seg(42_000)).unwrap();
+        let index = "\
+#EXTM3U
+#EXTINF:2.000000,
+seg020.m4s
+#EXTINF:2.000000,
+seg021.m4s
+#EXT-X-ENDLIST
+";
+        let mut map = SegmentMap::default();
+        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000).unwrap();
+        assert_eq!(n, 2);
+        assert!(map.get(40_000).is_some());
+        assert!(map.get(42_000).is_some());
     }
 
     #[test]

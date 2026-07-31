@@ -169,9 +169,12 @@ covers the bar, not the seek — that is the ADR-0016 failure mode.
 16. **`independent_segments`.** Confirmed for multi-GOP copy segments: first
     sample remains a sync sample. Keep the flag.
 
-17. **`spawn_ffmpeg`:** document that `-output_ts_offset` is load-bearing for
-    title-absolute `elst` / `sidx` under copy (and any path that relies on
-    those for the map).
+17. **`spawn_ffmpeg`:** `-output_ts_offset` is load-bearing on FFmpeg builds
+    that stamp title-absolute `elst` / `sidx` (Homebrew 8.x / recent upstream).
+    Ubuntu apt 6.1 still emits encode-relative `sidx` from 0 despite the flag.
+    Map ingest detects that case (first sidx ≪ encode `-ss`) and adds the
+    run's encode start so wire keys stay title-absolute. Each `run_*` dir
+    records `encode_start_ms` for re-sync after scrub.
 
 ## Consequences
 

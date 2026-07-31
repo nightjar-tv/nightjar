@@ -607,16 +607,31 @@ fn run_dir(session: &Session) -> PathBuf {
     session.dir.join(format!("run_{}", session.current_run_id))
 }
 
+fn write_run_encode_start(run_dir: &Path, start_ms: u64) -> Result<(), String> {
+    fs::write(run_dir.join("encode_start_ms"), start_ms.to_string())
+        .map_err(|e| format!("write encode_start_ms {}: {e}", run_dir.display()))
+}
+
+fn read_run_encode_start(run_dir: &Path) -> u64 {
+    fs::read_to_string(run_dir.join("encode_start_ms"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 fn sync_segment_map(session: &mut Session) {
-    let index_path = run_dir(session).join("index.m3u8");
+    let run = run_dir(session);
+    let index_path = run.join("index.m3u8");
     let Ok(text) = fs::read_to_string(&index_path) else {
         return;
     };
+    let encode_start_ms = read_run_encode_start(&run);
     if let Err(e) = crate::hls_segment_map::ingest_run_index(
         &mut session.segment_map,
         &session.dir,
         session.current_run_id,
         &text,
+        encode_start_ms,
     ) {
         tracing::warn!(
             run_id = session.current_run_id,
@@ -643,15 +658,18 @@ fn sync_all_run_indexes(session: &mut Session) {
         let Ok(run_id) = id_str.parse::<u64>() else {
             continue;
         };
-        let index_path = entry.path().join("index.m3u8");
+        let run_path = entry.path();
+        let index_path = run_path.join("index.m3u8");
         let Ok(text) = fs::read_to_string(&index_path) else {
             continue;
         };
+        let encode_start_ms = read_run_encode_start(&run_path);
         if let Err(e) = crate::hls_segment_map::ingest_run_index(
             &mut session.segment_map,
             &session.dir,
             run_id,
             &text,
+            encode_start_ms,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (all-runs sync)");
         }
@@ -976,6 +994,7 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&run_dir).map_err(|e| {
             StartSessionError::Spawn(format!("create run dir {}: {e}", run_dir.display()))
         })?;
+        write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
         // Release before ASS demux / ffmpeg spawn so a multi-minute NAS extract
         // does not freeze every other HLS request on this lock.
         drop(sessions);
@@ -1905,6 +1924,7 @@ fn restart_at(
     let run_dir = session.dir.join(format!("run_{run_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
+    write_run_encode_start(&run_dir, start_ms).map_err(PlaylistError::Failed)?;
     let burn_in = prepare_ass_burn_file(&session.src, &session.dir, session.burn_in.clone())
         .map_err(PlaylistError::Failed)?;
     session.burn_in = burn_in;
