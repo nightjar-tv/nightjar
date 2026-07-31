@@ -129,7 +129,7 @@ async function main() {
     await sleep(500);
   }
 
-  // Seek via video currentTime + seeked handler (playlist?startMs=).
+  // Seek via video currentTime; product path uses POST /seek (ADR-0020).
   await send(
     "Runtime.evaluate",
     {

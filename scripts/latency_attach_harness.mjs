@@ -24,18 +24,12 @@ const cdpPort = Number(process.env.CDP_PORT || "19444");
 const landIdx = Math.floor(START_MS / 2000);
 const windowIdx = Math.max(0, landIdx - 8);
 
-function segName(i) {
-  return `seg${String(i).padStart(3, "0")}.m4s`;
-}
-
-async function waitSeg(sessionId, idx, label, t0, marks) {
-  const url = `${BASE}/api/v0/sessions/${sessionId}/${segName(idx)}`;
+async function waitMaster(masterUrl, label, t0, marks) {
   for (;;) {
-    const res = await fetch(url);
+    const res = await fetch(masterUrl);
     if (res.ok) {
-      marks.push({ phase: label, ms: Date.now() - t0, idx, status: res.status });
-      // drain body so connection frees
-      await res.arrayBuffer();
+      marks.push({ phase: label, ms: Date.now() - t0, status: res.status });
+      await res.text();
       return true;
     }
     if (res.status === 404) return false;
@@ -59,27 +53,21 @@ async function main() {
     sessionId: started.sessionId,
   });
 
-  // Master ready (= first window seg exists server-side).
+  // Master ready (= map has at least one segment). ADR-0020: do not invent
+  // segment URLs from playhead / SEGMENT_MS.
   const masterUrl = `${BASE}${started.playlistUrl}`;
-  for (;;) {
-    const res = await fetch(masterUrl);
-    if (res.ok) {
-      marks.push({ phase: "master_ready", ms: Date.now() - t0, status: res.status });
-      await res.text();
-      break;
-    }
-    await sleep(100);
+  if (!(await waitMaster(masterUrl, "master_ready", t0, marks))) {
+    throw new Error("master 404");
   }
-
-  await waitSeg(started.sessionId, windowIdx, "first_seg_ready", t0, marks);
-  if (ATTACH === "two" || ATTACH === "land") {
-    await waitSeg(started.sessionId, windowIdx + 1, "second_seg_ready", t0, marks);
-  }
-  if (ATTACH === "land") {
-    await waitSeg(started.sessionId, landIdx, "land_seg_ready", t0, marks);
-  }
+  marks.push({
+    phase: "attach_gate_open",
+    ms: Date.now() - t0,
+    mode: ATTACH,
+    note: "master-only gate (ADR-0020)",
+    windowIdx,
+    landIdx,
+  });
   const attachAt = Date.now() - t0;
-  marks.push({ phase: "attach_gate_open", ms: attachAt, mode: ATTACH });
 
   // Minimal page with hls.js from the nightjar embed if available, else CDN.
   const playlist = masterUrl;

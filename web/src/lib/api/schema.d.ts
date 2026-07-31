@@ -189,7 +189,7 @@ export interface paths {
         put?: never;
         /**
          * Start an HLS playback session for an item
-         * @description ADR-0011. Returns 202 with sessionId and playlistUrl. Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Each POST creates a session; seek with ?startMs= on the playlist restarts that session in place. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+         * @description ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl (per-run master under /runs/{runId}/master.m3u8). Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=, which returns a fresh playlistUrl. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
          */
         post: operations["startTranscodeSession"];
         delete?: never;
@@ -198,7 +198,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/sessions/{sessionId}/master.m3u8": {
+    "/api/v0/sessions/{sessionId}/runs/{runId}/master.m3u8": {
         parameters: {
             query?: never;
             header?: never;
@@ -206,8 +206,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * HLS master playlist for a playback session
-         * @description ADR-0008 / ADR-0010. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start points here. Seek via startMs uses the same window-move rules as the media playlist.
+         * HLS master playlist for a producer run
+         * @description ADR-0020. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start / seek points here. Far seek is POST /seek, not a startMs query on this URI.
          */
         get: operations["getSessionMasterPlaylist"];
         put?: never;
@@ -218,7 +218,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/sessions/{sessionId}/index.m3u8": {
+    "/api/v0/sessions/{sessionId}/runs/{runId}/index.m3u8": {
         parameters: {
             query?: never;
             header?: never;
@@ -226,10 +226,27 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * HLS media playlist for a playback session
-         * @description Media playlist path is stable (ADR-0008). Segment URIs are relative init.mp4 / segNNN.m4s. Also accepts startMs for seek.
+         * HLS media playlist for a producer run
+         * @description Assembled from the session-global time-keyed segment map (ADR-0020). Segment URIs are session-root relative (`../../seg_<ms>.m4s` from `/runs/{runId}/index.m3u8`). EVENT while cooking; ENDLIST at that run's EOF. EXT-X-START is window-relative.
          */
         get: operations["getSessionPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/runs/{runId}/init.mp4": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** fMP4 init segment for a producer run */
+        get: operations["getSessionRunInit"];
         put?: never;
         post?: never;
         delete?: never;
@@ -275,7 +292,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/sessions/{sessionId}": {
+    "/api/v0/sessions/{sessionId}/seek": {
         parameters: {
             query?: never;
             header?: never;
@@ -283,6 +300,30 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
+        put?: never;
+        /**
+         * Far scrub — new producer run and playlist URI
+         * @description ADR-0020. Applies startMs, starts a new run when needed, and returns the fresh playlistUrl. Clients must swap the player source to that URI (hls.js loadSource / Safari native re-attach). Track selections do not survive the swap; re-apply after attach.
+         */
+        post: operations["seekTranscodeSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Current session snapshot
+         * @description playlistUrl, landedMs, and usableExtentMs when known (ADR-0020).
+         */
+        get: operations["getTranscodeSession"];
         put?: never;
         post?: never;
         /** Stop a playback session and reap its FFmpeg process */
@@ -355,7 +396,7 @@ export interface components {
             sessionId: string;
             /** Format: int64 */
             itemId: number;
-            /** @description Path to the HLS master playlist for this session (master.m3u8). The media playlist remains at index.m3u8 (ADR-0008). */
+            /** @description Path to the current run's HLS master playlist (/sessions/{id}/runs/{runId}/master.m3u8). Fresh URI per far seek (ADR-0020). */
             playlistUrl: string;
             /** @description FFmpeg encoder currently used by this session, or "copy" when the session stream-copies video (remux). */
             videoEncoder: string;
@@ -364,6 +405,16 @@ export interface components {
              * @enum {string}
              */
             encoderKind: "hardware" | "software" | "copy";
+            /**
+             * Format: int64
+             * @description Producer-observed land (first mapped segment start for the current run), title-absolute milliseconds.
+             */
+            landedMs: number;
+            /**
+             * Format: int64
+             * @description When a producer reaches EOF materially short of the container's claimed duration, the usable media end in milliseconds. Absent when unknown or undamaged.
+             */
+            usableExtentMs?: number;
         };
         Library: {
             /** Format: int64 */
@@ -553,6 +604,7 @@ export interface components {
         ItemId: number;
         JobId: number;
         SessionId: string;
+        RunId: number;
     };
     requestBodies: never;
     headers: never;
@@ -972,13 +1024,11 @@ export interface operations {
     };
     getSessionMasterPlaylist: {
         parameters: {
-            query?: {
-                /** @description Encode window start; a change restarts this session there */
-                startMs?: number;
-            };
+            query?: never;
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -993,8 +1043,17 @@ export interface operations {
                     "application/vnd.apple.mpegurl": string;
                 };
             };
-            /** @description Session not found or playlist not ready yet */
+            /** @description Session or run not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Playlist not ready yet (no mapped segments) */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1006,19 +1065,17 @@ export interface operations {
     };
     getSessionPlaylist: {
         parameters: {
-            query?: {
-                /** @description Encode window start; a change restarts this session there */
-                startMs?: number;
-            };
+            query?: never;
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];
+                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description HLS playlist */
+            /** @description HLS media playlist */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1027,8 +1084,58 @@ export interface operations {
                     "application/vnd.apple.mpegurl": string;
                 };
             };
-            /** @description Session not found or playlist not ready yet */
+            /** @description Session or run not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Playlist not ready yet */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionRunInit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                runId: components["parameters"]["RunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Init segment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "video/mp4": string;
+                };
+            };
+            /** @description Session or run not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Init not ready yet */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1084,7 +1191,7 @@ export interface operations {
     getSessionAsset: {
         parameters: {
             query?: {
-                /** @description Log-only client marker. Serving ignores this. JS land-ensure and attach-wait probes set it (`land-ensure`, `attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503/204 behaviour. */
+                /** @description Log-only client marker. Serving ignores this. Attach-wait probes may set it (`attach-wait`); Safari's native HLS engine does not. Distinguishes probe traffic from WebKit segment GETs in dogfood logs without changing 200/503/204 behaviour. Far scrub is POST /seek (ADR-0020) — clients must not poke segment URIs to force cooking. */
                 njFetcher?: string;
             };
             header?: never;
@@ -1123,6 +1230,71 @@ export interface operations {
             };
             /** @description Segment not on disk yet (encoder still cooking). Retryable; do not treat as a permanent miss. */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    seekTranscodeSession: {
+        parameters: {
+            query: {
+                /** @description Title-absolute play land in milliseconds */
+                startMs: number;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Seek applied (or already at this land) */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscodeSession"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getTranscodeSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session snapshot */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscodeSession"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

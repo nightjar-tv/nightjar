@@ -2,12 +2,13 @@
 	import { onMount, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { api } from '$lib/api/client';
-	import { copy } from '$lib/copy';
+	import { copy, formatClock } from '$lib/copy';
 	import {
 		attachHls,
 		watchProgressiveSubtitles,
 		type HlsHandle
 	} from '$lib/hlsPlayer';
+	import { scrubRangeMs } from '$lib/hlsTimeline';
 	import {
 		attachModeFromSearch,
 		LatencyProbe,
@@ -28,9 +29,10 @@
 	let playback = $state<PlaybackInfo | null>(null);
 	let error = $state<string | null>(null);
 	let playlistUrl = $state<string | null>(null);
-	let sessionEncoder = $state<Pick<TranscodeSession, 'videoEncoder' | 'encoderKind'> | null>(
-		null
-	);
+	let sessionEncoder = $state<Pick<
+		TranscodeSession,
+		'videoEncoder' | 'encoderKind' | 'usableExtentMs' | 'landedMs'
+	> | null>(null);
 	let preparingSession = $state(false);
 	let switchingAudio = $state(false);
 	let audioNote = $state<string | null>(null);
@@ -38,13 +40,20 @@
 	/** HLS captions index into session MEDIA tracks; -1 = off. */
 	let selectedSubtitleIndex = $state(0);
 	let videoEl = $state<HTMLVideoElement | null>(null);
+	/** Title-time scrub value (seconds); driven by the player handle. */
+	let scrubSec = $state(0);
+	let scrubDragging = $state(false);
+	/** True while a far seek is in flight — hold the range on the commit target. */
+	let scrubSeeking = $state(false);
+	let playerShellEl = $state<HTMLElement | null>(null);
+	let playerFullscreen = $state(false);
 	// Mutable holder so onMount cleanup / pagehide always DELETE the live
 	// session even if the $state read in a stale closure is still null.
 	const sessionRef: { id: string | null } = { id: null };
 	// Non-reactive so changing it does not re-run the attach effect on its own.
 	const resumeRef = { seconds: 0 };
-	// Current attach handle; its positionSeconds() is title-absolute where
-	// raw currentTime is not after a mid-title switch (see hlsPlayer).
+	// Current attach handle; its positionSeconds() is title-absolute (live
+	// landedMs + media currentTime — ADR-0020).
 	const playerRef: { handle: HlsHandle | null } = { handle: null };
 	// Read by every await loop so an unmount mid-flight stops the loop and
 	// reaps whatever it already started.
@@ -59,6 +68,11 @@
 	// Investigation: ?njAttach=land|first|two and ?njProbe=1 (see latencyProbe.ts).
 	const attachMode = $derived(attachModeFromSearch(page.url.search));
 	const probeOn = $derived(probeEnabled(page.url.search));
+	/** Optional land for dogfood / deep link (`?startMs=`). Default 0. */
+	const startMsFromSearch = $derived.by(() => {
+		const raw = Number(page.url.searchParams.get('startMs') ?? 0);
+		return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+	});
 
 	function releaseSession() {
 		const id = sessionRef.id;
@@ -96,10 +110,6 @@
 			await new Promise((r) => setTimeout(r, 200));
 		}
 		return false;
-	}
-
-	function sessionAssetUrl(playlistUrl: string, name: string): string {
-		return playlistUrl.replace(/\/master\.m3u8$/, `/${name}`);
 	}
 
 	function selectAudio(trackId: string) {
@@ -200,32 +210,17 @@
 		}
 	}
 
-	/** Investigation attach gate: land (shipped), first window seg, or two segs. */
+	/** Attach gate: wait until the run master is ready (map has segments). */
 	async function waitForAttachReady(
 		playlist: string,
-		windowIdx: number,
-		landIdx: number,
-		mode: AttachMode,
+		_windowIdx: number,
+		_landIdx: number,
+		_mode: AttachMode,
 		probe: LatencyProbe
 	): Promise<boolean> {
 		const masterOk = await waitForReady(playlist);
 		if (masterOk) probe.mark('master_ready');
-		if (!masterOk) return false;
-		if (mode === 'land') {
-			const landName = `seg${String(landIdx).padStart(3, '0')}.m4s`;
-			const ok = await waitForReady(sessionAssetUrl(playlist, landName));
-			if (ok) probe.mark('land_seg_ready', landName);
-			return ok;
-		}
-		const firstName = `seg${String(windowIdx).padStart(3, '0')}.m4s`;
-		const firstOk = await waitForReady(sessionAssetUrl(playlist, firstName));
-		if (firstOk) probe.mark('first_seg_ready', firstName);
-		if (!firstOk) return false;
-		if (mode === 'first') return true;
-		const secondName = `seg${String(windowIdx + 1).padStart(3, '0')}.m4s`;
-		const secondOk = await waitForReady(sessionAssetUrl(playlist, secondName));
-		if (secondOk) probe.mark('second_seg_ready', secondName);
-		return secondOk;
+		return masterOk;
 	}
 
 	const playable = $derived(
@@ -257,6 +252,11 @@
 		return `${itemId}:${playback.streamUrl}`;
 	});
 
+	/** Title / usable duration for the scrub bar (not EVENT Σ EXTINF). */
+	const scrubMaxSec = $derived(
+		scrubRangeMs(item?.durationMs, sessionEncoder?.usableExtentMs) / 1000
+	);
+
 	onMount(() => {
 		liveRef.alive = true;
 
@@ -278,9 +278,12 @@
 				let started: TranscodeSession | null = null;
 				for (let attempt = 0; liveRef.alive && attempt < 5; attempt++) {
 					try {
-						started = await api.startTranscodeSession(itemId);
+						const landMs = startMsFromSearch;
+						started = await api.startTranscodeSession(itemId, landMs);
 						sessionRef.id = started.sessionId;
 						sessionEncoder = started;
+						// Session land is title-absolute; media element starts at 0.
+						resumeRef.seconds = (started.landedMs ?? landMs) / 1000;
 						break;
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
@@ -300,6 +303,30 @@
 				if (await waitForReady(started.playlistUrl)) {
 					playlistUrl = started.playlistUrl;
 					preparingSession = false;
+					// Producer EOF may set usableExtentMs after the POST returns
+					// (damaged mid-title). Poll until known or the page dies.
+					void (async () => {
+						const sid = started.sessionId;
+						for (let i = 0; liveRef.alive && i < 120; i++) {
+							if (sessionRef.id !== sid) return;
+							try {
+								const view = await api.getTranscodeSession(sid);
+								if (view.usableExtentMs != null) {
+									sessionEncoder = {
+										...(sessionEncoder ?? view),
+										usableExtentMs: view.usableExtentMs,
+										landedMs: view.landedMs,
+										videoEncoder: view.videoEncoder,
+										encoderKind: view.encoderKind
+									};
+									return;
+								}
+							} catch {
+								return;
+							}
+							await new Promise((r) => setTimeout(r, 500));
+						}
+					})();
 					return;
 				}
 				preparingSession = false;
@@ -326,9 +353,75 @@
 		if (probeOn) console.warn('[nj-subs] item page attaching HLS', url);
 		const handle = attachHls(video, url, resumeRef.seconds);
 		playerRef.handle = handle;
+		const onTime = () => {
+			if (!scrubDragging && !scrubSeeking) {
+				scrubSec = handle.positionSeconds();
+			}
+		};
+		video.addEventListener('timeupdate', onTime);
 		return () => {
+			video.removeEventListener('timeupdate', onTime);
 			playerRef.handle = null;
 			handle.destroy();
+		};
+	});
+
+	function onScrubInput(ev: Event) {
+		const v = Number((ev.currentTarget as HTMLInputElement).value);
+		if (!Number.isFinite(v)) return;
+		scrubDragging = true;
+		scrubSec = Math.max(0, Math.min(scrubMaxSec || v, v));
+	}
+
+	async function onScrubCommit() {
+		scrubDragging = false;
+		const handle = playerRef.handle;
+		if (!handle) return;
+		scrubSeeking = true;
+		const target = scrubSec;
+		try {
+			await handle.seekToTitleSeconds(target);
+			scrubSec = handle.positionSeconds();
+		} finally {
+			scrubSeeking = false;
+		}
+	}
+
+	function onFullscreenChange() {
+		const shell = playerShellEl;
+		playerFullscreen = !!(
+			shell &&
+			(document.fullscreenElement === shell ||
+				// @ts-expect-error webkit prefix
+				document.webkitFullscreenElement === shell)
+		);
+	}
+
+	async function togglePlayerFullscreen() {
+		const shell = playerShellEl;
+		if (!shell) return;
+		try {
+			if (playerFullscreen) {
+				if (document.exitFullscreen) await document.exitFullscreen();
+				// @ts-expect-error webkit prefix
+				else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+			} else if (shell.requestFullscreen) {
+				await shell.requestFullscreen();
+			} else {
+				// @ts-expect-error webkit prefix (iPad Safari)
+				shell.webkitRequestFullscreen?.();
+			}
+		} catch {
+			// Gesture / policy denied — leave chrome as-is.
+		}
+	}
+
+	$effect(() => {
+		document.addEventListener('fullscreenchange', onFullscreenChange);
+		document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+		return () => {
+			document.removeEventListener('fullscreenchange', onFullscreenChange);
+			document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
 		};
 	});
 
@@ -389,11 +482,51 @@
 				{/if}
 			</p>
 			<p class="reason">{playback.reason}</p>
+			{#if sessionEncoder?.usableExtentMs != null && item.durationMs}
+				<p class="preparing" role="status">
+					{copy.titleDamagedUsable(
+						sessionEncoder.usableExtentMs / 1000,
+						item.durationMs / 1000
+					)}
+				</p>
+			{/if}
 		</header>
 
 		{#if playable && playlistUrl}
-			<!-- svelte-ignore a11y_media_has_caption -->
-			<video bind:this={videoEl} controls playsinline></video>
+			<div class="player" bind:this={playerShellEl}>
+				<!-- svelte-ignore a11y_media_has_caption -->
+				<!-- controlsList nofullscreen: use container fullscreen so our scrub stays -->
+				<video bind:this={videoEl} controls controlsList="nofullscreen" playsinline></video>
+				{#if scrubMaxSec > 0}
+					<label class="scrub">
+						<span class="scrub-label">{copy.scrubPosition}</span>
+						<input
+							type="range"
+							min="0"
+							max={scrubMaxSec}
+							step="0.1"
+							value={Math.min(scrubSec, scrubMaxSec)}
+							aria-valuetext="{formatClock(scrubSec)} / {formatClock(scrubMaxSec)}"
+							oninput={onScrubInput}
+							onchange={onScrubCommit}
+							onkeyup={(e) => {
+								if (e.key === 'Enter' || e.key === ' ') onScrubCommit();
+							}}
+						/>
+						<span class="scrub-clock" aria-hidden="true"
+							>{formatClock(scrubSec)} / {formatClock(scrubMaxSec)}</span
+						>
+					</label>
+				{/if}
+				<button
+					type="button"
+					class="player-fs"
+					onclick={togglePlayerFullscreen}
+					aria-pressed={playerFullscreen}
+				>
+					{playerFullscreen ? copy.playerExitFullscreen : copy.playerFullscreen}
+				</button>
+			</div>
 			{#if subtitlesPreparing}
 				<p class="preparing">{copy.subtitlesPreparing}</p>
 			{/if}
@@ -510,6 +643,70 @@
 		margin-top: 1.5rem;
 		background: #000;
 		border-radius: 8px;
+	}
+	.player {
+		margin-top: 1.5rem;
+	}
+	.player video {
+		margin-top: 0;
+	}
+	.player:fullscreen,
+	.player:-webkit-full-screen {
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		box-sizing: border-box;
+		width: 100%;
+		height: 100%;
+		padding: 1rem;
+		background: #000;
+	}
+	.player:fullscreen video,
+	.player:-webkit-full-screen video {
+		flex: 1 1 auto;
+		width: 100%;
+		height: auto;
+		max-height: calc(100% - 4rem);
+		border-radius: 0;
+		background: #000;
+	}
+	.player:fullscreen .scrub,
+	.player:-webkit-full-screen .scrub {
+		color: var(--moth);
+	}
+	.player-fs {
+		margin-top: 0.5rem;
+		font-family: 'Spline Sans Mono', ui-monospace, monospace;
+		font-size: 0.875rem;
+		color: var(--moth-dim);
+		background: transparent;
+		border: 1px solid var(--moth-dim);
+		border-radius: 4px;
+		padding: 0.35rem 0.75rem;
+		cursor: pointer;
+	}
+	.player-fs:focus-visible {
+		outline: 2px solid var(--dusk);
+		outline-offset: 2px;
+	}
+	.scrub {
+		display: grid;
+		grid-template-columns: auto 1fr auto;
+		gap: 0.75rem;
+		align-items: center;
+		margin-top: 0.75rem;
+		font-family: 'Spline Sans Mono', ui-monospace, monospace;
+		font-size: 0.875rem;
+		color: var(--moth-dim);
+	}
+	.scrub input[type='range'] {
+		width: 100%;
+		accent-color: var(--dusk);
+	}
+	.scrub-clock {
+		min-width: 7rem;
+		text-align: right;
+		font-variant-numeric: tabular-nums;
 	}
 	.error {
 		color: var(--dusk);

@@ -84,6 +84,18 @@ export const api = {
 			{ method: 'POST' }
 		);
 	},
+	seekTranscodeSession: (sessionId: string, startMs: number) => {
+		const params = new URLSearchParams();
+		params.set('startMs', String(Math.max(0, Math.floor(startMs))));
+		return request<Resp<'/api/v0/sessions/{sessionId}/seek', 'post'>>(
+			`/api/v0/sessions/${sessionId}/seek?${params}`,
+			{ method: 'POST' }
+		);
+	},
+	getTranscodeSession: (sessionId: string) =>
+		request<Resp<'/api/v0/sessions/{sessionId}', 'get'>>(
+			`/api/v0/sessions/${sessionId}`
+		),
 	deleteTranscodeSession: async (sessionId: string) => {
 		// keepalive: survives pagehide/unload so the DELETE reaches the
 		// server instead of being killed mid-flight (Safari reports that as

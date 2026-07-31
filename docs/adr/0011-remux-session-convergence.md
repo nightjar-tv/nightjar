@@ -26,9 +26,11 @@ subtitle-warm triggers) were not earning their keep (Rule 4.11).
    readiness.
 
 3. **One session per POST.** Session reuse by `(itemId, startMs)` and the
-   fork-on-scrub 409 path are removed. Each POST creates a session; seek via
-   `?startMs=` restarts that session in place. This is the simplification
-   named in ADR-0007 consequences, taken now that remux joins the same path.
+   fork-on-scrub 409 path are removed. Each POST creates a session; far seek
+   restarts that session in place. **Amended by
+   [ADR-0020](0020-copy-mode-segment-boundaries.md):** seek is
+   `POST /sessions/{id}/seek?startMs=` returning a fresh per-run
+   `playlistUrl` (not `?startMs=` on a stable master URI).
 
 4. **Subtitle warm at session start.** Embedded WebVTT warming runs when any
    session starts (remux or transcode). The remux-job warm path dies with the
@@ -85,10 +87,13 @@ transcode. Titles larger than the old remux cap play. Remux and transcode
 differ by a field (`SessionMode::Copy` vs encode), not by architecture
 (Rule 4.11).
 
-**Copy-mode caveat.** Stream-copy HLS cannot force 2 s IDRs; segment
-boundaries follow source keyframes. The generated VOD playlist still uses
-`SEGMENT_MS` for indexing; real segment duration may vary. That is acceptable
-for v0 remux; ABR alignment (ADR-0008) still applies to encoded sessions.
+**Copy-mode caveat (withdrawn by [ADR-0020](0020-copy-mode-segment-boundaries.md)).**
+Stream-copy HLS cannot force 2 s IDRs; segment boundaries follow source
+keyframes. Treating a `SEGMENT_MS`-indexed synthetic VOD as acceptable for v0
+was wrong: measured healthy titles leave most listed URIs unwritten and name
+the rest off the media timeline. ADR-0020 makes the producer own copy
+boundaries (time-keyed URIs, playlist from muxer truth). ABR alignment
+(ADR-0008) still applies to encoded sessions.
 
 **No session sharing.** Session reuse by `(itemId, startMs)` is removed with
 fork-on-scrub (§3), so two viewers of the same title get two FFmpeg processes.
@@ -126,6 +131,14 @@ path iOS/tvOS need).
    Mid-title session start and audio switch still spawn FFmpeg at the window
    (`-ss` / `-start_number` / `-output_ts_offset`); they do not pre-encode
    the whole title.
+
+   **Withdrawn by [ADR-0020](0020-copy-mode-segment-boundaries.md).**
+   Producer-backed EVENT/ENDLIST playlists with time-keyed URIs and a
+   **fresh playlist URI per run** replace the synthetic full-title grid.
+   Scrubber range comes from item / usable duration; far seek is
+   `?startMs=` + new playlist URI (probe:
+   `scripts/playlist_shape_probe/RESULTS.md`). Transcode still force-IDRs
+   on `SEGMENT_MS` (ADR-0008 §3); its time-keys fall on that grid.
 
 7. **Out-of-window segment requests are load-bearing 503s, not 404s.**
    A segment the current encode window has not produced (and that is not
