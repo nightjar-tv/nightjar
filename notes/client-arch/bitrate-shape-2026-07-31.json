@@ -1,0 +1,264 @@
+{
+  "db": "/Users/gmacarthur/nightjar-data/nightjar.db",
+  "n": 24842,
+  "unit": "Mbps",
+  "method": "size_bytes\u00d78/duration_ms; equals ffprobe format.bit_rate on this corpus (n=30 ratio 1.000)",
+  "excluded": "paths containing /testdata/",
+  "overall": {
+    "min": 0.409,
+    "p50": 3.863,
+    "p90": 10.016,
+    "p99": 18.241,
+    "max": 42.243
+  },
+  "histogram_mbps": [
+    {
+      "bucket_mbps": "0\u20131",
+      "n": 215,
+      "pct": 0.87
+    },
+    {
+      "bucket_mbps": "1\u20132",
+      "n": 3405,
+      "pct": 13.71
+    },
+    {
+      "bucket_mbps": "2\u20134",
+      "n": 9044,
+      "pct": 36.41
+    },
+    {
+      "bucket_mbps": "4\u20136",
+      "n": 4498,
+      "pct": 18.11
+    },
+    {
+      "bucket_mbps": "6\u20138",
+      "n": 2410,
+      "pct": 9.7
+    },
+    {
+      "bucket_mbps": "8\u201310",
+      "n": 2760,
+      "pct": 11.11
+    },
+    {
+      "bucket_mbps": "10\u201312",
+      "n": 1666,
+      "pct": 6.71
+    },
+    {
+      "bucket_mbps": "12\u201315",
+      "n": 353,
+      "pct": 1.42
+    },
+    {
+      "bucket_mbps": "15\u201320",
+      "n": 338,
+      "pct": 1.36
+    },
+    {
+      "bucket_mbps": "20\u201325",
+      "n": 107,
+      "pct": 0.43
+    },
+    {
+      "bucket_mbps": "25\u201330",
+      "n": 23,
+      "pct": 0.09
+    },
+    {
+      "bucket_mbps": "30\u201340",
+      "n": 20,
+      "pct": 0.08
+    },
+    {
+      "bucket_mbps": "40\u201350",
+      "n": 3,
+      "pct": 0.01
+    },
+    {
+      "bucket_mbps": "50\u201360",
+      "n": 0,
+      "pct": 0.0
+    },
+    {
+      "bucket_mbps": "60\u201380",
+      "n": 0,
+      "pct": 0.0
+    },
+    {
+      "bucket_mbps": "80\u2013100",
+      "n": 0,
+      "pct": 0.0
+    },
+    {
+      "bucket_mbps": "100\u2013200",
+      "n": 0,
+      "pct": 0.0
+    },
+    {
+      "bucket_mbps": "\u2265200",
+      "n": 0,
+      "pct": 0.0
+    }
+  ],
+  "exceed_ceiling": [
+    {
+      "ceiling_mbps": 4,
+      "exceed_n": 12178,
+      "exceed_pct": 49.02
+    },
+    {
+      "ceiling_mbps": 8,
+      "exceed_n": 5270,
+      "exceed_pct": 21.21
+    },
+    {
+      "ceiling_mbps": 15,
+      "exceed_n": 491,
+      "exceed_pct": 1.98
+    },
+    {
+      "ceiling_mbps": 25,
+      "exceed_n": 46,
+      "exceed_pct": 0.19
+    }
+  ],
+  "by_resolution_tier": {
+    "1080p": {
+      "n": 18828,
+      "pct_lib": 75.79,
+      "p50": 3.963,
+      "p90": 9.391,
+      "p99": 12.844,
+      "max": 42.243,
+      "exceed_8": 17.3,
+      "exceed_15": 0.54,
+      "exceed_25": 0.18
+    },
+    "720p": {
+      "n": 4901,
+      "pct_lib": 19.73,
+      "p50": 4.74,
+      "p90": 12.729,
+      "p99": 21.28,
+      "max": 34.347,
+      "exceed_8": 40.83,
+      "exceed_15": 7.79,
+      "exceed_25": 0.24
+    },
+    "<480p": {
+      "n": 572,
+      "pct_lib": 2.3,
+      "p50": 1.101,
+      "p90": 1.244,
+      "p99": 2.166,
+      "max": 2.197,
+      "exceed_8": 0.0,
+      "exceed_15": 0.0,
+      "exceed_25": 0.0
+    },
+    "480p": {
+      "n": 534,
+      "pct_lib": 2.15,
+      "p50": 1.176,
+      "p90": 4.373,
+      "p99": 6.722,
+      "max": 13.489,
+      "exceed_8": 0.75,
+      "exceed_15": 0.0,
+      "exceed_25": 0.0
+    },
+    "2160p+": {
+      "n": 6,
+      "pct_lib": 0.02,
+      "p50": 22.576,
+      "p90": 35.294,
+      "p99": 35.294,
+      "max": 35.294,
+      "exceed_8": 100.0,
+      "exceed_15": 100.0,
+      "exceed_25": 16.67
+    },
+    "1440p": {
+      "n": 1,
+      "pct_lib": 0.0,
+      "p50": 16.873,
+      "p90": 16.873,
+      "p99": 16.873,
+      "max": 16.873,
+      "exceed_8": 100.0,
+      "exceed_15": 100.0,
+      "exceed_25": 0.0
+    }
+  },
+  "by_source_tag": {
+    "WEB": {
+      "n": 14268,
+      "pct_lib": 57.43,
+      "p50": 5.098,
+      "p90": 9.897,
+      "p99": 11.207,
+      "max": 40.354,
+      "exceed_8": 25.2,
+      "exceed_15": 0.14,
+      "exceed_25": 0.03
+    },
+    "Bluray": {
+      "n": 6734,
+      "pct_lib": 27.11,
+      "p50": 3.181,
+      "p90": 12.344,
+      "p99": 21.935,
+      "max": 42.243,
+      "exceed_8": 20.36,
+      "exceed_15": 6.83,
+      "exceed_25": 0.5
+    },
+    "HDTV": {
+      "n": 2784,
+      "pct_lib": 11.21,
+      "p50": 2.371,
+      "p90": 8.126,
+      "p99": 12.715,
+      "max": 33.654,
+      "exceed_8": 10.56,
+      "exceed_15": 0.18,
+      "exceed_25": 0.11
+    },
+    "other": {
+      "n": 833,
+      "pct_lib": 3.35,
+      "p50": 1.098,
+      "p90": 1.403,
+      "p99": 4.105,
+      "max": 35.294,
+      "exceed_8": 0.6,
+      "exceed_15": 0.12,
+      "exceed_25": 0.12
+    },
+    "DVD": {
+      "n": 203,
+      "pct_lib": 0.82,
+      "p50": 1.197,
+      "p90": 5.427,
+      "p99": 6.501,
+      "max": 6.501,
+      "exceed_8": 0.0,
+      "exceed_15": 0.0,
+      "exceed_25": 0.0
+    },
+    "Remux": {
+      "n": 20,
+      "pct_lib": 0.08,
+      "p50": 3.074,
+      "p90": 34.524,
+      "p99": 38.926,
+      "max": 38.926,
+      "exceed_8": 25.0,
+      "exceed_15": 25.0,
+      "exceed_25": 20.0
+    }
+  }
+}

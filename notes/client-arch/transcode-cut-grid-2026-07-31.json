@@ -1,0 +1,1490 @@
+{
+  "question": "Forced-IDR transcode segment starts match N\u00d7hls_time grid?",
+  "tol_s": 0.05,
+  "encode_window_s": 40.0,
+  "model": "want[i] = start_s + i*hls_time; produce with -force_key_frames expr + -sc_threshold 0",
+  "total_compared": 291,
+  "total_mismatches": 18,
+  "overall_mismatch_rate": 0.061855670103092786,
+  "by_hls_time": {
+    "2.0": {
+      "compared": 242,
+      "mismatches": 15,
+      "rate": 0.06198347107438017
+    },
+    "10.0": {
+      "compared": 49,
+      "mismatches": 3,
+      "rate": 0.061224489795918366
+    }
+  },
+  "by_shape": {
+    "long-GOP": {
+      "compared": 96,
+      "mismatches": 6,
+      "rate": 0.0625
+    },
+    "short-GOP": {
+      "compared": 72,
+      "mismatches": 6,
+      "rate": 0.08333333333333333
+    },
+    "feature": {
+      "compared": 72,
+      "mismatches": 0,
+      "rate": 0.0
+    },
+    "damaged-DVD": {
+      "compared": 48,
+      "mismatches": 6,
+      "rate": 0.125
+    },
+    "VFR": {
+      "compared": 3,
+      "mismatches": 0,
+      "rate": 0.0
+    }
+  },
+  "results": [
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 2.0,
+      "start_s": 0.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 5,
+      "mismatch_rate": 0.25,
+      "max_abs_delta_s": 0.0589999999999975,
+      "first_fail": {
+        "i": 15,
+        "want": 30.0,
+        "got": 30.051,
+        "delta_s": 0.05099999999999838,
+        "ok": false
+      },
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 2.0,
+          "got": 2.023,
+          "delta_s": 0.02300000000000013,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 4.0,
+          "got": 4.025,
+          "delta_s": 0.025000000000000355,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 6.0,
+          "got": 6.027,
+          "delta_s": 0.027000000000000135,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 8.0,
+          "got": 8.029,
+          "delta_s": 0.028999999999999915,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 10.0,
+          "got": 10.031,
+          "delta_s": 0.031000000000000583,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 12.0,
+          "got": 12.033,
+          "delta_s": 0.032999999999999474,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 14.0,
+          "got": 14.035,
+          "delta_s": 0.03500000000000014,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 2.0,
+      "start_s": 300.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 300.0,
+          "got": 300.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 302.0,
+          "got": 302.002,
+          "delta_s": 0.0020000000000095497,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 304.0,
+          "got": 304.004,
+          "delta_s": 0.004000000000019099,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 306.0,
+          "got": 306.006,
+          "delta_s": 0.005999999999971806,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 308.0,
+          "got": 308.008,
+          "delta_s": 0.007999999999981355,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 310.0,
+          "got": 310.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 312.0,
+          "got": 312.012,
+          "delta_s": 0.012000000000000455,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 314.0,
+          "got": 314.014,
+          "delta_s": 0.014000000000010004,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 2.0,
+      "start_s": 600.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 600.0,
+          "got": 600.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 602.0,
+          "got": 602.002,
+          "delta_s": 0.0019999999999527063,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 604.0,
+          "got": 604.004,
+          "delta_s": 0.004000000000019099,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 606.0,
+          "got": 606.006,
+          "delta_s": 0.005999999999971806,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 608.0,
+          "got": 608.008,
+          "delta_s": 0.008000000000038199,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 610.0,
+          "got": 610.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 612.0,
+          "got": 612.012,
+          "delta_s": 0.011999999999943611,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 614.0,
+          "got": 614.014,
+          "delta_s": 0.014000000000010004,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 2.0,
+      "start_s": 1200.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 1200.0,
+          "got": 1200.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 1202.0,
+          "got": 1202.002,
+          "delta_s": 0.0019999999999527063,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 1204.0,
+          "got": 1204.004,
+          "delta_s": 0.0039999999999054126,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 1206.0,
+          "got": 1206.006,
+          "delta_s": 0.0060000000000854925,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 1208.0,
+          "got": 1208.008,
+          "delta_s": 0.008000000000038199,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 1210.0,
+          "got": 1210.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 1212.0,
+          "got": 1212.012,
+          "delta_s": 0.011999999999943611,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 1214.0,
+          "got": 1214.014,
+          "delta_s": 0.013999999999896318,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 10.0,
+      "start_s": 0.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 1,
+      "mismatch_rate": 0.25,
+      "max_abs_delta_s": 0.05099999999999838,
+      "first_fail": {
+        "i": 3,
+        "want": 30.0,
+        "got": 30.051,
+        "delta_s": 0.05099999999999838,
+        "ok": false
+      },
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 10.0,
+          "got": 10.031,
+          "delta_s": 0.031000000000000583,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 20.0,
+          "got": 20.041,
+          "delta_s": 0.04100000000000037,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 30.0,
+          "got": 30.051,
+          "delta_s": 0.05099999999999838,
+          "ok": false
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 10.0,
+      "start_s": 300.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 300.0,
+          "got": 300.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 310.0,
+          "got": 310.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 320.0,
+          "got": 320.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 330.0,
+          "got": 330.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 10.0,
+      "start_s": 600.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 600.0,
+          "got": 600.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 610.0,
+          "got": 610.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 620.0,
+          "got": 620.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 630.0,
+          "got": 630.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Elementary_3x05_longGOP",
+      "shape": "long-GOP",
+      "hls_time": 10.0,
+      "start_s": 1200.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 1200.0,
+          "got": 1200.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 1210.0,
+          "got": 1210.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 1220.0,
+          "got": 1220.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 1230.0,
+          "got": 1230.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "RickMorty_9x04_shortGOP",
+      "shape": "short-GOP",
+      "hls_time": 2.0,
+      "start_s": 0.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 5,
+      "mismatch_rate": 0.25,
+      "max_abs_delta_s": 0.0589999999999975,
+      "first_fail": {
+        "i": 15,
+        "want": 30.0,
+        "got": 30.051,
+        "delta_s": 0.05099999999999838,
+        "ok": false
+      },
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 2.0,
+          "got": 2.023,
+          "delta_s": 0.02300000000000013,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 4.0,
+          "got": 4.025,
+          "delta_s": 0.025000000000000355,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 6.0,
+          "got": 6.027,
+          "delta_s": 0.027000000000000135,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 8.0,
+          "got": 8.029,
+          "delta_s": 0.028999999999999915,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 10.0,
+          "got": 10.031,
+          "delta_s": 0.031000000000000583,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 12.0,
+          "got": 12.033,
+          "delta_s": 0.032999999999999474,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 14.0,
+          "got": 14.035,
+          "delta_s": 0.03500000000000014,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "RickMorty_9x04_shortGOP",
+      "shape": "short-GOP",
+      "hls_time": 2.0,
+      "start_s": 120.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 120.0,
+          "got": 120.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 122.0,
+          "got": 122.002,
+          "delta_s": 0.001999999999995339,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 124.0,
+          "got": 124.004,
+          "delta_s": 0.0040000000000048885,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 126.0,
+          "got": 126.006,
+          "delta_s": 0.006000000000000227,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 128.0,
+          "got": 128.008,
+          "delta_s": 0.008000000000009777,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 130.0,
+          "got": 130.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 132.0,
+          "got": 132.012,
+          "delta_s": 0.012000000000000455,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 134.0,
+          "got": 134.014,
+          "delta_s": 0.014000000000010004,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "RickMorty_9x04_shortGOP",
+      "shape": "short-GOP",
+      "hls_time": 2.0,
+      "start_s": 300.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 300.0,
+          "got": 300.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 302.0,
+          "got": 302.002,
+          "delta_s": 0.0020000000000095497,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 304.0,
+          "got": 304.004,
+          "delta_s": 0.004000000000019099,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 306.0,
+          "got": 306.006,
+          "delta_s": 0.005999999999971806,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 308.0,
+          "got": 308.008,
+          "delta_s": 0.007999999999981355,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 310.0,
+          "got": 310.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 312.0,
+          "got": 312.012,
+          "delta_s": 0.012000000000000455,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 314.0,
+          "got": 314.014,
+          "delta_s": 0.014000000000010004,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "RickMorty_9x04_shortGOP",
+      "shape": "short-GOP",
+      "hls_time": 10.0,
+      "start_s": 0.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 1,
+      "mismatch_rate": 0.25,
+      "max_abs_delta_s": 0.05099999999999838,
+      "first_fail": {
+        "i": 3,
+        "want": 30.0,
+        "got": 30.051,
+        "delta_s": 0.05099999999999838,
+        "ok": false
+      },
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 10.0,
+          "got": 10.031,
+          "delta_s": 0.031000000000000583,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 20.0,
+          "got": 20.041,
+          "delta_s": 0.04100000000000037,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 30.0,
+          "got": 30.051,
+          "delta_s": 0.05099999999999838,
+          "ok": false
+        }
+      ]
+    },
+    {
+      "label": "RickMorty_9x04_shortGOP",
+      "shape": "short-GOP",
+      "hls_time": 10.0,
+      "start_s": 120.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.030000000000001137,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 120.0,
+          "got": 120.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 130.0,
+          "got": 130.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 140.0,
+          "got": 140.02,
+          "delta_s": 0.020000000000010232,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 150.0,
+          "got": 150.03,
+          "delta_s": 0.030000000000001137,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "RickMorty_9x04_shortGOP",
+      "shape": "short-GOP",
+      "hls_time": 10.0,
+      "start_s": 300.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 300.0,
+          "got": 300.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 310.0,
+          "got": 310.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 320.0,
+          "got": 320.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 330.0,
+          "got": 330.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "AngryMen_feature",
+      "shape": "feature",
+      "hls_time": 2.0,
+      "start_s": 0.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.0379999999999967,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 2.0,
+          "got": 2.002,
+          "delta_s": 0.0019999999999997797,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 4.0,
+          "got": 4.004,
+          "delta_s": 0.0039999999999995595,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 6.0,
+          "got": 6.006,
+          "delta_s": 0.006000000000000227,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 8.0,
+          "got": 8.008,
+          "delta_s": 0.007999999999999119,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 10.0,
+          "got": 10.01,
+          "delta_s": 0.009999999999999787,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 12.0,
+          "got": 12.012,
+          "delta_s": 0.012000000000000455,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 14.0,
+          "got": 14.014,
+          "delta_s": 0.013999999999999346,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "AngryMen_feature",
+      "shape": "feature",
+      "hls_time": 2.0,
+      "start_s": 900.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 900.0,
+          "got": 900.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 902.0,
+          "got": 902.002,
+          "delta_s": 0.0019999999999527063,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 904.0,
+          "got": 904.004,
+          "delta_s": 0.004000000000019099,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 906.0,
+          "got": 906.006,
+          "delta_s": 0.005999999999971806,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 908.0,
+          "got": 908.008,
+          "delta_s": 0.008000000000038199,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 910.0,
+          "got": 910.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 912.0,
+          "got": 912.012,
+          "delta_s": 0.011999999999943611,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 914.0,
+          "got": 914.014,
+          "delta_s": 0.014000000000010004,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "AngryMen_feature",
+      "shape": "feature",
+      "hls_time": 2.0,
+      "start_s": 1800.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 1800.0,
+          "got": 1800.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 1802.0,
+          "got": 1802.002,
+          "delta_s": 0.0019999999999527063,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 1804.0,
+          "got": 1804.004,
+          "delta_s": 0.0039999999999054126,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 1806.0,
+          "got": 1806.006,
+          "delta_s": 0.0060000000000854925,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 1808.0,
+          "got": 1808.008,
+          "delta_s": 0.008000000000038199,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 1810.0,
+          "got": 1810.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 1812.0,
+          "got": 1812.012,
+          "delta_s": 0.011999999999943611,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 1814.0,
+          "got": 1814.014,
+          "delta_s": 0.013999999999896318,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "AngryMen_feature",
+      "shape": "feature",
+      "hls_time": 10.0,
+      "start_s": 0.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.030000000000001137,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 10.0,
+          "got": 10.01,
+          "delta_s": 0.009999999999999787,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 20.0,
+          "got": 20.02,
+          "delta_s": 0.019999999999999574,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 30.0,
+          "got": 30.03,
+          "delta_s": 0.030000000000001137,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "AngryMen_feature",
+      "shape": "feature",
+      "hls_time": 10.0,
+      "start_s": 900.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 900.0,
+          "got": 900.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 910.0,
+          "got": 910.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 920.0,
+          "got": 920.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 930.0,
+          "got": 930.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "AngryMen_feature",
+      "shape": "feature",
+      "hls_time": 10.0,
+      "start_s": 1800.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 1800.0,
+          "got": 1800.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 1810.0,
+          "got": 1810.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 1820.0,
+          "got": 1820.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 1830.0,
+          "got": 1830.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Futurama_4x06_8512",
+      "shape": "damaged-DVD",
+      "hls_time": 2.0,
+      "start_s": 0.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 5,
+      "mismatch_rate": 0.25,
+      "max_abs_delta_s": 0.0589999999999975,
+      "first_fail": {
+        "i": 15,
+        "want": 30.0,
+        "got": 30.051,
+        "delta_s": 0.05099999999999838,
+        "ok": false
+      },
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 2.0,
+          "got": 2.023,
+          "delta_s": 0.02300000000000013,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 4.0,
+          "got": 4.025,
+          "delta_s": 0.025000000000000355,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 6.0,
+          "got": 6.027,
+          "delta_s": 0.027000000000000135,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 8.0,
+          "got": 8.029,
+          "delta_s": 0.028999999999999915,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 10.0,
+          "got": 10.031,
+          "delta_s": 0.031000000000000583,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 12.0,
+          "got": 12.033,
+          "delta_s": 0.032999999999999474,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 14.0,
+          "got": 14.035,
+          "delta_s": 0.03500000000000014,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Futurama_4x06_8512",
+      "shape": "damaged-DVD",
+      "hls_time": 2.0,
+      "start_s": 300.0,
+      "actual_n": 20,
+      "compared": 20,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.038000000000010914,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 300.0,
+          "got": 300.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 302.0,
+          "got": 302.002,
+          "delta_s": 0.0020000000000095497,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 304.0,
+          "got": 304.004,
+          "delta_s": 0.004000000000019099,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 306.0,
+          "got": 306.006,
+          "delta_s": 0.005999999999971806,
+          "ok": true
+        },
+        {
+          "i": 4,
+          "want": 308.0,
+          "got": 308.008,
+          "delta_s": 0.007999999999981355,
+          "ok": true
+        },
+        {
+          "i": 5,
+          "want": 310.0,
+          "got": 310.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 6,
+          "want": 312.0,
+          "got": 312.012,
+          "delta_s": 0.012000000000000455,
+          "ok": true
+        },
+        {
+          "i": 7,
+          "want": 314.0,
+          "got": 314.014,
+          "delta_s": 0.014000000000010004,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "Futurama_4x06_8512",
+      "shape": "damaged-DVD",
+      "hls_time": 10.0,
+      "start_s": 0.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 1,
+      "mismatch_rate": 0.25,
+      "max_abs_delta_s": 0.05099999999999838,
+      "first_fail": {
+        "i": 3,
+        "want": 30.0,
+        "got": 30.051,
+        "delta_s": 0.05099999999999838,
+        "ok": false
+      },
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 10.0,
+          "got": 10.031,
+          "delta_s": 0.031000000000000583,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 20.0,
+          "got": 20.041,
+          "delta_s": 0.04100000000000037,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 30.0,
+          "got": 30.051,
+          "delta_s": 0.05099999999999838,
+          "ok": false
+        }
+      ]
+    },
+    {
+      "label": "Futurama_4x06_8512",
+      "shape": "damaged-DVD",
+      "hls_time": 10.0,
+      "start_s": 300.0,
+      "actual_n": 4,
+      "compared": 4,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.029999999999972715,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 300.0,
+          "got": 300.0,
+          "delta_s": 0.0,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 310.0,
+          "got": 310.01,
+          "delta_s": 0.009999999999990905,
+          "ok": true
+        },
+        {
+          "i": 2,
+          "want": 320.0,
+          "got": 320.02,
+          "delta_s": 0.01999999999998181,
+          "ok": true
+        },
+        {
+          "i": 3,
+          "want": 330.0,
+          "got": 330.03,
+          "delta_s": 0.029999999999972715,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "corpus_vfr_mp4",
+      "shape": "VFR",
+      "hls_time": 2.0,
+      "start_s": 0.0,
+      "actual_n": 2,
+      "compared": 2,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.021,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        },
+        {
+          "i": 1,
+          "want": 2.0,
+          "got": 2.021,
+          "delta_s": 0.020999999999999908,
+          "ok": true
+        }
+      ]
+    },
+    {
+      "label": "corpus_vfr_mp4",
+      "shape": "VFR",
+      "hls_time": 10.0,
+      "start_s": 0.0,
+      "actual_n": 1,
+      "compared": 1,
+      "mismatches": 0,
+      "mismatch_rate": 0.0,
+      "max_abs_delta_s": 0.021,
+      "first_fail": null,
+      "pairs_head": [
+        {
+          "i": 0,
+          "want": 0.0,
+          "got": 0.021,
+          "delta_s": 0.021,
+          "ok": true
+        }
+      ]
+    }
+  ],
+  "mid_start_only": {
+    "compared": 192,
+    "mismatches": 0,
+    "rate": 0.0
+  },
+  "start0_only": {
+    "compared": 99,
+    "mismatches": 18,
+    "rate": 0.18181818181818182
+  },
+  "verdict": "mid-start 0 mismatches; start=0 priming drift max~59ms; full-title transcode publishable"
+}

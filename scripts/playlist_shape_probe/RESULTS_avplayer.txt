@@ -1,0 +1,38 @@
+===== B EVENT landA seek20 =====
+ready=true before_seek={"duration":null,"seekable":[[0.000,27.048]],"current":8.007}
+seek_finished=true after_seek={"duration":null,"seekable":[[0.000,27.048]],"current":20.000}
+after_2s={"duration":null,"seekable":[[0.000,27.048]],"current":21.902} rate=1.0
+===== B EVENT landA seek600 =====
+ready=true before_seek={"duration":null,"seekable":[[0.000,27.048]],"current":8.007}
+seek_finished=false after_seek={"duration":null,"seekable":[[0.000,27.048]],"current":8.007}
+after_2s={"duration":null,"seekable":[[0.000,27.048]],"current":9.938} rate=1.0
+===== B EVENT landB seek610 =====
+ready=true before_seek={"duration":null,"seekable":[[0.000,27.485]],"current":31.031}
+seek_finished=false after_seek={"duration":null,"seekable":[[0.000,27.485]],"current":31.031}
+after_2s={"duration":null,"seekable":[[0.000,27.485]],"current":32.921} rate=1.0
+===== C VOD landA seek20 =====
+ready=true before_seek={"duration":42.048,"seekable":[[0.000,42.048]],"current":8.007}
+seek_finished=true after_seek={"duration":42.048,"seekable":[[0.000,42.048]],"current":20.000}
+after_2s={"duration":42.048,"seekable":[[0.000,42.048]],"current":21.897} rate=1.0
+===== C VOD landA seek600 =====
+ready=true before_seek={"duration":42.048,"seekable":[[0.000,42.048]],"current":8.007}
+seek_finished=true after_seek={"duration":42.048,"seekable":[[0.000,42.048]],"current":42.048}
+after_2s={"duration":42.048,"seekable":[[0.000,42.048]],"current":42.048} rate=0.0
+===== C VOD landB seek610 =====
+ready=true before_seek={"duration":42.486,"seekable":[[0.000,42.486]],"current":39.039}
+seek_finished=true after_seek={"duration":42.486,"seekable":[[0.000,42.486]],"current":42.486}
+after_2s={"duration":42.486,"seekable":[[0.000,42.486]],"current":42.486} rate=0.0
+===== A EVENT before-mutate seek20 =====
+ready=true before_seek={"duration":null,"seekable":[[0.000,27.048]],"current":8.007}
+seek_finished=true after_seek={"duration":null,"seekable":[[0.000,27.048]],"current":20.000}
+after_2s={"duration":null,"seekable":[[0.000,27.048]],"current":21.896} rate=1.0
+{"ok": true, "region": "b", "bytes": 1091}
+===== A EVENT after-mutate NEW player seek610 =====
+ready=true before_seek={"duration":null,"seekable":[[0.000,27.485]],"current":31.031}
+seek_finished=false after_seek={"duration":null,"seekable":[[0.000,27.485]],"current":31.031}
+after_2s={"duration":null,"seekable":[[0.000,27.485]],"current":32.920} rate=1.0
+===== A EVENT after-mutate NEW player seek20 =====
+ready=true before_seek={"duration":null,"seekable":[[0.000,27.485]],"current":31.031}
+seek_finished=true after_seek={"duration":null,"seekable":[[0.000,27.485]],"current":20.000}
+after_2s={"duration":null,"seekable":[[0.000,27.485]],"current":21.902} rate=1.0
+DONE
