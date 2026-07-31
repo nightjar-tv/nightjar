@@ -1,0 +1,60 @@
+{
+  "engine": "vlc",
+  "client": "cli",
+  "source": "file:// from DB path (decode/demux; HTTP attach measured in Part A)",
+  "attempted": 228,
+  "ok": 228,
+  "fail": 0,
+  "failure_rate": 0.0,
+  "threshold": 0.02,
+  "disqualified": false,
+  "failures": [],
+  "sampling": "stratified_oversample_tail",
+  "stratum_counts": {
+    "vc1": {
+      "available": 3,
+      "drawn": 3,
+      "target": 40
+    },
+    "mpeg4": {
+      "available": 562,
+      "drawn": 40,
+      "target": 40
+    },
+    "mpeg2": {
+      "available": 25,
+      "drawn": 25,
+      "target": 30
+    },
+    "heavy_audio": {
+      "available": 825,
+      "drawn": 50,
+      "target": 50
+    },
+    "damaged_class": {
+      "available": 0,
+      "drawn": 0,
+      "target": 20
+    },
+    "av1": {
+      "available": 153,
+      "drawn": 30,
+      "target": 30
+    },
+    "vp9": {
+      "available": 0,
+      "drawn": 0,
+      "target": 30
+    },
+    "hevc": {
+      "available": 13109,
+      "drawn": 40,
+      "target": 40
+    },
+    "h264": {
+      "available": 10168,
+      "drawn": 40,
+      "target": 40
+    }
+  }
+}

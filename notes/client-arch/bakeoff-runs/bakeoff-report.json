@@ -1,0 +1,224 @@
+{
+  "baseUrl": "http://127.0.0.1:18097",
+  "client": "flutter_bindings",
+  "url_resolution_note": "Part A uses dp_byte_serve /items/{id}/stream; Nightjar /stream is BROWSER_V0-gated",
+  "abr_signals": {
+    "media_kit": {
+      "package": "media_kit 1.2.x",
+      "streams": {
+        "playing": true,
+        "buffering": true,
+        "bufferingPercentage": true,
+        "buffer": true,
+        "duration": true,
+        "position": true,
+        "error": true,
+        "audioBitrate": true,
+        "videoParams": true,
+        "audioParams": true
+      },
+      "missing_for_server_abr": [
+        "download_rate_bytes_per_sec",
+        "hls_rendition / level index",
+        "rebuffer_event distinct from buffering bool"
+      ],
+      "usable_trigger": "buffering / bufferingPercentage / buffer Duration detect starve; no download-rate for proactive rung selection",
+      "notes": "Player.stream.buffering and bufferingPercentage are the practical stall signals. audioBitrate is media bitrate, not link throughput."
+    },
+    "libvlc_bakeoff": {
+      "hasMediaStatePlaying": true,
+      "hasBuffering": true,
+      "hasEncounteredError": true,
+      "hasTimeChanged": true,
+      "hasPositionChanged": true,
+      "hasStats": true,
+      "notes": "libvlc_media_player_get_state (Playing/Buffering/Error); libvlc_event_attach Playing/Buffering/EncounteredError/TimeChanged; libvlc_media_player_get_stats for input bitrate. Bake-off FFI exposes state polling + event attach; no Flutter texture."
+    },
+    "verdict": "Both expose stall/buffer signals usable as a trigger to ask the server for a lower rung. Neither exposes a clean download-rate for proactive ABR. Server-side ABR is not blocked — react to sustained buffering.",
+    "stop_gate_neither_signal": false
+  },
+  "part_a_mediakit": {
+    "engine": "mpv",
+    "url_resolution": "constructed /api/v0/items/{id}/stream from MPV_V0 DP sample; not playback-info",
+    "cold_startup": {
+      "n": 11,
+      "min_ms": 462,
+      "p50_ms": 2671,
+      "p90_ms": 5413,
+      "max_ms": 13408,
+      "samples_ms": [
+        3471,
+        2854,
+        2789,
+        1938,
+        595,
+        766,
+        13408,
+        5413,
+        616,
+        2671,
+        462
+      ]
+    },
+    "warm_startup": {
+      "n": 11,
+      "min_ms": 192,
+      "p50_ms": 670,
+      "p90_ms": 2981,
+      "max_ms": 7841,
+      "samples_ms": [
+        2297,
+        2981,
+        670,
+        858,
+        447,
+        659,
+        1109,
+        7841,
+        272,
+        528,
+        192
+      ]
+    },
+    "warm_near_seek": {
+      "n": 11,
+      "min_ms": 571,
+      "p50_ms": 2257,
+      "p90_ms": 10620,
+      "max_ms": 19921,
+      "samples_ms": [
+        1629,
+        1906,
+        2257,
+        1667,
+        10620,
+        2998,
+        2710,
+        4957,
+        19921,
+        2219,
+        571
+      ]
+    },
+    "warm_far_seek": {
+      "n": 11,
+      "min_ms": 280,
+      "p50_ms": 908,
+      "p90_ms": 8453,
+      "max_ms": 12752,
+      "samples_ms": [
+        5177,
+        908,
+        12752,
+        412,
+        8453,
+        853,
+        698,
+        2381,
+        1482,
+        280,
+        566
+      ]
+    },
+    "cold_far_seek": {
+      "n": 10,
+      "min_ms": 103,
+      "p50_ms": 804,
+      "p90_ms": 991,
+      "max_ms": 1315,
+      "samples_ms": [
+        804,
+        703,
+        104,
+        943,
+        991,
+        1315,
+        901,
+        371,
+        154,
+        103
+      ]
+    }
+  },
+  "t4_mediakit": {
+    "engine": "mpv",
+    "attempted": 40,
+    "ok": 37,
+    "fail": 3,
+    "failure_rate": 0.075,
+    "threshold": 0.02,
+    "disqualified": true,
+    "failures": [
+      {
+        "id": 10670,
+        "stratum": "mpeg4",
+        "video_codec": "mpeg4",
+        "audio_codec": "mp3",
+        "path": "/Volumes/media/TV Shows/JAG (1995)/Season 2/JAG - 2x15 - Rendezvous - SDTV.avi"
+      },
+      {
+        "id": 7927,
+        "stratum": "mpeg4",
+        "video_codec": "mpeg4",
+        "audio_codec": "ac3",
+        "path": "/Volumes/media/TV Shows/Felicity (1998)/Season 2/Felicity - 2x14 - True Colors - DVD.avi"
+      },
+      {
+        "id": 5518,
+        "stratum": "mpeg4",
+        "video_codec": "mpeg4",
+        "audio_codec": "mp3",
+        "path": "/Volumes/media/TV Shows/Charmed/Season 4/Charmed - 4x13 - Charmed and Dangerous - DVD.avi"
+      }
+    ],
+    "behaviour_notes": [],
+    "sampling": "stratified_oversample_tail",
+    "stratum_counts": {
+      "vc1": {
+        "available": 3,
+        "drawn": 3,
+        "target": 40
+      },
+      "mpeg4": {
+        "available": 562,
+        "drawn": 40,
+        "target": 40
+      },
+      "mpeg2": {
+        "available": 25,
+        "drawn": 25,
+        "target": 30
+      },
+      "heavy_audio": {
+        "available": 825,
+        "drawn": 50,
+        "target": 50
+      },
+      "damaged_class": {
+        "available": 0,
+        "drawn": 0,
+        "target": 20
+      },
+      "av1": {
+        "available": 153,
+        "drawn": 30,
+        "target": 30
+      },
+      "vp9": {
+        "available": 0,
+        "drawn": 0,
+        "target": 30
+      },
+      "hevc": {
+        "available": 13109,
+        "drawn": 40,
+        "target": 40
+      },
+      "h264": {
+        "available": 10168,
+        "drawn": 40,
+        "target": 40
+      }
+    }
+  }
+}

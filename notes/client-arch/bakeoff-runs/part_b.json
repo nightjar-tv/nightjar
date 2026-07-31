@@ -1,0 +1,78 @@
+{
+  "part_b_mpv": {
+    "engine": "mpv",
+    "force_method": "compatibility-transcode via BROWSER_V0 playback-info",
+    "caveat": "Encoder not bitrate-capped; SessionMode::Transcode + forced IDR delivery. Sample skews high-bitrate vs library p50/p90.",
+    "runs": [
+      {
+        "id": 3997,
+        "playbackMethod": "transcode",
+        "encoderKind": "hardware",
+        "videoEncoder": "h264_videotoolbox",
+        "bitrate_bps_est": 5443074,
+        "throttle_configured_bps": 2721537,
+        "startup_ms": 2103,
+        "far_seek_ms": null,
+        "sessionId": "s18"
+      },
+      {
+        "id": 13917,
+        "playbackMethod": "transcode",
+        "encoderKind": "hardware",
+        "videoEncoder": "h264_videotoolbox",
+        "bitrate_bps_est": 3269941,
+        "throttle_configured_bps": 1634970,
+        "startup_ms": 2213,
+        "far_seek_ms": null,
+        "sessionId": "s19"
+      },
+      {
+        "id": 16538,
+        "playbackMethod": "transcode",
+        "encoderKind": "hardware",
+        "videoEncoder": "h264_videotoolbox",
+        "bitrate_bps_est": 3332688,
+        "throttle_configured_bps": 1666344,
+        "startup_ms": 1431,
+        "far_seek_ms": null,
+        "sessionId": "s20"
+      },
+      {
+        "id": 19194,
+        "playbackMethod": "transcode",
+        "encoderKind": "hardware",
+        "videoEncoder": "h264_videotoolbox",
+        "bitrate_bps_est": 3729667,
+        "throttle_configured_bps": 1864833,
+        "startup_ms": 1519,
+        "far_seek_ms": null,
+        "sessionId": "s21"
+      },
+      {
+        "id": 4424,
+        "playbackMethod": "transcode",
+        "encoderKind": "hardware",
+        "videoEncoder": "h264_videotoolbox",
+        "bitrate_bps_est": 2691584,
+        "throttle_configured_bps": 1345792,
+        "startup_ms": 803,
+        "far_seek_ms": null,
+        "sessionId": "s22"
+      }
+    ]
+  },
+  "abr_signals": {
+    "media_kit": {
+      "usable_trigger": "buffering / bufferingPercentage / buffer Duration",
+      "download_rate": false,
+      "notes": "Player.stream API; audioBitrate is media bitrate not link goodput"
+    },
+    "libvlc_bakeoff": {
+      "usable_trigger": "state Buffering/Playing; Buffering event; get_stats",
+      "download_rate": "libvlc_media_player_get_stats input bitrate (not goodput)",
+      "notes": "FFI state polling; no Flutter texture path"
+    },
+    "verdict": "Both expose stall/buffer signals usable to trigger server rung reselection. Neither exposes clean proactive download-rate. stop_gate_neither_signal=false.",
+    "stop_gate_neither_signal": false
+  }
+}

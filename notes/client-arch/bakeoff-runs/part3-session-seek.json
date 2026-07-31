@@ -1,0 +1,118 @@
+{
+  "item_id": 3997,
+  "session_id": "s34",
+  "media_url_initial": "http://127.0.0.1:8096/api/v0/sessions/s34/runs/0/index.m3u8",
+  "playlist_type_live": "EVENT",
+  "playlist_sum_extinf_s_initial": 8.0,
+  "playlist_seg_count_initial": 4,
+  "item_duration_ms": 2584384,
+  "far_s": 1938.3,
+  "window_covers_far_initial": false,
+  "live_far_seek_immediate": {
+    "ms": null,
+    "ok": false,
+    "stderr_tail": "timeout"
+  },
+  "cook_via": "POST /api/v0/sessions/{id}/seek?startMs=",
+  "cook_log": [
+    {
+      "startMs": 0,
+      "media_url": "http://127.0.0.1:8096/api/v0/sessions/s34/runs/0/index.m3u8",
+      "sum_extinf_s": 138.0,
+      "seg_count": 69,
+      "first_seg": "/api/v0/sessions/s34/seg_00000000021.m4s",
+      "last_seg": "/api/v0/sessions/s34/seg_00000136032.m4s"
+    },
+    {
+      "startMs": 646096,
+      "media_url": "http://127.0.0.1:8096/api/v0/sessions/s34/runs/1/index.m3u8",
+      "sum_extinf_s": 22.0,
+      "seg_count": 11,
+      "first_seg": "/api/v0/sessions/s34/seg_00000646000.m4s",
+      "last_seg": "/api/v0/sessions/s34/seg_00000666020.m4s"
+    },
+    {
+      "startMs": 1292192,
+      "media_url": "http://127.0.0.1:8096/api/v0/sessions/s34/runs/2/index.m3u8",
+      "sum_extinf_s": 32.0,
+      "seg_count": 16,
+      "first_seg": "/api/v0/sessions/s34/seg_00001292000.m4s",
+      "last_seg": "/api/v0/sessions/s34/seg_00001322030.m4s"
+    },
+    {
+      "startMs": 1938288,
+      "media_url": "http://127.0.0.1:8096/api/v0/sessions/s34/runs/3/index.m3u8",
+      "sum_extinf_s": 32.0,
+      "seg_count": 16,
+      "first_seg": "/api/v0/sessions/s34/seg_00001938000.m4s",
+      "last_seg": "/api/v0/sessions/s34/seg_00001968030.m4s"
+    },
+    {
+      "startMs": 2569384,
+      "media_url": "http://127.0.0.1:8096/api/v0/sessions/s34/runs/4/index.m3u8",
+      "sum_extinf_s": 16.4,
+      "seg_count": 9,
+      "first_seg": "/api/v0/sessions/s34/seg_00002568000.m4s",
+      "last_seg": "/api/v0/sessions/s34/seg_00002584016.m4s"
+    }
+  ],
+  "live_far_seek_after_cook_latest_run": {
+    "ms": 2157,
+    "ok": true,
+    "returncode": 0,
+    "stderr_tail": ""
+  },
+  "disk_runs": [
+    {
+      "run": "run_0",
+      "sum_extinf_s": 138.0,
+      "seg_count": 69,
+      "playlist_type": "?"
+    },
+    {
+      "run": "run_1",
+      "sum_extinf_s": 22.0,
+      "seg_count": 11,
+      "playlist_type": "?"
+    },
+    {
+      "run": "run_2",
+      "sum_extinf_s": 32.0,
+      "seg_count": 16,
+      "playlist_type": "?"
+    },
+    {
+      "run": "run_3",
+      "sum_extinf_s": 32.0,
+      "seg_count": 16,
+      "playlist_type": "?"
+    },
+    {
+      "run": "run_4",
+      "sum_extinf_s": 16.4,
+      "seg_count": 9,
+      "playlist_type": "?"
+    }
+  ],
+  "mirror_seg_count": 121,
+  "mirror_sum_extinf_s": 240.5,
+  "mirror_covers_far": false,
+  "fulltitle_local_mirror_far_seek": {
+    "ms": null,
+    "ok": false,
+    "returncode": 2,
+    "stderr_tail": "",
+    "seek_target_s": 180.4
+  },
+  "cause_confirmed": "Live playlist is EVENT windowed: initial sum(EXTINF)=8s << title 2584s. Far seek outside the listed window fails. POST seek?startMs= moves the encode window (new run_N); it does not publish full-title on the live wire.",
+  "stop_gate": "If mirror_covers_far and fulltitle seek fails \u2192 stop (not window). If mirror covers and seek ok while live fails \u2192 1c full-title closes the loop.",
+  "findings": {
+    "cause": "EVENT windowed playlist; client seek cannot reach beyond sum(EXTINF)",
+    "live_immediate_far": "fail (timeout)",
+    "live_after_POST_seek_startMs_to_far": "land ok (2157 ms) once window covers target",
+    "multi_run_discontinuous_vod_mirror": "fail (not contiguous full-title; sum 240s << 1938s)",
+    "contiguous_full_title_vod": "not produced this pass (would require cooking entire title or short title)",
+    "profile_adr_implication": "publish honest full-title VOD for transcode sessions (1c) so client scrub works without POST startMs round-trip"
+  },
+  "throttle_note": "Starve probe configured 2.72 Mbps, achieved ~1.90 Mbps avg \u2014 report achieved as the starvation figure."
+}

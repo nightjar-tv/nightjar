@@ -1,0 +1,106 @@
+{
+  "engine": "AetherEngine",
+  "client": "spm_probe_outside_moonfin",
+  "builds_outside_moonfin": true,
+  "licence": "LGPL-3.0 + Apple Store/DRM exception (Vincent Herbst)",
+  "part_a": {
+    "cold_startup": {
+      "n": 12,
+      "min_ms": 849,
+      "p50_ms": 1691,
+      "p90_ms": 3127,
+      "max_ms": 3427,
+      "samples_ms": [
+        3127,
+        2191,
+        1691,
+        2799,
+        1798,
+        1504,
+        1562,
+        849,
+        1181,
+        1208,
+        1298,
+        3427
+      ]
+    },
+    "warm_startup": {
+      "n": 12,
+      "min_ms": 203,
+      "p50_ms": 753,
+      "p90_ms": 1777,
+      "max_ms": 2520,
+      "samples_ms": [
+        2520,
+        452,
+        615,
+        843,
+        349,
+        1143,
+        753,
+        1062,
+        691,
+        1777,
+        505,
+        203
+      ]
+    },
+    "warm_far_seek": {
+      "n": 12,
+      "min_ms": 251,
+      "p50_ms": 422,
+      "p90_ms": 657,
+      "max_ms": 1299,
+      "samples_ms": [
+        618,
+        657,
+        326,
+        360,
+        337,
+        335,
+        522,
+        422,
+        644,
+        1299,
+        251,
+        300
+      ]
+    },
+    "cold_far_seek": {
+      "n": 12,
+      "min_ms": 232,
+      "p50_ms": 358,
+      "p90_ms": 678,
+      "max_ms": 690,
+      "samples_ms": [
+        253,
+        590,
+        335,
+        292,
+        441,
+        678,
+        358,
+        297,
+        690,
+        588,
+        236,
+        232
+      ]
+    }
+  },
+  "t4_subsample": {
+    "n": 40,
+    "ok": 39,
+    "fail": 1,
+    "failure_rate_pct": 2.5,
+    "failures": [
+      {
+        "id": 86,
+        "stratum": "vc1",
+        "error": "timeout"
+      }
+    ]
+  },
+  "measured_at": "2026-07-31T07:41:54Z"
+}

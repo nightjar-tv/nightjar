@@ -1,0 +1,83 @@
+{
+  "item_id": 3997,
+  "bitrate_bps_est": 5443074,
+  "configured_bps": 2721537,
+  "achieved_bps_avg": 1896040,
+  "starved_ratio": 0.697,
+  "note": "compat-transcode playlist via throttle proxy; mpv stays on single rendition (Step 3). Observe stall vs recover over 60s.",
+  "samples": [
+    {
+      "t": 8.3,
+      "bytes_sent": 10596550,
+      "achieved_bps": 1271430,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 13.3,
+      "bytes_sent": 21404088,
+      "achieved_bps": 1604150,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 18.4,
+      "bytes_sent": 35584846,
+      "achieved_bps": 1938893,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 23.4,
+      "bytes_sent": 45489725,
+      "achieved_bps": 1947821,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 28.4,
+      "bytes_sent": 57152046,
+      "achieved_bps": 2015037,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 33.4,
+      "bytes_sent": 68059174,
+      "achieved_bps": 2039401,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 38.4,
+      "bytes_sent": 75674189,
+      "achieved_bps": 1972080,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 43.4,
+      "bytes_sent": 87652735,
+      "achieved_bps": 2020697,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 48.4,
+      "bytes_sent": 95065997,
+      "achieved_bps": 1964797,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 53.4,
+      "bytes_sent": 106052175,
+      "achieved_bps": 1986481,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 58.4,
+      "bytes_sent": 117892458,
+      "achieved_bps": 2018878,
+      "configured_bps": 2721537
+    },
+    {
+      "t": 63.4,
+      "bytes_sent": 125086493,
+      "achieved_bps": 1972814,
+      "configured_bps": 2721537
+    }
+  ],
+  "viewer": "expect stalls when segment fetch > EXTINF; no client downshift"
+}

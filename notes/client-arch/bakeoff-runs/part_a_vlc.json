@@ -1,0 +1,138 @@
+{
+  "baseUrl": "http://127.0.0.1:18097",
+  "part_a_vlc": {
+    "engine": "vlc",
+    "client": "cli",
+    "url_resolution": "bake-off dp_byte_serve /items/{id}/stream from DB path; Nightjar /api/v0/items/{id}/stream is BROWSER_V0-gated and returns 415 for MKV",
+    "cold_startup": {
+      "n": 10,
+      "min_ms": 58,
+      "p50_ms": 80,
+      "p90_ms": 124,
+      "max_ms": 1735,
+      "samples_ms": [
+        1735,
+        99,
+        59,
+        92,
+        78,
+        88,
+        80,
+        58,
+        124,
+        71
+      ]
+    },
+    "warm_startup": {
+      "n": 10,
+      "min_ms": 72,
+      "p50_ms": 91,
+      "p90_ms": 115,
+      "max_ms": 124,
+      "samples_ms": [
+        103,
+        115,
+        79,
+        102,
+        79,
+        91,
+        124,
+        72,
+        114,
+        91
+      ]
+    },
+    "warm_near_seek": {
+      "n": 10,
+      "min_ms": 63,
+      "p50_ms": 106,
+      "p90_ms": 123,
+      "max_ms": 136,
+      "samples_ms": [
+        63,
+        118,
+        136,
+        98,
+        111,
+        107,
+        123,
+        71,
+        106,
+        99
+      ]
+    },
+    "warm_far_seek": {
+      "n": 10,
+      "min_ms": 73,
+      "p50_ms": 114,
+      "p90_ms": 137,
+      "max_ms": 141,
+      "samples_ms": [
+        73,
+        82,
+        137,
+        115,
+        120,
+        141,
+        111,
+        118,
+        114,
+        114
+      ]
+    },
+    "cold_far_seek": {
+      "n": 10,
+      "min_ms": 58,
+      "p50_ms": 91,
+      "p90_ms": 116,
+      "max_ms": 118,
+      "samples_ms": [
+        74,
+        58,
+        103,
+        69,
+        109,
+        113,
+        77,
+        116,
+        118,
+        91
+      ]
+    }
+  },
+  "request_patterns_after_vlc": {
+    "n": 172,
+    "by_user_agent": {
+      "libmpv": {
+        "n": 171,
+        "n_with_range": 171,
+        "range_samples": [
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=245745442-",
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=1684042756-",
+          "bytes=0-"
+        ],
+        "bytes_p50": 1048576,
+        "bytes_max": 84934656
+      },
+      "curl/8.7.1": {
+        "n": 1,
+        "n_with_range": 0,
+        "range_samples": [],
+        "bytes_p50": 0,
+        "bytes_max": 0
+      }
+    }
+  }
+}

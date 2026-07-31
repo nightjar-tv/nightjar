@@ -1,13 +1,22 @@
 # Client engine bake-off
 
-Status: Steps 1 / 1b / 1c held. Step 3 (ABR throttle) recorded — does not
-overturn the engine path for v1. Step 2 (profile ADR + N100 capacity) desk
-work, not started.
+Status: Bake-off completion pass. Binding + AetherEngine scored; decision
+still **provisional**. media_kit has **no tvOS plugin** (stock Flutter or
+fluttertv/flutter-tvos; 2026-07-31). Step 2 profile ADR + Apple TV Part C
+(Aether vs native) + contiguous full-title VOD remain open. T5-4 unscored.
 Date: 2026-07-31
 
 Framing: decision note for Phase 4 player architecture (engine vs platform
-players). Not a Phase 4 code slice. ADR-0020 and the keyframe-map work stay
-on their own track either way.
+players). Not a Phase 4 code slice. The prototype under `apps/engine-bakeoff/`
+is measurement-only; Rule 2.4’s single Rust/libmpv core wording is exactly
+what the client ADR will supersede once this bake-off names the path.
+ADR-0020 and the keyframe-map work stay on their own track either way.
+
+**Pre-code T3 finding:** no maintained libVLC Flutter plugin for macOS
+(`flutter_vlc_player` is mobile-only; `dart_vlc` is abandoned for Apple).
+A bake-off FFI against VLC.app’s `libvlc.dylib` is required to measure
+libVLC at all. That ownership tax exists before any latency number and can
+outweigh latency when choosing an engine.
 
 Context that forced this: copy-mode HLS boundaries are producer-owned
 (ADR-0020). A stock scrubber can only seek the produced window. Plex / Emby /
@@ -56,6 +65,28 @@ reported. Land = first decoded frame after scrub release.
 
 Near-seek (±30 s) is recorded but does not decide alone.
 
+#### T2 gate 1 — scored (copy-mode baseline)
+
+Pre-committed first-pass from `scripts/far_seek_baseline.mjs` /
+`nightjar-meta/notes/far-seek-baseline-2026-07-31.md`:
+
+| | |
+|---|---|
+| Path | **Copy-mode HLS** (ADR-0020 producer-truth), warm `POST /seek` → first listed segment 200 |
+| n | 21 successful lands (cold not in this sample) |
+| warm p50 | **4621 ms** (min 1596 / p90 8278 / max 9094) |
+| Eviction | 0 |
+
+**Score:** warm median **> 3.0 s** → gate 1 fires: that session path was
+unacceptable.
+
+**Scope (do not misread):** this measured **copy/remux HLS far-seek**. Under
+an engine that path is nearly gone (Matroska direct play). The honest line is
+“the path this measured is being deleted; the surviving transcode path is
+unmeasured until the Part B prototype numbers.” Do not cite 4.62 s later as
+“sessions are unacceptable” after the architecture has already removed copy
+as the common LAN path.
+
 ### T3 — Ownership cost (lines we write and keep)
 
 Count lines written for the prototype, and estimate lines we would own per
@@ -99,6 +130,19 @@ session path as the main product path when **any** of:
 If (4) holds with engine share ≥90%, we still take the engine: the fix is
 direct play, not a better session.
 
+#### T5 condition 4 — unscored (open)
+
+Jellyfin same-box comparison is deferred (spinning up Jellyfin + forcing
+remux/transcode is its own session). Named open items — do not treat as
+passed:
+
+1. Jellyfin `video.seekable.end(0)` on a remux session vs item runtime
+   (teardown-2 full-title seekable claim).
+2. Same-file far-seek: Nightjar vs Jellyfin, same box/offset, n≥5 each;
+   confirm Jellyfin is remuxing/transcoding that file, not direct-playing.
+
+**T5 condition 4 remains unscored.**
+
 ### Decision procedure
 
 1. Run Step 1. If `MPV_V0` or `VLC_V0` ≥ 90% direct play → provisional engine
@@ -111,7 +155,11 @@ direct play, not a better session.
 
 ### Threshold-change log
 
-(none)
+| Date | Threshold | Change | Why |
+|---|---|---|---|
+| 2026-07-31 | T2 engine justify: warm far median ≤ **0.75 s** | Re-score: gate **not met** at CLI libmpv **1.05 s** / Flutter media_kit **0.91 s**; **met** at AetherEngine SPM probe **0.42 s**. Does **not** overturn the engine path vs copy HLS **4.62 s**. Formal amend candidate: raise warm justify to **≤ 1.25 s**, or keep 0.75 s as aspirational and treat “decisive vs deleted path” as the architecture rule. | 0.75 s was set with **no comparison baseline**. 1.05 s (and 0.91 s binding) against the path being deleted is still decisive for leaving AVPlayer remux. Aether clearing 0.75 s is a ranking input, not a reason to revive the deleted path. |
+
+Previously the log read “(none)” while the decision proceeded past a failed gate — that made Step 0 decorative. This entry restores the discipline.
 
 ---
 
@@ -256,34 +304,232 @@ Detail: `notes/client-arch/transcode-cut-grid-2026-07-31.md`.
 
 ---
 
-## Decision (current)
+## Decision (current) — **PROVISIONAL**
 
-**What the engine settles**
+**Still provisional.** What would make it final:
 
-- Compatibility: `MPV_V0` / `VLC_V0` = **100%** direct play on this library
-  (T1). Container-remux for AVPlayer is optional architecture, not destiny.
-- Path: ship Phase 4 on a Matroska-capable engine (libmpv / Rule 2.4). Do not
-  treat Apple AVPlayer as the product path for the household library.
-- Transcode sessions get honest full-title playlists (1c). Native scrubbers
-  work on the path that remains.
+1. **Apple TV dogfood** of Dolby Vision display switching, HDMI audio
+   passthrough, and Match Content — Aether vs native control on a real AVR
+   chain. **media_kit is not a third leg on tvOS** (see Finding — media_kit
+   / tvOS below). Closing Apple TV may flip the *tvOS* engine without
+   overturning the macOS/iOS provisional pick.
+2. **Full stratified T4 through bindings** (n=228), not the hard-codec head
+   of the sample (see T4 note below).
+3. **Contiguous full-title VOD** far-seek on a produced session (1c wire),
+   not only “window moved via `POST …/seek?startMs=`”.
+4. **Step 2 profile ADR** shipped enough that `/stream` honours a
+   client-reported profile (end-to-end DP on the real server).
 
-**What it does not settle**
+Until those close, Apple stays on **media_kit / libmpv** as the provisional
+pick **for macOS and iOS**. That pick is **unproven on Apple TV / tvOS**,
+which is the platform the Part C display/audio axes exist to test. Android
+stays **Media3**. Sessions stay for bandwidth.
 
-- Bandwidth: ceiling choice sets whether sessions are 49% / 21% / 2% of the
-  library. Sessions remain the remote/bitrate path.
-- Post-v1 ABR under libmpv: measured weak vs hls.js (Step 3). Does not reopen
-  AVPlayer for Matroska; does constrain how ABR must be designed later.
+**Provisional reason (updated):** binding T2/T4 for media_kit now exist;
+AetherEngine (Engine C) builds and measures outside Moonfin. The Apple choice
+is still not final because TV display/audio axes and contiguous full-title
+publish are open, Aether’s warm-far latency **clears** the 0.75 s gate while
+media_kit does not, and **media_kit has no tvOS plugin** (stock Flutter or
+[fluttertv/flutter-tvos](https://github.com/fluttertv/flutter-tvos)).
+
+**Path we take (provisional)**
+
+Ship **macOS / iOS** clients on **media_kit / libmpv** (Matroska direct play).
+Treat **tvOS** as a separate engine decision: AetherEngine (or another
+AVPlayer-presenting path) until proven otherwise. Keep **Media3 on Android**.
+Keep sessions for bandwidth. Do **not** build product playback on stock
+AVPlayer for the household library on Mac/iPhone. Do **not** choose
+libVLC/VLCKit on current evidence.
+
+**What it costs**
+
+- Flutter shell + OSD/scrubber + media_kit on macOS/iOS. Upstream media_kit is
+  dependency weight unless forked (Moonfin already forked `media_kit_video`
+  once on Android — that is the maintenance class).
+- AetherEngine alternative: ~48k Swift lines, Apple-only, single maintainer,
+  prebuilt SPM binaries, LGPL-3.0 + App Store/DRM exception. If unmaintained
+  we own a fork of that surface (realistic legally; expensive in practice).
+  On macOS/iOS, media_kit remains the cheaper fork story; **on tvOS media_kit
+  is not available without a Nightjar-owned port that would breach T3**.
+- Sessions remain for remote/bitrate. Restart / full-title publish matter on
+  that path (Part 3).
+
+### Three-engine scoreboard (binding / SPM)
+
+Instrument: `apps/engine-bakeoff/`. Raw: `notes/client-arch/bakeoff-runs/`.
+
+**Pod / build (T3 evidence):** first `pod install` failed because
+`flutter precache --macos` had never been run (`FlutterMacOS.xcframework`
+missing). After precache, media_kit macOS builds. App Sandbox also blocked
+reading the sample JSON until entitlements were disabled for the harness.
+
+**URL resolution:** Nightjar `/stream` is `BROWSER_V0`-gated (415 on MKV).
+Part A used `dp_byte_serve.py` on `:18097`. **Step 2 profile ADR is a client
+prerequisite, not a follow-up:** a profile the client can report, and
+`/stream` honouring it, before any engine is usable against the real server.
+
+| Gate | media_kit (Flutter) | libVLC | AetherEngine (SPM probe) |
+|---|---|---|---|
+| **T2 warm far p50** | **908 ms** (n=11) | CLI seek figures **deleted** (log heuristics). Binding seek not scored. | **422 ms** (n=12) |
+| **T2 cold far p50** | **804 ms** (n=10) | — | **358 ms** (n=12) |
+| **T2 warm startup p50** | 670 ms | — | 753 ms |
+| **T2 cold startup p50** | 2671 ms | — | 1691 ms |
+| **T3** | Maintained plugin; precache tax. Bake-off Dart ~0.9k + tools. | No maintained macOS Flutter plugin — FFI (~0.3k) + VLC.app. | Builds outside Moonfin. Own ~48k Swift if forked; Apple-only. |
+| **T4** | CLI full sample **0.44%** (n=228). Binding head n=40 **7.5%** (3× mpeg4 AVI) — **biased head, not library rate**; do not disqualify on this slice alone. | CLI **0%** (n=228). | SPM head n=40 **2.5%** (1× vc1 timeout) with DP up. Smoke on hevc/h264/DTS/TrueHD OK. |
+| **T2 gate 1** (copy HLS) | **4621 ms** — fires; path deleted under engine DP. | same | same |
+
+CLI libmpv warm far p50 was **1051 ms** — binding **908 ms** is the same band;
+CLI figures stay as corroboration, not the scoreboard row.
+
+**VLC CLI seek numbers remain deleted.** Do not cite heuristic VLC land times.
+
+**Preference (ranked, provisional)**
+
+1. **Flutter / T3 / forkability (macOS/iOS):** media_kit wins over libVLC (no
+   plugin) and over Aether’s ownership tax. **tvOS:** media_kit has no `tvos:`
+   plugin even under flutter-tvos; that axis does not apply without a T3-scale
+   port.
+2. **HTTP attach:** libmpv ranged (p50 1 MiB). VLC open-ended Range can pull
+   multi-GB. Aether uses its own reader over HTTP (works on dp_byte_serve).
+3. **T2 latency:** Aether clears ≤0.75 s; media_kit does not (0.91 s). Still
+   ~5× better than copy 4.62 s. See threshold log.
+4. **T4:** CLI media_kit/VLC clear 2%. Binding/Aether head slices are
+   hard-codec oversamples — re-run full n=228 before flipping.
+5. **Adaptive HLS:** tied (Step 3b); server-rung ABR not blocked.
+6. **Apple display/audio (unmeasured on TV):** only Aether presents through
+   AVPlayer — and media_kit does not run on stock tvOS (next finding).
+
+### Finding — media_kit cannot target tvOS without a Nightjar-owned port
+
+Investigation only (2026-07-31). Flutter **3.44.8** stable; resolved
+`media_kit_video` **2.0.1**, `media_kit_libs_ios_video` **1.1.4**,
+`media_kit_libs_macos_video` **1.1.4** from the pub cache (not pub.dev prose).
+
+**Known tvOS Flutter path:** [fluttertv/flutter-tvos](https://github.com/fluttertv/flutter-tvos)
+(currently tracks the same Flutter SDK rev as this bake-off’s `.tools/flutter`).
+It is a drop-in CLI + custom tvOS engine; plugins must declare an explicit
+`flutter.plugin.platforms.tvos` key — packages with only `ios:` are **not**
+loaded. Curated ports live under [fluttertv/plugins](https://github.com/fluttertv/plugins)
+/ pub.dev `fluttertv.dev` (`video_player_tvos`, `audioplayers_tvos`, etc.).
+**`media_kit` / `media_kit_video` are not in that index.**
+
+| Evidence | Result |
+|---|---|
+| `media_kit_video` pubspec `plugin.platforms` | android / ios / macos / windows / linux / web — **no `tvos:`** |
+| `media_kit_video` iOS podspec | `s.platform = :ios, '9.0'` |
+| `media_kit_video` iOS `Package.swift` (upstream main) | `platforms: [.iOS("9.0")]` only |
+| `media_kit_libs_ios_video` podspec | `s.platform = :ios, '9.0'`; Makefile downloads **ios-universal** libmpv xcframework only |
+| `media_kit_libs_macos_video` podspec | `s.platform = :osx, '10.9'` |
+| Upstream `media-kit/media-kit` | No open/closed issue that adds tvOS as a supported platform. README platform table omits tvOS. |
+| `media-kit/libmpv-darwin-build` #43 | Open PR adding tvOS/tvOS Simulator libmpv build targets. Maintainer (**birros**, 2026-04-20): Flutter does not officially support Apple TV, so **tvOS is not an immediate priority** for the package that consumes this repo; willing to consider non-interfering flags later. Contributor published fork artifacts; **not** merged into the Flutter plugins. |
+| Stock Flutter harness | `flutter create --platforms=tvos .` in `apps/engine-bakeoff` → **`"tvos" is not an allowed value for option "--platforms"`**. First hard failure on the **stock** tool. Stopped; no fix. |
+| flutter-tvos | Would clear that tool failure. Still would not pick up media_kit until a federated `*_tvos` plugin (and tvOS libmpv slice) exists — neither upstream nor in fluttertv’s curated list. |
+
+**Port cost (if forced on flutter-tvos):** Nightjar would own (a) adopting
+flutter-tvos as the Apple TV Flutter toolchain (engine/CLI dependency outside
+stock Flutter), (b) a `media_kit_libs_*_tvos` rebuild pipeline (Nix/meson
+darwin-build + xcframework, including the unmerged #43 work), and (c) a
+`media_kit_video` tvOS federated plugin (`tvos:` key + texture/Metal +
+registrar; `flutter-tvos plugin port` scaffolds, Nightjar finishes and keeps).
+That is well above the T3 gate (**> 2 500 Nightjar-owned lines per platform**,
+tvOS counted separately) before product glue — not a thin binding.
+
+**Consequence for Part C:** “media_kit vs Aether vs native on Apple TV”
+assumed media_kit runs on tvOS. On stock Flutter it does not even build; on
+flutter-tvos it still needs an owned plugin+libs port that is not done and
+would breach T3. Apple TV Part C is **Aether vs native** (and any future
+tvOS-capable engine already under the line), not a three-way with stock
+media_kit.
+
+### Finding — session far seek (surviving path) — cause confirmed
+
+Raw: `notes/client-arch/bakeoff-runs/part3-session-seek.json` (item 3997).
+
+| Observation | Result |
+|---|---|
+| Live playlist type | **EVENT** (windowed) |
+| Initial sum(EXTINF) vs title | **8 s** vs **2584 s** |
+| Far seek on window at start | **fail** (timeout) |
+| After `POST /sessions/{id}/seek?startMs=` at 75% | New `run_N`; far seek on that window **lands** (~2.2 s) |
+| Discontinuous multi-run VOD mirror (sum ~240 s) | **fail** — not contiguous full-title |
+| Contiguous full-title VOD 0…far | **Not produced** this pass (full cook or short title still open) |
+
+**Cause (from request/playlist shape, not assumption):** the engine can only
+seek inside the produced window. Same class of failure as AVPlayer on
+windowed sessions. Moving the window via `startMs` fixes land for that
+offset; it is not the 1c product contract.
+
+**Named fix for the profile ADR:** publish honest **full-title VOD** for
+transcode sessions (Step 1c; 0/192 mid-start mismatches). Contiguous body
+still needs one clean measure before calling 1c closed on the wire.
+
+**Throttle:** configured **2.72 Mbps**, achieved **~1.90 Mbps** avg
+(`partb-starve.json`). Report **achieved** as the starvation figure.
+
+**ABR signals:** media_kit + libVLC expose stall/buffer;
+`stop_gate_neither_signal` = false.
+
+### Part C — eyes-on (macOS limits)
+
+Capability tables are vendor claims until watched. This pass:
+
+| Axis | Status |
+|---|---|
+| HDR vs native | **Open on macOS eyes-on.** Aether opens 2160p HEVC (id 545) via SPM probe; ranking-changing HDR delta **not** scored by looking this session. |
+| Multichannel | Aether smoke: DTS 5.1 (id 32) and TrueHD 7.1 (id 35) reach first frame. Passthrough vs downmix **not** verified on an AVR. |
+| Subtitles | Household PGS titles exist (e.g. id 34, 43). ASS+PGS styling/position **not** eyes-on scored. |
+| Composition | media_kit `Video` composites under Flutter widgets in `engine_bakeoff`. Aether Flutter path is Moonfin-shaped platform view (`moonfin/aether_video`) — prior art only; not copied. Glue cost = AppKitView + channel, unmeasured in Nightjar tree. |
+
+**macOS cannot answer (named open items for Apple TV + real AV chain):**
+
+1. Dolby Vision display switching
+2. HDMI audio passthrough (E-AC-3 JOC / TrueHD / DTS)
+3. Match Content
+
+These are why AetherEngine remains a candidate on **tvOS**. Do not conclude
+them from a laptop. Do not schedule media_kit as a Part C peer on Apple TV.
+
+### AetherEngine dependency assessment
+
+| | |
+|---|---|
+| Builds outside Moonfin? | **Yes** — stock SPM `Package.swift` + probe binary. |
+| Licence | **LGPL-3.0 + Apple Store/DRM exception** (Vincent Herbst). FFmpegBuild / LibDovi remain separate LGPL pieces as in the teardown. |
+| Shape | Prebuilt SPM binary deps, ~48k Swift lines in checkout, **Apple-only**, single maintainer. |
+| If unmaintained | We own a fork of that Swift surface + binary rebuild pipeline. Legally fine under LGPL+exception; practically a product team’s media engine. |
+| vs media_kit | **Platform-conditional.** On **macOS/iOS**, media_kit is cross-platform, forkable (Moonfin already forked `media_kit_video` on Android), and cheaper long-term ownership. On **tvOS**, stock Flutter rejects the platform; [fluttertv/flutter-tvos](https://github.com/fluttertv/flutter-tvos) is the known toolchain, but media_kit still has no `tvos:` plugin (and is absent from fluttertv’s curated ports). A Nightjar port would own flutter-tvos adoption + libs rebuild + federated plugin and would breach T3. There Aether’s Apple-only cost is compared to “no media_kit,” not to a cheap fork. |
+
+### What blocks the engine from being usable (Part 5)
+
+Direct play against Nightjar `/stream` is **unproven end to end** while the
+route is `BROWSER_V0`-gated. Bake-off DP used a local byte server. **Step 2’s
+profile ADR is a prerequisite for the client**, not a follow-up. Minimum:
+
+1. A `ClientCapabilityProfile` the Flutter client can report.
+2. `/stream` (and playback-info) honouring that profile for Matroska DP.
 
 **Server consequence**
 
-- Session pipeline stays. It stops being "AVPlayer refused the container"
-  and becomes "link cannot carry the bitrate" (plus burn-in, outliers, web).
-- Restart-latency backlog: **matters for remote**, not for ~80% of LAN
-  engine playback. Refiled in `notes/session-latency-and-disk-backlog.md`.
-  Do not fully demote it; remote viewers are least tolerant of a multi-
-  second seek.
-- Keyframe-map slice and ADR-0020 stand. Copy/remux keeps producer-truth
-  windowing; under an engine that path is no longer the common LAN case.
+- Sessions stay for bandwidth (+ burn-in / web / outliers).
+- Full-title publish (1c) is the scrub contract on that path; windowed EVENT
+  + `startMs` is today’s behaviour and explains the far-seek finding.
+- ADR-0020 stands for copy/remux.
+
+### Open checklist
+
+1. Jellyfin seekable comparison (T5-4) — unscored.
+2. Step 2 profile ADR + N100 capacity.
+3. Contiguous full-title VOD far-seek measure.
+4. Full n=228 binding T4 for media_kit and Aether.
+5. Part C eyes-on on macOS (HDR/subs).
+6. **Apple TV Part C:** DV / HDMI / Match Content as **Aether vs native**
+   (media_kit has no stock or fluttertv-curated tvOS plugin — finding above).
+   Decide tvOS engine separately from the macOS/iOS media_kit provisional
+   pick. flutter-tvos is assumed as the Flutter shell path if we ship a
+   Flutter Apple TV app at all.
+7. libVLC binding seek land (or leave libVLC out of Apple).
+
+**T5 condition 4 remains unscored.**
 
 ### Step 2 — Profile ADR (requirements locked from this bake-off)
 
@@ -314,42 +560,74 @@ The ADR must reckon with:
 ### Step 3 — ABR under engine (recorded)
 
 Instrument: `scripts/abr_throttle_probe/` (three-rung ladder + 1 Mbps byte-rate
-proxy). Same playlist, same throttle, two clients. Source: Elementary 3x05
-mid-title 60 s window; rungs hi/mid/lo at ~4.5 / 1.7 / 0.75 Mbps tagged
-BANDWIDTH.
+proxy). Same playlist, same throttle. Source: Elementary 3x05 mid-title 60 s
+window; rungs hi/mid/lo at ~4.5 / 1.7 / 0.75 Mbps tagged BANDWIDTH.
+
+Step 3b is narrow: both engines cleared T1 at 100%, so if we put an engine
+on Apple, is libmpv or libVLC better on adaptive HLS. Not an Android question
+(Media3 already clears 96.5% and adapts). Desktop VLC 3.0.23 stands in for
+libVLC (same engine and adaptive demuxer; VLCKit is only the Apple binding).
+Master URL needed `:demux=adaptive` or VLC mis-demuxes the ladder. Options
+checked against this build: `--adaptive-logic
+{,predictive,nearoptimal,rate,fixedrate,lowest,highest}`.
 
 | Client | Under 1 Mbps throttle |
 |---|---|
 | **mpv 0.41** (`--hls-bitrate=max`, the default) | Probes early segments of all three rungs, then **stays on hi**. hi segments take **8–12 s** to fetch for 2 s of media. No mid-stream downshift in 30 s. mpv's only HLS bitrate choices are `no` / `min` / `max` / integer — **no auto ABR mode**. |
 | **hls.js** (web's bundled build, Chrome CDP) | Starts on hi (`startLevel: 2`), **downshifts to lo within ~1.1 s** of the first level event (t≈8.8s → 9.9s). Proxy sequence `hllllllll…`. One non-fatal `bufferStalledError`, then sustained play on lo (~1.3–1.7 s/seg). |
+| **libVLC** via desktop VLC 3.0.23. Default `--adaptive-logic` (empty) and `--adaptive-logic=nearoptimal` | Starts on **lo** (seg0 ~1.4 s), **upshifts to hi** at ~1.4 s, then **stays on hi** (`lhhh…`). hi segments **~8.5–9 s** for 2 s of media. No mid-stream downshift in 40 s. PCR-late / rebuffering while starved. |
+| **libVLC** `--adaptive-logic=rate` (also `lowest` sanity) | Starts on **lo** and **never leaves** (`llllllll…`). Segments ~1.2–2.0 s for 2 s media; no PCR-late stalls. Not a downshift: it never climbs. |
 
 Raw: `notes/client-arch/abr-mpv-max-log.json`,
 `notes/client-arch/abr-hlsjs-events.json`,
-`notes/client-arch/abr-hlsjs-access.json`.
+`notes/client-arch/abr-hlsjs-access.json`,
+`notes/client-arch/abr-vlc-default-log.json`,
+`notes/client-arch/abr-vlc-nearoptimal-log.json`,
+`notes/client-arch/abr-vlc-rate-log.json`,
+`notes/client-arch/abr-vlc-lowest-log.json`.
 
-**What the user sees:** mpv (and by extension libmpv / ffmpeg's HLS demuxer)
-on a multi-variant playlist under a thin link: stalls / waits on the top rung.
-hls.js: brief stall, then continuous playback at the sustainable rung.
+**What the user sees:** libmpv on a multi-variant playlist under a thin link:
+stalls / waits on the top rung. Default / nearoptimal libVLC: brief lo start,
+then the same starvation stall after it climbs. `rate` / `lowest`: continuous
+play on lo, no switch artefact. hls.js: brief stall, then continuous play at
+the sustainable rung after a real downshift.
 
-**Does this reopen platform players?** Partially, and only for the ABR case.
-It does **not** overturn the engine decision for v1:
+**Interpretation (Step 3b only)**
 
-- ADR-0008 already keeps ABR post-v1. v1 remote is **one server-chosen
-  rendition** (Auto / High / Original), not a client-switched ladder.
-- Compatibility + honest full-title transcode (Steps 1 / 1c) still favour the
-  engine for the household library.
-- When ABR eventually lands, do **not** assume libmpv will absorb a ladder.
-  Keep server-side selection, or pair the engine with a real ABR stack
-  (hls.js-class, ExoPlayer, or an mpv fork that actually adapts). That is a
-  Phase / post-v1 design choice, not a reason to keep AVPlayer as the
-  Matroska path today.
+1. **libmpv vs libVLC:** neither mid-stream downshifts under starvation at
+   defaults. libVLC climbs into the same trap; `--adaptive-logic=rate` (or
+   `lowest`) avoids the climb but is not hls.js-class ABR. On adaptive HLS
+   alone they are **tied**. That is one axis. Flutter integration maturity,
+   subtitle rendering, and platform audio handling are probably bigger inputs
+   to the Apple-engine choice and are all unmeasured.
+2. **ABR is not blocked either way.** Rendition selection can move
+   server-side: the client reports throughput and gets a new session at a
+   different rung, reusing the existing restart machinery. Slower than
+   hls.js at ~1.1 s, but it works with a client that cannot adapt. Do not
+   read the mpv (or libVLC default) row as "ABR is impossible."
+3. **v1 is unaffected.** ADR-0008 fixes v1 at one server-chosen rendition
+   (Auto / High / Original). This row is post-v1 input only.
 
-### Phase 4 / ADR-0020
+### Parked for Phase 4 (do not resume under Phase 2 / Gate 2)
 
-- Phase 4 player-core matches the constitution. ADR-0001 should be accepted
-  on that basis.
-- ADR-0020 stands for copy/remux sessions. Transcode may publish honest
-  full-title playlists (1c).
-- T2/T3/T4 confirmation on a laptop prototype when Phase 4 starts.
-- Step 2 (profile ADR + N100 capacity) remains desk work, well-specified,
-  not started.
+Explicit park (2026-08-01). Gate 2 and Phase 2 entry close first.
+
+- Remaining bake-off work: AetherEngine ranking, Part C on Apple TV hardware,
+  full n=228 binding T4, Jellyfin T5-4, contiguous full-title VOD wire measure.
+- ADR-0021 (client architecture) stays **proposed**. Apple engine stays
+  unresolved. Do not finalise it while Gate 2 is open.
+- Keyframe-map feasibility note stays a note until Phase 4 opens a schema ADR.
+- **Constitution conflict (deliberate):** `ENGINEERING_RULES.md` Rule 2.4 still
+  says one shared Rust/libmpv player core. ADR-0021 contradicts that for the
+  client stack. An ADR does not amend the constitution. Resolve the conflict
+  when Phase 4 opens (amend Rule 2.4 with unanimous approval, or revise the
+  ADR). Catch it on purpose then; do not discover it as a surprise mid-client.
+
+### ADR-0020 (Phase 2 / sessions — not parked)
+
+- ADR-0020 (producer-owned time-keyed segments) is the copy/remux session fix;
+  merge to `main` before trusting household playback or reusing last week's
+  seek numbers against trunk. Transcode still needs honest full-title publish
+  (1c); Part 3 confirmed EVENT windows block far seek until `startMs` moves
+  the window.
+- Step 2 profile ADR + N100 capacity remain Phase 2 Gate 2 work (not Phase 4).

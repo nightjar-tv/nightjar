@@ -1,0 +1,141 @@
+{
+  "baseUrl": "http://127.0.0.1:18097",
+  "part_a_mpv": {
+    "engine": "mpv",
+    "client": "cli",
+    "url_resolution": "bake-off dp_byte_serve /items/{id}/stream from DB path; Nightjar /api/v0/items/{id}/stream is BROWSER_V0-gated and returns 415 for MKV",
+    "cold_startup": {
+      "n": 12,
+      "min_ms": 520,
+      "p50_ms": 1660,
+      "p90_ms": 2230,
+      "max_ms": 2846,
+      "samples_ms": [
+        2177,
+        2230,
+        2097,
+        2846,
+        529,
+        549,
+        849,
+        532,
+        520,
+        2009,
+        1660,
+        1156
+      ]
+    },
+    "warm_startup": {
+      "n": 12,
+      "min_ms": 466,
+      "p50_ms": 585,
+      "p90_ms": 723,
+      "max_ms": 1225,
+      "samples_ms": [
+        570,
+        671,
+        723,
+        1225,
+        545,
+        483,
+        516,
+        466,
+        585,
+        524,
+        595,
+        625
+      ]
+    },
+    "warm_near_seek": {
+      "n": 12,
+      "min_ms": 693,
+      "p50_ms": 1755,
+      "p90_ms": 3458,
+      "max_ms": 3720,
+      "samples_ms": [
+        1506,
+        1166,
+        1865,
+        1755,
+        693,
+        894,
+        1368,
+        826,
+        2092,
+        3458,
+        1842,
+        3720
+      ]
+    },
+    "warm_far_seek": {
+      "n": 12,
+      "min_ms": 646,
+      "p50_ms": 1051,
+      "p90_ms": 1641,
+      "max_ms": 4268,
+      "samples_ms": [
+        1116,
+        1051,
+        1641,
+        710,
+        660,
+        646,
+        842,
+        922,
+        1423,
+        4268,
+        865,
+        1617
+      ]
+    },
+    "cold_far_seek": {
+      "n": 12,
+      "min_ms": 603,
+      "p50_ms": 746,
+      "p90_ms": 1024,
+      "max_ms": 2348,
+      "samples_ms": [
+        746,
+        725,
+        970,
+        603,
+        725,
+        627,
+        693,
+        941,
+        632,
+        2348,
+        804,
+        1024
+      ]
+    }
+  },
+  "request_patterns_after_mpv": {
+    "n": 170,
+    "by_user_agent": {
+      "libmpv": {
+        "n": 170,
+        "n_with_range": 170,
+        "range_samples": [
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=245745442-",
+          "bytes=0-",
+          "bytes=2265602422-",
+          "bytes=7565-",
+          "bytes=1684042756-",
+          "bytes=0-"
+        ],
+        "bytes_p50": 1048576,
+        "bytes_max": 84934656
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+name: libvlc_bakeoff
+description: Measurement-only Dart FFI to VLC.app libvlc for Nightjar engine bake-off.
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  ffi: ^2.1.0

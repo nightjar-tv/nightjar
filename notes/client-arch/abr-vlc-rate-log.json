@@ -1,0 +1,245 @@
+[
+  {
+    "t": 1785473976.947094,
+    "path": "/master.m3u8",
+    "bytes": 326,
+    "sent": 326,
+    "elapsed_s": 0.0,
+    "rendition": null,
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473977.000148,
+    "path": "/lo/index.m3u8",
+    "bytes": 972,
+    "sent": 972,
+    "elapsed_s": 0.0,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473977.0093288,
+    "path": "/lo/init.mp4",
+    "bytes": 1372,
+    "sent": 1372,
+    "elapsed_s": 0.0,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473977.031819,
+    "path": "/lo/seg0.m4s",
+    "bytes": 164804,
+    "sent": 164804,
+    "elapsed_s": 1.354,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473978.3880231,
+    "path": "/lo/seg1.m4s",
+    "bytes": 182723,
+    "sent": 182723,
+    "elapsed_s": 1.545,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473979.934243,
+    "path": "/lo/seg2.m4s",
+    "bytes": 197146,
+    "sent": 197146,
+    "elapsed_s": 1.634,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473981.582911,
+    "path": "/lo/seg3.m4s",
+    "bytes": 206362,
+    "sent": 206362,
+    "elapsed_s": 1.709,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473983.294553,
+    "path": "/lo/seg4.m4s",
+    "bytes": 208431,
+    "sent": 208431,
+    "elapsed_s": 1.861,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473985.159167,
+    "path": "/lo/seg5.m4s",
+    "bytes": 191274,
+    "sent": 191274,
+    "elapsed_s": 1.579,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473986.740791,
+    "path": "/lo/seg6.m4s",
+    "bytes": 176009,
+    "sent": 176009,
+    "elapsed_s": 1.424,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473988.166253,
+    "path": "/lo/seg7.m4s",
+    "bytes": 158365,
+    "sent": 158365,
+    "elapsed_s": 1.289,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473989.457886,
+    "path": "/lo/seg8.m4s",
+    "bytes": 159971,
+    "sent": 159971,
+    "elapsed_s": 1.295,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473990.756139,
+    "path": "/lo/seg9.m4s",
+    "bytes": 195778,
+    "sent": 195778,
+    "elapsed_s": 1.579,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473992.347002,
+    "path": "/lo/seg10.m4s",
+    "bytes": 210670,
+    "sent": 210670,
+    "elapsed_s": 1.708,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473994.0639,
+    "path": "/lo/seg11.m4s",
+    "bytes": 183572,
+    "sent": 183572,
+    "elapsed_s": 1.503,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473995.569033,
+    "path": "/lo/seg12.m4s",
+    "bytes": 180728,
+    "sent": 180728,
+    "elapsed_s": 1.501,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473997.0727181,
+    "path": "/lo/seg13.m4s",
+    "bytes": 192103,
+    "sent": 192103,
+    "elapsed_s": 1.588,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785473998.6637702,
+    "path": "/lo/seg14.m4s",
+    "bytes": 174677,
+    "sent": 174677,
+    "elapsed_s": 1.44,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474000.105559,
+    "path": "/lo/seg15.m4s",
+    "bytes": 203232,
+    "sent": 203232,
+    "elapsed_s": 1.637,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474001.744684,
+    "path": "/lo/seg16.m4s",
+    "bytes": 184166,
+    "sent": 184166,
+    "elapsed_s": 1.501,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474003.2613492,
+    "path": "/lo/seg17.m4s",
+    "bytes": 155528,
+    "sent": 155528,
+    "elapsed_s": 1.241,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474004.516952,
+    "path": "/lo/seg18.m4s",
+    "bytes": 156794,
+    "sent": 156794,
+    "elapsed_s": 1.298,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474005.829785,
+    "path": "/lo/seg19.m4s",
+    "bytes": 180889,
+    "sent": 180889,
+    "elapsed_s": 1.508,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474007.350604,
+    "path": "/lo/seg20.m4s",
+    "bytes": 175966,
+    "sent": 175966,
+    "elapsed_s": 1.439,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474008.804693,
+    "path": "/lo/seg21.m4s",
+    "bytes": 181664,
+    "sent": 181664,
+    "elapsed_s": 1.506,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474010.323755,
+    "path": "/lo/seg22.m4s",
+    "bytes": 248813,
+    "sent": 248813,
+    "elapsed_s": 2.043,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  },
+  {
+    "t": 1785474012.380102,
+    "path": "/lo/seg23.m4s",
+    "bytes": 157311,
+    "sent": 157311,
+    "elapsed_s": 1.53,
+    "rendition": "lo",
+    "ua": "VLC/3.0.23 LibVLC/3.0.23"
+  }
+]

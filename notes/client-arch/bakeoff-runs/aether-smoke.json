@@ -1,0 +1,17 @@
+{
+  "engine": "AetherEngine",
+  "note": "Hand smoke with DP byte server up; seek_to_s=20 on each",
+  "builds_outside_moonfin": true,
+  "licence": "LGPL-3.0 + Apple Store/DRM exception (Vincent Herbst / AetherEngine LICENSE)",
+  "swift_lines_approx": 48000,
+  "samples": [
+    {"id": 20175, "first_frame_ms": 4163, "seek_land_ms": 1649},
+    {"id": 10062, "first_frame_ms": 6714, "seek_land_ms": 1450},
+    {"id": 6831, "first_frame_ms": 6108, "seek_land_ms": 1530},
+    {"id": 32, "first_frame_ms": 5724, "seek_land_ms": 2020, "note": "DTS 5.1 h264"},
+    {"id": 35, "first_frame_ms": 6608, "seek_land_ms": 9010, "note": "TrueHD 7.1"},
+    {"id": 545, "first_frame_ms": 19549, "seek_land_ms": 4075, "note": "2160p hevc eac3"}
+  ],
+  "warm_far_seek_p50_approx_ms": 1834,
+  "cold_startup_p50_approx_ms": 6411
+}
