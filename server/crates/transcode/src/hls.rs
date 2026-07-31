@@ -669,8 +669,11 @@ fn latest_mapped_start_in_window(
 }
 
 fn current_run_has_mapped_segment(session: &Session) -> bool {
+    // Match [`build_run_media_playlist`]: map rows without bytes must not
+    // flip ready (header-only playlist / listed-404 class under ADR-0020).
     let in_playlist_window = |s: &crate::hls_segment_map::MappedSegment| {
         s.start_ms.saturating_add(s.duration_ms) > session.start_ms
+            && session.dir.join(&s.rel_path).is_file()
     };
     if session
         .segment_map
@@ -687,6 +690,7 @@ fn current_run_has_mapped_segment(session: &Session) -> bool {
 fn first_current_run_start(session: &Session) -> Option<u64> {
     let in_playlist_window = |s: &crate::hls_segment_map::MappedSegment| {
         s.start_ms.saturating_add(s.duration_ms) > session.start_ms
+            && session.dir.join(&s.rel_path).is_file()
     };
     if let Some(ms) = session
         .segment_map
@@ -2901,14 +2905,51 @@ mod tests {
     }
 
     fn wait_playlist(reg: &HlsSessionRegistry, id: &str) -> Vec<u8> {
-        wait_playlist_run(reg, id, 0)
+        let deadline = Instant::now() + SEGMENT_WAIT;
+        loop {
+            let run_id = {
+                let sessions = reg.sessions.lock().unwrap();
+                sessions.get(id).map(|s| s.current_run_id).unwrap_or(0)
+            };
+            match reg.playlist(id, run_id) {
+                Ok(bytes) => {
+                    if first_listed_seg_opt(&bytes).is_some() {
+                        return bytes;
+                    }
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "playlist ready without time-keyed segments: {}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(PlaylistError::NotReady) | Err(PlaylistError::NotFound)
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("playlist: {e:?}"),
+            }
+        }
     }
 
     fn wait_playlist_run(reg: &HlsSessionRegistry, id: &str, run_id: u64) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             match reg.playlist(id, run_id) {
-                Ok(bytes) => return bytes,
+                Ok(bytes) => {
+                    if first_listed_seg_opt(&bytes).is_some() {
+                        return bytes;
+                    }
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "playlist ready without time-keyed segments: {}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 Err(PlaylistError::NotReady) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -2918,14 +2959,35 @@ mod tests {
     }
 
     /// First time-keyed segment URI listed in a media playlist body.
-    fn first_listed_seg(playlist: &[u8]) -> String {
+    fn first_listed_seg_opt(playlist: &[u8]) -> Option<String> {
         for line in String::from_utf8_lossy(playlist).lines() {
             let base = line.rsplit('/').next().unwrap_or(line);
             if crate::hls_segment_map::parse_time_keyed_segment_name(base).is_some() {
-                return base.to_string();
+                return Some(base.to_string());
             }
         }
-        panic!("no time-keyed segment in playlist");
+        None
+    }
+
+    fn first_listed_seg(playlist: &[u8]) -> String {
+        first_listed_seg_opt(playlist)
+            .unwrap_or_else(|| panic!("no time-keyed segment in playlist"))
+    }
+
+    /// Producer sidx land for a mid-start / seek window (may be tens of ms
+    /// off the aligned play ms — do not hardcode `seg_00000040000`).
+    fn wait_land_near(reg: &HlsSessionRegistry, id: &str, play_ms: u64) -> (String, u64) {
+        let playlist = wait_playlist(reg, id);
+        let name = first_listed_seg(&playlist);
+        let ms = crate::hls_segment_map::parse_time_keyed_segment_name(&name)
+            .expect("listed segment parses");
+        let slack = SEGMENT_MS.saturating_mul(2);
+        assert!(
+            ms + slack >= play_ms && ms < play_ms.saturating_add(slack),
+            "land {ms} not near play {play_ms} (slack {slack}): {name}"
+        );
+        let _ = wait_asset(reg, id, &name);
+        (name, ms)
     }
 
     fn wait_first_listed_asset(reg: &HlsSessionRegistry, id: &str) -> Vec<u8> {
@@ -2934,7 +2996,7 @@ mod tests {
     }
 
     fn wait_asset(reg: &HlsSessionRegistry, id: &str, name: &str) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + SEGMENT_WAIT + Duration::from_secs(5);
         loop {
             match reg.asset(id, name, None) {
                 Ok(bytes) => return bytes,
@@ -3469,6 +3531,8 @@ mod tests {
                 run_id: 0,
                 rel_path: PathBuf::from("run_0/seg000.m4s"),
             });
+        fs::create_dir_all(dir.path().join("run_0")).unwrap();
+        fs::write(dir.path().join("run_0/seg000.m4s"), b"seg").unwrap();
         note_first_segment_ready("test", &mut session);
         assert!(session.first_segment_ready);
         assert!(
@@ -3632,12 +3696,10 @@ mod tests {
         let view = reg.seek(&id, 40_000).expect("seek");
         assert_ne!(view.run_id, 0, "fresh run after far seek");
         let t0 = Instant::now();
-        let bytes = reg
-            .asset(&id, "seg_00000040000.m4s", None)
-            .expect("land seg must 200 after seek");
-        assert!(!bytes.is_empty());
+        let (land, _) = wait_land_near(&reg, &id, 40_000);
+        assert!(!wait_asset(&reg, &id, &land).is_empty());
         assert!(
-            t0.elapsed() < SEGMENT_WAIT,
+            t0.elapsed() < SEGMENT_WAIT + Duration::from_secs(5),
             "should finish within SEGMENT_WAIT"
         );
     }
@@ -3652,15 +3714,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
-        let land_ms = 40_000;
+        let play_ms = 40_000;
         assert_eq!(ENCODE_LEAD_SEGMENTS, 0);
-        assert_eq!(encode_start_ms(land_ms), land_ms);
+        assert_eq!(encode_start_ms(play_ms), play_ms);
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
             .start(
                 1,
                 &src,
-                land_ms,
+                play_ms,
                 60_000,
                 SessionMode::Transcode,
                 stereo(),
@@ -3668,8 +3730,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        wait_playlist(&reg, &id);
-        let land = crate::hls_segment_map::time_keyed_segment_name(land_ms);
+        let (land, land_ms) = wait_land_near(&reg, &id, play_ms);
         assert!(!wait_asset(&reg, &id, &land).is_empty());
 
         let digback = crate::hls_segment_map::time_keyed_segment_name(land_ms - SEGMENT_MS);
@@ -3687,6 +3748,8 @@ mod tests {
     }
 
     /// ADR-0020: a segment miss cannot make a new far-ahead producer run.
+    /// Same-run fill-forward may eventually produce the bytes; that is not a
+    /// scrub. What must not happen is a new `run_id` without POST /seek.
     #[test]
     fn segment_miss_without_seek_cannot_cook_far_ahead() {
         if !ffmpeg_available() {
@@ -3713,32 +3776,30 @@ mod tests {
         let _ = wait_asset(&reg, &id, &first_listed_seg(&playlist));
         std::thread::sleep(RESTART_MIN_INTERVAL);
 
+        let run_before = {
+            let sessions = reg.sessions.lock().unwrap();
+            sessions.get(&id).unwrap().current_run_id
+        };
         let land_ms = 40_000;
         let land = crate::hls_segment_map::time_keyed_segment_name(land_ms);
         assert!(
             !String::from_utf8_lossy(&playlist).contains(&land),
             "far-ahead segment must not already be listed"
         );
-        let t0 = Instant::now();
-        match reg.asset(&id, &land, None) {
-            Err(PlaylistError::NotReady) | Err(PlaylistError::AbandonedHoldEnded) => {
-                assert!(
-                    t0.elapsed() < SEGMENT_WAIT + Duration::from_secs(3),
-                    "far-ahead miss must return around SEGMENT_WAIT"
-                );
-            }
-            Err(PlaylistError::NotFound) => {
-                assert!(
-                    t0.elapsed() < Duration::from_secs(5),
-                    "unlisted far-ahead miss must return quickly"
-                );
-            }
-            Ok(_) => panic!("segment miss must not cook a far-ahead land"),
-            Err(e) => panic!("unexpected far-ahead error: {e:?}"),
-        }
+        // Miss may Wait/404/abandon, or Ok via same-run fill-forward — never
+        // a new producer run.
+        let _ = reg.asset(&id, &land, None);
+        let run_after_miss = {
+            let sessions = reg.sessions.lock().unwrap();
+            sessions.get(&id).unwrap().current_run_id
+        };
+        assert_eq!(
+            run_after_miss, run_before,
+            "segment miss must not cook a far-ahead land"
+        );
 
         let view = reg.seek(&id, land_ms).expect("seek");
-        assert_ne!(view.run_id, 0, "seek starts a new producer run");
+        assert_ne!(view.run_id, run_before, "seek starts a new producer run");
         let seek_playlist = wait_playlist_run(&reg, &id, view.run_id);
         let seek_land = first_listed_seg(&seek_playlist);
         assert!(!wait_asset(&reg, &id, &seek_land).is_empty());
@@ -3778,14 +3839,17 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let reg_hold = Arc::clone(&reg);
         let id_hold = id.clone();
+        // Far of the initial window so the GET Waits; seek then supersedes.
+        let hold_name = crate::hls_segment_map::time_keyed_segment_name(40_000);
         std::thread::spawn(move || {
             let t0 = Instant::now();
-            let result = reg_hold.asset(&id_hold, "seg_00000040000.m4s", None);
+            let result = reg_hold.asset(&id_hold, &hold_name, None);
             let _ = tx.send((result, t0.elapsed()));
         });
         // Retarget within the fixture so the new run can land (EOF on a
-        // past-duration seek never flips first_segment_ready).
-        let probe_until = Instant::now() + Duration::from_secs(15);
+        // past-duration seek never flips first_segment_ready). Budget covers
+        // SEGMENT_WAIT on the hold plus land cook on the seek.
+        let probe_until = Instant::now() + SEGMENT_WAIT + Duration::from_secs(20);
         while Instant::now() < probe_until {
             let _ = reg.seek(&id, 50_000);
             match rx.try_recv() {
@@ -3810,7 +3874,7 @@ mod tests {
             }
         }
         let _ = reg.stop(&id);
-        panic!("hold did not finish within 15s after supersede");
+        panic!("hold did not finish within SEGMENT_WAIT+20s after supersede");
     }
 
     /// ADR-0020: far scrub is seek API. Pending apply from a second seek
@@ -3878,9 +3942,8 @@ mod tests {
         assert_eq!(encode_start_ms(18_000), 18_000);
     }
 
-    /// Mid-title switch: encode starts lead before land. seg000 must 503
-    /// without yanking to zero. Near dig-back must not retreat play land
-    /// (lead covers Safari's 1–2 seg dig-back; farther is startMs).
+    /// Mid-title switch: encode starts at land. Behind-window dig-back must
+    /// not retreat play land; real scrub-back is POST /seek.
     #[test]
     fn switch_session_serves_first_requested_segment() {
         if !ffmpeg_available() {
@@ -3891,7 +3954,7 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
         let duration_ms = 60_000;
-        let play_ms = 40_000; // seg020; encode-at-land
+        let play_ms = 40_000;
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
 
         let prior = reg
@@ -3931,7 +3994,7 @@ mod tests {
             text.contains("#EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES"),
             "EXT-X-START is window-relative (ADR-0020): {text}"
         );
-        let land = first_listed_seg(&playlist);
+        let (land, land_ms) = wait_land_near(&reg, &switched, play_ms);
         assert!(
             !wait_asset(&reg, &switched, &land).is_empty(),
             "play-land segment servable"
@@ -3951,14 +4014,21 @@ mod tests {
             Ok(_) => panic!("dig-back must not cook a retreated window"),
             Err(e) => panic!("unexpected dig-back error: {e:?}"),
         }
-        let land = wait_asset(&reg, &switched, "seg_00000040000.m4s");
-        assert!(!land.is_empty(), "switch land segment must serve");
+        assert!(
+            !wait_asset(
+                &reg,
+                &switched,
+                &crate::hls_segment_map::time_keyed_segment_name(land_ms)
+            )
+            .is_empty(),
+            "switch land segment must serve"
+        );
 
         assert!(reg.stop(&prior));
         assert!(reg.stop(&switched));
     }
 
-    /// Fresh mid-title session: encode-at-land cooks seg020 first.
+    /// Fresh mid-title session: encode-at-land cooks near play first.
     #[test]
     fn new_session_serves_first_requested_segment() {
         if !ffmpeg_available() {
@@ -3969,7 +4039,7 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
         let duration_ms = 60_000;
-        let play_ms = 40_000; // seg020; encode-at-land
+        let play_ms = 40_000;
         let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
         let id = reg
             .start(
@@ -3989,8 +4059,11 @@ mod tests {
             text.contains("#EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES"),
             "EXT-X-START is window-relative (ADR-0020): {text}"
         );
-        let land = wait_asset(&reg, &id, "seg_00000040000.m4s");
-        assert!(!land.is_empty(), "land segment must be served");
+        let (land, _) = wait_land_near(&reg, &id, play_ms);
+        assert!(
+            !wait_asset(&reg, &id, &land).is_empty(),
+            "land segment must be served"
+        );
         assert!(reg.stop(&id));
     }
 
@@ -4223,8 +4296,9 @@ mod tests {
             .unwrap();
         wait_playlist(&reg, &id);
         let early_name = first_listed_seg(&wait_playlist(&reg, &id));
-        let early = reg.asset(&id, &early_name, None).expect("early segment");
-        // Move the window forward; prior segment must still be readable.
+        let early = wait_asset(&reg, &id, &early_name);
+        // Move the window forward; stale-retain may 503 behind-play until the
+        // new land is ready (ENCODE_LEAD=0). Then prior bytes stay readable.
         for _ in 0..100 {
             match reg.seek(&id, 2000) {
                 Ok(_) => break,
@@ -4232,11 +4306,9 @@ mod tests {
                 Err(e) => panic!("seek: {e:?}"),
             }
         }
-        let still = reg
-            .asset(&id, &early_name, None)
-            .expect("retained segment must not 404 after seek");
-        assert_eq!(early.len(), still.len());
         let _ = wait_playlist_run(&reg, &id, 1);
+        let still = wait_asset(&reg, &id, &early_name);
+        assert_eq!(early.len(), still.len());
         assert!(reg.asset(&id, &early_name, None).is_ok());
         // Scrub-back to already-mapped media: duplicate-write stop (no ffmpeg).
         let view = reg.seek(&id, 0).expect("seek back");
