@@ -62,19 +62,22 @@ contradictory far-scrub runs each produced a quotable wrong number. Direct
 container reads (Cues / `stss` / `index_entries`) settle integrity; timing
 instruments settle latency.
 
-## Gating experiment: dictated cuts, not prediction
+## Gating experiment: dictated cuts (answered 2026-07-31)
 
-Recording keyframes is not enough for a full-title playlist. `-hls_time` is
-a heuristic; the residual short-GOP packing question only matters if
-dictated cuts fail. The gate is therefore:
+Recording keyframes is not enough for a full-title playlist. The gate was:
 
-1. Were the requested cut times actual keyframes? (Elementary 10.4s GOP is
-   the binding case — if they were not mapped KFs, a miss is expected.)
-2. Does production `-f hls` honour `-segment_times` in copy mode? A yes on
-   `-f segment` does not transfer. If HLS ignores the list, the fallback is
-   `-f segment` writing fMP4 with our own playlist (already generated).
+1. Were the requested cut times actual keyframes? **Yes** on Elementary —
+   all six dictated times match packet KF flags exactly
+   (`nightjar-meta/notes/elementary-dictated-kf-check-2026-07-31.*`).
+2. Does the muxer honour them? **No.** `-f segment` landed 1/6 within 100 ms
+   (max Δ ≈ 0.37 s). Production `-f hls` either ignored `-segment_times`
+   (one mega-segment when `hls_time` was large; 24 segs on short-GOP) or
+   reproduced the same early skew (`nightjar-meta/notes/segment-times-hls-2026-07-31.*`).
 
-No further cut-rule prediction work until those two answers land.
+**Full-title via copy-mode dictated boundaries is not available on this
+evidence.** Short-GOP packing prediction is moot. The map still buys land,
+scan-time damage/usable extent (instant banner), trickplay, and offsets —
+not pre-declared full-title `EXTINF`.
 
 ## Honest full-title, cook-on-miss, and native scrubbing
 
@@ -141,13 +144,11 @@ depth-sensitive hops (ADR-0008 note).
 
 1. ~~Sample index availability~~ — direct Cues/`stss`: 2% truncated, 16%
    walk fallback; scan is one-time/incremental.
-2. Confirm Elementary dictated times were real keyframes; then test
-   `-f hls` + `-segment_times` in copy mode. Full-title only if that path
-   (or `-f segment` + own playlist) is honest.
+2. ~~Dictated-cut gate~~ — Elementary KFs confirmed; neither `-f segment`
+   nor `-f hls` honoured them tightly enough. Full-title off the map ADR.
 3. ADR: map storage + index-first scan write + session land from map +
-   scan-time usable extent (instant damage banner); revive cook-on-miss
-   with the “justification returning” framing; full-title only if step 2
-   passes.
+   scan-time usable extent (instant damage banner). No full-title / cook-
+   on-miss revival until a new attach path is proven.
 4. Trickplay after the map exists.
 
 No code in this note.
