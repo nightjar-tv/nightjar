@@ -1,0 +1,75 @@
+[
+  {
+    "t_ms": 36,
+    "kind": "manifest",
+    "levels": [
+      {
+        "bitrate": 750000,
+        "width": 640,
+        "height": 360,
+        "url": [
+          "http://127.0.0.1:8765/lo/index.m3u8"
+        ]
+      },
+      {
+        "bitrate": 1700000,
+        "width": 854,
+        "height": 480,
+        "url": [
+          "http://127.0.0.1:8765/mid/index.m3u8"
+        ]
+      },
+      {
+        "bitrate": 4500000,
+        "width": 1280,
+        "height": 720,
+        "url": [
+          "http://127.0.0.1:8765/hi/index.m3u8"
+        ]
+      }
+    ]
+  },
+  {
+    "t_ms": 96,
+    "kind": "waiting",
+    "currentTime": 0
+  },
+  {
+    "t_ms": 8757,
+    "kind": "playing",
+    "currentTime": 0.000596
+  },
+  {
+    "t_ms": 8757,
+    "kind": "level",
+    "level": 2,
+    "bitrate": 4500000,
+    "width": 1280,
+    "height": 720
+  },
+  {
+    "t_ms": 9864,
+    "kind": "level",
+    "level": 0,
+    "bitrate": 750000,
+    "width": 640,
+    "height": 360
+  },
+  {
+    "t_ms": 10702,
+    "kind": "waiting",
+    "currentTime": 1.898808
+  },
+  {
+    "t_ms": 10800,
+    "kind": "error",
+    "type": "mediaError",
+    "details": "bufferStalledError",
+    "fatal": false
+  },
+  {
+    "t_ms": 11380,
+    "kind": "playing",
+    "currentTime": 1.944312
+  }
+]

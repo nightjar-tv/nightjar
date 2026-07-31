@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ABR throttle probe — hls.js</title>
+  <style>
+    body { font: 14px/1.4 system-ui; margin: 16px; background: #111; color: #eee; }
+    video { width: 640px; max-width: 100%; background: #000; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px;
+           max-height: 320px; overflow: auto; border: 1px solid #333; padding: 8px; }
+  </style>
+</head>
+<body>
+  <h1>hls.js ABR under throttle</h1>
+  <video id="v" controls muted autoplay playsinline></video>
+  <p id="status">loading…</p>
+  <div id="log"></div>
+  <script type="module">
+    // Prefer web's installed hls.js; fall back to CDN only if missing.
+    let Hls;
+    try {
+      const mod = await import('/vendor/hls.mjs');
+      Hls = mod.default;
+    } catch {
+      const mod = await import('https://cdn.jsdelivr.net/npm/hls.js@1.5.17/+esm');
+      Hls = mod.default;
+    }
+
+    const video = document.getElementById('v');
+    const status = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const events = [];
+    const t0 = performance.now();
+
+    function note(kind, detail) {
+      const row = { t_ms: Math.round(performance.now() - t0), kind, ...detail };
+      events.push(row);
+      logEl.textContent = events.map(e => JSON.stringify(e)).join('\n');
+      if (kind === 'level') {
+        status.textContent = `level=${detail.level} ${detail.width}x${detail.height} @${detail.bitrate}`;
+      }
+    }
+
+    window.__abrEvents = events;
+    window.__abrDone = false;
+
+    const src = new URL('/master.m3u8', location.href).href;
+    if (!Hls.isSupported()) {
+      status.textContent = 'hls.js not supported';
+      window.__abrDone = true;
+      throw new Error('no hls.js');
+    }
+    const hls = new Hls({
+      enableWorker: true,
+      // Prefer starting high so a downshift under the 1 Mbps proxy is visible;
+      // leave currentLevel alone so auto level stays enabled.
+      startLevel: 2,
+      abrEwmaDefaultEstimate: 5e6,
+      abrBandWidthFactor: 0.7,
+      abrBandWidthUpFactor: 0.5,
+    });
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+      note('manifest', { levels: data.levels.map(l => ({
+        bitrate: l.bitrate, width: l.width, height: l.height, url: l.url
+      }))});
+      video.play().catch(() => {});
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
+      const l = hls.levels[data.level];
+      note('level', {
+        level: data.level,
+        bitrate: l?.bitrate,
+        width: l?.width,
+        height: l?.height,
+      });
+    });
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      note('error', { type: data.type, details: data.details, fatal: data.fatal });
+    });
+    video.addEventListener('playing', () => note('playing', { currentTime: video.currentTime }));
+    video.addEventListener('waiting', () => note('waiting', { currentTime: video.currentTime }));
+    video.addEventListener('stalled', () => note('stalled', { currentTime: video.currentTime }));
+
+    // Stop after ~45s of wall time so the harness can scrape events.
+    setTimeout(() => {
+      note('stop', { currentTime: video.currentTime, level: hls.currentLevel });
+      window.__abrDone = true;
+      hls.destroy();
+    }, 45000);
+  </script>
+</body>
+</html>

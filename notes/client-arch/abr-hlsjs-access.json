@@ -1,0 +1,227 @@
+[
+  {
+    "t": 1785473512.057589,
+    "path": "/page.html",
+    "bytes": 3363,
+    "sent": 3363,
+    "elapsed_s": 0.0,
+    "rendition": null,
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473512.141074,
+    "path": "/vendor/hls.mjs",
+    "bytes": 1306989,
+    "sent": 1306989,
+    "elapsed_s": 11.053,
+    "rendition": null,
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473523.2262242,
+    "path": "/master.m3u8",
+    "bytes": 326,
+    "sent": 326,
+    "elapsed_s": 0.0,
+    "rendition": null,
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473523.2579598,
+    "path": "/hi/index.m3u8",
+    "bytes": 972,
+    "sent": 972,
+    "elapsed_s": 0.0,
+    "rendition": "hi",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473523.3155682,
+    "path": "/hi/init.mp4",
+    "bytes": 1371,
+    "sent": 1371,
+    "elapsed_s": 0.0,
+    "rendition": "hi",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473523.324259,
+    "path": "/hi/seg0.m4s",
+    "bytes": 1006953,
+    "sent": 1006953,
+    "elapsed_s": 8.365,
+    "rendition": "hi",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473531.707297,
+    "path": "/lo/index.m3u8",
+    "bytes": 972,
+    "sent": 972,
+    "elapsed_s": 0.0,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473531.710109,
+    "path": "/lo/init.mp4",
+    "bytes": 1372,
+    "sent": 1372,
+    "elapsed_s": 0.0,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473531.712128,
+    "path": "/lo/seg0.m4s",
+    "bytes": 164804,
+    "sent": 164804,
+    "elapsed_s": 1.361,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473533.077441,
+    "path": "/lo/seg1.m4s",
+    "bytes": 182723,
+    "sent": 182723,
+    "elapsed_s": 1.507,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473534.589739,
+    "path": "/lo/seg2.m4s",
+    "bytes": 197146,
+    "sent": 197146,
+    "elapsed_s": 1.653,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473536.245044,
+    "path": "/lo/seg3.m4s",
+    "bytes": 206362,
+    "sent": 206362,
+    "elapsed_s": 1.713,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473537.974408,
+    "path": "/lo/seg4.m4s",
+    "bytes": 208431,
+    "sent": 208431,
+    "elapsed_s": 1.697,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473539.676349,
+    "path": "/lo/seg5.m4s",
+    "bytes": 191274,
+    "sent": 191274,
+    "elapsed_s": 1.58,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473541.259657,
+    "path": "/lo/seg6.m4s",
+    "bytes": 176009,
+    "sent": 176009,
+    "elapsed_s": 1.444,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473542.706403,
+    "path": "/lo/seg7.m4s",
+    "bytes": 158365,
+    "sent": 158365,
+    "elapsed_s": 1.296,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473544.006363,
+    "path": "/lo/seg8.m4s",
+    "bytes": 159971,
+    "sent": 159971,
+    "elapsed_s": 1.289,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473545.298559,
+    "path": "/lo/seg9.m4s",
+    "bytes": 195778,
+    "sent": 195778,
+    "elapsed_s": 1.569,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473546.8705852,
+    "path": "/lo/seg10.m4s",
+    "bytes": 210670,
+    "sent": 210670,
+    "elapsed_s": 1.699,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473548.5732238,
+    "path": "/lo/seg11.m4s",
+    "bytes": 183572,
+    "sent": 183572,
+    "elapsed_s": 1.503,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473550.079236,
+    "path": "/lo/seg12.m4s",
+    "bytes": 180728,
+    "sent": 180728,
+    "elapsed_s": 1.492,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473551.574183,
+    "path": "/lo/seg13.m4s",
+    "bytes": 192103,
+    "sent": 192103,
+    "elapsed_s": 1.596,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473553.173831,
+    "path": "/lo/seg14.m4s",
+    "bytes": 174677,
+    "sent": 174677,
+    "elapsed_s": 1.436,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473554.613389,
+    "path": "/lo/seg15.m4s",
+    "bytes": 203232,
+    "sent": 203232,
+    "elapsed_s": 1.645,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  },
+  {
+    "t": 1785473556.261665,
+    "path": "/lo/seg16.m4s",
+    "bytes": 184166,
+    "sent": 147456,
+    "elapsed_s": 1.497,
+    "rendition": "lo",
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrom"
+  }
+]

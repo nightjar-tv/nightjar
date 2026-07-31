@@ -1,7 +1,8 @@
 # Client engine bake-off
 
-Status: Steps 1 / 1b / 1c held. Step 2 (profile ADR + N100 capacity) and
-Step 3 (ABR throttle) not started.
+Status: Steps 1 / 1b / 1c held. Step 3 (ABR throttle) recorded — does not
+overturn the engine path for v1. Step 2 (profile ADR + N100 capacity) desk
+work, not started.
 Date: 2026-07-31
 
 Framing: decision note for Phase 4 player architecture (engine vs platform
@@ -270,8 +271,8 @@ Detail: `notes/client-arch/transcode-cut-grid-2026-07-31.md`.
 
 - Bandwidth: ceiling choice sets whether sessions are 49% / 21% / 2% of the
   library. Sessions remain the remote/bitrate path.
-- ABR quality under libmpv on a throttled multi-variant playlist (Step 3):
-  the only scenario that partially reopens platform players.
+- Post-v1 ABR under libmpv: measured weak vs hls.js (Step 3). Does not reopen
+  AVPlayer for Matroska; does constrain how ABR must be designed later.
 
 **Server consequence**
 
@@ -310,10 +311,38 @@ The ADR must reckon with:
    1080p; 21% or 2% of playback is what lands there depending on the
    ceiling. Convert the percentage into a hardware answer.
 
-### Step 3 — still open
+### Step 3 — ABR under engine (recorded)
 
-libmpv / `media_kit` vs hls.js on the same multi-variant playlist under
-throttle. Only partial reopen of platform players.
+Instrument: `scripts/abr_throttle_probe/` (three-rung ladder + 1 Mbps byte-rate
+proxy). Same playlist, same throttle, two clients. Source: Elementary 3x05
+mid-title 60 s window; rungs hi/mid/lo at ~4.5 / 1.7 / 0.75 Mbps tagged
+BANDWIDTH.
+
+| Client | Under 1 Mbps throttle |
+|---|---|
+| **mpv 0.41** (`--hls-bitrate=max`, the default) | Probes early segments of all three rungs, then **stays on hi**. hi segments take **8–12 s** to fetch for 2 s of media. No mid-stream downshift in 30 s. mpv's only HLS bitrate choices are `no` / `min` / `max` / integer — **no auto ABR mode**. |
+| **hls.js** (web's bundled build, Chrome CDP) | Starts on hi (`startLevel: 2`), **downshifts to lo within ~1.1 s** of the first level event (t≈8.8s → 9.9s). Proxy sequence `hllllllll…`. One non-fatal `bufferStalledError`, then sustained play on lo (~1.3–1.7 s/seg). |
+
+Raw: `notes/client-arch/abr-mpv-max-log.json`,
+`notes/client-arch/abr-hlsjs-events.json`,
+`notes/client-arch/abr-hlsjs-access.json`.
+
+**What the user sees:** mpv (and by extension libmpv / ffmpeg's HLS demuxer)
+on a multi-variant playlist under a thin link: stalls / waits on the top rung.
+hls.js: brief stall, then continuous playback at the sustainable rung.
+
+**Does this reopen platform players?** Partially, and only for the ABR case.
+It does **not** overturn the engine decision for v1:
+
+- ADR-0008 already keeps ABR post-v1. v1 remote is **one server-chosen
+  rendition** (Auto / High / Original), not a client-switched ladder.
+- Compatibility + honest full-title transcode (Steps 1 / 1c) still favour the
+  engine for the household library.
+- When ABR eventually lands, do **not** assume libmpv will absorb a ladder.
+  Keep server-side selection, or pair the engine with a real ABR stack
+  (hls.js-class, ExoPlayer, or an mpv fork that actually adapts). That is a
+  Phase / post-v1 design choice, not a reason to keep AVPlayer as the
+  Matroska path today.
 
 ### Phase 4 / ADR-0020
 
@@ -322,3 +351,5 @@ throttle. Only partial reopen of platform players.
 - ADR-0020 stands for copy/remux sessions. Transcode may publish honest
   full-title playlists (1c).
 - T2/T3/T4 confirmation on a laptop prototype when Phase 4 starts.
+- Step 2 (profile ADR + N100 capacity) remains desk work, well-specified,
+  not started.

@@ -1,0 +1,173 @@
+[
+  {
+    "t": 1785473242.8188028,
+    "path": "/master.m3u8",
+    "bytes": 326,
+    "sent": 326,
+    "elapsed_s": 0.0,
+    "rendition": null,
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.825261,
+    "path": "/master.m3u8",
+    "bytes": 326,
+    "sent": 326,
+    "elapsed_s": 0.0,
+    "rendition": null,
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.827177,
+    "path": "/hi/index.m3u8",
+    "bytes": 972,
+    "sent": 972,
+    "elapsed_s": 0.0,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.828212,
+    "path": "/mid/index.m3u8",
+    "bytes": 972,
+    "sent": 972,
+    "elapsed_s": 0.0,
+    "rendition": "mid",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.828912,
+    "path": "/lo/index.m3u8",
+    "bytes": 972,
+    "sent": 972,
+    "elapsed_s": 0.0,
+    "rendition": "lo",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.8298619,
+    "path": "/hi/init.mp4",
+    "bytes": 1371,
+    "sent": 1371,
+    "elapsed_s": 0.0,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473243.040512,
+    "path": "/mid/init.mp4",
+    "bytes": 1376,
+    "sent": 1376,
+    "elapsed_s": 0.0,
+    "rendition": "mid",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473243.253464,
+    "path": "/lo/init.mp4",
+    "bytes": 1372,
+    "sent": 1372,
+    "elapsed_s": 0.0,
+    "rendition": "lo",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473243.254528,
+    "path": "/lo/seg0.m4s",
+    "bytes": 164804,
+    "sent": 164804,
+    "elapsed_s": 1.367,
+    "rendition": "lo",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473243.255234,
+    "path": "/lo/seg1.m4s",
+    "bytes": 182723,
+    "sent": 182723,
+    "elapsed_s": 1.499,
+    "rendition": "lo",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473243.0441742,
+    "path": "/mid/seg0.m4s",
+    "bytes": 390150,
+    "sent": 390150,
+    "elapsed_s": 3.206,
+    "rendition": "mid",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473243.046016,
+    "path": "/mid/seg1.m4s",
+    "bytes": 399652,
+    "sent": 399652,
+    "elapsed_s": 3.271,
+    "rendition": "mid",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.830859,
+    "path": "/hi/seg0.m4s",
+    "bytes": 1006953,
+    "sent": 1006953,
+    "elapsed_s": 8.355,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473242.831886,
+    "path": "/hi/seg1.m4s",
+    "bytes": 1018653,
+    "sent": 1018653,
+    "elapsed_s": 12.329,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473251.21346,
+    "path": "/hi/seg2.m4s",
+    "bytes": 1063921,
+    "sent": 1063921,
+    "elapsed_s": 8.819,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473255.162997,
+    "path": "/hi/seg3.m4s",
+    "bytes": 1085102,
+    "sent": 1085102,
+    "elapsed_s": 9.378,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473260.035997,
+    "path": "/hi/seg4.m4s",
+    "bytes": 1299117,
+    "sent": 1299117,
+    "elapsed_s": 10.774,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473270.8139122,
+    "path": "/hi/seg6.m4s",
+    "bytes": 1009775,
+    "sent": 155648,
+    "elapsed_s": 1.289,
+    "rendition": "hi",
+    "ua": "libmpv"
+  },
+  {
+    "t": 1785473264.545365,
+    "path": "/hi/seg5.m4s",
+    "bytes": 1059876,
+    "sent": 704512,
+    "elapsed_s": 7.636,
+    "rendition": "hi",
+    "ua": "libmpv"
+  }
+]
