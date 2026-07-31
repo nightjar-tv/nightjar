@@ -8,7 +8,7 @@ pub use filename::{ParsedName, parse_filename};
 pub use models::{LibraryKind, MediaKind};
 pub use playback::{
     BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
-    mime_for_path,
+    method_from_manifest_expect, mime_for_path,
 };
 
 pub fn version() -> &'static str {

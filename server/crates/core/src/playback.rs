@@ -200,6 +200,32 @@ pub fn mime_for_path(path: &str) -> String {
     .to_string()
 }
 
+/// Map a `testdata/manifest.json` `expect` string to the Gate 2 decision
+/// method, or `None` when the row is not a playback-method claim (sidecars,
+/// pending sources, Range-only fixtures).
+pub fn method_from_manifest_expect(expect: &str) -> Option<PlaybackMethod> {
+    let e = expect.to_ascii_lowercase();
+    if e.contains("not a media item")
+        || e.contains("once sourced")
+        || e.contains("open-ended range")
+        || e.contains("range past")
+        || e.contains("pending source")
+    {
+        return None;
+    }
+    // Session / remux before "direct play" so "session, not direct play" wins.
+    if e.contains("remux") || e.contains("session, not direct play") || e.contains("session with") {
+        return Some(PlaybackMethod::Remux);
+    }
+    if e.contains("needs transcode") || e.contains("structured scan_error") {
+        return Some(PlaybackMethod::Transcode);
+    }
+    if e.contains("direct play") {
+        return Some(PlaybackMethod::DirectPlay);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +461,35 @@ mod tests {
         assert_eq!(d.method, PlaybackMethod::Transcode);
         assert!(d.reason.contains("audio codec unsupported"));
         assert!(!d.reason.contains("video codec unsupported"));
+    }
+
+    #[test]
+    fn manifest_expect_strings_map_to_methods() {
+        assert_eq!(
+            method_from_manifest_expect("browser direct play"),
+            Some(PlaybackMethod::DirectPlay)
+        );
+        assert_eq!(
+            method_from_manifest_expect("remux as an HLS copy session (container only; ADR-0011)"),
+            Some(PlaybackMethod::Remux)
+        );
+        assert_eq!(
+            method_from_manifest_expect(
+                "session, not direct play: 8 channels exceed the browser ceiling"
+            ),
+            Some(PlaybackMethod::Remux)
+        );
+        assert_eq!(
+            method_from_manifest_expect("needs transcode (AC3)"),
+            Some(PlaybackMethod::Transcode)
+        );
+        assert_eq!(
+            method_from_manifest_expect("structured scan_error; no crash"),
+            Some(PlaybackMethod::Transcode)
+        );
+        assert_eq!(
+            method_from_manifest_expect("not a media item; associated to Movie.mp4"),
+            None
+        );
     }
 }

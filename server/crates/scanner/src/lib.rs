@@ -7,6 +7,7 @@ mod walk;
 mod watch;
 
 pub use pool::LibraryPool;
+pub use probe::{ProbeResult, ffprobe};
 pub use reachability::{Reachability, allow_delete_missing, check_root};
 pub use walk::{
     WalkCache, WalkOutcome, walk_concurrency, walk_media_files_cached,

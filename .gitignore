@@ -41,3 +41,9 @@ scripts/playlist_shape_probe/static/media/
 scripts/playlist_shape_probe/static/hls.min.js
 .tmp-ffmpeg-*/
 
+# Script bytecode
+scripts/__pycache__/
+
+# Gate 2 orphan soak live logs (script is tracked; runs are local)
+notes/gate2/
+

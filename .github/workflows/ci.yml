@@ -94,11 +94,11 @@ jobs:
         working-directory: server
         run: cargo build --release -p nightjar-api
       - name: Generate corpus seeds
-        run: chmod +x testdata/generate.sh testdata/bench_10k.sh scripts/gate1_ci.sh scripts/gate1_scan_10k.sh && ./testdata/generate.sh
+        run: chmod +x testdata/generate.sh testdata/bench_10k.sh scripts/gate1_ci.sh scripts/gate1_scan_10k.sh scripts/ci_benchmark_summary.py && ./testdata/generate.sh
       - name: Gate 1 smoke (startup, RAM, WAL kill-9, Range)
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
-        run: ./scripts/gate1_ci.sh
+        run: ./scripts/gate1_ci.sh | tee /tmp/gate1_ci.txt
       - name: Gate 1 scan 10k
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
@@ -106,4 +106,20 @@ jobs:
           # ADR-0004: floor catches half-speed regressions, not runner jitter.
           # ubuntu-latest often sits ~50 files/sec; 40 still fails a true halving.
           PROBE_FLOOR_FPS: "40"
-        run: ./scripts/gate1_scan_10k.sh
+        run: ./scripts/gate1_scan_10k.sh | tee /tmp/gate1_scan.txt
+      - name: Benchmark delta (report only)
+        env:
+          NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
+        run: |
+          # Baseline is optional until notes/ci/gate-metrics-baseline.json is
+          # seeded from a green main run (notes/ci/README.md). Missing file →
+          # "no baseline" in the summary; do not invent null placeholders.
+          args=(/tmp/gate1_ci.txt /tmp/gate1_scan.txt)
+          if [[ -f notes/ci/gate-metrics-baseline.json ]]; then
+            args+=(notes/ci/gate-metrics-baseline.json)
+          fi
+          python3 scripts/ci_benchmark_summary.py "${args[@]}" | tee /tmp/gate-metrics.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-metrics
+          path: /tmp/gate-metrics.json
