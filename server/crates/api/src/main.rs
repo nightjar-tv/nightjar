@@ -55,6 +55,8 @@ async fn main() {
     }
     pool.drain_pending_extracts()
         .unwrap_or_else(|e| tracing::warn!(error = %e, "enqueue pending subtitle extracts failed"));
+    pool.drain_pending_maps()
+        .unwrap_or_else(|e| tracing::warn!(error = %e, "enqueue pending keyframe maps failed"));
     if let Err(e) = pool.cleanup_orphan_subtitles() {
         tracing::warn!(error = %e, "subtitle orphan cleanup failed");
     }

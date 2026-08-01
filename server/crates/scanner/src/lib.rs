@@ -1,11 +1,13 @@
 //! Library scanner: index pass, then bounded ffprobe pool (ADR-0004).
 
+mod keymap;
 mod pool;
 mod probe;
 mod reachability;
 mod walk;
 mod watch;
 
+pub use keymap::{KeyframeEntry, KeyframeMapBuild, build_keyframe_map};
 pub use pool::LibraryPool;
 pub use probe::{ProbeResult, ffprobe};
 pub use reachability::{Reachability, allow_delete_missing, check_root};
@@ -183,6 +185,17 @@ fn run_scan_job(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path_str.clone());
                     let parsed = parse_filename(&file_name);
+                    let content_id = match nightjar_db::content_id_for_path(&file.path) {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %file.path.display(),
+                                error = %e,
+                                "content_id read failed; map rebuild will retry"
+                            );
+                            None
+                        }
+                    };
                     pending_upserts.push(UpsertItem {
                         path: path_str,
                         mtime_ms: file.mtime_ms,
@@ -192,6 +205,7 @@ fn run_scan_job(
                         year: parsed.year,
                         season: parsed.season,
                         episode: parsed.episode,
+                        content_id,
                     });
                     pending_were_existing.push(existing.is_some());
                     if pending_upserts.len() >= INDEX_BATCH {
@@ -348,10 +362,12 @@ fn run_scan_job(
         .map(|item| (item.item_id, item.path.clone()))
         .collect();
     pool.enqueue_probe_batch(probe_queue).wait();
-    for (item_id, path) in probe_ids {
-        pool.enqueue(pool::WorkItem::extract(item_id, library_id, path));
+    for (item_id, path) in &probe_ids {
+        pool.enqueue(pool::WorkItem::extract(*item_id, library_id, path.clone()));
+        pool.enqueue_map_rebuild(*item_id, library_id, path.clone());
     }
     pool.drain_pending_extracts()?;
+    pool.drain_pending_maps()?;
     let probe_duration_ms = probe_started.elapsed().as_millis() as u64;
     db.complete_scan_job(job_id, probe_duration_ms)?;
 

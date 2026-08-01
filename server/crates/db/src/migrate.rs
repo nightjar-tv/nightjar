@@ -10,6 +10,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         6,
         include_str!("../migrations/006_library_availability.sql"),
     ),
+    (
+        7,
+        include_str!("../migrations/007_content_identity_keyframe_map.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -100,7 +104,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, 7);
         let has_reachable: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('libraries') WHERE name = 'reachable'",
@@ -109,6 +113,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_reachable, 1);
+        let has_content_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'content_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_content_id, 1);
+        let has_map: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'keyframe_map_entries'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_map, 1);
         migrate(&conn).unwrap(); // idempotent
     }
 
@@ -145,6 +165,14 @@ mod tests {
             .query_row("SELECT reachable FROM libraries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(reachable, 1);
+        let map_status: String = conn
+            .query_row("SELECT map_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(map_status, "pending");
+        let content_id: Option<String> = conn
+            .query_row("SELECT content_id FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(content_id, None);
     }
 
     #[test]
@@ -210,5 +238,52 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn migration_7_adds_identity_and_map_without_dropping_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(6) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, probe_status, subtitle_status
+             ) VALUES (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie', 'probed', 'ready');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 1);
+        let map_status: String = conn
+            .query_row("SELECT map_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(map_status, "pending");
+        // No moov cache table — per-session rebuild (ADR-0023 §3c).
+        let moov_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%moov%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moov_tables, 0);
     }
 }

@@ -1,8 +1,9 @@
 # ADR-0023: Keyframe map and byte-offset session start
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-01
-- Gate: Phase 2 / Gate 2 (schedule with ADR-0022; schemas stay separate)
+- Gate: Phase 2 / Gate 2 (priority over remaining ADR-0022 profile work;
+  schemas stay separate)
 - Related: [ADR-0020](0020-copy-mode-segment-boundaries.md) (`landedMs`),
   [ADR-0022](0022-capability-profiles.md) (client reports; this is how the
   server reads), [ADR-0013](0013-subtitle-extraction-at-scan.md) /
@@ -163,15 +164,13 @@ scope; map byte offsets are stored so that work needs no second index pass.
 #### 3c. Virtual `moov'` lifetime (MP4)
 
 The rewritten `moov` is **computed**, not a second copy of the media file.
-Decide at implementation (either is allowed; pick one and stick to it):
 
-| Choice | Rule |
-|---|---|
-| **Per session (default lean)** | Build `moov'` when the virtual file is bound; drop with the session. Always matches the bytes about to be served; pays rewrite cost on each session that needs end-moov relocation (~1–3 s observed on dogfood sizes for a full rewrite — optimise later if needed, e.g. rewrite only once per process cache keyed below). |
-| **Cached with the map** | Store `moov'` (or an equivalent rewrite artifact) beside the keyframe map under the same **`content_id`**. On fingerprint mismatch, invalidate like every other derived artifact (§6). Do not cache without the fingerprint. |
-
-Default recommendation: **per session** until rewrite cost shows up in
-Gate 2 cold dogfood; if cached, fingerprint is mandatory.
+**Settled: per session.** Build `moov'` when the virtual file is bound; drop
+with the session. No `moov'` table or on-disk cache. Always matches the bytes
+about to be served; pays rewrite cost on each session that needs end-moov
+relocation (~1–3 s observed on dogfood sizes for a full rewrite). If Gate 2
+cold dogfood shows that cost in the land path, revisit caching — any cache
+must carry `content_id` like every other derived artifact (§6).
 
 ### 4. Scope of the virtual file
 
@@ -185,6 +184,30 @@ session to an FFmpeg subprocess.
 - **Two handlers, one concept:** Matroska Cluster splice vs MP4 virtual
   faststart. Same binding rules; different byte maps. Never feed MP4 into
   the Matroska splice handler.
+
+**Mid-playback replace (settled).** *arr quality upgrades often rename over
+the path while a session is open. An open FD that still holds the old inode
+may keep playing old bytes until that producer exits — that is acceptable
+and is why an in-flight session does not need to be killed on replace.
+Someone will otherwise "fix" a live session that is still correct on the
+old inode; do not.
+
+The dangerous case is the **next** bind (session start or post-seek run)
+opening the new file with the old map's byte offsets.
+
+At every virtual-file bind / FFmpeg input open: compute live `content_id`
+from the path and compare it to the `content_id` the map (and this bind)
+was keyed on. On mismatch: **do not** serve map offsets; fall through to
+§8 (`-ss` on the real file + enqueue rebuild). Do not keep a bound virtual
+file across an identity change. In-place truncate under a live FD (rare vs
+atomic replace) surfaces as producer failure; treat that as §8, not as a
+reason to keep splicing.
+
+**Bind-time fingerprint cost.** Revalidation reads 128 KiB per bind. Cold
+NAS preads are why this slice exists — do not assume that is free. Measure
+land-path cost with the handlers. If it shows, cache the verified
+fingerprint on the session and re-check the cheap mtime/size pair on later
+binds in that session; full window re-hash only when mtime/size moved.
 
 ### 5. Advertise the snapped land
 
@@ -202,55 +225,86 @@ are the normal case.
 - extracted ASS (ADR-0019)
 - usable extent
 - keyframe map (this ADR)
-- cached MP4 `moov'` if that choice is taken (§3c)
 - later trickplay
+
+MP4 `moov'` is per-session (§3c), not a derived artifact.
 
 **Media vs sidecars:** Bazarr writing an SRT updates `media_item_sidecars`
 only — not a re-probe and not a new keyframe map.
 
-**Identity:** `content_id` = **`size_bytes` + hash of first 64 KiB + hash of
-last 64 KiB`** (fit prefix/suffix when smaller). **Computed at scan and
-stored.** Invalidation is a **comparison**, not a re-read on every session.
-Rescan still uses mtime/size to choose paths; fingerprint decides derived
+**Identity:** `content_id` = **`size_bytes` + sha256(first 64 KiB) +
+sha256(last 64 KiB)`** (fit prefix/suffix when smaller). **Computed at
+scan and stored.** Day-to-day invalidation is a **stored comparison**
+against derived stamps. Bind-time revalidation (§4) re-reads the windows
+because a replace can land before the next scan. Rescan still uses
+mtime/size to choose which paths to touch; fingerprint decides derived
 validity. On mismatch: stale derived rows + **enqueue rebuild** (§8).
 mtime/size alone is rejected for map invalidation.
 
+The fingerprint is an identity check, not a security boundary. SHA-256 is
+the digest in tree today; a lighter non-cryptographic hash is a fair later
+argument if cost shows up — do not hand-roll one.
+
 ### 7. On-disk / on-wire shapes (Rule 4.9 — before any writer)
 
-**`media_file_identity`** (indicative):
+Locked in migration `007_content_identity_keyframe_map.sql`. Identity columns
+live on `media_items` (not a separate identity table): `size_bytes` /
+`mtime_ms` already exist; fingerprint stamps sit beside them.
+
+**`content_id` string shape** (`nightjar_db::format_content_id`):
+
+`{size_bytes}-{sha256_hex(first 64 KiB)}-{sha256_hex(last 64 KiB)}`
+
+Lowercase hex digests; windows truncate when the file is smaller than 64 KiB.
+Invalidation is string equality (`content_id_matches`).
+
+**`media_items` additions:**
+
+| Column | Role |
+|---|---|
+| `content_id` | live fingerprint, computed at scan |
+| `probed_content_id` | identity probe columns were built under |
+| `subtitle_content_id` | identity embedded extracts were built under |
+| `usable_extent_ms` | DEF-8519 damage signal from map/index pass |
+| `usable_extent_content_id` | identity that extent was measured under |
+| `map_status` | `pending` \| `ready` \| `error` \| `unavailable` |
+| `map_content_id` | identity the map entries were built under |
+
+Sidecars stay on `media_item_sidecars` with their own mtime/size. A Bazarr SRT
+does not change `content_id` and must not force re-probe or a new map.
+
+**`keyframe_map_entries`:**
 
 | Column | Role |
 |---|---|
 | `media_item_id` | FK |
-| `content_id` | fingerprint hex, stored at scan |
-| `size_bytes`, `mtime_ms` | last observed |
-| `probed_content_id` | identity probe rows were built under |
-
-**`keyframe_map_entries`** (indicative):
-
-| Column | Role |
-|---|---|
-| `media_item_id` | FK |
-| `content_id` | must match live identity |
+| `content_id` | must match live identity to be used |
 | `container_kind` | `matroska` \| `mp4` |
 | `pts_ms` | title-absolute |
 | `byte_offset` | kind-specific (§1) |
-| `map_status` | `pending` \| `ready` \| `error` (may live on `media_items`) |
 
-If MP4 `moov'` is cached (§3c), its store carries `content_id` the same way.
+No MP4 `moov'` store (§3c settled per session).
 
-Wire: clients keep **`landedMs`** (ADR-0020). No new capability field.
-
-Exact migrations land in the implementation PR after this ADR is accepted.
+Wire: clients keep **`landedMs`** (ADR-0020). No new session response field.
 
 ### 8. Fallback when there is no map
 
 No ready map, or `content_id` mismatch: **today’s `-ss` on the real file**
 (no virtual faststart / no Cluster splice). Do not fail the session.
 
-**Rebuild trigger (required).** That fallback **must enqueue a map rebuild**
-unless one is already pending or in flight. Invalidation without rebuild
-leaves the title on the slow path forever.
+**Rebuild trigger (required — writers slice, not deferred).** That fallback
+**must enqueue a map rebuild** unless one is already pending or in flight.
+The same enqueue runs when index upsert clears map rows on replace (mtime /
+size path). *arr upgrades make replace continuous; without the trigger,
+every upgraded title sits on the ~7 s path until a full rescan. Clearing
+rows without rebuild is not a complete invalidation path.
+
+**Concurrency bound.** Map rebuild shares the existing library worker pool
+(ADR-0004 / ADR-0013): same 2–16 workers, probes first, background work
+(subtitle extract and map) behind the index gate unless priority. Do not
+grow a second unbounded walker queue — a season-wide *arr upgrade would
+otherwise saturate the share with packet walks on the ~16% without a usable
+index while someone is watching.
 
 ## Consequences
 
@@ -258,8 +312,8 @@ leaves the title on the slow path forever.
   mechanism locked and mid-seek cold under 3 s on two end-moov titles after
   purge; MP4 far-scrub cold still implement-time dogfood.
 - Two start paths, one map schema, one virtual-file binding model.
-- Identity fingerprint is the common invalidation key; optional cached
-  `moov'` uses it too.
+- Identity fingerprint is the common invalidation key. MP4 `moov'` is
+  per-session, not a derived artifact.
 - Full-title playlist cook remains dead for cold-seek latency.
 - ADR-0022 stays a separate schema and slice.
 

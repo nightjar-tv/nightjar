@@ -13,6 +13,8 @@ use std::time::Duration;
 pub enum WorkKind {
     Probe,
     Extract,
+    /// Keyframe map build (ADR-0023). Shares the background queue with Extract.
+    Map,
 }
 
 #[derive(Clone)]
@@ -51,11 +53,24 @@ impl WorkItem {
             batch: None,
         }
     }
+
+    pub fn map(item_id: i64, library_id: i64, path: PathBuf) -> Self {
+        Self {
+            kind: WorkKind::Map,
+            item_id,
+            library_id,
+            path,
+            scan_job_id: None,
+            priority: false,
+            batch: None,
+        }
+    }
 }
 
 struct Queue {
     probes: VecDeque<WorkItem>,
-    extracts: VecDeque<WorkItem>,
+    /// Subtitle extract + keyframe map (ADR-0023 shares this bound with extract).
+    background: VecDeque<WorkItem>,
 }
 
 struct ProbeBatchState {
@@ -95,6 +110,8 @@ pub struct LibraryPool {
     index_active: AtomicUsize,
     /// Item ids whose extract worker is running (not merely queued).
     extracting: Mutex<HashSet<i64>>,
+    /// Item ids whose map worker is running (not merely queued).
+    mapping: Mutex<HashSet<i64>>,
     pub availability: Arc<Availability>,
 }
 
@@ -106,7 +123,7 @@ impl LibraryPool {
             subs,
             queue: Mutex::new(Queue {
                 probes: VecDeque::new(),
-                extracts: VecDeque::new(),
+                background: VecDeque::new(),
             }),
             available: Condvar::new(),
             walk_caches: Mutex::new(HashMap::new()),
@@ -114,6 +131,7 @@ impl LibraryPool {
             scan_dirty: Mutex::new(HashSet::new()),
             index_active: AtomicUsize::new(0),
             extracting: Mutex::new(HashSet::new()),
+            mapping: Mutex::new(HashSet::new()),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -203,18 +221,20 @@ impl LibraryPool {
             .fetch_add(1, Ordering::Relaxed);
         if reachable {
             tracing::info!(library_id, path, "library reachable");
-            let (probes, extracts) = self.db.requeue_unavailable_for_library(library_id)?;
-            if probes > 0 || extracts > 0 {
+            let (probes, extracts, maps) = self.db.requeue_unavailable_for_library(library_id)?;
+            if probes > 0 || extracts > 0 || maps > 0 {
                 tracing::info!(
                     library_id,
                     probes,
                     extracts,
+                    maps,
                     "re-queued availability failures"
                 );
             }
             self.purge_queue_for_library(library_id);
             self.drain_pending_probes()?;
             self.drain_pending_extracts()?;
+            self.drain_pending_maps()?;
         } else {
             tracing::info!(library_id, path, "library unreachable");
             self.purge_queue_for_library(library_id);
@@ -240,13 +260,13 @@ impl LibraryPool {
             }
         }
         queue.probes = kept_probes;
-        let mut kept_extracts = VecDeque::new();
-        while let Some(item) = queue.extracts.pop_front() {
+        let mut kept_background = VecDeque::new();
+        while let Some(item) = queue.background.pop_front() {
             if item.library_id != library_id {
-                kept_extracts.push_back(item);
+                kept_background.push_back(item);
             }
         }
-        queue.extracts = kept_extracts;
+        queue.background = kept_background;
     }
 
     pub fn enqueue(&self, item: WorkItem) {
@@ -256,18 +276,40 @@ impl LibraryPool {
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         match item.kind {
             WorkKind::Probe => queue.probes.push_back(item),
-            WorkKind::Extract => Self::enqueue_extract_unique(&mut queue, item),
+            WorkKind::Extract | WorkKind::Map => {
+                Self::enqueue_background_unique(&mut queue, item);
+            }
         }
         self.available.notify_one();
     }
 
-    fn enqueue_extract_unique(queue: &mut Queue, item: WorkItem) {
-        // Same-pass enqueue + drain_pending_extracts can otherwise queue the
-        // same item twice and waste another multi-minute demux.
-        if queue.extracts.iter().any(|w| w.item_id == item.item_id) {
+    fn enqueue_background_unique(queue: &mut Queue, item: WorkItem) {
+        // Same-pass enqueue + drain can otherwise queue the same item twice.
+        if queue
+            .background
+            .iter()
+            .any(|w| w.item_id == item.item_id && w.kind == item.kind)
+        {
             return;
         }
-        queue.extracts.push_back(item);
+        queue.background.push_back(item);
+    }
+
+    /// Enqueue a map rebuild unless one is already pending or in flight (ADR-0023 §8).
+    pub fn enqueue_map_rebuild(&self, item_id: i64, library_id: i64, path: PathBuf) {
+        if self.availability.pause.is_paused(library_id) {
+            return;
+        }
+        if self
+            .mapping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&item_id)
+        {
+            return;
+        }
+        let _ = self.db.mark_map_pending(item_id);
+        self.enqueue(WorkItem::map(item_id, library_id, path));
     }
 
     /// Move an item's extract to the front of the queue (first-play path).
@@ -288,22 +330,58 @@ impl LibraryPool {
             return;
         }
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = queue.extracts.iter().position(|w| w.item_id == item_id) {
+        if let Some(pos) = queue
+            .background
+            .iter()
+            .position(|w| w.item_id == item_id && w.kind == WorkKind::Extract)
+        {
             if pos == 0 {
-                if let Some(front) = queue.extracts.front_mut() {
+                if let Some(front) = queue.background.front_mut() {
                     front.priority = true;
                 }
                 self.available.notify_one();
                 return;
             }
-            if let Some(mut item) = queue.extracts.remove(pos) {
+            if let Some(mut item) = queue.background.remove(pos) {
                 item.priority = true;
-                queue.extracts.push_front(item);
+                queue.background.push_front(item);
             }
         } else {
             let mut item = WorkItem::extract(item_id, library_id, path);
             item.priority = true;
-            queue.extracts.push_front(item);
+            queue.background.push_front(item);
+        }
+        self.available.notify_one();
+    }
+
+    /// Priority map rebuild for session fallback (ADR-0023 §8).
+    pub fn prioritize_map_rebuild(&self, item_id: i64, library_id: i64, path: PathBuf) {
+        if self.availability.pause.is_paused(library_id) {
+            return;
+        }
+        if self
+            .mapping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&item_id)
+        {
+            return;
+        }
+        let _ = self.db.mark_map_pending(item_id);
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = queue
+            .background
+            .iter()
+            .position(|w| w.item_id == item_id && w.kind == WorkKind::Map)
+        {
+            if let Some(mut item) = queue.background.remove(pos) {
+                item.priority = true;
+                queue.background.push_front(item);
+            }
+        } else {
+            let mut item = WorkItem::map(item_id, library_id, path);
+            item.priority = true;
+            queue.background.push_front(item);
         }
         self.available.notify_one();
     }
@@ -348,6 +426,13 @@ impl LibraryPool {
     pub fn drain_pending_extracts(&self) -> Result<(), String> {
         for (item_id, path, _, _, library_id) in self.db.list_pending_subtitle_items()? {
             self.enqueue(WorkItem::extract(item_id, library_id, PathBuf::from(path)));
+        }
+        Ok(())
+    }
+
+    pub fn drain_pending_maps(&self) -> Result<(), String> {
+        for (item_id, path, library_id) in self.db.list_pending_map_items()? {
+            self.enqueue(WorkItem::map(item_id, library_id, PathBuf::from(path)));
         }
         Ok(())
     }
@@ -398,11 +483,11 @@ impl LibraryPool {
                     }
                     let index_busy = self.index_active.load(Ordering::SeqCst) != 0;
                     let should_pop = queue
-                        .extracts
+                        .background
                         .front()
                         .is_some_and(|front| !index_busy || front.priority);
-                    let next_extract = should_pop.then(|| queue.extracts.pop_front()).flatten();
-                    if let Some(item) = next_extract {
+                    let next_bg = should_pop.then(|| queue.background.pop_front()).flatten();
+                    if let Some(item) = next_bg {
                         if self.availability.pause.is_paused(item.library_id) {
                             continue;
                         }
@@ -418,6 +503,7 @@ impl LibraryPool {
             match item.kind {
                 WorkKind::Probe => self.probe(item),
                 WorkKind::Extract => self.extract(item),
+                WorkKind::Map => self.map_item(item),
             }
         }
     }
@@ -626,6 +712,109 @@ impl LibraryPool {
         }
         finish();
     }
+
+    fn map_item(&self, item: WorkItem) {
+        if self.availability.pause.is_paused(item.library_id) {
+            return;
+        }
+        let item_id = item.item_id;
+        {
+            let mut mapping = self.mapping.lock().unwrap_or_else(|e| e.into_inner());
+            mapping.insert(item_id);
+        }
+        let finish = || {
+            self.mapping
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&item_id);
+        };
+        let row = match self.db.get_item(item_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                finish();
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(item_id, error = %e, "load map item failed");
+                finish();
+                return;
+            }
+        };
+        if row.map_status == "error" {
+            finish();
+            return;
+        }
+        let content_id = match row.content_id.clone() {
+            Some(id) => id,
+            None => match nightjar_db::content_id_for_path(&item.path) {
+                Ok(id) => {
+                    if let Err(e) = self.db.set_content_id(item_id, &id) {
+                        tracing::warn!(item_id, error = %e, "store content_id failed");
+                        finish();
+                        return;
+                    }
+                    id
+                }
+                Err(e) => {
+                    tracing::warn!(item_id, error = %e, "content_id for map failed");
+                    let _ = self.db.set_map_status(item_id, "error");
+                    finish();
+                    return;
+                }
+            },
+        };
+        match crate::keymap::build_keyframe_map(&item.path, row.duration_ms) {
+            Ok(built) => {
+                let entries: Vec<(i64, i64)> = built
+                    .entries
+                    .iter()
+                    .map(|e| (e.pts_ms, e.byte_offset))
+                    .collect();
+                if let Err(e) = self.db.replace_keyframe_map(
+                    item_id,
+                    &content_id,
+                    built.container_kind,
+                    &entries,
+                    built.usable_extent_ms,
+                ) {
+                    tracing::warn!(item_id, error = %e, "store keyframe map failed");
+                    let _ = self.db.set_map_status(item_id, "error");
+                } else {
+                    tracing::info!(
+                        item_id,
+                        entries = entries.len(),
+                        source = built.source,
+                        kind = built.container_kind,
+                        "keyframe map ready"
+                    );
+                }
+            }
+            Err(e) => {
+                let unavailable = self.availability.pause.is_paused(item.library_id)
+                    || message_looks_unavailable(&e)
+                    || self
+                        .db
+                        .get_library(item.library_id)
+                        .ok()
+                        .flatten()
+                        .map(|lib| {
+                            matches!(
+                                reachability::check_root(std::path::Path::new(&lib.path)),
+                                Reachability::Unreachable
+                            )
+                        })
+                        .unwrap_or(false);
+                if unavailable {
+                    tracing::warn!(item_id, error = %e, "keyframe map unavailable");
+                    let _ = self.db.set_map_status(item_id, "unavailable");
+                } else {
+                    tracing::warn!(item_id, error = %e, "keyframe map failed");
+                    let _ = self.db.set_map_status(item_id, "error");
+                }
+            }
+        }
+        finish();
+    }
 }
 
 #[cfg(test)]
@@ -633,41 +822,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enqueue_extract_unique_skips_duplicate_item_id() {
+    fn enqueue_background_unique_skips_duplicate_kind_item() {
         let mut queue = Queue {
             probes: VecDeque::new(),
-            extracts: VecDeque::new(),
+            background: VecDeque::new(),
         };
         let first = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"));
         let second = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"));
+        let map = WorkItem::map(42, 1, PathBuf::from("/tmp/a.mkv"));
 
-        LibraryPool::enqueue_extract_unique(&mut queue, first);
-        LibraryPool::enqueue_extract_unique(&mut queue, second);
+        LibraryPool::enqueue_background_unique(&mut queue, first);
+        LibraryPool::enqueue_background_unique(&mut queue, second);
+        LibraryPool::enqueue_background_unique(&mut queue, map);
 
-        assert_eq!(queue.extracts.len(), 1);
-        assert_eq!(queue.extracts[0].item_id, 42);
+        assert_eq!(queue.background.len(), 2);
+        assert_eq!(queue.background[0].kind, WorkKind::Extract);
+        assert_eq!(queue.background[1].kind, WorkKind::Map);
     }
 
     #[test]
     fn prioritize_extract_moves_existing_to_front() {
         let mut queue = Queue {
             probes: VecDeque::new(),
-            extracts: VecDeque::new(),
+            background: VecDeque::new(),
         };
-        LibraryPool::enqueue_extract_unique(
+        LibraryPool::enqueue_background_unique(
             &mut queue,
             WorkItem::extract(1, 1, PathBuf::from("/a")),
         );
-        LibraryPool::enqueue_extract_unique(
+        LibraryPool::enqueue_background_unique(
             &mut queue,
             WorkItem::extract(2, 1, PathBuf::from("/b")),
         );
-        let pos = queue.extracts.iter().position(|w| w.item_id == 2).unwrap();
-        let mut item = queue.extracts.remove(pos).unwrap();
+        let pos = queue
+            .background
+            .iter()
+            .position(|w| w.item_id == 2)
+            .unwrap();
+        let mut item = queue.background.remove(pos).unwrap();
         item.priority = true;
-        queue.extracts.push_front(item);
-        assert_eq!(queue.extracts[0].item_id, 2);
-        assert!(queue.extracts[0].priority);
-        assert_eq!(queue.extracts[1].item_id, 1);
+        queue.background.push_front(item);
+        assert_eq!(queue.background[0].item_id, 2);
+        assert!(queue.background[0].priority);
+        assert_eq!(queue.background[1].item_id, 1);
     }
 }

@@ -1,10 +1,17 @@
 //! SQLite layer: WAL, numbered append-only migrations, library/item access.
 
+mod content_id;
 mod migrate;
 mod status;
 mod store;
 
-pub use status::{parse_probe_status, parse_subtitle_status};
+pub use content_id::{
+    CONTENT_ID_WINDOW, content_id_for_path, content_id_from_reader, content_id_matches,
+    format_content_id,
+};
+pub use status::{
+    parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
+};
 pub use store::{
     Db, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate, ScanJobRow, SidecarRow, UpsertItem,
 };
