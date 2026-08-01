@@ -50,6 +50,7 @@ modes (§3). Do not let “byte-offset start” collapse them in prose or code.
 | End-moov dogfood `-ss 60` (historical cost class) | ~19 seeks / ~12 s | `far-seek-cluster-spawn` |
 | MP4 virtual faststart + `-ss` (warm spawn) | TC land ~1.3–1.6 s; sidx exact | `mp4-virtual-faststart-spawn-2026-08-01` |
 | MP4 virtual faststart + `-ss` (**after purge**, mid-seek) | Grey’s TC **1453 ms**; Mincemeat TC **1740 ms**; sidx exact | same harness post-purge; mincemeat-cold JSON |
+| MP4 virtual faststart + `-ss` (**after purge**, far ~20 min) | Grey’s TC max **2123 ms** (n=3); copy max **806 ms**; sidx exact on TC | `gate2-cold-purge-matrix-2026-08-01` |
 
 **MP4 evidence discipline.** The n=300 cold `-ss` comparison across largest
 faststart vs end-moov files was **size-confounded and is not evidence** for
@@ -65,7 +66,7 @@ it is not re-cited as the current cold wall on the titles above.
 | Matroska mechanism + Gate 2 cold (mid/far purge matrix) | Proven |
 | MP4 mechanism (virtual faststart + map-PTS `-ss`, honest sidx; naive splice rejected) | Proven |
 | MP4 Gate 2 cold mid-seek (`-ss 60`) on end-moov after purge | Proven on two titles (above) |
-| MP4 Gate 2 cold **far** scrub on long titles | **Pending** implement-time dogfood (harness used mid-seek only) |
+| MP4 Gate 2 cold **far** scrub on long titles | Proven — Grey’s WEBRip end-moov, `ss=1200`, cold purge matrix 2026-08-01 (TC max 2123 ms) |
 
 ## Decision
 
@@ -300,12 +301,14 @@ every upgraded title sits on the ~7 s path until a full rescan. Clearing
 rows without rebuild is not a complete invalidation path.
 
 **Live replace dogfood (manual).** Unit tests cover bind-time mismatch and
-fallback flags. Confirm once by hand on the Unraid share: start a mapped
-session, scrub so offsets are held, atomically replace the file underneath
-(rename-over as *arr does), scrub again. Expect `-ss` fallback and a map
-rebuild enqueue — not garbage reads from stale Cluster/`stss` offsets. The
-old inode under an open FD may keep the in-flight producer honest until it
-exits; the next bind is the check.
+fallback flags. Confirmed 2026-08-01 on a local disposable copy (not the
+live library tree): mapped session → scrub → atomic replace under the path
+(new inode + mutated last 64 KiB window) → scrub again. Observed identity
+stale → `-ss` fallback + map rebuild enqueue
+(`nightjar-meta/notes/gate2-live-replace-dogfood.md`). Unraid SMB open-FD
+quirks remain optional share dogfood; the dangerous next-bind case is
+covered. The old inode under an open FD may keep the in-flight producer
+honest until it exits; the next bind is the check.
 
 **Concurrency bound.** Map rebuild shares the existing library worker pool
 (ADR-0004 / ADR-0013): same 2–16 workers, probes first, background work
@@ -316,9 +319,11 @@ index while someone is watching.
 
 ## Consequences
 
-- Gate 2 under-3s seek: Matroska claimable on measured cold matrix; MP4
-  mechanism locked and mid-seek cold under 3 s on two end-moov titles after
-  purge; MP4 far-scrub cold still implement-time dogfood.
+- Gate 2 under-3s seek: Matroska and MP4 cold mid/far claimable on the
+  2026-08-01 purge matrix (`nightjar-meta/notes/gate2-cold-purge-matrix-2026-08-01.md`);
+  every land_ms &lt; 3000 including MP4 far TC (max 2123 ms). Live replace under
+  an open session dogfooded locally (§8;
+  `nightjar-meta/notes/gate2-live-replace-dogfood.md`).
 - Two start paths, one map schema, one virtual-file binding model.
 - Identity fingerprint is the common invalidation key. MP4 `moov'` is
   per-session, not a derived artifact.
@@ -341,4 +346,6 @@ index while someone is watching.
 - `nightjar-meta/notes/far-seek-cluster-spawn-2026-08-01.md`
 - `nightjar-meta/notes/mp4-faststart-2026-08-01.md`
 - `nightjar-meta/notes/mp4-virtual-faststart-spawn-2026-08-01.md`
+- `nightjar-meta/notes/gate2-cold-purge-matrix-2026-08-01.md`
+- `nightjar-meta/notes/gate2-live-replace-dogfood.md`
 - `nightjar-meta/notes/cut-rule-gating-2026-07-31.md` (elst / priming ~83 ms)
