@@ -3184,10 +3184,7 @@ mod tests {
             return;
         }
         let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../testdata/files");
-        let cases = [
-            ("hevc_hdr10_mp4.mp4", true),
-            ("hevc_hlg_mp4.mp4", false),
-        ];
+        let cases = [("hevc_hdr10_mp4.mp4", true), ("hevc_hlg_mp4.mp4", false)];
         for (name, required) in cases {
             let src = testdata.join(name);
             if !src.exists() {

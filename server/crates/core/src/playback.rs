@@ -960,11 +960,7 @@ mod tests {
             false,
         );
         assert_eq!(d.method, PlaybackMethod::Transcode);
-        assert!(
-            d.reason.contains("lacks zscale"),
-            "{}",
-            d.reason
-        );
+        assert!(d.reason.contains("lacks zscale"), "{}", d.reason);
     }
 
     #[test]
