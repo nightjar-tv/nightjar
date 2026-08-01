@@ -185,6 +185,20 @@ session to an FFmpeg subprocess.
   faststart. Same binding rules; different byte maps. Never feed MP4 into
   the Matroska splice handler.
 
+**Mid-playback replace (settled).** *arr quality upgrades often rename over
+the path while a session is open. An open FD that still holds the old inode
+may keep playing old bytes until that producer exits — that is acceptable.
+The dangerous case is the **next** bind (session start or post-seek run)
+opening the new file with the old map's byte offsets.
+
+At every virtual-file bind / FFmpeg input open: compute live `content_id`
+from the path and compare it to the `content_id` the map (and this bind)
+was keyed on. On mismatch: **do not** serve map offsets; fall through to
+§8 (`-ss` on the real file + enqueue rebuild). Do not keep a bound virtual
+file across an identity change. In-place truncate under a live FD (rare vs
+atomic replace) surfaces as producer failure; treat that as §8, not as a
+reason to keep splicing.
+
 ### 5. Advertise the snapped land
 
 Reuse ADR-0020 **`landedMs`**. Do not invent a second snapped field.
@@ -201,18 +215,25 @@ are the normal case.
 - extracted ASS (ADR-0019)
 - usable extent
 - keyframe map (this ADR)
-- cached MP4 `moov'` if that choice is taken (§3c)
 - later trickplay
+
+MP4 `moov'` is per-session (§3c), not a derived artifact.
 
 **Media vs sidecars:** Bazarr writing an SRT updates `media_item_sidecars`
 only — not a re-probe and not a new keyframe map.
 
-**Identity:** `content_id` = **`size_bytes` + hash of first 64 KiB + hash of
-last 64 KiB`** (fit prefix/suffix when smaller). **Computed at scan and
-stored.** Invalidation is a **comparison**, not a re-read on every session.
-Rescan still uses mtime/size to choose paths; fingerprint decides derived
+**Identity:** `content_id` = **`size_bytes` + sha256(first 64 KiB) +
+sha256(last 64 KiB)`** (fit prefix/suffix when smaller). **Computed at
+scan and stored.** Day-to-day invalidation is a **stored comparison**
+against derived stamps. Bind-time revalidation (§4) re-reads the windows
+because a replace can land before the next scan. Rescan still uses
+mtime/size to choose which paths to touch; fingerprint decides derived
 validity. On mismatch: stale derived rows + **enqueue rebuild** (§8).
 mtime/size alone is rejected for map invalidation.
+
+The fingerprint is an identity check, not a security boundary. SHA-256 is
+the digest in tree today; a lighter non-cryptographic hash is a fair later
+argument if cost shows up — do not hand-roll one.
 
 ### 7. On-disk / on-wire shapes (Rule 4.9 — before any writer)
 
@@ -261,9 +282,12 @@ Wire: clients keep **`landedMs`** (ADR-0020). No new session response field.
 No ready map, or `content_id` mismatch: **today’s `-ss` on the real file**
 (no virtual faststart / no Cluster splice). Do not fail the session.
 
-**Rebuild trigger (required).** That fallback **must enqueue a map rebuild**
-unless one is already pending or in flight. Invalidation without rebuild
-leaves the title on the slow path forever.
+**Rebuild trigger (required — writers slice, not deferred).** That fallback
+**must enqueue a map rebuild** unless one is already pending or in flight.
+The same enqueue runs when index upsert clears map rows on replace (mtime /
+size path). *arr upgrades make replace continuous; without the trigger,
+every upgraded title sits on the ~7 s path until a full rescan. Clearing
+rows without rebuild is not a complete invalidation path.
 
 ## Consequences
 
