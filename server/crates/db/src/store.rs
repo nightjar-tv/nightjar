@@ -1,5 +1,5 @@
 use crate::migrate;
-use crate::status::{parse_probe_status, parse_subtitle_status};
+use crate::status::{parse_map_status, parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -71,6 +71,8 @@ pub struct UpsertItem {
     pub year: Option<i32>,
     pub season: Option<i32>,
     pub episode: Option<i32>,
+    /// ADR-0023 fingerprint; None only when the read failed (row stays NULL).
+    pub content_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,12 +299,12 @@ impl Db {
                         library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
                         audio_codec, audio_channels, width, height, probe_status,
-                        scan_error, probed_at
+                        scan_error, probed_at, content_id
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6,
                         ?7, ?8, ?9, NULL, NULL, NULL,
                         NULL, NULL, NULL, NULL, 'indexed',
-                        NULL, NULL
+                        NULL, NULL, ?10
                      )
                      ON CONFLICT(library_id, path) DO UPDATE SET
                         mtime_ms = excluded.mtime_ms,
@@ -325,7 +327,7 @@ impl Db {
                         subtitle_status = 'pending',
                         subtitle_source_mtime_ms = NULL,
                         subtitle_source_size_bytes = NULL,
-                        content_id = NULL,
+                        content_id = excluded.content_id,
                         probed_content_id = NULL,
                         subtitle_content_id = NULL,
                         usable_extent_ms = NULL,
@@ -345,6 +347,7 @@ impl Db {
                     item.year,
                     item.season,
                     item.episode,
+                    item.content_id,
                 ])
                 .map_err(|e| format!("upsert item {}: {e}", item.path))?;
             }
@@ -389,7 +392,8 @@ impl Db {
                 height = ?8,
                 probe_status = ?9,
                 scan_error = ?10,
-                probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                probed_content_id = content_id
              WHERE id = ?1",
             params![
                 update.item_id,
@@ -421,7 +425,11 @@ impl Db {
             "UPDATE media_items SET
                 subtitle_status = ?2,
                 subtitle_source_mtime_ms = ?3,
-                subtitle_source_size_bytes = ?4
+                subtitle_source_size_bytes = ?4,
+                subtitle_content_id = CASE
+                    WHEN ?2 IN ('ready', 'none') THEN content_id
+                    ELSE NULL
+                END
              WHERE id = ?1",
             params![item_id, status, source_mtime_ms, source_size_bytes],
         )
@@ -429,11 +437,158 @@ impl Db {
         Ok(())
     }
 
+    /// Persist a built keyframe map under `content_id` (ADR-0023).
+    pub fn replace_keyframe_map(
+        &self,
+        media_item_id: i64,
+        content_id: &str,
+        container_kind: &str,
+        entries: &[(i64, i64)],
+        usable_extent_ms: Option<i64>,
+    ) -> Result<(), String> {
+        let kind = crate::status::parse_map_container_kind(container_kind)?;
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin keyframe map replace: {e}"))?;
+        tx.execute(
+            "DELETE FROM keyframe_map_entries WHERE media_item_id = ?1",
+            [media_item_id],
+        )
+        .map_err(|e| format!("clear keyframe map for item {media_item_id}: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO keyframe_map_entries (
+                        media_item_id, content_id, container_kind, pts_ms, byte_offset
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| format!("prepare keyframe map insert: {e}"))?;
+            for &(pts_ms, byte_offset) in entries {
+                stmt.execute(params![
+                    media_item_id,
+                    content_id,
+                    kind,
+                    pts_ms,
+                    byte_offset
+                ])
+                .map_err(|e| format!("insert keyframe map entry: {e}"))?;
+            }
+        }
+        tx.execute(
+            "UPDATE media_items SET
+                map_status = 'ready',
+                map_content_id = ?2,
+                usable_extent_ms = ?3,
+                usable_extent_content_id = CASE WHEN ?3 IS NULL THEN NULL ELSE ?2 END
+             WHERE id = ?1",
+            params![media_item_id, content_id, usable_extent_ms],
+        )
+        .map_err(|e| format!("set map ready for item {media_item_id}: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit keyframe map replace: {e}"))?;
+        Ok(())
+    }
+
+    pub fn set_map_status(&self, item_id: i64, status: &str) -> Result<(), String> {
+        let status = parse_map_status(status)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE media_items SET map_status = ?2 WHERE id = ?1",
+            params![item_id, status],
+        )
+        .map_err(|e| format!("set map status for item {item_id}: {e}"))?;
+        Ok(())
+    }
+
+    pub fn set_content_id(&self, item_id: i64, content_id: &str) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE media_items SET content_id = ?2 WHERE id = ?1",
+            params![item_id, content_id],
+        )
+        .map_err(|e| format!("set content_id for item {item_id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Mark map pending and clear entries (session fallback / explicit rebuild).
+    pub fn mark_map_pending(&self, item_id: i64) -> Result<(), String> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin map pending: {e}"))?;
+        tx.execute(
+            "DELETE FROM keyframe_map_entries WHERE media_item_id = ?1",
+            [item_id],
+        )
+        .map_err(|e| format!("clear map for pending item {item_id}: {e}"))?;
+        tx.execute(
+            "UPDATE media_items SET
+                map_status = 'pending',
+                map_content_id = NULL,
+                usable_extent_ms = NULL,
+                usable_extent_content_id = NULL
+             WHERE id = ?1",
+            [item_id],
+        )
+        .map_err(|e| format!("mark map pending for item {item_id}: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit map pending: {e}"))?;
+        Ok(())
+    }
+
+    /// Returns (item_id, path, library_id) for maps that need building.
+    pub fn list_pending_map_items(&self) -> Result<Vec<(i64, String, i64)>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, library_id FROM media_items
+                 WHERE map_status = 'pending'
+                    OR (map_status = 'ready' AND (
+                        map_content_id IS NULL
+                        OR content_id IS NULL
+                        OR map_content_id IS NOT content_id
+                    ))
+                 ORDER BY id",
+            )
+            .map_err(|e| format!("prepare pending map items: {e}"))?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| format!("list pending map items: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read pending map items: {e}"))
+    }
+
+    /// Snap map entry at or before `pts_ms` when map_content_id matches live content_id.
+    pub fn map_entry_at_or_before(
+        &self,
+        media_item_id: i64,
+        pts_ms: i64,
+    ) -> Result<Option<(i64, i64, String)>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT e.pts_ms, e.byte_offset, e.container_kind
+             FROM keyframe_map_entries e
+             JOIN media_items m ON m.id = e.media_item_id
+             WHERE e.media_item_id = ?1
+               AND m.map_status = 'ready'
+               AND m.content_id IS NOT NULL
+               AND m.map_content_id = m.content_id
+               AND e.content_id = m.content_id
+               AND e.pts_ms <= ?2
+             ORDER BY e.pts_ms DESC
+             LIMIT 1",
+            params![media_item_id, pts_ms],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| format!("map entry at_or_before for item {media_item_id}: {e}"))
+    }
+
     /// Reset availability failures so the pool can re-drain them (ADR-0014).
     pub fn requeue_unavailable_for_library(
         &self,
         library_id: i64,
-    ) -> Result<(usize, usize), String> {
+    ) -> Result<(usize, usize, usize), String> {
         let conn = self.lock()?;
         let probes = conn
             .execute(
@@ -450,7 +605,14 @@ impl Db {
                 [library_id],
             )
             .map_err(|e| format!("requeue unavailable extracts: {e}"))?;
-        Ok((probes, extracts))
+        let maps = conn
+            .execute(
+                "UPDATE media_items SET map_status = 'pending', map_content_id = NULL
+                 WHERE library_id = ?1 AND map_status = 'unavailable'",
+                [library_id],
+            )
+            .map_err(|e| format!("requeue unavailable maps: {e}"))?;
+        Ok((probes, extracts, maps))
     }
 
     /// Items that never finished probing (e.g. process restart mid-scan).

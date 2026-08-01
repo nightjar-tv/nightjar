@@ -187,7 +187,11 @@ session to an FFmpeg subprocess.
 
 **Mid-playback replace (settled).** *arr quality upgrades often rename over
 the path while a session is open. An open FD that still holds the old inode
-may keep playing old bytes until that producer exits — that is acceptable.
+may keep playing old bytes until that producer exits — that is acceptable
+and is why an in-flight session does not need to be killed on replace.
+Someone will otherwise "fix" a live session that is still correct on the
+old inode; do not.
+
 The dangerous case is the **next** bind (session start or post-seek run)
 opening the new file with the old map's byte offsets.
 
@@ -198,6 +202,12 @@ was keyed on. On mismatch: **do not** serve map offsets; fall through to
 file across an identity change. In-place truncate under a live FD (rare vs
 atomic replace) surfaces as producer failure; treat that as §8, not as a
 reason to keep splicing.
+
+**Bind-time fingerprint cost.** Revalidation reads 128 KiB per bind. Cold
+NAS preads are why this slice exists — do not assume that is free. Measure
+land-path cost with the handlers. If it shows, cache the verified
+fingerprint on the session and re-check the cheap mtime/size pair on later
+binds in that session; full window re-hash only when mtime/size moved.
 
 ### 5. Advertise the snapped land
 
@@ -288,6 +298,13 @@ The same enqueue runs when index upsert clears map rows on replace (mtime /
 size path). *arr upgrades make replace continuous; without the trigger,
 every upgraded title sits on the ~7 s path until a full rescan. Clearing
 rows without rebuild is not a complete invalidation path.
+
+**Concurrency bound.** Map rebuild shares the existing library worker pool
+(ADR-0004 / ADR-0013): same 2–16 workers, probes first, background work
+(subtitle extract and map) behind the index gate unless priority. Do not
+grow a second unbounded walker queue — a season-wide *arr upgrade would
+otherwise saturate the share with packet walks on the ~16% without a usable
+index while someone is watching.
 
 ## Consequences
 
