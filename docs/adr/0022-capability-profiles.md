@@ -65,25 +65,33 @@ FFmpeg graph; it does not silently strip HDR.
 
 **Host tonemap capability (slice 2).** HDR→SDR for an SDR encode path needs
 FFmpeg `zscale` (libzimg). That is a host ceiling, same class as bitrate and
-height: probe once at process start. When the source is HDR, the profile (or
-session encode target) requires tone-map, and `zscale` is absent:
+height: probe once at process start. When the source is HDR, the session
+encode path requires tone-map, and `zscale` is absent:
 
 - `decide_playback` still returns **transcode** (DirectPlay/Remux of HDR into
   an SDR H.264 session is wrong), with an explicit reason naming the gap
   (e.g. `host FFmpeg lacks zscale/libzimg; cannot tone-map HDR`).
-- Session **start refuses before spawn** with that same reason. Never hand
-  the client a playlist whose encoder dies mid-flight.
+- Session **start refuses before spawn** with **415** and that same reason.
+  Hosts without zscale get a named failure, not a dead HLS session.
 
-Debian bookworm's `ffmpeg` → `libavfilter8` is built with `--enable-libzimg`
-(`zscale` present). A product image that runs encodes must install that
-FFmpeg (or document a host FFmpeg with libzimg). Missing `zscale` on a ship
-path is a packaging bug; decide refusal is the honest runtime behaviour when
-the host still lacks it.
+**Packaging note (verified 2026-08-01, narrow).** Debian bookworm
+`libavfilter8` on **arm64** Declares `libzimg2` and the shared object contains
+the `zscale` filter string / zimg symbols (`Depends` + `strings` on the
+`.deb`). That is **not** a full ship-path proof: amd64 was not checked the
+same way, and the Nightjar Dockerfile still installs **no** FFmpeg, so a
+container that encodes must use a host FFmpeg with libzimg or gain an image
+packaging change. Missing `zscale` on a real host remains a packaging or
+install gap; decide+415 is what makes that survivable at runtime.
 
 Regression coverage for the graph: committed synthetic PQ (`hevc_hdr10_mp4`)
 and HLG (`hevc_hlg_mp4`) assert encode labels are BT.709; a measured
-retag-vs-tonemap MAD floor proves **not-retag only** (not beauty). Kit
-P8.1 / P8.4 remain human beauty passes.
+retag-vs-tonemap MAD floor proves **not-retag only** (not beauty) —
+`notes/hdr-tonemap-delta-2026-08-01.md`.
+
+**Beauty (Proven by inspection, not measured).** Kit titles, stills + one
+browser play each, criteria and paths in
+`notes/hdr-tonemap-beauty-2026-08-01.md` (2026-08-01): HDR10-P8.1 FHD and
+HLG-P8.4 FHD. DV Profile 5 beauty is still open.
 
 ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
@@ -128,12 +136,17 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   transcode; probe stores `video_bitrate_bps` and `hdr`.
 - Slice 2: encode targets (`scale` + `-b:v` from ceilings), real HDR→SDR
   tonemap (`zscale` + hable), field-bag query overrides, `AETHER_V0`
-  (T1-scored), host `zscale` probe with decide reason + refuse-before-spawn
-  when tonemap is required and unavailable. Kit PQ/HLG beauty passes are
-  inspection evidence (claim wording lands after this commit). MAD
-  regression is not-retag only.
+  (T1-scored), host `zscale` probe with decide reason + **415
+  refuse-before-spawn** when tonemap is required and unavailable (packaging
+  gap is survivable: named reason, not a dead session). MAD regression is
+  not-retag only (`notes/hdr-tonemap-delta-2026-08-01.md`). Kit PQ/HLG
+  beauty is **Proven by inspection** per
+  `notes/hdr-tonemap-beauty-2026-08-01.md` — not a measured Gate metric.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
 - N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4
   for the scan carry). Unraid is the VAAPI/QSV verification host once iGPU
   enablement is confirmed.
+- Product Docker image still does **not** install FFmpeg; bookworm
+  `libavfilter8` arm64 has zscale when ffmpeg is installed on the host (see
+  §4 packaging note).
