@@ -5,12 +5,16 @@
 # Sequencing: run only after ADR-0020 (PR #11) is on the binary under test.
 # Soaking pre-0020 session code measures a lifecycle about to be replaced.
 #
-# Host: prefer the Unraid (or other always-on) box. A sleeping laptop aborts
-# the wall-clock run; nohup does not survive sleep. Unraid is also closer to
-# a real deployment than founder desktop.
+# Host: the machine that stays awake for HOURS. A sleeping laptop aborts the
+# wall-clock run; nohup does not survive sleep. Prefer Unraid, or drive the
+# API from a laptop with ORPHAN_SSH so pgrep still runs on the server.
 #
 # Usage (on Unraid, post-#11 build):
 #   BASE=http://127.0.0.1:8096 HOURS=48 ./scripts/gate2_orphan_soak.sh
+#
+# Usage (from a laptop against Unraid Docker; keep the laptop awake):
+#   BASE=http://RM400:18096 HOURS=48 NIGHTJAR_DATA_DIR=/config \
+#     ORPHAN_SSH=root@RM400 ./scripts/gate2_orphan_soak.sh
 #
 # Every INTERVAL_S sample appends one JSON line to
 # notes/gate2/orphan-soak-<stamp>.jsonl with the scheduled ffmpeg process
@@ -35,13 +39,21 @@ SERIES="$OUT_DIR/orphan-soak-$STAMP.jsonl"
 SUMMARY="$OUT_DIR/orphan-soak-$STAMP.json"
 
 DATA_DIR="${NIGHTJAR_DATA_DIR:-$HOME/nightjar-data}"
+# When set (user@host), orphan pgrep runs there so this script can live on a
+# laptop while Nightjar's FFmpeg runs on Unraid.
+ORPHAN_SSH="${ORPHAN_SSH:-}"
 END_EPOCH=$(( $(date +%s) + HOURS * 3600 ))
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG"; }
 
 ffmpeg_matching() {
   # Nightjar-owned FFmpeg: argv still references this data dir.
-  pgrep -lf '[f]fmpeg' 2>/dev/null | grep -F "$DATA_DIR" || true
+  if [[ -n "$ORPHAN_SSH" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$ORPHAN_SSH" \
+      "pgrep -lf '[f]fmpeg' 2>/dev/null | grep -F $(printf '%q' "$DATA_DIR") || true"
+  else
+    pgrep -lf '[f]fmpeg' 2>/dev/null | grep -F "$DATA_DIR" || true
+  fi
 }
 
 ffmpeg_count() {
@@ -95,8 +107,8 @@ if [[ -z "$ITEM" ]]; then
   exit 1
 fi
 
-log "start hours=$HOURS interval=${INTERVAL_S}s item=$ITEM data_dir=$DATA_DIR base=$BASE series=$SERIES"
-log "prerequisite: binary must include ADR-0020 (PR #11); host should not sleep"
+log "start hours=$HOURS interval=${INTERVAL_S}s item=$ITEM data_dir=$DATA_DIR base=$BASE orphan_ssh=${ORPHAN_SSH:-local} series=$SERIES"
+log "prerequisite: binary must include ADR-0020 (PR #11); machine running this script must not sleep"
 MAX_FFMPEG=0
 SAMPLES=0
 CHURNS=0
