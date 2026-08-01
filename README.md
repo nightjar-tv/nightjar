@@ -32,16 +32,23 @@ Open `http://localhost:8096`, add a library folder, scan, and press play.
 `ffprobe` must be on `PATH`. `NIGHTJAR_DATA_DIR` defaults to `./data`.
 `NIGHTJAR_PORT` defaults to `8096`.
 
-Or build the Docker image from this repo:
+Or build the Docker image from this repo. The image includes Debian’s `ffmpeg`
+/`ffprobe` plus Intel/Mesa VA drivers (external process, not linked). Pass
+`/dev/dri` when you want hardware encode:
 
 ```bash
 docker build -t nightjar/nightjar .
 docker run --rm -p 8096:8096 \
+  --device=/dev/dri \
   -v /path/to/media:/media \
   -v /path/to/config:/config \
   -e NIGHTJAR_DATA_DIR=/config \
   nightjar/nightjar
 ```
+
+Without `--device=/dev/dri`, startup still verifies `libx264` and falls back to
+software. Bare-binary installs are unchanged: put any FFmpeg (with VAAPI/QSV if
+you want hardware) on `PATH` yourself.
 
 Published image tags and GitHub Releases are not available yet.
 
