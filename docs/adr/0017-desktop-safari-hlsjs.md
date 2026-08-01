@@ -50,8 +50,8 @@ stands for that rationale. This decision is not that workaround: the
 playlist is already full-title VOD with load-bearing 503s; the defect is
 post-ready native fetch timing on desktop Safari.
 
-Rule 2.4 still binds: iOS/iPadOS remains on native HLS (required there;
-hls.js is not the product path on those devices). This ADR changes
+Rule 2.4 and Rule 2.6 still bind: iOS/iPadOS remains on native HLS (required
+there; hls.js is not the product path on those devices). This ADR changes
 **AttachBackend selection** on desktop Apple WebKit only. It does not add a
 second player stack, remount `video.src` for scrub, or diverge server
 protocol by client.
@@ -94,7 +94,7 @@ protocol by client.
   regression comparison. The former `?njHlsJs=1` probe is removed; hls.js
   is the desktop default.
 - Forever-refuse/404 papering and desktop-only protocol forks remain
-  rejected (Rule 2.4). Backend selection stays the approved *attach*
+  rejected (Rule 2.6). Backend selection stays the approved *attach*
   lever; see the amendment below for the scoped native-land remount.
 
 ## Amendment (2026-07-29): post-land `#t=` on native HLS

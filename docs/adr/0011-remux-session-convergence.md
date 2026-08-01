@@ -10,7 +10,7 @@ ADR-0006 delivered remux as a whole-file MP4 stream-copy behind
 remux whole-file "for this slice." Measured dogfooding on the household NAS
 showed the whole-file path fails the start-in-seconds bar that sessions
 already meet, and that two video delivery paths (plus two caches and two
-subtitle-warm triggers) were not earning their keep (Rule 4.11).
+subtitle-warm triggers) were not earning their keep (Rule 4.10).
 
 ## Decision
 
@@ -85,7 +85,7 @@ stabilise for transcode.
 solved once for sessions rather than separately for remux MP4 and HLS
 transcode. Titles larger than the old remux cap play. Remux and transcode
 differ by a field (`SessionMode::Copy` vs encode), not by architecture
-(Rule 4.11).
+(Rule 4.10).
 
 **Copy-mode caveat (withdrawn by [ADR-0020](0020-copy-mode-segment-boundaries.md)).**
 Stream-copy HLS cannot force 2 s IDRs; segment boundaries follow source

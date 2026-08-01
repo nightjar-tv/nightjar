@@ -105,7 +105,7 @@ the same session surface so audio switching is solved once.
    segment fix. Alternate renditions stay closed unless a later dogfood pass
    still rejects that cutover.
 
-6. **Track identity (Rule 4.9 / 4.11).** Embedded audio uses
+6. **Track identity (Rule 4.9 / 4.10).** Embedded audio uses
    `trackId = e{streamIndex}` (absolute ffprobe index), the same scheme as
    embedded subtitles (ADR-0010). Inventory shape:
    `{ trackId, language?, codec, channels, channelLayout?, label?, default,

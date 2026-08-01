@@ -25,7 +25,7 @@ remains a shared follow-up with the item player UI.
 
 ## Decision
 
-1. **One burn-in inventory (Rule 4.11).** Embedded ASS/SSA/PGS and sidecar
+1. **One burn-in inventory (Rule 4.10).** Embedded ASS/SSA/PGS and sidecar
    ASS/SSA share `SubtitleTrack` with soft text tracks. They differ by
    `render`: `soft` | `burnIn`. Soft keeps `url` / readiness. Burn-in has
    no `url` and no readiness. Codecs in scope: `ass`, `ssa`,
@@ -48,7 +48,7 @@ remains a shared follow-up with the item player UI.
    same model as audio. Seek restart must not carry burn-in switches.
 
 5. **FFmpeg graphs.** Burn-in is one user concept (`render: burnIn`) but
-   two encode graphs. Unifying on one filter is wrong (Rule 4.11):
+   two encode graphs. Unifying on one filter is wrong (Rule 4.10):
    - **ASS/SSA** need libass. Overlay/`sub2video` leaves ASS as
      non-bitmap even when libass is built in — silent blank burn. The
      working path is `-vf ass=<path>,…` (sidecar path, or a demuxed
@@ -157,7 +157,7 @@ mid-session encoder splice can cross parsers without
    choice, deferred splice, pre-splice limitation).
    [ADR-0019](0019-ass-burn-extract-at-scan.md) owns when extraction runs,
    where durable `.ass` lives, and that a cold miss only enqueues the
-   shared worker. No separate cache ADR (Rule 4.11).
+   shared worker. No separate cache ADR (Rule 4.10).
 
 ### Consequences
 

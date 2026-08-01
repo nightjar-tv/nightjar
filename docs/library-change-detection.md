@@ -11,7 +11,7 @@ Related: [ADR-0004](adr/0004-async-scan-jobs.md) (async scan jobs),
 [ADR-0013](adr/0013-subtitle-extraction-at-scan.md) (watcher + walk cache),
 [ADR-0014](adr/0014-library-availability.md) (reachability). Engineering
 constraints: [ENGINEERING_RULES.md](../ENGINEERING_RULES.md) Rules 4.7, 4.8,
-4.11.
+4.10.
 
 The code excerpts describe the arrangement that produced the dogfood findings
 (scanner after ADR-0013 / availability work, before later WIP on the same
@@ -326,7 +326,7 @@ Whatever uses poll must choose an interval. Evidence so far:
 - **Rule 4.7 (no speculative abstraction).** No trait soup or config matrix
   for hypothetical mount types. Abstract when a second concrete case
   demands it, not when the table of fstypes gets long.
-- **Rule 4.11 (one concept, one path).** “Library tree changed” should not
+- **Rule 4.10 (one concept, one path).** “Library tree changed” should not
   remain two competing implementations that both fire forever. If notify
   and poll coexist, the ADR must say which is source of truth and which is
   hint or fallback, and the code must match that sentence.

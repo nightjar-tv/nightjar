@@ -2,6 +2,8 @@
 
 Read [ENGINEERING_RULES.md](ENGINEERING_RULES.md) first. It is short, and it is
 the law here: stack, scope, and how AI-assisted contributions are handled.
+Client platforms and playback engines are in
+[docs/adr/0021-client-architecture.md](docs/adr/0021-client-architecture.md).
 
 Git workflow (branches, commits, PRs) is in [docs/GIT_RULES.md](docs/GIT_RULES.md).
 Everything reaches `main` via PR; squash-merge only.

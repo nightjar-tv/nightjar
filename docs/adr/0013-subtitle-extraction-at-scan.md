@@ -327,12 +327,12 @@ this ADR records that as the reason, and the tests below lock it.
     the first frag and collapses later cues (pile-up / “works at land then
     dies”). The hls.js path therefore, after each subtitle `FRAG_LOADED`,
     rewrites TextTrack cue `startTime`/`endTime` from the fetched VTT using
-    the stable cue id (start ms). Same segment URLs (Rule 4.11); native
+    the stable cue id (start ms). Same segment URLs (Rule 4.10); native
     inject unchanged. Dogfood closed the ADR-0017 subtitle gate.
 
     **Safari native HLS after seek: client cue injection (2026-07-28).**
     Delivery stays EXT-X-MEDIA → `subs/{trackId}/segNNN.vtt` (one wire
-    shape; Rule 4.11). There is no OpenAPI or other client-visible API
+    shape; Rule 4.10). There is no OpenAPI or other client-visible API
     contract change: injection only consumes those existing segment URLs.
     Linear Safari playback can populate the native TextTrack from that
     rendition. After a user scrub, WebKit does not reliably reload those

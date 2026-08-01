@@ -89,7 +89,7 @@ pass (Rule 6.1 / 4.9).
 9. **Delivery skins.** Progressive `<video>` takes subtitles via `<track>`;
    HLS takes them via master-playlist `EXT-X-MEDIA` (TYPE=SUBTITLES) pointing at
    a one-segment subtitle media playlist that references the same item VTT URL.
-   Two skins, one inventory (Rule 4.11). The media playlist stays at
+   Two skins, one inventory (Rule 4.10). The media playlist stays at
    `index.m3u8`; the master is `master.m3u8` (ADR-0008 additive test held).
 
 10. **Client contract.** `playbackInfo` always lists tracks the same way
@@ -119,7 +119,7 @@ Subtitle extraction is stream-copy (or subtitle-to-SRT remux for mov_text /
 embedded WebVTT) plus in-process conversion. FFmpeg's WebVTT muxer was the
 measured bottleneck: on a NAS-hosted remux title, `-c:s webvtt` lagged far
 behind `-c:s copy -f srt` for the same demux. Embedded and sidecar tracks
-share one converter (Rule 4.11).
+share one converter (Rule 4.10).
 
 Extraction still shares remux's whole-file-artifact shape: the first request
 pays for a demux of the source, then hits a named cache object. Cache warming

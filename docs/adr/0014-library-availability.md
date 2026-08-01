@@ -81,7 +81,7 @@ data loss, not a support nuisance.
 
 **Gained.** Mount flaps stop permanently failing the library. Empty/doubtful
 walks cannot wipe items. Probe and extract agree on failure meaning
-(Rule 4.11). Beta reports of ffprobe failures carry stderr or at least an
+(Rule 4.10). Beta reports of ffprobe failures carry stderr or at least an
 exit code.
 
 **Lost.** SQLite no longer CHECKs probe/subtitle status strings; Rust writers

@@ -12,8 +12,8 @@ This document governs all humans and LLMs contributing to this project. When in 
 | Database | SQLite (+ Litestream backup) | No Postgres, no Redis, no ORM |
 | Media pipeline | FFmpeg via direct process orchestration | No wrapper libraries |
 | Web UI | SvelteKit (PWA-installable) | No React, no second frontend framework |
-| Player core | One shared Rust library (libmpv/FFmpeg) with C FFI | No per-platform player implementations |
-| App shells | Flutter over the shared player core | No separate Swift/Kotlin codebases |
+| Client UI | Flutter where a working toolchain exists; SvelteKit for web | No parallel Swift/Kotlin phone/tablet shells. tvOS SwiftUI only if flutter-tvos is unhealthy (ADR-0021) |
+| Playback engines | Per-platform engine behind one Dart player interface (ADR-0021): Media3; media_kit/libmpv; Apple engine per ADR-0021; vendor players on Tizen/webOS; browser/hls.js on web | No plugin player zoo. No Nightjar-owned decode engine on Tizen/webOS |
 | Distribution | Single static binary; Docker as primary channel | No installers, no bundled runtimes |
 
 **Rule 1.1** — Adding any new language, framework, database, or service dependency requires an ADR and unanimous approval. Default answer: no.
@@ -21,15 +21,16 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 ## 2. Architecture Rules
 
-**Rule 2.1 — Dumb clients, smart server.** All logic (transcode decisions, watch state, metadata, auth, sorting) lives server-side. Clients render API responses and play streams. A client that computes anything the server could compute is a bug.
+**Rule 2.1 — Dumb clients, smart server.** All logic (transcode decisions, watch state, metadata, auth, sorting) lives server-side. Clients render API responses and play streams. Clients report capability profiles; they never choose direct play / remux / session locally. A client that computes anything the server could compute is a bug.
 **Rule 2.2 — The API is the product.** Every feature is API-first. The web UI consumes the same public API as every other client. No private/internal endpoints.
 **Rule 2.3 — API stability.** Once v1 is published, endpoints are never broken, only versioned. Additive changes only within a version.
-**Rule 2.4 — One player core.** Playback bugs are fixed once, in the Rust core. Never patched per-platform.
+**Rule 2.4 — One player interface.** Playback behaviour (attach, seek, track selection, state, errors) is owned once: the Dart player interface plus the server session contract. Platform engines implement that interface. Do not invent a second OSD, scrubber, or playback-method decision per platform.
 **Rule 2.5 — FFmpeg is orchestrated, never forked or patched.** We adapt to FFmpeg, not the reverse.
+**Rule 2.6 — Client matrix.** A user-visible feature is not finished until every supported client that should have it has merged and dogfooded it, or an omission is named with a form-factor reason (e.g. offline downloads on phone, not TV). Do not leave the matrix for tag day. Sessions are a permanent path for clients that cannot direct-play; "works on Media3" is not "works everywhere."
 
 ## 3. Scope Rules (v1 lock)
 
-**IN scope:** library scan, metadata (TMDB/TVDB), direct play, remux, hardware transcode, HLS, multi-user auth, watch state/resume, text subtitles (embedded and sidecar, served as WebVTT), image-subtitle burn-in, web UI, Android/Android TV, iOS, tvOS subject to the timeboxed spike and go/no-go in ADR-0001, Tizen/webOS web wrappers.
+**IN scope:** library scan, metadata (TMDB/TVDB), direct play, remux, hardware transcode, HLS, multi-user auth, watch state/resume, text subtitles (embedded and sidecar, served as WebVTT), image-subtitle burn-in, web UI; Flutter clients per ADR-0021 (Android/Android TV, iOS, Windows/Linux; tvOS subject to flutter-tvos health and Apple engine choice; Tizen/webOS via vendor Flutter shells and vendor players). Sessions are first-class for web and any client that cannot direct-play the library.
 
 **OUT of scope for v1 — auto-reject any PR, issue, or suggestion containing:** Live TV, DVR, plugins/extension system, music/photo libraries, federation/multi-server, cloud sync, social features, recommendations/ML, themes beyond light/dark, restyling image subtitles.
 
@@ -46,8 +47,8 @@ This document governs all humans and LLMs contributing to this project. When in 
 **Rule 4.6 — Dogfooding is mandatory.** Main branch runs as the team's real household media server. If you won't run it at home, don't merge it.
 **Rule 4.7 — No speculative abstraction.** No traits, generics, or config options for hypothetical future needs. Abstract on the second concrete use case, not the first.
 **Rule 4.8 — Incomplete, never provisional.** A slice may do less than the final product, but it may not be built on a design we expect to replace. If the honest description of a slice is "this works for now and we will redo it," stop and design the real thing first. Fewer features is fine; a placeholder architecture is not. Do not hide one behind a "provisional", "temporary", or "good enough for now" label that quietly becomes permanent.
-**Rule 4.9 — Data shapes before writers.** Any on-disk or on-wire shape that is expensive to change (segment duration, keyframe cadence, cache keys, schema columns, URL paths that clients bookmark) is decided in an ADR before the code that writes it. Illustration: a frame-count `-g 48` looked like a 2-second GOP until a 60 fps source made segments 0.8s; locking a time-based interval in ADR-0008 is the kind of decision this rule requires up front. The same value was also expressed twice in different units, and the playlist's `TARGETDURATION` disagreed with the encoder's actual segment length until `SEGMENT_MS` became the single owner. Duplicated expressions of one data shape are the same class of bug as choosing the shape badly.
-**Rule 4.11 — One concept, one path.** Two things that mean the same to a user are one type with one code path, distinguished by a field, not two implementations that coexist because they arrived in different weeks. An embedded subtitle and a sidecar subtitle are both a subtitle. A remux and a transcode are both a playback session. When a new case arrives, the question is which field it adds, not which branch it needs. If unifying is genuinely wrong, the ADR says why rather than leaving the fork unexplained.
+**Rule 4.9 — Data shapes before writers.** Any on-disk or on-wire shape that is expensive to change (segment duration, keyframe cadence, cache keys, schema columns, URL paths that clients bookmark) is decided in an ADR before the code that writes it. Example: locking a time-based segment interval rather than a frame-count GOP — see ADR-0008. Duplicated expressions of one data shape are the same class of bug as choosing the shape badly.
+**Rule 4.10 — One concept, one path.** Two things that mean the same to a user are one type with one code path, distinguished by a field, not two implementations that coexist because they arrived in different weeks. An embedded subtitle and a sidecar subtitle are both a subtitle. Remux and transcode as one session concept: see ADR-0011. When a new case arrives, the question is which field it adds, not which branch it needs. If unifying is genuinely wrong, the ADR says why rather than leaving the fork unexplained.
 
 ## 5. LLM-Specific Rules
 
@@ -60,8 +61,8 @@ This document governs all humans and LLMs contributing to this project. When in 
 ## 6. Process Rules
 
 **Rule 6.1 — ADRs for irreversible decisions.** Any decision that's expensive to undo (schema, API shape, protocol choice) gets a one-page Architecture Decision Record before code.
-**Rule 6.2 — One owner per subsystem.** Transcoding, metadata, API, player core, clients — each has exactly one accountable owner.
-**Rule 6.3 — Quarterly rule read-through.** Once per quarter, read this document as a whole for overlap and contradiction, including whether Rules 4.5, 4.7, and 4.11 still say distinct things. Rules may be amended at any time with unanimous agreement when the reasoning is recorded in the commit message.
+**Rule 6.2 — One owner per subsystem.** Transcoding, metadata, API, client playback, clients — each has exactly one accountable owner.
+**Rule 6.3 — Quarterly rule read-through.** Once per quarter, read this document as a whole for overlap and contradiction, including whether Rules 4.5, 4.7, and 4.10 still say distinct things, and whether Rules 2.6 and 4.8 still say distinct things. Rules may be amended at any time with unanimous agreement when the reasoning is recorded in the commit message.
 **Rule 6.4 — The escape hatch.** If a rule is genuinely blocking shipping, write the ADR explaining why, get unanimous sign-off, and amend the rule — don't violate it silently.
 **Rule 6.5 — Git.** Branching, commits, PRs, and history hygiene are defined in [docs/GIT_RULES.md](docs/GIT_RULES.md).
 

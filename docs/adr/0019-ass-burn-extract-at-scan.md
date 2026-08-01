@@ -102,7 +102,7 @@ Spike closeout asked whether durable `.ass` needs its own cache ADR. Six
 store questions against this document: path and one-store are already here;
 invalidation, doctor reporting, cold-miss behaviour, and concurrent writers
 were incomplete or only implied by ADR-0013. A second ADR for the same
-`subs/{itemId}/` tree would fork Rule 4.11. Extend in place.
+`subs/{itemId}/` tree would fork Rule 4.10. Extend in place.
 
 V1_PLAN Phase 2 item 3 (text backfill default / opt-in / on-demand) names
 neither a path nor a key; it stays parked on browser proof of items 1–2 and

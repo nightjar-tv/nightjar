@@ -29,13 +29,13 @@ that reads like a careful senior engineer wrote it.
   request sequence from attach through the action under test. Do not speculate
   with playlist or player edits until that trace exists. One capture beats
   multiple guessing commits.
-- **Hardest client binds (enforces Rule 2.4 / one path).** A playback or scrub
-  fix is not done if it only works on the founder desktop (or only on MSE)
+- **Hardest client binds (enforces Rule 2.6 / client matrix).** A playback or
+  scrub fix is not done if it only works on the founder desktop (or only on MSE)
   while iOS / native Apple WebKit on the same product path stays broken or
   gets a different attach backend. Do not remount `video.src` to clear a stuck
   scrub (exits fullscreen). Do not route only desktop Safari to hls.js so Mac
   dogfood passes. If the honest fix cannot land on the binding client, stop
-  and say so — cite Rule 2.4 / Rule 4.8; do not invent a desktop-shaped escape.
+  and say so — cite Rule 2.6 / Rule 4.8; do not invent a desktop-shaped escape.
 - **Rejected approaches stay dead.** If this chat or dogfood already rejected a
   scrub approach (src remount, forever-refuse/404 papering, etc.), do not
   revive it to clear the latest log. Stop or ask; a new ADR with new evidence
@@ -43,15 +43,21 @@ that reads like a careful senior engineer wrote it.
 
 ## 1. Stack boundaries (hard, from ENGINEERING_RULES.md §1–2)
 
-- Rust (Axum + Tokio) for the server. SvelteKit for web. Flutter for app shells.
-  Never introduce another language, framework, ORM, or service. SQLite via rusqlite
-  patterns already in `server/crates/db` (raw SQL, no query builders).
+- Rust (Axum + Tokio) for the server. SvelteKit for web. Flutter for client UI
+  where a working toolchain exists (ADR-0021). Never introduce another language,
+  framework, ORM, or service. SQLite via rusqlite patterns already in
+  `server/crates/db` (raw SQL, no query builders).
 - FFmpeg is invoked as a child process through the existing orchestration in
   `server/crates/transcode`. Never add an FFmpeg wrapper crate. Never suggest
   patching FFmpeg.
-- All logic lives server-side (Rule 2.1). If you find yourself writing sorting,
-  filtering, transcode decisions, or auth checks in Svelte or Dart, stop and move
-  it behind the API.
+- All logic lives server-side (Rule 2.1). Clients report capability profiles;
+  they never choose direct play / remux / session locally. If you find yourself
+  writing sorting, filtering, transcode decisions, or auth checks in Svelte or
+  Dart, stop and move it behind the API.
+- Playback engines are per-platform behind one Dart player interface
+  (ADR-0021 / Rule 2.4): Media3, media_kit/libmpv, Apple engine per ADR-0021,
+  vendor TV players, browser/hls.js. No plugin player zoo. No Nightjar-owned
+  decode engine on Tizen/webOS.
 - Every new capability is expressed in api/openapi.yaml FIRST, then implemented.
   Never hand-write API types in clients; they are generated.
 - Nothing may break single-binary deployment (Rule 1.2): no runtime file
@@ -145,10 +151,14 @@ that reads like a careful senior engineer wrote it.
 - Client state is UI state only (open menus, scroll position). Watch state,
   sort order, and permissions come from the server. Cache, don't compute
   (Rule 2.1).
-- Flutter: playback goes through the shared player core FFI, never a platform
-  video plugin (Rule 2.4).
+- Flutter: playback goes through the Dart player interface over the engine
+  that platform uses (ADR-0021 / Rule 2.4). Do not invent a second OSD,
+  scrubber, or local playback-method chooser per engine. Do not add a
+  Nightjar-owned decode engine on Tizen/webOS.
 - Web HLS: do not change `pickBackend` / native-vs-hls.js to make founder
-  desktop dogfood pass while iOS stays on another path (Rule 2.4).
+  desktop dogfood pass while iOS stays on another path (Rule 2.6).
+- A user-visible feature is not done until every supported client that should
+  have it has it, or an omission is named with a form-factor reason (Rule 2.6).
 - Accessibility floor is non-negotiable: keyboard/D-pad focus visible, labels
   on controls, reduced-motion respected. TV UIs must be operable by arrows +
   enter alone.
@@ -166,7 +176,7 @@ that reads like a careful senior engineer wrote it.
 - When you cut a corner for any reason, say exactly which corner, in the
   response, not in a code comment.
 - After a playback dogfood failure: stop or ask — do not chain desktop-only
-  workarounds. That is a Rule 2.4 / Rule 4.8 violation dressed as iteration.
+  workarounds. That is a Rule 2.6 / Rule 4.8 violation dressed as iteration.
 - **ENGINEERING_RULES.md is LOCKED.** Never edit it unless the human explicitly
   asks to amend the constitution with unanimous approval and a commit message
   that explains what prompted the change. "Add a Cursor rule" is not permission
