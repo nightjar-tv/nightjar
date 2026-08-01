@@ -1,5 +1,10 @@
-# Nightjar — single-binary image (Phase 0 hello-world)
-# Build context: repo root
+# Nightjar — single-binary image with FFmpeg on PATH (Gate 2 HW claim).
+# Build context: repo root.
+#
+# FFmpeg is Debian bookworm's package, invoked as an external process (not
+# linked). Intel VAAPI/QSV need the media drivers in the image and
+# --device=/dev/dri at run time. We do not vendor a competitor's FFmpeg build.
+# See nightjar-meta/notes/hw/packaging-ffmpeg-image.md.
 
 FROM node:22-bookworm AS web
 WORKDIR /src/web
@@ -17,9 +22,16 @@ RUN cargo build --release -p nightjar-api
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ca-certificates \
+	&& apt-get install -y --no-install-recommends \
+		ca-certificates \
+		ffmpeg \
+		intel-media-va-driver \
+		mesa-va-drivers \
+		i965-va-driver \
 	&& rm -rf /var/lib/apt/lists/*
 COPY --from=server /src/server/target/release/nightjar /usr/local/bin/nightjar
 ENV NIGHTJAR_PORT=8096
+# Help VAAPI find drivers in slim images.
+ENV LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
 EXPOSE 8096
 ENTRYPOINT ["nightjar"]
