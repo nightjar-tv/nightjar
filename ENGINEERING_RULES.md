@@ -21,6 +21,7 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 ## 2. Architecture Rules
 
+**Rule 2.0 — Playback first.** Interactive playback wins over everything else. Background jobs, library work, metadata, UI polish, and new features all yield to an active play or seek. Nothing may saturate CPU, disk, network, or the share enough to make press-play unreliable. If a change cannot ship without hurting playback, it does not ship.
 **Rule 2.1 — Dumb clients, smart server.** All logic (transcode decisions, watch state, metadata, auth, sorting) lives server-side. Clients render API responses and play streams. Clients report capability profiles; they never choose direct play / remux / session locally. A client that computes anything the server could compute is a bug.
 **Rule 2.2 — The API is the product.** Every feature is API-first. The web UI consumes the same public API as every other client. No private/internal endpoints.
 **Rule 2.3 — API stability.** Once v1 is published, endpoints are never broken, only versioned. Additive changes only within a version.

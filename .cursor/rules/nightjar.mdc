@@ -54,6 +54,10 @@ that reads like a careful senior engineer wrote it.
   they never choose direct play / remux / session locally. If you find yourself
   writing sorting, filtering, transcode decisions, or auth checks in Svelte or
   Dart, stop and move it behind the API.
+- Playback first (Rule 2.0): interactive play and seek win over everything
+  else — background jobs, library work, metadata, UI polish, new features.
+  Do not ship a change that saturates CPU, disk, network, or the share so
+  press-play becomes unreliable.
 - Playback engines are per-platform behind one Dart player interface
   (ADR-0021 / Rule 2.4): Media3, media_kit/libmpv, Apple engine per ADR-0021,
   vendor TV players, browser/hls.js. No plugin player zoo. No Nightjar-owned
