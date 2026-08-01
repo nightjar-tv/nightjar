@@ -69,9 +69,6 @@ fn corpus_manifest_expects_match_decide_playback() {
             );
             continue;
         };
-        if row.commit == Some(false) {
-            continue;
-        }
         if row.status.as_deref() == Some("pending source") {
             continue;
         }
@@ -80,6 +77,10 @@ fn corpus_manifest_expects_match_decide_playback() {
         };
 
         let path = testdata.join(rel);
+        // Non-committed rows (large-*, Dolby kit): exercise when present, skip if absent.
+        if row.commit == Some(false) && !path.is_file() {
+            continue;
+        }
         assert!(
             path.is_file(),
             "corpus file missing (run testdata/generate.sh): {}",
