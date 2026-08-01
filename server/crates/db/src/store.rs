@@ -50,6 +50,14 @@ pub struct MediaItemRow {
     pub subtitle_status: String,
     pub subtitle_source_mtime_ms: Option<i64>,
     pub subtitle_source_size_bytes: Option<i64>,
+    /// ADR-0023 live media-file fingerprint (NULL until scan computes it).
+    pub content_id: Option<String>,
+    pub probed_content_id: Option<String>,
+    pub subtitle_content_id: Option<String>,
+    pub usable_extent_ms: Option<i64>,
+    pub usable_extent_content_id: Option<String>,
+    pub map_status: String,
+    pub map_content_id: Option<String>,
 }
 
 /// Index-pass upsert: codecs left null, probe_status = indexed.
@@ -210,7 +218,9 @@ impl Db {
                         year, season, episode, duration_ms, container, video_codec,
                         audio_codec, audio_channels, width, height, probe_status,
                         scan_error, subtitle_status, subtitle_source_mtime_ms,
-                        subtitle_source_size_bytes
+                        subtitle_source_size_bytes, content_id, probed_content_id,
+                        subtitle_content_id, usable_extent_ms, usable_extent_content_id,
+                        map_status, map_content_id
                  FROM media_items
                  WHERE library_id = ?1
                  ORDER BY title COLLATE NOCASE, season, episode",
@@ -230,7 +240,9 @@ impl Db {
                     year, season, episode, duration_ms, container, video_codec,
                     audio_codec, audio_channels, width, height, probe_status,
                     scan_error, subtitle_status, subtitle_source_mtime_ms,
-                    subtitle_source_size_bytes
+                    subtitle_source_size_bytes, content_id, probed_content_id,
+                    subtitle_content_id, usable_extent_ms, usable_extent_content_id,
+                    map_status, map_content_id
              FROM media_items WHERE id = ?1",
             [id],
             map_item,
@@ -312,7 +324,14 @@ impl Db {
                         probed_at = NULL,
                         subtitle_status = 'pending',
                         subtitle_source_mtime_ms = NULL,
-                        subtitle_source_size_bytes = NULL",
+                        subtitle_source_size_bytes = NULL,
+                        content_id = NULL,
+                        probed_content_id = NULL,
+                        subtitle_content_id = NULL,
+                        usable_extent_ms = NULL,
+                        usable_extent_content_id = NULL,
+                        map_status = 'pending',
+                        map_content_id = NULL",
                 )
                 .map_err(|e| format!("prepare index upsert: {e}"))?;
             for item in items {
@@ -339,6 +358,16 @@ impl Db {
                     .query_row(params![library_id, item.path], |r| r.get(0))
                     .map_err(|e| format!("fetch upserted id: {e}"))?;
                 ids.push(id);
+            }
+        }
+        {
+            // Stale byte offsets are worse than no map (ADR-0023 §6).
+            let mut del = tx
+                .prepare("DELETE FROM keyframe_map_entries WHERE media_item_id = ?1")
+                .map_err(|e| format!("prepare map clear: {e}"))?;
+            for &id in &ids {
+                del.execute([id])
+                    .map_err(|e| format!("clear map entries for item {id}: {e}"))?;
             }
         }
         tx.commit()
@@ -844,6 +873,13 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         subtitle_status: r.get(19)?,
         subtitle_source_mtime_ms: r.get(20)?,
         subtitle_source_size_bytes: r.get(21)?,
+        content_id: r.get(22)?,
+        probed_content_id: r.get(23)?,
+        subtitle_content_id: r.get(24)?,
+        usable_extent_ms: r.get(25)?,
+        usable_extent_content_id: r.get(26)?,
+        map_status: r.get(27)?,
+        map_content_id: r.get(28)?,
     })
 }
 

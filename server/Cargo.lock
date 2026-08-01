@@ -544,6 +544,7 @@ name = "nightjar-db"
 version = "0.0.1"
 dependencies = [
  "rusqlite",
+ "sha2",
  "tempfile",
  "tracing",
 ]
