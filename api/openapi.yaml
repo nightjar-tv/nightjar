@@ -178,6 +178,7 @@ paths:
       summary: Playback method and delivery URL for an item
       parameters:
         - $ref: "#/components/parameters/ItemId"
+        - $ref: "#/components/parameters/ProfileId"
       responses:
         "200":
           description: Playback info
@@ -227,9 +228,12 @@ paths:
       summary: Byte stream for playback (supports HTTP Range)
       description: >
         Serves the original file for directPlay items. Remux and transcode
-        items are delivered as HLS sessions (ADR-0011).
+        items are delivered as HLS sessions (ADR-0011). Honours profileId
+        (ADR-0022); default BROWSER_V0 keeps today's 415 on Matroska for
+        anonymous browser callers.
       parameters:
         - $ref: "#/components/parameters/ItemId"
+        - $ref: "#/components/parameters/ProfileId"
         - name: Range
           in: header
           required: false
@@ -286,6 +290,7 @@ paths:
             type: integer
             format: int64
             minimum: 0
+        - $ref: "#/components/parameters/ProfileId"
         - name: audioTrackId
           in: query
           required: false
@@ -653,8 +658,46 @@ components:
         type: integer
         format: int64
         minimum: 0
+    ProfileId:
+      name: profileId
+      in: query
+      required: false
+      description: >
+        Client capability profile id (ADR-0022). Known ids: BROWSER_V0,
+        MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back
+        to BROWSER_V0. Decision and /stream / sessions agree on the same id.
+      schema:
+        type: string
+        minLength: 1
 
   schemas:
+    HdrCapability:
+      type: string
+      enum: [none, hdr10, dolbyVision]
+      description: >
+        Highest HDR the client accepts (ADR-0022). Source above this forces
+        transcode (tone-map graph is a later slice).
+
+    ClientCapabilityProfile:
+      type: object
+      description: >
+        Wire shape for a reported profile (ADR-0022). Named ids cover the
+        common engines; an unknown id may send this bag in a later slice.
+      properties:
+        profileId:
+          type: string
+        maxBitrateBps:
+          type: integer
+          format: int64
+          nullable: true
+          description: Source video bitrate above this forces transcode. null = no ceiling.
+        maxHeight:
+          type: integer
+          nullable: true
+          description: Source height above this forces transcode. null = no ceiling.
+        hdr:
+          $ref: "#/components/schemas/HdrCapability"
+
     Health:
       type: object
       required: [status, version]

@@ -1,9 +1,9 @@
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::decide;
+use crate::routes::items::{ProfileQuery, decide, profile_from_query};
 use crate::state::AppState;
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -16,6 +16,7 @@ use tokio_util::io::ReaderStream;
 pub async fn stream_item(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
+    Query(query): Query<ProfileQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let row = state
@@ -23,7 +24,8 @@ pub async fn stream_item(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let decision = decide(&row);
+    let profile = profile_from_query(query.profile_id.as_deref());
+    let decision = decide(&row, profile);
 
     match decision.method {
         PlaybackMethod::DirectPlay => {

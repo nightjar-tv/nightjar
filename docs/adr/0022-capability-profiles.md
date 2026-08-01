@@ -1,6 +1,6 @@
 # ADR-0022: Client capability profiles (bitrate, resolution, HDR)
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-01
 - Depends on: ADR-0008 §6; ADR-0012 (channel ceiling); ADR-0021 (which
   profile ids exist once clients ship)
@@ -101,6 +101,10 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
 ## Consequences
 
 - OpenAPI + `decide_playback` + `/stream` grow additively; no break inside `/v0`.
+- Slice 1 (accepted): `profileId` on playback-info / stream / sessions;
+  named `BROWSER_V0` / `MEDIA3_V0` / `MPV_V0`; bitrate / height / HDR ceilings
+  force transcode; probe stores `video_bitrate_bps` and `hdr`. Tone-map graph
+  and encode-target bitrate are follow-up slices.
 - Bake-off Step 2 profile work has a home; `AETHER_V0` stays unscored until
   counted.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR

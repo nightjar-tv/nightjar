@@ -17,8 +17,45 @@ impl PlaybackMethod {
     }
 }
 
-/// What a client can play natively. The compatibility contract for Phase 2
-/// (ADR-0006); richer per-client profiles arrive additively later.
+/// Highest HDR the client accepts (ADR-0022). Source above this forces
+/// transcode; tone-map FFmpeg graph is a later slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrCapability {
+    None,
+    Hdr10,
+    DolbyVision,
+}
+
+impl HdrCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Hdr10 => "hdr10",
+            Self::DolbyVision => "dolbyVision",
+        }
+    }
+
+    /// Parse a stored source or wire value (`none` / `hdr10` / `dolbyVision`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "hdr10" => Some(Self::Hdr10),
+            "dolbyVision" | "dolby_vision" => Some(Self::DolbyVision),
+            _ => None,
+        }
+    }
+
+    fn accepts(self, source: HdrCapability) -> bool {
+        match source {
+            HdrCapability::None => true,
+            HdrCapability::Hdr10 => matches!(self, Self::Hdr10 | Self::DolbyVision),
+            HdrCapability::DolbyVision => matches!(self, Self::DolbyVision),
+        }
+    }
+}
+
+/// What a client can play natively (ADR-0006 / ADR-0022).
+#[derive(Debug, Clone, Copy)]
 pub struct ClientCapabilityProfile {
     pub video_codecs: &'static [&'static str],
     pub audio_codecs: &'static [&'static str],
@@ -29,6 +66,11 @@ pub struct ClientCapabilityProfile {
     /// Highest audio channel count the client renders usefully; tracks above
     /// it are downmixed by a session (ADR-0012). `None` means no ceiling.
     pub max_audio_channels: Option<u32>,
+    /// Source video bitrate above this forces transcode. `None` = no ceiling.
+    pub max_bitrate_bps: Option<u64>,
+    /// Source height above this forces transcode. `None` = no ceiling.
+    pub max_height: Option<u32>,
+    pub hdr: HdrCapability,
 }
 
 /// Phase 1 browser whitelist: H.264 family + AAC in MP4/M4V, stereo audio.
@@ -38,7 +80,98 @@ pub const BROWSER_V0: ClientCapabilityProfile = ClientCapabilityProfile {
     containers: &["mp4", "m4v", "mov"],
     extensions: &["mp4", "m4v"],
     max_audio_channels: Some(2),
+    max_bitrate_bps: None,
+    max_height: None,
+    hdr: HdrCapability::None,
 };
+
+/// Android / Android TV Media3 floor (ADR-0022). Wide codecs; no bitrate /
+/// height ceiling on LAN dogfood.
+pub const MEDIA3_V0: ClientCapabilityProfile = ClientCapabilityProfile {
+    video_codecs: &[
+        "h264",
+        "avc",
+        "avc1",
+        "hevc",
+        "h265",
+        "hev1",
+        "av1",
+        "vp9",
+        "vp8",
+        "mpeg2video",
+        "mpeg4",
+    ],
+    audio_codecs: &[
+        "aac", "mp4a", "ac3", "eac3", "truehd", "dts", "flac", "opus", "mp3", "vorbis",
+    ],
+    containers: &[
+        "mp4", "m4v", "mov", "matroska", "webm", "avi", "mpegts", "mpeg",
+    ],
+    extensions: &["mp4", "m4v", "mkv", "webm", "avi", "ts", "m2ts", "mov"],
+    max_audio_channels: None,
+    max_bitrate_bps: None,
+    max_height: None,
+    hdr: HdrCapability::DolbyVision,
+};
+
+/// libmpv / media_kit floor (ADR-0022). Same wide accept list as Media3 for
+/// v0; no remote bitrate ceiling.
+pub const MPV_V0: ClientCapabilityProfile = ClientCapabilityProfile {
+    video_codecs: &[
+        "h264",
+        "avc",
+        "avc1",
+        "hevc",
+        "h265",
+        "hev1",
+        "av1",
+        "vp9",
+        "vp8",
+        "mpeg2video",
+        "mpeg4",
+        "vc1",
+    ],
+    audio_codecs: &[
+        "aac",
+        "mp4a",
+        "ac3",
+        "eac3",
+        "truehd",
+        "dts",
+        "dtshd",
+        "flac",
+        "opus",
+        "mp3",
+        "vorbis",
+        "pcm_s16le",
+    ],
+    containers: &[
+        "mp4", "m4v", "mov", "matroska", "webm", "avi", "mpegts", "mpeg",
+    ],
+    extensions: &["mp4", "m4v", "mkv", "webm", "avi", "ts", "m2ts", "mov"],
+    max_audio_channels: None,
+    max_bitrate_bps: None,
+    max_height: None,
+    hdr: HdrCapability::DolbyVision,
+};
+
+/// Named profile from a client `profileId`, or `None` when unknown.
+pub fn known_profile(id: &str) -> Option<&'static ClientCapabilityProfile> {
+    match id {
+        "BROWSER_V0" => Some(&BROWSER_V0),
+        "MEDIA3_V0" => Some(&MEDIA3_V0),
+        "MPV_V0" => Some(&MPV_V0),
+        _ => None,
+    }
+}
+
+/// Resolve a client profile id. Omitted / empty / unknown → `BROWSER_V0`.
+pub fn resolve_profile(id: Option<&str>) -> &'static ClientCapabilityProfile {
+    match id {
+        None | Some("") => &BROWSER_V0,
+        Some(id) => known_profile(id).unwrap_or(&BROWSER_V0),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaybackDecision {
@@ -60,6 +193,10 @@ pub struct PlaybackDecision {
 /// `None` also loses direct play when the profile has a ceiling: an upgraded
 /// database may still have NULL after migration 004 until the next probe, and
 /// treating that as "within ceiling" would keep direct-playing 5.1 to browsers.
+///
+/// `height`, `bitrate_bps`, and `source_hdr` (`none` / `hdr10` /
+/// `dolbyVision`) apply ADR-0022 ceilings: over ceiling forces **transcode**
+/// (re-encode), not remux.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_playback(
     path: &str,
@@ -67,6 +204,9 @@ pub fn decide_playback(
     video_codec: Option<&str>,
     audio_codec: Option<&str>,
     audio_channels: Option<u32>,
+    height: Option<u32>,
+    bitrate_bps: Option<u64>,
+    source_hdr: Option<&str>,
     scan_error: Option<&str>,
     probe_status: &str,
     profile: &ClientCapabilityProfile,
@@ -96,6 +236,15 @@ pub fn decide_playback(
     let container_ok = matches_container(path, container, profile);
 
     if video_ok && audio_ok {
+        if let Some(reason) =
+            profile_ceiling_transcode_reason(height, bitrate_bps, source_hdr, profile)
+        {
+            return PlaybackDecision {
+                method: PlaybackMethod::Transcode,
+                reason,
+                mime_type: "application/vnd.apple.mpegurl".into(),
+            };
+        }
         if let Some(reason) = channel_ceiling_session_reason(audio_channels, profile) {
             return PlaybackDecision {
                 method: PlaybackMethod::Remux,
@@ -129,6 +278,42 @@ pub fn decide_playback(
         reason: format!("needs transcode: {}", why.join(", ")),
         mime_type: mime_for_path(path),
     }
+}
+
+/// ADR-0022 bitrate / height / HDR ceilings force a re-encode session.
+fn profile_ceiling_transcode_reason(
+    height: Option<u32>,
+    bitrate_bps: Option<u64>,
+    source_hdr: Option<&str>,
+    profile: &ClientCapabilityProfile,
+) -> Option<String> {
+    if let Some(max_h) = profile.max_height
+        && let Some(h) = height
+        && h > max_h
+    {
+        return Some(format!(
+            "source height {h} exceeds profile maxHeight {max_h}"
+        ));
+    }
+    if let Some(max_b) = profile.max_bitrate_bps
+        && let Some(b) = bitrate_bps
+        && b > max_b
+    {
+        return Some(format!(
+            "source bitrate {b} exceeds profile maxBitrateBps {max_b}"
+        ));
+    }
+    if let Some(raw) = source_hdr.filter(|s| !s.is_empty()) {
+        let source = HdrCapability::parse(raw).unwrap_or(HdrCapability::None);
+        if !profile.hdr.accepts(source) {
+            return Some(format!(
+                "source HDR {} exceeds profile hdr {}",
+                source.as_str(),
+                profile.hdr.as_str()
+            ));
+        }
+    }
+    None
 }
 
 /// Why this title cannot DirectPlay under the profile's channel ceiling.
@@ -244,8 +429,12 @@ mod tests {
             video,
             audio,
             Some(2),
+            None,
+            None,
+            Some("none"),
             scan_error,
             probe_status,
+            &BROWSER_V0,
         )
     }
 
@@ -256,8 +445,12 @@ mod tests {
         video: Option<&str>,
         audio: Option<&str>,
         channels: Option<u32>,
+        height: Option<u32>,
+        bitrate_bps: Option<u64>,
+        source_hdr: Option<&str>,
         scan_error: Option<&str>,
         probe_status: &str,
+        profile: &ClientCapabilityProfile,
     ) -> PlaybackDecision {
         decide_playback(
             path,
@@ -265,9 +458,12 @@ mod tests {
             video,
             audio,
             channels,
+            height,
+            bitrate_bps,
+            source_hdr,
             scan_error,
             probe_status,
-            &BROWSER_V0,
+            profile,
         )
     }
 
@@ -343,7 +539,11 @@ mod tests {
                     Some("aac"),
                     Some(8),
                     None,
+                    None,
+                    Some("none"),
+                    None,
                     "probed",
+                    &BROWSER_V0,
                 ),
                 PlaybackMethod::Remux,
             ),
@@ -356,7 +556,11 @@ mod tests {
                     Some("aac"),
                     Some(1),
                     None,
+                    None,
+                    Some("none"),
+                    None,
                     "probed",
+                    &BROWSER_V0,
                 ),
                 PlaybackMethod::DirectPlay,
             ),
@@ -369,7 +573,11 @@ mod tests {
                     Some("aac"),
                     None,
                     None,
+                    None,
+                    Some("none"),
+                    None,
                     "probed",
+                    &BROWSER_V0,
                 ),
                 PlaybackMethod::Remux,
             ),
@@ -379,8 +587,6 @@ mod tests {
         }
     }
 
-    /// ADR-0012: the 7.1 downgrade is user-visible, so the reason has to name
-    /// the layout rather than blame the container.
     #[test]
     fn channel_ceiling_session_reports_hls_mime_and_names_the_layout() {
         let d = decide_channels(
@@ -390,7 +596,11 @@ mod tests {
             Some("aac"),
             Some(8),
             None,
+            None,
+            Some("none"),
+            None,
             "probed",
+            &BROWSER_V0,
         );
         assert_eq!(d.method, PlaybackMethod::Remux);
         assert_eq!(d.mime_type, "application/vnd.apple.mpegurl");
@@ -407,7 +617,11 @@ mod tests {
             Some("aac"),
             None,
             None,
+            None,
+            Some("none"),
+            None,
             "probed",
+            &BROWSER_V0,
         );
         assert_eq!(d.method, PlaybackMethod::Remux);
         assert!(d.reason.contains("not yet stored"), "{}", d.reason);
@@ -461,6 +675,108 @@ mod tests {
         assert_eq!(d.method, PlaybackMethod::Transcode);
         assert!(d.reason.contains("audio codec unsupported"));
         assert!(!d.reason.contains("video codec unsupported"));
+    }
+
+    #[test]
+    fn height_ceiling_forces_transcode() {
+        let capped = ClientCapabilityProfile {
+            max_height: Some(1080),
+            hdr: HdrCapability::None,
+            ..BROWSER_V0
+        };
+        let d = decide_channels(
+            "/a/b.mp4",
+            Some("mov,mp4,m4a"),
+            Some("h264"),
+            Some("aac"),
+            Some(2),
+            Some(2160),
+            None,
+            Some("none"),
+            None,
+            "probed",
+            &capped,
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(d.reason.contains("maxHeight"), "{}", d.reason);
+    }
+
+    #[test]
+    fn bitrate_ceiling_forces_transcode() {
+        let capped = ClientCapabilityProfile {
+            max_bitrate_bps: Some(5_000_000),
+            ..BROWSER_V0
+        };
+        let d = decide_channels(
+            "/a/b.mp4",
+            Some("mov,mp4,m4a"),
+            Some("h264"),
+            Some("aac"),
+            Some(2),
+            Some(1080),
+            Some(40_000_000),
+            Some("none"),
+            None,
+            "probed",
+            &capped,
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(d.reason.contains("maxBitrateBps"), "{}", d.reason);
+    }
+
+    #[test]
+    fn hdr_mismatch_forces_transcode_on_browser() {
+        let d = decide_channels(
+            "/a/b.mp4",
+            Some("mov,mp4,m4a"),
+            Some("h264"),
+            Some("aac"),
+            Some(2),
+            None,
+            None,
+            Some("hdr10"),
+            None,
+            "probed",
+            &BROWSER_V0,
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(d.reason.contains("HDR"), "{}", d.reason);
+    }
+
+    #[test]
+    fn mpv_direct_plays_mkv_hevc() {
+        let d = decide_channels(
+            "/a/b.mkv",
+            Some("matroska,webm"),
+            Some("hevc"),
+            Some("aac"),
+            Some(2),
+            None,
+            None,
+            Some("none"),
+            None,
+            "probed",
+            &MPV_V0,
+        );
+        assert_eq!(d.method, PlaybackMethod::DirectPlay, "{}", d.reason);
+    }
+
+    #[test]
+    fn resolve_profile_unknown_falls_back_to_browser() {
+        assert_eq!(
+            resolve_profile(None).max_audio_channels,
+            BROWSER_V0.max_audio_channels
+        );
+        assert_eq!(
+            resolve_profile(Some("nope")).video_codecs,
+            BROWSER_V0.video_codecs
+        );
+        assert_eq!(
+            resolve_profile(Some("MPV_V0")).video_codecs,
+            MPV_V0.video_codecs
+        );
+        assert!(known_profile("MEDIA3_V0").is_some());
+        assert!(known_profile("ghost").is_none());
     }
 
     #[test]

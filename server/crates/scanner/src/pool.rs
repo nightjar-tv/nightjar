@@ -533,6 +533,8 @@ impl LibraryPool {
                 audio_channels: p.audio_channels,
                 width: p.width,
                 height: p.height,
+                video_bitrate_bps: p.video_bitrate_bps,
+                hdr: p.hdr,
                 probe_status: "probed".into(),
                 scan_error: None,
             },
@@ -568,6 +570,8 @@ impl LibraryPool {
                         audio_channels: None,
                         width: None,
                         height: None,
+                        video_bitrate_bps: None,
+                        hdr: None,
                         probe_status: "unavailable".into(),
                         scan_error: Some(e),
                     }
@@ -582,6 +586,8 @@ impl LibraryPool {
                         audio_channels: None,
                         width: None,
                         height: None,
+                        video_bitrate_bps: None,
+                        hdr: None,
                         probe_status: "error".into(),
                         scan_error: Some(e),
                     }

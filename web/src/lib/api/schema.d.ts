@@ -167,7 +167,7 @@ export interface paths {
         };
         /**
          * Byte stream for playback (supports HTTP Range)
-         * @description Serves the original file for directPlay items. Remux and transcode items are delivered as HLS sessions (ADR-0011).
+         * @description Serves the original file for directPlay items. Remux and transcode items are delivered as HLS sessions (ADR-0011). Honours profileId (ADR-0022); default BROWSER_V0 keeps today's 415 on Matroska for anonymous browser callers.
          */
         get: operations["streamItem"];
         put?: never;
@@ -357,6 +357,23 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description Highest HDR the client accepts (ADR-0022). Source above this forces transcode (tone-map graph is a later slice).
+         * @enum {string}
+         */
+        HdrCapability: "none" | "hdr10" | "dolbyVision";
+        /** @description Wire shape for a reported profile (ADR-0022). Named ids cover the common engines; an unknown id may send this bag in a later slice. */
+        ClientCapabilityProfile: {
+            profileId?: string;
+            /**
+             * Format: int64
+             * @description Source video bitrate above this forces transcode. null = no ceiling.
+             */
+            maxBitrateBps?: number | null;
+            /** @description Source height above this forces transcode. null = no ceiling. */
+            maxHeight?: number | null;
+            hdr?: components["schemas"]["HdrCapability"];
+        };
         Health: {
             /** @example ok */
             status: string;
@@ -605,6 +622,8 @@ export interface components {
         JobId: number;
         SessionId: string;
         RunId: number;
+        /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+        ProfileId: string;
     };
     requestBodies: never;
     headers: never;
@@ -846,7 +865,10 @@ export interface operations {
     };
     getPlaybackInfo: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+                profileId?: components["parameters"]["ProfileId"];
+            };
             header?: never;
             path: {
                 itemId: components["parameters"]["ItemId"];
@@ -910,7 +932,10 @@ export interface operations {
     };
     streamItem: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+                profileId?: components["parameters"]["ProfileId"];
+            };
             header?: {
                 Range?: string;
             };
@@ -971,6 +996,8 @@ export interface operations {
             query?: {
                 /** @description Encode window start in milliseconds (default 0) */
                 startMs?: number;
+                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+                profileId?: components["parameters"]["ProfileId"];
                 /** @description Audio track to map, from playbackInfo.audioTracks (ADR-0012). Defaults to the flagged default track, else the first. Switching audio starts a new session at the current position and DELETEs the old one. On an otherwise DirectPlay title, an over-ceiling track starts a hybrid session (ADR-0012 / ADR-0018). */
                 audioTrackId?: string;
                 /** @description Burn-in subtitle track from playbackInfo.subtitleTracks with render=burnIn (ADR-0018). Soft (WebVTT) tracks are selected via MEDIA / track elements, not this param. Switching burn-in starts a new session at the current position and DELETEs the old one. Selecting burn-in on a DirectPlay title starts a transcode session. */
