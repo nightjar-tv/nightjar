@@ -302,4 +302,59 @@ mod tests {
         std::fs::write(&path, b"replaced bytes").unwrap();
         assert!(verify_identity(&path, &live).is_err());
     }
+
+    /// NAS-gated smoke: real end-moov through virtual faststart + FFmpeg
+    /// copy `-ss`. Catches range-server truncation (nonblocking accept
+    /// inherit) that synthetic fixtures never filled a send buffer hard
+    /// enough to surface. AAC interleave coverage lives in `hls` tests.
+    #[test]
+    fn greys_end_moov_bind_survives_ffmpeg_copy_seek() {
+        let src = std::path::Path::new(
+            "/Volumes/media/TV Shows/Greys Anatomy/Season 6/\
+             Grey's Anatomy - 6x14 - Valentine's Day Massacre - WEBRip-1080p.mp4",
+        );
+        if !src.is_file() {
+            eprintln!("skipping: dogfood end-moov not mounted");
+            return;
+        }
+        let bind = bind_mp4(
+            src,
+            KeyframeEntry {
+                pts_ms: 58_976,
+                byte_offset: 18_012_697,
+            },
+            None,
+        )
+        .expect("bind");
+        assert!(bind.virtual_input.is_some());
+        let url = bind.input.to_string_lossy().into_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let err = dir.path().join("err");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                "58.976",
+                "-i",
+                &url,
+                "-t",
+                "4",
+                "-c",
+                "copy",
+            ])
+            .arg(dir.path().join("out.mp4"))
+            .stderr(std::fs::File::create(&err).unwrap())
+            .status()
+            .unwrap();
+        let err_text = std::fs::read_to_string(&err).unwrap();
+        assert!(
+            status.success(),
+            "ffmpeg against rust virtual faststart failed: {err_text}"
+        );
+        drop(bind);
+    }
 }

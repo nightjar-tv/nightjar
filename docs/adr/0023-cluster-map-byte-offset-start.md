@@ -299,6 +299,14 @@ size path). *arr upgrades make replace continuous; without the trigger,
 every upgraded title sits on the ~7 s path until a full rescan. Clearing
 rows without rebuild is not a complete invalidation path.
 
+**Live replace dogfood (manual).** Unit tests cover bind-time mismatch and
+fallback flags. Confirm once by hand on the Unraid share: start a mapped
+session, scrub so offsets are held, atomically replace the file underneath
+(rename-over as *arr does), scrub again. Expect `-ss` fallback and a map
+rebuild enqueue — not garbage reads from stale Cluster/`stss` offsets. The
+old inode under an open FD may keep the in-flight producer honest until it
+exits; the next bind is the check.
+
 **Concurrency bound.** Map rebuild shares the existing library worker pool
 (ADR-0004 / ADR-0013): same 2–16 workers, probes first, background work
 (subtitle extract and map) behind the index gate unless priority. Do not

@@ -6312,4 +6312,234 @@ mod tests {
         assert!(reg.map_fallback(&id), "bind refusal must enqueue a rebuild");
         let _ = wait_land_near(&reg, &id, 6000);
     }
+
+    /// The naive MP4 splice stamped honest sidx and broke AAC on real
+    /// interleaved titles. Synthetic fixtures do not reproduce that pattern:
+    /// this path must run against a household end-moov file when the NAS is
+    /// mounted. Skips cleanly in CI.
+    #[test]
+    fn mapped_real_library_end_moov_mp4_copy_keeps_aac() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let src = Path::new(
+            "/Volumes/media/TV Shows/Greys Anatomy/Season 6/\
+             Grey's Anatomy - 6x14 - Valentine's Day Massacre - WEBRip-1080p.mp4",
+        );
+        if !src.is_file() {
+            eprintln!("skipping: dogfood end-moov MP4 not mounted at {}", src.display());
+            return;
+        }
+
+        let duration_ms = probe_duration_ms(src);
+        assert!(duration_ms > 120_000, "unexpected short dogfood title");
+        // Keyframes around the mid land only — a full packet walk of a
+        // 40-minute WEBRip is not what this assertion needs.
+        let entries = mp4_entries_near(src, 60.0, 15.0);
+        let map = keyframe_map(MapContainerKind::Mp4, src, entries);
+        let request_ms = 60_000;
+        let land_ms = map.entry_at_or_before(request_ms).unwrap().pts_ms;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let id = reg
+            .start(
+                1,
+                src,
+                request_ms,
+                duration_ms,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_some(),
+                "real end-moov must go through virtual faststart"
+            );
+            assert!(!session.map_binding.fell_back);
+            assert_eq!(session.start_ms, land_ms);
+        }
+
+        let joined = wait_land_and_join_window(&reg, &id, dir.path(), 8);
+        assert_eq!(probe_entry(&joined, "a:0", "codec_name"), "aac");
+        assert_audio_decodes(&joined);
+        let video_start = probe_secs(&joined, "v:0", "start_time");
+        let audio_start = probe_secs(&joined, "a:0", "start_time");
+        let land = land_ms as f64 / 1000.0;
+        // Copy `-ss` may still open on the previous source IDR when the map
+        // PTS and the demuxer disagree by a frame; keep the land within one
+        // segment of the snap, not frame-exact.
+        assert!(
+            (video_start - land).abs() < 2.0,
+            "video starts at {video_start}s, land was {land}s"
+        );
+        // Copy residual: elst / priming (~83 ms) is in-family; keep room for
+        // real interleaving without letting a broken splice pass.
+        assert!(
+            (video_start - audio_start).abs() < 0.2,
+            "A/V offset {:.3}s on real end-moov copy (video {video_start}s, audio {audio_start}s)",
+            video_start - audio_start
+        );
+    }
+
+    fn probe_duration_ms(path: &Path) -> u64 {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe duration for {}",
+            path.display()
+        );
+        let secs: f64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("duration for {}", path.display()));
+        (secs * 1000.0) as u64
+    }
+
+    /// Sync samples near `center_s` (±`window_s`) via ffprobe read intervals.
+    fn mp4_entries_near(src: &Path, center_s: f64, window_s: f64) -> Vec<KeyframeEntry> {
+        let start = (center_s - window_s).max(0.0);
+        let end = center_s + window_s;
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time,pos,flags",
+                "-of",
+                "csv=p=0",
+                "-read_intervals",
+                &format!("{start}%{end}"),
+            ])
+            .arg(src)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe near-land packets for {}",
+            src.display()
+        );
+        let mut entries = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.split(',');
+            let (Some(pts), Some(pos), Some(flags)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if !flags.contains('K') {
+                continue;
+            }
+            let Ok(pts_s) = pts.parse::<f64>() else {
+                continue;
+            };
+            let Ok(byte_offset) = pos.parse::<u64>() else {
+                continue;
+            };
+            entries.push(KeyframeEntry {
+                pts_ms: (pts_s * 1000.0) as u64,
+                byte_offset,
+            });
+        }
+        assert!(
+            entries.len() > 1,
+            "need keyframes around {center_s}s on {}",
+            src.display()
+        );
+        entries
+    }
+
+    /// Wait for the land segment, then join enough of the producer run to
+    /// decode audio — without cooking a full episode to EOF on the assertion.
+    fn wait_land_and_join_window(
+        reg: &HlsSessionRegistry,
+        id: &str,
+        out: &Path,
+        window_secs: u32,
+    ) -> PathBuf {
+        let land_ms = {
+            let sessions = reg.sessions.lock().unwrap();
+            sessions.get(id).unwrap().landed_ms
+        };
+        let (name, _) = wait_land_near(reg, id, land_ms);
+        let _ = wait_asset(reg, id, &name);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let run_index = loop {
+            let (run_id, dir, failed) = {
+                let sessions = reg.sessions.lock().unwrap();
+                let session = sessions.get(id).expect("session live");
+                (
+                    session.current_run_id,
+                    session.dir.clone(),
+                    session.failed.clone(),
+                )
+            };
+            if let Some(err) = failed {
+                panic!("session failed: {err}");
+            }
+            let _ = reg.playlist(id, run_id);
+            let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
+            let text = fs::read_to_string(&index).unwrap_or_default();
+            let listed_secs: f64 = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("#EXTINF:"))
+                .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
+                .sum();
+            if listed_secs >= f64::from(window_secs) || text.contains("#EXT-X-ENDLIST") {
+                break index;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "producer never listed {window_secs}s; playlist:\n{text}\nfailed={failed:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let joined = out.join("joined_window.mp4");
+        // Join the producer playlist with copyts so title-absolute lands
+        // survive. Do not `-t` from zero — that yields an empty file when the
+        // land is a minute in.
+        let err = out.join("join.err");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-copyts", "-i"])
+            .arg(&run_index)
+            .args(["-c", "copy"])
+            .arg(&joined)
+            .stderr(std::fs::File::create(&err).unwrap())
+            .status()
+            .unwrap();
+        let err_text = fs::read_to_string(&err).unwrap_or_default();
+        assert!(
+            status.success(),
+            "join window {}: {err_text}",
+            run_index.display()
+        );
+        let meta = fs::metadata(&joined).unwrap();
+        assert!(
+            meta.len() > 10_000,
+            "joined window too small ({} bytes): {err_text}",
+            meta.len()
+        );
+        joined
+    }
 }

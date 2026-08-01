@@ -94,6 +94,16 @@ impl RangeServer {
                 while !accept_shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // The listener is nonblocking so Drop can wake the
+                            // accept loop; accepted sockets inherit that and
+                            // must be switched back. A nonblocking stream makes
+                            // write_all return WouldBlock once the send buffer
+                            // fills (~hundreds of KB), which FFmpeg reads as a
+                            // truncated MP4 (corrupted STCO / premature EOF).
+                            if let Err(e) = stream.set_nonblocking(false) {
+                                tracing::warn!(error = %e, "virtual input: set blocking");
+                                continue;
+                            }
                             let file = Arc::clone(&file);
                             let shutdown = Arc::clone(&accept_shutdown);
                             // FFmpeg opens concurrent Range connections; a
@@ -444,5 +454,53 @@ mod tests {
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).unwrap();
         assert!(line.starts_with("HTTP/1.1 404"), "{line}");
+    }
+
+    /// Accepted sockets inherit the nonblocking listener. Without flipping
+    /// them back, write_all returns WouldBlock once the send buffer fills
+    /// and FFmpeg sees a truncated moov (corrupted STCO).
+    #[test]
+    fn large_in_memory_piece_reaches_a_slow_client() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, b"x").unwrap();
+        let payload = vec![0x5Au8; 2 * 1024 * 1024];
+        let file = VirtualFile::new(
+            &src,
+            vec![Piece::Bytes(payload.clone())],
+            "application/octet-stream",
+            "bin",
+        );
+        let server = RangeServer::start(file).unwrap();
+        let url = server.url().to_string();
+        let (host_port, target) = url.trim_start_matches("http://").split_once('/').unwrap();
+        let target = format!("/{target}");
+
+        let mut stream = TcpStream::connect(host_port).unwrap();
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-\r\n\r\n"
+        )
+        .unwrap();
+        // Pause after the request so the server fills the send buffer before
+        // we drain — the WouldBlock failure mode only shows under back-pressure.
+        std::thread::sleep(Duration::from_millis(50));
+        let mut reader = BufReader::new(stream);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            head.push_str(&line);
+        }
+        assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).unwrap();
+        assert_eq!(body.len(), payload.len(), "truncated body under back-pressure");
+        assert_eq!(body, payload);
+        drop(server);
     }
 }
