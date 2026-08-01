@@ -13,7 +13,8 @@ pub use status::{
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
 };
 pub use store::{
-    Db, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate, ScanJobRow, SidecarRow, UpsertItem,
+    Db, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate, ScanJobRow, SidecarRow,
+    UpsertItem,
 };
 
 use std::path::{Path, PathBuf};

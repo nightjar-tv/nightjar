@@ -1,13 +1,15 @@
 //! FFmpeg orchestration: HLS playback sessions in copy or encode mode
 //! (ADR-0007, ADR-0011), hardware encode detection (ADR-0009), text
 //! subtitle WebVTT at scan time (ADR-0010 / ADR-0013), audio track
-//! selection with stereo downmix (ADR-0012), and ASS/PGS burn-in (ADR-0018).
+//! selection with stereo downmix (ADR-0012), ASS/PGS burn-in (ADR-0018),
+//! and keyframe-map byte-offset session start (ADR-0023).
 
 mod audio;
 mod hls;
 mod hls_segment_map;
 mod hwaccel;
 mod subs;
+mod virtual_input;
 
 pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
@@ -29,6 +31,7 @@ pub use subs::{
     list_text_subtitles, normalize_language, prepare_session_subtitles, slice_webvtt,
     srt_to_webvtt, stored_webvtt, webvtt_max_cue_end_ms,
 };
+pub use virtual_input::{KeyframeEntry, KeyframeMap, MapContainerKind};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

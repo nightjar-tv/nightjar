@@ -568,6 +568,7 @@ dependencies = [
 name = "nightjar-transcode"
 version = "0.0.1"
 dependencies = [
+ "nightjar-db",
  "serde",
  "serde_json",
  "tempfile",
