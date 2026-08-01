@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+nightjar-core = { path = "../core" }
 nightjar-db = { path = "../db" }
 tracing.workspace = true
 serde = { workspace = true }

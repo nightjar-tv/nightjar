@@ -1,5 +1,5 @@
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::{decide, subtitle_tracks_for};
+use crate::routes::items::{decide, profile_from_query, subtitle_tracks_for};
 use crate::state::AppState;
 use axum::{
     Json,
@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use nightjar_core::{BROWSER_V0, PlaybackMethod};
+use nightjar_core::{ClientCapabilityProfile, PlaybackMethod, video_encode_plan};
 use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeEntry, KeyframeMap,
@@ -61,6 +61,10 @@ pub struct StartQuery {
     pub start_ms: Option<u64>,
     pub audio_track_id: Option<String>,
     pub subtitle_track_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub max_bitrate_bps: Option<u64>,
+    pub max_height: Option<u32>,
+    pub hdr: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,7 +108,13 @@ pub async fn start(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let decision = decide(&row);
+    let profile = profile_from_query(
+        query.profile_id.as_deref(),
+        query.max_bitrate_bps,
+        query.max_height,
+        query.hdr.as_deref(),
+    );
+    let decision = decide(&row, &profile, state.tonemap_available);
     if row.probe_status != "probed" {
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -121,7 +131,7 @@ pub async fn start(
         });
     };
 
-    let audio = resolve_audio(&row, query.audio_track_id.as_deref())?;
+    let audio = resolve_audio(&row, query.audio_track_id.as_deref(), &profile)?;
     let burn_in = resolve_burn_in(&state, &row, query.subtitle_track_id.as_deref())?;
 
     // DirectPlay is allowed when a track selection requires encode work the
@@ -169,6 +179,18 @@ pub async fn start(
 
     let start_ms = query.start_ms.unwrap_or(0);
     let keyframe_map = keyframe_map_for(&state, &row);
+    let encode_plan = video_encode_plan(
+        row.height.and_then(|h| u32::try_from(h).ok()),
+        row.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),
+        row.hdr.as_deref(),
+        &profile,
+    );
+    if encode_plan.tone_map && !state.tonemap_available {
+        return Err(ApiError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: decision.reason.clone(),
+        });
+    }
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
     let src = std::path::PathBuf::from(&row.path);
@@ -184,6 +206,7 @@ pub async fn start(
             tracks_for_start,
             burn_in,
             keyframe_map,
+            encode_plan,
         )
     })
     .await
@@ -257,8 +280,12 @@ fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
 
 /// Which audio stream this session maps (ADR-0012). No `audioTrackId` takes
 /// the container default, else the first track.
-fn resolve_audio(row: &MediaItemRow, requested: Option<&str>) -> Result<AudioSelection, ApiError> {
-    let max_channels = BROWSER_V0.max_audio_channels.unwrap_or(u32::MAX);
+fn resolve_audio(
+    row: &MediaItemRow,
+    requested: Option<&str>,
+    profile: &ClientCapabilityProfile,
+) -> Result<AudioSelection, ApiError> {
+    let max_channels = profile.max_audio_channels.unwrap_or(u32::MAX);
     let tracks = match list_audio_tracks(std::path::Path::new(&row.path)) {
         Ok(tracks) => tracks,
         // Without a requested track the stored first-audio count still

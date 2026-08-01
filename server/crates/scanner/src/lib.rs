@@ -638,6 +638,8 @@ mod tests {
                 audio_channels: None,
                 width: None,
                 height: None,
+                video_bitrate_bps: None,
+                hdr: None,
                 probe_status: "unavailable".into(),
                 scan_error: Some("unavailable: test".into()),
             })

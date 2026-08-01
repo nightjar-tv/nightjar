@@ -16,5 +16,19 @@ LARGE=1 ./testdata/generate.sh      # also multi-GB open-ended Range stress (git
 ./scripts/gate1_scan_10k.sh         # time first scan (<60s) + rescan (<5s)
 ```
 
-Dolby Vision profile 8 is listed in the manifest as `pending source` until an
-explicitly licensed sample is obtained.
+## Dolby Vision Browser Test Kit (local only)
+
+Dolby’s Patterns of Nature MP4s live under
+`files/dolby-vision-browser-kit/` (gitignored: kit license + ~1 GB). Manifest
+rows use `"commit": false` and are exercised by `corpus_decide` when the files
+are present.
+
+Refresh by placing the kit’s `24fps/` and `30fps/` trees there:
+
+```text
+testdata/files/dolby-vision-browser-kit/24fps/{SD,HD,FHD,UHD}/
+testdata/files/dolby-vision-browser-kit/30fps/{SD,HD,FHD,UHD}/
+```
+
+Do not `git add` those MP4s. Priority manifest rows are 24 fps FHD P5 / P8.1 /
+P8.4 and 24 fps UHD P8.1.

@@ -60,10 +60,17 @@ async fn main() {
     if let Err(e) = pool.cleanup_orphan_subtitles() {
         tracing::warn!(error = %e, "subtitle orphan cleanup failed");
     }
+    let tonemap_available = nightjar_transcode::host_tonemap_available();
+    if !tonemap_available {
+        tracing::warn!(
+            "FFmpeg lacks zscale (libzimg); HDR→SDR sessions will be refused (ADR-0022)"
+        );
+    }
     let state = AppState {
         db,
         hls,
         transcode_caps,
+        tonemap_available,
         subs,
         pool: std::sync::Arc::clone(&pool),
     };

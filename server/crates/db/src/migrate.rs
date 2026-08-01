@@ -14,6 +14,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         7,
         include_str!("../migrations/007_content_identity_keyframe_map.sql"),
     ),
+    (8, include_str!("../migrations/008_probe_bitrate_hdr.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -104,7 +105,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, 8);
         let has_reachable: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('libraries') WHERE name = 'reachable'",
@@ -121,6 +122,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_content_id, 1);
+        let has_bitrate: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'video_bitrate_bps'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_bitrate, 1);
+        let has_hdr: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'hdr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_hdr, 1);
         let has_map: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'keyframe_map_entries'",

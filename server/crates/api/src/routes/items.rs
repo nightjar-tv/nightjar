@@ -3,17 +3,20 @@ use crate::state::AppState;
 use axum::{
     Json,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use nightjar_core::{BROWSER_V0, PlaybackDecision, PlaybackMethod, decide_playback};
+use nightjar_core::{
+    BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
+    known_profile, resolve_profile_bag,
+};
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
     TrackReadiness, is_burn_in_sidecar_format, is_serveable_sidecar_format, list_audio_tracks,
     list_burn_in_subtitles, list_text_subtitles, stored_webvtt,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,16 +131,57 @@ pub async fn get(
     Ok(Json(to_dto(row)))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileQuery {
+    pub profile_id: Option<String>,
+    pub max_bitrate_bps: Option<u64>,
+    pub max_height: Option<u32>,
+    pub hdr: Option<String>,
+}
+
+/// Resolve `profileId` plus optional field-bag ceilings (ADR-0022).
+pub fn profile_from_query(
+    profile_id: Option<&str>,
+    max_bitrate_bps: Option<u64>,
+    max_height: Option<u32>,
+    hdr: Option<&str>,
+) -> ClientCapabilityProfile {
+    let unknown = profile_id
+        .filter(|s| !s.is_empty())
+        .is_some_and(|id| known_profile(id).is_none());
+    let bag = max_bitrate_bps.is_some() || max_height.is_some() || hdr.is_some();
+    if unknown && !bag {
+        tracing::warn!(
+            profile_id = profile_id.unwrap_or(""),
+            "unknown client profile id with no field bag; using BROWSER_V0"
+        );
+    } else if unknown && bag {
+        tracing::info!(
+            profile_id = profile_id.unwrap_or(""),
+            "unknown client profile id; applying field bag on BROWSER_V0 codec floor"
+        );
+    }
+    resolve_profile_bag(profile_id, max_bitrate_bps, max_height, hdr)
+}
+
 pub async fn playback_info(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
+    Query(query): Query<ProfileQuery>,
 ) -> ApiResult<Json<PlaybackInfoDto>> {
     let row = state
         .db
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let decision = decide(&row);
+    let profile = profile_from_query(
+        query.profile_id.as_deref(),
+        query.max_bitrate_bps,
+        query.max_height,
+        query.hdr.as_deref(),
+    );
+    let decision = decide(&row, &profile, state.tonemap_available);
     let subtitle_tracks = subtitle_tracks_for(&state, &row).unwrap_or_else(|e| {
         tracing::warn!(item_id, error = %e, "subtitle list failed");
         Vec::new()
@@ -152,7 +196,7 @@ pub async fn playback_info(
     // Remux and transcode both play through a session; only direct play is
     // served from the file itself (ADR-0011). sessionsUrl still appears on
     // DirectPlay when a track selection can force encode (ADR-0012 / ADR-0018).
-    let max_channels = BROWSER_V0.max_audio_channels.unwrap_or(u32::MAX);
+    let max_channels = profile.max_audio_channels.unwrap_or(u32::MAX);
     let selection_may_need_session = subtitle_tracks.iter().any(|t| t.render == "burnIn")
         || audio_tracks.iter().any(|a| a.channels > max_channels);
     let (stream_url, sessions_url) = match decision.method {
@@ -395,21 +439,29 @@ fn sidecar_to_dto(state: &AppState, row: &MediaItemRow, s: &SidecarRow) -> Subti
     })
 }
 
-pub fn decide(row: &MediaItemRow) -> PlaybackDecision {
+pub fn decide(
+    row: &MediaItemRow,
+    profile: &ClientCapabilityProfile,
+    tonemap_available: bool,
+) -> PlaybackDecision {
     decide_playback(
         &row.path,
         row.container.as_deref(),
         row.video_codec.as_deref(),
         row.audio_codec.as_deref(),
         row.audio_channels.and_then(|c| u32::try_from(c).ok()),
+        row.height.and_then(|h| u32::try_from(h).ok()),
+        row.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),
+        row.hdr.as_deref(),
         row.scan_error.as_deref(),
         &row.probe_status,
-        &BROWSER_V0,
+        profile,
+        tonemap_available,
     )
 }
 
 pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
-    let decision = decide(&row);
+    let decision = decide(&row, &BROWSER_V0, true);
     MediaItemDto {
         id: row.id,
         library_id: row.library_id,

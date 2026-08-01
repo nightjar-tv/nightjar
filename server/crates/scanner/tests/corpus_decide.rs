@@ -69,9 +69,6 @@ fn corpus_manifest_expects_match_decide_playback() {
             );
             continue;
         };
-        if row.commit == Some(false) {
-            continue;
-        }
         if row.status.as_deref() == Some("pending source") {
             continue;
         }
@@ -80,6 +77,10 @@ fn corpus_manifest_expects_match_decide_playback() {
         };
 
         let path = testdata.join(rel);
+        // Non-committed rows (large-*, Dolby kit): exercise when present, skip if absent.
+        if row.commit == Some(false) && !path.is_file() {
+            continue;
+        }
         assert!(
             path.is_file(),
             "corpus file missing (run testdata/generate.sh): {}",
@@ -94,9 +95,13 @@ fn corpus_manifest_expects_match_decide_playback() {
                 p.video_codec.as_deref(),
                 p.audio_codec.as_deref(),
                 p.audio_channels.map(|c| c as u32),
+                p.height.and_then(|h| u32::try_from(h).ok()),
+                p.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),
+                p.hdr.as_deref(),
                 None,
                 "probed",
                 &BROWSER_V0,
+                true,
             ),
             Err(err) => decide_playback(
                 &path_str,
@@ -104,9 +109,13 @@ fn corpus_manifest_expects_match_decide_playback() {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
                 Some(err.as_str()),
                 "error",
                 &BROWSER_V0,
+                true,
             ),
         };
 

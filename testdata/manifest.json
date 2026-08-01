@@ -154,6 +154,34 @@
       "expect": "needs transcode; HLG metadata present"
     },
     {
+      "path": "files/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_HDR10-P8.1_FHD_24_H265-4Mbps_DD+JOC-768Kbps.mp4",
+      "tags": ["dolby-vision", "profile-8.1", "hdr10", "hevc", "fhd"],
+      "expect": "needs transcode (Dolby Vision P8.1 / HEVC); local Dolby Browser Test Kit",
+      "commit": false,
+      "note": "Gitignored. Patterns of Nature 24fps FHD P8.1 from Dolby Vision Browser Test Kit."
+    },
+    {
+      "path": "files/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_DoVi_24_P5_FHD_HEVC-4mbps_DD+JOC-768kbps_iOS.mp4",
+      "tags": ["dolby-vision", "profile-5", "hevc", "fhd"],
+      "expect": "needs transcode (Dolby Vision P5 / HEVC); local Dolby Browser Test Kit",
+      "commit": false,
+      "note": "Gitignored. Profile 5 has no HDR10 fallback."
+    },
+    {
+      "path": "files/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_HLG-P8.4_FHD_24_H265-4Mbps_DD+JOC-768Kbps.mp4",
+      "tags": ["dolby-vision", "profile-8.4", "hlg", "hevc", "fhd"],
+      "expect": "needs transcode (Dolby Vision P8.4 HLG / HEVC); local Dolby Browser Test Kit",
+      "commit": false,
+      "note": "Gitignored. HLG transfer (P8.4)."
+    },
+    {
+      "path": "files/dolby-vision-browser-kit/24fps/UHD/Patterns_Of_Nature_HDR10-P8.1_UHD_24_H265-10Mbps_DD+JOC-768Kbps.mp4",
+      "tags": ["dolby-vision", "profile-8.1", "hdr10", "hevc", "uhd"],
+      "expect": "needs transcode (Dolby Vision P8.1 UHD / HEVC); local Dolby Browser Test Kit",
+      "commit": false,
+      "note": "Gitignored. UHD seed for future maxHeight / scale dogfood."
+    },
+    {
       "path": "files/large-range-trigger.mp4",
       "tags": ["h264", "aac", "range", "generated"],
       "expect": "open-ended Range streams without buffering whole file",

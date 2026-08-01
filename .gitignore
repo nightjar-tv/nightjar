@@ -26,6 +26,7 @@ web/.vite/
 testdata/files/large-*
 testdata/files/soak_scrub_*
 testdata/files/.generated
+testdata/files/dolby-vision-browser-kit/
 testdata/bench_10k/
 testdata/.bench_seed.mp4
 
