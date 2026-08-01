@@ -5,203 +5,693 @@
   "files": [
     {
       "path": "files/h264_aac_mp4.mp4",
-      "tags": ["h264", "aac", "mp4", "phase1-direct"],
+      "tags": [
+        "h264",
+        "aac",
+        "mp4",
+        "phase1-direct"
+      ],
       "expect": "browser direct play"
     },
     {
       "path": "files/h264_ac3_mp4.mp4",
-      "tags": ["h264", "ac3", "mp4"],
+      "tags": [
+        "h264",
+        "ac3",
+        "mp4"
+      ],
       "expect": "needs transcode (AC3)"
     },
     {
       "path": "files/h264_aac_mkv.mkv",
-      "tags": ["h264", "aac", "mkv"],
+      "tags": [
+        "h264",
+        "aac",
+        "mkv"
+      ],
       "expect": "remux as an HLS copy session (container only; ADR-0011)"
     },
     {
       "path": "files/hevc_aac_mp4.mp4",
-      "tags": ["hevc", "aac", "mp4"],
+      "tags": [
+        "hevc",
+        "aac",
+        "mp4"
+      ],
       "expect": "needs transcode (HEVC)"
     },
     {
       "path": "files/hevc10_aac_mp4.mp4",
-      "tags": ["hevc", "10bit", "aac", "mp4"],
+      "tags": [
+        "hevc",
+        "10bit",
+        "aac",
+        "mp4"
+      ],
       "expect": "needs transcode (10-bit HEVC)"
     },
     {
       "path": "files/av1_aac_mp4.mp4",
-      "tags": ["av1", "aac", "mp4"],
+      "tags": [
+        "av1",
+        "aac",
+        "mp4"
+      ],
       "expect": "needs transcode (AV1)"
     },
     {
       "path": "files/mpeg2_interlaced.ts",
-      "tags": ["mpeg2", "interlaced"],
+      "tags": [
+        "mpeg2",
+        "interlaced"
+      ],
       "expect": "needs transcode or structured probe"
     },
     {
       "path": "files/h264_aac_ass_mkv.mkv",
-      "tags": ["ass", "subs", "mkv"],
+      "tags": [
+        "ass",
+        "subs",
+        "mkv"
+      ],
       "expect": "remux (HLS copy session); ASS listed with render=burnIn; session subtitleTrackId burns via libass (ADR-0018)"
     },
     {
       "path": "files/h264_aac_srt_mkv.mkv",
-      "tags": ["srt", "subs", "mkv", "embedded"],
+      "tags": [
+        "srt",
+        "subs",
+        "mkv",
+        "embedded"
+      ],
       "expect": "remux (HLS copy session); embedded SRT served as WebVTT sidecar (ADR-0010)"
     },
     {
       "path": "files/sidecar_beside/Movie.mp4",
-      "tags": ["sidecar", "srt", "subs"],
+      "tags": [
+        "sidecar",
+        "srt",
+        "subs"
+      ],
       "expect": "direct play; Movie.en.srt associated at index (trackId s-en)"
     },
     {
       "path": "files/sidecar_beside/Movie.en.srt",
-      "tags": ["sidecar", "srt"],
+      "tags": [
+        "sidecar",
+        "srt"
+      ],
       "expect": "not a media item; associated to Movie.mp4"
     },
     {
       "path": "files/sidecar_subs_dir/Show.mp4",
-      "tags": ["sidecar", "srt", "Subs"],
+      "tags": [
+        "sidecar",
+        "srt",
+        "Subs"
+      ],
       "expect": "direct play; Subs/Show.en.srt associated (trackId s-Subs.en)"
     },
     {
       "path": "files/sidecar_subs_dir/Subs/Show.en.srt",
-      "tags": ["sidecar", "srt"],
+      "tags": [
+        "sidecar",
+        "srt"
+      ],
       "expect": "not a media item; associated to Show.mp4"
     },
     {
       "path": "files/h264_aac_pgs_mkv.mkv",
-      "tags": ["pgs", "image-subs", "mkv"],
+      "tags": [
+        "pgs",
+        "image-subs",
+        "mkv"
+      ],
       "expect": "remux (HLS copy session); PGS listed with render=burnIn; session subtitleTrackId burns via overlay (ADR-0018)"
     },
     {
       "path": "files/h264_aac_71_mp4.mp4",
-      "tags": ["aac", "7.1", "mp4", "downmix"],
+      "tags": [
+        "aac",
+        "7.1",
+        "mp4",
+        "downmix"
+      ],
       "expect": "session, not direct play: 8 channels exceed the browser ceiling, so the session copies video and pans audio to stereo (ADR-0012)"
     },
     {
       "path": "files/h264_aac_multilang_mkv.mkv",
-      "tags": ["aac", "multi-track", "audio", "mkv"],
+      "tags": [
+        "aac",
+        "multi-track",
+        "audio",
+        "mkv"
+      ],
       "expect": "remux (HLS copy session); two audio tracks listed as e1/e2 with language en and es; first is default; session start takes audioTrackId (ADR-0012)"
     },
     {
       "path": "files/h264_aac_commentary_mkv.mkv",
-      "tags": ["aac", "multi-track", "commentary", "mkv"],
+      "tags": [
+        "aac",
+        "multi-track",
+        "commentary",
+        "mkv"
+      ],
       "expect": "remux (HLS copy session); main track flagged default; commentary reachable by trackId and labelled from its title tag (ADR-0012)"
     },
     {
       "path": "files/h264_flac_60_mkv.mkv",
-      "tags": ["flac", "6.0", "downmix-fallback", "mkv"],
+      "tags": [
+        "flac",
+        "6.0",
+        "downmix-fallback",
+        "mkv"
+      ],
       "expect": "needs transcode (FLAC); session uses -ac 2 fallback: 6.0 shares a channel count with 5.1 but not the pan index map (ADR-0012)"
     },
     {
       "path": "files/h264_ac3_51side_mkv.mkv",
-      "tags": ["ac3", "5.1(side)", "downmix-fallback", "mkv"],
+      "tags": [
+        "ac3",
+        "5.1(side)",
+        "downmix-fallback",
+        "mkv"
+      ],
       "expect": "needs transcode (AC3); session uses -ac 2 fallback: 5.1(side) is over ceiling and outside the pan tables (ADR-0012)"
     },
     {
       "path": "files/h264_eac3_mp4.mp4",
-      "tags": ["eac3", "mp4"],
+      "tags": [
+        "eac3",
+        "mp4"
+      ],
       "expect": "needs transcode (E-AC3)"
     },
     {
       "path": "files/h264_aac_vfr_mp4.mp4",
-      "tags": ["vfr", "h264", "aac"],
+      "tags": [
+        "vfr",
+        "h264",
+        "aac"
+      ],
       "expect": "direct play if probed as h264/aac/mp4"
     },
     {
       "path": "files/broken_moov.mp4",
-      "tags": ["broken-moov", "hostile"],
+      "tags": [
+        "broken-moov",
+        "hostile"
+      ],
       "expect": "needs transcode; structured scan_error; no crash"
     },
     {
       "path": "files/vp9_opus_webm.webm",
-      "tags": ["vp9", "opus", "webm"],
+      "tags": [
+        "vp9",
+        "opus",
+        "webm"
+      ],
       "expect": "needs transcode"
     },
     {
       "path": "files/h264_aac_mov.mov",
-      "tags": ["h264", "aac", "mov"],
+      "tags": [
+        "h264",
+        "aac",
+        "mov"
+      ],
       "expect": "direct play (mov in mp4 family)"
     },
     {
       "path": "files/h264_mp3_mp4.mp4",
-      "tags": ["h264", "mp3", "mp4"],
+      "tags": [
+        "h264",
+        "mp3",
+        "mp4"
+      ],
       "expect": "needs transcode (MP3 not on AAC whitelist)"
     },
     {
       "path": "files/h264_aac_32k_mp4.mp4",
-      "tags": ["aac", "32000hz"],
+      "tags": [
+        "aac",
+        "32000hz"
+      ],
       "expect": "direct play per whitelist"
     },
     {
       "path": "files/h264_aac_mono_mp4.mp4",
-      "tags": ["aac", "mono"],
+      "tags": [
+        "aac",
+        "mono"
+      ],
       "expect": "direct play per whitelist; mono is under the channel ceiling and skips the pan filter (ADR-0012)"
     },
     {
       "path": "files/mpeg4_mp2_avi.avi",
-      "tags": ["mpeg4", "avi"],
+      "tags": [
+        "mpeg4",
+        "avi"
+      ],
       "expect": "needs transcode"
     },
     {
+      "path": "files/h264_sdr_bt709_mp4.mp4",
+      "tags": [
+        "h264",
+        "aac",
+        "mp4",
+        "sdr",
+        "bt709",
+        "hdr-control"
+      ],
+      "container": "mp4",
+      "codec": "h264",
+      "bit_depth": 8,
+      "transfer": "bt709",
+      "dv_profile": null,
+      "expect": "browser direct play",
+      "note": "SDR BT.709 control for the HDR axis."
+    },
+    {
       "path": "files/hevc_hdr10_mp4.mp4",
-      "tags": ["hevc", "hdr10", "pq", "bt2020"],
+      "tags": [
+        "hevc",
+        "hdr10",
+        "pq",
+        "bt2020",
+        "hdr-control"
+      ],
+      "container": "mp4",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": null,
       "expect": "needs transcode; HDR10 metadata present"
     },
     {
       "path": "files/hevc_hlg_mp4.mp4",
-      "tags": ["hevc", "hlg", "arib-std-b67", "bt2020"],
-      "expect": "needs transcode; HLG metadata present"
+      "tags": [
+        "hevc",
+        "hlg",
+        "arib-std-b67",
+        "bt2020",
+        "hdr-control"
+      ],
+      "container": "mp4",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "arib-std-b67",
+      "dv_profile": null,
+      "expect": "needs transcode; HLG metadata present",
+      "note": "Plain HLG, no Dolby Vision. classify_hdr maps arib-std-b67 \u2192 hdr10."
+    },
+    {
+      "path": "files/hevc_hdr10plus_mp4.mp4",
+      "tags": [
+        "hevc",
+        "hdr10plus",
+        "pq",
+        "bt2020",
+        "hdr-control"
+      ],
+      "container": "mp4",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": null,
+      "frame_side_data": [
+        {
+          "side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
+        }
+      ],
+      "expect": "needs transcode; HDR10+ dynamic metadata present",
+      "note": "HDR10+ is on frames (SEI), not stream extradata. classify_hdr \u2192 hdr10 via smpte2084."
+    },
+    {
+      "path": "files/hevc_dv_p84_hlg_mkv.mkv",
+      "tags": [
+        "hevc",
+        "dolby-vision",
+        "profile-8.4",
+        "hlg",
+        "mkv"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "arib-std-b67",
+      "dv_profile": 8,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 8,
+        "dv_level": 1,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 4,
+        "dv_md_compression": "none"
+      },
+      "expect": "needs transcode (Dolby Vision P8.4 HLG / HEVC)",
+      "note": "Synthetic via dovi_tool generate + inject-rpu into HLG HEVC (MakeMKV set has no P8.4)."
+    },
+    {
+      "path": "files/hevc_dv_p84_hlg_mp4.mp4",
+      "tags": [
+        "hevc",
+        "dolby-vision",
+        "profile-8.4",
+        "hlg",
+        "mp4"
+      ],
+      "container": "mp4",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "arib-std-b67",
+      "dv_profile": 8,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 8,
+        "dv_level": 3,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 4,
+        "dv_md_compression": "none"
+      },
+      "expect": "needs transcode (Dolby Vision P8.4 HLG / HEVC)",
+      "note": "Same RPU as the MKV; MP4 carries dvvC (compat id 4) grafted after remux."
+    },
+    {
+      "path": "files/hevc_dv_p81_pair.mkv",
+      "tags": [
+        "hevc",
+        "dolby-vision",
+        "profile-8.1",
+        "mkv",
+        "container-pair"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": 8,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 8,
+        "dv_level": 3,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 1,
+        "dv_md_compression": "none"
+      },
+      "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
+      "note": "2s truncate of Browser Kit P8.1; Matroska DV signalling."
+    },
+    {
+      "path": "files/hevc_dv_p81_pair.mp4",
+      "tags": [
+        "hevc",
+        "dolby-vision",
+        "profile-8.1",
+        "mp4",
+        "container-pair"
+      ],
+      "container": "mp4",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": 8,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 8,
+        "dv_level": 3,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 1,
+        "dv_md_compression": "none"
+      },
+      "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
+      "note": "Same 2s content as the MKV pair; MP4 dvhe/dvh1 sample-entry signalling (dvvC). ffmpeg -c copy alone drops dvvC."
+    },
+    {
+      "path": "files/dolby-vision-makemkv/P4_LG_Dolby_Trailer_4K_Demo.mkv",
+      "tags": [
+        "dolby-vision",
+        "profile-4",
+        "hevc",
+        "makemkv-dvtest"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": null,
+      "dv_profile": 4,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 4,
+        "dv_level": 6,
+        "rpu_present_flag": 1,
+        "el_present_flag": 1,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 2,
+        "dv_md_compression": "none"
+      },
+      "audio": "eac3/6",
+      "sha256": "044642f88616f6b72a819c2719a7e07b377b3428de88bd1c10d64fc69a736515",
+      "expect": "needs transcode (Dolby Vision P4 / HEVC)",
+      "commit": false,
+      "note": "Fetched by generate.sh from makemkv.com/download/dvtest/ (Wayback fallback). Do not LFS-commit."
+    },
+    {
+      "path": "files/dolby-vision-makemkv/P5_Dolby_Amaze.mkv",
+      "tags": [
+        "dolby-vision",
+        "profile-5",
+        "hevc",
+        "makemkv-dvtest"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": null,
+      "dv_profile": 5,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 5,
+        "dv_level": 9,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 0,
+        "dv_md_compression": "none"
+      },
+      "audio": "eac3/6",
+      "sha256": "1a97082e1f2e4d4cf56618370fc842f558dafe6156ef6a4878fcac5a0a65f476",
+      "expect": "needs transcode (Dolby Vision P5 / HEVC)",
+      "commit": false,
+      "note": "Fetched by generate.sh; gitignored."
+    },
+    {
+      "path": "files/dolby-vision-makemkv/P7_FEL_GIJoe_The_Rise_of_Cobra.mkv",
+      "tags": [
+        "dolby-vision",
+        "profile-7",
+        "fel",
+        "hevc",
+        "makemkv-dvtest"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": 7,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 7,
+        "dv_level": 6,
+        "rpu_present_flag": 1,
+        "el_present_flag": 1,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 6,
+        "dv_md_compression": "none"
+      },
+      "audio": "dts/6",
+      "sha256": "06e42fc4e06ee90c8eea0b7a31450f844ad4228ea639a5ba12d51c05d2930e63",
+      "expect": "needs transcode (Dolby Vision P7 FEL / HEVC)",
+      "commit": false,
+      "note": "Fetched by generate.sh; gitignored."
+    },
+    {
+      "path": "files/dolby-vision-makemkv/P7_MEL_GIJoe_The_Rise_of_Cobra.mkv",
+      "tags": [
+        "dolby-vision",
+        "profile-7",
+        "mel",
+        "hevc",
+        "makemkv-dvtest"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": 7,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 7,
+        "dv_level": 6,
+        "rpu_present_flag": 1,
+        "el_present_flag": 1,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 6,
+        "dv_md_compression": "none"
+      },
+      "audio": "ac3/2",
+      "sha256": "9deb64f1f07b367b62cf853fee1d4e54054d1eaf11da2c744dbe06062b5881cc",
+      "expect": "needs transcode (Dolby Vision P7 MEL / HEVC)",
+      "commit": false,
+      "note": "Fetched by generate.sh; gitignored."
+    },
+    {
+      "path": "files/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv",
+      "tags": [
+        "dolby-vision",
+        "profile-8.1",
+        "hevc",
+        "makemkv-dvtest"
+      ],
+      "container": "matroska",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": 8,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 8,
+        "dv_level": 9,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 6,
+        "dv_md_compression": "none"
+      },
+      "audio": "eac3/6",
+      "sha256": "db0e079a0c911ca351e228055d5cc147e0d7b7755d5255914318336624f80d04",
+      "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
+      "commit": false,
+      "note": "Fetched by generate.sh; gitignored. bl_signal_compatibility_id=6 as ffprobe reports."
     },
     {
       "path": "files/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_HDR10-P8.1_FHD_24_H265-4Mbps_DD+JOC-768Kbps.mp4",
-      "tags": ["dolby-vision", "profile-8.1", "hdr10", "hevc", "fhd"],
+      "tags": [
+        "dolby-vision",
+        "profile-8.1",
+        "hdr10",
+        "hevc",
+        "fhd"
+      ],
+      "container": "mp4",
+      "codec": "hevc",
+      "bit_depth": 10,
+      "transfer": "smpte2084",
+      "dv_profile": 8,
+      "dovi_configuration_record": {
+        "side_data_type": "DOVI configuration record",
+        "dv_version_major": 1,
+        "dv_version_minor": 0,
+        "dv_profile": 8,
+        "dv_level": 3,
+        "rpu_present_flag": 1,
+        "el_present_flag": 0,
+        "bl_present_flag": 1,
+        "dv_bl_signal_compatibility_id": 1,
+        "dv_md_compression": "none"
+      },
       "expect": "needs transcode (Dolby Vision P8.1 / HEVC); local Dolby Browser Test Kit",
       "commit": false,
       "note": "Gitignored. Patterns of Nature 24fps FHD P8.1 from Dolby Vision Browser Test Kit."
     },
     {
       "path": "files/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_DoVi_24_P5_FHD_HEVC-4mbps_DD+JOC-768kbps_iOS.mp4",
-      "tags": ["dolby-vision", "profile-5", "hevc", "fhd"],
+      "tags": [
+        "dolby-vision",
+        "profile-5",
+        "hevc",
+        "fhd"
+      ],
       "expect": "needs transcode (Dolby Vision P5 / HEVC); local Dolby Browser Test Kit",
       "commit": false,
       "note": "Gitignored. Profile 5 has no HDR10 fallback."
     },
     {
       "path": "files/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_HLG-P8.4_FHD_24_H265-4Mbps_DD+JOC-768Kbps.mp4",
-      "tags": ["dolby-vision", "profile-8.4", "hlg", "hevc", "fhd"],
+      "tags": [
+        "dolby-vision",
+        "profile-8.4",
+        "hlg",
+        "hevc",
+        "fhd"
+      ],
       "expect": "needs transcode (Dolby Vision P8.4 HLG / HEVC); local Dolby Browser Test Kit",
       "commit": false,
       "note": "Gitignored. HLG transfer (P8.4)."
     },
     {
       "path": "files/dolby-vision-browser-kit/24fps/UHD/Patterns_Of_Nature_HDR10-P8.1_UHD_24_H265-10Mbps_DD+JOC-768Kbps.mp4",
-      "tags": ["dolby-vision", "profile-8.1", "hdr10", "hevc", "uhd"],
+      "tags": [
+        "dolby-vision",
+        "profile-8.1",
+        "hdr10",
+        "hevc",
+        "uhd"
+      ],
       "expect": "needs transcode (Dolby Vision P8.1 UHD / HEVC); local Dolby Browser Test Kit",
       "commit": false,
       "note": "Gitignored. UHD seed for future maxHeight / scale dogfood."
     },
     {
       "path": "files/large-range-trigger.mp4",
-      "tags": ["h264", "aac", "range", "generated"],
+      "tags": [
+        "h264",
+        "aac",
+        "range",
+        "generated"
+      ],
       "expect": "open-ended Range streams without buffering whole file",
       "commit": false,
       "note": "Produced by generate.sh; gitignored via large-*. Multi-GB variant: LARGE=1."
     },
     {
       "path": "files/large-over-4gb.mp4",
-      "tags": ["h264", "aac", "over-4gb", "offsets"],
+      "tags": [
+        "h264",
+        "aac",
+        "over-4gb",
+        "offsets"
+      ],
       "expect": "probe OK; Range past 4GiB uses 64-bit offsets; needs OVER4GB=1 to generate",
       "commit": false,
       "note": "Valid moov at start, sparse-extended past 4 GiB. Catches 32-bit offset bugs."
-    },
-    {
-      "path": null,
-      "id": "dolby_vision_profile_8",
-      "tags": ["dolby-vision", "profile-8"],
-      "expect": "needs transcode once sourced",
-      "status": "pending source",
-      "note": "Hard to synthesize cleanly. Park until an explicitly licensed DV P8 clip is obtained (Rule 4.3)."
     }
   ]
 }

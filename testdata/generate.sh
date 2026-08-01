@@ -241,6 +241,124 @@ gen hevc_hlg_mp4.mp4 \
   -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" \
   -c:a aac -ac 2 -shortest
 
+# 22c. SDR BT.709 control (explicit colour tags; contrasts HDR axis)
+gen h264_sdr_bt709_mp4.mp4 \
+  -f lavfi -i "testsrc=size=1280x720:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -c:v libx264 -pix_fmt yuv420p -profile:v high \
+  -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+  -x264-params "colorprim=bt709:transfer=bt709:colormatrix=bt709" \
+  -c:a aac -ac 2 -shortest
+
+# Tool helpers for HDR10+ / DV synthesis (optional; skip with a named reason).
+TOOLS_BIN="$ROOT/../scripts/.tools/bin"
+find_tool() {
+  local name="$1"
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  if [[ -x "$TOOLS_BIN/$name" ]]; then
+    echo "$TOOLS_BIN/$name"
+    return 0
+  fi
+  return 1
+}
+
+# 22d. HDR10+: PQ HEVC + SMPTE 2094-40 dynamic metadata (control)
+HDR10PLUS_JSON="$ROOT/assets/hdr10plus_48f.json"
+if HDR10PLUS_TOOL="$(find_tool hdr10plus_tool)" && MKVMERGE="$(find_tool mkvmerge)" \
+  && [[ -f "$HDR10PLUS_JSON" ]]; then
+  echo "→ hevc_hdr10plus_mp4.mp4"
+  TMP_H10P="$(mktemp -d)"
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=1280x720:rate=24:duration=2" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+    -c:v libx265 -pix_fmt yuv420p10le -crf 28 \
+    -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400:repeat-headers=1" \
+    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+    -c:a aac -ac 2 -shortest "$TMP_H10P/base.mp4"
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$TMP_H10P/base.mp4" -an -c:v copy \
+    -bsf:v hevc_mp4toannexb "$TMP_H10P/base.hevc"
+  "$HDR10PLUS_TOOL" inject -i "$TMP_H10P/base.hevc" -j "$HDR10PLUS_JSON" \
+    -o "$TMP_H10P/inj.hevc"
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$TMP_H10P/base.mp4" -vn -c:a copy \
+    "$TMP_H10P/a.m4a"
+  "$MKVMERGE" -o "$TMP_H10P/mux.mkv" --default-duration 0:24fps \
+    "$TMP_H10P/inj.hevc" "$TMP_H10P/a.m4a" >/dev/null
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$TMP_H10P/mux.mkv" -c copy -tag:v hvc1 \
+    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+    "$OUT/hevc_hdr10plus_mp4.mp4"
+  rm -rf "$TMP_H10P"
+else
+  echo "skip hevc_hdr10plus_mp4.mp4: need hdr10plus_tool + mkvmerge + assets/hdr10plus_48f.json"
+fi
+
+# 22e. DV P8.4 (HLG base): dovi_tool generate + inject-rpu into short HLG HEVC
+DOVI_P84_JSON="$ROOT/assets/dovi_p84_gen.json"
+# dvvC from Dolby Browser Kit HLG-P8.4 (compat id 4); grafted after ffmpeg remux drops it.
+DVVC_P84_HEX="00000020647676430100101d4000000000000000000000000000000000000000"
+if DOVI_TOOL="$(find_tool dovi_tool)" && MKVMERGE="$(find_tool mkvmerge)" \
+  && [[ -f "$DOVI_P84_JSON" ]]; then
+  echo "→ hevc_dv_p84_hlg_mkv.mkv (+ mp4 when inject_dvvc.py works)"
+  TMP_P84="$(mktemp -d)"
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=1280x720:rate=24:duration=2" \
+    -c:v libx265 -pix_fmt yuv420p10le -crf 28 \
+    -x265-params "repeat-headers=1:annexb=1:keyint=24:min-keyint=24" \
+    -color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc \
+    -an -f hevc "$TMP_P84/hlg.hevc"
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+    -c:a aac -ac 2 "$TMP_P84/a.m4a"
+  "$DOVI_TOOL" generate -j "$DOVI_P84_JSON" -o "$TMP_P84/p84.rpu"
+  "$DOVI_TOOL" inject-rpu -i "$TMP_P84/hlg.hevc" --rpu-in "$TMP_P84/p84.rpu" \
+    -o "$TMP_P84/hlg_p84.hevc"
+  "$MKVMERGE" -o "$OUT/hevc_dv_p84_hlg_mkv.mkv" --default-duration 0:24fps \
+    "$TMP_P84/hlg_p84.hevc" "$TMP_P84/a.m4a" >/dev/null
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$OUT/hevc_dv_p84_hlg_mkv.mkv" \
+    -c copy -tag:v hvc1 \
+    -color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc \
+    "$TMP_P84/p84.mp4"
+  if python3 "$ROOT/inject_dvvc.py" "$TMP_P84/p84.mp4" "$DVVC_P84_HEX"; then
+    cp "$TMP_P84/p84.mp4" "$OUT/hevc_dv_p84_hlg_mp4.mp4"
+  else
+    echo "skip hevc_dv_p84_hlg_mp4.mp4: dvvC graft failed (MKV still written)"
+  fi
+  rm -rf "$TMP_P84"
+else
+  echo "skip hevc_dv_p84_hlg_*: need dovi_tool + mkvmerge + assets/dovi_p84_gen.json"
+fi
+
+# 22f. P8.1 mkv/mp4 pair (same content; Matroska vs MP4 DV signalling)
+# Prefer local Browser Kit; else MakeMKV P8.1 after fetch. ffmpeg -c copy drops dvvC
+# on MP4, so graft the kit/source dvvC (compat id 1 for HDR10 BL).
+DVVC_P81_HEX="00000020647676430100101d1000000000000000000000000000000000000000"
+P81_KIT="$OUT/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_HDR10-P8.1_FHD_24_H265-4Mbps_DD+JOC-768Kbps.mp4"
+P81_MAKEMKV="$OUT/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv"
+P81_SRC=""
+if [[ -f "$P81_KIT" ]]; then
+  P81_SRC="$P81_KIT"
+elif [[ -f "$P81_MAKEMKV" ]]; then
+  P81_SRC="$P81_MAKEMKV"
+fi
+if [[ -n "$P81_SRC" ]]; then
+  echo "→ hevc_dv_p81_pair.{mkv,mp4} from $(basename "$P81_SRC")"
+  TMP_P81="$(mktemp -d)"
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy \
+    "$OUT/hevc_dv_p81_pair.mkv"
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy -tag:v hvc1 \
+    "$TMP_P81/pair.mp4"
+  if python3 "$ROOT/inject_dvvc.py" "$TMP_P81/pair.mp4" "$DVVC_P81_HEX"; then
+    cp "$TMP_P81/pair.mp4" "$OUT/hevc_dv_p81_pair.mp4"
+  else
+    echo "skip hevc_dv_p81_pair.mp4: dvvC graft failed (MKV still written)"
+  fi
+  rm -rf "$TMP_P81"
+else
+  echo "skip hevc_dv_p81_pair.*: need Browser Kit P8.1 or fetched MakeMKV P81"
+fi
+
 # 23. Two AAC stereo tracks tagged eng/spa (ADR-0012 multi-track switch)
 gen h264_aac_multilang_mkv.mkv \
   -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
@@ -370,6 +488,98 @@ with open(path, "r+b") as f:
     f.truncate(target)
 print(f"  size={os.path.getsize(path)}")
 PY
+fi
+
+# ---------------------------------------------------------------------------
+# Dolby Vision MakeMKV test clips (Rule 4.3 / official Dolby samples).
+# Video (+ audio) MKVs hosted at makemkv.com/download/dvtest/. Do NOT commit
+# to git/LFS — fetch locally, verify pinned sha256, skip with a named reason.
+# ---------------------------------------------------------------------------
+fetch_makemkv_dvtest() {
+  local dir="$OUT/dolby-vision-makemkv"
+  mkdir -p "$dir"
+
+  # Self-pinned 2026-08-02: Wayback id_ fetches (makemkv.com returned Cloudflare
+  # 525). Stability of the local cache only — not provenance. See testdata/README.md.
+  local -a SPECS=(
+    "P4_LG_Dolby_Trailer_4K_Demo.mkv|20220530161818|044642f88616f6b72a819c2719a7e07b377b3428de88bd1c10d64fc69a736515"
+    "P5_Dolby_Amaze.mkv|20220530162104|1a97082e1f2e4d4cf56618370fc842f558dafe6156ef6a4878fcac5a0a65f476"
+    "P7_FEL_GIJoe_The_Rise_of_Cobra.mkv|20220530162117|06e42fc4e06ee90c8eea0b7a31450f844ad4228ea639a5ba12d51c05d2930e63"
+    "P7_MEL_GIJoe_The_Rise_of_Cobra.mkv|20220530162129|9deb64f1f07b367b62cf853fee1d4e54054d1eaf11da2c744dbe06062b5881cc"
+    "P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv|20220530163158|db0e079a0c911ca351e228055d5cc147e0d7b7755d5255914318336624f80d04"
+  )
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "skip dolby-vision-makemkv/*: curl not on PATH"
+    return 0
+  fi
+  if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+    echo "skip dolby-vision-makemkv/*: no sha256 tool (shasum/sha256sum)"
+    return 0
+  fi
+
+  digest_of() {
+    if command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "$1" | awk '{print $1}'
+    else
+      sha256sum "$1" | awk '{print $1}'
+    fi
+  }
+
+  local entry name ts want primary archive got
+  for entry in "${SPECS[@]}"; do
+    IFS='|' read -r name ts want <<<"$entry"
+    local dest="$dir/$name"
+    if [[ -f "$dest" ]]; then
+      got="$(digest_of "$dest")"
+      if [[ "$got" == "$want" ]]; then
+        echo "→ dolby-vision-makemkv/$name (cached, sha256 ok)"
+        continue
+      fi
+      echo "skip dolby-vision-makemkv/$name: cached digest mismatch (got $got want $want); remove file to re-fetch"
+      continue
+    fi
+
+    primary="https://www.makemkv.com/download/dvtest/${name}"
+    archive="https://web.archive.org/web/${ts}id_/https://www.makemkv.com/download/dvtest/${name}"
+    echo "→ fetch dolby-vision-makemkv/$name"
+    if ! curl -fL --connect-timeout 20 --max-time 120 -A 'Mozilla/5.0' \
+      -o "$dest.part" "$primary" 2>/dev/null; then
+      rm -f "$dest.part"
+      if ! curl -fL --connect-timeout 30 --retry 3 --retry-delay 2 -C - \
+        -A 'Mozilla/5.0' -o "$dest.part" "$archive"; then
+        rm -f "$dest.part"
+        echo "skip dolby-vision-makemkv/$name: fetch failed (makemkv.com + Wayback unavailable)"
+        continue
+      fi
+    fi
+    mv "$dest.part" "$dest"
+    got="$(digest_of "$dest")"
+    if [[ "$got" != "$want" ]]; then
+      rm -f "$dest"
+      echo "skip dolby-vision-makemkv/$name: sha256 mismatch (got $got want $want)"
+      continue
+    fi
+    echo "→ dolby-vision-makemkv/$name (sha256 ok)"
+  done
+}
+
+fetch_makemkv_dvtest
+
+# Rebuild P8.1 pair if MakeMKV P81 arrived after the earlier synth pass.
+if [[ ! -f "$OUT/hevc_dv_p81_pair.mkv" ]] \
+  && [[ -f "$OUT/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv" ]]; then
+  echo "→ hevc_dv_p81_pair.* (retry from MakeMKV P81)"
+  P81_SRC="$OUT/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv"
+  TMP_P81="$(mktemp -d)"
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy \
+    "$OUT/hevc_dv_p81_pair.mkv"
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy -tag:v hvc1 \
+    "$TMP_P81/pair.mp4"
+  python3 "$ROOT/inject_dvvc.py" "$TMP_P81/pair.mp4" "$DVVC_P81_HEX" \
+    && cp "$TMP_P81/pair.mp4" "$OUT/hevc_dv_p81_pair.mp4" \
+    || echo "skip hevc_dv_p81_pair.mp4: dvvC graft failed"
+  rm -rf "$TMP_P81"
 fi
 
 touch "$OUT/.generated"
