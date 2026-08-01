@@ -233,6 +233,14 @@ gen hevc_hdr10_mp4.mp4 \
   -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
   -c:a aac -ac 2 -shortest
 
+# 22b. HLG: HEVC 10-bit + arib-std-b67 / BT.2020 (plain HLG, no DV)
+gen hevc_hlg_mp4.mp4 \
+  -f lavfi -i "testsrc=size=1280x720:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -c:v libx265 -pix_fmt yuv420p10le -tag:v hvc1 \
+  -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" \
+  -c:a aac -ac 2 -shortest
+
 # 23. Two AAC stereo tracks tagged eng/spa (ADR-0012 multi-track switch)
 gen h264_aac_multilang_mkv.mkv \
   -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
