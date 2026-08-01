@@ -538,6 +538,8 @@ struct Session {
     /// Burn-in baked into this session's encode (ADR-0018). Seek restarts
     /// keep the same selection; switching burn-in is a fresh POST.
     burn_in: Option<BurnInSelection>,
+    /// Keyframe map snapshot and the virtual file bound from it (ADR-0023).
+    map_binding: MapBinding,
     /// Actual encoder for this process. Future fallback updates this field.
     video_encoder: String,
     /// Encode window start for the current run (`-ss` / lead-in).
@@ -973,9 +975,9 @@ impl HlsSessionRegistry {
         audio: AudioSelection,
         subtitle_tracks: Vec<HlsSubtitleTrack>,
         burn_in: Option<BurnInSelection>,
+        keyframe_map: Option<crate::virtual_input::KeyframeMap>,
     ) -> Result<String, StartSessionError> {
         let play_start_ms = align_to_segment(start_ms);
-        let start_ms = encode_start_ms(play_start_ms);
         let sessions = self
             .sessions
             .lock()
@@ -994,24 +996,27 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&run_dir).map_err(|e| {
             StartSessionError::Spawn(format!("create run dir {}: {e}", run_dir.display()))
         })?;
-        write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
         // Release before ASS demux / ffmpeg spawn so a multi-minute NAS extract
         // does not freeze every other HLS request on this lock.
         drop(sessions);
 
         let spawn_started = Instant::now();
+        let mut map_binding = MapBinding::new(keyframe_map);
+        let mut plan = map_binding.plan(src, play_start_ms);
+        let start_ms = plan.window_start_ms;
+        write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
         let burn_in =
             prepare_ass_burn_file(src, &dir, burn_in).map_err(StartSessionError::Spawn)?;
         let child = spawn_ffmpeg(
-            src,
+            &plan,
             &run_dir,
-            start_ms,
             mode,
             audio.clone(),
             &self.video_encoder,
             burn_in.as_ref(),
         )
         .map_err(StartSessionError::Spawn)?;
+        map_binding.bound = plan.virtual_input.take();
         // Only cold (non-store) tracks need a session demux. Ready tracks
         // point MEDIA at the item VTT and must not re-read the source.
         spawn_session_subtitle_worker(src, &dir, &subtitle_tracks);
@@ -1029,6 +1034,9 @@ impl HlsSessionRegistry {
             burn_in = burn_in.as_ref().map(|b| b.track_id.as_str()),
             encoder = %self.video_encoder,
             spawn_ms,
+            start_path = plan.start_path,
+            container_kind = plan.container_kind,
+            fingerprint_cost_ms = plan.fingerprint_cost_ms,
             "hls session started"
         );
         let mut sessions = self
@@ -1044,10 +1052,11 @@ impl HlsSessionRegistry {
                 mode,
                 audio,
                 burn_in,
+                map_binding,
                 video_encoder: self.video_encoder.clone(),
                 start_ms,
                 play_start_ms,
-                landed_ms: play_start_ms,
+                landed_ms: start_ms,
                 usable_extent_ms: None,
                 duration_ms,
                 current_run_id: run_id,
@@ -1069,6 +1078,17 @@ impl HlsSessionRegistry {
             },
         );
         Ok(id)
+    }
+
+    /// True when a spawn in this session held a keyframe map but still had
+    /// to start with `-ss` (stale identity or a bind that would not hold).
+    /// The caller enqueues a map rebuild (ADR-0023 §8).
+    pub fn map_fallback(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(session_id).map(|s| s.map_binding.fell_back))
+            .unwrap_or(false)
     }
 
     pub fn item_id(&self, session_id: &str) -> Option<i64> {
@@ -1797,7 +1817,6 @@ fn restart_at(
     video_encoder: &str,
 ) -> Result<RestartAtOutcome, PlaylistError> {
     let play_start_ms = align_to_segment(play_ms);
-    let start_ms = encode_start_ms(play_start_ms);
     let prior_play = session.play_start_ms;
     let prior_ready = session.first_segment_ready;
     let cooking_land = align_to_segment(prior_play);
@@ -1924,26 +1943,28 @@ fn restart_at(
     let run_dir = session.dir.join(format!("run_{run_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
+    let mut plan = session.map_binding.plan(&session.src, play_start_ms);
+    let start_ms = plan.window_start_ms;
     write_run_encode_start(&run_dir, start_ms).map_err(PlaylistError::Failed)?;
     let burn_in = prepare_ass_burn_file(&session.src, &session.dir, session.burn_in.clone())
         .map_err(PlaylistError::Failed)?;
     session.burn_in = burn_in;
     let child = spawn_ffmpeg(
-        &session.src,
+        &plan,
         &run_dir,
-        start_ms,
         session.mode,
         session.audio.clone(),
         video_encoder,
         session.burn_in.as_ref(),
     )
     .map_err(PlaylistError::Failed)?;
+    session.map_binding.bound = plan.virtual_input.take();
     session.child = Some(child);
     session.current_run_id = run_id;
     session.current_run_eof = false;
     session.start_ms = start_ms;
     session.play_start_ms = play_start_ms;
-    session.landed_ms = play_start_ms;
+    session.landed_ms = start_ms;
     session.failed = None;
     session.last_restart = Instant::now();
     session.primed = false;
@@ -1960,6 +1981,9 @@ fn restart_at(
         run_id,
         session_disk_bytes = session_disk_bytes(&session.dir),
         encoder = video_encoder,
+        start_path = plan.start_path,
+        container_kind = plan.container_kind,
+        fingerprint_cost_ms = plan.fingerprint_cost_ms,
         path = %session.src.display(),
         "hls session seek restart"
     );
@@ -2469,15 +2493,115 @@ fn escape_hls_quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// What one producer run opens, and how that run is timed (ADR-0023 §3).
+struct StartPlan {
+    /// `-i` argument: the real file, or a session-scoped virtual-file URL.
+    input: std::ffi::OsString,
+    /// Title-absolute start of this run: `-output_ts_offset`, `-start_number`,
+    /// the burn-in shift, and the run's recorded encode start. Equals the
+    /// snapped map PTS on the mapped path.
+    window_start_ms: u64,
+    /// Whether FFmpeg seeks inside the input (`-ss`).
+    seek_input: bool,
+    /// `mapped` when the keyframe map placed this start, else `ss`.
+    start_path: &'static str,
+    container_kind: &'static str,
+    /// Cost of the bind-time identity re-read (ADR-0023 §4).
+    fingerprint_cost_ms: u128,
+    virtual_input: Option<crate::virtual_input::VirtualInput>,
+}
+
+/// The session's keyframe map and the virtual file bound from it. Dropping
+/// it stops the session's range server.
+#[derive(Default)]
+struct MapBinding {
+    /// Cleared when identity or a bind fails: a poisoned map is not retried
+    /// for the life of the session.
+    map: Option<crate::virtual_input::KeyframeMap>,
+    bound: Option<crate::virtual_input::VirtualInput>,
+    /// Set once a spawn fell back to `-ss` while holding a map (ADR-0023 §8);
+    /// the API reads it to enqueue a map rebuild.
+    fell_back: bool,
+}
+
+impl MapBinding {
+    fn new(map: Option<crate::virtual_input::KeyframeMap>) -> Self {
+        Self {
+            map,
+            bound: None,
+            fell_back: false,
+        }
+    }
+
+    /// Decides how the next run starts. Mapped when the map still matches
+    /// the bytes on disk and binds; otherwise today's `-ss` on the real file
+    /// (ADR-0023 §8). A map problem never fails the session.
+    fn plan(&mut self, src: &Path, play_start_ms: u64) -> StartPlan {
+        let Some(map) = self.map.take() else {
+            return ss_start_plan(src, play_start_ms, 0);
+        };
+        let cost_ms = match crate::virtual_input::verify_identity(src, &map.content_id) {
+            Ok(cost_ms) => cost_ms,
+            Err(e) => {
+                tracing::info!(
+                    path = %src.display(),
+                    reason = %e,
+                    "hls start: keyframe map identity stale; falling back to -ss"
+                );
+                self.bound = None;
+                self.fell_back = true;
+                return ss_start_plan(src, play_start_ms, 0);
+            }
+        };
+        match crate::virtual_input::bind(src, &map, play_start_ms, self.bound.take()) {
+            Ok(bind) => {
+                let plan = StartPlan {
+                    input: bind.input,
+                    window_start_ms: bind.land_ms,
+                    seek_input: bind.seek_input,
+                    start_path: "mapped",
+                    container_kind: map.container_kind.as_str(),
+                    fingerprint_cost_ms: cost_ms,
+                    virtual_input: bind.virtual_input,
+                };
+                self.map = Some(map);
+                plan
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %src.display(),
+                    reason = %e,
+                    "hls start: keyframe map bind failed; falling back to -ss"
+                );
+                self.fell_back = true;
+                ss_start_plan(src, play_start_ms, cost_ms)
+            }
+        }
+    }
+}
+
+/// Today's start: `-ss` on the real file at the encode window (ADR-0023 §8).
+fn ss_start_plan(src: &Path, play_start_ms: u64, fingerprint_cost_ms: u128) -> StartPlan {
+    StartPlan {
+        input: src.as_os_str().to_owned(),
+        window_start_ms: encode_start_ms(play_start_ms),
+        seek_input: true,
+        start_path: "ss",
+        container_kind: "-",
+        fingerprint_cost_ms,
+        virtual_input: None,
+    }
+}
+
 fn spawn_ffmpeg(
-    src: &Path,
+    input: &StartPlan,
     dir: &Path,
-    start_ms: u64,
     mode: SessionMode,
     audio: AudioSelection,
     video_encoder: &str,
     burn_in: Option<&BurnInSelection>,
 ) -> Result<Child, String> {
+    let start_ms = input.window_start_ms;
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
     let start_number = (start_ms / SEGMENT_MS).to_string();
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
@@ -2497,10 +2621,13 @@ fn spawn_ffmpeg(
         // deadlocks ffmpeg so the playlist never appears.
         .stderr(Stdio::null())
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
-    if start_ms > 0 {
+    // The Matroska splice already starts at the land Cluster, so seeking
+    // inside it would land a second time (ADR-0023 §3a). MP4 keeps `-ss`:
+    // its virtual file spans the whole title (§3b).
+    if start_ms > 0 && input.seek_input {
         cmd.args(["-ss", &start_secs]);
     }
-    cmd.arg("-i").arg(src);
+    cmd.arg("-i").arg(&input.input);
     if start_ms > 0 {
         // ADR-0020: load-bearing under copy. Does not rewrite tfdt/trun (those
         // stay segment-local at 0); it stamps title-absolute time into the
@@ -2519,7 +2646,7 @@ fn spawn_ffmpeg(
             tracing::warn!(
                 channels = audio.channels,
                 layout = audio.channel_layout.as_deref().unwrap_or("unknown"),
-                path = %src.display(),
+                input = %input.input.to_string_lossy(),
                 "no downmix matrix for this layout; falling back to -ac 2"
             );
         }
@@ -2638,7 +2765,7 @@ fn spawn_ffmpeg(
         if e.kind() == std::io::ErrorKind::NotFound {
             "ffmpeg not found on PATH".into()
         } else {
-            format!("spawn ffmpeg for {}: {e}", src.display())
+            format!("spawn ffmpeg for {}: {e}", input.input.to_string_lossy())
         }
     })
 }
@@ -2865,6 +2992,7 @@ fn is_safe_asset(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::BurnInKind;
+    use crate::virtual_input::{KeyframeEntry, KeyframeMap, MapContainerKind};
     use std::process::Command;
 
     fn ffmpeg_available() -> bool {
@@ -3520,6 +3648,7 @@ mod tests {
             mode: SessionMode::Transcode,
             audio: stereo(),
             burn_in: None,
+            map_binding: MapBinding::default(),
             video_encoder: "libx264".into(),
             start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
             play_start_ms: play_ms,
@@ -3707,6 +3836,7 @@ mod tests {
                 stereo(),
                 vec![],
                 None,
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -3747,6 +3877,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -3789,6 +3920,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -3849,6 +3981,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -3919,6 +4052,7 @@ mod tests {
                 stereo(),
                 vec![],
                 None,
+                None,
             )
             .unwrap();
         {
@@ -3987,6 +4121,7 @@ mod tests {
                 stereo(),
                 vec![],
                 None,
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &prior);
@@ -4005,6 +4140,7 @@ mod tests {
                     max_channels: 2,
                 },
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -4071,6 +4207,7 @@ mod tests {
                 stereo(),
                 vec![],
                 None,
+                None,
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &id);
@@ -4106,6 +4243,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -4169,6 +4307,7 @@ mod tests {
                     item_vtt_path: None,
                 }],
                 None,
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4218,6 +4357,7 @@ mod tests {
                 stereo(),
                 vec![],
                 None,
+                None,
             )
             .unwrap();
         let b = reg
@@ -4229,6 +4369,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -4242,6 +4383,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None
             ),
             Err(StartSessionError::CapFull)
@@ -4274,6 +4416,7 @@ mod tests {
                 SessionMode::Copy,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -4311,6 +4454,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -4385,7 +4529,8 @@ mod tests {
     ) -> PathBuf {
         let enc = dir.join("enc");
         fs::create_dir_all(&enc).unwrap();
-        let mut child = spawn_ffmpeg(src, &enc, 0, mode, audio, encoder, None).unwrap();
+        let mut child =
+            spawn_ffmpeg(&ss_start_plan(src, 0, 0), &enc, mode, audio, encoder, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if child.try_wait().ok().flatten().is_some() {
@@ -4640,6 +4785,7 @@ mod tests {
                     item_vtt_path: Some(vtt),
                 }],
                 None,
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4719,9 +4865,8 @@ mod tests {
             let enc = dir.path().join(name);
             fs::create_dir_all(&enc).unwrap();
             let mut child = spawn_ffmpeg(
-                src,
+                &ss_start_plan(src, 0, 0),
                 &enc,
-                0,
                 SessionMode::Transcode,
                 stereo(),
                 "libx264",
@@ -5070,6 +5215,7 @@ mod tests {
                 stereo(),
                 vec![],
                 Some(selection),
+                None,
             )
             .unwrap();
         {
@@ -5121,6 +5267,7 @@ mod tests {
                 stereo(),
                 vec![],
                 Some(selection),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5200,6 +5347,7 @@ mod tests {
                 stereo(),
                 vec![],
                 Some(selection),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5230,6 +5378,7 @@ mod tests {
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
+            map_binding: MapBinding::default(),
             video_encoder: "copy".into(),
             start_ms: 0,
             play_start_ms: 0,
@@ -5295,6 +5444,7 @@ mod tests {
                 SessionMode::Transcode,
                 stereo(),
                 vec![],
+                None,
                 None,
             )
             .unwrap();
@@ -5423,6 +5573,7 @@ mod tests {
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
+            map_binding: MapBinding::default(),
             video_encoder: "copy".into(),
             start_ms: 1_014_000,
             play_start_ms: 1_014_000,
@@ -5501,6 +5652,7 @@ mod tests {
             mode: SessionMode::Transcode,
             audio: stereo(),
             burn_in: None,
+            map_binding: MapBinding::default(),
             video_encoder: "libx264".into(),
             start_ms: 0,
             play_start_ms: 0,
@@ -5563,5 +5715,833 @@ mod tests {
         unsafe {
             std::env::remove_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES");
         }
+    }
+
+    /// Twelve seconds with a keyframe every second, so a keyframe map has
+    /// mid-title lands to snap to. Matroska gets one Cluster per keyframe.
+    fn make_mapped_fixture(path: &Path, secs: u32) {
+        let d = secs.to_string();
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=size=64x64:rate=25:d={d}"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("sine=frequency=440:duration={d}"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
+            "-sc_threshold",
+            "0",
+            "-c:a",
+            "aac",
+        ]);
+        if path.extension().and_then(|e| e.to_str()) == Some("mkv") {
+            cmd.args(["-cluster_time_limit", "1000"]);
+        }
+        assert!(cmd.arg(path).status().unwrap().success());
+    }
+
+    fn keyframe_map(
+        kind: MapContainerKind,
+        src: &Path,
+        entries: Vec<KeyframeEntry>,
+    ) -> KeyframeMap {
+        assert!(entries.len() > 4, "fixture needs mid-title lands");
+        KeyframeMap {
+            container_kind: kind,
+            content_id: nightjar_db::content_id_for_path(src).unwrap(),
+            entries,
+        }
+    }
+
+    /// EBML variable-size integer at `at`: value with the marker bit
+    /// stripped, and how many bytes it occupied.
+    fn read_vint(bytes: &[u8], at: usize) -> Option<(u64, usize)> {
+        let first = *bytes.get(at)?;
+        if first == 0 {
+            return None;
+        }
+        let len = first.leading_zeros() as usize + 1;
+        let mut value = u64::from(first) & (0xFF >> len);
+        for step in 1..len {
+            value = (value << 8) | u64::from(*bytes.get(at + step)?);
+        }
+        Some((value, len))
+    }
+
+    /// Cluster offsets and Cluster timestamps, the pair a Matroska map
+    /// carries. Timestamps are raw TimestampScale units, which the fixture
+    /// leaves at the 1ms default.
+    fn matroska_entries(src: &Path) -> Vec<KeyframeEntry> {
+        let bytes = fs::read(src).unwrap();
+        let mut entries = Vec::new();
+        let mut at = 0usize;
+        while at + 4 <= bytes.len() {
+            if bytes[at..at + 4] != [0x1F, 0x43, 0xB6, 0x75] {
+                at += 1;
+                continue;
+            }
+            // A Cluster ID that is really frame data will not be followed by
+            // a size and a Timestamp child, so the parse rejects it.
+            let mut cursor = at + 4;
+            let Some((_, size_len)) = read_vint(&bytes, cursor) else {
+                at += 1;
+                continue;
+            };
+            cursor += size_len;
+            // FFmpeg writes a CRC-32 child ahead of the Cluster Timestamp.
+            if bytes.get(cursor) == Some(&0xBF) {
+                let Some((crc_len, crc_len_len)) = read_vint(&bytes, cursor + 1) else {
+                    at += 1;
+                    continue;
+                };
+                cursor += 1 + crc_len_len + crc_len as usize;
+            }
+            if bytes.get(cursor) != Some(&0xE7) {
+                at += 1;
+                continue;
+            }
+            cursor += 1;
+            let Some((len, len_len)) = read_vint(&bytes, cursor) else {
+                at += 1;
+                continue;
+            };
+            cursor += len_len;
+            let end = cursor + len as usize;
+            let pts_ms = bytes[cursor..end]
+                .iter()
+                .fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+            entries.push(KeyframeEntry {
+                pts_ms,
+                byte_offset: at as u64,
+            });
+            at = end;
+        }
+        entries
+    }
+
+    /// Sync sample PTS and position, the pair an MP4 map carries.
+    fn mp4_entries(src: &Path) -> Vec<KeyframeEntry> {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_packets",
+                "-show_entries",
+                "packet=pts_time,pos,flags",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(src)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe packets for {}",
+            src.display()
+        );
+        let mut entries = Vec::new();
+        let (mut pts_ms, mut byte_offset) = (None, None);
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "pts_time" => pts_ms = value.parse::<f64>().ok().map(|s| (s * 1000.0) as u64),
+                "pos" => byte_offset = value.parse::<u64>().ok(),
+                "flags" if value.starts_with('K') => {
+                    if let (Some(pts_ms), Some(byte_offset)) = (pts_ms, byte_offset) {
+                        entries.push(KeyframeEntry {
+                            pts_ms,
+                            byte_offset,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        entries
+    }
+
+    /// Drives a started session to producer EOF and joins the run so the
+    /// delivered stream can be probed as one file.
+    fn run_to_eof_and_join(reg: &HlsSessionRegistry, id: &str, out: &Path) -> PathBuf {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let run_index = loop {
+            let (run_id, dir, failed) = {
+                let sessions = reg.sessions.lock().unwrap();
+                let session = sessions.get(id).expect("session live");
+                (
+                    session.current_run_id,
+                    session.dir.clone(),
+                    session.failed.clone(),
+                )
+            };
+            if let Some(err) = failed {
+                panic!("session failed: {err}");
+            }
+            // Keeps last_access fresh so the reaper leaves the session alone.
+            let _ = reg.playlist(id, run_id);
+            let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
+            if fs::read_to_string(&index)
+                .map(|text| text.contains("#EXT-X-ENDLIST"))
+                .unwrap_or(false)
+            {
+                break index;
+            }
+            assert!(Instant::now() < deadline, "producer never reached EOF");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let joined = out.join("joined.mp4");
+        // -copyts: without it the join rebases to zero and the title-absolute
+        // land the session encoded at would not survive into the probe.
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-copyts", "-i"])
+            .arg(&run_index)
+            .args(["-c", "copy"])
+            .arg(&joined)
+            .status()
+            .unwrap();
+        assert!(status.success(), "join {}", run_index.display());
+        joined
+    }
+
+    fn probe_secs(path: &Path, select: &str, entry: &str) -> f64 {
+        let raw = probe_entry(path, select, entry);
+        raw.parse()
+            .unwrap_or_else(|_| panic!("{select} {entry} was {raw:?}"))
+    }
+
+    /// Decodes the audio the session delivered. A byte splice that lands
+    /// mid-frame still probes as AAC and still lists a duration; only a
+    /// decode says whether the frames survived.
+    fn assert_audio_decodes(path: &Path) {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:a:0", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.trim().is_empty(),
+            "audio decode errors in {}: {stderr}",
+            path.display()
+        );
+    }
+
+    /// Video and audio must start together at the land: the splice is only
+    /// honest if both tracks begin where the map said (ADR-0023 §3).
+    fn assert_av_landed(joined: &Path, land_ms: u64, fixture_ms: u64) {
+        let land = land_ms as f64 / 1000.0;
+        let video_start = probe_secs(joined, "v:0", "start_time");
+        let audio_start = probe_secs(joined, "a:0", "start_time");
+        assert!(
+            (video_start - land).abs() < 0.2,
+            "video starts at {video_start}s, land was {land}s"
+        );
+        assert!(
+            (video_start - audio_start).abs() < 0.15,
+            "A/V offset {:.3}s (video {video_start}s, audio {audio_start}s)",
+            video_start - audio_start
+        );
+        let want = (fixture_ms - land_ms) as f64 / 1000.0;
+        let video_duration = probe_secs(joined, "v:0", "duration");
+        let audio_duration = probe_secs(joined, "a:0", "duration");
+        assert!(
+            (video_duration - want).abs() < 0.5,
+            "video runs {video_duration}s, expected {want}s from the land to EOF"
+        );
+        assert!(
+            (audio_duration - want).abs() < 0.5,
+            "audio runs {audio_duration}s, expected {want}s from the land to EOF"
+        );
+        assert_audio_decodes(joined);
+    }
+
+    const MAPPED_FIXTURE_MS: u64 = 12_000;
+
+    /// ADR-0023 §3a: the Matroska splice opens at the land Cluster with no
+    /// `-ss`, and what comes out still decodes on both tracks.
+    #[test]
+    fn mapped_matroska_session_starts_at_the_land_cluster() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
+        let land_ms = map.entry_at_or_before(6000).unwrap().pts_ms;
+
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_some(),
+                "Matroska map start must open the spliced virtual file"
+            );
+            assert!(!session.map_binding.fell_back);
+            assert_eq!(
+                session.start_ms, land_ms,
+                "encode window is the land Cluster PTS, not an -ss lead-in"
+            );
+        }
+        let joined = run_to_eof_and_join(&reg, &id, dir.path());
+        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+    }
+
+    /// A seek re-splices at the new land: the session keeps the map, so the
+    /// second run opens a fresh virtual file rather than falling back.
+    #[test]
+    fn seek_rebinds_the_splice_at_the_new_land() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
+        let land_ms = map.entry_at_or_before(2000).unwrap().pts_ms;
+
+        // Start late and scrub back: the running encode cannot cover the new
+        // land, so the seek has to respawn rather than retarget.
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                8000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+        let view = reg.seek(&id, 2000).expect("seek");
+        assert_ne!(view.run_id, 0, "fresh run after seek");
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(session.map_binding.bound.is_some(), "seek re-splices");
+            assert_eq!(session.start_ms, land_ms);
+        }
+        assert!(!reg.map_fallback(&id), "rebind must hold across a seek");
+        let joined = run_to_eof_and_join(&reg, &id, dir.path());
+        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+    }
+
+    /// Copy leaves the source frames untouched, so a splice that lands
+    /// mid-frame shows up as drift between the tracks. Checked here rather
+    /// than inferred from the transcode run, which would re-time both.
+    #[test]
+    fn mapped_matroska_copy_session_keeps_audio_with_video() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
+        let land_ms = map.entry_at_or_before(4000).unwrap().pts_ms;
+
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                4000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        let joined = run_to_eof_and_join(&reg, &id, dir.path());
+        assert_eq!(probe_entry(&joined, "a:0", "codec_name"), "aac");
+        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+    }
+
+    /// ADR-0023 §3b: an end-moov MP4 is served as faststart and still seeks
+    /// with `-ss`. The naive splice broke AAC here, so copy mode carries the
+    /// original frames through to a decode.
+    #[test]
+    fn mapped_mp4_session_keeps_aac_intact() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        make_mapped_fixture(&src, 12);
+        let map = keyframe_map(MapContainerKind::Mp4, &src, mp4_entries(&src));
+        let land_ms = map.entry_at_or_before(6000).unwrap().pts_ms;
+
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_some(),
+                "end-moov MP4 must be served through the faststart layout"
+            );
+            assert!(!session.map_binding.fell_back);
+            assert_eq!(session.start_ms, land_ms);
+        }
+        let joined = run_to_eof_and_join(&reg, &id, dir.path());
+        assert_eq!(probe_entry(&joined, "a:0", "codec_name"), "aac");
+        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+    }
+
+    /// A faststart MP4 needs no virtual file: the map snap is the whole win
+    /// and FFmpeg seeks the real path (ADR-0023 §3b).
+    #[test]
+    fn faststart_mp4_maps_without_a_virtual_file() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged.mp4");
+        make_mapped_fixture(&staged, 12);
+        let src = dir.path().join("clip.mp4");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&staged)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let map = keyframe_map(MapContainerKind::Mp4, &src, mp4_entries(&src));
+        let land_ms = map.entry_at_or_before(6000).unwrap().pts_ms;
+
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_none(),
+                "no server for faststart"
+            );
+            assert!(!session.map_binding.fell_back);
+            assert_eq!(session.start_ms, land_ms);
+        }
+        let (_, listed_ms) = wait_land_near(&reg, &id, 6000);
+        assert!(
+            listed_ms + SEGMENT_MS >= land_ms,
+            "land {listed_ms} before map"
+        );
+    }
+
+    /// ADR-0023 §8: no map is not a failure, it is today's start.
+    #[test]
+    fn unmapped_session_starts_with_ss() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        make_mapped_fixture(&src, 12);
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(session.map_binding.bound.is_none());
+        }
+        assert!(
+            !reg.map_fallback(&id),
+            "no map held means nothing to rebuild from this signal"
+        );
+        let _ = wait_land_near(&reg, &id, 6000);
+    }
+
+    /// ADR-0023 §4: the file was replaced under the map. The session starts
+    /// with `-ss` on the real bytes and flags the rebuild the API enqueues.
+    #[test]
+    fn replaced_file_degrades_to_ss_and_flags_rebuild() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
+        make_mapped_fixture(&src, 10);
+
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                10_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_none(),
+                "stale identity must not serve map offsets into new bytes"
+            );
+        }
+        assert!(reg.map_fallback(&id), "stale map must enqueue a rebuild");
+        let _ = wait_land_near(&reg, &id, 6000);
+    }
+
+    /// A packet-walk map records block positions inside a Cluster. Splicing
+    /// one hands FFmpeg garbage that still parses, so the bind refuses it and
+    /// the session falls back (ADR-0023 §8).
+    #[test]
+    fn offsets_that_are_not_clusters_degrade_to_ss_and_flag_rebuild() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let mut map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
+        for entry in &mut map.entries {
+            entry.byte_offset += 18;
+        }
+
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            assert!(sessions.get(&id).unwrap().map_binding.bound.is_none());
+        }
+        assert!(reg.map_fallback(&id), "bind refusal must enqueue a rebuild");
+        let _ = wait_land_near(&reg, &id, 6000);
+    }
+
+    /// The naive MP4 splice stamped honest sidx and broke AAC on real
+    /// interleaved titles. Synthetic fixtures do not reproduce that pattern:
+    /// this path must run against a household end-moov file when the NAS is
+    /// mounted. Skips cleanly in CI.
+    #[test]
+    fn mapped_real_library_end_moov_mp4_copy_keeps_aac() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let src = Path::new(
+            "/Volumes/media/TV Shows/Greys Anatomy/Season 6/\
+             Grey's Anatomy - 6x14 - Valentine's Day Massacre - WEBRip-1080p.mp4",
+        );
+        if !src.is_file() {
+            eprintln!(
+                "skipping: dogfood end-moov MP4 not mounted at {}",
+                src.display()
+            );
+            return;
+        }
+
+        let duration_ms = probe_duration_ms(src);
+        assert!(duration_ms > 120_000, "unexpected short dogfood title");
+        // Keyframes around the mid land only — a full packet walk of a
+        // 40-minute WEBRip is not what this assertion needs.
+        let entries = mp4_entries_near(src, 60.0, 15.0);
+        let map = keyframe_map(MapContainerKind::Mp4, src, entries);
+        let request_ms = 60_000;
+        let land_ms = map.entry_at_or_before(request_ms).unwrap().pts_ms;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let id = reg
+            .start(
+                1,
+                src,
+                request_ms,
+                duration_ms,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                None,
+                Some(map),
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_some(),
+                "real end-moov must go through virtual faststart"
+            );
+            assert!(!session.map_binding.fell_back);
+            assert_eq!(session.start_ms, land_ms);
+        }
+
+        let joined = wait_land_and_join_window(&reg, &id, dir.path(), 8);
+        assert_eq!(probe_entry(&joined, "a:0", "codec_name"), "aac");
+        assert_audio_decodes(&joined);
+        let video_start = probe_secs(&joined, "v:0", "start_time");
+        let audio_start = probe_secs(&joined, "a:0", "start_time");
+        let land = land_ms as f64 / 1000.0;
+        // Copy `-ss` may still open on the previous source IDR when the map
+        // PTS and the demuxer disagree by a frame; keep the land within one
+        // segment of the snap, not frame-exact.
+        assert!(
+            (video_start - land).abs() < 2.0,
+            "video starts at {video_start}s, land was {land}s"
+        );
+        // Copy residual: elst / priming (~83 ms) is in-family; keep room for
+        // real interleaving without letting a broken splice pass.
+        assert!(
+            (video_start - audio_start).abs() < 0.2,
+            "A/V offset {:.3}s on real end-moov copy (video {video_start}s, audio {audio_start}s)",
+            video_start - audio_start
+        );
+    }
+
+    fn probe_duration_ms(path: &Path) -> u64 {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe duration for {}",
+            path.display()
+        );
+        let secs: f64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("duration for {}", path.display()));
+        (secs * 1000.0) as u64
+    }
+
+    /// Sync samples near `center_s` (±`window_s`) via ffprobe read intervals.
+    fn mp4_entries_near(src: &Path, center_s: f64, window_s: f64) -> Vec<KeyframeEntry> {
+        let start = (center_s - window_s).max(0.0);
+        let end = center_s + window_s;
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time,pos,flags",
+                "-of",
+                "csv=p=0",
+                "-read_intervals",
+                &format!("{start}%{end}"),
+            ])
+            .arg(src)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe near-land packets for {}",
+            src.display()
+        );
+        let mut entries = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.split(',');
+            let (Some(pts), Some(pos), Some(flags)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if !flags.contains('K') {
+                continue;
+            }
+            let Ok(pts_s) = pts.parse::<f64>() else {
+                continue;
+            };
+            let Ok(byte_offset) = pos.parse::<u64>() else {
+                continue;
+            };
+            entries.push(KeyframeEntry {
+                pts_ms: (pts_s * 1000.0) as u64,
+                byte_offset,
+            });
+        }
+        assert!(
+            entries.len() > 1,
+            "need keyframes around {center_s}s on {}",
+            src.display()
+        );
+        entries
+    }
+
+    /// Wait for the land segment, then join enough of the producer run to
+    /// decode audio — without cooking a full episode to EOF on the assertion.
+    fn wait_land_and_join_window(
+        reg: &HlsSessionRegistry,
+        id: &str,
+        out: &Path,
+        window_secs: u32,
+    ) -> PathBuf {
+        let land_ms = {
+            let sessions = reg.sessions.lock().unwrap();
+            sessions.get(id).unwrap().landed_ms
+        };
+        let (name, _) = wait_land_near(reg, id, land_ms);
+        let _ = wait_asset(reg, id, &name);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let run_index = loop {
+            let (run_id, dir, failed) = {
+                let sessions = reg.sessions.lock().unwrap();
+                let session = sessions.get(id).expect("session live");
+                (
+                    session.current_run_id,
+                    session.dir.clone(),
+                    session.failed.clone(),
+                )
+            };
+            if let Some(err) = failed {
+                panic!("session failed: {err}");
+            }
+            let _ = reg.playlist(id, run_id);
+            let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
+            let text = fs::read_to_string(&index).unwrap_or_default();
+            let listed_secs: f64 = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("#EXTINF:"))
+                .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
+                .sum();
+            if listed_secs >= f64::from(window_secs) || text.contains("#EXT-X-ENDLIST") {
+                break index;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "producer never listed {window_secs}s; playlist:\n{text}\nfailed={failed:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let joined = out.join("joined_window.mp4");
+        // Join the producer playlist with copyts so title-absolute lands
+        // survive. Do not `-t` from zero — that yields an empty file when the
+        // land is a minute in.
+        let err = out.join("join.err");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-copyts", "-i"])
+            .arg(&run_index)
+            .args(["-c", "copy"])
+            .arg(&joined)
+            .stderr(std::fs::File::create(&err).unwrap())
+            .status()
+            .unwrap();
+        let err_text = fs::read_to_string(&err).unwrap_or_default();
+        assert!(
+            status.success(),
+            "join window {}: {err_text}",
+            run_index.display()
+        );
+        let meta = fs::metadata(&joined).unwrap();
+        assert!(
+            meta.len() > 10_000,
+            "joined window too small ({} bytes): {err_text}",
+            meta.len()
+        );
+        joined
     }
 }

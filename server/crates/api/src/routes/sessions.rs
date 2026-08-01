@@ -11,8 +11,9 @@ use axum::{
 use nightjar_core::{BROWSER_V0, PlaybackMethod};
 use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
-    AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, PlaylistError, SessionMode,
-    StartSessionError, burn_in_kind_for_codec, list_audio_tracks, list_burn_in_subtitles,
+    AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeEntry, KeyframeMap,
+    MapContainerKind, PlaylistError, SessionMode, StartSessionError, burn_in_kind_for_codec,
+    list_audio_tracks, list_burn_in_subtitles,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -167,6 +168,7 @@ pub async fn start(
     }
 
     let start_ms = query.start_ms.unwrap_or(0);
+    let keyframe_map = keyframe_map_for(&state, &row);
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
     let src = std::path::PathBuf::from(&row.path);
@@ -181,6 +183,7 @@ pub async fn start(
             audio,
             tracks_for_start,
             burn_in,
+            keyframe_map,
         )
     })
     .await
@@ -191,6 +194,9 @@ pub async fn start(
             let view = hls.view(&session_id).map_err(|e| {
                 ApiError::internal(format!("session {session_id} view after start: {e:?}"))
             })?;
+            if hls.map_fallback(&session_id) {
+                request_map_rebuild(&state, &row);
+            }
             log_hls_client_req(&session_id, "POST /sessions", Some(start_ms), 202, None);
             Ok((StatusCode::ACCEPTED, Json(dto_from_view(view))))
         }
@@ -203,6 +209,50 @@ pub async fn start(
         }
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),
     }
+}
+
+/// Keyframe map for this session, or None when the item has no usable one.
+///
+/// A missing map is the ADR-0023 §8 fallback: the session starts with `-ss`
+/// on the real file and a rebuild goes on the library pool. Identity is
+/// re-checked against the bytes on disk at every bind, inside the session.
+fn keyframe_map_for(state: &AppState, row: &MediaItemRow) -> Option<KeyframeMap> {
+    let rows = match state.db.keyframe_map(row.id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(item_id = row.id, error = %e, "keyframe map read failed at session start");
+            None
+        }
+    };
+    let map = rows.and_then(|rows| {
+        let container_kind = MapContainerKind::parse(&rows.container_kind)?;
+        Some(KeyframeMap {
+            container_kind,
+            content_id: rows.content_id,
+            entries: rows
+                .entries
+                .iter()
+                .filter_map(|&(pts_ms, byte_offset)| {
+                    Some(KeyframeEntry {
+                        pts_ms: u64::try_from(pts_ms).ok()?,
+                        byte_offset: u64::try_from(byte_offset).ok()?,
+                    })
+                })
+                .collect(),
+        })
+    });
+    if map.is_none() {
+        request_map_rebuild(state, row);
+    }
+    map
+}
+
+/// Puts a map build at the front of the library pool's background work
+/// (ADR-0023 §8). Already pending or in flight is a no-op.
+fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
+    state
+        .pool
+        .prioritize_map_rebuild(row.id, row.library_id, std::path::PathBuf::from(&row.path));
 }
 
 /// Which audio stream this session maps (ADR-0012). No `audioTrackId` takes
@@ -405,6 +455,13 @@ pub async fn seek(
         .map_err(|e| ApiError::internal(format!("hls seek task: {e}")))?;
     match result {
         Ok(view) => {
+            // A seek restart re-binds the virtual file, so this is where a
+            // mid-session replacement shows up (ADR-0023 §4).
+            if state.hls.map_fallback(&session_id)
+                && let Ok(Some(row)) = state.db.get_item(view.item_id)
+            {
+                request_map_rebuild(&state, &row);
+            }
             log_hls_client_req(&session_id, "POST /seek", Some(start_ms), 202, None);
             Ok((StatusCode::ACCEPTED, Json(dto_from_view(view))))
         }

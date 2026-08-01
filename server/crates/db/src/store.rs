@@ -60,6 +60,15 @@ pub struct MediaItemRow {
     pub map_content_id: Option<String>,
 }
 
+/// A stored keyframe map (ADR-0023 §7) whose stamps match live identity.
+#[derive(Debug, Clone)]
+pub struct KeyframeMapRows {
+    pub container_kind: String,
+    pub content_id: String,
+    /// `(pts_ms, byte_offset)` ordered by `pts_ms`.
+    pub entries: Vec<(i64, i64)>,
+}
+
 /// Index-pass upsert: codecs left null, probe_status = indexed.
 #[derive(Debug, Clone)]
 pub struct UpsertItem {
@@ -558,30 +567,51 @@ impl Db {
             .map_err(|e| format!("read pending map items: {e}"))
     }
 
-    /// Snap map entry at or before `pts_ms` when map_content_id matches live content_id.
-    pub fn map_entry_at_or_before(
-        &self,
-        media_item_id: i64,
-        pts_ms: i64,
-    ) -> Result<Option<(i64, i64, String)>, String> {
+    /// Keyframe map for a session start, or None when there is nothing
+    /// usable: no ready map, or stamps that no longer match live identity.
+    ///
+    /// The whole map is read at session create so later seeks in that
+    /// session snap without another query. Bind-time revalidation against
+    /// the file on disk is the caller's (ADR-0023 §4).
+    pub fn keyframe_map(&self, media_item_id: i64) -> Result<Option<KeyframeMapRows>, String> {
         let conn = self.lock()?;
-        conn.query_row(
-            "SELECT e.pts_ms, e.byte_offset, e.container_kind
-             FROM keyframe_map_entries e
-             JOIN media_items m ON m.id = e.media_item_id
-             WHERE e.media_item_id = ?1
-               AND m.map_status = 'ready'
-               AND m.content_id IS NOT NULL
-               AND m.map_content_id = m.content_id
-               AND e.content_id = m.content_id
-               AND e.pts_ms <= ?2
-             ORDER BY e.pts_ms DESC
-             LIMIT 1",
-            params![media_item_id, pts_ms],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()
-        .map_err(|e| format!("map entry at_or_before for item {media_item_id}: {e}"))
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.pts_ms, e.byte_offset, e.container_kind, e.content_id
+                 FROM keyframe_map_entries e
+                 JOIN media_items m ON m.id = e.media_item_id
+                 WHERE e.media_item_id = ?1
+                   AND m.map_status = 'ready'
+                   AND m.content_id IS NOT NULL
+                   AND m.map_content_id = m.content_id
+                   AND e.content_id = m.content_id
+                 ORDER BY e.pts_ms",
+            )
+            .map_err(|e| format!("prepare keyframe map for item {media_item_id}: {e}"))?;
+        let rows = stmt
+            .query_map(params![media_item_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("keyframe map for item {media_item_id}: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read keyframe map for item {media_item_id}: {e}"))?;
+
+        let Some((_, _, container_kind, content_id)) = rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(KeyframeMapRows {
+            container_kind: container_kind.clone(),
+            content_id: content_id.clone(),
+            entries: rows
+                .iter()
+                .map(|&(pts, offset, ..)| (pts, offset))
+                .collect(),
+        }))
     }
 
     /// Reset availability failures so the pool can re-drain them (ADR-0014).
@@ -1078,4 +1108,63 @@ fn map_sidecar(r: &rusqlite::Row<'_>) -> rusqlite::Result<SidecarRow> {
         forced: forced != 0,
         sdh: sdh != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One indexed item with a ready map, both stamped with `content_id`.
+    fn mapped_item(db: &Db, content_id: &str) -> i64 {
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "films".into(),
+                path: "/films".into(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "/films/clip.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 2,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some(content_id.into()),
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.replace_keyframe_map(
+            item_id,
+            content_id,
+            "matroska",
+            &[(0, 100), (2000, 900)],
+            None,
+        )
+        .unwrap();
+        item_id
+    }
+
+    /// ADR-0023 §4: a map is only usable while its stamp still matches the
+    /// item's identity, so a replaced file reads as no map at all.
+    #[test]
+    fn keyframe_map_is_withheld_once_identity_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("nightjar.db")).unwrap();
+        let item_id = mapped_item(&db, "1-aaa-bbb");
+
+        let map = db.keyframe_map(item_id).unwrap().expect("map is usable");
+        assert_eq!(map.container_kind, "matroska");
+        assert_eq!(map.content_id, "1-aaa-bbb");
+        assert_eq!(map.entries, vec![(0, 100), (2000, 900)]);
+
+        db.set_content_id(item_id, "2-ccc-ddd").unwrap();
+        assert!(db.keyframe_map(item_id).unwrap().is_none());
+    }
 }
