@@ -499,7 +499,11 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
         let mut body = Vec::new();
         reader.read_to_end(&mut body).unwrap();
-        assert_eq!(body.len(), payload.len(), "truncated body under back-pressure");
+        assert_eq!(
+            body.len(),
+            payload.len(),
+            "truncated body under back-pressure"
+        );
         assert_eq!(body, payload);
         drop(server);
     }

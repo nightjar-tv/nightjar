@@ -6328,7 +6328,10 @@ mod tests {
              Grey's Anatomy - 6x14 - Valentine's Day Massacre - WEBRip-1080p.mp4",
         );
         if !src.is_file() {
-            eprintln!("skipping: dogfood end-moov MP4 not mounted at {}", src.display());
+            eprintln!(
+                "skipping: dogfood end-moov MP4 not mounted at {}",
+                src.display()
+            );
             return;
         }
 
@@ -6442,8 +6445,7 @@ mod tests {
         let mut entries = Vec::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let mut parts = line.split(',');
-            let (Some(pts), Some(pos), Some(flags)) =
-                (parts.next(), parts.next(), parts.next())
+            let (Some(pts), Some(pos), Some(flags)) = (parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
