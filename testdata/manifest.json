@@ -271,6 +271,21 @@
       "transfer": "bt709",
       "dv_profile": null,
       "expect": "browser direct play",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "directPlay",
+          "provisional": false
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "directPlay",
+          "provisional": false
+        }
+      },
       "note": "SDR BT.709 control for the HDR axis."
     },
     {
@@ -287,7 +302,25 @@
       "bit_depth": 10,
       "transfer": "smpte2084",
       "dv_profile": null,
-      "expect": "needs transcode; HDR10 metadata present"
+      "expect": "needs transcode; HDR10 metadata present",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "hdr10Fallback",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      }
     },
     {
       "path": "files/hevc_hlg_mp4.mp4",
@@ -304,6 +337,24 @@
       "transfer": "arib-std-b67",
       "dv_profile": null,
       "expect": "needs transcode; HLG metadata present",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered_note": "HLG passthrough unmeasured; no DV render token",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "note": "Plain HLG, no Dolby Vision. classify_hdr maps arib-std-b67 \u2192 hdr10."
     },
     {
@@ -326,6 +377,25 @@
         }
       ],
       "expect": "needs transcode; HDR10+ dynamic metadata present",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "hdr10Fallback",
+          "rendered_note": "HDR10+ dynamic metadata; token is hdr10Fallback family",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "note": "HDR10+ is on frames (SEI), not stream extradata. classify_hdr \u2192 hdr10 via smpte2084."
     },
     {
@@ -355,6 +425,24 @@
         "dv_md_compression": "none"
       },
       "expect": "needs transcode (Dolby Vision P8.4 HLG / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "note": "Synthetic via dovi_tool generate + inject-rpu into HLG HEVC (MakeMKV set has no P8.4)."
     },
     {
@@ -384,6 +472,24 @@
         "dv_md_compression": "none"
       },
       "expect": "needs transcode (Dolby Vision P8.4 HLG / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "note": "Same RPU as the MKV; MP4 carries dvvC (compat id 4) grafted after remux."
     },
     {
@@ -413,6 +519,25 @@
         "dv_md_compression": "none"
       },
       "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "rendered_note": "P8.1 DV support varies by device generation / tvOS",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "note": "2s truncate of Browser Kit P8.1; Matroska DV signalling."
     },
     {
@@ -442,6 +567,25 @@
         "dv_md_compression": "none"
       },
       "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "rendered_note": "P8.1 DV support varies by device generation / tvOS",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "note": "Same 2s content as the MKV pair; MP4 dvhe/dvh1 sample-entry signalling (dvvC). ffmpeg -c copy alone drops dvvC."
     },
     {
@@ -472,6 +616,25 @@
       "audio": "eac3/6",
       "sha256": "044642f88616f6b72a819c2719a7e07b377b3428de88bd1c10d64fc69a736515",
       "expect": "needs transcode (Dolby Vision P4 / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "rendered_note": "P4 SDR-compatible BL (compat id 2); Apple P4 DV engagement unmeasured",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "commit": false,
       "note": "Fetched by generate.sh from makemkv.com/download/dvtest/ (Wayback fallback). Do not LFS-commit."
     },
@@ -503,6 +666,24 @@
       "audio": "eac3/6",
       "sha256": "1a97082e1f2e4d4cf56618370fc842f558dafe6156ef6a4878fcac5a0a65f476",
       "expect": "needs transcode (Dolby Vision P5 / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "commit": false,
       "note": "Fetched by generate.sh; gitignored."
     },
@@ -535,6 +716,25 @@
       "audio": "dts/6",
       "sha256": "06e42fc4e06ee90c8eea0b7a31450f844ad4228ea639a5ba12d51c05d2930e63",
       "expect": "needs transcode (Dolby Vision P7 FEL / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "hdr10Fallback",
+          "rendered_note": "Apple has no P7 decoder (Dolby licence); plays HDR10 BL, ignores EL \u2014 not a Nightjar bug",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "commit": false,
       "note": "Fetched by generate.sh; gitignored."
     },
@@ -567,6 +767,25 @@
       "audio": "ac3/2",
       "sha256": "9deb64f1f07b367b62cf853fee1d4e54054d1eaf11da2c744dbe06062b5881cc",
       "expect": "needs transcode (Dolby Vision P7 MEL / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "hdr10Fallback",
+          "rendered_note": "Apple has no P7 decoder (Dolby licence); plays HDR10 BL, ignores EL \u2014 not a Nightjar bug",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "commit": false,
       "note": "Fetched by generate.sh; gitignored."
     },
@@ -598,6 +817,25 @@
       "audio": "eac3/6",
       "sha256": "db0e079a0c911ca351e228055d5cc147e0d7b7755d5255914318336624f80d04",
       "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
+      "expect_by_profile": {
+        "BROWSER_V0": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        },
+        "AETHER_V0": {
+          "method": "directPlay",
+          "provisional": true,
+          "rendered": "dolbyVision",
+          "rendered_note": "P8.1 DV support varies by device generation / tvOS",
+          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
+        },
+        "NO_HDR_WIDE": {
+          "method": "transcode",
+          "provisional": false,
+          "rendered": "tonemappedSdr"
+        }
+      },
       "commit": false,
       "note": "Fetched by generate.sh; gitignored. bl_signal_compatibility_id=6 as ffprobe reports."
     },

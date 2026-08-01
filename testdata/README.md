@@ -56,3 +56,18 @@ testdata/files/dolby-vision-browser-kit/30fps/{SD,HD,FHD,UHD}/
 
 Do not `git add` those MP4s. Priority kit rows are 24 fps FHD P5 / P8.1 /
 P8.4 and 24 fps UHD P8.1.
+
+## Profile expectations (`expect_by_profile`)
+
+HDR/DV rows may carry per-profile objects with `method`, optional `rendered`
+(`dolbyVision` | `hdr10Fallback` | `tonemappedSdr`), and `provisional`.
+
+`provisional` means unmeasured, not "probably fine" (Rule 4.8). It marks a
+claim we have not proven on a real client path; do not treat a green corpus
+row as device coverage.
+
+`BROWSER_V0` and the no-HDR wide profile assert routing (which method and
+whether a tonemap encode was selected), not colour fidelity. A
+`transcode` + `tonemappedSdr` pass for Dolby Vision P5 is expected today even
+though `zscale` ignores the RPU and the pixels will be wrong.
+
