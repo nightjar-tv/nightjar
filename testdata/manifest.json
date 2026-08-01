@@ -149,6 +149,11 @@
       "expect": "needs transcode; HDR10 metadata present"
     },
     {
+      "path": "files/hevc_hlg_mp4.mp4",
+      "tags": ["hevc", "hlg", "arib-std-b67", "bt2020"],
+      "expect": "needs transcode; HLG metadata present"
+    },
+    {
       "path": "files/large-range-trigger.mp4",
       "tags": ["h264", "aac", "range", "generated"],
       "expect": "open-ended Range streams without buffering whole file",
