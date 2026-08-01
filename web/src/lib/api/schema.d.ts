@@ -358,11 +358,11 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * @description Highest HDR the client accepts (ADR-0022). Source above this forces transcode (tone-map graph is a later slice).
+         * @description Highest HDR the client accepts (ADR-0022). Source above this forces transcode with a real tone-map graph (zscale + hable) when encoding.
          * @enum {string}
          */
         HdrCapability: "none" | "hdr10" | "dolbyVision";
-        /** @description Wire shape for a reported profile (ADR-0022). Named ids cover the common engines; an unknown id may send this bag in a later slice. */
+        /** @description Wire shape for a reported profile (ADR-0022). Named ids cover the common engines; unknown id may send maxBitrateBps / maxHeight / hdr as query overrides (field bag). Codec lists on the bag are a later additive slice. */
         ClientCapabilityProfile: {
             profileId?: string;
             /**
@@ -622,8 +622,14 @@ export interface components {
         JobId: number;
         SessionId: string;
         RunId: number;
-        /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+        /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0, AETHER_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Optional maxBitrateBps / maxHeight / hdr override the named floor (unknown id + bag still decides). */
         ProfileId: string;
+        /** @description Field-bag override (ADR-0022). Source video bitrate above this forces transcode at or under the ceiling. null / omitted leaves the named profile value. */
+        MaxBitrateBps: number;
+        /** @description Field-bag override (ADR-0022). Source height above this forces transcode with scale. null / omitted leaves the named profile value. */
+        MaxHeight: number;
+        /** @description Field-bag override for highest accepted HDR (ADR-0022). */
+        ProfileHdr: components["schemas"]["HdrCapability"];
     };
     requestBodies: never;
     headers: never;
@@ -866,8 +872,14 @@ export interface operations {
     getPlaybackInfo: {
         parameters: {
             query?: {
-                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0, AETHER_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Optional maxBitrateBps / maxHeight / hdr override the named floor (unknown id + bag still decides). */
                 profileId?: components["parameters"]["ProfileId"];
+                /** @description Field-bag override (ADR-0022). Source video bitrate above this forces transcode at or under the ceiling. null / omitted leaves the named profile value. */
+                maxBitrateBps?: components["parameters"]["MaxBitrateBps"];
+                /** @description Field-bag override (ADR-0022). Source height above this forces transcode with scale. null / omitted leaves the named profile value. */
+                maxHeight?: components["parameters"]["MaxHeight"];
+                /** @description Field-bag override for highest accepted HDR (ADR-0022). */
+                hdr?: components["parameters"]["ProfileHdr"];
             };
             header?: never;
             path: {
@@ -933,8 +945,14 @@ export interface operations {
     streamItem: {
         parameters: {
             query?: {
-                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0, AETHER_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Optional maxBitrateBps / maxHeight / hdr override the named floor (unknown id + bag still decides). */
                 profileId?: components["parameters"]["ProfileId"];
+                /** @description Field-bag override (ADR-0022). Source video bitrate above this forces transcode at or under the ceiling. null / omitted leaves the named profile value. */
+                maxBitrateBps?: components["parameters"]["MaxBitrateBps"];
+                /** @description Field-bag override (ADR-0022). Source height above this forces transcode with scale. null / omitted leaves the named profile value. */
+                maxHeight?: components["parameters"]["MaxHeight"];
+                /** @description Field-bag override for highest accepted HDR (ADR-0022). */
+                hdr?: components["parameters"]["ProfileHdr"];
             };
             header?: {
                 Range?: string;
@@ -996,8 +1014,14 @@ export interface operations {
             query?: {
                 /** @description Encode window start in milliseconds (default 0) */
                 startMs?: number;
-                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Decision and /stream / sessions agree on the same id. */
+                /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0, AETHER_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Optional maxBitrateBps / maxHeight / hdr override the named floor (unknown id + bag still decides). */
                 profileId?: components["parameters"]["ProfileId"];
+                /** @description Field-bag override (ADR-0022). Source video bitrate above this forces transcode at or under the ceiling. null / omitted leaves the named profile value. */
+                maxBitrateBps?: components["parameters"]["MaxBitrateBps"];
+                /** @description Field-bag override (ADR-0022). Source height above this forces transcode with scale. null / omitted leaves the named profile value. */
+                maxHeight?: components["parameters"]["MaxHeight"];
+                /** @description Field-bag override for highest accepted HDR (ADR-0022). */
+                hdr?: components["parameters"]["ProfileHdr"];
                 /** @description Audio track to map, from playbackInfo.audioTracks (ADR-0012). Defaults to the flagged default track, else the first. Switching audio starts a new session at the current position and DELETEs the old one. On an otherwise DirectPlay title, an over-ceiling track starts a hybrid session (ADR-0012 / ADR-0018). */
                 audioTrackId?: string;
                 /** @description Burn-in subtitle track from playbackInfo.subtitleTracks with render=burnIn (ADR-0018). Soft (WebVTT) tracks are selected via MEDIA / track elements, not this param. Switching burn-in starts a new session at the current position and DELETEs the old one. Selecting burn-in on a DirectPlay title starts a transcode session. */

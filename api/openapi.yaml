@@ -179,6 +179,9 @@ paths:
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - $ref: "#/components/parameters/ProfileId"
+        - $ref: "#/components/parameters/MaxBitrateBps"
+        - $ref: "#/components/parameters/MaxHeight"
+        - $ref: "#/components/parameters/ProfileHdr"
       responses:
         "200":
           description: Playback info
@@ -234,6 +237,9 @@ paths:
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - $ref: "#/components/parameters/ProfileId"
+        - $ref: "#/components/parameters/MaxBitrateBps"
+        - $ref: "#/components/parameters/MaxHeight"
+        - $ref: "#/components/parameters/ProfileHdr"
         - name: Range
           in: header
           required: false
@@ -291,6 +297,9 @@ paths:
             format: int64
             minimum: 0
         - $ref: "#/components/parameters/ProfileId"
+        - $ref: "#/components/parameters/MaxBitrateBps"
+        - $ref: "#/components/parameters/MaxHeight"
+        - $ref: "#/components/parameters/ProfileHdr"
         - name: audioTrackId
           in: query
           required: false
@@ -664,11 +673,41 @@ components:
       required: false
       description: >
         Client capability profile id (ADR-0022). Known ids: BROWSER_V0,
-        MEDIA3_V0, MPV_V0. Omitted or unknown with no field bag falls back
-        to BROWSER_V0. Decision and /stream / sessions agree on the same id.
+        MEDIA3_V0, MPV_V0, AETHER_V0. Omitted or unknown with no field bag
+        falls back to BROWSER_V0. Optional maxBitrateBps / maxHeight / hdr
+        override the named floor (unknown id + bag still decides).
       schema:
         type: string
         minLength: 1
+    MaxBitrateBps:
+      name: maxBitrateBps
+      in: query
+      required: false
+      description: >
+        Field-bag override (ADR-0022). Source video bitrate above this forces
+        transcode at or under the ceiling. null / omitted leaves the named
+        profile value.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    MaxHeight:
+      name: maxHeight
+      in: query
+      required: false
+      description: >
+        Field-bag override (ADR-0022). Source height above this forces
+        transcode with scale. null / omitted leaves the named profile value.
+      schema:
+        type: integer
+        minimum: 1
+    ProfileHdr:
+      name: hdr
+      in: query
+      required: false
+      description: Field-bag override for highest accepted HDR (ADR-0022).
+      schema:
+        $ref: "#/components/schemas/HdrCapability"
 
   schemas:
     HdrCapability:
@@ -676,13 +715,15 @@ components:
       enum: [none, hdr10, dolbyVision]
       description: >
         Highest HDR the client accepts (ADR-0022). Source above this forces
-        transcode (tone-map graph is a later slice).
+        transcode with a real tone-map graph (zscale + hable) when encoding.
 
     ClientCapabilityProfile:
       type: object
       description: >
         Wire shape for a reported profile (ADR-0022). Named ids cover the
-        common engines; an unknown id may send this bag in a later slice.
+        common engines; unknown id may send maxBitrateBps / maxHeight / hdr
+        as query overrides (field bag). Codec lists on the bag are a later
+        additive slice.
       properties:
         profileId:
           type: string

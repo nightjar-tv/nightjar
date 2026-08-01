@@ -101,6 +101,7 @@ fn corpus_manifest_expects_match_decide_playback() {
                 None,
                 "probed",
                 &BROWSER_V0,
+                true,
             ),
             Err(err) => decide_playback(
                 &path_str,
@@ -114,6 +115,7 @@ fn corpus_manifest_expects_match_decide_playback() {
                 Some(err.as_str()),
                 "error",
                 &BROWSER_V0,
+                true,
             ),
         };
 

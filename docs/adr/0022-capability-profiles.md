@@ -35,7 +35,7 @@ Dart player interface rule in ADR-0021 and applies to the web client too.
 | `BROWSER_V0` | Web (and today's anonymous default) | Already shipped. Codecs + containers + `maxAudioChannels: 2`. |
 | `MEDIA3_V0` | Android / Android TV Flutter | Scored in bake-off (~96.5% DP on dogfood). |
 | `MPV_V0` | Windows / Linux media_kit; bake-off libmpv floor | Scored (~100% DP on dogfood). |
-| `AETHER_V0` | Apple if ADR-0021 option (a) wins | **Unscored.** Needs a `t1_profile_counts.py` run before Gate 1-style DP language. |
+| `AETHER_V0` | Apple if ADR-0021 option (a) wins | T1 on dogfood (24 877 items): **100.0%** directPlay (24 866). Matroska + wide codecs; client bridges audio AVPlayer rejects. |
 | Tizen / webOS model-year ids | Vendor Flutter shells | Capability varies by TV year; client must report what that stick can decode. |
 
 Ids are additive. Unknown id + full field bag still decides; unknown id with
@@ -62,6 +62,28 @@ enough: video must be re-encoded to meet the ceiling). Reason strings name
 the field that fired (`source bitrate exceeds profile maxBitrateBps`, etc.).
 HDR mismatch is its own reason and selects tone-map vs passthrough in the
 FFmpeg graph; it does not silently strip HDR.
+
+**Host tonemap capability (slice 2).** HDR→SDR for an SDR encode path needs
+FFmpeg `zscale` (libzimg). That is a host ceiling, same class as bitrate and
+height: probe once at process start. When the source is HDR, the profile (or
+session encode target) requires tone-map, and `zscale` is absent:
+
+- `decide_playback` still returns **transcode** (DirectPlay/Remux of HDR into
+  an SDR H.264 session is wrong), with an explicit reason naming the gap
+  (e.g. `host FFmpeg lacks zscale/libzimg; cannot tone-map HDR`).
+- Session **start refuses before spawn** with that same reason. Never hand
+  the client a playlist whose encoder dies mid-flight.
+
+Debian bookworm's `ffmpeg` → `libavfilter8` is built with `--enable-libzimg`
+(`zscale` present). A product image that runs encodes must install that
+FFmpeg (or document a host FFmpeg with libzimg). Missing `zscale` on a ship
+path is a packaging bug; decide refusal is the honest runtime behaviour when
+the host still lacks it.
+
+Regression coverage for the graph: committed synthetic PQ (`hevc_hdr10_mp4`)
+and HLG (`hevc_hlg_mp4`) assert encode labels are BT.709; a measured
+retag-vs-tonemap MAD floor proves **not-retag only** (not beauty). Kit
+P8.1 / P8.4 remain human beauty passes.
 
 ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
@@ -101,12 +123,15 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
 ## Consequences
 
 - OpenAPI + `decide_playback` + `/stream` grow additively; no break inside `/v0`.
-- Slice 1 (accepted): `profileId` on playback-info / stream / sessions;
-  named `BROWSER_V0` / `MEDIA3_V0` / `MPV_V0`; bitrate / height / HDR ceilings
-  force transcode; probe stores `video_bitrate_bps` and `hdr`. Tone-map graph
-  and encode-target bitrate are follow-up slices.
-- Bake-off Step 2 profile work has a home; `AETHER_V0` stays unscored until
-  counted.
+- Slice 1: `profileId` on playback-info / stream / sessions; named
+  `BROWSER_V0` / `MEDIA3_V0` / `MPV_V0`; bitrate / height / HDR ceilings force
+  transcode; probe stores `video_bitrate_bps` and `hdr`.
+- Slice 2: encode targets (`scale` + `-b:v` from ceilings), real HDR→SDR
+  tonemap (`zscale` + hable), field-bag query overrides, `AETHER_V0`
+  (T1-scored), host `zscale` probe with decide reason + refuse-before-spawn
+  when tonemap is required and unavailable. Kit PQ/HLG beauty passes are
+  inspection evidence (claim wording lands after this commit). MAD
+  regression is not-retag only.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
 - N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4

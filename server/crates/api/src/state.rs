@@ -8,6 +8,8 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub hls: Arc<HlsSessionRegistry>,
     pub transcode_caps: Arc<TranscodeCapabilities>,
+    /// Host FFmpeg has `zscale` (libzimg) for HDR→SDR (ADR-0022).
+    pub tonemap_available: bool,
     pub subs: Arc<SubsStore>,
     pub pool: Arc<LibraryPool>,
 }

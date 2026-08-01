@@ -24,8 +24,13 @@ pub async fn stream_item(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let profile = profile_from_query(query.profile_id.as_deref());
-    let decision = decide(&row, profile);
+    let profile = profile_from_query(
+        query.profile_id.as_deref(),
+        query.max_bitrate_bps,
+        query.max_height,
+        query.hdr.as_deref(),
+    );
+    let decision = decide(&row, &profile, state.tonemap_available);
 
     match decision.method {
         PlaybackMethod::DirectPlay => {

@@ -20,6 +20,7 @@ use super::subs::{
     BurnInKind, BurnInSelection, SessionSubInput, extract_embedded_ass, prepare_session_subtitles,
     slice_webvtt, webvtt_max_cue_end_ms,
 };
+use nightjar_core::VideoEncodePlan;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -538,6 +539,8 @@ struct Session {
     /// Burn-in baked into this session's encode (ADR-0018). Seek restarts
     /// keep the same selection; switching burn-in is a fresh POST.
     burn_in: Option<BurnInSelection>,
+    /// ADR-0022 scale / bitrate / tone-map knobs for Transcode mode.
+    encode_plan: VideoEncodePlan,
     /// Keyframe map snapshot and the virtual file bound from it (ADR-0023).
     map_binding: MapBinding,
     /// Actual encoder for this process. Future fallback updates this field.
@@ -964,6 +967,7 @@ impl HlsSessionRegistry {
     /// session; seeking restarts that session in place (ADR-0011). Switching
     /// audio or burn-in does not: it starts a fresh session (ADR-0012 /
     /// ADR-0018). `subtitle_tracks` is snapshotted here and never revisited.
+    /// `encode_plan` applies only in Transcode mode (ADR-0022).
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
@@ -976,6 +980,7 @@ impl HlsSessionRegistry {
         subtitle_tracks: Vec<HlsSubtitleTrack>,
         burn_in: Option<BurnInSelection>,
         keyframe_map: Option<crate::virtual_input::KeyframeMap>,
+        encode_plan: VideoEncodePlan,
     ) -> Result<String, StartSessionError> {
         let play_start_ms = align_to_segment(start_ms);
         let sessions = self
@@ -1014,6 +1019,7 @@ impl HlsSessionRegistry {
             audio.clone(),
             &self.video_encoder,
             burn_in.as_ref(),
+            encode_plan,
         )
         .map_err(StartSessionError::Spawn)?;
         map_binding.bound = plan.virtual_input.take();
@@ -1033,6 +1039,9 @@ impl HlsSessionRegistry {
             audio_channels = audio.channels,
             burn_in = burn_in.as_ref().map(|b| b.track_id.as_str()),
             encoder = %self.video_encoder,
+            max_height = encode_plan.max_height,
+            max_bitrate_bps = encode_plan.max_bitrate_bps,
+            tone_map = encode_plan.tone_map,
             spawn_ms,
             start_path = plan.start_path,
             container_kind = plan.container_kind,
@@ -1052,6 +1061,7 @@ impl HlsSessionRegistry {
                 mode,
                 audio,
                 burn_in,
+                encode_plan,
                 map_binding,
                 video_encoder: self.video_encoder.clone(),
                 start_ms,
@@ -1956,6 +1966,7 @@ fn restart_at(
         session.audio.clone(),
         video_encoder,
         session.burn_in.as_ref(),
+        session.encode_plan,
     )
     .map_err(PlaylistError::Failed)?;
     session.map_binding.bound = plan.virtual_input.take();
@@ -2600,6 +2611,7 @@ fn spawn_ffmpeg(
     audio: AudioSelection,
     video_encoder: &str,
     burn_in: Option<&BurnInSelection>,
+    encode_plan: VideoEncodePlan,
 ) -> Result<Child, String> {
     let start_ms = input.window_start_ms;
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
@@ -2655,8 +2667,6 @@ fn spawn_ffmpeg(
         None
     };
 
-    let sdr_chain =
-        "sidedata=delete,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709";
     // ASS uses libass `-vf` filters; PGS uses overlay `filter_complex`
     // (ADR-0018). Never overlay text ASS — sub2video draws blank.
     if let Some(burn) = burn_in {
@@ -2667,8 +2677,17 @@ fn spawn_ffmpeg(
         Some(burn) if burn.kind == BurnInKind::Ass => Some(ass_burn_vf(burn, start_ms)?),
         _ => None,
     };
+    let video_chain = if mode == SessionMode::Transcode {
+        Some(transcode_video_filter_chain(
+            encode_plan,
+            ass_vf.as_deref(),
+        )?)
+    } else {
+        None
+    };
     if let Some(ref complex) = pgs_overlay {
-        let full = format!("{complex},{sdr_chain}[vout]");
+        let tail = video_chain.as_deref().unwrap_or(SDR_RETAG_CHAIN);
+        let full = format!("{complex},{tail}[vout]");
         cmd.args(["-filter_complex", &full]);
         cmd.args(["-map", "[vout]", "-map", &audio_map]);
     } else {
@@ -2697,19 +2716,10 @@ fn spawn_ffmpeg(
                 // verification.
                 cmd.args(["-pix_fmt", "yuv420p"]);
             }
-            // Browser sessions are SDR. VideoToolbox otherwise copies PQ/BT.2020
-            // VUI and HDR10 side data from an HDR source onto an 8-bit encode;
-            // Safari native HLS rejects that (Chrome/hls.js is more forgiving).
-            // Color flags alone are not enough on videotoolbox — strip side
-            // data and force BT.709 through setparams.
             if pgs_overlay.is_some() {
                 cmd.args(["-map_metadata", "-1"]);
-            } else {
-                let vf = match ass_vf.as_deref() {
-                    Some(ass) => format!("{ass},{sdr_chain}"),
-                    None => sdr_chain.to_string(),
-                };
-                cmd.args(["-map_metadata", "-1", "-vf", &vf]);
+            } else if let Some(ref vf) = video_chain {
+                cmd.args(["-map_metadata", "-1", "-vf", vf]);
             }
             cmd.args([
                 "-colorspace",
@@ -2719,6 +2729,11 @@ fn spawn_ffmpeg(
                 "-color_trc",
                 "bt709",
             ]);
+            if let Some(bps) = encode_plan.max_bitrate_bps {
+                let rate = bps.to_string();
+                let buf = (bps.saturating_mul(2)).to_string();
+                cmd.args(["-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf]);
+            }
             cmd.args([
                 // Time-based IDRs derived from SEGMENT_MS (same source as
                 // -hls_time and the generated playlist EXTINF). A frame-count
@@ -2795,6 +2810,73 @@ fn libass_filters_listed(filters_text: &str) -> bool {
         }
     }
     has_ass && has_subtitles
+}
+
+/// Retag-only SDR labels for non-HDR re-encodes. VideoToolbox otherwise copies
+/// PQ/BT.2020 VUI onto an 8-bit encode; Safari native HLS rejects that.
+const SDR_RETAG_CHAIN: &str =
+    "sidedata=delete,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709";
+
+/// PQ/HLG → SDR via zscale linearise + hable tonemap (ADR-0022). Requires
+/// FFmpeg built with libzimg (`zscale` in `-filters`).
+const HDR_TONEMAP_CHAIN: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,sidedata=delete";
+
+/// Video filter chain for Transcode mode: optional scale, then tonemap or
+/// SDR retag, with optional ASS burn prefix.
+fn transcode_video_filter_chain(
+    plan: VideoEncodePlan,
+    ass_vf: Option<&str>,
+) -> Result<String, String> {
+    if plan.tone_map && !ffmpeg_has_zscale() {
+        return Err(
+            "HDR tone-map requires FFmpeg with libzimg (zscale filter); \
+             install an FFmpeg build configured --enable-libzimg"
+                .into(),
+        );
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ass) = ass_vf {
+        parts.push(ass.to_string());
+    }
+    if let Some(h) = plan.max_height {
+        // Shrink only; never upscale a source already under the ceiling.
+        parts.push(format!("scale=-2:'min({h},ih)'"));
+    }
+    if plan.tone_map {
+        parts.push(HDR_TONEMAP_CHAIN.to_string());
+    } else {
+        parts.push(SDR_RETAG_CHAIN.to_string());
+    }
+    Ok(parts.join(","))
+}
+
+/// Cached probe of the host FFmpeg filter list for zscale (libzimg).
+pub fn host_tonemap_available() -> bool {
+    ffmpeg_has_zscale()
+}
+
+fn ffmpeg_has_zscale() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let output = match Command::new("ffmpeg")
+            .args(["-hide_banner", "-filters"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        let text = if output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stderr)
+        } else {
+            String::from_utf8_lossy(&output.stdout)
+        };
+        text.lines().any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|name| name == "zscale")
+        })
+    })
 }
 
 /// Cached probe of the host FFmpeg filter list for libass.
@@ -3005,6 +3087,170 @@ mod tests {
             panic!("NIGHTJAR_TEST_REQUIRE_FFMPEG is set but ffmpeg is not on PATH");
         }
         ok
+    }
+
+    #[test]
+    fn video_filter_scales_and_retags_sdr() {
+        let plan = VideoEncodePlan {
+            max_height: Some(1080),
+            max_bitrate_bps: Some(5_000_000),
+            tone_map: false,
+        };
+        let vf = transcode_video_filter_chain(plan, None).unwrap();
+        assert!(vf.contains("min(1080,ih)"), "{vf}");
+        assert!(vf.contains("setparams=color_primaries=bt709"), "{vf}");
+        assert!(!vf.contains("tonemap="), "{vf}");
+    }
+
+    #[test]
+    fn video_filter_tone_map_requires_zscale() {
+        let plan = VideoEncodePlan {
+            tone_map: true,
+            ..VideoEncodePlan::default()
+        };
+        let result = transcode_video_filter_chain(plan, None);
+        if ffmpeg_has_zscale() {
+            let vf = result.expect("zscale present");
+            assert!(vf.contains("tonemap=tonemap=hable"), "{vf}");
+            assert!(vf.contains("zscale="), "{vf}");
+        } else {
+            let err = result.expect_err("no zscale");
+            assert!(err.contains("libzimg"), "{err}");
+        }
+    }
+
+    /// Proves tonemap changed pixels vs retag — not beauty.
+    /// Floor from `notes/hdr-tonemap-delta-2026-08-01.md` (measured MAD ≈ 11.08).
+    #[test]
+    fn tonemap_frame_differs_from_retag() {
+        if !ffmpeg_available() || !ffmpeg_has_zscale() {
+            eprintln!("skipping: need ffmpeg with zscale");
+            return;
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/hevc_hdr10_mp4.mp4");
+        if !src.exists() {
+            eprintln!("skipping: missing {}", src.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let retag_rgb = dir.path().join("retag.rgb");
+        let tonemap_rgb = dir.path().join("tonemap.rgb");
+        for (vf, out) in [
+            (SDR_RETAG_CHAIN, &retag_rgb),
+            (HDR_TONEMAP_CHAIN, &tonemap_rgb),
+        ] {
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    "1",
+                    "-t",
+                    "0.05",
+                    "-i",
+                ])
+                .arg(&src)
+                .args(["-vf", &format!("{vf},format=rgb24"), "-frames:v", "1"])
+                .arg(out)
+                .status()
+                .unwrap();
+            assert!(status.success(), "frame extract failed for {vf}");
+        }
+        let a = fs::read(&retag_rgb).unwrap();
+        let b = fs::read(&tonemap_rgb).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert!(!a.is_empty());
+        let sum: u64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| u64::from((*x as i16 - *y as i16).unsigned_abs()))
+            .sum();
+        let mad = sum as f64 / a.len() as f64;
+        // Half of measured ~11.08 — notes/hdr-tonemap-delta-2026-08-01.md
+        assert!(
+            mad >= 5.0,
+            "expected tonemap≠retag (MAD≥5.0), got MAD={mad}"
+        );
+    }
+
+    /// End-to-end: committed HDR fixtures through spawn_ffmpeg → BT.709 labels.
+    #[test]
+    fn tonemap_session_marks_bt709_for_pq_and_hlg() {
+        if !ffmpeg_available() || !ffmpeg_has_zscale() {
+            eprintln!("skipping: need ffmpeg with zscale");
+            return;
+        }
+        let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../testdata/files");
+        let cases = [
+            ("hevc_hdr10_mp4.mp4", true),
+            ("hevc_hlg_mp4.mp4", false),
+        ];
+        for (name, required) in cases {
+            let src = testdata.join(name);
+            if !src.exists() {
+                if required {
+                    panic!("committed fixture missing: {}", src.display());
+                }
+                eprintln!("skipping optional fixture (land via testdata/hevc-hlg-fixture): {name}");
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let enc = dir.path().join("enc");
+            fs::create_dir_all(&enc).unwrap();
+            let plan = VideoEncodePlan {
+                tone_map: true,
+                ..VideoEncodePlan::default()
+            };
+            let mut child = spawn_ffmpeg(
+                &ss_start_plan(&src, 0, 0),
+                &enc,
+                SessionMode::Transcode,
+                stereo(),
+                "libx264",
+                None,
+                plan,
+            )
+            .unwrap_or_else(|e| panic!("spawn tonemap session for {name}: {e}"));
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            stop_child(&mut Some(child));
+            assert!(
+                enc.join("seg000.m4s").exists() || enc.join("index.m3u8").exists(),
+                "{name}: tonemap session produced no HLS output"
+            );
+            let joined = dir.path().join("joined.mp4");
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+                .arg(enc.join("index.m3u8"))
+                .args(["-c", "copy"])
+                .arg(&joined)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}: remux from HLS failed");
+            let trc = probe_entry(&joined, "v:0", "color_transfer");
+            let prim = probe_entry(&joined, "v:0", "color_primaries");
+            let space = probe_entry(&joined, "v:0", "color_space");
+            assert!(
+                trc == "bt709" || trc == "1",
+                "{name}: expected bt709 transfer, got {trc:?}"
+            );
+            assert!(
+                prim == "bt709" || prim == "1",
+                "{name}: expected bt709 primaries, got {prim:?}"
+            );
+            assert!(
+                space == "bt709" || space == "1",
+                "{name}: expected bt709 space, got {space:?}"
+            );
+        }
     }
 
     fn make_fixture(path: &Path) {
@@ -3648,6 +3894,7 @@ mod tests {
             mode: SessionMode::Transcode,
             audio: stereo(),
             burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
             video_encoder: "libx264".into(),
             start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
@@ -3837,6 +4084,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -3879,6 +4127,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         let (land, land_ms) = wait_land_near(&reg, &id, play_ms);
@@ -3922,6 +4171,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &id);
@@ -3983,6 +4233,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4053,6 +4304,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -4122,6 +4374,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &prior);
@@ -4142,6 +4395,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &switched);
@@ -4208,6 +4462,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &id);
@@ -4245,6 +4500,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         assert_eq!(
@@ -4308,6 +4564,7 @@ mod tests {
                 }],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4358,6 +4615,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         let b = reg
@@ -4371,6 +4629,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         assert_ne!(a, b);
@@ -4384,7 +4643,8 @@ mod tests {
                 stereo(),
                 vec![],
                 None,
-                None
+                None,
+                VideoEncodePlan::default(),
             ),
             Err(StartSessionError::CapFull)
         ));
@@ -4418,6 +4678,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         assert_eq!(
@@ -4456,6 +4717,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4529,8 +4791,16 @@ mod tests {
     ) -> PathBuf {
         let enc = dir.join("enc");
         fs::create_dir_all(&enc).unwrap();
-        let mut child =
-            spawn_ffmpeg(&ss_start_plan(src, 0, 0), &enc, mode, audio, encoder, None).unwrap();
+        let mut child = spawn_ffmpeg(
+            &ss_start_plan(src, 0, 0),
+            &enc,
+            mode,
+            audio,
+            encoder,
+            None,
+            VideoEncodePlan::default(),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if child.try_wait().ok().flatten().is_some() {
@@ -4786,6 +5056,7 @@ mod tests {
                 }],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4871,6 +5142,7 @@ mod tests {
                 stereo(),
                 "libx264",
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -5216,6 +5488,7 @@ mod tests {
                 vec![],
                 Some(selection),
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -5268,6 +5541,7 @@ mod tests {
                 vec![],
                 Some(selection),
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5348,6 +5622,7 @@ mod tests {
                 vec![],
                 Some(selection),
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5378,6 +5653,7 @@ mod tests {
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
             video_encoder: "copy".into(),
             start_ms: 0,
@@ -5446,6 +5722,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5573,6 +5850,7 @@ mod tests {
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
             video_encoder: "copy".into(),
             start_ms: 1_014_000,
@@ -5652,6 +5930,7 @@ mod tests {
             mode: SessionMode::Transcode,
             audio: stereo(),
             burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
             video_encoder: "libx264".into(),
             start_ms: 0,
@@ -6002,6 +6281,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -6049,6 +6329,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -6093,6 +6374,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         let joined = run_to_eof_and_join(&reg, &id, dir.path());
@@ -6127,6 +6409,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -6179,6 +6462,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -6220,6 +6504,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -6260,6 +6545,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -6303,6 +6589,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {
@@ -6357,6 +6644,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
+                VideoEncodePlan::default(),
             )
             .unwrap();
         {

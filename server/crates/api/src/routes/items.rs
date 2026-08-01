@@ -9,7 +9,7 @@ use axum::{
 };
 use nightjar_core::{
     BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
-    known_profile, resolve_profile,
+    known_profile, resolve_profile_bag,
 };
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
@@ -135,19 +135,34 @@ pub async fn get(
 #[serde(rename_all = "camelCase")]
 pub struct ProfileQuery {
     pub profile_id: Option<String>,
+    pub max_bitrate_bps: Option<u64>,
+    pub max_height: Option<u32>,
+    pub hdr: Option<String>,
 }
 
-/// Resolve `profileId` for decision / stream / session (ADR-0022).
-pub fn profile_from_query(profile_id: Option<&str>) -> &'static ClientCapabilityProfile {
-    if let Some(id) = profile_id.filter(|s| !s.is_empty())
-        && known_profile(id).is_none()
-    {
+/// Resolve `profileId` plus optional field-bag ceilings (ADR-0022).
+pub fn profile_from_query(
+    profile_id: Option<&str>,
+    max_bitrate_bps: Option<u64>,
+    max_height: Option<u32>,
+    hdr: Option<&str>,
+) -> ClientCapabilityProfile {
+    let unknown = profile_id
+        .filter(|s| !s.is_empty())
+        .is_some_and(|id| known_profile(id).is_none());
+    let bag = max_bitrate_bps.is_some() || max_height.is_some() || hdr.is_some();
+    if unknown && !bag {
         tracing::warn!(
-            profile_id = id,
-            "unknown client profile id; using BROWSER_V0"
+            profile_id = profile_id.unwrap_or(""),
+            "unknown client profile id with no field bag; using BROWSER_V0"
+        );
+    } else if unknown && bag {
+        tracing::info!(
+            profile_id = profile_id.unwrap_or(""),
+            "unknown client profile id; applying field bag on BROWSER_V0 codec floor"
         );
     }
-    resolve_profile(profile_id)
+    resolve_profile_bag(profile_id, max_bitrate_bps, max_height, hdr)
 }
 
 pub async fn playback_info(
@@ -160,8 +175,13 @@ pub async fn playback_info(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let profile = profile_from_query(query.profile_id.as_deref());
-    let decision = decide(&row, profile);
+    let profile = profile_from_query(
+        query.profile_id.as_deref(),
+        query.max_bitrate_bps,
+        query.max_height,
+        query.hdr.as_deref(),
+    );
+    let decision = decide(&row, &profile, state.tonemap_available);
     let subtitle_tracks = subtitle_tracks_for(&state, &row).unwrap_or_else(|e| {
         tracing::warn!(item_id, error = %e, "subtitle list failed");
         Vec::new()
@@ -419,7 +439,11 @@ fn sidecar_to_dto(state: &AppState, row: &MediaItemRow, s: &SidecarRow) -> Subti
     })
 }
 
-pub fn decide(row: &MediaItemRow, profile: &ClientCapabilityProfile) -> PlaybackDecision {
+pub fn decide(
+    row: &MediaItemRow,
+    profile: &ClientCapabilityProfile,
+    tonemap_available: bool,
+) -> PlaybackDecision {
     decide_playback(
         &row.path,
         row.container.as_deref(),
@@ -432,11 +456,12 @@ pub fn decide(row: &MediaItemRow, profile: &ClientCapabilityProfile) -> Playback
         row.scan_error.as_deref(),
         &row.probe_status,
         profile,
+        tonemap_available,
     )
 }
 
 pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
-    let decision = decide(&row, &BROWSER_V0);
+    let decision = decide(&row, &BROWSER_V0, true);
     MediaItemDto {
         id: row.id,
         library_id: row.library_id,

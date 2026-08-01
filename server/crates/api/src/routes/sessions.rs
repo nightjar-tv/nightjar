@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use nightjar_core::{ClientCapabilityProfile, PlaybackMethod};
+use nightjar_core::{ClientCapabilityProfile, PlaybackMethod, video_encode_plan};
 use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeEntry, KeyframeMap,
@@ -62,6 +62,9 @@ pub struct StartQuery {
     pub audio_track_id: Option<String>,
     pub subtitle_track_id: Option<String>,
     pub profile_id: Option<String>,
+    pub max_bitrate_bps: Option<u64>,
+    pub max_height: Option<u32>,
+    pub hdr: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,8 +108,13 @@ pub async fn start(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let profile = profile_from_query(query.profile_id.as_deref());
-    let decision = decide(&row, profile);
+    let profile = profile_from_query(
+        query.profile_id.as_deref(),
+        query.max_bitrate_bps,
+        query.max_height,
+        query.hdr.as_deref(),
+    );
+    let decision = decide(&row, &profile, state.tonemap_available);
     if row.probe_status != "probed" {
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -123,7 +131,7 @@ pub async fn start(
         });
     };
 
-    let audio = resolve_audio(&row, query.audio_track_id.as_deref(), profile)?;
+    let audio = resolve_audio(&row, query.audio_track_id.as_deref(), &profile)?;
     let burn_in = resolve_burn_in(&state, &row, query.subtitle_track_id.as_deref())?;
 
     // DirectPlay is allowed when a track selection requires encode work the
@@ -171,6 +179,18 @@ pub async fn start(
 
     let start_ms = query.start_ms.unwrap_or(0);
     let keyframe_map = keyframe_map_for(&state, &row);
+    let encode_plan = video_encode_plan(
+        row.height.and_then(|h| u32::try_from(h).ok()),
+        row.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),
+        row.hdr.as_deref(),
+        &profile,
+    );
+    if encode_plan.tone_map && !state.tonemap_available {
+        return Err(ApiError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: decision.reason.clone(),
+        });
+    }
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
     let src = std::path::PathBuf::from(&row.path);
@@ -186,6 +206,7 @@ pub async fn start(
             tracks_for_start,
             burn_in,
             keyframe_map,
+            encode_plan,
         )
     })
     .await

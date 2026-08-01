@@ -18,7 +18,7 @@ impl PlaybackMethod {
 }
 
 /// Highest HDR the client accepts (ADR-0022). Source above this forces
-/// transcode; tone-map FFmpeg graph is a later slice.
+/// transcode; the session applies a real tonemap graph when encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HdrCapability {
     None,
@@ -155,12 +155,43 @@ pub const MPV_V0: ClientCapabilityProfile = ClientCapabilityProfile {
     hdr: HdrCapability::DolbyVision,
 };
 
+/// Apple Aether floor (ADR-0022): Matroska demux + AVPlayer loopback; client
+/// bridges audio AVPlayer rejects. T1-scored against dogfood (same accept
+/// shape as Media3 for decide_playback).
+pub const AETHER_V0: ClientCapabilityProfile = ClientCapabilityProfile {
+    video_codecs: &[
+        "h264",
+        "avc",
+        "avc1",
+        "hevc",
+        "h265",
+        "hev1",
+        "av1",
+        "vp9",
+        "vp8",
+        "mpeg2video",
+        "mpeg4",
+    ],
+    audio_codecs: &[
+        "aac", "mp4a", "ac3", "eac3", "truehd", "dts", "flac", "opus", "mp3", "vorbis", "alac",
+    ],
+    containers: &[
+        "mp4", "m4v", "mov", "matroska", "webm", "avi", "mpegts", "mpeg",
+    ],
+    extensions: &["mp4", "m4v", "mkv", "webm", "avi", "ts", "m2ts", "mov"],
+    max_audio_channels: None,
+    max_bitrate_bps: None,
+    max_height: None,
+    hdr: HdrCapability::DolbyVision,
+};
+
 /// Named profile from a client `profileId`, or `None` when unknown.
 pub fn known_profile(id: &str) -> Option<&'static ClientCapabilityProfile> {
     match id {
         "BROWSER_V0" => Some(&BROWSER_V0),
         "MEDIA3_V0" => Some(&MEDIA3_V0),
         "MPV_V0" => Some(&MPV_V0),
+        "AETHER_V0" => Some(&AETHER_V0),
         _ => None,
     }
 }
@@ -170,6 +201,80 @@ pub fn resolve_profile(id: Option<&str>) -> &'static ClientCapabilityProfile {
     match id {
         None | Some("") => &BROWSER_V0,
         Some(id) => known_profile(id).unwrap_or(&BROWSER_V0),
+    }
+}
+
+/// Optional wire overrides on top of a named (or fallback) profile (ADR-0022
+/// field bag). Unknown id without overrides stays `BROWSER_V0`.
+pub fn resolve_profile_bag(
+    id: Option<&str>,
+    max_bitrate_bps: Option<u64>,
+    max_height: Option<u32>,
+    hdr: Option<&str>,
+) -> ClientCapabilityProfile {
+    let mut profile = *resolve_profile(id);
+    if let Some(bps) = max_bitrate_bps {
+        profile.max_bitrate_bps = Some(bps);
+    }
+    if let Some(h) = max_height {
+        profile.max_height = Some(h);
+    }
+    if let Some(h) = hdr.and_then(HdrCapability::parse) {
+        profile.hdr = h;
+    }
+    profile
+}
+
+/// Encode knobs for an HLS re-encode session (ADR-0022). Applied only when
+/// `SessionMode::Transcode`; remux/copy never scales or tone-maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoEncodePlan {
+    /// Cap output height (FFmpeg `scale=-2:min(H,ih)`). `None` = keep source.
+    pub max_height: Option<u32>,
+    /// Target video bitrate. `None` = encoder default.
+    pub max_bitrate_bps: Option<u64>,
+    /// Source is HDR and the session encodes H.264 SDR → real tonemap graph.
+    pub tone_map: bool,
+}
+
+/// Build the encode plan from source probe fields × profile ceilings.
+///
+/// Height/bitrate caps apply when the profile sets them and the source is
+/// over (or height is unknown). HDR sources always tone-map on transcode:
+/// session output is H.264 SDR regardless of profile passthrough (passthrough
+/// is DirectPlay/Remux only).
+pub fn video_encode_plan(
+    source_height: Option<u32>,
+    source_bitrate_bps: Option<u64>,
+    source_hdr: Option<&str>,
+    profile: &ClientCapabilityProfile,
+) -> VideoEncodePlan {
+    let max_height = match profile.max_height {
+        Some(max) => match source_height {
+            Some(h) if h > max => Some(max),
+            None => Some(max),
+            Some(_) => None,
+        },
+        None => None,
+    };
+    let max_bitrate_bps = match profile.max_bitrate_bps {
+        Some(max) => match source_bitrate_bps {
+            Some(b) if b > max => Some(max),
+            None => Some(max),
+            Some(_) => None,
+        },
+        None => None,
+    };
+    let tone_map = matches!(
+        source_hdr
+            .and_then(HdrCapability::parse)
+            .unwrap_or(HdrCapability::None),
+        HdrCapability::Hdr10 | HdrCapability::DolbyVision
+    );
+    VideoEncodePlan {
+        max_height,
+        max_bitrate_bps,
+        tone_map,
     }
 }
 
@@ -197,6 +302,10 @@ pub struct PlaybackDecision {
 /// `height`, `bitrate_bps`, and `source_hdr` (`none` / `hdr10` /
 /// `dolbyVision`) apply ADR-0022 ceilings: over ceiling forces **transcode**
 /// (re-encode), not remux.
+///
+/// `tonemap_available` is the host FFmpeg `zscale` probe (ADR-0022). When a
+/// session would re-encode HDR without it, the reason names the gap so
+/// session start can refuse before spawn.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_playback(
     path: &str,
@@ -210,6 +319,7 @@ pub fn decide_playback(
     scan_error: Option<&str>,
     probe_status: &str,
     profile: &ClientCapabilityProfile,
+    tonemap_available: bool,
 ) -> PlaybackDecision {
     if probe_status == "indexed" || probe_status == "unavailable" {
         return PlaybackDecision {
@@ -235,49 +345,69 @@ pub fn decide_playback(
     let audio_ok = matches_codec(audio_codec, profile.audio_codecs);
     let container_ok = matches_container(path, container, profile);
 
-    if video_ok && audio_ok {
+    let mut decision = if video_ok && audio_ok {
         if let Some(reason) =
             profile_ceiling_transcode_reason(height, bitrate_bps, source_hdr, profile)
         {
-            return PlaybackDecision {
+            PlaybackDecision {
                 method: PlaybackMethod::Transcode,
                 reason,
                 mime_type: "application/vnd.apple.mpegurl".into(),
-            };
-        }
-        if let Some(reason) = channel_ceiling_session_reason(audio_channels, profile) {
-            return PlaybackDecision {
+            }
+        } else if let Some(reason) = channel_ceiling_session_reason(audio_channels, profile) {
+            PlaybackDecision {
                 method: PlaybackMethod::Remux,
                 reason,
                 mime_type: "application/vnd.apple.mpegurl".into(),
-            };
-        }
-        if container_ok {
-            return PlaybackDecision {
+            }
+        } else if container_ok {
+            PlaybackDecision {
                 method: PlaybackMethod::DirectPlay,
                 reason: "codecs and container supported by client".into(),
                 mime_type: mime_for_path(path),
-            };
+            }
+        } else {
+            PlaybackDecision {
+                method: PlaybackMethod::Remux,
+                reason: "codecs supported; container needs a stream-copy session".into(),
+                mime_type: "application/vnd.apple.mpegurl".into(),
+            }
         }
-        return PlaybackDecision {
-            method: PlaybackMethod::Remux,
-            reason: "codecs supported; container needs a stream-copy session".into(),
-            mime_type: "application/vnd.apple.mpegurl".into(),
-        };
+    } else {
+        let mut why = Vec::new();
+        if !video_ok {
+            why.push("video codec unsupported");
+        }
+        if !audio_ok {
+            why.push("audio codec unsupported");
+        }
+        PlaybackDecision {
+            method: PlaybackMethod::Transcode,
+            reason: format!("needs transcode: {}", why.join(", ")),
+            mime_type: mime_for_path(path),
+        }
+    };
+
+    if decision.method == PlaybackMethod::Transcode
+        && source_needs_tonemap(source_hdr)
+        && !tonemap_available
+    {
+        decision.reason = format!(
+            "host FFmpeg lacks zscale/libzimg; cannot tone-map HDR ({})",
+            decision.reason
+        );
     }
 
-    let mut why = Vec::new();
-    if !video_ok {
-        why.push("video codec unsupported");
-    }
-    if !audio_ok {
-        why.push("audio codec unsupported");
-    }
-    PlaybackDecision {
-        method: PlaybackMethod::Transcode,
-        reason: format!("needs transcode: {}", why.join(", ")),
-        mime_type: mime_for_path(path),
-    }
+    decision
+}
+
+fn source_needs_tonemap(source_hdr: Option<&str>) -> bool {
+    matches!(
+        source_hdr
+            .and_then(HdrCapability::parse)
+            .unwrap_or(HdrCapability::None),
+        HdrCapability::Hdr10 | HdrCapability::DolbyVision
+    )
 }
 
 /// ADR-0022 bitrate / height / HDR ceilings force a re-encode session.
@@ -464,6 +594,7 @@ mod tests {
             scan_error,
             probe_status,
             profile,
+            true,
         )
     }
 
@@ -776,7 +907,79 @@ mod tests {
             MPV_V0.video_codecs
         );
         assert!(known_profile("MEDIA3_V0").is_some());
+        assert!(known_profile("AETHER_V0").is_some());
         assert!(known_profile("ghost").is_none());
+    }
+
+    #[test]
+    fn encode_plan_scales_and_caps_bitrate_when_over_ceiling() {
+        let capped = ClientCapabilityProfile {
+            max_height: Some(1080),
+            max_bitrate_bps: Some(5_000_000),
+            ..BROWSER_V0
+        };
+        let plan = video_encode_plan(Some(2160), Some(40_000_000), Some("none"), &capped);
+        assert_eq!(plan.max_height, Some(1080));
+        assert_eq!(plan.max_bitrate_bps, Some(5_000_000));
+        assert!(!plan.tone_map);
+    }
+
+    #[test]
+    fn encode_plan_skips_scale_when_already_under() {
+        let capped = ClientCapabilityProfile {
+            max_height: Some(1080),
+            ..BROWSER_V0
+        };
+        let plan = video_encode_plan(Some(720), Some(2_000_000), Some("none"), &capped);
+        assert_eq!(plan.max_height, None);
+        assert!(!plan.tone_map);
+    }
+
+    #[test]
+    fn encode_plan_tone_maps_hdr_sources() {
+        let plan = video_encode_plan(Some(1080), None, Some("hdr10"), &BROWSER_V0);
+        assert!(plan.tone_map);
+        let dv = video_encode_plan(Some(1080), None, Some("dolby_vision"), &MEDIA3_V0);
+        assert!(dv.tone_map);
+    }
+
+    #[test]
+    fn missing_host_tonemap_names_zscale_in_reason() {
+        let d = decide_playback(
+            "/a/b.mp4",
+            Some("mov,mp4,m4a"),
+            Some("hevc"),
+            Some("aac"),
+            Some(2),
+            Some(1080),
+            None,
+            Some("hdr10"),
+            None,
+            "probed",
+            &BROWSER_V0,
+            false,
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(
+            d.reason.contains("lacks zscale"),
+            "{}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn profile_bag_overrides_ceilings_on_unknown_id() {
+        let p = resolve_profile_bag(
+            Some("TIZEN_FUTURE"),
+            Some(3_000_000),
+            Some(720),
+            Some("hdr10"),
+        );
+        assert_eq!(p.max_bitrate_bps, Some(3_000_000));
+        assert_eq!(p.max_height, Some(720));
+        assert_eq!(p.hdr, HdrCapability::Hdr10);
+        // Unknown id keeps browser codec floor until the bag grows codecs.
+        assert_eq!(p.video_codecs, BROWSER_V0.video_codecs);
     }
 
     #[test]

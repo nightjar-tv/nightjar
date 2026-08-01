@@ -15,7 +15,7 @@ pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
     AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PlaylistError,
     SegmentMissAction, SessionEncoder, SessionMode, SessionView, StartSessionError, WindowAction,
-    decide_segment_miss, decide_window_action,
+    decide_segment_miss, decide_window_action, host_tonemap_available,
 };
 pub use hwaccel::{
     EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,
