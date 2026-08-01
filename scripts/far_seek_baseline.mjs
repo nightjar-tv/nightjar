@@ -15,7 +15,9 @@ const LOG = process.env.LOG || "/tmp/nj-far-seek-server.log";
 const OUT_DIR =
   process.env.OUT_DIR ||
   `/Users/gmacarthur/Documents/GitHub/nightjar-meta/notes`;
-const OUT = `${OUT_DIR}/far-seek-baseline-2026-07-31.md`;
+const STAMP = process.env.STAMP || new Date().toISOString().slice(0, 10);
+const OUT = `${OUT_DIR}/far-seek-baseline-${STAMP}.md`;
+const OUT_JSON = `${OUT_DIR}/far-seek-baseline-${STAMP}.json`;
 mkdirSync(OUT_DIR, { recursive: true });
 
 /** Diverse titles: long-GOP copy candidates + short-GOP + feature. */
@@ -153,6 +155,7 @@ async function run() {
       continue;
     }
     const durationMs = info.body.durationMs || item.durationMs;
+    const playbackMethod = info.body.playbackMethod || "unknown";
 
     // Cold create once, wait first segment — then only warm seeks count.
     const started = await json(
@@ -208,6 +211,7 @@ async function run() {
       const sample = {
         itemId: item.id,
         label: item.label,
+        playbackMethod,
         frac,
         startMs,
         postMs,
@@ -229,34 +233,69 @@ async function run() {
     );
   }
 
-  const ok = samples
-    .filter((s) => s.landOk && s.seekToFirstListedMs != null)
-    .map((s) => s.seekToFirstListedMs)
-    .sort((a, b) => a - b);
+  const okSamples = samples.filter(
+    (s) => s.landOk && s.seekToFirstListedMs != null,
+  );
+  const ok = okSamples.map((s) => s.seekToFirstListedMs).sort((a, b) => a - b);
   const evictionRuns = samples.filter((s) => s.evictionLogHits > 0);
 
+  function statsFor(rows) {
+    const vals = rows
+      .map((s) => s.seekToFirstListedMs)
+      .filter((v) => v != null)
+      .sort((a, b) => a - b);
+    return {
+      n: vals.length,
+      min: vals[0] ?? null,
+      p50: pct(vals, 50),
+      p90: pct(vals, 90),
+      max: vals[vals.length - 1] ?? null,
+      under3s: vals.filter((v) => v < 3000).length,
+    };
+  }
+
+  const byMethod = {};
+  for (const s of okSamples) {
+    const m = s.playbackMethod || "unknown";
+    (byMethod[m] ??= []).push(s);
+  }
+  const byMethodStats = Object.fromEntries(
+    Object.entries(byMethod).map(([m, rows]) => [m, statsFor(rows)]),
+  );
+
   const summary = {
+    stamp: STAMP,
     n: ok.length,
     min: ok[0] ?? null,
     p50: pct(ok, 50),
     p90: pct(ok, 90),
     max: ok[ok.length - 1] ?? null,
+    under3s: ok.filter((v) => v < 3000).length,
+    byMethod: byMethodStats,
     evictionRuns: evictionRuns.length,
     cacheBudgetDefaultBytes: 2 * 1024 * 1024 * 1024,
+    gateCriterionMs: 3000,
     errors,
   };
 
-  const md = `# Far-seek latency baseline (ADR-0020 committed build)
+  const methodTable = Object.entries(byMethodStats)
+    .map(
+      ([m, st]) =>
+        `| ${m} | ${st.n} | ${st.min} | ${st.p50} | ${st.p90} | ${st.max} | ${st.under3s}/${st.n} |`,
+    )
+    .join("\n");
 
-- Date: 2026-07-31
-- Build: committed \`transcode/adr-0020-producer-truth\` (producer-truth HLS)
-- Cache: default \`SESSION_RUN_CACHE_BUDGET_BYTES\` = 2 GiB (not the 2 MiB
-  pressure run that produced p50=5.4s / outliers 19s / 39.7s)
-- Method: cold create + first segment once per title, then **warm**
-  \`POST /seek\` only; wall time = seek POST → first listed segment 200 with
-  bytes. \`n=${summary.n}\` across titles and offsets.
+  const md = `# Far-seek latency baseline (ADR-0020 / #11)
 
-## Summary
+- Date: ${STAMP}
+- Build: gate tip including ADR-0020 producer-owned segments (#11)
+- Cache: default \`SESSION_RUN_CACHE_BUDGET_BYTES\` = 2 GiB
+- Wall time: warm \`POST /seek\` → first listed segment 200 with bytes
+- Labelled by item \`playbackMethod\` (directPlay / remux / transcode)
+- Gate 2 criterion: seek into untranscoded region < 3000 ms
+- \`n=${summary.n}\` successful lands across titles and offsets
+
+## Summary (all methods)
 
 | | ms |
 |---|---:|
@@ -264,6 +303,13 @@ async function run() {
 | p50 | ${summary.p50} |
 | p90 | ${summary.p90} |
 | max | ${summary.max} |
+| under 3s | ${summary.under3s}/${summary.n} |
+
+## By playbackMethod
+
+| method | n | min | p50 | p90 | max | under 3s |
+|---|---:|---:|---:|---:|---:|---|
+${methodTable || "| (none) | | | | | | |"}
 
 Eviction log hits during samples: **${summary.evictionRuns}** of ${samples.length} runs.
 ${
@@ -272,7 +318,7 @@ ${
       evictionRuns
         .map(
           (s) =>
-            `- ${s.label} @${s.startMs}ms run=${s.runId} hits=${s.evictionLogHits}`,
+            `- ${s.label} (${s.playbackMethod}) @${s.startMs}ms run=${s.runId} hits=${s.evictionLogHits}`,
         )
         .join("\n")
     : "\nNo eviction markers observed in the server log during these seeks.\n"
@@ -292,10 +338,7 @@ ${JSON.stringify(errors, null, 2)}
 `;
 
   writeFileSync(OUT, md);
-  writeFileSync(
-    `${OUT_DIR}/far-seek-baseline-2026-07-31.json`,
-    JSON.stringify({ summary, samples, errors }, null, 2),
-  );
+  writeFileSync(OUT_JSON, JSON.stringify({ summary, samples, errors }, null, 2));
   console.log(JSON.stringify(summary, null, 2));
   console.log(`wrote ${OUT}`);
 }
