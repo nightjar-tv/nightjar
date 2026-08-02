@@ -28,6 +28,7 @@ What this document still has to decide:
 2. Negative-result cache shape (backoff + manual retry)
 3. Raw provider payload persistence and size at dogfood scale
 4. Where the shipped application key lives and how a user key overrides it
+5. Collections storage on the movie detail write (so the fix flow can clear it)
 
 Wrong matches are worse than unmatched: they orphan watch state onto the
 wrong `item_key` (ADR-0025) and feed the kids evaluator a wrong
@@ -181,6 +182,16 @@ credentials later use this file rather than inventing a second store or
 putting tokens in SQLite. The application key
 is not copied into the secrets file.
 
+### 6. Collections storage only
+
+On a successful movie detail write, persist `belongs_to_collection.id` and
+`belongs_to_collection.name` (both nullable) in the same transaction as the
+canonical metadata row. No browse surface, no rail, no setting — the
+item-page line is Block 3. Storing the fields now costs a nullable column;
+adding them after first-run enrichment would spend the TMDB budget again.
+ADR-0028 clears these fields when a manual reassignment orphans the old
+collection linkage.
+
 ## Alternatives considered
 
 **Daily-export FTS matching index.** Rejected in Continuity; spike evidence
@@ -241,3 +252,5 @@ default; the user key is the escape hatch.
 - Ask TMDB whether embedding an application key in a self-hosted binary at
   scale is acceptable (Continuity follow-up); this ADR does not depend on
   a favourable answer, but a public reply beats forum inference.
+- Manual-fix (ADR-0028) clears collection id/name on reassignment; writers
+  must populate §6 on the initial detail write or the clear is a no-op forever.
