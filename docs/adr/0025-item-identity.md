@@ -194,7 +194,7 @@ key (§4); no third shape.
   record already fetched. Per-episode ids do not: the metadata pipeline
   must pull them via a season append (`append_to_response` season/N) or
   the season endpoint — one call per season, not per episode. Cheap, but
-  a request shape the pipeline ADR (next) inherits rather than discovers.
+  a request shape the pipeline ADR (ADR-0026) inherits rather than discovers.
 - Manual fix API cannot ship without the migrator.
 - Gate 3 needs an explicit test: rename + re-encode + library
   remove-and-re-add → resume still attaches for a matched title.
