@@ -104,18 +104,51 @@ correct; P8.4 visual unknown; P5 failed session via named refuse —
 ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
 
-### 5. `/stream` and sessions
+### 5. Capability ceilings vs policy ceilings
+
+`maxBitrateBps` and `maxHeight` on a capability profile answer what a client
+can decode. They are not what a user is allowed to receive. That second
+question is a server policy decision (Phase 3 accounts). Both may narrow the
+same number; they have different owners, and only the policy half is trusted.
+
+**Rule.** The effective ceiling is the tighter of client capability and server
+policy, computed server-side. A client can only narrow; it cannot widen past
+policy. Until accounts and policy exist, the capability half is the only
+input — same behaviour as today. Until trusted-proxy configuration and
+local-versus-remote detection land (Phase 3 security pass), any remote policy
+cap is advisory by design: behind a reverse proxy every client can look local.
+Do not read this section as shipped enforceable behaviour.
+
+**Direct play.** A policy ceiling cannot shape a byte-range serve of the
+original file; there is no encoder in that path. Enforcing a lower height or
+bitrate against a higher source means refusing the stream or demoting the
+title to a session so a scale/bitrate filter can do the work.
+
+**Reasons.** The internal `decide_playback` reason carries which ceiling
+source fired (capability vs policy) so operators can tell them apart in logs.
+Whether that distinction appears in the public reason-code enum is deferred
+to the Phase 3 API freeze. No policy row shape is defined here; profiles do
+not exist yet.
+
+### 6. `/stream` and sessions
 
 `GET /api/v0/items/{id}/stream` honours the reported profile. Until a client
 sends one, behaviour stays `BROWSER_V0` (today's 415 on MKV is correct for
 anonymous browser callers). Session start accepts the same profile input so
-decision and encode target agree.
+decision and encode target agree. When policy ceilings exist, enforcement
+belongs on `/stream` and session start, not only on `playbackInfo` — an
+authenticated caller can skip the client and request the stream URL
+directly.
 
-### 6. N100 capacity (Gate 2 companion measure)
+### 7. N100 capacity (Gate 2 companion measure)
 
 Before calling Gate 2 sized, measure how many concurrent 1080p transcodes an
-Intel N100 sustains at the Auto target this profile ADR implies. Record the
-number next to the Gate 2 checklist; do not guess from `NIGHTJAR_HLS_MAX_SESSIONS`.
+Intel N100 sustains at the Auto target this profile ADR implies, reading
+source media from **local disk** (or another path whose read bandwidth is not
+the bottleneck). Record the number next to the Gate 2 checklist; do not guess
+from `NIGHTJAR_HLS_MAX_SESSIONS`. Concurrent encodes against an SMB or other
+remote share are a storage-admission observation, not this encoder-ceiling
+number.
 
 Hardware long pole for Gate 2 / Phase 2 entry (after Unraid): **N100** (this
 measure) and **Pi 4** (ADR-0005 scan carry). Unraid covers VAAPI and QSV for
@@ -150,10 +183,14 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   MAD regression is not-retag only (`notes/hdr-tonemap-delta-2026-08-01.md`).
   Kit / product picture claims are **Proven by inspection** where dated —
   not measured Gate metrics.
+- Amendment (2026-08-02): §5 splits capability from policy so Phase 3 does not
+  discover the split as a schema change. Policy rows and the public
+  reason-code shape wait for accounts and the API freeze; internal reasons
+  carry the ceiling source when policy exists.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
 - N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4
-  for the scan carry). Unraid is the VAAPI/QSV verification host once iGPU
-  enablement is confirmed.
+  for the scan carry), sourced from local disk (§7). Unraid is the VAAPI/QSV
+  verification host once iGPU enablement is confirmed.
 - Product Docker image installs Debian `ffmpeg` + VA drivers (#19); see §4
   packaging note.

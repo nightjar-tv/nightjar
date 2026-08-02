@@ -35,11 +35,13 @@ used jellyfin-ffmpeg on PATH; the shipped Docker image uses Debian `ffmpeg` +
 VA drivers — re-verify on Unraid with that image. Pass `--device=/dev/dri` for
 hardware. Bare binary still expects an operator-provided FFmpeg. NVENC remains
 tier 2 until a team Nvidia box is verified. Remaining hardware poles for Gate 2
-sizing: Intel N100/N150 (concurrent 1080p capacity) and Pi 4 (ADR-0005 scan
-carry). Arc as a pinned QSV device is a Phase 3 product choice
-(`nightjar-meta/notes/design/drm-device-selection.md`), not a matrix tier gap.
-Concurrency floors on RM400: 5×1080p QSV and 5×1080p libx264 realtime
-(`nightjar-meta/notes/hw/concurrency-ceiling-unraid.md`).
+sizing: Intel N100/N150 (concurrent 1080p capacity from **local disk**) and
+Pi 4 (ADR-0005 scan carry). SMB or other remote-share runs are storage-
+admission observations, not the encoder-ceiling number
+(`nightjar/notes/spike-smb-gate-2026-08-02.md`). Arc as a pinned QSV device is
+a Phase 3 product choice (`nightjar-meta/notes/design/drm-device-selection.md`),
+not a matrix tier gap. Concurrency floors on RM400: 5×1080p QSV and 5×1080p
+libx264 realtime (`nightjar-meta/notes/hw/concurrency-ceiling-unraid.md`).
 
 ## What detection reports
 
