@@ -36,11 +36,13 @@ impl HdrCapability {
     }
 
     /// Parse a stored source or wire value (`none` / `hdr10` / `dolbyVision`).
+    /// `dolby_vision_p5` is still Dolby Vision for ceiling matching; decide
+    /// refuses the tonemap path separately.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "none" => Some(Self::None),
             "hdr10" => Some(Self::Hdr10),
-            "dolbyVision" | "dolby_vision" => Some(Self::DolbyVision),
+            "dolbyVision" | "dolby_vision" | "dolby_vision_p5" => Some(Self::DolbyVision),
             _ => None,
         }
     }
@@ -265,17 +267,24 @@ pub fn video_encode_plan(
         },
         None => None,
     };
-    let tone_map = matches!(
-        source_hdr
-            .and_then(HdrCapability::parse)
-            .unwrap_or(HdrCapability::None),
-        HdrCapability::Hdr10 | HdrCapability::DolbyVision
-    );
+    // Profile 5 is IPT-PQ; no tonemap attempt (decide refuses that session).
+    let tone_map = !is_dolby_vision_profile5(source_hdr)
+        && matches!(
+            source_hdr
+                .and_then(HdrCapability::parse)
+                .unwrap_or(HdrCapability::None),
+            HdrCapability::Hdr10 | HdrCapability::DolbyVision
+        );
     VideoEncodePlan {
         max_height,
         max_bitrate_bps,
         tone_map,
     }
+}
+
+/// Probed as `dolby_vision_p5` (ffprobe `dv_profile` 5).
+pub fn is_dolby_vision_profile5(source_hdr: Option<&str>) -> bool {
+    matches!(source_hdr, Some("dolby_vision_p5"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +397,13 @@ pub fn decide_playback(
         }
     };
 
-    if decision.method == PlaybackMethod::Transcode
+    // P5 has no supported SDR encode path today (zscale cannot map IPT-PQ).
+    // Refuse before any tonemap/zscale attempt; DirectPlay/Remux of true DV
+    // to a DV-capable client is unchanged.
+    if decision.method == PlaybackMethod::Transcode && is_dolby_vision_profile5(source_hdr) {
+        decision.reason =
+            "Dolby Vision Profile 5 cannot be tone-mapped (IPT-PQ; no P5→SDR path)".into();
+    } else if decision.method == PlaybackMethod::Transcode
         && source_needs_tonemap(source_hdr)
         && !tonemap_available
     {
@@ -941,6 +956,33 @@ mod tests {
         assert!(plan.tone_map);
         let dv = video_encode_plan(Some(1080), None, Some("dolby_vision"), &MEDIA3_V0);
         assert!(dv.tone_map);
+        let p5 = video_encode_plan(Some(1080), None, Some("dolby_vision_p5"), &BROWSER_V0);
+        assert!(!p5.tone_map, "P5 must not select a tonemap graph");
+    }
+
+    #[test]
+    fn decide_refuses_dv_profile5_transcode_without_tonemap_attempt() {
+        let d = decide_playback(
+            "/a/p5.mkv",
+            Some("matroska,webm"),
+            Some("hevc"),
+            Some("aac"),
+            Some(2),
+            Some(1080),
+            None,
+            Some("dolby_vision_p5"),
+            None,
+            "probed",
+            &BROWSER_V0,
+            true, // zscale present — still refuse P5
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(
+            d.reason.contains("Profile 5") && d.reason.contains("cannot be tone-mapped"),
+            "{}",
+            d.reason
+        );
+        assert!(!d.reason.contains("zscale"), "{}", d.reason);
     }
 
     #[test]

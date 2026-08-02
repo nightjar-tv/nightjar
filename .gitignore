@@ -27,6 +27,7 @@ testdata/files/large-*
 testdata/files/soak_scrub_*
 testdata/files/.generated
 testdata/files/dolby-vision-browser-kit/
+testdata/files/dolby-vision-makemkv/
 testdata/bench_10k/
 testdata/.bench_seed.mp4
 

@@ -47,7 +47,7 @@ pub struct MediaItemRow {
     pub height: Option<i32>,
     /// Video stream bitrate from ffprobe (ADR-0022); NULL until probed.
     pub video_bitrate_bps: Option<i64>,
-    /// Source HDR: `none` | `hdr10` | `dolby_vision` (ADR-0022).
+    /// Source HDR: `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` (ADR-0022).
     pub hdr: Option<String>,
     pub probe_status: String,
     pub scan_error: Option<String>,

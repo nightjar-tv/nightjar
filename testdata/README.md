@@ -8,7 +8,7 @@ file here, forever (Rule 4.3).
 licensed samples. Never copyrighted commercial media.
 
 ```bash
-./testdata/generate.sh              # committed-size seeds + PGS + HDR10 + range trigger
+./testdata/generate.sh              # committed-size seeds + PGS + HDR axis + range trigger
 OVER4GB=1 ./testdata/generate.sh    # also >4 GiB offset-stress file (gitignored)
 LARGE=1 ./testdata/generate.sh      # also multi-GB open-ended Range stress (gitignored)
 
@@ -16,12 +16,36 @@ LARGE=1 ./testdata/generate.sh      # also multi-GB open-ended Range stress (git
 ./scripts/gate1_scan_10k.sh         # time first scan (<60s) + rescan (<5s)
 ```
 
-## Dolby Vision Browser Test Kit (local only)
+Optional tools for the HDR/DV synth path (looked up on `PATH` or
+`scripts/.tools/bin/`): `dovi_tool`, `hdr10plus_tool`, `mkvmerge`. When a tool
+is missing, `generate.sh` prints `skip …: <reason>` and leaves any previously
+committed fixture in place.
+
+## HDR / Dolby Vision axis
+
+Controls (committed when generated): SDR BT.709, HDR10, HDR10+, plain HLG,
+synthetic DV P8.4 HLG, and a short P8.1 mkv/mp4 pair (same content; Matroska
+block additions vs MP4 `dvvC` / `hvc1`).
+
+### MakeMKV Dolby Vision test clips (local only)
+
+Dolby’s official profile samples (P4, P5, P7 MEL, P7 FEL, P8.1) are published
+as MKVs at `https://www.makemkv.com/download/dvtest/`. `generate.sh` fetches
+them into `files/dolby-vision-makemkv/`, verifies pinned sha256 digests, and
+skips with a named reason when the network or digest check fails. Do not
+`git add` those MKVs (gitignored; do not put them in LFS).
+
+The pinned digests are self-pinned: on 2026-08-02 makemkv.com returned
+Cloudflare 525, so all five files were fetched from the Wayback Machine and
+hashed as downloaded. That proves bit-stability of the local cache, not
+authenticity against an upstream digest — there was nothing to cross-check.
+
+### Dolby Vision Browser Test Kit (local only)
 
 Dolby’s Patterns of Nature MP4s live under
 `files/dolby-vision-browser-kit/` (gitignored: kit license + ~1 GB). Manifest
 rows use `"commit": false` and are exercised by `corpus_decide` when the files
-are present.
+are present. The P8.1 pair prefers this kit as its source when available.
 
 Refresh by placing the kit’s `24fps/` and `30fps/` trees there:
 
@@ -30,5 +54,20 @@ testdata/files/dolby-vision-browser-kit/24fps/{SD,HD,FHD,UHD}/
 testdata/files/dolby-vision-browser-kit/30fps/{SD,HD,FHD,UHD}/
 ```
 
-Do not `git add` those MP4s. Priority manifest rows are 24 fps FHD P5 / P8.1 /
+Do not `git add` those MP4s. Priority kit rows are 24 fps FHD P5 / P8.1 /
 P8.4 and 24 fps UHD P8.1.
+
+## Profile expectations (`expect_by_profile`)
+
+HDR/DV rows may carry per-profile objects with `method`, optional `rendered`
+(`dolbyVision` | `hdr10Fallback` | `tonemappedSdr`), and `provisional`.
+
+`provisional` means unmeasured, not "probably fine" (Rule 4.8). It marks a
+claim we have not proven on a real client path; do not treat a green corpus
+row as device coverage.
+
+`BROWSER_V0` and the no-HDR wide profile assert routing (which method and
+whether a tonemap encode was selected), not colour fidelity. A
+Dolby Vision Profile 5 is refuse-with-reason at decide/session start (no
+tonemap attempt). Other HDR/DV rows may still select `tonemappedSdr`.
+
