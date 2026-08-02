@@ -1,5 +1,7 @@
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::{decide, profile_from_query, subtitle_tracks_for};
+use crate::routes::items::{
+    abs_path, decide, library_root, profile_from_query, subtitle_tracks_for,
+};
 use crate::state::AppState;
 use axum::{
     Json,
@@ -13,6 +15,7 @@ use nightjar_core::{
     select_audio_track, select_subtitle_track, video_encode_plan,
 };
 use nightjar_db::MediaItemRow;
+use nightjar_db::resolve_media_path;
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeEntry, KeyframeMap,
     MapContainerKind, PlaylistError, SessionMode, StartSessionError, burn_in_kind_for_codec,
@@ -134,7 +137,7 @@ pub async fn start(
         });
     };
 
-    let audio = resolve_audio(&row, query.audio_track_id.as_deref(), &profile)?;
+    let audio = resolve_audio(&state, &row, query.audio_track_id.as_deref(), &profile)?;
     let burn_in = resolve_burn_in(&state, &row, query.subtitle_track_id.as_deref())?;
 
     // DirectPlay is allowed when a track selection requires encode work the
@@ -158,8 +161,9 @@ pub async fn start(
         mode = SessionMode::Transcode;
     }
 
-    let subtitle_tracks = match subtitle_tracks_for(&state, &row) {
-        Ok(tracks) => match snapshot_hls_tracks(&state, &row, &tracks) {
+    let lib_root = library_root(&state, row.library_id)?;
+    let subtitle_tracks = match subtitle_tracks_for(&state, &row, &lib_root) {
+        Ok(tracks) => match snapshot_hls_tracks(&state, &row, &lib_root, &tracks) {
             Ok(snap) => snap,
             Err(e) => {
                 tracing::warn!(item_id, error = %e, "subtitle snapshot failed at session start");
@@ -177,7 +181,7 @@ pub async fn start(
     if row.subtitle_status == "pending" {
         state
             .pool
-            .prioritize_extract(row.id, row.library_id, std::path::PathBuf::from(&row.path));
+            .prioritize_extract(row.id, row.library_id, abs_path(&lib_root, &row.path));
     }
 
     let start_ms = query.start_ms.unwrap_or(0);
@@ -204,7 +208,7 @@ pub async fn start(
     }
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
-    let src = std::path::PathBuf::from(&row.path);
+    let src = abs_path(&lib_root, &row.path);
     let tracks_for_start = subtitle_tracks;
     let started = tokio::task::spawn_blocking(move || {
         hls_for_start.start(
@@ -284,19 +288,24 @@ fn keyframe_map_for(state: &AppState, row: &MediaItemRow) -> Option<KeyframeMap>
 /// Puts a map build at the front of the library pool's background work
 /// (ADR-0023 §8). Already pending or in flight is a no-op.
 fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
+    let Ok(root) = library_root(state, row.library_id) else {
+        return;
+    };
     state
         .pool
-        .prioritize_map_rebuild(row.id, row.library_id, std::path::PathBuf::from(&row.path));
+        .prioritize_map_rebuild(row.id, row.library_id, abs_path(&root, &row.path));
 }
 
 /// Which audio stream this session maps (ADR-0012 / ADR-0024).
 fn resolve_audio(
+    state: &AppState,
     row: &MediaItemRow,
     requested: Option<&str>,
     profile: &ClientCapabilityProfile,
 ) -> Result<AudioSelection, ApiError> {
     let max_channels = profile.max_audio_channels.unwrap_or(u32::MAX);
-    let tracks = match list_audio_tracks(std::path::Path::new(&row.path)) {
+    let root = library_root(state, row.library_id)?;
+    let tracks = match list_audio_tracks(&abs_path(&root, &row.path)) {
         Ok(tracks) => tracks,
         // Without a requested track the stored first-audio count still
         // applies the ceiling, so a failed inventory need not fail playback.
@@ -375,7 +384,8 @@ fn resolve_burn_in(
     let Some(id) = requested else {
         return Ok(None);
     };
-    let tracks = subtitle_tracks_for(state, row).map_err(ApiError::internal)?;
+    let root = library_root(state, row.library_id)?;
+    let tracks = subtitle_tracks_for(state, row, &root).map_err(ApiError::internal)?;
     let track = tracks.iter().find(|t| t.track_id == id).ok_or_else(|| {
         ApiError::not_found(format!("subtitle track {id} not found for item {}", row.id))
     })?;
@@ -398,7 +408,7 @@ fn resolve_burn_in(
         let path = sidecars
             .iter()
             .find(|s| s.track_id == id)
-            .map(|s| std::path::PathBuf::from(&s.path))
+            .map(|s| resolve_media_path(&root, &s.path))
             .ok_or_else(|| {
                 ApiError::not_found(format!("sidecar path for burn-in track {id} missing"))
             })?;
@@ -411,7 +421,7 @@ fn resolve_burn_in(
         }));
     }
     let embedded =
-        list_burn_in_subtitles(std::path::Path::new(&row.path)).map_err(ApiError::internal)?;
+        list_burn_in_subtitles(&abs_path(&root, &row.path)).map_err(ApiError::internal)?;
     let stream = embedded
         .iter()
         .find(|s| s.track_id() == id)
@@ -440,6 +450,7 @@ fn stored_channels(row: &MediaItemRow) -> u32 {
 fn snapshot_hls_tracks(
     state: &AppState,
     row: &MediaItemRow,
+    library_root: &str,
     tracks: &[crate::routes::items::SubtitleTrackDto],
 ) -> Result<Vec<HlsSubtitleTrack>, String> {
     let sidecars = state.db.list_item_sidecars(row.id)?;
@@ -452,7 +463,7 @@ fn snapshot_hls_tracks(
         // captions appear on the next session once complete.
         .filter(|t| t.readiness == Some("complete") && t.url.is_some())
         .collect();
-    let audio_lang = list_audio_tracks(std::path::Path::new(&row.path))
+    let audio_lang = list_audio_tracks(&abs_path(library_root, &row.path))
         .ok()
         .and_then(|audio| {
             let cands: Vec<TrackCandidate> = audio
@@ -509,7 +520,7 @@ fn snapshot_hls_tracks(
             let path = sidecars
                 .iter()
                 .find(|s| s.track_id == t.track_id)
-                .map(|s| std::path::PathBuf::from(&s.path));
+                .map(|s| resolve_media_path(library_root, &s.path));
             (None, path)
         } else {
             (t.stream_index, None)

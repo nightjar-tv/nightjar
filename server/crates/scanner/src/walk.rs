@@ -84,7 +84,9 @@ pub fn walk_concurrency() -> usize {
         .clamp(1, 256)
 }
 
-/// Walk `root`, following directories but not symlink loops. Permission errors are skipped.
+/// Walk `root`, following directories (and file symlinks via [`fs::metadata`]) but
+/// not symlink loops: each directory's canonical path is visited at most once.
+/// Permission errors are skipped.
 ///
 /// When `cache` is provided, directories whose mtime matches the previous walk are not
 /// re-listed: their prior file list and child set are reused. That is the cheap
@@ -372,7 +374,9 @@ fn process_dir(dir: &Path, prev_dirs: Option<&HashMap<PathBuf, CachedDir>>) -> D
             }
         };
         let path = entry.path();
-        let meta = match entry.metadata() {
+        // Follow symlinks (fs::metadata, not DirEntry::metadata/lstat) so a
+        // symlink-to-file is visible to the under-root check (ADR-0030).
+        let meta = match fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 errors += 1;
@@ -562,5 +566,29 @@ mod tests {
             serial_delta.relisted_dirs, par_delta.relisted_dirs,
             "delta relisted dirs"
         );
+    }
+
+    #[test]
+    fn directory_symlink_cycle_does_not_spin() {
+        let root = tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        File::create(a.join("keep.mp4")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&b, a.join("to_b")).unwrap();
+            std::os::unix::fs::symlink(&a, b.join("to_a")).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        // Must finish; canonical `seen` set breaks the a↔b directory loop.
+        let outcome = walk_media_files_cached_with_concurrency(root.path(), None, 1).unwrap();
+        assert_eq!(outcome.files.len(), 1);
+        let outcome_par = walk_media_files_cached_with_concurrency(root.path(), None, 4).unwrap();
+        assert_eq!(outcome_par.files.len(), 1);
     }
 }

@@ -101,6 +101,8 @@ so rather than pretending otherwise.
 `path:{library_id}:{relpath}` binds to `libraries.id` (SQLite
 `INTEGER PRIMARY KEY AUTOINCREMENT` in the data dir under
 `NIGHTJAR_DATA_DIR`). Relative path is relative to that library root.
+**Storage of that relpath on `media_items` / sidecars** is ADR-0030
+(completes this section; does not supersede the key grammar here).
 
 **Why `library_id`, knowingly:** the same ADR rejects keying watch state
 on internal *media* row ids because those churn. Library rows are few and

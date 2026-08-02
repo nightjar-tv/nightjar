@@ -53,7 +53,11 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Update library name and/or repoint library root (ADR-0030)
+         * @description Name-only updates return 200 with the library. A path change accepts an async repoint job (202) that dry-runs a full walk against a 0.90 retain guard before committing `libraries.path` and enqueueing a normal scan. Refusal reasons appear on the job error (`repoint_empty_match` | `repoint_below_retain_threshold`). No force override in v1. Path PATCH work is scan-class duration (two walks). Phase 1–2: unauthenticated (ADR-0003). Phase 3: admin-only — this mutates the library root and must not stay public after accounts land (ADR-0030).
+         */
+        patch: operations["patchLibrary"];
         trace?: never;
     };
     "/api/v0/libraries/{libraryId}/scan": {
@@ -443,6 +447,21 @@ export interface components {
             itemCount: number;
             /** @description False when the library root is not reachable (unmounted share, missing path). Work is paused until it returns (ADR-0014). */
             reachable: boolean;
+            /**
+             * Format: int64
+             * @description Rows still stored as absolute paths after migration / pending repair under the current root (ADR-0030).
+             */
+            pathsUnresolved: number;
+            /**
+             * Format: int64
+             * @description Last index pass count of walked files outside the library root (symlink escape / bind overlap); visible, not log-only (ADR-0030).
+             */
+            skippedOutsideRoot: number;
+        };
+        PatchLibraryRequest: {
+            name?: string;
+            /** @description Candidate library root for async repoint. Must be an existing directory. Same path as current (after normalize) is a no-op. */
+            path?: string;
         };
         CreateLibraryRequest: {
             name: string;
@@ -459,6 +478,10 @@ export interface components {
             /** Format: int64 */
             itemCount: number;
             reachable: boolean;
+            /** Format: int64 */
+            pathsUnresolved: number;
+            /** Format: int64 */
+            skippedOutsideRoot: number;
             /**
              * Format: int64
              * @description Async scan job started for this library.
@@ -470,6 +493,7 @@ export interface components {
             id: number;
             /** Format: int64 */
             libraryId: number;
+            /** @description Absolute filesystem path reconstructed at response time from the current library root and stored relpath (ADR-0030). Not stable across library repoint — use `id` for identity. */
             path: string;
             title: string;
             kind: components["schemas"]["MediaKind"];
@@ -515,11 +539,29 @@ export interface components {
             indexDurationMs?: number | null;
             /** Format: int64 */
             probeDurationMs?: number | null;
+            /** @description Failure message. Repoint refusals use stable prefixes `repoint_empty_match` or `repoint_below_retain_threshold` (ADR-0030). */
             error?: string | null;
             /** Format: date-time */
             startedAt: string;
             /** Format: date-time */
             finishedAt?: string | null;
+            /**
+             * @description `scan` or `repoint` (ADR-0030).
+             * @enum {string}
+             */
+            kind: "scan" | "repoint";
+            /** @description Candidate root for a repoint job; absent on ordinary scans. */
+            candidatePath?: string | null;
+            /**
+             * Format: int64
+             * @description Files walked but not indexed because they were outside the library root (ADR-0030).
+             */
+            skippedOutsideRoot: number;
+            /**
+             * Format: int64
+             * @description On `kind=repoint` jobs: count of existing media rows that missed the new root keep-set and were left in place (delete_missing deferred to the next ordinary scan). Zero on ordinary scans (ADR-0030).
+             */
+            deferredRemove: number;
         };
         PlaybackInfo: {
             /** Format: int64 */
@@ -730,6 +772,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Library"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    patchLibrary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                libraryId: components["parameters"]["LibraryId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchLibraryRequest"];
+            };
+        };
+        responses: {
+            /** @description Name-only update applied (no path change) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Library"];
+                };
+            };
+            /** @description Path repoint job accepted; poll GET /scan-jobs/{jobId} */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScanJobAccepted"];
+                };
+            };
+            /** @description Invalid request or active job already running */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Not found */

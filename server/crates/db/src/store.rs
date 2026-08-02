@@ -1,6 +1,11 @@
 use crate::migrate;
+use crate::paths::{
+    fold_path, is_absolute_stored, require_library_root, require_relpath, resolve_media_path,
+    to_relpath,
+};
 use crate::status::{parse_map_status, parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -24,6 +29,10 @@ pub struct LibraryRow {
     pub item_count: i64,
     /// ADR-0014: false when the library root is not reachable.
     pub reachable: bool,
+    /// ADR-0030: rows still absolute after migration / pending repair.
+    pub paths_unresolved: i64,
+    /// ADR-0030: last index pass skipped (outside root) count.
+    pub skipped_outside_root: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +129,21 @@ pub struct ScanJobRow {
     pub error_message: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// `scan` | `repoint` (ADR-0030).
+    pub kind: String,
+    pub candidate_path: Option<String>,
+    pub skipped_outside_root: i64,
+    /// Rows that would have been deleted on a repoint's first index; still present.
+    pub deferred_remove: i64,
+}
+
+/// One row for fold-aware index matching (ADR-0030 §2).
+#[derive(Debug, Clone)]
+pub struct ItemPathRow {
+    pub id: i64,
+    pub path: String,
+    pub mtime_ms: i64,
+    pub probe_status: String,
 }
 
 /// Filesystem subtitle sidecar stored at index time (ADR-0010).
@@ -158,20 +182,23 @@ impl Db {
     }
 
     pub fn create_library(&self, lib: &NewLibrary) -> Result<LibraryRow, String> {
+        let root = require_library_root(&lib.path)?;
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO libraries (name, path, kind) VALUES (?1, ?2, ?3)",
-            params![lib.name, lib.path, lib.kind],
+            params![lib.name, root, lib.kind],
         )
         .map_err(|e| format!("insert library: {e}"))?;
         let id = conn.last_insert_rowid();
         Ok(LibraryRow {
             id,
             name: lib.name.clone(),
-            path: lib.path.clone(),
+            path: root,
             kind: lib.kind.clone(),
             item_count: 0,
             reachable: true,
+            paths_unresolved: 0,
+            skipped_outside_root: 0,
         })
     }
 
@@ -181,7 +208,7 @@ impl Db {
             .prepare(
                 "SELECT l.id, l.name, l.path, l.kind,
                         (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id),
-                        l.reachable
+                        l.reachable, l.paths_unresolved, l.skipped_outside_root
                  FROM libraries l
                  ORDER BY l.name COLLATE NOCASE",
             )
@@ -198,13 +225,154 @@ impl Db {
         conn.query_row(
             "SELECT l.id, l.name, l.path, l.kind,
                     (SELECT COUNT(*) FROM media_items m WHERE m.library_id = l.id),
-                    l.reachable
+                    l.reachable, l.paths_unresolved, l.skipped_outside_root
              FROM libraries l WHERE l.id = ?1",
             [id],
             map_library,
         )
         .optional()
         .map_err(|e| format!("get library {id}: {e}"))
+    }
+
+    pub fn update_library_name(&self, library_id: i64, name: &str) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE libraries SET name = ?2 WHERE id = ?1",
+            params![library_id, name],
+        )
+        .map_err(|e| format!("update library name: {e}"))?;
+        Ok(())
+    }
+
+    pub fn update_library_path(&self, library_id: i64, path: &str) -> Result<(), String> {
+        let root = require_library_root(path)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE libraries SET path = ?2 WHERE id = ?1",
+            params![library_id, root],
+        )
+        .map_err(|e| format!("update library path: {e}"))?;
+        Ok(())
+    }
+
+    pub fn set_library_path_counters(
+        &self,
+        library_id: i64,
+        paths_unresolved: i64,
+        skipped_outside_root: i64,
+    ) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE libraries SET paths_unresolved = ?2, skipped_outside_root = ?3
+             WHERE id = ?1",
+            params![library_id, paths_unresolved, skipped_outside_root],
+        )
+        .map_err(|e| format!("set library path counters: {e}"))?;
+        Ok(())
+    }
+
+    /// Strip remaining absolute rows that now match `library.path` (ADR-0030 §5).
+    pub fn repair_library_paths(&self, library_id: i64) -> Result<i64, String> {
+        let lib = self
+            .get_library(library_id)?
+            .ok_or_else(|| format!("library {library_id} not found"))?;
+        let conn = self.lock()?;
+        let items: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, path FROM media_items WHERE library_id = ?1")
+                .map_err(|e| format!("repair prepare items: {e}"))?;
+            let rows = stmt
+                .query_map(params![library_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("repair query items: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("repair read items: {e}"))?
+        };
+        let mut unresolved = 0i64;
+        for (id, path) in items {
+            if !is_absolute_stored(&path) {
+                continue;
+            }
+            match to_relpath(&lib.path, Path::new(&path)) {
+                Some(rel) => {
+                    conn.execute(
+                        "UPDATE media_items SET path = ?2 WHERE id = ?1",
+                        params![id, rel],
+                    )
+                    .map_err(|e| format!("repair item {id}: {e}"))?;
+                }
+                None => unresolved += 1,
+            }
+        }
+        let sidecars: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.media_item_id, s.track_id, s.path FROM media_item_sidecars s
+                     JOIN media_items m ON m.id = s.media_item_id
+                     WHERE m.library_id = ?1",
+                )
+                .map_err(|e| format!("repair prepare sidecars: {e}"))?;
+            let rows = stmt
+                .query_map(params![library_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .map_err(|e| format!("repair query sidecars: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("repair read sidecars: {e}"))?
+        };
+        for (media_item_id, track_id, path) in sidecars {
+            if !is_absolute_stored(&path) {
+                continue;
+            }
+            match to_relpath(&lib.path, Path::new(&path)) {
+                Some(rel) => {
+                    conn.execute(
+                        "UPDATE media_item_sidecars SET path = ?3
+                         WHERE media_item_id = ?1 AND track_id = ?2",
+                        params![media_item_id, track_id, rel],
+                    )
+                    .map_err(|e| format!("repair sidecar: {e}"))?;
+                }
+                None => unresolved += 1,
+            }
+        }
+        conn.execute(
+            "UPDATE libraries SET paths_unresolved = ?2 WHERE id = ?1",
+            params![library_id, unresolved],
+        )
+        .map_err(|e| format!("repair set unresolved: {e}"))?;
+        Ok(unresolved)
+    }
+
+    pub fn list_item_paths(&self, library_id: i64) -> Result<Vec<ItemPathRow>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, mtime_ms, probe_status FROM media_items
+                 WHERE library_id = ?1",
+            )
+            .map_err(|e| format!("prepare item paths: {e}"))?;
+        let rows = stmt
+            .query_map(params![library_id], |r| {
+                Ok(ItemPathRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    mtime_ms: r.get(2)?,
+                    probe_status: r.get(3)?,
+                })
+            })
+            .map_err(|e| format!("query item paths: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read item paths: {e}"))
+    }
+
+    /// Absolute filesystem path for an item (mixed absolute/relpath column).
+    pub fn absolute_item_path(&self, library_id: i64, stored_path: &str) -> Result<String, String> {
+        let lib = self
+            .get_library(library_id)?
+            .ok_or_else(|| format!("library {library_id} not found"))?;
+        Ok(resolve_media_path(&lib.path, stored_path)
+            .to_string_lossy()
+            .into_owned())
     }
 
     pub fn set_library_reachable(&self, library_id: i64, reachable: bool) -> Result<(), String> {
@@ -354,9 +522,10 @@ impl Db {
                 )
                 .map_err(|e| format!("prepare index upsert: {e}"))?;
             for item in items {
+                let path = require_relpath(&item.path)?;
                 stmt.execute(params![
                     library_id,
-                    item.path,
+                    path,
                     item.mtime_ms,
                     item.size_bytes,
                     item.title,
@@ -366,7 +535,7 @@ impl Db {
                     item.episode,
                     item.content_id,
                 ])
-                .map_err(|e| format!("upsert item {}: {e}", item.path))?;
+                .map_err(|e| format!("upsert item {path}: {e}"))?;
             }
         }
         {
@@ -732,62 +901,54 @@ impl Db {
         Ok(())
     }
 
+    /// Delete items whose path fold is not in `keep_folds`. Never deletes
+    /// unresolved absolute rows (ADR-0030 §5). `keep_folds` are
+    /// [`fold_path`] keys of walked relpaths.
+    pub fn delete_missing_fold(
+        &self,
+        library_id: i64,
+        keep_folds: &HashSet<String>,
+    ) -> Result<Vec<i64>, String> {
+        let rows = self.list_item_paths(library_id)?;
+        let mut to_delete = Vec::new();
+        for row in &rows {
+            if is_absolute_stored(&row.path) {
+                continue;
+            }
+            if keep_folds.contains(&fold_path(&row.path)) {
+                continue;
+            }
+            to_delete.push(row.id);
+        }
+        if to_delete.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin delete_missing: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM media_items WHERE id = ?1")
+                .map_err(|e| format!("prepare delete item: {e}"))?;
+            for id in &to_delete {
+                stmt.execute(params![id])
+                    .map_err(|e| format!("delete item {id}: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit delete_missing: {e}"))?;
+        Ok(to_delete)
+    }
+
+    /// Legacy exact-path delete (tests). Prefer [`Self::delete_missing_fold`].
     pub fn delete_missing(
         &self,
         library_id: i64,
         keep_paths: &[String],
     ) -> Result<Vec<i64>, String> {
-        let conn = self.lock()?;
-        if keep_paths.is_empty() {
-            let mut stmt = conn
-                .prepare("SELECT id FROM media_items WHERE library_id = ?1")
-                .map_err(|e| format!("prepare deleted items: {e}"))?;
-            let ids = stmt
-                .query_map([library_id], |r| r.get(0))
-                .map_err(|e| format!("list deleted items: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("read deleted items: {e}"))?;
-            conn.execute(
-                "DELETE FROM media_items WHERE library_id = ?1",
-                [library_id],
-            )
-            .map_err(|e| format!("delete all items: {e}"))?;
-            return Ok(ids);
-        }
-        conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS keep_paths (path TEXT PRIMARY KEY);
-             DELETE FROM keep_paths;",
-        )
-        .map_err(|e| format!("temp keep_paths: {e}"))?;
-        {
-            let mut stmt = conn
-                .prepare("INSERT INTO keep_paths (path) VALUES (?1)")
-                .map_err(|e| format!("prepare keep insert: {e}"))?;
-            for p in keep_paths {
-                stmt.execute(params![p])
-                    .map_err(|e| format!("insert keep path: {e}"))?;
-            }
-        }
-        let mut stmt = conn
-            .prepare(
-                "SELECT id FROM media_items
-                 WHERE library_id = ?1
-                   AND path NOT IN (SELECT path FROM keep_paths)",
-            )
-            .map_err(|e| format!("prepare deleted items: {e}"))?;
-        let ids = stmt
-            .query_map([library_id], |r| r.get(0))
-            .map_err(|e| format!("list deleted items: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read deleted items: {e}"))?;
-        conn.execute(
-            "DELETE FROM media_items
-             WHERE library_id = ?1
-               AND path NOT IN (SELECT path FROM keep_paths)",
-            [library_id],
-        )
-        .map_err(|e| format!("delete missing: {e}"))?;
-        Ok(ids)
+        let folds: HashSet<String> = keep_paths.iter().map(|p| fold_path(p)).collect();
+        self.delete_missing_fold(library_id, &folds)
     }
 
     /// Replace all sidecar rows for one media item (index-pass association).
@@ -839,10 +1000,11 @@ impl Db {
                 )
                 .map_err(|e| format!("prepare sidecar insert: {e}"))?;
             for s in sidecars {
+                let path = require_relpath(&s.path)?;
                 stmt.execute(params![
                     media_item_id,
                     s.track_id,
-                    s.path,
+                    path,
                     s.mtime_ms,
                     s.size_bytes,
                     s.format,
@@ -900,10 +1062,22 @@ impl Db {
     pub fn create_scan_job(&self, library_id: i64) -> Result<i64, String> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO scan_jobs (library_id, state) VALUES (?1, 'queued')",
+            "INSERT INTO scan_jobs (library_id, state, kind) VALUES (?1, 'queued', 'scan')",
             [library_id],
         )
         .map_err(|e| format!("insert scan job: {e}"))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn create_repoint_job(&self, library_id: i64, candidate_path: &str) -> Result<i64, String> {
+        let candidate = require_library_root(candidate_path)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO scan_jobs (library_id, state, kind, candidate_path)
+             VALUES (?1, 'queued', 'repoint', ?2)",
+            params![library_id, candidate],
+        )
+        .map_err(|e| format!("insert repoint job: {e}"))?;
         Ok(conn.last_insert_rowid())
     }
 
@@ -944,13 +1118,57 @@ impl Db {
         conn.query_row(
             "SELECT id, library_id, state, added, updated, removed, unchanged,
                     probed, errors, index_duration_ms, probe_duration_ms,
-                    error_message, started_at, finished_at
+                    error_message, started_at, finished_at, kind, candidate_path,
+                    skipped_outside_root, deferred_remove
              FROM scan_jobs WHERE id = ?1",
             [job_id],
             map_scan_job,
         )
         .optional()
         .map_err(|e| format!("get scan job {job_id}: {e}"))
+    }
+
+    pub fn set_scan_job_skipped_outside_root(
+        &self,
+        job_id: i64,
+        skipped: i64,
+    ) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE scan_jobs SET skipped_outside_root = ?2 WHERE id = ?1",
+            params![job_id, skipped],
+        )
+        .map_err(|e| format!("set scan job skipped_outside_root: {e}"))?;
+        Ok(())
+    }
+
+    pub fn set_scan_job_deferred_remove(
+        &self,
+        job_id: i64,
+        deferred_remove: i64,
+    ) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE scan_jobs SET deferred_remove = ?2 WHERE id = ?1",
+            params![job_id, deferred_remove],
+        )
+        .map_err(|e| format!("set scan job deferred_remove: {e}"))?;
+        Ok(())
+    }
+
+    /// Rows that [`Self::delete_missing_fold`] would remove (relpath rows only).
+    pub fn count_missing_fold(
+        &self,
+        library_id: i64,
+        keep_folds: &HashSet<String>,
+    ) -> Result<i64, String> {
+        let rows = self.list_item_paths(library_id)?;
+        let n = rows
+            .iter()
+            .filter(|r| !is_absolute_stored(&r.path))
+            .filter(|r| !keep_folds.contains(&fold_path(&r.path)))
+            .count();
+        Ok(n as i64)
     }
 
     pub fn set_scan_job_state(&self, job_id: i64, state: &str) -> Result<(), String> {
@@ -1050,6 +1268,8 @@ fn map_library(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRow> {
         kind: r.get(3)?,
         item_count: r.get(4)?,
         reachable: reachable_i != 0,
+        paths_unresolved: r.get(6)?,
+        skipped_outside_root: r.get(7)?,
     })
 }
 
@@ -1105,6 +1325,10 @@ fn map_scan_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobRow> {
         error_message: r.get(11)?,
         started_at: r.get(12)?,
         finished_at: r.get(13)?,
+        kind: r.get(14)?,
+        candidate_path: r.get(15)?,
+        skipped_outside_root: r.get(16)?,
+        deferred_remove: r.get(17)?,
     })
 }
 
@@ -1141,7 +1365,7 @@ mod tests {
             .upsert_items_indexed(
                 lib.id,
                 &[UpsertItem {
-                    path: "/films/clip.mkv".into(),
+                    path: "clip.mkv".into(),
                     mtime_ms: 1,
                     size_bytes: 2,
                     title: "clip".into(),

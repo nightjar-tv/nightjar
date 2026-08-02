@@ -1,4 +1,7 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use std::path::Path;
+
+use crate::paths::{normalize_library_root, to_relpath};
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
@@ -24,6 +27,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         11,
         include_str!("../migrations/011_canonical_metadata_item_links.sql"),
     ),
+    (
+        12,
+        include_str!("../migrations/012_library_relative_paths.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -47,12 +54,12 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         if version <= current {
             continue;
         }
-        let before_items = if version == 6 {
+        let before_items = if version == 6 || version == 12 {
             count_table(conn, "media_items")?
         } else {
             0
         };
-        let before_sidecars = if version == 6 {
+        let before_sidecars = if version == 6 || version == 12 {
             count_table(conn, "media_item_sidecars")?
         } else {
             0
@@ -79,6 +86,22 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             }
         }
 
+        if version == 12 {
+            strip_paths_to_relpath(&tx)?;
+            let after_items = count_table(&tx, "media_items")?;
+            let after_sidecars = count_table(&tx, "media_item_sidecars")?;
+            if after_items != before_items {
+                return Err(format!(
+                    "migration 12 aborted: media_items count {before_items} -> {after_items}"
+                ));
+            }
+            if after_sidecars != before_sidecars {
+                return Err(format!(
+                    "migration 12 aborted: media_item_sidecars count {before_sidecars} -> {after_sidecars}"
+                ));
+            }
+        }
+
         tx.execute(
             "INSERT INTO schema_migrations (version) VALUES (?1)",
             [version],
@@ -87,6 +110,94 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         tx.commit()
             .map_err(|e| format!("commit migration {version}: {e}"))?;
         tracing::info!(version, "applied database migration");
+    }
+    Ok(())
+}
+
+/// ADR-0030 §5: strip clean prefixes; leave non-stripping rows absolute and
+/// count them on the library. Never abort boot.
+fn strip_paths_to_relpath(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    let libs: Vec<(i64, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, path FROM libraries")
+            .map_err(|e| format!("migration 12 list libraries: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("migration 12 query libraries: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("migration 12 read libraries: {e}"))?
+    };
+
+    for (lib_id, root_raw) in libs {
+        let root = normalize_library_root(&root_raw);
+        if root != root_raw {
+            tx.execute(
+                "UPDATE libraries SET path = ?2 WHERE id = ?1",
+                params![lib_id, root],
+            )
+            .map_err(|e| format!("migration 12 normalize root {lib_id}: {e}"))?;
+        }
+
+        let items: Vec<(i64, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, path FROM media_items WHERE library_id = ?1")
+                .map_err(|e| format!("migration 12 prepare items: {e}"))?;
+            let rows = stmt
+                .query_map(params![lib_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("migration 12 query items: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("migration 12 read items: {e}"))?
+        };
+
+        let mut unresolved = 0i64;
+        for (item_id, path) in items {
+            match to_relpath(&root, Path::new(&path)) {
+                Some(rel) if rel != path => {
+                    tx.execute(
+                        "UPDATE media_items SET path = ?2 WHERE id = ?1",
+                        params![item_id, rel],
+                    )
+                    .map_err(|e| format!("migration 12 item {item_id}: {e}"))?;
+                }
+                Some(_) => {}
+                None => unresolved += 1,
+            }
+        }
+
+        let sidecars: Vec<(i64, String, String)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT s.media_item_id, s.track_id, s.path FROM media_item_sidecars s
+                     JOIN media_items m ON m.id = s.media_item_id
+                     WHERE m.library_id = ?1",
+                )
+                .map_err(|e| format!("migration 12 prepare sidecars: {e}"))?;
+            let rows = stmt
+                .query_map(params![lib_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| format!("migration 12 query sidecars: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("migration 12 read sidecars: {e}"))?
+        };
+        for (media_item_id, track_id, path) in sidecars {
+            match to_relpath(&root, Path::new(&path)) {
+                Some(rel) if rel != path => {
+                    tx.execute(
+                        "UPDATE media_item_sidecars SET path = ?3
+                         WHERE media_item_id = ?1 AND track_id = ?2",
+                        params![media_item_id, track_id, rel],
+                    )
+                    .map_err(|e| format!("migration 12 sidecar {media_item_id}/{track_id}: {e}"))?;
+                }
+                Some(_) => {}
+                None => unresolved += 1,
+            }
+        }
+
+        tx.execute(
+            "UPDATE libraries SET paths_unresolved = ?2 WHERE id = ?1",
+            params![lib_id, unresolved],
+        )
+        .map_err(|e| format!("migration 12 set unresolved {lib_id}: {e}"))?;
     }
     Ok(())
 }
@@ -114,7 +225,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 11);
+        assert_eq!(v, 12);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -351,5 +462,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(moov_tables, 0);
+    }
+
+    /// Copy a real dogfood DB, migrate through 012, print strip leftovers.
+    /// Run: `NIGHTJAR_MIGRATE_COPY=/path/to/copy.db cargo test -p nightjar-db \
+    ///   migrate_copy_through_012 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: needs NIGHTJAR_MIGRATE_COPY pointing at a disposable DB copy"]
+    fn migrate_copy_through_012() {
+        let path = std::env::var("NIGHTJAR_MIGRATE_COPY")
+            .expect("NIGHTJAR_MIGRATE_COPY must point at a disposable .db copy");
+        let conn = Connection::open(&path).unwrap();
+        let version_before: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let items_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let sidecars_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_sidecars", [], |r| r.get(0))
+            .unwrap();
+        eprintln!(
+            "before: schema={version_before} items={items_before} sidecars={sidecars_before}"
+        );
+        migrate(&conn).unwrap();
+        let version_after: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let items_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let sidecars_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_sidecars", [], |r| r.get(0))
+            .unwrap();
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(paths_unresolved), 0) FROM libraries",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let abs_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items WHERE path LIKE '/%' OR substr(path, 2, 1) = ':'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let abs_sidecars: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_sidecars WHERE path LIKE '/%' OR substr(path, 2, 1) = ':'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "after: schema={version_after} items={items_after} sidecars={sidecars_after} \
+             paths_unresolved_sum={unresolved} abs_shaped_items={abs_items} abs_shaped_sidecars={abs_sidecars}"
+        );
+        assert_eq!(items_before, items_after, "media_items COUNT must hold");
+        assert_eq!(sidecars_before, sidecars_after, "sidecars COUNT must hold");
+        assert_eq!(version_after, 12);
     }
 }

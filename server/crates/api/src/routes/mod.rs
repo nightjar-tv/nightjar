@@ -22,7 +22,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/libraries",
             get(libraries::list).post(libraries::create),
         )
-        .route("/api/v0/libraries/{library_id}", get(libraries::get))
+        .route(
+            "/api/v0/libraries/{library_id}",
+            get(libraries::get).patch(libraries::patch),
+        )
         .route("/api/v0/libraries/{library_id}/scan", post(libraries::scan))
         .route("/api/v0/scan-jobs/{job_id}", get(libraries::get_scan_job))
         .route(
