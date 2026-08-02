@@ -2,10 +2,35 @@
 
 use std::path::Path;
 
-/// Prefer folder `Title (Year)` over probe year.
+/// Prefer folder `Title (Year)` over probe year (movies: parent of the file).
 pub fn year_from_path(path: &str) -> Option<i32> {
     let parent = Path::new(path).parent()?.file_name()?.to_str()?;
     year_in_parens(parent)
+}
+
+/// Show-root folder year for `…/Show Name (2001)/Season 1/…`.
+/// Library organisation signal — not years embedded in episode titles.
+pub fn year_from_show_folder(path: &str) -> Option<i32> {
+    let show = Path::new(path).parent()?.parent()?.file_name()?.to_str()?;
+    year_in_parens(show)
+}
+
+/// Series premiere year from library: earliest non-null episode `year`, else
+/// show-folder `(YYYY)`. Do not scrape years out of episode filenames.
+pub fn series_library_year(
+    episode_years: impl IntoIterator<Item = Option<i32>>,
+    episode_path: &str,
+) -> Option<i32> {
+    let mut min_y: Option<i32> = None;
+    for y in episode_years.into_iter().flatten() {
+        if (1920..=2035).contains(&y) {
+            min_y = Some(match min_y {
+                Some(m) => m.min(y),
+                None => y,
+            });
+        }
+    }
+    min_y.or_else(|| year_from_show_folder(episode_path))
 }
 
 fn year_in_parens(s: &str) -> Option<i32> {
@@ -155,6 +180,20 @@ mod tests {
         assert_eq!(
             year_from_path("/Volumes/media/Movies/Fight Club (1999)/Fight Club.mkv"),
             Some(1999)
+        );
+    }
+
+    #[test]
+    fn series_library_year_prefers_episode_then_show_folder() {
+        let path = "/Volumes/media/TV Shows/Scrubs (2001)/Season 1/Scrubs - 1x01.mkv";
+        assert_eq!(series_library_year([None, None], path), Some(2001));
+        assert_eq!(
+            series_library_year([Some(2005), Some(2001), None], path),
+            Some(2001)
+        );
+        assert_eq!(
+            series_library_year([None], "/Volumes/media/TV Shows/Bones/Season 1/x.mkv"),
+            None
         );
     }
 }

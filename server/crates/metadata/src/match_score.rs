@@ -84,11 +84,27 @@ fn title_hit(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
         || original.is_some_and(|t| norm_key(t) == query_norm)
 }
 
-/// Score TMDB search results against a cleaned filename title/year (ADR-0026 table).
+/// Score TMDB search results (ADR-0026 table + library-year pin for TV multi-exact).
+///
+/// `year` is the query/filename year when present. `library_year` is the series
+/// premiere year known from the library (earliest episode year, else show-folder
+/// `(YYYY)`). On multi exact-title hits, exactly one candidate whose
+/// `first_air_date` year equals `library_year` lifts above the floor; zero or
+/// two+ pins stay at 0.72 (One Piece guard).
 pub fn score_search(
     results: &[SearchHit],
     title: &str,
     year: Option<i32>,
+    kind: SearchKind,
+) -> Option<MatchCandidate> {
+    score_search_with_library_year(results, title, year, None, kind)
+}
+
+pub fn score_search_with_library_year(
+    results: &[SearchHit],
+    title: &str,
+    year: Option<i32>,
+    library_year: Option<i32>,
     kind: SearchKind,
 ) -> Option<MatchCandidate> {
     if results.is_empty() {
@@ -114,9 +130,24 @@ pub fn score_search(
             .unwrap();
         (hit, 0.70, "exact_title_year_nearest")
     } else if !exact.is_empty() {
-        let hit = exact[0];
-        let conf = if exact.len() == 1 { 0.90 } else { 0.72 };
-        (hit, conf, "exact_title")
+        if exact.len() == 1 {
+            (exact[0], 0.90, "exact_title")
+        } else if let Some(ly) = library_year {
+            let pinned: Vec<&SearchHit> = exact
+                .iter()
+                .copied()
+                .filter(|r| row_year(r, kind) == Some(ly))
+                .collect();
+            if pinned.len() == 1 {
+                // Multi-exact disambiguated by library premiere year.
+                (pinned[0], 0.90, "exact_title_library_year")
+            } else {
+                // Pins nothing or ≥2 — stay unmatched (floor guard).
+                (exact[0], 0.72, "exact_title")
+            }
+        } else {
+            (exact[0], 0.72, "exact_title")
+        }
     } else {
         let hit = &results[0];
         let mut conf = if results.len() == 1 { 0.55 } else { 0.45 };
@@ -156,6 +187,18 @@ mod tests {
         }
     }
 
+    fn tv(id: i64, name: &str, year: i32) -> SearchHit {
+        SearchHit {
+            id,
+            title: None,
+            name: Some(name.into()),
+            original_title: None,
+            original_name: Some(name.into()),
+            release_date: None,
+            first_air_date: Some(format!("{year}-01-01")),
+        }
+    }
+
     #[test]
     fn unique_title_year_is_0_98() {
         let results = vec![movie(550, "Fight Club", 1999)];
@@ -168,30 +211,57 @@ mod tests {
 
     #[test]
     fn multi_exact_title_is_0_72_below_floor() {
-        let results = vec![
-            SearchHit {
-                id: 37854,
-                title: None,
-                name: Some("One Piece".into()),
-                original_title: None,
-                original_name: Some("One Piece".into()),
-                release_date: None,
-                first_air_date: Some("1999-10-20".into()),
-            },
-            SearchHit {
-                id: 111110,
-                title: None,
-                name: Some("One Piece".into()),
-                original_title: None,
-                original_name: Some("One Piece".into()),
-                release_date: None,
-                first_air_date: Some("2023-08-31".into()),
-            },
-        ];
+        let results = vec![tv(37854, "One Piece", 1999), tv(111110, "One Piece", 2023)];
         let m = score_search(&results, "One Piece", None, SearchKind::Tv).unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
         assert!(!meets_auto_match_floor(m.confidence));
         assert_eq!(m.method, "exact_title");
+    }
+
+    #[test]
+    fn library_year_pins_unique_multi_exact_above_floor() {
+        let results = vec![tv(37854, "One Piece", 1999), tv(111110, "One Piece", 2023)];
+        let m =
+            score_search_with_library_year(&results, "One Piece", None, Some(1999), SearchKind::Tv)
+                .unwrap();
+        assert_eq!(m.tmdb_id, 37854);
+        assert!((m.confidence - 0.90).abs() < f64::EPSILON);
+        assert!(meets_auto_match_floor(m.confidence));
+        assert_eq!(m.method, "exact_title_library_year");
+    }
+
+    #[test]
+    fn library_year_wrong_side_still_pins_that_year_only() {
+        // If library year were 2023 (mis-tagged), pin live-action — caller's
+        // year source must be trustworthy; scorer only counts the pin.
+        let results = vec![tv(37854, "One Piece", 1999), tv(111110, "One Piece", 2023)];
+        let m =
+            score_search_with_library_year(&results, "One Piece", None, Some(2023), SearchKind::Tv)
+                .unwrap();
+        assert_eq!(m.tmdb_id, 111110);
+        assert_eq!(m.method, "exact_title_library_year");
+    }
+
+    #[test]
+    fn library_year_pins_nothing_stays_0_72() {
+        let results = vec![tv(1, "Bones", 2005), tv(2, "Bones", 2019)];
+        let m = score_search_with_library_year(&results, "Bones", None, Some(1990), SearchKind::Tv)
+            .unwrap();
+        assert!((m.confidence - 0.72).abs() < f64::EPSILON);
+        assert_eq!(m.method, "exact_title");
+    }
+
+    #[test]
+    fn library_year_pins_two_stays_0_72() {
+        let results = vec![
+            tv(1, "Show", 2001),
+            tv(2, "Show", 2001),
+            tv(3, "Show", 2010),
+        ];
+        let m = score_search_with_library_year(&results, "Show", None, Some(2001), SearchKind::Tv)
+            .unwrap();
+        assert!((m.confidence - 0.72).abs() < f64::EPSILON);
+        assert!(!meets_auto_match_floor(m.confidence));
     }
 
     #[test]

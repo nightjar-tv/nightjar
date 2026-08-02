@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use nightjar_metadata::{
     AUTO_MATCH_FLOOR, SearchKind, TmdbClient, TmdbCredentials, clean_movie_title, clean_show_title,
-    meets_auto_match_floor, year_from_path,
+    meets_auto_match_floor, series_library_year, year_from_path,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -31,7 +31,10 @@ enum QueryKind {
 struct QueryKey {
     kind: QueryKind,
     title: String,
+    /// Query/filename year (movies; rare on show titles).
     year: Option<i32>,
+    /// Series premiere year from library (TV only).
+    library_year: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,9 +55,11 @@ struct Report {
     unique_queries: usize,
     movies: BucketStats,
     episodes: BucketStats,
-    combined: BucketStats,
+    /// Episode items matched via the library-year pin (scorer change).
+    episode_library_year_pin_items: usize,
     /// Below-threshold items / total — fragile path-key watch state (ADR-0025/0026).
     fragile_watch_state_fraction: f64,
+    combined: BucketStats,
     elapsed_secs: f64,
     note: String,
 }
@@ -122,19 +127,37 @@ fn main() {
             kind: QueryKind::Movie,
             title: ct,
             year: cy,
+            library_year: None,
         };
         movie_groups.entry(key).or_default().push(*id);
     }
 
+    // Group episodes by cleaned show title; library year from min(episode.year)
+    // else show-folder (YYYY).
+    let mut ep_raw: HashMap<String, Vec<(i64, Option<i32>, String)>> = HashMap::new();
+    for (id, title, year, path) in &episodes {
+        let (ct, _cy) = clean_show_title(title);
+        ep_raw
+            .entry(ct)
+            .or_default()
+            .push((*id, *year, path.clone()));
+    }
+
     let mut ep_groups: HashMap<QueryKey, Vec<i64>> = HashMap::new();
-    for (id, title, _year, _path) in &episodes {
-        let (ct, cy) = clean_show_title(title);
+    for (ct, rows) in ep_raw {
+        let years = rows.iter().map(|(_, y, _)| *y);
+        let path0 = &rows[0].2;
+        let library_year = series_library_year(years, path0);
         let key = QueryKey {
             kind: QueryKind::Tv,
             title: ct,
-            year: cy,
+            year: None, // don't pass folder year as API search filter
+            library_year,
         };
-        ep_groups.entry(key).or_default().push(*id);
+        ep_groups
+            .entry(key)
+            .or_default()
+            .extend(rows.into_iter().map(|(id, _, _)| id));
     }
 
     let unique = movie_groups.len() + ep_groups.len();
@@ -148,6 +171,7 @@ fn main() {
 
     let started = Instant::now();
     let mut done = 0usize;
+    let mut library_pin_items = 0usize;
 
     let mut score_group = |key: &QueryKey,
                            ids: &[i64],
@@ -164,8 +188,13 @@ fn main() {
             QueryKind::Tv => SearchKind::Tv,
         };
         let n = ids.len();
-        match client.match_search(kind, &key.title, key.year) {
-            Ok(Some(c)) if meets_auto_match_floor(c.confidence) => *matched += n,
+        match client.match_search_with_library_year(kind, &key.title, key.year, key.library_year) {
+            Ok(Some(c)) if meets_auto_match_floor(c.confidence) => {
+                if c.method == "exact_title_library_year" {
+                    library_pin_items += n;
+                }
+                *matched += n;
+            }
             Ok(Some(_)) => *below += n,
             Ok(None) => *miss += n,
             Err(e) => {
@@ -238,14 +267,15 @@ fn main() {
         unique_queries: unique,
         movies: bucket(movies_n, m_matched, m_below, m_miss, m_err),
         episodes: bucket(episodes_n, e_matched, e_below, e_miss, e_err),
-        combined: bucket(total, c_matched, c_below, c_miss, c_err),
+        episode_library_year_pin_items: library_pin_items,
         fragile_watch_state_fraction: if total == 0 {
             0.0
         } else {
             c_below as f64 / total as f64
         },
+        combined: bucket(total, c_matched, c_below, c_miss, c_err),
         elapsed_secs: started.elapsed().as_secs_f64(),
-        note: "Search+confidence only (no detail). Episodes expand from unique show queries. Below-threshold fraction == fragile path-key watch state (ADR-0026)."
+        note: "Search+confidence only. TV multi-exact pinned by library_year (earliest episode year else show-folder YYYY). Region tags untouched."
             .into(),
     };
 

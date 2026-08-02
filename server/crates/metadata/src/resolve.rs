@@ -16,6 +16,9 @@ pub struct ResolveInput {
     /// Cleaned title for provider search when NFO is absent.
     pub title: Option<String>,
     pub year: Option<i32>,
+    /// Series premiere year from the library (earliest episode year, else
+    /// show-folder `(YYYY)`). Used to pin multi exact-title TV hits.
+    pub library_year: Option<i32>,
     /// Search target; episodes search as TV (ADR-0026).
     pub kind: Option<MetadataKind>,
 }
@@ -222,6 +225,7 @@ mod tests {
             nfo_xml: Some(fixture("malformed.nfo")),
             title: Some("Fight Club".into()),
             year: Some(1999),
+            library_year: None,
             kind: Some(MetadataKind::Movie),
         })
         .unwrap();

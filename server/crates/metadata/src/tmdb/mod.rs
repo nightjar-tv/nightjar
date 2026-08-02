@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::match_score::{
-    MatchCandidate, SearchHit, SearchKind, meets_auto_match_floor, score_search,
+    MatchCandidate, SearchHit, SearchKind, meets_auto_match_floor, score_search_with_library_year,
 };
 use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
@@ -190,8 +190,26 @@ impl TmdbClient {
         title: &str,
         year: Option<i32>,
     ) -> Result<Option<MatchCandidate>, ResolveError> {
+        self.match_search_with_library_year(kind, title, year, None)
+    }
+
+    pub fn match_search_with_library_year(
+        &self,
+        kind: SearchKind,
+        title: &str,
+        year: Option<i32>,
+        library_year: Option<i32>,
+    ) -> Result<Option<MatchCandidate>, ResolveError> {
+        // Search without forcing `library_year` into the API year filter so
+        // multi-exact candidates remain visible for the pin guardrails.
         let results = self.search(kind, title, year)?;
-        Ok(score_search(&results, title, year, kind))
+        Ok(score_search_with_library_year(
+            &results,
+            title,
+            year,
+            library_year,
+            kind,
+        ))
     }
 
     pub fn movie_detail(
@@ -238,11 +256,23 @@ impl TmdbClient {
         title: &str,
         year: Option<i32>,
     ) -> Result<TmdbResolve, ResolveError> {
+        self.resolve_title_with_library_year(kind, title, year, None)
+    }
+
+    pub fn resolve_title_with_library_year(
+        &self,
+        kind: MetadataKind,
+        title: &str,
+        year: Option<i32>,
+        library_year: Option<i32>,
+    ) -> Result<TmdbResolve, ResolveError> {
         let search_kind = match kind {
             MetadataKind::Movie => SearchKind::Movie,
             MetadataKind::Episode | MetadataKind::Show => SearchKind::Tv,
         };
-        let Some(candidate) = self.match_search(search_kind, title, year)? else {
+        let Some(candidate) =
+            self.match_search_with_library_year(search_kind, title, year, library_year)?
+        else {
             return Ok(TmdbResolve::NoResults);
         };
         if !meets_auto_match_floor(candidate.confidence) {
@@ -279,7 +309,7 @@ impl MetadataSource for TmdbClient {
             return Ok(ProviderResult::Miss);
         };
         let kind = input.kind.unwrap_or(MetadataKind::Movie);
-        match self.resolve_title(kind, title, input.year)? {
+        match self.resolve_title_with_library_year(kind, title, input.year, input.library_year)? {
             TmdbResolve::Matched { metadata, .. } => Ok(ProviderResult::Hit(metadata)),
             TmdbResolve::BelowThreshold { candidate } => Ok(ProviderResult::BelowThreshold {
                 confidence: candidate.confidence,

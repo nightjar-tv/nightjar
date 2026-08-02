@@ -11,10 +11,12 @@ mod nfo;
 mod resolve;
 mod tmdb;
 
-pub use clean::{clean_movie_title, clean_show_title, year_from_path};
+pub use clean::{
+    clean_movie_title, clean_show_title, series_library_year, year_from_path, year_from_show_folder,
+};
 pub use match_score::{
     AUTO_MATCH_FLOOR, MatchCandidate, SearchHit, SearchKind, meets_auto_match_floor, norm_key,
-    score_search,
+    score_search, score_search_with_library_year,
 };
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
