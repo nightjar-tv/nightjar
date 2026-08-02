@@ -13,10 +13,8 @@
 //! play). It is not a per-DV-profile render proof.
 //!
 //! `BROWSER_V0` / `NO_HDR_WIDE` rows assert routing (method + that a tonemap
-//! path was selected), not colour fidelity. A `transcode` + `tonemappedSdr`
-//! pass for P5 is expected today even though `zscale` ignores the RPU and the
-//! pixels will be wrong — that is a known encode gap, not a green light on
-//! beauty.
+//! path was selected), not colour fidelity. Profile 5 is refuse-with-reason
+//! (no tonemap attempt); other DV rows may still select tonemap.
 //!
 //! Wrong current behaviour is encoded as the correct expectation with
 //! `HdrCase.ignore` set (row skipped), not as an assertion of the bug.
@@ -449,25 +447,48 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
                 probe.hdr.as_deref(),
                 &BROWSER_V0,
             );
-            assert!(
-                plan.tone_map,
-                "{}: encode plan must tone-map HDR sources",
-                case.rel
-            );
+            let is_p5 = probe.hdr.as_deref() == Some("dolby_vision_p5");
+            if is_p5 {
+                assert!(
+                    !plan.tone_map,
+                    "{}: P5 encode plan must not tonemap",
+                    case.rel
+                );
+                assert_eq!(
+                    probe.hdr.as_deref(),
+                    Some("dolby_vision_p5"),
+                    "{}: probe must store dolby_vision_p5",
+                    case.rel
+                );
+            } else {
+                assert!(
+                    plan.tone_map,
+                    "{}: encode plan must tone-map HDR sources",
+                    case.rel
+                );
+            }
 
-            // refuse-with-reason: host without zscale still decides Transcode,
-            // with an explicit reason session start can 415 on (ADR-0022).
+            // refuse-with-reason: session start can 415 on the named gap.
             if case.browser.method == PlaybackMethod::Transcode
                 || case.no_hdr.method == PlaybackMethod::Transcode
             {
                 let refused = decide_for(&path, &NO_HDR_WIDE, false);
                 assert_eq!(refused.method, PlaybackMethod::Transcode);
-                assert!(
-                    refused.reason.contains("lacks zscale"),
-                    "{}: expected refuse-with-reason naming zscale, got {}",
-                    case.rel,
-                    refused.reason
-                );
+                if is_p5 {
+                    assert!(
+                        refused.reason.contains("Profile 5"),
+                        "{}: expected P5 refuse-with-reason, got {}",
+                        case.rel,
+                        refused.reason
+                    );
+                } else {
+                    assert!(
+                        refused.reason.contains("lacks zscale"),
+                        "{}: expected refuse-with-reason naming zscale, got {}",
+                        case.rel,
+                        refused.reason
+                    );
+                }
             }
         }
 

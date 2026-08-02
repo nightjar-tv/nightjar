@@ -14,7 +14,8 @@ pub struct ProbeResult {
     pub height: Option<i32>,
     /// Video stream bitrate when ffprobe reports it (ADR-0022).
     pub video_bitrate_bps: Option<i64>,
-    /// `none` | `hdr10` | `dolby_vision` (ADR-0022).
+    /// `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` (ADR-0022).
+    /// Profile 5 is distinct: IPT-PQ has no zscale tonemap path.
     pub hdr: Option<String>,
 }
 
@@ -47,6 +48,8 @@ struct FfStream {
 #[derive(Debug, Deserialize)]
 struct FfSideData {
     side_data_type: Option<String>,
+    /// Present on DOVI configuration records (ffprobe).
+    dv_profile: Option<u64>,
 }
 
 const STDERR_TAIL: usize = 512;
@@ -159,6 +162,10 @@ fn classify_hdr(color_transfer: Option<&str>, side_data: &[FfSideData]) -> Strin
         };
         let lower = t.to_ascii_lowercase();
         if lower.contains("dovi") || lower.contains("dolby vision") {
+            // Profile 5 is IPT-PQ; zscale+hable cannot map it (no colourspace path).
+            if side.dv_profile == Some(5) {
+                return "dolby_vision_p5".into();
+            }
             return "dolby_vision".into();
         }
     }
@@ -235,9 +242,20 @@ mod tests {
                 Some("bt709"),
                 &[FfSideData {
                     side_data_type: Some("DOVI configuration record".into()),
+                    dv_profile: Some(8),
                 }]
             ),
             "dolby_vision"
+        );
+        assert_eq!(
+            classify_hdr(
+                None,
+                &[FfSideData {
+                    side_data_type: Some("DOVI configuration record".into()),
+                    dv_profile: Some(5),
+                }]
+            ),
+            "dolby_vision_p5"
         );
     }
 }

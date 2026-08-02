@@ -68,6 +68,6 @@ row as device coverage.
 
 `BROWSER_V0` and the no-HDR wide profile assert routing (which method and
 whether a tonemap encode was selected), not colour fidelity. A
-`transcode` + `tonemappedSdr` pass for Dolby Vision P5 is expected today even
-though `zscale` ignores the RPU and the pixels will be wrong.
+Dolby Vision Profile 5 is refuse-with-reason at decide/session start (no
+tonemap attempt). Other HDR/DV rows may still select `tonemappedSdr`.
 

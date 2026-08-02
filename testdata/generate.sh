@@ -226,9 +226,10 @@ gen _pgs_video.mp4 \
 rm -f "$OUT/_pgs_video.mp4" "$OUT/_tmp.sup"
 
 # 22. HDR10: HEVC 10-bit + PQ / BT.2020 + master-display / max-cll
+# ≥12s so seek/tonemap samples (e.g. -ss 5 -t 10) are valid.
 gen hevc_hdr10_mp4.mp4 \
-  -f lavfi -i "testsrc=size=1280x720:rate=24:duration=2" \
-  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -f lavfi -i "testsrc=size=1280x720:rate=24:duration=12" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=12" \
   -c:v libx265 -pix_fmt yuv420p10le -tag:v hvc1 \
   -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
   -c:a aac -ac 2 -shortest
@@ -302,14 +303,18 @@ if DOVI_TOOL="$(find_tool dovi_tool)" && MKVMERGE="$(find_tool mkvmerge)" \
   && [[ -f "$DOVI_P84_JSON" ]]; then
   echo "→ hevc_dv_p84_hlg_mkv.mkv (+ mp4 when inject_dvvc.py works)"
   TMP_P84="$(mktemp -d)"
+  # ≥12s (see HDR10 control); RPU length comes from assets/dovi_p84_gen.json.
+  # Colour must live in the HEVC VUI (x265-params). Container tags alone are
+  # lost after inject-rpu/mkvmerge; without transfer/primaries, product
+  # zscale+hable fails with "no path between colorspaces".
   "$FFMPEG" -y -hide_banner -loglevel error \
-    -f lavfi -i "testsrc2=size=1280x720:rate=24:duration=2" \
+    -f lavfi -i "testsrc2=size=1280x720:rate=24:duration=12" \
     -c:v libx265 -pix_fmt yuv420p10le -crf 28 \
-    -x265-params "repeat-headers=1:annexb=1:keyint=24:min-keyint=24" \
+    -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:repeat-headers=1:annexb=1:keyint=24:min-keyint=24" \
     -color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc \
     -an -f hevc "$TMP_P84/hlg.hevc"
   "$FFMPEG" -y -hide_banner -loglevel error \
-    -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=12" \
     -c:a aac -ac 2 "$TMP_P84/a.m4a"
   "$DOVI_TOOL" generate -j "$DOVI_P84_JSON" -o "$TMP_P84/p84.rpu"
   "$DOVI_TOOL" inject-rpu -i "$TMP_P84/hlg.hevc" --rpu-in "$TMP_P84/p84.rpu" \
