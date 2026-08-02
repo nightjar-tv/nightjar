@@ -161,6 +161,16 @@ ignores the cache for that lookup. The fix-match UI and any "retry
 metadata" admin action go through that path. Path changes that alter
 `query_key` naturally miss the old row; that is intended.
 
+**Cleaner / `query_key` version.** A path rename orphaning one key is
+different from a title-cleaner change, which re-keys the whole library at
+once. Old rows become unhittable sediment — invisible to live lookups,
+indistinguishable from live rows in a dump. Do not treat historical
+negative-cache CSVs as a live bug list without reproducing each row
+against the current cleaner. The table needs either a **cleaner-version
+stamp** on each row (misses with a mismatched stamp are ignored and
+rewritten) or an explicit **sweep on cleaner change**. Pick the shape
+when the stamp/sweep lands; until then, provenance-check before acting.
+
 ### 4. Raw provider payload persistence
 
 Persist the raw JSON returned by TMDB for each fetched entity, keyed by
@@ -444,6 +454,10 @@ only on the ready subset.
 - Filename cleaner folds (`and`↔`&`, apostrophes, colons, diacritics) share
   one `norm_key` path. New folds need a corpus fixture row
   (`fold_corpus.json`) before the rule — same discipline as a playback bug.
+  Cleaner changes re-key the negative-result cache (§3); ship a version
+  stamp or sweep so old rows do not accumulate as unhittable sediment.
+  Historical cache dumps are not a live bug list without current-cleaner
+  repro.
 - **Raw payload store size (measured 2026-08-02, dogfood, testdata
   excluded):** `SUM(LENGTH(payload))` = **317 MiB** across 4,193 entity
   rows (1,721 movie / 682 tv / 1,790 season). The §4 projection of
