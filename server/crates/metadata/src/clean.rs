@@ -1,4 +1,4 @@
-//! Filename / folder title cleaning for search inputs (spike parity).
+//! Filename / folder title cleaning for search inputs.
 
 use std::path::Path;
 
@@ -9,14 +9,13 @@ pub fn year_from_path(path: &str) -> Option<i32> {
 }
 
 /// Show-root folder year for `…/Show Name (2001)/Season 1/…`.
-/// Library organisation signal — not years embedded in episode titles.
 pub fn year_from_show_folder(path: &str) -> Option<i32> {
     let show = Path::new(path).parent()?.parent()?.file_name()?.to_str()?;
     year_in_parens(show)
 }
 
 /// Series premiere year from library: earliest non-null episode `year`, else
-/// show-folder `(YYYY)`. Do not scrape years out of episode filenames.
+/// show-folder `(YYYY)`.
 pub fn series_library_year(
     episode_years: impl IntoIterator<Item = Option<i32>>,
     episode_path: &str,
@@ -81,21 +80,24 @@ fn strip_year_parens(s: &str) -> String {
 }
 
 fn first_year_in_parens(s: &str) -> Option<i32> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 5 < bytes.len() {
-        if bytes[i] == b'('
-            && bytes[i + 1].is_ascii_digit()
-            && bytes[i + 2].is_ascii_digit()
-            && bytes[i + 3].is_ascii_digit()
-            && bytes[i + 4].is_ascii_digit()
-            && bytes[i + 5] == b')'
-        {
-            return std::str::from_utf8(&bytes[i + 1..i + 5]).ok()?.parse().ok();
+    year_in_parens(s).or_else(|| {
+        // year_in_parens requires 1920–2035; first_year keeps any four digits
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i + 5 < bytes.len() {
+            if bytes[i] == b'('
+                && bytes[i + 1].is_ascii_digit()
+                && bytes[i + 2].is_ascii_digit()
+                && bytes[i + 3].is_ascii_digit()
+                && bytes[i + 4].is_ascii_digit()
+                && bytes[i + 5] == b')'
+            {
+                return std::str::from_utf8(&bytes[i + 1..i + 5]).ok()?.parse().ok();
+            }
+            i += 1;
         }
-        i += 1;
-    }
-    None
+        None
+    })
 }
 
 const JUNK_TOKENS: &[&str] = &[
@@ -110,7 +112,6 @@ fn strip_junk(s: &str) -> String {
     let mut cut = lower.len();
     for tok in JUNK_TOKENS {
         if let Some(idx) = lower.find(tok) {
-            // Only treat as release junk when preceded by separator-ish chars.
             let ok_boundary = idx == 0
                 || matches!(
                     lower.as_bytes()[idx - 1],
@@ -128,10 +129,73 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn is_combining_mark(c: char) -> bool {
+    matches!(c, '\u{0300}'..='\u{036F}')
+}
+
+/// Map common Latin diacritics to ASCII (dogfood set; no unicode-norm crate).
+fn strip_diacritics(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_combining_mark(c) {
+            continue;
+        }
+        let repl = match c {
+            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => "A",
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => "a",
+            'È' | 'É' | 'Ê' | 'Ë' => "E",
+            'è' | 'é' | 'ê' | 'ë' => "e",
+            'Ì' | 'Í' | 'Î' | 'Ï' => "I",
+            'ì' | 'í' | 'î' | 'ï' => "i",
+            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' => "O",
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => "o",
+            'Ù' | 'Ú' | 'Û' | 'Ü' => "U",
+            'ù' | 'ú' | 'û' | 'ü' => "u",
+            'Ý' => "Y",
+            'ý' | 'ÿ' => "y",
+            'Ñ' => "N",
+            'ñ' => "n",
+            'Ç' => "C",
+            'ç' => "c",
+            'Æ' => "AE",
+            'æ' => "ae",
+            'Œ' => "OE",
+            'œ' => "oe",
+            'ß' => "ss",
+            '²' => "2",
+            'Ð' => "D",
+            'ð' => "d",
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        out.push_str(repl);
+    }
+    out
+}
+
+/// Fold punctuation / orthography so library titles match TMDB:
+/// `and`↔`&`, apostrophes (ASCII + U+2019), colons, diacritics.
+pub fn fold_title_orthography(s: &str) -> String {
+    let s = strip_diacritics(s);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str(" and "),
+            '\'' | '\u{2018}' | '\u{2019}' | '`' => {}
+            ':' | '/' | '.' | ',' | '!' | '?' | '…' | '-' | '—' | '–' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    collapse_ws(&out)
+}
+
 pub fn clean_movie_title(raw: &str, year: Option<i32>) -> (String, Option<i32>) {
     let mut y = year.or_else(|| year_in_parens(raw));
     let mut t = strip_year_parens(raw.trim());
     t = strip_junk(&t);
+    t = fold_title_orthography(&t);
     t = collapse_ws(&t)
         .trim_matches(|c: char| " .-_".contains(c))
         .to_string();
@@ -150,6 +214,7 @@ pub fn clean_movie_title(raw: &str, year: Option<i32>) -> (String, Option<i32>) 
 pub fn clean_show_title(raw: &str) -> (String, Option<i32>) {
     let y = first_year_in_parens(raw.trim());
     let mut t = strip_year_parens(raw.trim());
+    t = fold_title_orthography(&t);
     t = collapse_ws(&t)
         .trim_matches(|c: char| " .-_".contains(c))
         .to_string();
@@ -170,7 +235,6 @@ mod tests {
     #[test]
     fn show_year_tag() {
         let (t, y) = clean_show_title("Heartland (2007) (CA)");
-        // Spike cleaner strips `(YYYY)` only; region tags remain.
         assert_eq!(t, "Heartland (CA)");
         assert_eq!(y, Some(2007));
     }
@@ -194,6 +258,28 @@ mod tests {
         assert_eq!(
             series_library_year([None], "/Volumes/media/TV Shows/Bones/Season 1/x.mkv"),
             None
+        );
+    }
+
+    #[test]
+    fn folds_ampersand_apostrophe_colon_diacritic() {
+        assert_eq!(
+            fold_title_orthography("Angels & Demons"),
+            "Angels and Demons"
+        );
+        assert_eq!(
+            fold_title_orthography("Angels and Demons"),
+            "Angels and Demons"
+        );
+        assert_eq!(fold_title_orthography("A Bug's Life"), "A Bugs Life");
+        assert_eq!(fold_title_orthography("A Bug\u{2019}s Life"), "A Bugs Life");
+        assert_eq!(
+            fold_title_orthography("Joker: Folie à Deux"),
+            "Joker Folie a Deux"
+        );
+        assert_eq!(
+            fold_title_orthography("Léon The Professional"),
+            "Leon The Professional"
         );
     }
 }

@@ -19,6 +19,9 @@ pub struct ResolveInput {
     /// Series premiere year from the library (earliest episode year, else
     /// show-folder `(YYYY)`). Used to pin multi exact-title TV hits.
     pub library_year: Option<i32>,
+    /// Distinct episode files / seasons under the show (TV collision pin).
+    pub library_episode_count: Option<u32>,
+    pub library_season_count: Option<u32>,
     /// Search target; episodes search as TV (ADR-0026).
     pub kind: Option<MetadataKind>,
 }
@@ -226,6 +229,8 @@ mod tests {
             title: Some("Fight Club".into()),
             year: Some(1999),
             library_year: None,
+            library_episode_count: None,
+            library_season_count: None,
             kind: Some(MetadataKind::Movie),
         })
         .unwrap();

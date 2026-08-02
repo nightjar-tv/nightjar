@@ -12,11 +12,13 @@ mod resolve;
 mod tmdb;
 
 pub use clean::{
-    clean_movie_title, clean_show_title, series_library_year, year_from_path, year_from_show_folder,
+    clean_movie_title, clean_show_title, fold_title_orthography, series_library_year,
+    year_from_path, year_from_show_folder,
 };
 pub use match_score::{
-    AUTO_MATCH_FLOOR, MatchCandidate, SearchHit, SearchKind, meets_auto_match_floor, norm_key,
-    score_search, score_search_with_library_year,
+    AUTO_MATCH_FLOOR, CandidateShape, LibrarySeriesShape, MatchCandidate, SearchHit, SearchKind,
+    meets_auto_match_floor, needs_collision_detail, norm_key, score_search,
+    score_search_with_library_year, score_search_with_shape,
 };
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,

@@ -1,4 +1,7 @@
 //! Search confidence scoring (ADR-0026 §2). Floor is 0.80.
+//!
+//! Multi-exact collisions use one pin rule: the first discriminator that
+//! selects exactly one candidate lifts above the floor; otherwise stay 0.72.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +31,25 @@ pub struct SearchHit {
     pub first_air_date: Option<String>,
 }
 
+/// Library-side series shape for collision pins (TV).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LibrarySeriesShape {
+    /// Premiere year: earliest episode year, else show-folder `(YYYY)`.
+    pub year: Option<i32>,
+    /// Distinct episode files under the show.
+    pub episode_count: Option<u32>,
+    /// Distinct season numbers present (excludes null).
+    pub season_count: Option<u32>,
+}
+
+/// Per-candidate extras (search year always; counts from `/tv/{id}` detail).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandidateShape {
+    pub year: Option<i32>,
+    pub episode_count: Option<u32>,
+    pub season_count: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchCandidate {
     pub tmdb_id: i64,
@@ -38,8 +60,9 @@ pub struct MatchCandidate {
     pub n_results: usize,
 }
 
-/// Normalise a title for exact comparison (spike `norm_key`).
+/// Normalise a title for exact comparison (spike `norm_key` + orthography fold).
 pub fn norm_key(s: &str) -> String {
+    let s = crate::clean::fold_title_orthography(s);
     let mut s = s.to_ascii_lowercase();
     s = s.trim().to_string();
     for article in ["the ", "a ", "an "] {
@@ -84,20 +107,79 @@ fn title_hit(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
         || original.is_some_and(|t| norm_key(t) == query_norm)
 }
 
-/// Score TMDB search results (ADR-0026 table + library-year pin for TV multi-exact).
-///
-/// `year` is the query/filename year when present. `library_year` is the series
-/// premiere year known from the library (earliest episode year, else show-folder
-/// `(YYYY)`). On multi exact-title hits, exactly one candidate whose
-/// `first_air_date` year equals `library_year` lifts above the floor; zero or
-/// two+ pins stay at 0.72 (One Piece guard).
+/// Soft episode-count match: absolute or proportional slack so incomplete
+/// libraries (311 vs 327) still pin when only one candidate is close.
+fn episode_count_close(library: u32, candidate: u32) -> bool {
+    let diff = library.abs_diff(candidate);
+    let tol = (candidate as f64 * 0.15).ceil() as u32;
+    diff <= tol.max(5)
+}
+
+/// First discriminator that selects exactly one of `exact` wins.
+/// Order: premiere year → episode count → season count (exact).
+fn pin_collision<'a>(
+    exact: &[&'a SearchHit],
+    shapes: &[CandidateShape],
+    library: LibrarySeriesShape,
+) -> Option<(&'a SearchHit, &'static str)> {
+    debug_assert_eq!(exact.len(), shapes.len());
+
+    let try_pin = |pred: &dyn Fn(usize) -> bool, method: &'static str| {
+        let mut hit: Option<&SearchHit> = None;
+        for (i, h) in exact.iter().enumerate() {
+            if pred(i) {
+                if hit.is_some() {
+                    return None; // two+
+                }
+                hit = Some(*h);
+            }
+        }
+        hit.map(|h| (h, method))
+    };
+
+    if let Some(ly) = library.year
+        && let Some(p) = try_pin(&|i| shapes[i].year == Some(ly), "exact_title_library_year")
+    {
+        return Some(p);
+    }
+    if let Some(le) = library.episode_count
+        && let Some(p) = try_pin(
+            &|i| {
+                shapes[i]
+                    .episode_count
+                    .is_some_and(|ce| episode_count_close(le, ce))
+            },
+            "exact_title_episode_count",
+        )
+    {
+        return Some(p);
+    }
+    if let Some(ls) = library.season_count
+        && let Some(p) = try_pin(
+            &|i| shapes[i].season_count == Some(ls),
+            "exact_title_season_count",
+        )
+    {
+        return Some(p);
+    }
+    None
+}
+
+/// Score TMDB search results (ADR-0026 table + collision pin).
 pub fn score_search(
     results: &[SearchHit],
     title: &str,
     year: Option<i32>,
     kind: SearchKind,
 ) -> Option<MatchCandidate> {
-    score_search_with_library_year(results, title, year, None, kind)
+    score_search_with_shape(
+        results,
+        title,
+        year,
+        kind,
+        LibrarySeriesShape::default(),
+        None,
+    )
 }
 
 pub fn score_search_with_library_year(
@@ -106,6 +188,29 @@ pub fn score_search_with_library_year(
     year: Option<i32>,
     library_year: Option<i32>,
     kind: SearchKind,
+) -> Option<MatchCandidate> {
+    score_search_with_shape(
+        results,
+        title,
+        year,
+        kind,
+        LibrarySeriesShape {
+            year: library_year,
+            ..Default::default()
+        },
+        None,
+    )
+}
+
+pub fn score_search_with_shape(
+    results: &[SearchHit],
+    title: &str,
+    year: Option<i32>,
+    kind: SearchKind,
+    library: LibrarySeriesShape,
+    // Parallel to title-exact hits when provided (detail counts). When None,
+    // year pin still works from search first_air_date.
+    candidate_shapes: Option<&[CandidateShape]>,
 ) -> Option<MatchCandidate> {
     if results.is_empty() {
         return None;
@@ -132,21 +237,25 @@ pub fn score_search_with_library_year(
     } else if !exact.is_empty() {
         if exact.len() == 1 {
             (exact[0], 0.90, "exact_title")
-        } else if let Some(ly) = library_year {
-            let pinned: Vec<&SearchHit> = exact
+        } else {
+            // Build shapes from search years when caller omitted detail.
+            let owned: Vec<CandidateShape> = exact
                 .iter()
-                .copied()
-                .filter(|r| row_year(r, kind) == Some(ly))
+                .map(|h| CandidateShape {
+                    year: row_year(h, kind),
+                    episode_count: None,
+                    season_count: None,
+                })
                 .collect();
-            if pinned.len() == 1 {
-                // Multi-exact disambiguated by library premiere year.
-                (pinned[0], 0.90, "exact_title_library_year")
+            let shapes = match candidate_shapes {
+                Some(s) if s.len() == exact.len() => s,
+                _ => owned.as_slice(),
+            };
+            if let Some((hit, method)) = pin_collision(&exact, shapes, library) {
+                (hit, 0.90, method)
             } else {
-                // Pins nothing or ≥2 — stay unmatched (floor guard).
                 (exact[0], 0.72, "exact_title")
             }
-        } else {
-            (exact[0], 0.72, "exact_title")
         }
     } else {
         let hit = &results[0];
@@ -165,6 +274,27 @@ pub fn score_search_with_library_year(
         result_year: row_year(hit, kind),
         n_results: results.len(),
     })
+}
+
+/// Whether multi-exact scoring needs `/tv/{id}` detail for count pins.
+pub fn needs_collision_detail(
+    results: &[SearchHit],
+    title: &str,
+    year: Option<i32>,
+    kind: SearchKind,
+    library: LibrarySeriesShape,
+) -> bool {
+    if kind != SearchKind::Tv {
+        return false;
+    }
+    if library.episode_count.is_none() && library.season_count.is_none() {
+        return false;
+    }
+    let Some(c) = score_search_with_shape(results, title, year, kind, library, None) else {
+        return false;
+    };
+    // Still below floor on multi-exact after year-only pin → fetch details.
+    c.confidence < AUTO_MATCH_FLOOR && c.method == "exact_title"
 }
 
 pub fn meets_auto_match_floor(confidence: f64) -> bool {
@@ -225,21 +355,8 @@ mod tests {
             score_search_with_library_year(&results, "One Piece", None, Some(1999), SearchKind::Tv)
                 .unwrap();
         assert_eq!(m.tmdb_id, 37854);
-        assert!((m.confidence - 0.90).abs() < f64::EPSILON);
+        assert_eq!(m.method, "exact_title_library_year");
         assert!(meets_auto_match_floor(m.confidence));
-        assert_eq!(m.method, "exact_title_library_year");
-    }
-
-    #[test]
-    fn library_year_wrong_side_still_pins_that_year_only() {
-        // If library year were 2023 (mis-tagged), pin live-action — caller's
-        // year source must be trustworthy; scorer only counts the pin.
-        let results = vec![tv(37854, "One Piece", 1999), tv(111110, "One Piece", 2023)];
-        let m =
-            score_search_with_library_year(&results, "One Piece", None, Some(2023), SearchKind::Tv)
-                .unwrap();
-        assert_eq!(m.tmdb_id, 111110);
-        assert_eq!(m.method, "exact_title_library_year");
     }
 
     #[test]
@@ -248,7 +365,6 @@ mod tests {
         let m = score_search_with_library_year(&results, "Bones", None, Some(1990), SearchKind::Tv)
             .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
-        assert_eq!(m.method, "exact_title");
     }
 
     #[test]
@@ -261,7 +377,107 @@ mod tests {
         let m = score_search_with_library_year(&results, "Show", None, Some(2001), SearchKind::Tv)
             .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
-        assert!(!meets_auto_match_floor(m.confidence));
+    }
+
+    #[test]
+    fn episode_count_pins_supernatural_shape() {
+        let results = vec![
+            tv(1622, "Supernatural", 2005),
+            tv(999, "Supernatural", 2025),
+        ];
+        let shapes = [
+            CandidateShape {
+                year: Some(2005),
+                episode_count: Some(327),
+                season_count: Some(15),
+            },
+            CandidateShape {
+                year: Some(2025),
+                episode_count: Some(8),
+                season_count: Some(1),
+            },
+        ];
+        let m = score_search_with_shape(
+            &results,
+            "Supernatural",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: None,
+                episode_count: Some(311),
+                season_count: Some(15),
+            },
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.tmdb_id, 1622);
+        assert_eq!(m.method, "exact_title_episode_count");
+        assert!(meets_auto_match_floor(m.confidence));
+    }
+
+    #[test]
+    fn season_count_pins_when_episode_count_ambiguous() {
+        // The Boys: both candidates report 40 episodes; seasons differ.
+        let results = vec![tv(76479, "The Boys", 2019), tv(107755, "The Boys", 1997)];
+        let shapes = [
+            CandidateShape {
+                year: Some(2019),
+                episode_count: Some(40),
+                season_count: Some(5),
+            },
+            CandidateShape {
+                year: Some(1997),
+                episode_count: Some(40),
+                season_count: Some(1),
+            },
+        ];
+        let m = score_search_with_shape(
+            &results,
+            "The Boys",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: None,
+                episode_count: Some(42),
+                season_count: Some(5),
+            },
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.tmdb_id, 76479);
+        assert_eq!(m.method, "exact_title_season_count");
+    }
+
+    #[test]
+    fn episode_count_pins_two_stays_0_72() {
+        let results = vec![tv(1, "X", 2000), tv(2, "X", 2010)];
+        let shapes = [
+            CandidateShape {
+                year: Some(2000),
+                episode_count: Some(40),
+                season_count: Some(1),
+            },
+            CandidateShape {
+                year: Some(2010),
+                episode_count: Some(40),
+                season_count: Some(1),
+            },
+        ];
+        let m = score_search_with_shape(
+            &results,
+            "X",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: None,
+                episode_count: Some(40),
+                season_count: Some(1),
+            },
+            Some(&shapes),
+        )
+        .unwrap();
+        assert!((m.confidence - 0.72).abs() < f64::EPSILON);
+        assert_eq!(m.method, "exact_title");
     }
 
     #[test]

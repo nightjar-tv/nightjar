@@ -7,7 +7,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::match_score::{
-    MatchCandidate, SearchHit, SearchKind, meets_auto_match_floor, score_search_with_library_year,
+    CandidateShape, LibrarySeriesShape, MatchCandidate, SearchHit, SearchKind,
+    meets_auto_match_floor, needs_collision_detail, norm_key, score_search_with_shape,
 };
 use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
@@ -200,16 +201,79 @@ impl TmdbClient {
         year: Option<i32>,
         library_year: Option<i32>,
     ) -> Result<Option<MatchCandidate>, ResolveError> {
-        // Search without forcing `library_year` into the API year filter so
-        // multi-exact candidates remain visible for the pin guardrails.
-        let results = self.search(kind, title, year)?;
-        Ok(score_search_with_library_year(
-            &results,
+        self.match_search_with_series_shape(
+            kind,
             title,
             year,
-            library_year,
+            LibrarySeriesShape {
+                year: library_year,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Search + collision pin. Fetches `/tv/{id}` shapes only when multi-exact
+    /// survives the year discriminator (tens of shows, not per-file).
+    pub fn match_search_with_series_shape(
+        &self,
+        kind: SearchKind,
+        title: &str,
+        year: Option<i32>,
+        library: LibrarySeriesShape,
+    ) -> Result<Option<MatchCandidate>, ResolveError> {
+        let results = self.search(kind, title, year)?;
+        if !needs_collision_detail(&results, title, year, kind, library) {
+            return Ok(score_search_with_shape(
+                &results, title, year, kind, library, None,
+            ));
+        }
+        let nk = norm_key(title);
+        let exact: Vec<&SearchHit> = results
+            .iter()
+            .filter(|r| {
+                let (primary, original) = match kind {
+                    SearchKind::Movie => (r.title.as_deref(), r.original_title.as_deref()),
+                    SearchKind::Tv => (r.name.as_deref(), r.original_name.as_deref()),
+                };
+                primary.is_some_and(|t| norm_key(t) == nk)
+                    || original.is_some_and(|t| norm_key(t) == nk)
+            })
+            .take(8)
+            .collect();
+        let mut shapes = Vec::with_capacity(exact.len());
+        for hit in &exact {
+            shapes.push(self.tv_candidate_shape(hit)?);
+        }
+        // Re-score using only the shaped exact subset as the result list so
+        // shape indices align; non-exact hits already lost for pinning.
+        let shaped_results: Vec<SearchHit> = exact.iter().map(|h| (*h).clone()).collect();
+        Ok(score_search_with_shape(
+            &shaped_results,
+            title,
+            year,
             kind,
+            library,
+            Some(&shapes),
         ))
+    }
+
+    fn tv_candidate_shape(&self, hit: &SearchHit) -> Result<CandidateShape, ResolveError> {
+        let year = hit
+            .first_air_date
+            .as_deref()
+            .and_then(|d| d.get(..4)?.parse().ok());
+        let data = self.get_json(&format!("/tv/{}", hit.id), &[("language", "en-US")])?;
+        Ok(CandidateShape {
+            year,
+            episode_count: data
+                .get("number_of_episodes")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+            season_count: data
+                .get("number_of_seasons")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+        })
     }
 
     pub fn movie_detail(
@@ -266,12 +330,30 @@ impl TmdbClient {
         year: Option<i32>,
         library_year: Option<i32>,
     ) -> Result<TmdbResolve, ResolveError> {
+        self.resolve_title_with_series_shape(
+            kind,
+            title,
+            year,
+            LibrarySeriesShape {
+                year: library_year,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn resolve_title_with_series_shape(
+        &self,
+        kind: MetadataKind,
+        title: &str,
+        year: Option<i32>,
+        library: LibrarySeriesShape,
+    ) -> Result<TmdbResolve, ResolveError> {
         let search_kind = match kind {
             MetadataKind::Movie => SearchKind::Movie,
             MetadataKind::Episode | MetadataKind::Show => SearchKind::Tv,
         };
         let Some(candidate) =
-            self.match_search_with_library_year(search_kind, title, year, library_year)?
+            self.match_search_with_series_shape(search_kind, title, year, library)?
         else {
             return Ok(TmdbResolve::NoResults);
         };
@@ -309,7 +391,16 @@ impl MetadataSource for TmdbClient {
             return Ok(ProviderResult::Miss);
         };
         let kind = input.kind.unwrap_or(MetadataKind::Movie);
-        match self.resolve_title_with_library_year(kind, title, input.year, input.library_year)? {
+        match self.resolve_title_with_series_shape(
+            kind,
+            title,
+            input.year,
+            LibrarySeriesShape {
+                year: input.library_year,
+                episode_count: input.library_episode_count,
+                season_count: input.library_season_count,
+            },
+        )? {
             TmdbResolve::Matched { metadata, .. } => Ok(ProviderResult::Hit(metadata)),
             TmdbResolve::BelowThreshold { candidate } => Ok(ProviderResult::BelowThreshold {
                 confidence: candidate.confidence,
