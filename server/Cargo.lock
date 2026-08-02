@@ -550,6 +550,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nightjar-metadata"
+version = "0.0.1"
+dependencies = [
+ "nightjar-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nightjar-scanner"
 version = "0.0.1"
 dependencies = [
