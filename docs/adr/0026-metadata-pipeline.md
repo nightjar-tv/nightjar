@@ -250,10 +250,15 @@ and leave the connection cap unenforced where it does. Uplink/disk
 contention during first run is admission control if it ever proves real
 (post-v1); metadata HTTP does not share that path with transcodes.
 
-Politeness budget (constants, not settings): about **10 requests/second**
-with a small concurrency cap, well inside the ~50/s ceiling. A full-library
-search pass of ~2,500 unique queries in ~12.5 minutes ran at roughly 3/s
-without trouble.
+Politeness budget (constants, not settings): about **10 requests/second**,
+well inside the ~50/s ceiling. A full-library search pass of ~2,500 unique
+queries in ~12.5 minutes ran at roughly 3/s without trouble.
+
+Ceiling / 429 probes must use a **personal or other non-application** TMDB
+key. The Continuity open question is whether TMDB accepts an embedded
+application key at scale; walking that key into deliberate rate-limit
+rejections answers it the wrong way. The ceiling is an IP/host property,
+not a key property — a personal key measures it.
 
 ### 8. Metadata queue is a query, not a jobs table
 
@@ -271,11 +276,38 @@ table** — that would be a second structure tracking the same fact (Rule
 4.11). Resume-after-restart is automatic: still-`pending` rows are selected
 again; `ready` / `unmatched` are not.
 
+This is deliberately a **second scheduling concept** beside the scan pool
+(`WorkKind::Probe | Extract | Map` with its own priority ordering). Metadata
+is HTTP-bound and gated by the API rate limiter (§7); scan work is
+disk/CPU-bound. Do not merge them from intuition — shared structure would
+couple unrelated backpressure.
+
 Priority order (strategy note): continue watching, visible items, search
 results, recently added, then everything else. Until Block 2/3 surfaces
 exist, only **recently added** then **everything else** are wired — both
 expressed as `ORDER BY id DESC` (insertion order ≈ recently added) with a
 priority-band function that reserved slots for the later bands.
+
+v1 drain resolves **movie and show (episode-group) search+detail only**.
+Season detail (`/tv/{id}/season/{n}`, ADR-0025 episode ids / §4 season
+append) is not yet enqueued; first-run request count and wall time must
+not be quoted as complete until that pass exists.
+
+v1 `drain_pending` walks groups **serially** (one resolve at a time). While
+that holds, a concurrency knob does nothing — Rule 4.11: engage it with
+group-level fan-out or remove it; do not ship a dead tunable. Search→detail
+is inherently serial *within* a group; fan-out's only axis is across groups.
+
+First-run wall time is an **ordering** problem before a throughput one: the
+library is browsable after index (~150 s); metadata filling in over the
+following tens of minutes matches the copy-deck promise if continue-
+watching / visible / search bands drain first. Wire those bands (and
+measure whether anyone still cares) before building fan-out.
+
+Prefix probes (`QUEUE_MAX_GROUPS`) are not representative of full-library
+cost when the first N groups skew movie-heavy (show detail payloads are
+larger — §4). Record movie/show group split on every probe; do not
+extrapolate wall time from a prefix.
 
 ## Alternatives considered
 

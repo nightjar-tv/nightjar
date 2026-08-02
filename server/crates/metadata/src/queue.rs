@@ -13,7 +13,7 @@ use crate::clean::{clean_movie_title, clean_show_title, series_library_year, yea
 use crate::model::MetadataKind;
 use crate::negative_cache::query_key;
 use crate::resolve::MetadataSource;
-use crate::resolve::{ResolveInput, ResolveOutcome, Resolver, UnresolvedReason};
+use crate::resolve::{ResolveInput, ResolveOutcome, Resolver};
 
 /// Priority bands (ADR-0026 §8 / strategy note). Lower ordinal = sooner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -100,10 +100,16 @@ struct QueryGroup {
 #[derive(Debug, Default)]
 pub struct DrainStats {
     pub groups: usize,
+    pub movie_groups: usize,
+    pub show_groups: usize,
     pub items_ready: usize,
     pub items_unmatched: usize,
+    /// Groups left `pending` because the provider errored (not cached).
+    pub items_left_pending: usize,
     pub provider_resolves: usize,
+    pub provider_errors: usize,
     pub http_429: u64,
+    pub http_requests: u64,
 }
 
 /// Load pending items and fold into resolve groups (newest groups first).
@@ -231,14 +237,34 @@ pub fn set_metadata_status(
 }
 
 /// Drain pending groups through the resolver (store + neg-cache + limiter).
+///
+/// Provider/`api_error` failures leave the group's rows **pending** and are
+/// not written to the negative-result cache — a blip must not park the
+/// library for a day. Genuine misses become `unmatched` (and may cache).
+///
+/// `max_groups`: `None` drains all pending groups; `Some(n)` stops after `n`
+/// (for short concurrency probes — do not use a full-library wall time).
 pub fn drain_pending<T: MetadataSource>(
     conn: &Connection,
     resolver: &Resolver<T>,
     http_429: &std::sync::atomic::AtomicU64,
+    http_requests: &std::sync::atomic::AtomicU64,
+    max_groups: Option<usize>,
 ) -> Result<DrainStats, String> {
-    let groups = pending_query_groups(conn)?;
+    let mut groups = pending_query_groups(conn)?;
+    if let Some(n) = max_groups {
+        groups.truncate(n);
+    }
     let mut stats = DrainStats {
         groups: groups.len(),
+        movie_groups: groups
+            .iter()
+            .filter(|g| g.resolve_kind == MetadataKind::Movie)
+            .count(),
+        show_groups: groups
+            .iter()
+            .filter(|g| g.resolve_kind == MetadataKind::Show)
+            .count(),
         ..DrainStats::default()
     };
     for (i, g) in groups.iter().enumerate() {
@@ -255,24 +281,24 @@ pub fn drain_pending<T: MetadataSource>(
             ..Default::default()
         };
         stats.provider_resolves += 1;
-        let outcome = resolver
-            .resolve_with_store(&input, conn)
-            .map_err(|e| e.to_string())?;
-        let status = match outcome {
-            ResolveOutcome::Resolved { .. } => MetadataStatus::Ready,
-            ResolveOutcome::Unresolved {
-                reason: UnresolvedReason::NfoInvalid { .. },
-            } => MetadataStatus::Unmatched,
-            ResolveOutcome::Unresolved { .. } => MetadataStatus::Unmatched,
-        };
-        set_metadata_status(conn, &g.item_ids, status)?;
-        match status {
-            MetadataStatus::Ready => stats.items_ready += g.item_ids.len(),
-            MetadataStatus::Unmatched => stats.items_unmatched += g.item_ids.len(),
-            MetadataStatus::Pending => {}
+        match resolver.resolve_with_store(&input, conn) {
+            Ok(ResolveOutcome::Resolved { .. }) => {
+                set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
+                stats.items_ready += g.item_ids.len();
+            }
+            Ok(ResolveOutcome::Unresolved { .. }) => {
+                set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+                stats.items_unmatched += g.item_ids.len();
+            }
+            Err(e) => {
+                eprintln!("  provider error (left pending): {} — {e}", g.title);
+                stats.provider_errors += 1;
+                stats.items_left_pending += g.item_ids.len();
+            }
         }
     }
     stats.http_429 = http_429.load(std::sync::atomic::Ordering::Relaxed);
+    stats.http_requests = http_requests.load(std::sync::atomic::Ordering::Relaxed);
     Ok(stats)
 }
 
@@ -314,7 +340,8 @@ mod tests {
         let c = seeded();
         let resolver = Resolver { tmdb: TmdbStub };
         let http_429 = AtomicU64::new(0);
-        let s1 = drain_pending(&c, &resolver, &http_429).unwrap();
+        let http_requests = AtomicU64::new(0);
+        let s1 = drain_pending(&c, &resolver, &http_429, &http_requests, None).unwrap();
         assert_eq!(s1.items_unmatched, 2);
         let pending: i64 = c
             .query_row(
@@ -324,9 +351,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 0);
-        let s2 = drain_pending(&c, &resolver, &http_429).unwrap();
+        let s2 = drain_pending(&c, &resolver, &http_429, &http_requests, None).unwrap();
         assert_eq!(s2.groups, 0);
         let _ = ApiRateLimiter::polite_default();
+    }
+
+    #[test]
+    fn provider_error_leaves_rows_pending() {
+        struct Boom;
+        impl MetadataSource for Boom {
+            fn resolve(
+                &self,
+                _: &ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                Err(crate::resolve::ResolveError::Provider("timeout".into()))
+            }
+        }
+        let c = seeded();
+        let resolver = Resolver { tmdb: Boom };
+        let s = drain_pending(&c, &resolver, &AtomicU64::new(0), &AtomicU64::new(0), None).unwrap();
+        assert_eq!(s.provider_errors, 2);
+        assert_eq!(s.items_left_pending, 2);
+        let pending: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM media_items WHERE metadata_status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 2);
+        let neg: i64 = c
+            .query_row("SELECT COUNT(*) FROM metadata_negative_cache", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(neg, 0, "api_error must not write negative cache");
     }
 
     #[test]

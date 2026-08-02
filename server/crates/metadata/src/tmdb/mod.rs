@@ -93,6 +93,8 @@ pub struct TmdbClient {
     limiter: Arc<ApiRateLimiter>,
     /// Count of HTTP 429 responses (measure harness).
     pub http_429: Arc<AtomicU64>,
+    /// Count of API HTTP attempts (every `get_json`, including errors).
+    pub http_requests: Arc<AtomicU64>,
 }
 
 impl TmdbClient {
@@ -110,11 +112,13 @@ impl TmdbClient {
             agent,
             limiter,
             http_429: Arc::new(AtomicU64::new(0)),
+            http_requests: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, ResolveError> {
         let _permit = self.limiter.acquire();
+        self.http_requests.fetch_add(1, Ordering::Relaxed);
         let mut url = format!("https://api.themoviedb.org/3{path}");
         let mut first = true;
         let push = |url: &mut String, first: &mut bool, k: &str, v: &str| {
