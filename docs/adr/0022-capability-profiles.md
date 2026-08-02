@@ -124,6 +124,16 @@ original file; there is no encoder in that path. Enforcing a lower height or
 bitrate against a higher source means refusing the stream or demoting the
 title to a session so a scale/bitrate filter can do the work.
 
+**Multi-version selection (follow-up; ADR-0025).** When several media files
+share one logical `item_key`, the effective ceiling can **improve** playback
+rather than only degrade it: pick the highest version the ceiling permits,
+and prefer a direct-playable smaller file over transcoding a larger one (a
+remote user capped at 1080p gets the 1080p file, not a transcode of the 4K).
+Decision shape before anyone writes a second ranker: reuse ADR-0024's pure
+server-side rank function + reason string (tracks ≠ files; same pattern).
+Library collapse of versions to one card and the item-page version
+affordance are Block 3 UI, not decided here.
+
 **Reasons.** The internal `decide_playback` reason carries which ceiling
 source fired (capability vs policy) so operators can tell them apart in logs.
 Whether that distinction appears in the public reason-code enum is deferred
@@ -187,6 +197,11 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   discover the split as a schema change. Policy rows and the public
   reason-code shape wait for accounts and the API freeze; internal reasons
   carry the ceiling source when policy exists.
+- Amendment (2026-08-02, ADR-0025): §5 names multi-version file selection
+  under the effective ceiling as a follow-up decide_playback decision
+  (prefer ceiling-fitting direct play over transcoding a larger version).
+  Rank-function shape check against ADR-0024 before a second ranker; Block 3
+  owns version UI.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
 - N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4
