@@ -16,7 +16,7 @@ use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::rate_limit::ApiRateLimiter;
 use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
 
-pub use map::{RawProviderPayload, map_movie_detail, map_tv_detail};
+pub use map::{RawProviderPayload, map_episodes_from_season, map_movie_detail, map_tv_detail};
 
 /// Placeholder until a live client is configured. Always [`ProviderResult::Miss`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -439,11 +439,27 @@ impl MetadataSource for TmdbClient {
             TmdbResolve::NoResults => Ok(ProviderResult::Miss),
         }
     }
+
+    fn fetch_season(
+        &self,
+        show_id: i64,
+        season_number: i32,
+    ) -> Result<Option<RawProviderPayload>, ResolveError> {
+        Ok(Some(self.season_detail(show_id, season_number)?))
+    }
 }
 
 impl MetadataSource for &TmdbClient {
     fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
         (*self).resolve(input)
+    }
+
+    fn fetch_season(
+        &self,
+        show_id: i64,
+        season_number: i32,
+    ) -> Result<Option<RawProviderPayload>, ResolveError> {
+        (*self).fetch_season(show_id, season_number)
     }
 }
 

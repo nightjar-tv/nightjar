@@ -43,8 +43,7 @@ pub fn upsert_raw_payload(
 /// Open a transaction, run `canonical_write`, upsert `raw`, commit.
 ///
 /// Canonical writers pass their SQL into `canonical_write` so both lands
-/// atomically. Measure / resolve paths with no canonical table yet pass
-/// `|_| Ok(())`.
+/// atomically (see [`crate::canonical::persist_mapped_hit`]).
 pub fn persist_hit_with_canonical<F>(
     conn: &Connection,
     provider: &str,

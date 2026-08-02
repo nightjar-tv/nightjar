@@ -74,6 +74,11 @@ pub fn parse_nfo(xml: &str) -> Result<CanonicalMetadata, NfoError> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         year,
+        air_date: first_text(trimmed, "aired")
+            .or_else(|| first_text(trimmed, "premiered"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|_| kind == MetadataKind::Episode),
         plot: plot
             .map(|s| decode_basic_entities(s.trim()))
             .filter(|s| !s.is_empty()),
