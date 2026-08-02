@@ -286,7 +286,13 @@ Named so the next reader does not treat them as forgotten:
 - Manual fix API (ADR-0028) — consumes these shapes; does not define them.
 - Re-project mechanism, mapper fixes, TV ratings gap — wait on this shape.
 - Cleaner-version stamp and `series_library_year` — independent; can
-  proceed after #31 without this ADR.
+  proceed after #31 without this ADR. `year_from_show_folder` walks two
+  parents and is path-form sensitive when the library root *is* the show
+  folder (absolute keeps `Show (YYYY)/…`; relpath `Season N/…` loses it).
+  Normal `library/Show/Season/file` is identical under both forms. Any
+  `series_library_year` / collision-pin year repro must record whether
+  paths were absolute or relative so a later media_items.path → relpath
+  change (ADR-0030) is not a third untracked variable.
 - Fan-out, series watch identity, Visible migration off the soft key.
 
 ## Alternatives considered

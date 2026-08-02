@@ -9,6 +9,15 @@ pub fn year_from_path(path: &str) -> Option<i32> {
 }
 
 /// Show-root folder year for `…/Show Name (2001)/Season 1/…`.
+///
+/// Walks exactly two parents above the file. That is path-form sensitive when
+/// the **library root is the show folder**: absolute
+/// `…/Show (2001)/Season 1/ep.mkv` still yields `(2001)`, but the same file
+/// stored as relpath `Season 1/ep.mkv` has no show-folder component left.
+/// Normal `library/Show (YYYY)/Season N/…` keeps the same answer under both
+/// absolute and relative storage. Pin path form when reproing
+/// `series_library_year` / collision-pin year misses — do not conflate with
+/// a media_items.path → relpath migration (ADR-0030).
 pub fn year_from_show_folder(path: &str) -> Option<i32> {
     let show = Path::new(path).parent()?.parent()?.file_name()?.to_str()?;
     year_in_parens(show)
@@ -262,6 +271,19 @@ mod tests {
             series_library_year([None], "/Volumes/media/TV Shows/Bones/Season 1/x.mkv"),
             None
         );
+        // Normal layout: absolute and library-relative agree.
+        assert_eq!(
+            year_from_show_folder("Scrubs (2001)/Season 1/Scrubs - 1x01.mkv"),
+            Some(2001)
+        );
+        // Library root == show folder: absolute still sees the show component;
+        // relpath does not. Recorded so a 0030 migration is not misread as the
+        // series_library_year bug.
+        assert_eq!(
+            year_from_show_folder("/mnt/Show (2001)/Season 1/x.mkv"),
+            Some(2001)
+        );
+        assert_eq!(year_from_show_folder("Season 1/x.mkv"), None);
     }
 
     #[test]
