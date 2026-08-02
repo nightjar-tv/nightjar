@@ -780,22 +780,24 @@ mod tests {
             "scan finished before overlap window; enlarge fixture if this flakes"
         );
 
+        // Job1 clearing `active` can race the follow-up spawn: wait until we
+        // either see two finished jobs or the follow-up has run and gone idle.
+        let mut completed = 0;
         for _ in 0..800 {
-            if db.active_scan_job(lib.id).unwrap().is_none() {
+            completed = 0;
+            for id in job1..job1 + 8 {
+                if let Ok(Some(j)) = db.get_scan_job(id)
+                    && j.library_id == lib.id
+                    && (j.state == "completed" || j.state == "failed")
+                {
+                    completed += 1;
+                }
+            }
+            let active = db.active_scan_job(lib.id).unwrap();
+            if active.is_none() && completed >= 2 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        assert!(db.active_scan_job(lib.id).unwrap().is_none());
-
-        let mut completed = 0;
-        for id in job1..job1 + 8 {
-            if let Ok(Some(j)) = db.get_scan_job(id)
-                && j.library_id == lib.id
-                && (j.state == "completed" || j.state == "failed")
-            {
-                completed += 1;
-            }
         }
         assert_eq!(
             completed, 2,
