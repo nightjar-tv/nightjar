@@ -2,6 +2,8 @@
 
 mod map;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -11,6 +13,7 @@ use crate::match_score::{
     meets_auto_match_floor, needs_collision_detail, norm_key, score_search_with_shape,
 };
 use crate::model::{CanonicalMetadata, MetadataKind};
+use crate::rate_limit::ApiRateLimiter;
 use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
 
 pub use map::{RawProviderPayload, map_movie_detail, map_tv_detail};
@@ -27,6 +30,7 @@ impl MetadataSource for TmdbStub {
 
 const MOVIE_APPEND: &str = "images,credits,videos,release_dates,external_ids";
 const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggregate_credits";
+const SEASON_APPEND: &str = "images,credits,videos,external_ids";
 
 #[derive(Debug, Clone)]
 pub struct TmdbCredentials {
@@ -86,12 +90,19 @@ fn dirs_next_home() -> Option<std::path::PathBuf> {
 pub struct TmdbClient {
     creds: TmdbCredentials,
     agent: ureq::Agent,
-    min_interval: Duration,
-    last_call: std::sync::Mutex<Option<std::time::Instant>>,
+    limiter: Arc<ApiRateLimiter>,
+    /// Count of HTTP 429 responses (measure harness).
+    pub http_429: Arc<AtomicU64>,
+    /// Count of API HTTP attempts (every `get_json`, including errors).
+    pub http_requests: Arc<AtomicU64>,
 }
 
 impl TmdbClient {
     pub fn new(creds: TmdbCredentials) -> Self {
+        Self::with_limiter(creds, ApiRateLimiter::polite_default())
+    }
+
+    pub fn with_limiter(creds: TmdbCredentials, limiter: Arc<ApiRateLimiter>) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(30))
@@ -99,24 +110,15 @@ impl TmdbClient {
         Self {
             creds,
             agent,
-            min_interval: Duration::from_millis(40),
-            last_call: std::sync::Mutex::new(None),
+            limiter,
+            http_429: Arc::new(AtomicU64::new(0)),
+            http_requests: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    fn throttle(&self) {
-        let mut guard = self.last_call.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = *guard {
-            let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                std::thread::sleep(self.min_interval - elapsed);
-            }
-        }
-        *guard = Some(std::time::Instant::now());
     }
 
     fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, ResolveError> {
-        self.throttle();
+        let _permit = self.limiter.acquire();
+        self.http_requests.fetch_add(1, Ordering::Relaxed);
         let mut url = format!("https://api.themoviedb.org/3{path}");
         let mut first = true;
         let push = |url: &mut String, first: &mut bool, k: &str, v: &str| {
@@ -144,6 +146,9 @@ impl TmdbClient {
         let body = resp
             .into_string()
             .map_err(|e| ResolveError::Provider(e.to_string()))?;
+        if status == 429 {
+            self.http_429.fetch_add(1, Ordering::Relaxed);
+        }
         if !(200..300).contains(&status) {
             return Err(ResolveError::Provider(format!(
                 "TMDB {status}: {}",
@@ -312,6 +317,23 @@ impl TmdbClient {
         Ok((meta, raw))
     }
 
+    /// Season detail keyed `{show_id}:{season_number}` (ADR-0026 §4).
+    pub fn season_detail(
+        &self,
+        show_id: i64,
+        season_number: i32,
+    ) -> Result<RawProviderPayload, ResolveError> {
+        let data = self.get_json(
+            &format!("/tv/{show_id}/season/{season_number}"),
+            &[("append_to_response", SEASON_APPEND), ("language", "en-US")],
+        )?;
+        Ok(RawProviderPayload {
+            entity_kind: "season".into(),
+            provider_id: format!("{show_id}:{season_number}"),
+            payload: data.to_string(),
+        })
+    }
+
     /// Search + floor gate + detail. Returns metadata when confidence ≥
     /// [`crate::match_score::AUTO_MATCH_FLOOR`] (ADR-0026 §2).
     pub fn resolve_title(
@@ -404,10 +426,11 @@ impl MetadataSource for TmdbClient {
             TmdbResolve::Matched {
                 metadata,
                 candidate,
-                ..
+                raw,
             } => Ok(ProviderResult::Hit {
                 metadata,
                 method: candidate.method,
+                raw: Some(raw),
             }),
             TmdbResolve::BelowThreshold { candidate } => Ok(ProviderResult::BelowThreshold {
                 confidence: candidate.confidence,
@@ -415,6 +438,12 @@ impl MetadataSource for TmdbClient {
             }),
             TmdbResolve::NoResults => Ok(ProviderResult::Miss),
         }
+    }
+}
+
+impl MetadataSource for &TmdbClient {
+    fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+        (*self).resolve(input)
     }
 }
 

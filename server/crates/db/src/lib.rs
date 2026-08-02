@@ -9,6 +9,7 @@ pub use content_id::{
     CONTENT_ID_WINDOW, content_id_for_path, content_id_from_reader, content_id_matches,
     format_content_id,
 };
+pub use migrate::migrate;
 pub use status::{
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
 };
