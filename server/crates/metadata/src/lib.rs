@@ -33,10 +33,11 @@ pub use negative_cache::{
 };
 pub use nfo::{NfoError, parse_nfo};
 pub use queue::{
-    DrainOptions, DrainStats, MetadataStatus, PendingItem, QueueBand, T_FIRST_SCREEN_PASS_SECS,
-    T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N, VisibleProxy, VisibleProxyUnit,
-    drain_pending, proxy_terminal_progress, queue_band_for_item, set_metadata_status,
-    snapshot_visible_proxy, snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
+    DrainOptions, DrainStats, MEASURE_EXCLUDE_LIBRARY_NAMES, MetadataStatus, PendingItem,
+    QueueBand, T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N,
+    VisibleProxy, VisibleProxyUnit, drain_pending, measure_exclude_libraries_sql_in,
+    proxy_terminal_progress, queue_band_for_item, set_metadata_status, snapshot_visible_proxy,
+    snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
 };
 pub use rate_limit::{ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC};
 pub use raw_payload::{

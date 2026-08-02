@@ -18,6 +18,21 @@ use crate::resolve::{ResolveInput, ResolveOutcome, Resolver};
 /// Roughly one cold first screen (ADR-0026 §8). Constant, not a setting.
 pub const VISIBLE_FIRST_SCREEN_N: usize = 40;
 
+/// Libraries omitted from dogfood measures when `EXCLUDE_TESTDATA=1`.
+///
+/// Not only the formal `Test Data` library — local HDR/pattern scratch libs
+/// (`DV`, `DV2`) must not enter the Visible proxy or negative-cache tallies.
+pub const MEASURE_EXCLUDE_LIBRARY_NAMES: &[&str] = &["Test Data", "DV", "DV2"];
+
+/// SQL `name IN (...)` fragment for [`MEASURE_EXCLUDE_LIBRARY_NAMES`].
+pub fn measure_exclude_libraries_sql_in() -> String {
+    MEASURE_EXCLUDE_LIBRARY_NAMES
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Predicted `T_first_screen` for dogfood Visible union (~40 movie + ~40 show
 /// groups × 1.84 HTTP/group ÷ 4.9 rps). Pass bar is 60 s.
 pub const T_FIRST_SCREEN_PREDICTED_SECS: f64 = 30.0;
@@ -154,8 +169,8 @@ pub fn snapshot_visible_proxy_n(conn: &Connection, n: usize) -> Result<VisiblePr
     snapshot_visible_proxy_filtered(conn, n, &[])
 }
 
-/// `exclude_library_names` drops named libraries from the proxy (measure harness
-/// uses this for `Test Data` when `EXCLUDE_TESTDATA=1`).
+/// `exclude_library_names` drops named libraries from the proxy (see
+/// [`MEASURE_EXCLUDE_LIBRARY_NAMES`] when measuring).
 pub fn snapshot_visible_proxy_filtered(
     conn: &Connection,
     n: usize,
@@ -521,7 +536,7 @@ pub struct DrainOptions {
     pub max_groups: Option<usize>,
     /// Snapshot Visible once; stop when every proxy unit is terminal.
     pub stop_when_visible_terminal: bool,
-    /// Library names omitted from the Visible snapshot (e.g. `Test Data`).
+    /// Library names omitted from the Visible snapshot (measure excludes).
     pub exclude_library_names: Vec<String>,
 }
 
@@ -791,6 +806,34 @@ mod tests {
         assert!(QueueBand::Visible < QueueBand::RecentlyAdded);
         assert!(QueueBand::Search < QueueBand::RecentlyAdded);
         assert!(QueueBand::RecentlyAdded < QueueBand::Background);
+    }
+
+    #[test]
+    fn measure_exclude_covers_pattern_libs_not_only_test_data() {
+        assert!(MEASURE_EXCLUDE_LIBRARY_NAMES.contains(&"Test Data"));
+        assert!(MEASURE_EXCLUDE_LIBRARY_NAMES.contains(&"DV"));
+        assert!(MEASURE_EXCLUDE_LIBRARY_NAMES.contains(&"DV2"));
+    }
+
+    #[test]
+    fn measure_exclude_drops_dv2_from_visible_proxy() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES
+               ('Movies', '/m', 'movies'),
+               ('DV2', '/dv2', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES
+               (1, '/m/Alpha.mkv', 1, 1, 'Alpha', 'movie'),
+               (2, '/dv2/Pattern.mkv', 1, 1, 'Patterns Of Nature', 'movie');",
+        )
+        .unwrap();
+        let with = snapshot_visible_proxy_filtered(&c, 40, &[]).unwrap();
+        assert_eq!(with.movie_unit_count(), 2);
+        let excl = snapshot_visible_proxy_filtered(&c, 40, MEASURE_EXCLUDE_LIBRARY_NAMES).unwrap();
+        assert_eq!(excl.movie_unit_count(), 1);
+        assert_eq!(excl.units[0].item_ids, vec![1]);
     }
 
     #[test]

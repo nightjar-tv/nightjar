@@ -1,7 +1,7 @@
 //! Search-only match-rate measure across dogfood `media_items` (ADR-0026 floor).
 //!
-//! Env: `DB`, TMDB credentials. Optional `EXCLUDE_TESTDATA=1` drops the
-//! `Test Data` library from movie counts.
+//! Env: `DB`, TMDB credentials. Optional `EXCLUDE_TESTDATA=1` drops
+//! [`nightjar_metadata::MEASURE_EXCLUDE_LIBRARY_NAMES`] from counts.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -83,12 +83,19 @@ fn main() {
 
     let mut testdata_libs = HashSet::new();
     if exclude_testdata {
+        let in_list = nightjar_metadata::measure_exclude_libraries_sql_in();
         let mut stmt = con
-            .prepare("SELECT id FROM libraries WHERE name = 'Test Data'")
+            .prepare(&format!(
+                "SELECT id FROM libraries WHERE name IN ({in_list})"
+            ))
             .unwrap();
         for id in stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap() {
             testdata_libs.insert(id.unwrap());
         }
+        eprintln!(
+            "EXCLUDE_TESTDATA=1: skipping {:?}",
+            nightjar_metadata::MEASURE_EXCLUDE_LIBRARY_NAMES
+        );
     }
 
     let mut movies: Vec<(i64, String, Option<i32>, String)> = Vec::new();

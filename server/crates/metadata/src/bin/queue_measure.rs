@@ -3,7 +3,9 @@
 //! Default: first-screen gate (Visible proxy terminal + early stop).
 //!
 //! Env:
-//! - `DB`, TMDB credentials, `EXCLUDE_TESTDATA=1`, optional `MEASURE_DB`
+//! - `DB`, TMDB credentials, optional `MEASURE_DB`
+//! - `EXCLUDE_TESTDATA=1` — skip [`MEASURE_EXCLUDE_LIBRARY_NAMES`] (Test Data,
+//!   DV, DV2) for proxy, drain, and pending reset
 //! - `QUEUE_FIRST_SCREEN=0` — full drain (no early stop)
 //! - `QUEUE_MAX_GROUPS` — short probe cap (implies not first-screen)
 //! - `QUEUE_REQUESTS_PER_SEC`, `QUEUE_MAX_IN_FLIGHT` (if unused while serial)
@@ -16,9 +18,10 @@ use std::time::Instant;
 
 use nightjar_db::migrate;
 use nightjar_metadata::{
-    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions, Resolver,
-    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, TmdbCredentials,
-    VISIBLE_FIRST_SCREEN_N, drain_pending, snapshot_visible_proxy_filtered,
+    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions,
+    MEASURE_EXCLUDE_LIBRARY_NAMES, Resolver, T_FIRST_SCREEN_PASS_SECS,
+    T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, TmdbCredentials, VISIBLE_FIRST_SCREEN_N,
+    drain_pending, measure_exclude_libraries_sql_in, snapshot_visible_proxy_filtered,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -118,18 +121,27 @@ fn main() {
     migrate(&conn).expect("migrate");
 
     if exclude_testdata {
+        let in_list = measure_exclude_libraries_sql_in();
         conn.execute(
-            "UPDATE media_items SET metadata_status = 'ready'
-             WHERE library_id IN (SELECT id FROM libraries WHERE name = 'Test Data')",
+            &format!(
+                "UPDATE media_items SET metadata_status = 'ready'
+                 WHERE library_id IN (SELECT id FROM libraries WHERE name IN ({in_list}))"
+            ),
             [],
         )
-        .expect("skip testdata");
+        .expect("skip measure-exclude libs");
         conn.execute(
-            "UPDATE media_items SET metadata_status = 'pending'
-             WHERE library_id NOT IN (SELECT id FROM libraries WHERE name = 'Test Data')",
+            &format!(
+                "UPDATE media_items SET metadata_status = 'pending'
+                 WHERE library_id NOT IN (SELECT id FROM libraries WHERE name IN ({in_list}))"
+            ),
             [],
         )
         .expect("reset pending");
+        eprintln!(
+            "EXCLUDE_TESTDATA=1: skipping libraries {:?}",
+            MEASURE_EXCLUDE_LIBRARY_NAMES
+        );
     } else {
         conn.execute("UPDATE media_items SET metadata_status = 'pending'", [])
             .expect("reset pending");
@@ -141,7 +153,7 @@ fn main() {
     .ok();
 
     let exclude_libs: Vec<&str> = if exclude_testdata {
-        vec!["Test Data"]
+        MEASURE_EXCLUDE_LIBRARY_NAMES.to_vec()
     } else {
         vec![]
     };
