@@ -3,7 +3,9 @@
 //! Slice 4: metadata queue (query over `metadata_status`) and API
 //! request-rate limiter (ADR-0026 §7/§8).
 
+mod canonical;
 mod clean;
+mod item_links;
 mod match_score;
 mod measure_exclude;
 mod model;
@@ -15,9 +17,16 @@ mod raw_payload;
 mod resolve;
 mod tmdb;
 
+pub use canonical::{
+    get_canonical, persist_mapped_hit, persist_season_projection, reproject_from_payload,
+    upsert_canonical,
+};
 pub use clean::{
     clean_movie_title, clean_show_title, fold_title_orthography, series_library_year,
     year_from_path, year_from_show_folder,
+};
+pub use item_links::{
+    effective_item_key, link_keys_for_item, path_item_key, replace_auto_link, upsert_link,
 };
 pub use match_score::{
     AUTO_MATCH_FLOOR, CandidateShape, LibrarySeriesShape, MatchCandidate, SearchHit, SearchKind,
@@ -53,6 +62,6 @@ pub use resolve::{
     ResolveOutcome, Resolver, UnresolvedReason, resolve,
 };
 pub use tmdb::{
-    RawProviderPayload, TmdbClient, TmdbCredentials, TmdbResolve, TmdbStub, map_movie_detail,
-    map_tv_detail,
+    RawProviderPayload, TmdbClient, TmdbCredentials, TmdbResolve, TmdbStub,
+    map_episodes_from_season, map_movie_detail, map_tv_detail,
 };

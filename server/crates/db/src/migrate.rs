@@ -20,6 +20,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/009_metadata_cache_payloads.sql"),
     ),
     (10, include_str!("../migrations/010_metadata_status.sql")),
+    (
+        11,
+        include_str!("../migrations/011_canonical_metadata_item_links.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -110,7 +114,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 10);
+        assert_eq!(v, 11);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -127,6 +131,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_raw, 1);
+        let has_canonical: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_canonical'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_canonical, 1);
+        let has_links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_item_links'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_links, 1);
         let has_meta_status: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'metadata_status'",

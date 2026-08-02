@@ -9,9 +9,11 @@ use std::time::Instant;
 
 use rusqlite::{Connection, params};
 
+use crate::canonical;
 use crate::clean::{clean_movie_title, clean_show_title, series_library_year, year_from_path};
-use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind};
-use crate::negative_cache::query_key;
+use crate::item_links;
+use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind, item_key_for_metadata};
+use crate::negative_cache::{PROVIDER_TMDB, query_key};
 use crate::resolve::MetadataSource;
 use crate::resolve::{ResolveInput, ResolveOutcome, Resolver};
 
@@ -98,6 +100,7 @@ pub struct PendingItem {
     pub year: Option<i32>,
     pub path: String,
     pub season: Option<i32>,
+    pub episode: Option<i32>,
 }
 
 /// One browse unit in the Visible proxy (movie, or provisional show soft-key).
@@ -391,7 +394,7 @@ fn pending_query_groups(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, title, year, path, season
+            "SELECT id, kind, title, year, path, season, episode
              FROM media_items
              WHERE metadata_status = 'pending'
              ORDER BY id DESC",
@@ -406,6 +409,7 @@ fn pending_query_groups(
                 year: r.get(3)?,
                 path: r.get(4)?,
                 season: r.get(5)?,
+                episode: r.get(6)?,
             })
         })
         .map_err(|e| format!("query pending: {e}"))?;
@@ -487,6 +491,106 @@ fn pending_query_groups(
 
     let mut out: Vec<QueryGroup> = groups.into_values().collect();
     out.sort_by(|a, b| a.band.cmp(&b.band).then_with(|| b.max_id.cmp(&a.max_id)));
+    Ok(out)
+}
+
+/// Write provider bindings (and season→episode projection when the source
+/// supports `fetch_season`). TV files without a season fetch stay unbound
+/// (derived path key — ADR-0029 §2 / §3). Stub sources skip seasons; that
+/// path is wired but unproven until live season enqueue runs.
+fn bind_resolved_items<T: MetadataSource>(
+    conn: &Connection,
+    resolver: &Resolver<T>,
+    item_ids: &[i64],
+    metadata: &CanonicalMetadata,
+) -> Result<(), String> {
+    match metadata.kind {
+        MetadataKind::Movie => {
+            let Some(key) = item_key_for_metadata(metadata) else {
+                return Ok(());
+            };
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("begin movie bind tx: {e}"))?;
+            for id in item_ids {
+                item_links::replace_auto_link(&tx, *id, &key)?;
+            }
+            tx.commit().map_err(|e| format!("commit movie bind: {e}"))?;
+            Ok(())
+        }
+        MetadataKind::Show | MetadataKind::Episode => {
+            let Some(show_id) = metadata.ids.tmdb.or(metadata.ids.tmdb_show) else {
+                return Ok(());
+            };
+            let rows = episode_slots(conn, item_ids)?;
+            let seasons: std::collections::HashSet<i32> =
+                rows.iter().filter_map(|r| r.season).collect();
+            if seasons.is_empty() {
+                return Ok(());
+            }
+            let mut by_se: std::collections::HashMap<(i32, i32), i64> =
+                std::collections::HashMap::new();
+            for row in &rows {
+                if let (Some(s), Some(e)) = (row.season, row.episode) {
+                    by_se.insert((s, e), row.id);
+                }
+            }
+            for sn in seasons {
+                let Some(raw) = resolver
+                    .tmdb
+                    .fetch_season(show_id, sn)
+                    .map_err(|e| e.to_string())?
+                else {
+                    // Stub / no season support — leave files unbound.
+                    continue;
+                };
+                let eps = canonical::persist_season_projection(conn, PROVIDER_TMDB, show_id, &raw)?;
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| format!("begin episode bind tx: {e}"))?;
+                for ep in &eps {
+                    let (Some(s), Some(e)) = (ep.season, ep.episode) else {
+                        continue;
+                    };
+                    let Some(media_id) = by_se.get(&(s, e)) else {
+                        continue;
+                    };
+                    let Some(key) = item_key_for_metadata(ep) else {
+                        continue;
+                    };
+                    item_links::replace_auto_link(&tx, *media_id, &key)?;
+                }
+                tx.commit()
+                    .map_err(|e| format!("commit episode bind: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+struct EpisodeSlot {
+    id: i64,
+    season: Option<i32>,
+    episode: Option<i32>,
+}
+
+fn episode_slots(conn: &Connection, ids: &[i64]) -> Result<Vec<EpisodeSlot>, String> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut stmt = conn
+        .prepare("SELECT id, season, episode FROM media_items WHERE id = ?1")
+        .map_err(|e| format!("prepare episode slots: {e}"))?;
+    for id in ids {
+        let row = stmt
+            .query_row(params![id], |r| {
+                Ok(EpisodeSlot {
+                    id: r.get(0)?,
+                    season: r.get(1)?,
+                    episode: r.get(2)?,
+                })
+            })
+            .map_err(|e| format!("episode slot {id}: {e}"))?;
+        out.push(row);
+    }
     Ok(out)
 }
 
@@ -613,6 +717,9 @@ pub fn drain_pending<T: MetadataSource>(
         stats.provider_resolves += 1;
         match resolver.resolve_with_store(&input, conn) {
             Ok(ResolveOutcome::Resolved { metadata, .. }) => {
+                if let Err(e) = bind_resolved_items(conn, resolver, &g.item_ids, &metadata) {
+                    eprintln!("  bind/season ({}): {e}", g.title);
+                }
                 set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
                 stats.items_ready += g.item_ids.len();
                 let poster = has_poster(&metadata);

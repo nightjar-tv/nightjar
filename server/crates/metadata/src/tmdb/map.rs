@@ -35,6 +35,7 @@ pub fn map_movie_detail(data: &Value) -> Result<CanonicalMetadata, ResolveError>
         title,
         original_title: text(data, "original_title"),
         year,
+        air_date: None,
         plot: text(data, "overview"),
         genres: genres(data),
         runtime_minutes: data
@@ -86,6 +87,7 @@ pub fn map_tv_detail(data: &Value) -> Result<CanonicalMetadata, ResolveError> {
         title,
         original_title: text(data, "original_name"),
         year,
+        air_date: None,
         plot: text(data, "overview"),
         genres: genres(data),
         runtime_minutes: data
@@ -112,6 +114,71 @@ pub fn map_tv_detail(data: &Value) -> Result<CanonicalMetadata, ResolveError> {
         season: None,
         episode: None,
     })
+}
+
+/// Episode rows from a season detail payload (ADR-0029 §1.1 / §1.2).
+/// Kind-sparse: no genres/cast (inherit via `tmdb_show` → tv row).
+pub fn map_episodes_from_season(
+    show_id: i64,
+    data: &Value,
+) -> Result<Vec<CanonicalMetadata>, ResolveError> {
+    let arr = data
+        .get("episodes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ResolveError::Provider("season detail missing episodes".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for ep in arr {
+        let id = ep
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ResolveError::Provider("episode missing id".into()))?;
+        let title = ep
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let air_date = text(ep, "air_date");
+        let year = air_date.as_deref().and_then(|d| d.get(..4)?.parse().ok());
+        let mut artwork = Vec::new();
+        if let Some(path) = ep.get("still_path").and_then(|v| v.as_str())
+            && !path.is_empty()
+        {
+            artwork.push(ArtworkRef {
+                kind: ArtworkKind::Other,
+                path: path.to_string(),
+            });
+        }
+        let ratings = movie_ratings(ep); // vote_average / vote_count on episode object
+        out.push(CanonicalMetadata {
+            kind: MetadataKind::Episode,
+            title,
+            original_title: None,
+            year,
+            air_date,
+            plot: text(ep, "overview"),
+            genres: Vec::new(),
+            runtime_minutes: ep.get("runtime").and_then(|v| v.as_i64()).map(|n| n as i32),
+            cast: Vec::new(),
+            ratings,
+            ids: ProviderIds {
+                tmdb: Some(id),
+                tmdb_show: Some(show_id),
+                imdb: None,
+                tvdb: None,
+            },
+            artwork,
+            collection: None,
+            season: ep
+                .get("season_number")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32),
+            episode: ep
+                .get("episode_number")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32),
+        });
+    }
+    Ok(out)
 }
 
 fn text(data: &Value, key: &str) -> Option<String> {
@@ -238,5 +305,31 @@ mod tests {
             Some("FC")
         );
         assert_eq!(meta.cast[0].name, "Brad Pitt");
+    }
+
+    #[test]
+    fn maps_episodes_kind_sparse() {
+        let data = serde_json::json!({
+            "season_number": 1,
+            "episodes": [{
+                "id": 42,
+                "name": "Pilot",
+                "overview": "ep",
+                "air_date": "2011-04-17",
+                "season_number": 1,
+                "episode_number": 1,
+                "still_path": "/still.jpg",
+                "vote_average": 7.5,
+                "vote_count": 3
+            }]
+        });
+        let eps = map_episodes_from_season(99, &data).unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].ids.tmdb, Some(42));
+        assert_eq!(eps[0].ids.tmdb_show, Some(99));
+        assert!(eps[0].genres.is_empty());
+        assert!(eps[0].cast.is_empty());
+        assert_eq!(eps[0].air_date.as_deref(), Some("2011-04-17"));
+        assert_eq!(eps[0].year, Some(2011));
     }
 }

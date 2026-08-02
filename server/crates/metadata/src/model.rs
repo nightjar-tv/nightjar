@@ -77,7 +77,11 @@ pub struct CanonicalMetadata {
     pub kind: MetadataKind,
     pub title: String,
     pub original_title: Option<String>,
+    /// Movie release / show first_air year. Episode: derived from [`Self::air_date`]
+    /// only when persisted; never feeds browse sort (ADR-0029 §1.2).
     pub year: Option<i32>,
+    /// Episode air date (ISO `YYYY-MM-DD`). Null for movie/tv.
+    pub air_date: Option<String>,
     pub plot: Option<String>,
     pub genres: Vec<String>,
     pub runtime_minutes: Option<i32>,

@@ -2,12 +2,12 @@
 
 use rusqlite::Connection;
 
+use crate::canonical;
 use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::negative_cache::{
     self, CacheKind, NegativeReason, PROVIDER_TMDB, now_rfc3339, query_key,
 };
 use crate::nfo::{NfoError, parse_nfo};
-use crate::raw_payload;
 use crate::tmdb::RawProviderPayload;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +111,16 @@ pub enum ProviderResult {
 /// One metadata backend (TMDB today; keep the trait thin — Rule 4.7).
 pub trait MetadataSource {
     fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError>;
+
+    /// Season detail for episode-id projection (ADR-0029). Default: unsupported
+    /// (stubs / measures that only exercise search+show detail).
+    fn fetch_season(
+        &self,
+        _show_id: i64,
+        _season_number: i32,
+    ) -> Result<Option<RawProviderPayload>, ResolveError> {
+        Ok(None)
+    }
 }
 
 /// Parses `input.nfo_xml` when present. Not a [`MetadataSource`]: corrupt NFO
@@ -157,12 +167,11 @@ impl<T: MetadataSource> Resolver<T> {
         self.resolve_inner(input, None)
     }
 
-    /// Resolve with ADR-0026 §3 negative cache and §4 raw payload persistence.
+    /// Resolve with ADR-0026 §3 negative cache and §4/ADR-0029 persistence.
     ///
     /// Cached `no_results` / `below_threshold` entries skip the provider until
     /// `next_retry_at`. Provider errors are **not** cached. Hits upsert the
-    /// raw payload in a transaction (canonical writer is a no-op until that
-    /// table lands).
+    /// raw payload and canonical projection in one transaction.
     pub fn resolve_with_store(
         &self,
         input: &ResolveInput,
@@ -235,9 +244,7 @@ impl<T: MetadataSource> Resolver<T> {
                     if let Some(ref qk) = qk {
                         let _ = negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, qk);
                     }
-                    // Canonical table lands with writers; empty write keeps the
-                    // same-transaction contract (ADR-0026 §4).
-                    raw_payload::persist_hit_with_canonical(conn, PROVIDER_TMDB, raw, |_| Ok(()))
+                    canonical::persist_mapped_hit(conn, PROVIDER_TMDB, raw, &metadata)
                         .map_err(ResolveError::Provider)?;
                 }
                 Ok(ResolveOutcome::Resolved {
