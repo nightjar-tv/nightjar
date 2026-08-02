@@ -78,9 +78,14 @@ Sidecars use the **same** rules in the **same** migration. A sidecar
 beside a video becomes e.g. `Show/Season 1/ep.en.srt` under the same
 library root.
 
-**On-disk open path** for probe / extract / playback:
-`Path::new(&library.path).join(relpath)` with the canonical root (no
-trailing slash) and the stored relpath.
+**On-disk open path** — one helper, every call site (Rule 4.11). After
+migration, a library may be in a **mixed representation** indefinitely:
+stripped rows hold relpaths; non-stripping rows still hold absolutes in
+the same column (§5). Resolve with a single function, e.g. absolute if
+the stored value starts with the root-path separator (or otherwise matches
+an absolute form on that host), else `join(libraries.path, stored)`.
+No scattered `if` at probe / extract / playback / doctor — one path
+through that helper.
 
 ### 2. Case sensitivity is identity
 
@@ -107,6 +112,12 @@ duplicates; do not pick silently.
 First-indexed spelling wins. `delete_missing` / keep-set membership is
 fold-aware so a folding walk does not drop the sticky-spelling row.
 
+**Stored spelling may disagree with `ls` on folding hosts.** That is
+deliberate: creation-time (or migration-time) spelling is not refreshed.
+The filesystem folds on open, so playback/probe still work. String
+compare of DB path to walk/`ls` output is not a bug signal — use fold
+equality or open, not byte equality, when diagnosing.
+
 **Why not rewrite (and why that is safe):** a fold-aware dry-run (§3) can
 match ~100% while every walked spelling differs from storage (case-
 sensitive host → case-folding mount). Rewriting would be a mass `UPDATE`
@@ -114,9 +125,10 @@ of the identity column on an ordinary scan — no migration transaction,
 no `COUNT(*)` guard, and it would change derived
 `path:{library_id}:{relpath}` strings for unmatched items (future watch
 state) without the ADR-0025 migrator. Sticky spelling avoids that class
-entirely. Opening `join(root, stored_relpath)` on a case-insensitive
-host resolves; a true case rename on a case-sensitive host is a different
-directory entry and follows normal remove/add.
+entirely and keeps `path:{library_id}:{relpath}` stable across a
+case-folding remount — the point of ADR-0025 §4. A true case rename on a
+case-sensitive host is a different directory entry and follows normal
+remove/add.
 
 Case-sensitive hosts (typical Linux ext4): fold-equal implies byte-equal
 for the usual ASCII media layout; behaviour matches today's unique key.
@@ -290,8 +302,10 @@ if documented as unstable across repoint.
 
 ## Consequences
 
-- Scanner upsert and sidecar association write canonical relpaths; open
-  paths join to `libraries.path`; fold-aware keep-set; sticky spelling.
+- Scanner upsert and sidecar association write canonical relpaths;
+  fold-aware keep-set; sticky spelling (DB may disagree with `ls`).
+- One absolute-path helper for mixed absolute/relpath rows — used
+  everywhere a file is opened or shown as filesystem path.
 - Implementing slice: migration with visible unresolved-path counts +
   repair; async path PATCH + dry-run retain guard; OpenAPI description on
   `MediaItem.path`; `skipped_outside_root` on scan/library + doctor.
