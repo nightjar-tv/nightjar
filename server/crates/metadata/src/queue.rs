@@ -18,21 +18,6 @@ use crate::resolve::{ResolveInput, ResolveOutcome, Resolver};
 /// Roughly one cold first screen (ADR-0026 §8). Constant, not a setting.
 pub const VISIBLE_FIRST_SCREEN_N: usize = 40;
 
-/// Libraries omitted from dogfood measures when `EXCLUDE_TESTDATA=1`.
-///
-/// Not only the formal `Test Data` library — local HDR/pattern scratch libs
-/// (`DV`, `DV2`) must not enter the Visible proxy or negative-cache tallies.
-pub const MEASURE_EXCLUDE_LIBRARY_NAMES: &[&str] = &["Test Data", "DV", "DV2"];
-
-/// SQL `name IN (...)` fragment for [`MEASURE_EXCLUDE_LIBRARY_NAMES`].
-pub fn measure_exclude_libraries_sql_in() -> String {
-    MEASURE_EXCLUDE_LIBRARY_NAMES
-        .iter()
-        .map(|n| format!("'{n}'"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Predicted `T_first_screen` for dogfood Visible union (~40 movie + ~40 show
 /// groups × 1.84 HTTP/group ÷ 4.9 rps). Pass bar is 60 s.
 pub const T_FIRST_SCREEN_PREDICTED_SECS: f64 = 30.0;
@@ -169,8 +154,8 @@ pub fn snapshot_visible_proxy_n(conn: &Connection, n: usize) -> Result<VisiblePr
     snapshot_visible_proxy_filtered(conn, n, &[])
 }
 
-/// `exclude_library_names` drops named libraries from the proxy (see
-/// [`MEASURE_EXCLUDE_LIBRARY_NAMES`] when measuring).
+/// `exclude_library_names` drops named libraries from the proxy (harnesses
+/// supply machine-specific names via env — see `measure_exclude`).
 pub fn snapshot_visible_proxy_filtered(
     conn: &Connection,
     n: usize,
@@ -809,14 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn measure_exclude_covers_pattern_libs_not_only_test_data() {
-        assert!(MEASURE_EXCLUDE_LIBRARY_NAMES.contains(&"Test Data"));
-        assert!(MEASURE_EXCLUDE_LIBRARY_NAMES.contains(&"DV"));
-        assert!(MEASURE_EXCLUDE_LIBRARY_NAMES.contains(&"DV2"));
-    }
-
-    #[test]
-    fn measure_exclude_drops_dv2_from_visible_proxy() {
+    fn exclude_list_drops_named_libs_from_visible_proxy() {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         c.execute_batch(
@@ -831,7 +809,7 @@ mod tests {
         .unwrap();
         let with = snapshot_visible_proxy_filtered(&c, 40, &[]).unwrap();
         assert_eq!(with.movie_unit_count(), 2);
-        let excl = snapshot_visible_proxy_filtered(&c, 40, MEASURE_EXCLUDE_LIBRARY_NAMES).unwrap();
+        let excl = snapshot_visible_proxy_filtered(&c, 40, &["DV2"]).unwrap();
         assert_eq!(excl.movie_unit_count(), 1);
         assert_eq!(excl.units[0].item_ids, vec![1]);
     }

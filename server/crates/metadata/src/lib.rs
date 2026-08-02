@@ -5,6 +5,7 @@
 
 mod clean;
 mod match_score;
+mod measure_exclude;
 mod model;
 mod negative_cache;
 mod nfo;
@@ -23,6 +24,10 @@ pub use match_score::{
     meets_auto_match_floor, needs_collision_detail, norm_key, score_search,
     score_search_with_library_year, score_search_with_shape,
 };
+pub use measure_exclude::{
+    MEASURE_EXCLUDE_LIBRARY_NAMES_DEFAULT, MEASURE_EXCLUDE_LIBRARY_NAMES_ENV,
+    measure_exclude_libraries_sql_in, measure_exclude_library_names,
+};
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
     ProviderIds, Rating, item_key_for_metadata,
@@ -33,11 +38,10 @@ pub use negative_cache::{
 };
 pub use nfo::{NfoError, parse_nfo};
 pub use queue::{
-    DrainOptions, DrainStats, MEASURE_EXCLUDE_LIBRARY_NAMES, MetadataStatus, PendingItem,
-    QueueBand, T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N,
-    VisibleProxy, VisibleProxyUnit, drain_pending, measure_exclude_libraries_sql_in,
-    proxy_terminal_progress, queue_band_for_item, set_metadata_status, snapshot_visible_proxy,
-    snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
+    DrainOptions, DrainStats, MetadataStatus, PendingItem, QueueBand, T_FIRST_SCREEN_PASS_SECS,
+    T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N, VisibleProxy, VisibleProxyUnit,
+    drain_pending, proxy_terminal_progress, queue_band_for_item, set_metadata_status,
+    snapshot_visible_proxy, snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
 };
 pub use rate_limit::{ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC};
 pub use raw_payload::{

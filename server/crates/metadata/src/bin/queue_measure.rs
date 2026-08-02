@@ -4,8 +4,9 @@
 //!
 //! Env:
 //! - `DB`, TMDB credentials, optional `MEASURE_DB`
-//! - `EXCLUDE_TESTDATA=1` — skip [`MEASURE_EXCLUDE_LIBRARY_NAMES`] (Test Data,
-//!   DV, DV2) for proxy, drain, and pending reset
+//! - `EXCLUDE_TESTDATA=1` — apply library-name exclusion (see
+//!   `MEASURE_EXCLUDE_LIBRARY_NAMES`; dogfood default Test Data,DV,DV2)
+//! - `MEASURE_EXCLUDE_LIBRARY_NAMES` — comma-separated library names (config)
 //! - `QUEUE_FIRST_SCREEN=0` — full drain (no early stop)
 //! - `QUEUE_MAX_GROUPS` — short probe cap (implies not first-screen)
 //! - `QUEUE_REQUESTS_PER_SEC`, `QUEUE_MAX_IN_FLIGHT` (if unused while serial)
@@ -18,10 +19,10 @@ use std::time::Instant;
 
 use nightjar_db::migrate;
 use nightjar_metadata::{
-    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions,
-    MEASURE_EXCLUDE_LIBRARY_NAMES, Resolver, T_FIRST_SCREEN_PASS_SECS,
-    T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, TmdbCredentials, VISIBLE_FIRST_SCREEN_N,
-    drain_pending, measure_exclude_libraries_sql_in, snapshot_visible_proxy_filtered,
+    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions, Resolver,
+    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, TmdbCredentials,
+    VISIBLE_FIRST_SCREEN_N, drain_pending, measure_exclude_libraries_sql_in,
+    measure_exclude_library_names, snapshot_visible_proxy_filtered,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -56,6 +57,7 @@ struct Report {
     requests_per_sec_budget: u32,
     max_in_flight: usize,
     visible_n: usize,
+    exclude_libraries: Vec<String>,
     stopped_early: bool,
     seasons_in_drain: bool,
     note: String,
@@ -120,8 +122,14 @@ fn main() {
         .unwrap_or_else(|e| panic!("open {}: {e}", measure_db.display()));
     migrate(&conn).expect("migrate");
 
-    if exclude_testdata {
-        let in_list = measure_exclude_libraries_sql_in();
+    let exclude_libs: Vec<String> = if exclude_testdata {
+        measure_exclude_library_names()
+    } else {
+        vec![]
+    };
+
+    if !exclude_libs.is_empty() {
+        let in_list = measure_exclude_libraries_sql_in(&exclude_libs);
         conn.execute(
             &format!(
                 "UPDATE media_items SET metadata_status = 'ready'
@@ -138,10 +146,7 @@ fn main() {
             [],
         )
         .expect("reset pending");
-        eprintln!(
-            "EXCLUDE_TESTDATA=1: skipping libraries {:?}",
-            MEASURE_EXCLUDE_LIBRARY_NAMES
-        );
+        eprintln!("EXCLUDE_TESTDATA=1: skipping libraries {exclude_libs:?}");
     } else {
         conn.execute("UPDATE media_items SET metadata_status = 'pending'", [])
             .expect("reset pending");
@@ -152,14 +157,9 @@ fn main() {
     )
     .ok();
 
-    let exclude_libs: Vec<&str> = if exclude_testdata {
-        MEASURE_EXCLUDE_LIBRARY_NAMES.to_vec()
-    } else {
-        vec![]
-    };
-    let proxy = snapshot_visible_proxy_filtered(&conn, VISIBLE_FIRST_SCREEN_N, &exclude_libs)
+    let exclude_refs: Vec<&str> = exclude_libs.iter().map(String::as_str).collect();
+    let proxy = snapshot_visible_proxy_filtered(&conn, VISIBLE_FIRST_SCREEN_N, &exclude_refs)
         .expect("proxy");
-    // Scale ADR ~30s (80 units) to this dogfood proxy size.
     let predicted = T_FIRST_SCREEN_PREDICTED_SECS * (proxy.units.len() as f64 / 80.0);
     eprintln!(
         "Visible proxy: {} units ({} movie / {} show), N={VISIBLE_FIRST_SCREEN_N}/library, \
@@ -186,7 +186,7 @@ fn main() {
         DrainOptions {
             max_groups,
             stop_when_visible_terminal: first_screen,
-            exclude_library_names: exclude_libs.iter().map(|s| (*s).to_string()).collect(),
+            exclude_library_names: exclude_libs.clone(),
         },
     )
     .expect("drain");
@@ -258,6 +258,7 @@ fn main() {
         requests_per_sec_budget: rps,
         max_in_flight,
         visible_n: VISIBLE_FIRST_SCREEN_N,
+        exclude_libraries: exclude_libs,
         stopped_early: stats.stopped_early,
         seasons_in_drain: false,
         note,
