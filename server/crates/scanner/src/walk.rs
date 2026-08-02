@@ -372,7 +372,9 @@ fn process_dir(dir: &Path, prev_dirs: Option<&HashMap<PathBuf, CachedDir>>) -> D
             }
         };
         let path = entry.path();
-        let meta = match entry.metadata() {
+        // Follow symlinks (fs::metadata, not DirEntry::metadata/lstat) so a
+        // symlink-to-file is visible to the under-root check (ADR-0030).
+        let meta = match fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 errors += 1;

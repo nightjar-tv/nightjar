@@ -11,7 +11,7 @@ use nightjar_core::{
     BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
     known_profile, resolve_profile_bag, title_looks_forced, title_looks_sdh,
 };
-use nightjar_db::{MediaItemRow, SidecarRow};
+use nightjar_db::{MediaItemRow, SidecarRow, resolve_media_path};
 use nightjar_transcode::{
     TrackReadiness, is_burn_in_sidecar_format, is_serveable_sidecar_format, list_audio_tracks,
     list_burn_in_subtitles, list_text_subtitles, stored_webvtt,
@@ -128,7 +128,21 @@ pub async fn get(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    Ok(Json(to_dto(row)))
+    let root = library_root(&state, row.library_id)?;
+    Ok(Json(to_dto(row, &root)))
+}
+
+pub(crate) fn library_root(state: &AppState, library_id: i64) -> ApiResult<String> {
+    Ok(state
+        .db
+        .get_library(library_id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?
+        .path)
+}
+
+pub(crate) fn abs_path(library_root: &str, stored: &str) -> std::path::PathBuf {
+    resolve_media_path(library_root, stored)
 }
 
 #[derive(Deserialize)]
@@ -182,13 +196,15 @@ pub async fn playback_info(
         query.hdr.as_deref(),
     );
     let decision = decide(&row, &profile, state.tonemap_available);
-    let subtitle_tracks = subtitle_tracks_for(&state, &row).unwrap_or_else(|e| {
+    let root = library_root(&state, row.library_id)?;
+    let abs = abs_path(&root, &row.path);
+    let subtitle_tracks = subtitle_tracks_for(&state, &row, &root).unwrap_or_else(|e| {
         tracing::warn!(item_id, error = %e, "subtitle list failed");
         Vec::new()
     });
     // Listed the same for every method: the client asks for a track and never
     // reasons about delivery to find one (ADR-0012).
-    let audio_tracks = audio_tracks_for(&row).unwrap_or_else(|e| {
+    let audio_tracks = audio_tracks_for(&row, &root).unwrap_or_else(|e| {
         tracing::warn!(item_id, error = %e, "audio track list failed");
         Vec::new()
     });
@@ -218,7 +234,7 @@ pub async fn playback_info(
     if row.subtitle_status == "pending" {
         state
             .pool
-            .prioritize_extract(row.id, row.library_id, std::path::PathBuf::from(&row.path));
+            .prioritize_extract(row.id, row.library_id, abs.clone());
     }
 
     Ok(Json(PlaybackInfoDto {
@@ -278,8 +294,11 @@ pub async fn subtitle_vtt(
     Ok(res)
 }
 
-pub(crate) fn audio_tracks_for(row: &MediaItemRow) -> Result<Vec<AudioTrackDto>, String> {
-    let tracks = list_audio_tracks(std::path::Path::new(&row.path))?
+pub(crate) fn audio_tracks_for(
+    row: &MediaItemRow,
+    library_root: &str,
+) -> Result<Vec<AudioTrackDto>, String> {
+    let tracks = list_audio_tracks(&abs_path(library_root, &row.path))?
         .into_iter()
         .map(|a| AudioTrackDto {
             track_id: a.track_id(),
@@ -298,9 +317,11 @@ pub(crate) fn audio_tracks_for(row: &MediaItemRow) -> Result<Vec<AudioTrackDto>,
 pub(crate) fn subtitle_tracks_for(
     state: &AppState,
     row: &MediaItemRow,
+    library_root: &str,
 ) -> Result<Vec<SubtitleTrackDto>, String> {
     let mut tracks = Vec::new();
-    let src = std::path::Path::new(&row.path);
+    let src_buf = abs_path(library_root, &row.path);
+    let src = src_buf.as_path();
     for s in list_text_subtitles(src)? {
         let forced = s.is_forced || title_looks_forced(s.title.as_deref());
         let sdh = title_looks_sdh(s.title.as_deref());
@@ -464,12 +485,15 @@ pub fn decide(
     )
 }
 
-pub fn to_dto(row: MediaItemRow) -> MediaItemDto {
+pub fn to_dto(row: MediaItemRow, library_root: &str) -> MediaItemDto {
     let decision = decide(&row, &BROWSER_V0, true);
+    let path = abs_path(library_root, &row.path)
+        .to_string_lossy()
+        .into_owned();
     MediaItemDto {
         id: row.id,
         library_id: row.library_id,
-        path: row.path,
+        path,
         title: row.title,
         kind: row.kind,
         year: row.year,

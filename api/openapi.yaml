@@ -85,6 +85,52 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    patch:
+      operationId: patchLibrary
+      summary: Update library name and/or repoint library root (ADR-0030)
+      description: >
+        Name-only updates return 200 with the library. A path change accepts an
+        async repoint job (202) that dry-runs a full walk against a 0.90 retain
+        guard before committing `libraries.path` and enqueueing a normal scan.
+        Refusal reasons appear on the job error
+        (`repoint_empty_match` | `repoint_below_retain_threshold`). No force
+        override in v1. Path PATCH work is scan-class duration (two walks).
+        Phase 1–2: unauthenticated (ADR-0003). Phase 3: admin-only — this
+        mutates the library root and must not stay public after accounts land
+        (ADR-0030).
+      parameters:
+        - $ref: "#/components/parameters/LibraryId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchLibraryRequest"
+      responses:
+        "200":
+          description: Name-only update applied (no path change)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Library"
+        "202":
+          description: Path repoint job accepted; poll GET /scan-jobs/{jobId}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanJobAccepted"
+        "400":
+          description: Invalid request or active job already running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /api/v0/libraries/{libraryId}/scan:
     post:
@@ -851,7 +897,15 @@ components:
 
     Library:
       type: object
-      required: [id, name, path, kind, itemCount, reachable]
+      required:
+        - id
+        - name
+        - path
+        - kind
+        - itemCount
+        - reachable
+        - pathsUnresolved
+        - skippedOutsideRoot
       properties:
         id:
           type: integer
@@ -870,6 +924,31 @@ components:
           description: >
             False when the library root is not reachable (unmounted share,
             missing path). Work is paused until it returns (ADR-0014).
+        pathsUnresolved:
+          type: integer
+          format: int64
+          description: >
+            Rows still stored as absolute paths after migration / pending
+            repair under the current root (ADR-0030).
+        skippedOutsideRoot:
+          type: integer
+          format: int64
+          description: >
+            Last index pass count of walked files outside the library root
+            (symlink escape / bind overlap); visible, not log-only (ADR-0030).
+
+    PatchLibraryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        path:
+          type: string
+          minLength: 1
+          description: >
+            Candidate library root for async repoint. Must be an existing
+            directory. Same path as current (after normalize) is a no-op.
 
     CreateLibraryRequest:
       type: object
@@ -886,7 +965,16 @@ components:
 
     CreateLibraryResponse:
       type: object
-      required: [id, name, path, kind, itemCount, reachable, jobId]
+      required:
+        - id
+        - name
+        - path
+        - kind
+        - itemCount
+        - reachable
+        - pathsUnresolved
+        - skippedOutsideRoot
+        - jobId
       description: >
         Library row plus the scan job enqueued on create (ADR-0015).
       properties:
@@ -904,6 +992,12 @@ components:
           format: int64
         reachable:
           type: boolean
+        pathsUnresolved:
+          type: integer
+          format: int64
+        skippedOutsideRoot:
+          type: integer
+          format: int64
         jobId:
           type: integer
           format: int64
@@ -921,6 +1015,10 @@ components:
           format: int64
         path:
           type: string
+          description: >
+            Absolute filesystem path reconstructed at response time from the
+            current library root and stored relpath (ADR-0030). Not stable
+            across library repoint — use `id` for identity.
         title:
           type: string
         kind:
@@ -990,6 +1088,8 @@ components:
         - probed
         - errors
         - startedAt
+        - kind
+        - skippedOutsideRoot
       properties:
         id:
           type: integer
@@ -1023,6 +1123,9 @@ components:
         error:
           type: string
           nullable: true
+          description: >
+            Failure message. Repoint refusals use stable prefixes
+            `repoint_empty_match` or `repoint_below_retain_threshold` (ADR-0030).
         startedAt:
           type: string
           format: date-time
@@ -1030,6 +1133,20 @@ components:
           type: string
           format: date-time
           nullable: true
+        kind:
+          type: string
+          description: "`scan` or `repoint` (ADR-0030)."
+          enum: [scan, repoint]
+        candidatePath:
+          type: string
+          nullable: true
+          description: Candidate root for a repoint job; absent on ordinary scans.
+        skippedOutsideRoot:
+          type: integer
+          format: int64
+          description: >
+            Files walked but not indexed because they were outside the library
+            root (ADR-0030).
 
     PlaybackInfo:
       type: object

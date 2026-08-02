@@ -1,5 +1,5 @@
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::{ProfileQuery, decide, profile_from_query};
+use crate::routes::items::{ProfileQuery, abs_path, decide, library_root, profile_from_query};
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -34,8 +34,9 @@ pub async fn stream_item(
 
     match decision.method {
         PlaybackMethod::DirectPlay => {
-            let path = std::path::PathBuf::from(&row.path);
-            let mime = mime_for_path(&row.path);
+            let root = library_root(&state, row.library_id)?;
+            let path = abs_path(&root, &row.path);
+            let mime = mime_for_path(&path.to_string_lossy());
             serve_file(path, mime, &headers).await
         }
         PlaybackMethod::Remux | PlaybackMethod::Transcode => Err(ApiError {

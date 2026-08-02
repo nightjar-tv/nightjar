@@ -1,13 +1,16 @@
 # ADR-0030: Library-relative media paths and library repoint
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-03
 - Depends on: ADR-0025 §4 (path-key grammar); ADR-0014 (reachability /
   `delete_missing`); ADR-0015 (async library jobs); ADR-0029 (join stores
   provider keys only — path keys derived)
+- Supersedes: none — completes ADR-0025 §4 *storage* (relpath was paper-only
+  there); does not replace ADR-0029
 - Gate: Gate 3 — remount / Docker bind-path moves must not wipe probe,
   subtitle extract, or metadata bindings
-- Related: ADR-0013 (`{DATA}/subs/{itemId}/`); OpenAPI `MediaItem.path`
+- Related: ADR-0013 (`{DATA}/subs/{itemId}/`); OpenAPI `MediaItem.path`;
+  ADR-0003 (no auth in v0 — Phase 3)
 
 ## Context
 
@@ -78,14 +81,17 @@ Sidecars use the **same** rules in the **same** migration. A sidecar
 beside a video becomes e.g. `Show/Season 1/ep.en.srt` under the same
 library root.
 
-**On-disk open path** — one helper, every call site (Rule 4.11). After
-migration, a library may be in a **mixed representation** indefinitely:
-stripped rows hold relpaths; non-stripping rows still hold absolutes in
-the same column (§5). Resolve with a single function, e.g. absolute if
-the stored value starts with the root-path separator (or otherwise matches
-an absolute form on that host), else `join(libraries.path, stored)`.
-No scattered `if` at probe / extract / playback / doctor — one path
-through that helper.
+**One column, in place (Rule 4.11 / 4.5).** There is no second path column.
+Migration `UPDATE`s `media_items.path` / `media_item_sidecars.path` to the
+relpath when the strip succeeds; the absolute bytes are not retained on that
+row. Rows that cannot strip keep their existing absolute string in the **same**
+column and increment `paths_unresolved` (§5) until repair. That mixed
+population is transitional failure state, not a dual-representation design.
+
+**On-disk open path** — one helper, every call site (Rule 4.11). Resolve with
+a single function: absolute stored values (unresolved leftovers) used as-is;
+else `join(libraries.path, stored)`. No scattered `if` at probe / extract /
+playback / doctor — one path through that helper.
 
 ### 2. Case sensitivity is identity
 
@@ -171,11 +177,14 @@ reachability is in *doubt*. A typo root that is reachable and walks empty
 *successfully* is not doubt — today that wipe still fires. The retain
 threshold is the repoint-specific guard; ordinary scans keep §2.
 
-**Retain fraction 0.90** is a **judgement call**, not a measured constant.
-It exists to catch wrong roots while allowing small tree churn. What would
-change it: dogfood or support evidence that real remounts routinely move
-more than 10% of relpaths without being a wrong root, or that 10% still
-lets through destructive mis-points. Not a setting (Rule 4.12).
+**Retain fraction 0.90** is a **default judgement**, not a measured floor.
+It was **not** run against the ~24 800-item dogfood library before acceptance;
+it was picked to catch wrong roots while allowing small tree churn. A dry-run
+at **0.89** (or any `matched/current < 0.90`) **refuses** — it does not
+repoint and drop 11%. Job error prefix: `repoint_below_retain_threshold`.
+**Revisit trigger:** dogfood remount evidence that real keep-relpath remounts
+routinely land under 0.90 without being a wrong root, or that 0.90 still
+admits destructive mis-points. Not a setting (Rule 4.12).
 
 **Small libraries:** with fewer than 10 items, losing a single row is
 already >10%, so the threshold is effectively **all-or-nothing** (any
@@ -190,6 +199,13 @@ provides **no** escape hatch (no `?force=`, no confirm token). The only
 path is delete-and-re-add, which creates a new `library_id` and loses
 probe, extracts, and bindings — said plainly (Rule 4.8). A deliberate
 force flag is a later ADR if support demand appears.
+
+**Auth (Phase 3 marker).** `PATCH` mutates the library root. Phase 1–2 have
+no auth (ADR-0003 §3); the route is public like every other write today.
+**Phase 3: admin-only.** Leaving it public after accounts land would let any
+authenticated household member repoint (or refuse-loop) libraries. Same
+class as ADR-0009's capability readout — call out now so the security pass
+cannot miss it.
 
 ### 4. What a successful repoint preserves; API `path`
 
@@ -208,11 +224,13 @@ force flag is a later ADR if support demand appears.
 
 **OpenAPI `MediaItem.path`:** remains a required string and remains
 **absolute in the response** — reconstructed as
-`libraries.path` *(at response time)* + `/` + stored relpath. It is
-**not a stable identifier** across repoint; clients that need stability
-use `id` or (later) `item_key`. Document that in the schema description.
-Request bodies that accept paths (if any) are out of scope for v0 create-
-library (still takes the root only).
+`libraries.path` *(at response time)* + `/` + stored relpath. Wire meaning
+is unchanged: absolute filesystem path of the media file (Rule 2.3 for v0
+clients that already consume absolute paths). It is **not a stable
+identifier** across repoint; clients that need stability use `id` or
+(later) `item_key`. Document that in the schema description. Request bodies
+that accept paths (if any) are out of scope for v0 create-library (still
+takes the root only).
 
 ### 5. Migration shape (constraints only)
 
@@ -308,12 +326,19 @@ if documented as unstable across repoint.
   everywhere a file is opened or shown as filesystem path.
 - Implementing slice: migration with visible unresolved-path counts +
   repair; async path PATCH + dry-run retain guard; OpenAPI description on
-  `MediaItem.path`; `skipped_outside_root` on scan/library + doctor.
+  `MediaItem.path`; `skipped_outside_root` on scan/library API.
+- **User-visible (ASS pattern):** `skipped_outside_root` and
+  `paths_unresolved` are on the library and scan-job JSON. There is no web
+  UI surface yet — the server knows; the household user does not unless a
+  client shows the counters or `nightjar doctor` (Phase 4 plan) does.
+  Failed repoint drops **zero** items (refuse). A *successful* repoint then
+  runs a normal scan: ordinary `delete_missing` can remove rows that miss
+  the new tree while still clearing the retain bar.
 - ADR-0025 §4 storage and grammar finally agree; derived path keys use
   the stored (sticky) relpath column.
-- Gate 3 remount / Docker path-move tests: async repoint with retain
-  ≥ 0.90 keeps item ids and subtitle extracts; refuse path covers empty
-  wrong root; case-fold remount does not mass-UPDATE paths.
+- Gate 3 remount / Docker path-move verification against the dogfood
+  library is **still outstanding** at acceptance of this ADR text; local
+  unit/integration coverage is not a substitute.
 - v1 has no force-repoint: operators whose tree genuinely changed by more
   than 10% of relpaths must delete-and-re-add (new `library_id`, lose
   derived state) or wait for a later ADR.

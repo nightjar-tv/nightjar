@@ -2,6 +2,7 @@
 
 mod content_id;
 mod migrate;
+mod paths;
 mod status;
 mod store;
 
@@ -10,12 +11,16 @@ pub use content_id::{
     format_content_id,
 };
 pub use migrate::migrate;
+pub use paths::{
+    fold_path, is_absolute_stored, normalize_library_root, paths_fold_equal, resolve_media_path,
+    to_relpath,
+};
 pub use status::{
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
 };
 pub use store::{
-    Db, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate, ScanJobRow, SidecarRow,
-    UpsertItem,
+    Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate,
+    ScanJobRow, SidecarRow, UpsertItem,
 };
 
 use std::path::{Path, PathBuf};

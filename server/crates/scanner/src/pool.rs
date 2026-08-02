@@ -639,12 +639,29 @@ impl LibraryPool {
             finish();
             return;
         }
+        let lib_root = match self.db.get_library(item.library_id) {
+            Ok(Some(lib)) => lib.path,
+            Ok(None) => {
+                tracing::warn!(
+                    item_id = item.item_id,
+                    library_id = item.library_id,
+                    "library missing for subtitle extract"
+                );
+                finish();
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(item_id = item.item_id, error = %e, "load library for extract failed");
+                finish();
+                return;
+            }
+        };
         let sidecars = match self.db.list_item_sidecars(item.item_id) {
             Ok(rows) => rows
                 .into_iter()
                 .map(|s| SidecarInput {
                     track_id: s.track_id,
-                    path: PathBuf::from(s.path),
+                    path: nightjar_db::resolve_media_path(&lib_root, &s.path),
                     format: s.format,
                 })
                 .collect::<Vec<_>>(),
