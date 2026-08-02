@@ -109,6 +109,8 @@ pub struct TextSubtitleStream {
     pub codec: String,
     pub language: Option<String>,
     pub title: Option<String>,
+    pub is_default: bool,
+    pub is_forced: bool,
 }
 
 impl TextSubtitleStream {
@@ -337,11 +339,14 @@ pub fn list_text_subtitles(src: &Path) -> Result<Vec<TextSubtitleStream>, String
             continue;
         };
         let tags = stream.tags.unwrap_or_default();
+        let disp = stream.disposition.unwrap_or_default();
         out.push(TextSubtitleStream {
             language: container_stream_language(tags.language),
             stream_index: index,
             codec,
             title: tags.title.filter(|s| !s.is_empty()),
+            is_default: disp.default == 1,
+            is_forced: disp.forced == 1,
         });
     }
     Ok(out)
@@ -1055,7 +1060,16 @@ struct FfprobeSubs {
 struct FfSubStream {
     index: Option<u32>,
     codec_name: Option<String>,
+    disposition: Option<FfSubDisposition>,
     tags: Option<FfTags>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfSubDisposition {
+    #[serde(default)]
+    default: u8,
+    #[serde(default)]
+    forced: u8,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1136,6 +1150,8 @@ mod tests {
             codec: "subrip".into(),
             language: Some("en".into()),
             title: None,
+            is_default: false,
+            is_forced: false,
         };
         assert_eq!(s.track_id(), "e2");
     }

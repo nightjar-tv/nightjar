@@ -8,7 +8,10 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use nightjar_core::{ClientCapabilityProfile, PlaybackMethod, video_encode_plan};
+use nightjar_core::{
+    ClientCapabilityProfile, DEFAULT_PREFERENCE_LANGUAGE, PlaybackMethod, TrackCandidate,
+    select_audio_track, select_subtitle_track, video_encode_plan,
+};
 use nightjar_db::MediaItemRow;
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeEntry, KeyframeMap,
@@ -286,8 +289,7 @@ fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
         .prioritize_map_rebuild(row.id, row.library_id, std::path::PathBuf::from(&row.path));
 }
 
-/// Which audio stream this session maps (ADR-0012). No `audioTrackId` takes
-/// the container default, else the first track.
+/// Which audio stream this session maps (ADR-0012 / ADR-0024).
 fn resolve_audio(
     row: &MediaItemRow,
     requested: Option<&str>,
@@ -311,10 +313,42 @@ fn resolve_audio(
     };
 
     let track = match requested {
-        Some(id) => Some(tracks.iter().find(|t| t.track_id() == id).ok_or_else(|| {
-            ApiError::not_found(format!("audio track {id} not found for item {}", row.id))
-        })?),
-        None => tracks.iter().find(|t| t.is_default),
+        Some(id) => {
+            let t = tracks.iter().find(|t| t.track_id() == id).ok_or_else(|| {
+                ApiError::not_found(format!("audio track {id} not found for item {}", row.id))
+            })?;
+            tracing::info!(
+                item_id = row.id,
+                track_id = %id,
+                reason = "client requested audioTrackId",
+                "audio track selected"
+            );
+            Some(t)
+        }
+        None => {
+            let candidates: Vec<TrackCandidate> = tracks
+                .iter()
+                .map(|t| TrackCandidate {
+                    track_id: t.track_id(),
+                    language: t.language.clone(),
+                    title: t.title.clone(),
+                    is_default: t.is_default,
+                    is_forced: false,
+                    is_image: false,
+                    stream_index: t.stream_index,
+                })
+                .collect();
+            let sel = select_audio_track(&candidates, Some(DEFAULT_PREFERENCE_LANGUAGE));
+            tracing::info!(
+                item_id = row.id,
+                track_id = sel.track_id.as_deref().unwrap_or("-"),
+                reason = %sel.reason,
+                "audio track selected"
+            );
+            sel.track_id
+                .as_deref()
+                .and_then(|id| tracks.iter().find(|t| t.track_id() == id))
+        }
     };
     Ok(match track {
         Some(t) => AudioSelection {
@@ -409,26 +443,68 @@ fn snapshot_hls_tracks(
     tracks: &[crate::routes::items::SubtitleTrackDto],
 ) -> Result<Vec<HlsSubtitleTrack>, String> {
     let sidecars = state.db.list_item_sidecars(row.id)?;
-    let mut out = Vec::new();
-    let mut saw_default = false;
-    for t in tracks {
+    let ready: Vec<&crate::routes::items::SubtitleTrackDto> = tracks
+        .iter()
         // HLS MEDIA only for fully extracted tracks. Declaring a cold
         // session-inline rendition re-demuxes the source beside the encode
         // and can block Safari start when seg000.vtt never lands (ADR-0013).
         // Pending/partial stay on play-priority extract + preparing UI;
         // captions appear on the next session once complete.
-        if t.readiness != Some("complete") || t.url.is_none() {
-            continue;
-        }
+        .filter(|t| t.readiness == Some("complete") && t.url.is_some())
+        .collect();
+    let audio_lang = list_audio_tracks(std::path::Path::new(&row.path))
+        .ok()
+        .and_then(|audio| {
+            let cands: Vec<TrackCandidate> = audio
+                .iter()
+                .map(|t| TrackCandidate {
+                    track_id: t.track_id(),
+                    language: t.language.clone(),
+                    title: t.title.clone(),
+                    is_default: t.is_default,
+                    is_forced: false,
+                    is_image: false,
+                    stream_index: t.stream_index,
+                })
+                .collect();
+            let id = select_audio_track(&cands, Some(DEFAULT_PREFERENCE_LANGUAGE)).track_id?;
+            audio
+                .iter()
+                .find(|t| t.track_id() == id)
+                .and_then(|t| t.language.clone())
+        });
+    let sub_cands: Vec<TrackCandidate> = ready
+        .iter()
+        .map(|t| TrackCandidate {
+            track_id: t.track_id.clone(),
+            language: t.language.clone(),
+            title: t.label.clone(),
+            is_default: false,
+            is_forced: t.forced,
+            is_image: false,
+            stream_index: t.stream_index.unwrap_or(u32::MAX),
+        })
+        .collect();
+    let sub_sel = select_subtitle_track(
+        &sub_cands,
+        Some(DEFAULT_PREFERENCE_LANGUAGE),
+        audio_lang.as_deref(),
+    );
+    tracing::info!(
+        item_id = row.id,
+        track_id = sub_sel.track_id.as_deref().unwrap_or("-"),
+        reason = %sub_sel.reason,
+        "subtitle track selected"
+    );
+    let default_id = sub_sel.track_id.as_deref();
+    let mut out = Vec::new();
+    for t in ready {
         let name = t
             .label
             .clone()
             .or_else(|| t.language.clone())
             .unwrap_or_else(|| t.track_id.clone());
-        let is_default = !saw_default;
-        if is_default {
-            saw_default = true;
-        }
+        let is_default = default_id == Some(t.track_id.as_str());
         let (stream_index, sidecar_path) = if t.source == "sidecar" {
             let path = sidecars
                 .iter()
