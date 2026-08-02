@@ -15,6 +15,6 @@ pub use model::{
 pub use nfo::{NfoError, parse_nfo};
 pub use resolve::{
     MetadataOrigin, MetadataSource, NfoSource, ResolveError, ResolveInput, ResolveOutcome,
-    Resolver, resolve,
+    Resolver, UnresolvedReason, resolve,
 };
 pub use tmdb::TmdbStub;
