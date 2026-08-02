@@ -1,0 +1,14 @@
+[
+  {"in": "Angels & Demons", "out": "Angels and Demons"},
+  {"in": "Angels and Demons", "out": "Angels and Demons"},
+  {"in": "A Bug's Life", "out": "A Bugs Life"},
+  {"in": "A Bug\u2019s Life", "out": "A Bugs Life"},
+  {"in": "Assassin's Creed", "out": "Assassins Creed"},
+  {"in": "Joker: Folie à Deux", "out": "Joker Folie a Deux"},
+  {"in": "Léon The Professional", "out": "Leon The Professional"},
+  {"in": "Les Misérables", "out": "Les Miserables"},
+  {"in": "Pokémon Detective Pikachu", "out": "Pokemon Detective Pikachu"},
+  {"in": "Will & Grace", "out": "Will and Grace"},
+  {"in": "Avatar - The Last Airbender", "out": "Avatar The Last Airbender"},
+  {"in": "The Accountant²", "out": "The Accountant2"}
+]
