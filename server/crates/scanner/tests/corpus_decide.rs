@@ -20,8 +20,8 @@
 //! `HdrCase.ignore` set (row skipped), not as an assertion of the bug.
 
 use nightjar_core::{
-    decide_playback, method_from_manifest_expect, video_encode_plan, ClientCapabilityProfile,
-    HdrCapability, PlaybackMethod, AETHER_V0, BROWSER_V0,
+    AETHER_V0, BROWSER_V0, ClientCapabilityProfile, HdrCapability, PlaybackMethod, decide_playback,
+    method_from_manifest_expect, video_encode_plan,
 };
 use nightjar_scanner::ffprobe;
 use serde::Deserialize;

@@ -186,8 +186,7 @@ pub async fn start(
         &profile,
     );
     // Profile 5: no tonemap attempt (decide already names the refuse reason).
-    if mode == SessionMode::Transcode
-        && nightjar_core::is_dolby_vision_profile5(row.hdr.as_deref())
+    if mode == SessionMode::Transcode && nightjar_core::is_dolby_vision_profile5(row.hdr.as_deref())
     {
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,

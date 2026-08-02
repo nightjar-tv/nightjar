@@ -402,8 +402,7 @@ pub fn decide_playback(
     // to a DV-capable client is unchanged.
     if decision.method == PlaybackMethod::Transcode && is_dolby_vision_profile5(source_hdr) {
         decision.reason =
-            "Dolby Vision Profile 5 cannot be tone-mapped (IPT-PQ; no P5→SDR path)"
-                .into();
+            "Dolby Vision Profile 5 cannot be tone-mapped (IPT-PQ; no P5→SDR path)".into();
     } else if decision.method == PlaybackMethod::Transcode
         && source_needs_tonemap(source_hdr)
         && !tonemap_available
