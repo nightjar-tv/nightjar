@@ -1,13 +1,15 @@
 //! Metadata resolution: NFO first, then TMDB (ADR-0025 / ADR-0026).
 //!
-//! Slice 3: negative-result cache (ADR-0026 §3) and entity-keyed raw payload
-//! store (ADR-0026 §4). Measure: `metadata-store-measure`.
+//! Slice 4: metadata queue (query over `metadata_status`) and API
+//! request-rate limiter (ADR-0026 §7/§8).
 
 mod clean;
 mod match_score;
 mod model;
 mod negative_cache;
 mod nfo;
+mod queue;
+mod rate_limit;
 mod raw_payload;
 mod resolve;
 mod tmdb;
@@ -30,6 +32,11 @@ pub use negative_cache::{
     clear as clear_negative_cache, counts_by_reason, query_key, record_miss, should_skip,
 };
 pub use nfo::{NfoError, parse_nfo};
+pub use queue::{
+    DrainStats, MetadataStatus, PendingItem, QueueBand, drain_pending, queue_band_for_item,
+    set_metadata_status,
+};
+pub use rate_limit::{ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC};
 pub use raw_payload::{
     PayloadStoreStats, get_raw_payload, payload_store_stats, persist_hit_with_canonical,
     upsert_raw_payload,

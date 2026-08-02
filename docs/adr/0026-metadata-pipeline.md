@@ -6,6 +6,8 @@
   discipline; full-library match rates after pin + fold
 - Amended: 2026-08-02 — raw payload store measured at 317 MiB
   (`SUM(LENGTH(payload))`); ship uncompressed
+- Amended: 2026-08-03 — API rate limiter is not shared with artwork;
+  metadata queue is a query over item `metadata_status`, not a jobs table
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -46,11 +48,13 @@ the Gate 3 criterion met.
 
 NFO first, then TMDB search + detail. An NFO that already carries a TMDB id
 skips search. Matching uses TMDB search directly. Pipeline shape, queue
-priority, state machine, `append_to_response`, change lists, long refresh
-windows, and the shared rate limiter across metadata and artwork download
-are as in `metadata-artwork-strategy.md` and Phase 3 Block 1. Episode ids
-come from season append per ADR-0025. Artwork acquisition, image pipeline,
-and lazy download are out of scope here.
+priority, state machine, `append_to_response`, change lists, and long refresh
+windows are as in `metadata-artwork-strategy.md` and Phase 3 Block 1.
+**API request-rate limiting** (this ADR §7) applies only to
+`api.themoviedb.org`. Artwork uses a separate connection cap on
+`image.tmdb.org`, decided in the artwork ADR — not one shared limiter over
+both hosts. Episode ids come from season append per ADR-0025. Artwork
+acquisition, image pipeline, and lazy download are out of scope here.
 
 ### 2. Match confidence and threshold
 
@@ -231,6 +235,48 @@ adding them after first-run enrichment would spend the TMDB budget again.
 ADR-0028 clears these fields when a manual reassignment orphans the old
 collection linkage.
 
+### 7. API request-rate limiter (metadata only)
+
+`api.themoviedb.org` is rate-limited by request rate per IP (CDN-enforced,
+roughly 50 requests/second; the API key is not considered).
+`image.tmdb.org` has **no** request-rate limit; TMDB caps **simultaneous
+connections** there (about 20). Those are different ceilings on different
+hosts.
+
+v1 therefore uses an **API request-rate limiter** for metadata only. The
+artwork connection cap is decided in the artwork ADR. One limiter over both
+would throttle image downloads against a budget that does not apply to them
+and leave the connection cap unenforced where it does. Uplink/disk
+contention during first run is admission control if it ever proves real
+(post-v1); metadata HTTP does not share that path with transcodes.
+
+Politeness budget (constants, not settings): about **10 requests/second**
+with a small concurrency cap, well inside the ~50/s ceiling. A full-library
+search pass of ~2,500 unique queries in ~12.5 minutes ran at roughly 3/s
+without trouble.
+
+### 8. Metadata queue is a query, not a jobs table
+
+Enrichment state lives on the item row as `metadata_status`:
+
+| Value | Meaning |
+|---|---|
+| `pending` | Not yet resolved (default for new/scanned items) |
+| `ready` | Metadata written (NFO or TMDB hit + payload) |
+| `unmatched` | Resolve finished without a provider match (below floor, no results, invalid NFO) |
+
+The work queue is `SELECT` over `metadata_status = 'pending'`, skipping
+network when the negative-result cache (§3) says so. **No separate jobs
+table** — that would be a second structure tracking the same fact (Rule
+4.11). Resume-after-restart is automatic: still-`pending` rows are selected
+again; `ready` / `unmatched` are not.
+
+Priority order (strategy note): continue watching, visible items, search
+results, recently added, then everything else. Until Block 2/3 surfaces
+exist, only **recently added** then **everything else** are wired — both
+expressed as `ORDER BY id DESC` (insertion order ≈ recently added) with a
+priority-band function that reserved slots for the later bands.
+
 ## Alternatives considered
 
 **Daily-export FTS matching index.** Rejected in Continuity; spike evidence
@@ -261,6 +307,14 @@ decision OpenSubtitles will inherit.
 **Application key only in environment / secrets, not embedded.** Rejected:
 core behaviour must work by default (Rule 4.12). The embedded key is the
 default; the user key is the escape hatch.
+
+**Separate metadata jobs table.** Rejected (Rule 4.11): item
+`metadata_status` plus the negative-result cache already express work and
+backoff; a jobs table would duplicate that.
+
+**One rate limiter shared by metadata API and artwork CDN.** Rejected:
+different hosts, different ceiling types (request rate vs connection cap);
+see §7.
 
 ## Consequences
 
@@ -293,8 +347,10 @@ default; the user key is the escape hatch.
   complaint; pruning `credits` from `append_to_response` is the better
   design lever if bandwidth/storage need cutting (credits alone were
   ~70% of movie payload bytes in a sample).
-- Artwork ADR consumes detail payloads (image paths) already stored here;
-  it does not re-fetch metadata to learn poster URLs.
+- Artwork ADR owns the `image.tmdb.org` connection cap; it must not reuse
+  the metadata API request-rate limiter.
+- Queue workers select `metadata_status = 'pending'`; writing `ready` /
+  `unmatched` is what makes progress durable across restarts.
 - Release engineering must be able to rotate `NIGHTJAR_TMDB_APP_KEY` and
   ship a new binary; document that beside the secrets-file override.
 - Ask TMDB whether embedding an application key in a self-hosted binary at

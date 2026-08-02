@@ -23,3 +23,7 @@ path = "src/bin/match_measure.rs"
 [[bin]]
 name = "metadata-store-measure"
 path = "src/bin/store_measure.rs"
+
+[[bin]]
+name = "metadata-queue-measure"
+path = "src/bin/queue_measure.rs"

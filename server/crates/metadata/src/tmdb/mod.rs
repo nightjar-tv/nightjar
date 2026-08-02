@@ -2,6 +2,8 @@
 
 mod map;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -11,6 +13,7 @@ use crate::match_score::{
     meets_auto_match_floor, needs_collision_detail, norm_key, score_search_with_shape,
 };
 use crate::model::{CanonicalMetadata, MetadataKind};
+use crate::rate_limit::ApiRateLimiter;
 use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
 
 pub use map::{RawProviderPayload, map_movie_detail, map_tv_detail};
@@ -87,12 +90,17 @@ fn dirs_next_home() -> Option<std::path::PathBuf> {
 pub struct TmdbClient {
     creds: TmdbCredentials,
     agent: ureq::Agent,
-    min_interval: Duration,
-    last_call: std::sync::Mutex<Option<std::time::Instant>>,
+    limiter: Arc<ApiRateLimiter>,
+    /// Count of HTTP 429 responses (measure harness).
+    pub http_429: Arc<AtomicU64>,
 }
 
 impl TmdbClient {
     pub fn new(creds: TmdbCredentials) -> Self {
+        Self::with_limiter(creds, ApiRateLimiter::polite_default())
+    }
+
+    pub fn with_limiter(creds: TmdbCredentials, limiter: Arc<ApiRateLimiter>) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(30))
@@ -100,24 +108,13 @@ impl TmdbClient {
         Self {
             creds,
             agent,
-            min_interval: Duration::from_millis(40),
-            last_call: std::sync::Mutex::new(None),
+            limiter,
+            http_429: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    fn throttle(&self) {
-        let mut guard = self.last_call.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = *guard {
-            let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                std::thread::sleep(self.min_interval - elapsed);
-            }
-        }
-        *guard = Some(std::time::Instant::now());
     }
 
     fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, ResolveError> {
-        self.throttle();
+        let _permit = self.limiter.acquire();
         let mut url = format!("https://api.themoviedb.org/3{path}");
         let mut first = true;
         let push = |url: &mut String, first: &mut bool, k: &str, v: &str| {
@@ -145,6 +142,9 @@ impl TmdbClient {
         let body = resp
             .into_string()
             .map_err(|e| ResolveError::Provider(e.to_string()))?;
+        if status == 429 {
+            self.http_429.fetch_add(1, Ordering::Relaxed);
+        }
         if !(200..300).contains(&status) {
             return Err(ResolveError::Provider(format!(
                 "TMDB {status}: {}",
