@@ -9,5 +9,12 @@ publish = false
 nightjar-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ureq = "2.12"
+rusqlite = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "metadata-match-measure"
+path = "src/bin/match_measure.rs"

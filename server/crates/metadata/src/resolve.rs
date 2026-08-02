@@ -1,6 +1,6 @@
 //! Resolve NFO first, then TMDB (ADR-0026 resolution path).
 
-use crate::model::CanonicalMetadata;
+use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::nfo::{NfoError, parse_nfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,18 +13,26 @@ pub enum MetadataOrigin {
 pub struct ResolveInput {
     /// Raw NFO XML when a sidecar (or equivalent) is present.
     pub nfo_xml: Option<String>,
+    /// Cleaned title for provider search when NFO is absent.
+    pub title: Option<String>,
+    pub year: Option<i32>,
+    /// Search target; episodes search as TV (ADR-0026).
+    pub kind: Option<MetadataKind>,
 }
 
 /// Why an item stayed unmatched. Surfaced for the fix flow (ADR-0028); not a
 /// log-only hard failure. A present-but-corrupt NFO must not fall through to
 /// TMDB ("local data always wins").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedReason {
-    /// No usable NFO and the provider returned nothing.
+    /// No usable NFO and the provider returned nothing useful.
     NoMatch,
     /// NFO bytes were present but could not be parsed. Item stays unmatched
     /// with this reason until the user fixes the file or clears/retries.
     NfoInvalid { detail: String },
+    /// Best search hit scored below the auto-match floor (ADR-0026 §2).
+    /// Path `item_key` / fragile watch state until manual fix or better input.
+    BelowThreshold { confidence: f64, method: String },
 }
 
 impl std::fmt::Display for UnresolvedReason {
@@ -32,6 +40,9 @@ impl std::fmt::Display for UnresolvedReason {
         match self {
             Self::NoMatch => write!(f, "no match"),
             Self::NfoInvalid { detail } => write!(f, "invalid nfo: {detail}"),
+            Self::BelowThreshold { confidence, method } => {
+                write!(f, "below threshold: {confidence:.2} ({method})")
+            }
         }
     }
 }
@@ -64,14 +75,26 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// Provider search/detail outcome. Kept to Hit / Below / Miss so the trait
+/// stays thin (Rule 4.7) while still surfacing the floor gate for the fix flow.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderResult {
+    Hit(Box<CanonicalMetadata>),
+    BelowThreshold {
+        confidence: f64,
+        method: &'static str,
+    },
+    Miss,
+}
+
 /// One metadata backend (TMDB today; keep the trait thin — Rule 4.7).
 pub trait MetadataSource {
-    fn resolve(&self, input: &ResolveInput) -> Result<Option<CanonicalMetadata>, ResolveError>;
+    fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError>;
 }
 
 /// Parses `input.nfo_xml` when present. Not a [`MetadataSource`]: corrupt NFO
 /// must become [`UnresolvedReason::NfoInvalid`] in the resolver, not a trait
-/// `None` that would look like "try TMDB next".
+/// `Miss` that would look like "try TMDB next".
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NfoSource;
 
@@ -126,15 +149,23 @@ impl<T: MetadataSource> Resolver<T> {
             }
             NfoAttempt::Absent => {}
         }
-        if let Some(metadata) = self.tmdb.resolve(input)? {
-            return Ok(ResolveOutcome::Resolved {
-                metadata: Box::new(metadata),
+        match self.tmdb.resolve(input)? {
+            ProviderResult::Hit(metadata) => Ok(ResolveOutcome::Resolved {
+                metadata,
                 source: MetadataOrigin::Tmdb,
-            });
+            }),
+            ProviderResult::BelowThreshold { confidence, method } => {
+                Ok(ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::BelowThreshold {
+                        confidence,
+                        method: method.to_string(),
+                    },
+                })
+            }
+            ProviderResult::Miss => Ok(ResolveOutcome::Unresolved {
+                reason: UnresolvedReason::NoMatch,
+            }),
         }
-        Ok(ResolveOutcome::Unresolved {
-            reason: UnresolvedReason::NoMatch,
-        })
     }
 }
 
@@ -157,6 +188,7 @@ mod tests {
     fn prefers_nfo_over_tmdb_stub() {
         let outcome = resolve(&ResolveInput {
             nfo_xml: Some(fixture("movie.nfo")),
+            ..Default::default()
         })
         .unwrap();
         match outcome {
@@ -171,7 +203,10 @@ mod tests {
     #[test]
     fn unresolved_without_nfo_when_tmdb_is_stub() {
         let outcome = Resolver { tmdb: TmdbStub }
-            .resolve(&ResolveInput { nfo_xml: None })
+            .resolve(&ResolveInput {
+                nfo_xml: None,
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(
             outcome,
@@ -185,6 +220,9 @@ mod tests {
     fn malformed_nfo_is_unresolved_reason_not_tmdb_fallback() {
         let outcome = resolve(&ResolveInput {
             nfo_xml: Some(fixture("malformed.nfo")),
+            title: Some("Fight Club".into()),
+            year: Some(1999),
+            kind: Some(MetadataKind::Movie),
         })
         .unwrap();
         match outcome {
