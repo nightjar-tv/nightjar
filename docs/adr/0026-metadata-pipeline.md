@@ -282,11 +282,62 @@ is HTTP-bound and gated by the API rate limiter (§7); scan work is
 disk/CPU-bound. Do not merge them from intuition — shared structure would
 couple unrelated backpressure.
 
-Priority order (strategy note): continue watching, visible items, search
-results, recently added, then everything else. Until Block 2/3 surfaces
-exist, only **recently added** then **everything else** are wired — both
-expressed as `ORDER BY id DESC` (insertion order ≈ recently added) with a
-priority-band function that reserved slots for the later bands.
+#### Band ordering (derive at SELECT — no priority column)
+
+Bands are predicates in the queue query, not a denormalised
+`queue_band` / `priority` column on `media_items` (Rule 4.9 / 4.11).
+Group fold is unchanged: one resolve per search `query_key`; a group's
+band is `min(member bands)` — so one episode in a higher band promotes
+the **entire show group** (intentional once Visible is show-unit).
+
+| Band | How the SELECT knows |
+|---|---|
+| Continue watching | Join on watch-progress when Block 2 exists; empty until then |
+| Visible | Server browse-unit proxy (below); expressible today |
+| Search | **Reserved, undesigned.** No boost table or expiry schema here (Rule 4.7); Block 3 designs the predicate with the use case |
+| Recently added / background | Remaining `pending`, `id DESC` |
+
+**Visible proxy (not client scroll hints):** first paint of the default
+library grid, keyed by library kind — **movies** for a movies library,
+**shows** (distinct series, not episodes) for a shows library. Rank is
+over **all** browse units in the library (not pending-only), so
+already-ready neighbours do not steal slots from pending units still on
+the first screen. **N ≈ 40** means roughly one cold first screen — a
+constant (Rule 4.12), not a setting; the number may move with Block 3
+poster-card layout without amending this ADR. Try the proxy before any
+chatty client→server visibility hint.
+
+Episode-sorted item lists are the wrong unit for TV: top-N episodes
+collapse to one or two `query_key` groups and measure nothing.
+
+**Reordering under drain:** a view already rendered must not re-sort
+under the user while a drain is in flight — that is a **client**
+snapshot concern. Do not ban writers from updating `media_items.title`
+to "solve" it; permanently sorting on filename while cards show canonical
+titles is worse than a one-time re-sort.
+
+#### First-screen success criterion
+
+Full-library wall (~22 min movie+show drain) is an ordering problem
+wearing a throughput costume. Fan-out stays dead unless this gate fails.
+
+**T_first_screen:** wall seconds from drain start on a cold pending
+dogfood library until every browse unit in the Visible proxy set is
+**terminal** (`metadata_status IN ('ready','unmatched')`). Poster
+reference (payload `poster_path` or NFO thumb) is required only for the
+**ready** subset; unmatched units are holes, not infinite waits. Report
+`proxy_ready` / `proxy_unmatched` beside the time. Image bytes remain
+ADR-0027.
+
+**Prediction:** dogfood Visible union ≈ 40 movie groups + 40 show groups.
+At measured serial-drain rates (~1.84 HTTP/group, ~4.9 req/s) that is
+~80 × 1.84 / 4.9 ≈ **30 s**. (Movies-only would be ~15 s; do not quote
+that for the union.) Show detail payloads are ~1.8× movie (§4) and may
+stretch wall slightly above the request-count model. Still well inside
+the pass bar.
+
+**Pass:** `T_first_screen ≤ 60`. ~30 s confirms the model; ~55 s means
+the proxy path costs ~1.8× the plain drain — investigate before fan-out.
 
 v1 drain resolves **movie and show (episode-group) search+detail only**.
 Season detail (`/tv/{id}/season/{n}`, ADR-0025 episode ids / §4 season
@@ -297,12 +348,6 @@ v1 `drain_pending` walks groups **serially** (one resolve at a time). While
 that holds, a concurrency knob does nothing — Rule 4.11: engage it with
 group-level fan-out or remove it; do not ship a dead tunable. Search→detail
 is inherently serial *within* a group; fan-out's only axis is across groups.
-
-First-run wall time is an **ordering** problem before a throughput one: the
-library is browsable after index (~150 s); metadata filling in over the
-following tens of minutes matches the copy-deck promise if continue-
-watching / visible / search bands drain first. Wire those bands (and
-measure whether anyone still cares) before building fan-out.
 
 Prefix probes (`QUEUE_MAX_GROUPS`) are not representative of full-library
 cost when the first N groups skew movie-heavy (show detail payloads are
@@ -347,6 +392,28 @@ backoff; a jobs table would duplicate that.
 **One rate limiter shared by metadata API and artwork CDN.** Rejected:
 different hosts, different ceiling types (request rate vs connection cap);
 see §7.
+
+**Denormalised `queue_band` / priority column on `media_items`.** Rejected:
+bands are SELECT predicates over durable facts (status, browse-unit rank,
+future watch-progress). A priority column is state someone must keep
+correct for no query benefit (Rule 4.11).
+
+**Client scroll/visibility hints for the Visible band.** Rejected for v1:
+chatty API; try first-N browse-unit proxy first. Revisit only if
+`T_first_screen` fails the prediction for the right reason.
+
+**Search boost table (`item_id` + expiry) in this settle.** Rejected as
+premature (Rule 4.7): the Search band is reserved undesigned until Block 3
+has the use case.
+
+**Ban writers from updating `media_items.title` to freeze browse sort.**
+Rejected: permanently diverges filename sort from canonical card titles.
+Reordering-under-drain is a client snapshot concern (§8).
+
+**Gate on `metadata_status = 'ready'` alone for first screen.** Rejected:
+unmatched is terminal; at ~4.5% below-floor a 40-unit set is unmatched
+~84% of the time and the gate never closes. Use terminal status; posters
+only on the ready subset.
 
 ## Consequences
 
