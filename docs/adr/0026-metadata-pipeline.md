@@ -307,6 +307,14 @@ constant (Rule 4.12), not a setting; the number may move with Block 3
 poster-card layout without amending this ADR. Try the proxy before any
 chatty client→server visibility hint.
 
+**Provisional show browse unit (v1):** there is no durable series row yet
+(ADR-0025 owns movie/episode `item_key` only). Until a series handle
+exists, a shows-library browse unit is the same soft key the resolve
+queue already uses: `clean_show_title` → yearless `query_key`. That is
+filename-derived and may split a show if episode titles clean differently;
+it is **not** a watch `item_key` and must not be mistaken for one. Durable
+series identity is a later schema/ADR.
+
 Episode-sorted item lists are the wrong unit for TV: top-N episodes
 collapse to one or two `query_key` groups and measure nothing.
 

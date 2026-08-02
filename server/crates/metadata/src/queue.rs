@@ -1,28 +1,38 @@
 //! Metadata work queue as a query over `metadata_status` (ADR-0026 §8).
 //!
 //! No jobs table. Pending rows are selected, grouped by search `query_key`
-//! (one provider resolve per group), ordered by recently-added then
-//! everything else. Continue-watching / visible / search bands are reserved
-//! for Block 2/3.
+//! (one provider resolve per group), ordered by band then `max_id DESC`.
+//! Bands derive at query time — no priority column.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use rusqlite::{Connection, params};
 
 use crate::clean::{clean_movie_title, clean_show_title, series_library_year, year_from_path};
-use crate::model::MetadataKind;
+use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind};
 use crate::negative_cache::query_key;
 use crate::resolve::MetadataSource;
 use crate::resolve::{ResolveInput, ResolveOutcome, Resolver};
 
-/// Priority bands (ADR-0026 §8 / strategy note). Lower ordinal = sooner.
+/// Roughly one cold first screen (ADR-0026 §8). Constant, not a setting.
+pub const VISIBLE_FIRST_SCREEN_N: usize = 40;
+
+/// Predicted `T_first_screen` for dogfood Visible union (~40 movie + ~40 show
+/// groups × 1.84 HTTP/group ÷ 4.9 rps). Pass bar is 60 s.
+pub const T_FIRST_SCREEN_PREDICTED_SECS: f64 = 30.0;
+
+/// Pass bar for [`T_FIRST_SCREEN_PREDICTED_SECS`] (ADR-0026 §8).
+pub const T_FIRST_SCREEN_PASS_SECS: f64 = 60.0;
+
+/// Priority bands (ADR-0026 §8). Lower ordinal = sooner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum QueueBand {
-    /// Block 2 — not wired until continue-watching exists.
+    /// Block 2 — predicate empty until watch-progress exists.
     ContinueWatching = 0,
-    /// Block 3 — not wired until browse surfaces exist.
+    /// Browse-unit proxy (top-N per library kind).
     Visible = 1,
-    /// Block 3 — not wired until search exists.
+    /// Reserved undesigned — predicate empty until Block 3.
     Search = 2,
     RecentlyAdded = 3,
     Background = 4,
@@ -40,11 +50,14 @@ impl QueueBand {
     }
 }
 
-/// Today every pending item is [`QueueBand::RecentlyAdded`]; ordering within
-/// the band is `id DESC` (insertion ≈ recently added). Wire higher bands
-/// here when Block 2/3 enqueue sources exist — do not invent them now.
-pub fn queue_band_for_item(_item_id: i64) -> QueueBand {
-    QueueBand::RecentlyAdded
+/// Continue-watching band: empty until Block 2 watch-progress exists.
+fn continue_watching_item_ids(_conn: &Connection) -> HashSet<i64> {
+    HashSet::new()
+}
+
+/// Search band: reserved undesigned — always empty (no boost table).
+fn search_boost_item_ids(_conn: &Connection) -> HashSet<i64> {
+    HashSet::new()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +84,10 @@ impl MetadataStatus {
             _ => None,
         }
     }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Ready | Self::Unmatched)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +100,196 @@ pub struct PendingItem {
     pub season: Option<i32>,
 }
 
+/// One browse unit in the Visible proxy (movie, or provisional show soft-key).
+#[derive(Debug, Clone)]
+pub struct VisibleProxyUnit {
+    pub unit_key: String,
+    pub library_id: i64,
+    pub item_ids: Vec<i64>,
+    pub is_movie: bool,
+}
+
+/// Snapshot of top-N browse units per library (ADR-0026 §8).
+#[derive(Debug, Clone, Default)]
+pub struct VisibleProxy {
+    pub units: Vec<VisibleProxyUnit>,
+}
+
+impl VisibleProxy {
+    pub fn item_id_set(&self) -> HashSet<i64> {
+        let mut s = HashSet::new();
+        for u in &self.units {
+            s.extend(u.item_ids.iter().copied());
+        }
+        s
+    }
+
+    pub fn movie_unit_count(&self) -> usize {
+        self.units.iter().filter(|u| u.is_movie).count()
+    }
+
+    pub fn show_unit_count(&self) -> usize {
+        self.units.iter().filter(|u| !u.is_movie).count()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LibraryItemRow {
+    id: i64,
+    library_id: i64,
+    library_kind: String,
+    kind: String,
+    title: String,
+    year: Option<i32>,
+    path: String,
+}
+
+/// All-items Visible proxy: movies by title; shows by provisional soft key
+/// (`clean_show_title` → yearless `query_key`). Rank is a library property.
+pub fn snapshot_visible_proxy(conn: &Connection) -> Result<VisibleProxy, String> {
+    snapshot_visible_proxy_filtered(conn, VISIBLE_FIRST_SCREEN_N, &[])
+}
+
+pub fn snapshot_visible_proxy_n(conn: &Connection, n: usize) -> Result<VisibleProxy, String> {
+    snapshot_visible_proxy_filtered(conn, n, &[])
+}
+
+/// `exclude_library_names` drops named libraries from the proxy (measure harness
+/// uses this for `Test Data` when `EXCLUDE_TESTDATA=1`).
+pub fn snapshot_visible_proxy_filtered(
+    conn: &Connection,
+    n: usize,
+    exclude_library_names: &[&str],
+) -> Result<VisibleProxy, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.library_id, l.kind, m.kind, m.title, m.year, m.path, l.name
+             FROM media_items m
+             JOIN libraries l ON l.id = m.library_id
+             ORDER BY m.library_id, m.id",
+        )
+        .map_err(|e| format!("prepare visible snapshot: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                LibraryItemRow {
+                    id: r.get(0)?,
+                    library_id: r.get(1)?,
+                    library_kind: r.get(2)?,
+                    kind: r.get(3)?,
+                    title: r.get(4)?,
+                    year: r.get(5)?,
+                    path: r.get(6)?,
+                },
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|e| format!("query visible snapshot: {e}"))?;
+
+    let mut by_library: HashMap<i64, (String, Vec<LibraryItemRow>)> = HashMap::new();
+    for row in rows {
+        let (row, lib_name) = row.map_err(|e| format!("visible row: {e}"))?;
+        if exclude_library_names.iter().any(|n| *n == lib_name) {
+            continue;
+        }
+        by_library
+            .entry(row.library_id)
+            .or_insert_with(|| (row.library_kind.clone(), Vec::new()))
+            .1
+            .push(row);
+    }
+
+    let mut units = Vec::new();
+    for (library_id, (library_kind, items)) in by_library {
+        match library_kind.as_str() {
+            "movies" => {
+                let mut movies: Vec<&LibraryItemRow> =
+                    items.iter().filter(|i| i.kind == "movie").collect();
+                movies.sort_by(|a, b| {
+                    a.title
+                        .to_lowercase()
+                        .cmp(&b.title.to_lowercase())
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                for m in movies.into_iter().take(n) {
+                    let folder_year = year_from_path(&m.path);
+                    let (ct, cy) = clean_movie_title(&m.title, folder_year.or(m.year));
+                    let qk = query_key(&ct, cy);
+                    units.push(VisibleProxyUnit {
+                        unit_key: format!("movie|{qk}"),
+                        library_id,
+                        item_ids: vec![m.id],
+                        is_movie: true,
+                    });
+                }
+            }
+            "shows" => {
+                // Provisional: distinct show = resolve soft key (ADR-0026 §8).
+                let mut by_show: HashMap<String, Vec<&LibraryItemRow>> = HashMap::new();
+                for it in &items {
+                    if it.kind != "episode" {
+                        continue;
+                    }
+                    let (ct, _) = clean_show_title(&it.title);
+                    let qk = query_key(&ct, None);
+                    by_show.entry(format!("tv|{qk}")).or_default().push(it);
+                }
+                let mut show_units: Vec<(String, String, Vec<i64>, i64)> = by_show
+                    .into_iter()
+                    .map(|(unit_key, eps)| {
+                        let sort_title = {
+                            let (ct, _) = clean_show_title(&eps[0].title);
+                            ct.to_lowercase()
+                        };
+                        let mut ids: Vec<i64> = eps.iter().map(|e| e.id).collect();
+                        ids.sort_unstable();
+                        let max_id = ids.iter().copied().max().unwrap_or(0);
+                        (unit_key, sort_title, ids, max_id)
+                    })
+                    .collect();
+                show_units.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
+                for (unit_key, _, item_ids, _) in show_units.into_iter().take(n) {
+                    units.push(VisibleProxyUnit {
+                        unit_key,
+                        library_id,
+                        item_ids,
+                        is_movie: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(VisibleProxy { units })
+}
+
+fn band_for_item(
+    item_id: i64,
+    visible: &HashSet<i64>,
+    continue_watching: &HashSet<i64>,
+    search: &HashSet<i64>,
+) -> QueueBand {
+    if continue_watching.contains(&item_id) {
+        QueueBand::ContinueWatching
+    } else if visible.contains(&item_id) {
+        QueueBand::Visible
+    } else if search.contains(&item_id) {
+        QueueBand::Search
+    } else {
+        QueueBand::RecentlyAdded
+    }
+}
+
+/// Band for a pending item given a Visible snapshot (CW/Search empty today).
+pub fn queue_band_for_item(item_id: i64, visible: &VisibleProxy) -> QueueBand {
+    band_for_item(
+        item_id,
+        &visible.item_id_set(),
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+}
+
 #[derive(Debug, Clone)]
 struct QueryGroup {
     resolve_kind: MetadataKind,
@@ -92,9 +299,9 @@ struct QueryGroup {
     library_episode_count: Option<u32>,
     library_season_count: Option<u32>,
     item_ids: Vec<i64>,
-    /// Max media_items.id in the group — recently-added sort key.
     max_id: i64,
     band: QueueBand,
+    unit_key: String,
 }
 
 #[derive(Debug, Default)]
@@ -104,16 +311,84 @@ pub struct DrainStats {
     pub show_groups: usize,
     pub items_ready: usize,
     pub items_unmatched: usize,
-    /// Groups left `pending` because the provider errored (not cached).
     pub items_left_pending: usize,
     pub provider_resolves: usize,
     pub provider_errors: usize,
     pub http_429: u64,
     pub http_requests: u64,
+    /// Set when draining with a Visible proxy (first-screen measure).
+    pub visible_proxy_size: usize,
+    pub proxy_movie_units: usize,
+    pub proxy_show_units: usize,
+    pub unmatched_in_proxy: usize,
+    pub ready_in_proxy: usize,
+    pub ready_missing_poster: usize,
+    pub t_first_screen_secs: Option<f64>,
+    pub predicted_secs: f64,
+    pub gate_pass: bool,
+    pub stopped_early: bool,
 }
 
-/// Load pending items and fold into resolve groups (newest groups first).
-fn pending_query_groups(conn: &Connection) -> Result<Vec<QueryGroup>, String> {
+fn has_poster(meta: &CanonicalMetadata) -> bool {
+    meta.artwork
+        .iter()
+        .any(|a| a.kind == ArtworkKind::Poster && !a.path.is_empty())
+}
+
+fn statuses_for_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<MetadataStatus>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    let mut stmt = conn
+        .prepare("SELECT metadata_status FROM media_items WHERE id = ?1")
+        .map_err(|e| format!("prepare status read: {e}"))?;
+    for id in ids {
+        let s: String = stmt
+            .query_row(params![id], |r| r.get(0))
+            .map_err(|e| format!("status for {id}: {e}"))?;
+        out.push(MetadataStatus::parse(&s).ok_or_else(|| format!("bad metadata_status {s}"))?);
+    }
+    Ok(out)
+}
+
+/// Proxy progress: terminal when every item is ready|unmatched.
+pub fn proxy_terminal_progress(
+    conn: &Connection,
+    proxy: &VisibleProxy,
+    unit_has_poster: &HashMap<String, bool>,
+) -> Result<(bool, usize, usize, usize), String> {
+    let mut unmatched_units = 0usize;
+    let mut ready_units = 0usize;
+    let mut ready_missing_poster = 0usize;
+    for u in &proxy.units {
+        let statuses = statuses_for_ids(conn, &u.item_ids)?;
+        if statuses.contains(&MetadataStatus::Pending) {
+            return Ok((false, unmatched_units, ready_units, ready_missing_poster));
+        }
+        let any_ready = statuses.contains(&MetadataStatus::Ready);
+        if any_ready {
+            ready_units += 1;
+            let poster = unit_has_poster.get(&u.unit_key).copied().unwrap_or(false);
+            if !poster {
+                ready_missing_poster += 1;
+            }
+        } else {
+            unmatched_units += 1;
+        }
+    }
+    Ok((true, unmatched_units, ready_units, ready_missing_poster))
+}
+
+/// Load pending items and fold into resolve groups (band, then newest first).
+fn pending_query_groups(
+    conn: &Connection,
+    visible: &VisibleProxy,
+) -> Result<Vec<QueryGroup>, String> {
+    let visible_ids = visible.item_id_set();
+    let cw = continue_watching_item_ids(conn);
+    let search = search_boost_item_ids(conn);
+
     let mut stmt = conn
         .prepare(
             "SELECT id, kind, title, year, path, season
@@ -140,7 +415,6 @@ fn pending_query_groups(conn: &Connection) -> Result<Vec<QueryGroup>, String> {
         items.push(row.map_err(|e| format!("pending row: {e}"))?);
     }
 
-    // Episode shape for collision pin: group raw episodes by cleaned show title.
     let mut ep_by_show: HashMap<String, Vec<&PendingItem>> = HashMap::new();
     for it in &items {
         if it.kind == "episode" {
@@ -151,14 +425,15 @@ fn pending_query_groups(conn: &Connection) -> Result<Vec<QueryGroup>, String> {
 
     let mut groups: HashMap<String, QueryGroup> = HashMap::new();
     for it in &items {
-        let band = queue_band_for_item(it.id);
+        let band = band_for_item(it.id, &visible_ids, &cw, &search);
         match it.kind.as_str() {
             "movie" => {
                 let folder_year = year_from_path(&it.path);
                 let (ct, cy) = clean_movie_title(&it.title, folder_year.or(it.year));
                 let qk = query_key(&ct, cy);
+                let unit_key = format!("movie|{qk}");
                 let g = groups
-                    .entry(format!("movie|{qk}"))
+                    .entry(unit_key.clone())
                     .or_insert_with(|| QueryGroup {
                         resolve_kind: MetadataKind::Movie,
                         title: ct,
@@ -169,6 +444,7 @@ fn pending_query_groups(conn: &Connection) -> Result<Vec<QueryGroup>, String> {
                         item_ids: Vec::new(),
                         max_id: it.id,
                         band,
+                        unit_key,
                     });
                 g.item_ids.push(it.id);
                 g.max_id = g.max_id.max(it.id);
@@ -186,8 +462,9 @@ fn pending_query_groups(conn: &Connection) -> Result<Vec<QueryGroup>, String> {
                 let seasons: std::collections::HashSet<i32> =
                     siblings.iter().filter_map(|s| s.season).collect();
                 let qk = query_key(&ct, None);
+                let unit_key = format!("tv|{qk}");
                 let g = groups
-                    .entry(format!("tv|{qk}"))
+                    .entry(unit_key.clone())
                     .or_insert_with(|| QueryGroup {
                         resolve_kind: MetadataKind::Episode,
                         title: ct.clone(),
@@ -198,6 +475,7 @@ fn pending_query_groups(conn: &Connection) -> Result<Vec<QueryGroup>, String> {
                         item_ids: Vec::new(),
                         max_id: it.id,
                         band,
+                        unit_key,
                     });
                 g.item_ids.push(it.id);
                 g.max_id = g.max_id.max(it.id);
@@ -236,25 +514,42 @@ pub fn set_metadata_status(
     Ok(())
 }
 
+/// Options for [`drain_pending`].
+#[derive(Debug, Clone, Default)]
+pub struct DrainOptions {
+    /// Cap groups (short probes). Ignored when [`Self::stop_when_visible_terminal`].
+    pub max_groups: Option<usize>,
+    /// Snapshot Visible once; stop when every proxy unit is terminal.
+    pub stop_when_visible_terminal: bool,
+    /// Library names omitted from the Visible snapshot (e.g. `Test Data`).
+    pub exclude_library_names: Vec<String>,
+}
+
 /// Drain pending groups through the resolver (store + neg-cache + limiter).
 ///
 /// Provider/`api_error` failures leave the group's rows **pending** and are
 /// not written to the negative-result cache — a blip must not park the
 /// library for a day. Genuine misses become `unmatched` (and may cache).
-///
-/// `max_groups`: `None` drains all pending groups; `Some(n)` stops after `n`
-/// (for short concurrency probes — do not use a full-library wall time).
 pub fn drain_pending<T: MetadataSource>(
     conn: &Connection,
     resolver: &Resolver<T>,
     http_429: &std::sync::atomic::AtomicU64,
     http_requests: &std::sync::atomic::AtomicU64,
-    max_groups: Option<usize>,
+    opts: DrainOptions,
 ) -> Result<DrainStats, String> {
-    let mut groups = pending_query_groups(conn)?;
-    if let Some(n) = max_groups {
+    let exclude: Vec<&str> = opts
+        .exclude_library_names
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let proxy = snapshot_visible_proxy_filtered(conn, VISIBLE_FIRST_SCREEN_N, &exclude)?;
+    let mut groups = pending_query_groups(conn, &proxy)?;
+    if !opts.stop_when_visible_terminal
+        && let Some(n) = opts.max_groups
+    {
         groups.truncate(n);
     }
+
     let mut stats = DrainStats {
         groups: groups.len(),
         movie_groups: groups
@@ -263,10 +558,45 @@ pub fn drain_pending<T: MetadataSource>(
             .count(),
         show_groups: groups
             .iter()
-            .filter(|g| g.resolve_kind == MetadataKind::Show)
+            .filter(|g| g.resolve_kind == MetadataKind::Episode)
             .count(),
+        visible_proxy_size: proxy.units.len(),
+        proxy_movie_units: proxy.movie_unit_count(),
+        proxy_show_units: proxy.show_unit_count(),
+        predicted_secs: T_FIRST_SCREEN_PREDICTED_SECS * (proxy.units.len() as f64 / 80.0),
         ..DrainStats::default()
     };
+
+    let mut unit_has_poster: HashMap<String, bool> = HashMap::new();
+    // Units already terminal before drain (ready with unknown poster → fail open false).
+    for u in &proxy.units {
+        let statuses = statuses_for_ids(conn, &u.item_ids)?;
+        if statuses.iter().all(|s| s.is_terminal()) && statuses.contains(&MetadataStatus::Ready) {
+            unit_has_poster.entry(u.unit_key.clone()).or_insert(false);
+        }
+    }
+
+    let t0 = Instant::now();
+    if opts.stop_when_visible_terminal {
+        let (term, unmatched, ready, missing) =
+            proxy_terminal_progress(conn, &proxy, &unit_has_poster)?;
+        if term {
+            stats.unmatched_in_proxy = unmatched;
+            stats.ready_in_proxy = ready;
+            stats.ready_missing_poster = missing;
+            stats.t_first_screen_secs = Some(0.0);
+            stats.gate_pass = missing == 0;
+            stats.stopped_early = true;
+            stats.groups = 0;
+            stats.movie_groups = 0;
+            stats.show_groups = 0;
+            stats.http_429 = http_429.load(std::sync::atomic::Ordering::Relaxed);
+            stats.http_requests = http_requests.load(std::sync::atomic::Ordering::Relaxed);
+            return Ok(stats);
+        }
+    }
+
+    let mut resolved_groups = 0usize;
     for (i, g) in groups.iter().enumerate() {
         if (i + 1) % 50 == 0 || i + 1 == groups.len() {
             eprintln!("  queue {}/{} …", i + 1, groups.len());
@@ -282,9 +612,14 @@ pub fn drain_pending<T: MetadataSource>(
         };
         stats.provider_resolves += 1;
         match resolver.resolve_with_store(&input, conn) {
-            Ok(ResolveOutcome::Resolved { .. }) => {
+            Ok(ResolveOutcome::Resolved { metadata, .. }) => {
                 set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
                 stats.items_ready += g.item_ids.len();
+                let poster = has_poster(&metadata);
+                unit_has_poster
+                    .entry(g.unit_key.clone())
+                    .and_modify(|p| *p = *p || poster)
+                    .or_insert(poster);
             }
             Ok(ResolveOutcome::Unresolved { .. }) => {
                 set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
@@ -296,7 +631,48 @@ pub fn drain_pending<T: MetadataSource>(
                 stats.items_left_pending += g.item_ids.len();
             }
         }
+        resolved_groups += 1;
+
+        if opts.stop_when_visible_terminal {
+            let (term, unmatched, ready, missing) =
+                proxy_terminal_progress(conn, &proxy, &unit_has_poster)?;
+            if term {
+                stats.unmatched_in_proxy = unmatched;
+                stats.ready_in_proxy = ready;
+                stats.ready_missing_poster = missing;
+                stats.t_first_screen_secs = Some(t0.elapsed().as_secs_f64());
+                stats.gate_pass = missing == 0
+                    && stats.t_first_screen_secs.unwrap_or(f64::MAX) <= T_FIRST_SCREEN_PASS_SECS;
+                stats.stopped_early = true;
+                stats.groups = resolved_groups;
+                stats.movie_groups = groups[..resolved_groups]
+                    .iter()
+                    .filter(|g| g.resolve_kind == MetadataKind::Movie)
+                    .count();
+                stats.show_groups = groups[..resolved_groups]
+                    .iter()
+                    .filter(|g| g.resolve_kind == MetadataKind::Episode)
+                    .count();
+                break;
+            }
+        }
     }
+
+    if opts.stop_when_visible_terminal && stats.t_first_screen_secs.is_none() {
+        let (term, unmatched, ready, missing) =
+            proxy_terminal_progress(conn, &proxy, &unit_has_poster)?;
+        stats.unmatched_in_proxy = unmatched;
+        stats.ready_in_proxy = ready;
+        stats.ready_missing_poster = missing;
+        if term {
+            stats.t_first_screen_secs = Some(t0.elapsed().as_secs_f64());
+            stats.gate_pass = missing == 0
+                && stats.t_first_screen_secs.unwrap_or(f64::MAX) <= T_FIRST_SCREEN_PASS_SECS;
+        } else {
+            stats.gate_pass = false;
+        }
+    }
+
     stats.http_429 = http_429.load(std::sync::atomic::Ordering::Relaxed);
     stats.http_requests = http_requests.load(std::sync::atomic::Ordering::Relaxed);
     Ok(stats)
@@ -312,7 +688,7 @@ mod tests {
     use rusqlite::Connection;
     use std::sync::atomic::AtomicU64;
 
-    fn seeded() -> Connection {
+    fn seeded_movies() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         c.execute_batch(
@@ -328,20 +704,27 @@ mod tests {
 
     #[test]
     fn pending_groups_newest_id_first() {
-        let c = seeded();
-        let groups = pending_query_groups(&c).unwrap();
+        let c = seeded_movies();
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        let groups = pending_query_groups(&c, &proxy).unwrap();
         assert_eq!(groups.len(), 2);
         assert!(groups[0].max_id > groups[1].max_id);
-        assert_eq!(groups[0].band, QueueBand::RecentlyAdded);
     }
 
     #[test]
     fn drain_marks_stub_misses_unmatched_and_second_pass_is_empty() {
-        let c = seeded();
+        let c = seeded_movies();
         let resolver = Resolver { tmdb: TmdbStub };
         let http_429 = AtomicU64::new(0);
         let http_requests = AtomicU64::new(0);
-        let s1 = drain_pending(&c, &resolver, &http_429, &http_requests, None).unwrap();
+        let s1 = drain_pending(
+            &c,
+            &resolver,
+            &http_429,
+            &http_requests,
+            DrainOptions::default(),
+        )
+        .unwrap();
         assert_eq!(s1.items_unmatched, 2);
         let pending: i64 = c
             .query_row(
@@ -351,7 +734,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 0);
-        let s2 = drain_pending(&c, &resolver, &http_429, &http_requests, None).unwrap();
+        let s2 = drain_pending(
+            &c,
+            &resolver,
+            &http_429,
+            &http_requests,
+            DrainOptions::default(),
+        )
+        .unwrap();
         assert_eq!(s2.groups, 0);
         let _ = ApiRateLimiter::polite_default();
     }
@@ -367,9 +757,16 @@ mod tests {
                 Err(crate::resolve::ResolveError::Provider("timeout".into()))
             }
         }
-        let c = seeded();
+        let c = seeded_movies();
         let resolver = Resolver { tmdb: Boom };
-        let s = drain_pending(&c, &resolver, &AtomicU64::new(0), &AtomicU64::new(0), None).unwrap();
+        let s = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
         assert_eq!(s.provider_errors, 2);
         assert_eq!(s.items_left_pending, 2);
         let pending: i64 = c
@@ -394,5 +791,116 @@ mod tests {
         assert!(QueueBand::Visible < QueueBand::RecentlyAdded);
         assert!(QueueBand::Search < QueueBand::RecentlyAdded);
         assert!(QueueBand::RecentlyAdded < QueueBand::Background);
+    }
+
+    #[test]
+    fn visible_rank_is_over_all_items_not_pending_only() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('M', '/tmp/M', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+             VALUES
+               (1, '/tmp/M/a.mkv', 1, 1, 'Alpha', 'movie', 'ready'),
+               (1, '/tmp/M/b.mkv', 1, 1, 'Bravo', 'movie', 'pending'),
+               (1, '/tmp/M/c.mkv', 1, 1, 'Charlie', 'movie', 'pending');",
+        )
+        .unwrap();
+        // N=1 → only Alpha (ready) is Visible; Bravo must NOT become Visible.
+        let proxy = snapshot_visible_proxy_n(&c, 1).unwrap();
+        assert_eq!(proxy.units.len(), 1);
+        assert_eq!(proxy.units[0].item_ids, vec![1]);
+        let groups = pending_query_groups(&c, &proxy).unwrap();
+        let bravo = groups.iter().find(|g| g.title == "Bravo").unwrap();
+        let charlie = groups.iter().find(|g| g.title == "Charlie").unwrap();
+        assert_eq!(bravo.band, QueueBand::RecentlyAdded);
+        assert_eq!(charlie.band, QueueBand::RecentlyAdded);
+    }
+
+    #[test]
+    fn shows_proxy_returns_distinct_shows_not_one_show_episodes() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, '/tmp/S/Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1),
+               (1, '/tmp/S/Alpha/S01E02.mkv', 1, 1, 'Alpha', 'episode', 1, 2),
+               (1, '/tmp/S/Bravo/S01E01.mkv', 1, 1, 'Bravo', 'episode', 1, 1),
+               (1, '/tmp/S/Charlie/S01E01.mkv', 1, 1, 'Charlie', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let proxy = snapshot_visible_proxy_n(&c, 2).unwrap();
+        assert_eq!(proxy.units.len(), 2);
+        assert!(proxy.units.iter().all(|u| !u.is_movie));
+        let keys: HashSet<_> = proxy.units.iter().map(|u| u.unit_key.as_str()).collect();
+        assert_eq!(keys.len(), 2, "two distinct show units");
+        // Alpha has 2 episodes — if we wrongly ranked episodes, N=2 could be Alpha×2.
+        let alpha = proxy.units.iter().find(|u| u.unit_key.contains("alpha"));
+        if let Some(a) = alpha {
+            assert_eq!(a.item_ids.len(), 2);
+        }
+    }
+
+    #[test]
+    fn one_visible_episode_promotes_whole_show_group() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        // N=1 → only Alpha is Visible (title sort). Both Alpha episodes pending.
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, '/tmp/S/Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1),
+               (1, '/tmp/S/Alpha/S01E02.mkv', 1, 1, 'Alpha', 'episode', 1, 2),
+               (1, '/tmp/S/Zulu/S01E01.mkv', 1, 1, 'Zulu', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let proxy = snapshot_visible_proxy_n(&c, 1).unwrap();
+        assert_eq!(proxy.units.len(), 1);
+        let groups = pending_query_groups(&c, &proxy).unwrap();
+        let alpha = groups.iter().find(|g| g.title == "Alpha").unwrap();
+        let zulu = groups.iter().find(|g| g.title == "Zulu").unwrap();
+        assert_eq!(alpha.band, QueueBand::Visible);
+        assert_eq!(alpha.item_ids.len(), 2);
+        assert_eq!(zulu.band, QueueBand::RecentlyAdded);
+        assert!(alpha.band < zulu.band);
+    }
+
+    #[test]
+    fn empty_cw_and_search_do_not_change_ordering() {
+        let c = seeded_movies();
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        assert!(continue_watching_item_ids(&c).is_empty());
+        assert!(search_boost_item_ids(&c).is_empty());
+        let groups = pending_query_groups(&c, &proxy).unwrap();
+        // With N=40 and 2 movies, both are Visible — none CW/Search.
+        assert!(groups.iter().all(|g| g.band == QueueBand::Visible));
+        assert!(!groups.iter().any(|g| g.band == QueueBand::ContinueWatching));
+        assert!(!groups.iter().any(|g| g.band == QueueBand::Search));
+    }
+
+    #[test]
+    fn terminal_gate_accepts_unmatched_without_poster() {
+        let c = seeded_movies();
+        let resolver = Resolver { tmdb: TmdbStub };
+        let s = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions {
+                stop_when_visible_terminal: true,
+                ..DrainOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(s.stopped_early);
+        assert!(s.t_first_screen_secs.is_some());
+        assert_eq!(s.unmatched_in_proxy, s.visible_proxy_size);
+        assert_eq!(s.ready_in_proxy, 0);
+        assert_eq!(s.ready_missing_poster, 0);
+        assert!(s.gate_pass, "unmatched-only proxy must pass poster check");
     }
 }

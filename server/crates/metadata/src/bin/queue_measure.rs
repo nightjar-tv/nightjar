@@ -1,13 +1,12 @@
-//! Metadata queue drain / short probe (ADR-0026 §7/§8).
+//! Metadata queue drain / first-screen measure (ADR-0026 §7/§8).
+//!
+//! Default: first-screen gate (Visible proxy terminal + early stop).
 //!
 //! Env:
 //! - `DB`, TMDB credentials, `EXCLUDE_TESTDATA=1`, optional `MEASURE_DB`
-//! - `QUEUE_REQUESTS_PER_SEC` (default 10)
-//! - `QUEUE_MAX_IN_FLIGHT` — unused while drain is serial; do not tune it
-//! - `QUEUE_MAX_GROUPS` — **use for probes**. Caps groups so a check finishes
-//!   in minutes. Record movie/show split; do not extrapolate full-library
-//!   wall from a prefix (show detail is heavier). Omit only for a deliberate
-//!   full drain.
+//! - `QUEUE_FIRST_SCREEN=0` — full drain (no early stop)
+//! - `QUEUE_MAX_GROUPS` — short probe cap (implies not first-screen)
+//! - `QUEUE_REQUESTS_PER_SEC`, `QUEUE_MAX_IN_FLIGHT` (if unused while serial)
 //!
 //! Ceiling / 429 probes: use a personal TMDB key, not the application key.
 
@@ -17,8 +16,9 @@ use std::time::Instant;
 
 use nightjar_db::migrate;
 use nightjar_metadata::{
-    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, Resolver, TmdbClient,
-    TmdbCredentials, drain_pending,
+    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions, Resolver,
+    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, TmdbCredentials,
+    VISIBLE_FIRST_SCREEN_N, drain_pending, snapshot_visible_proxy_filtered,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -26,11 +26,21 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 struct Report {
     measure_db: String,
+    mode: String,
     wall_secs: f64,
-    groups: usize,
+    predicted_t_first_screen_secs: f64,
+    t_first_screen_secs: Option<f64>,
+    pass_bar_secs: f64,
+    gate_pass: bool,
+    visible_proxy_size: usize,
     movie_groups: usize,
     show_groups: usize,
-    max_groups_cap: Option<usize>,
+    proxy_movie_units: usize,
+    proxy_show_units: usize,
+    unmatched_in_proxy: usize,
+    ready_in_proxy: usize,
+    ready_missing_poster: usize,
+    groups_drained: usize,
     items_ready: usize,
     items_unmatched: usize,
     items_left_pending: usize,
@@ -38,12 +48,12 @@ struct Report {
     provider_errors: usize,
     http_requests: u64,
     mean_http_per_group: f64,
-    http_requests_per_1000_items: f64,
-    mean_secs_per_request: f64,
     effective_req_per_sec: f64,
     http_429: u64,
     requests_per_sec_budget: u32,
     max_in_flight: usize,
+    visible_n: usize,
+    stopped_early: bool,
     seasons_in_drain: bool,
     note: String,
 }
@@ -61,6 +71,10 @@ fn main() {
     let max_groups: Option<usize> = std::env::var("QUEUE_MAX_GROUPS")
         .ok()
         .and_then(|s| s.parse().ok());
+    let first_screen = max_groups.is_none()
+        && std::env::var("QUEUE_FIRST_SCREEN")
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
     let src_db = std::env::var("DB").map(PathBuf::from).unwrap_or_else(|_| {
         dirs_home()
@@ -70,9 +84,13 @@ fn main() {
     let measure_db = std::env::var("MEASURE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let tag = max_groups
-                .map(|n| format!("g{n}"))
-                .unwrap_or_else(|| "full".into());
+            let tag = if first_screen {
+                "firstscreen".into()
+            } else {
+                max_groups
+                    .map(|n| format!("g{n}"))
+                    .unwrap_or_else(|| "full".into())
+            };
             src_db
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
@@ -122,30 +140,92 @@ fn main() {
     )
     .ok();
 
-    match max_groups {
-        Some(n) => eprintln!(
-            "PROBE: max_groups={n} rps={rps} max_in_flight={max_in_flight} \
-             (serial drain — if unused; not a full-library wall)"
-        ),
-        None => eprintln!(
-            "FULL DRAIN: rps={rps} max_in_flight={max_in_flight} — expect tens of minutes"
-        ),
+    let exclude_libs: Vec<&str> = if exclude_testdata {
+        vec!["Test Data"]
+    } else {
+        vec![]
+    };
+    let proxy = snapshot_visible_proxy_filtered(&conn, VISIBLE_FIRST_SCREEN_N, &exclude_libs)
+        .expect("proxy");
+    // Scale ADR ~30s (80 units) to this dogfood proxy size.
+    let predicted = T_FIRST_SCREEN_PREDICTED_SECS * (proxy.units.len() as f64 / 80.0);
+    eprintln!(
+        "Visible proxy: {} units ({} movie / {} show), N={VISIBLE_FIRST_SCREEN_N}/library, \
+         predicted={predicted:.1}s (ADR baseline 30s @ 80 units) pass_bar={T_FIRST_SCREEN_PASS_SECS}s",
+        proxy.units.len(),
+        proxy.movie_unit_count(),
+        proxy.show_unit_count(),
+    );
+
+    if first_screen {
+        eprintln!("MODE: first-screen (early-stop when proxy terminal)");
+    } else if let Some(n) = max_groups {
+        eprintln!("MODE: probe max_groups={n}");
+    } else {
+        eprintln!("MODE: full drain");
     }
 
     let t0 = Instant::now();
-    let stats =
-        drain_pending(&conn, &resolver, &http_429, &http_requests, max_groups).expect("drain");
+    let stats = drain_pending(
+        &conn,
+        &resolver,
+        &http_429,
+        &http_requests,
+        DrainOptions {
+            max_groups,
+            stop_when_visible_terminal: first_screen,
+            exclude_library_names: exclude_libs.iter().map(|s| (*s).to_string()).collect(),
+        },
+    )
+    .expect("drain");
     let wall = t0.elapsed().as_secs_f64();
 
-    let items_touched =
-        (stats.items_ready + stats.items_unmatched + stats.items_left_pending).max(1) as f64;
+    let t_fs = stats.t_first_screen_secs;
+    let note = if first_screen {
+        match t_fs {
+            Some(t) if (t - predicted).abs() <= 10.0 => {
+                format!("Measured near scaled prediction ({predicted:.1}s) — model holds.")
+            }
+            Some(t) if (45.0..=T_FIRST_SCREEN_PASS_SECS).contains(&t) => {
+                format!(
+                    "Inside pass bar but {t:.1}s vs predicted {predicted:.1}s — proxy path may cost more than drain average; investigate before calling it a clean pass."
+                )
+            }
+            Some(t) if t > T_FIRST_SCREEN_PASS_SECS => {
+                format!(
+                    "FAILED pass bar ({t:.1}s > {T_FIRST_SCREEN_PASS_SECS}s). Do not start fan-out from this alone — report and stop."
+                )
+            }
+            Some(_) => "First-screen terminal reached.".into(),
+            None => "Proxy never reached terminal (provider errors left pending?).".into(),
+        }
+    } else {
+        "Not a first-screen run.".into()
+    };
+
     let report = Report {
         measure_db: measure_db.display().to_string(),
+        mode: if first_screen {
+            "first_screen".into()
+        } else if max_groups.is_some() {
+            "probe".into()
+        } else {
+            "full".into()
+        },
         wall_secs: wall,
-        groups: stats.groups,
+        predicted_t_first_screen_secs: predicted,
+        t_first_screen_secs: t_fs,
+        pass_bar_secs: T_FIRST_SCREEN_PASS_SECS,
+        gate_pass: stats.gate_pass,
+        visible_proxy_size: stats.visible_proxy_size,
         movie_groups: stats.movie_groups,
         show_groups: stats.show_groups,
-        max_groups_cap: max_groups,
+        proxy_movie_units: stats.proxy_movie_units,
+        proxy_show_units: stats.proxy_show_units,
+        unmatched_in_proxy: stats.unmatched_in_proxy,
+        ready_in_proxy: stats.ready_in_proxy,
+        ready_missing_poster: stats.ready_missing_poster,
+        groups_drained: stats.groups,
         items_ready: stats.items_ready,
         items_unmatched: stats.items_unmatched,
         items_left_pending: stats.items_left_pending,
@@ -157,12 +237,6 @@ fn main() {
         } else {
             0.0
         },
-        http_requests_per_1000_items: (stats.http_requests as f64) * 1000.0 / items_touched,
-        mean_secs_per_request: if stats.http_requests > 0 {
-            wall / stats.http_requests as f64
-        } else {
-            0.0
-        },
         effective_req_per_sec: if wall > 0.0 {
             stats.http_requests as f64 / wall
         } else {
@@ -171,11 +245,10 @@ fn main() {
         http_429: stats.http_429,
         requests_per_sec_budget: rps,
         max_in_flight,
+        visible_n: VISIBLE_FIRST_SCREEN_N,
+        stopped_early: stats.stopped_early,
         seasons_in_drain: false,
-        note: "Serial movie+show drain (no seasons). Prefix probes can skew movie-heavy — \
-               do not extrapolate wall. max_in_flight unused until group fan-out. \
-               429/ceiling probes: personal TMDB key only."
-            .into(),
+        note,
     };
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
