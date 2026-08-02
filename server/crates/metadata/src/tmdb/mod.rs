@@ -401,7 +401,14 @@ impl MetadataSource for TmdbClient {
                 season_count: input.library_season_count,
             },
         )? {
-            TmdbResolve::Matched { metadata, .. } => Ok(ProviderResult::Hit(metadata)),
+            TmdbResolve::Matched {
+                metadata,
+                candidate,
+                ..
+            } => Ok(ProviderResult::Hit {
+                metadata,
+                method: candidate.method,
+            }),
             TmdbResolve::BelowThreshold { candidate } => Ok(ProviderResult::BelowThreshold {
                 confidence: candidate.confidence,
                 method: candidate.method,

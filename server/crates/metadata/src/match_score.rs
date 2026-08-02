@@ -254,7 +254,7 @@ pub fn score_search_with_shape(
             if let Some((hit, method)) = pin_collision(&exact, shapes, library) {
                 (hit, 0.90, method)
             } else {
-                (exact[0], 0.72, "exact_title")
+                (exact[0], 0.72, "exact_title_collision_unpinned")
             }
         }
     } else {
@@ -293,8 +293,8 @@ pub fn needs_collision_detail(
     let Some(c) = score_search_with_shape(results, title, year, kind, library, None) else {
         return false;
     };
-    // Still below floor on multi-exact after year-only pin → fetch details.
-    c.confidence < AUTO_MATCH_FLOOR && c.method == "exact_title"
+    // Still below floor after year-only pin → fetch detail counts.
+    c.confidence < AUTO_MATCH_FLOOR && c.method == "exact_title_collision_unpinned"
 }
 
 pub fn meets_auto_match_floor(confidence: f64) -> bool {
@@ -345,7 +345,7 @@ mod tests {
         let m = score_search(&results, "One Piece", None, SearchKind::Tv).unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
         assert!(!meets_auto_match_floor(m.confidence));
-        assert_eq!(m.method, "exact_title");
+        assert_eq!(m.method, "exact_title_collision_unpinned");
     }
 
     #[test]
@@ -365,6 +365,7 @@ mod tests {
         let m = score_search_with_library_year(&results, "Bones", None, Some(1990), SearchKind::Tv)
             .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
+        assert_eq!(m.method, "exact_title_collision_unpinned");
     }
 
     #[test]
@@ -377,6 +378,7 @@ mod tests {
         let m = score_search_with_library_year(&results, "Show", None, Some(2001), SearchKind::Tv)
             .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
+        assert_eq!(m.method, "exact_title_collision_unpinned");
     }
 
     #[test]
@@ -477,7 +479,7 @@ mod tests {
         )
         .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
-        assert_eq!(m.method, "exact_title");
+        assert_eq!(m.method, "exact_title_collision_unpinned");
     }
 
     #[test]

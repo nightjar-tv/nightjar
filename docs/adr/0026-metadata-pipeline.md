@@ -2,6 +2,8 @@
 
 - Status: accepted
 - Date: 2026-08-02
+- Amended: 2026-08-02 — TV multi-exact collision pin; title-fold corpus
+  discipline; full-library match rates after pin + fold
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -59,13 +61,44 @@ the discrete method classes from the spike matcher:
 | `exact_title_year` (unique) | 0.98 | Normalised title hit and year match; one candidate |
 | `exact_title` (unique) | 0.90 | Title hit; no year on the file, one candidate |
 | `exact_title_year` (multi) | 0.80 | Title+year hit; more than one candidate |
-| `exact_title` (multi) | 0.72 | Title hit; more than one candidate |
+| `exact_title` (multi) | 0.72 | Title hit; more than one candidate; **superseded for TV** by the collision pin below when a discriminator fires |
+| `exact_title_collision_unpinned` | 0.72 | Multi exact-title; no discriminator selected exactly one candidate |
+| `exact_title_library_year` | 0.90 | Multi exact-title; library premiere year uniquely matched `first_air_date` year |
+| `exact_title_episode_count` | 0.90 | Multi exact-title; library episode count uniquely matched (soft) a candidate's `number_of_episodes` |
+| `exact_title_season_count` | 0.90 | Multi exact-title; library season count uniquely matched `number_of_seasons` |
 | `exact_title_year_nearest` | 0.70 | Title hit; year present but no exact year row |
 | `top1_rank` | 0.45–0.65 | No exact title hit; took search ranking |
 
 **Auto-match only when confidence ≥ 0.80.** Below that the item stays
 unmatched and keeps its path `item_key`. Do not write a provider key for a
 low-confidence hit.
+
+#### TV multi-exact collision pin (one rule)
+
+When normalised title matches more than one `/search/tv` hit and query year
+did not already produce an `exact_title_year` row, do **not** lower the floor.
+Apply discriminators in order; the **first that selects exactly one
+candidate** lifts to 0.90 under the method name above. If a discriminator
+selects zero or two-or-more candidates, try the next. If none pin uniquely,
+stay at 0.72 as `exact_title_collision_unpinned`.
+
+| Order | Library signal | Candidate field | Match |
+|---|---|---|---|
+| 1 | Premiere year (earliest episode `year`, else show-folder `(YYYY)`) | `first_air_date` year (search hit) | Exact year |
+| 2 | Episode file count under the show | `/tv/{id}` `number_of_episodes` | Soft (±15% or ±5) |
+| 3 | Distinct season numbers present | `/tv/{id}` `number_of_seasons` | Exact |
+
+Detail shapes for (2) and (3) are fetched only when (1) did not pin — tens of
+ambiguous shows, not per file. Wrong series match remains worse than none:
+ambiguous residue goes to the fix flow (ADR-0028), not a looser floor.
+
+The discrete mid-table weights (0.72 vs 0.55, etc.) are the spike's carried
+forward classes; the floor and the collision pin are what dogfood measured.
+Do not retune those middle weights without a new hand-scored sample.
+
+Match outcomes carry the method string (resolved `match_method`, or
+`BelowThreshold { method }`) so logs and the fix flow name which table row
+or discriminator fired — same debuggability bar as track-selection reasons.
 
 0.80 is calibrated against the 280-item stratified dogfood sample in
 `notes/fts-vs-search-match-quality-2026-08-02.md`: it is the lowest
@@ -83,13 +116,17 @@ measure), not taste.
 
 The two episode wrongs were both `One Piece` at 0.72 (`exact_title` multi:
 live-action id over the anime series). Lowering the floor to clear Gate 3
-coverage would re-admit that class. Coverage climbs by improving inputs
-(filename cleaner folding `&`/`and` and apostrophes; year extraction), not
-by accepting multi-hit title matches.
+coverage would re-admit that class. Coverage climbs by improving inputs and
+by the collision pin above, not by accepting multi-hit title matches without
+a unique discriminator.
 
-Gate 3 still requires a hand-scored measure of auto-match rate and wrong
-rate at this threshold on the full dogfood library. The spike is the
-calibration sample, not that measure.
+Full-library measure (2026-08-02, testdata library excluded): movies
+**95.8%**, episodes **94.9%**, combined **95.0%** at floor 0.80; below-floor
+/ fragile path-key fraction **~4.5%**. Residue is genuinely ambiguous
+(incomplete libraries, double-count collisions); fix flow owns it.
+
+Gate 3 still wants a hand-scored wrong-rate check at this threshold; the
+coverage numbers above are auto-match rate, not proof of zero wrongs.
 
 ### 3. Negative-result cache
 
@@ -225,26 +262,25 @@ default; the user key is the escape hatch.
 
 ## Consequences
 
-- Matcher code owns the confidence function and the 0.80 constant; tests
-  assert method → score and threshold gating on fixture result lists. The
-  constant is sample-calibrated; raising or lowering it is a re-calibration
-  against a larger hand-scored set, recorded in an ADR amend.
+- Matcher code owns the confidence function, the 0.80 constant, and the TV
+  collision pin (§2); tests assert method → score, pin uniqueness, and
+  threshold gating on fixture result lists. The constant is
+  sample-calibrated; raising or lowering it is a re-calibration against a
+  larger hand-scored set, recorded in an ADR amend. Do not retune the
+  mid-table discrete weights without that evidence.
 - Unmatched (below threshold, no results, or NFO-less miss) keeps the
   path `item_key` from ADR-0025 until a manual fix or a successful retry.
   Path keys lose history on rename and do not survive library
   remove-and-re-add, so the below-floor rate is also the fraction of the
-  library with fragile watch state. On the calibration sample that is
-  17/280 (6.1%; movies 5/180, episodes 12/100). Weighting those rates by
-  dogfood composition (1,864 movies + 23,076 episodes) projects about
-  11% of files (~2,800) onto path keys — episode-heavy, and the sample
-  oversampled anime, so the full-library Gate 3 measure owns the real
-  number. ADR-0025 did not know this interaction when it chose path keys
-  for unmatched.
+  library with fragile watch state. Full-library measure (testdata
+  excluded, after collision pin + title fold): about **4.5%** below floor.
+  The calibration sample had projected ~11%; ADR-0025 Consequences should
+  cite the measured figure when amended.
 - Gate 3 measurement must report auto-match rate and wrong rate **at
   threshold 0.80** on the dogfood library, not top-1 with no floor.
-- Filename cleaner fold for `&`/`and` and apostrophes remains a separate
-  small slice; it is the cheapest coverage recovery without moving the
-  threshold.
+- Filename cleaner folds (`and`↔`&`, apostrophes, colons, diacritics) share
+  one `norm_key` path. New folds need a corpus fixture row
+  (`fold_corpus.json`) before the rule — same discipline as a playback bug.
 - Artwork ADR consumes detail payloads (image paths) already stored here;
   it does not re-fetch metadata to learn poster URLs.
 - Release engineering must be able to rotate `NIGHTJAR_TMDB_APP_KEY` and

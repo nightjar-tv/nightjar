@@ -177,6 +177,9 @@ fn strip_diacritics(s: &str) -> String {
 
 /// Fold punctuation / orthography so library titles match TMDB:
 /// `and`↔`&`, apostrophes (ASCII + U+2019), colons, diacritics.
+///
+/// New folds need a row in `tests/fixtures/fold_corpus.json` (same discipline
+/// as a playback bug: corpus fixture before the rule).
 pub fn fold_title_orthography(s: &str) -> String {
     let s = strip_diacritics(s);
     let mut out = String::with_capacity(s.len());
@@ -281,5 +284,25 @@ mod tests {
             fold_title_orthography("Léon The Professional"),
             "Leon The Professional"
         );
+    }
+
+    #[test]
+    fn fold_corpus_fixture() {
+        let path = format!(
+            "{}/tests/fixtures/fold_corpus.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        assert!(!rows.is_empty(), "fold corpus must not be empty");
+        for row in rows {
+            let input = row["in"].as_str().expect("in");
+            let expected = row["out"].as_str().expect("out");
+            assert_eq!(
+                fold_title_orthography(input),
+                expected,
+                "fold corpus row for {input:?}"
+            );
+        }
     }
 }

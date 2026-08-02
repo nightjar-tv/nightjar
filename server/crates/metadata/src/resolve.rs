@@ -47,7 +47,7 @@ impl std::fmt::Display for UnresolvedReason {
             Self::NoMatch => write!(f, "no match"),
             Self::NfoInvalid { detail } => write!(f, "invalid nfo: {detail}"),
             Self::BelowThreshold { confidence, method } => {
-                write!(f, "below threshold: {confidence:.2} ({method})")
+                write!(f, "below threshold: {confidence:.2} [{method}]")
             }
         }
     }
@@ -58,6 +58,8 @@ pub enum ResolveOutcome {
     Resolved {
         metadata: Box<CanonicalMetadata>,
         source: MetadataOrigin,
+        /// Scorer method / discriminator name (TMDB path). `None` for NFO.
+        match_method: Option<String>,
     },
     Unresolved {
         reason: UnresolvedReason,
@@ -85,7 +87,11 @@ impl std::error::Error for ResolveError {}
 /// stays thin (Rule 4.7) while still surfacing the floor gate for the fix flow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderResult {
-    Hit(Box<CanonicalMetadata>),
+    Hit {
+        metadata: Box<CanonicalMetadata>,
+        /// Scorer method string (which table row / discriminator fired).
+        method: &'static str,
+    },
     BelowThreshold {
         confidence: f64,
         method: &'static str,
@@ -144,6 +150,7 @@ impl<T: MetadataSource> Resolver<T> {
                 return Ok(ResolveOutcome::Resolved {
                     metadata,
                     source: MetadataOrigin::Nfo,
+                    match_method: None,
                 });
             }
             NfoAttempt::Invalid(err) => {
@@ -156,9 +163,10 @@ impl<T: MetadataSource> Resolver<T> {
             NfoAttempt::Absent => {}
         }
         match self.tmdb.resolve(input)? {
-            ProviderResult::Hit(metadata) => Ok(ResolveOutcome::Resolved {
+            ProviderResult::Hit { metadata, method } => Ok(ResolveOutcome::Resolved {
                 metadata,
                 source: MetadataOrigin::Tmdb,
+                match_method: Some(method.to_string()),
             }),
             ProviderResult::BelowThreshold { confidence, method } => {
                 Ok(ResolveOutcome::Unresolved {
@@ -198,9 +206,14 @@ mod tests {
         })
         .unwrap();
         match outcome {
-            ResolveOutcome::Resolved { source, metadata } => {
+            ResolveOutcome::Resolved {
+                source,
+                metadata,
+                match_method,
+            } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
                 assert_eq!(metadata.title, "Fight Club");
+                assert_eq!(match_method, None);
             }
             ResolveOutcome::Unresolved { .. } => panic!("expected NFO resolve"),
         }
