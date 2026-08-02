@@ -1090,6 +1090,7 @@ components:
         - startedAt
         - kind
         - skippedOutsideRoot
+        - deferredRemove
       properties:
         id:
           type: integer
@@ -1147,6 +1148,14 @@ components:
           description: >
             Files walked but not indexed because they were outside the library
             root (ADR-0030).
+        deferredRemove:
+          type: integer
+          format: int64
+          description: >
+            On `kind=repoint` jobs: count of existing media rows that missed
+            the new root keep-set and were left in place (delete_missing
+            deferred to the next ordinary scan). Zero on ordinary scans
+            (ADR-0030).
 
     PlaybackInfo:
       type: object

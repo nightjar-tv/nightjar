@@ -398,13 +398,26 @@ fn run_index_and_probe(
         if !root_ok_after {
             let _ = pool.set_library_reachability(library_id, &lib.path, false);
         }
-        let allow_delete = allow_delete_missing(
-            true,
-            root_ok_after,
-            listing_errors,
-            keep_folds.is_empty(),
-            existing_count,
-        );
+        // First index after a successful repoint: report unmatched rows but do
+        // not delete_missing (ADR-0030). Next ordinary scan deletes.
+        let job_kind = db
+            .get_scan_job(job_id)?
+            .map(|j| j.kind)
+            .unwrap_or_else(|| "scan".into());
+        let defer_delete = job_kind == "repoint";
+        let allow_delete = !defer_delete
+            && allow_delete_missing(
+                true,
+                root_ok_after,
+                listing_errors,
+                keep_folds.is_empty(),
+                existing_count,
+            );
+        let deferred_remove = if defer_delete {
+            db.count_missing_fold(library_id, &keep_folds)?
+        } else {
+            0
+        };
         let (removed, deleted_ids) = if allow_delete {
             let deleted_ids = db.delete_missing_fold(library_id, &keep_folds)?;
             for item_id in &deleted_ids {
@@ -414,17 +427,27 @@ fn run_index_and_probe(
             }
             (deleted_ids.len() as u32, deleted_ids)
         } else {
-            tracing::warn!(
-                library_id,
-                listing_errors,
-                existing_count,
-                files = keep_folds.len(),
-                root_ok_after,
-                "skipping delete_missing; reachability in doubt"
-            );
+            if defer_delete {
+                tracing::info!(
+                    library_id,
+                    job_id,
+                    deferred_remove,
+                    "repoint index: deferring delete_missing until next scan"
+                );
+            } else {
+                tracing::warn!(
+                    library_id,
+                    listing_errors,
+                    existing_count,
+                    files = keep_folds.len(),
+                    root_ok_after,
+                    "skipping delete_missing; reachability in doubt"
+                );
+            }
             (0, Vec::new())
         };
         let _ = db.set_scan_job_skipped_outside_root(job_id, skipped_outside_root);
+        let _ = db.set_scan_job_deferred_remove(job_id, deferred_remove);
         let unresolved = db
             .get_library(library_id)?
             .map(|l| l.paths_unresolved)

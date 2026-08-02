@@ -12,13 +12,19 @@ pub fn normalize_library_root(root: &str) -> String {
 }
 
 /// True when `stored` is still an absolute (unresolved) path.
+///
+/// On-disk discriminator (ADR-0030, Rule 4.9): `std::path::Path::is_absolute`
+/// on the server host. Relpath writers must never produce a string that is
+/// absolute under that predicate (no leading `/`, no Windows drive/UNC form).
+/// Library root `/` is rejected for media libraries, so a leading `/` always
+/// means transitional absolute leftover, not a relative segment.
 pub fn is_absolute_stored(stored: &str) -> bool {
     Path::new(stored).is_absolute()
 }
 
 /// One helper for every open/display site (ADR-0030 §1, Rule 4.11).
 /// Absolute stored values (migration leftovers) are used as-is; otherwise
-/// join to the library root.
+/// join to the library root. Discrimination: [`is_absolute_stored`].
 pub fn resolve_media_path(library_root: &str, stored: &str) -> PathBuf {
     if is_absolute_stored(stored) {
         PathBuf::from(stored)

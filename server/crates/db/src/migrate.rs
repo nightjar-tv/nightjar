@@ -463,4 +463,71 @@ mod tests {
             .unwrap();
         assert_eq!(moov_tables, 0);
     }
+
+    /// Copy a real dogfood DB, migrate through 012, print strip leftovers.
+    /// Run: `NIGHTJAR_MIGRATE_COPY=/path/to/copy.db cargo test -p nightjar-db \
+    ///   migrate_copy_through_012 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: needs NIGHTJAR_MIGRATE_COPY pointing at a disposable DB copy"]
+    fn migrate_copy_through_012() {
+        let path = std::env::var("NIGHTJAR_MIGRATE_COPY")
+            .expect("NIGHTJAR_MIGRATE_COPY must point at a disposable .db copy");
+        let conn = Connection::open(&path).unwrap();
+        let version_before: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let items_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let sidecars_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_sidecars", [], |r| r.get(0))
+            .unwrap();
+        eprintln!(
+            "before: schema={version_before} items={items_before} sidecars={sidecars_before}"
+        );
+        migrate(&conn).unwrap();
+        let version_after: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let items_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let sidecars_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_sidecars", [], |r| r.get(0))
+            .unwrap();
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(paths_unresolved), 0) FROM libraries",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let abs_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items WHERE path LIKE '/%' OR substr(path, 2, 1) = ':'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let abs_sidecars: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_sidecars WHERE path LIKE '/%' OR substr(path, 2, 1) = ':'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "after: schema={version_after} items={items_after} sidecars={sidecars_after} \
+             paths_unresolved_sum={unresolved} abs_shaped_items={abs_items} abs_shaped_sidecars={abs_sidecars}"
+        );
+        assert_eq!(items_before, items_after, "media_items COUNT must hold");
+        assert_eq!(sidecars_before, sidecars_after, "sidecars COUNT must hold");
+        assert_eq!(version_after, 12);
+    }
 }

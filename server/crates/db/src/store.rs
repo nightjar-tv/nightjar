@@ -132,6 +132,8 @@ pub struct ScanJobRow {
     pub kind: String,
     pub candidate_path: Option<String>,
     pub skipped_outside_root: i64,
+    /// Rows that would have been deleted on a repoint's first index; still present.
+    pub deferred_remove: i64,
 }
 
 /// One row for fold-aware index matching (ADR-0030 §2).
@@ -1114,7 +1116,7 @@ impl Db {
             "SELECT id, library_id, state, added, updated, removed, unchanged,
                     probed, errors, index_duration_ms, probe_duration_ms,
                     error_message, started_at, finished_at, kind, candidate_path,
-                    skipped_outside_root
+                    skipped_outside_root, deferred_remove
              FROM scan_jobs WHERE id = ?1",
             [job_id],
             map_scan_job,
@@ -1135,6 +1137,35 @@ impl Db {
         )
         .map_err(|e| format!("set scan job skipped_outside_root: {e}"))?;
         Ok(())
+    }
+
+    pub fn set_scan_job_deferred_remove(
+        &self,
+        job_id: i64,
+        deferred_remove: i64,
+    ) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE scan_jobs SET deferred_remove = ?2 WHERE id = ?1",
+            params![job_id, deferred_remove],
+        )
+        .map_err(|e| format!("set scan job deferred_remove: {e}"))?;
+        Ok(())
+    }
+
+    /// Rows that [`Self::delete_missing_fold`] would remove (relpath rows only).
+    pub fn count_missing_fold(
+        &self,
+        library_id: i64,
+        keep_folds: &HashSet<String>,
+    ) -> Result<i64, String> {
+        let rows = self.list_item_paths(library_id)?;
+        let n = rows
+            .iter()
+            .filter(|r| !is_absolute_stored(&r.path))
+            .filter(|r| !keep_folds.contains(&fold_path(&r.path)))
+            .count();
+        Ok(n as i64)
     }
 
     pub fn set_scan_job_state(&self, job_id: i64, state: &str) -> Result<(), String> {
@@ -1294,6 +1325,7 @@ fn map_scan_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobRow> {
         kind: r.get(14)?,
         candidate_path: r.get(15)?,
         skipped_outside_root: r.get(16)?,
+        deferred_remove: r.get(17)?,
     })
 }
 

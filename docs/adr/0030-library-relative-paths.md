@@ -93,6 +93,24 @@ a single function: absolute stored values (unresolved leftovers) used as-is;
 else `join(libraries.path, stored)`. No scattered `if` at probe / extract /
 playback / doctor — one path through that helper.
 
+**Absolute vs relative discrimination (Rule 4.9).** No marker column. The
+on-disk form is discriminated by `std::path::Path::is_absolute(stored)` on
+the server host (`is_absolute_stored` / `resolve_media_path`). That is the
+locked shape rule for the transitional mixed population and afterwards:
+
+- Legal relpaths are definitionally **not** absolute under that predicate
+  (no leading `/`, no Windows drive letter, no UNC). Writers (`to_relpath`,
+  scan upsert, sidecar associate, migration strip) must only store such
+  strings.
+- Library root `/` is rejected for media libraries, so a leading `/` cannot
+  be a relative segment under a valid root.
+- When `paths_unresolved` is zero, every row is relpath by construction; the
+  predicate still holds as the writer invariant.
+
+A separate `path_form` column was rejected: it would duplicate a property
+already constrained by the relpath grammar, and the mixed state is meant to
+drain to zero via repair, not become a permanent dual enum.
+
 ### 2. Case sensitivity is identity
 
 SQLite `UNIQUE (library_id, path)` uses **BINARY** collation (SQLite's
@@ -206,6 +224,19 @@ no auth (ADR-0003 §3); the route is public like every other write today.
 authenticated household member repoint (or refuse-loop) libraries. Same
 class as ADR-0009's capability readout — call out now so the security pass
 cannot miss it.
+
+**First index after repoint defers `delete_missing`.** The refuse bar (≥0.90
+match) stops the catastrophic wrong-root case. It does **not** stop a quiet
+~9% miss: retain passes, then a normal scan would `delete_missing` the
+unmatched rows under a different mechanism. That wipe still destroys
+`media_items.id` (probe, extracts, sidecars, `media_item_links`) and would
+orphan future `watch_state` rows that key on path `item_key` until re-match
+— today watch_state is not shipped, but the extract/binding loss is already
+real. Therefore: on a job with `kind=repoint`, the continuing index
+**reports** unmatched count as `deferred_remove` and **does not** call
+`delete_missing`. The next ordinary scan (`kind=scan`) deletes as usual.
+Operators (and later UI/doctor) can see the delta before the second pass.
+This makes the 0.90 default less load-bearing for quiet partial trees.
 
 ### 4. What a successful repoint preserves; API `path`
 
@@ -327,18 +358,20 @@ if documented as unstable across repoint.
 - Implementing slice: migration with visible unresolved-path counts +
   repair; async path PATCH + dry-run retain guard; OpenAPI description on
   `MediaItem.path`; `skipped_outside_root` on scan/library API.
-- **User-visible (ASS pattern):** `skipped_outside_root` and
-  `paths_unresolved` are on the library and scan-job JSON. There is no web
-  UI surface yet — the server knows; the household user does not unless a
-  client shows the counters or `nightjar doctor` (Phase 4 plan) does.
-  Failed repoint drops **zero** items (refuse). A *successful* repoint then
-  runs a normal scan: ordinary `delete_missing` can remove rows that miss
-  the new tree while still clearing the retain bar.
+- **User-visible (ASS pattern):** `skipped_outside_root`,
+  `paths_unresolved`, and repoint `deferred_remove` are on the library /
+  scan-job JSON. There is no web UI surface yet — the server knows; the
+  household user does not unless a client shows the counters or
+  `nightjar doctor` (Phase 4 plan) does. Failed repoint drops **zero**
+  items (refuse). Successful repoint's first index also drops **zero**;
+  unmatched count is `deferred_remove` until the next ordinary scan.
 - ADR-0025 §4 storage and grammar finally agree; derived path keys use
   the stored (sticky) relpath column.
-- Gate 3 remount / Docker path-move verification against the dogfood
-  library is **still outstanding** at acceptance of this ADR text; local
-  unit/integration coverage is not a substitute.
+- Migration dry-run on a VACUUM copy of the household dogfood DB
+  (2026-08-03): schema 8→12, `media_items` 24940→24940,
+  `media_item_sidecars` 8583→8583, `paths_unresolved` sum 0, zero
+  absolute-shaped leftovers. Gate 3 remount / Docker path-move
+  verification against the live dogfood library remains outstanding.
 - v1 has no force-repoint: operators whose tree genuinely changed by more
   than 10% of relpaths must delete-and-re-add (new `library_id`, lose
   derived state) or wait for a later ADR.

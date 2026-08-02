@@ -93,6 +93,8 @@ pub struct ScanJobDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_path: Option<String>,
     pub skipped_outside_root: i64,
+    /// Present on repoint jobs: unmatched rows left in place (delete deferred).
+    pub deferred_remove: i64,
 }
 
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<LibrariesResponse>> {
@@ -348,5 +350,6 @@ fn job_to_dto(row: ScanJobRow) -> ScanJobDto {
         kind: row.kind,
         candidate_path: row.candidate_path,
         skipped_outside_root: row.skipped_outside_root,
+        deferred_remove: row.deferred_remove,
     }
 }
