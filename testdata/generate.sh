@@ -399,6 +399,116 @@ gen h264_ac3_51side_mkv.mkv \
   -f lavfi -i "anullsrc=channel_layout=5.1(side):sample_rate=48000:duration=2" \
   -c:v libx264 -pix_fmt yuv420p -c:a ac3 -shortest
 
+# 27. Adversarial multi-sub MKV (ADR-0024 / Heartstopper-class).
+# 32 soft SRT tracks, none flagged default; alphabetical language-name order
+# puts Arabic at the lowest subtitle index. Duplicate language tags, SDH only
+# in title, regional spa/por variants. Audio: commentary eng before main eng
+# so first-stream-wins would pick the wrong dialogue.
+ADV_SRT="$OUT/_adv_track_select.srt"
+cat > "$ADV_SRT" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar adversarial subtitle
+EOF
+# language code, title — English display names sorted so ara is first.
+ADV_SUBS=(
+  "ara|Arabic"
+  "chi|Chinese"
+  "chi|Chinese (Traditional)"
+  "cze|Czech"
+  "dan|Danish"
+  "dut|Dutch"
+  "fin|Finnish"
+  "fre|French"
+  "ger|German"
+  "gre|Greek"
+  "heb|Hebrew"
+  "hin|Hindi"
+  "hun|Hungarian"
+  "ind|Indonesian"
+  "ita|Italian"
+  "jpn|Japanese"
+  "kor|Korean"
+  "nor|Norwegian"
+  "pol|Polish"
+  "por|Portuguese"
+  "por|Brazilian Portuguese"
+  "rum|Romanian"
+  "rus|Russian"
+  "spa|Spanish"
+  "spa|European Spanish"
+  "swe|Swedish"
+  "tha|Thai"
+  "tur|Turkish"
+  "ukr|Ukrainian"
+  "vie|Vietnamese"
+  "eng|English"
+  "eng|English [SDH]"
+)
+if [[ ${#ADV_SUBS[@]} -ne 32 ]]; then
+  echo "internal error: ADV_SUBS must be 32 entries, got ${#ADV_SUBS[@]}" >&2
+  exit 1
+fi
+echo "→ h264_aac_adv_track_select_mkv.mkv (32 subs, commentary+main audio)"
+ADV_ARGS=(
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2"
+  -f lavfi -i "sine=frequency=220:sample_rate=48000:duration=2"
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2"
+  -i "$ADV_SRT"
+  -map 0:v:0 -map 1:a:0 -map 2:a:0
+)
+for _ in "${ADV_SUBS[@]}"; do
+  ADV_ARGS+=(-map 3:0)
+done
+ADV_ARGS+=(
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -c:s srt
+  -metadata:s:a:0 language=eng -metadata:s:a:0 title="Commentary"
+  -metadata:s:a:1 language=eng -metadata:s:a:1 title="Main"
+  -disposition:a:0 0 -disposition:a:1 0
+)
+si=0
+for entry in "${ADV_SUBS[@]}"; do
+  lang="${entry%%|*}"
+  title="${entry#*|}"
+  ADV_ARGS+=(-metadata:s:s:${si} language="$lang")
+  ADV_ARGS+=(-metadata:s:s:${si} title="$title")
+  ADV_ARGS+=(-disposition:s:${si} 0)
+  si=$((si + 1))
+done
+ADV_ARGS+=(-shortest "$OUT/h264_aac_adv_track_select_mkv.mkv")
+"$FFMPEG" -y -hide_banner -loglevel error "${ADV_ARGS[@]}"
+rm -f "$ADV_SRT"
+
+# 28. Forced-mode fixture (ADR-0024 / Phase 2 item 5). Non-English audio so
+# forced selection can fire; English forced track present. Matching-audio
+# control is the same file with preferred language = jpn (expect nothing).
+FORCED_SRT="$OUT/_forced_track_select.srt"
+cat > "$FORCED_SRT" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar forced signs
+EOF
+FORCED_FULL="$OUT/_forced_full.srt"
+cat > "$FORCED_FULL" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+Nightjar full English dialogue
+EOF
+echo "→ h264_aac_forced_track_select_mkv.mkv (jpn audio, eng forced + eng full)"
+"$FFMPEG" -y -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=2" \
+  -i "$FORCED_SRT" -i "$FORCED_FULL" \
+  -map 0:v:0 -map 1:a:0 -map 2:0 -map 3:0 \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -c:s srt \
+  -metadata:s:a:0 language=jpn -metadata:s:a:0 title="Japanese" \
+  -metadata:s:s:0 language=eng -metadata:s:s:0 title="English (Forced)" \
+  -metadata:s:s:1 language=eng -metadata:s:s:1 title="English" \
+  -disposition:s:0 +forced -disposition:s:1 0 \
+  -shortest \
+  "$OUT/h264_aac_forced_track_select_mkv.mkv"
+rm -f "$FORCED_SRT" "$FORCED_FULL"
+
 # Optional multi-GB open-ended Range stress (never commit; gitignored)
 if [[ "${LARGE:-}" == "1" ]]; then
   echo "→ large-open-ended-range.mp4 (~2 GB, gitignored)"

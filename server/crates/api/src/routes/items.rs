@@ -9,7 +9,7 @@ use axum::{
 };
 use nightjar_core::{
     BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
-    known_profile, resolve_profile_bag,
+    known_profile, resolve_profile_bag, title_looks_forced, title_looks_sdh,
 };
 use nightjar_db::{MediaItemRow, SidecarRow};
 use nightjar_transcode::{
@@ -302,6 +302,8 @@ pub(crate) fn subtitle_tracks_for(
     let mut tracks = Vec::new();
     let src = std::path::Path::new(&row.path);
     for s in list_text_subtitles(src)? {
+        let forced = s.is_forced || title_looks_forced(s.title.as_deref());
+        let sdh = title_looks_sdh(s.title.as_deref());
         tracks.push(serveable_track_dto(
             state,
             row,
@@ -311,21 +313,23 @@ pub(crate) fn subtitle_tracks_for(
                 codec: s.codec,
                 language: s.language,
                 label: s.title,
-                forced: false,
-                sdh: false,
+                forced,
+                sdh,
                 stream_index: Some(s.stream_index),
             },
         ));
     }
     for s in list_burn_in_subtitles(src)? {
+        let forced = title_looks_forced(s.title.as_deref());
+        let sdh = title_looks_sdh(s.title.as_deref());
         tracks.push(burn_in_track_dto(ServeableTrack {
             track_id: s.track_id(),
             source: "embedded",
             codec: s.codec,
             language: s.language,
             label: s.title,
-            forced: false,
-            sdh: false,
+            forced,
+            sdh,
             stream_index: Some(s.stream_index),
         }));
     }

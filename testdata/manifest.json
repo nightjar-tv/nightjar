@@ -160,6 +160,28 @@
       "expect": "remux (HLS copy session); main track flagged default; commentary reachable by trackId and labelled from its title tag (ADR-0012)"
     },
     {
+      "path": "files/h264_aac_adv_track_select_mkv.mkv",
+      "tags": [
+        "aac",
+        "multi-track",
+        "subtitle",
+        "track-select",
+        "mkv"
+      ],
+      "expect": "remux; 32 soft subs none default, Arabic at lowest subtitle index; eng preference selects English not Arabic and not English [SDH]; unknown preference selects nothing; audio eng preference selects Main not Commentary (ADR-0024)"
+    },
+    {
+      "path": "files/h264_aac_forced_track_select_mkv.mkv",
+      "tags": [
+        "aac",
+        "subtitle",
+        "forced",
+        "track-select",
+        "mkv"
+      ],
+      "expect": "remux; jpn audio with eng forced + eng full; eng preference + foreign audio selects forced; jpn preference (matching audio) selects nothing (ADR-0024 / Phase 2 item 5)"
+    },
+    {
       "path": "files/h264_flac_60_mkv.mkv",
       "tags": [
         "flac",
