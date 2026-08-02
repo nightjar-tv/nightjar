@@ -75,6 +75,15 @@ shape and the verify contract, so they are decided here before code
    the team has verified on real hardware. The API reports what *this process*
    verified; the matrix reports what *we* stand behind.
 
+9. **Presence is not capacity.** A device or ICD that enumerates (DRM node,
+   Vulkan ICD, encoder name in `ffmpeg -encoders`) must still pass the encode+
+   demux verify before it is `verified`. Software paths that present a device
+   but cannot sustain realtime (e.g. Mesa lavapipe ~0.30× on the 2026-08-02
+   libplacebo spike host) must not be promoted as if they were usable encode
+   capacity. Detection answers “can this process encode”; sizing and Gate
+   concurrency floors answer “how many streams” — keep those claims separate.
+   Spike pointer: `notes/hw/libplacebo-dv-spike-2026-08-02.md`.
+
 ## Consequences
 
 Startup grows by the cost of a few short encodes once. A hung hardware driver
@@ -99,3 +108,7 @@ becomes admin-only in Phase 3 because it discloses server capability.
 
 This advances ADR-0007's deferred hardware work for encode selection only.
 Decode `-hwaccel` and remux remain unchanged.
+
+Enumerated-but-slow software Vulkan (lavapipe) is a reminder that verify and
+realtime capacity are different claims; do not treat ICD presence as a Gate 2
+concurrency floor.

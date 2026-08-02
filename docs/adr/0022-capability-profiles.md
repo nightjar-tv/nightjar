@@ -35,7 +35,7 @@ Dart player interface rule in ADR-0021 and applies to the web client too.
 | `BROWSER_V0` | Web (and today's anonymous default) | Already shipped. Codecs + containers + `maxAudioChannels: 2`. |
 | `MEDIA3_V0` | Android / Android TV Flutter | Scored in bake-off (~96.5% DP on dogfood). |
 | `MPV_V0` | Windows / Linux media_kit; bake-off libmpv floor | Scored (~100% DP on dogfood). |
-| `AETHER_V0` | Apple if ADR-0021 option (a) wins | T1 on dogfood (24 877 items): **100.0%** directPlay (24 866). Matroska + wide codecs; client bridges audio AVPlayer rejects. |
+| `AETHER_V0` | Apple if ADR-0021 option (a) wins | **Modelled, not measured:** `decide_playback` rates on dogfood DB (~24 940 items, 2026-08-02): ~100% directPlay. Same modelled run: `APPLE_AVPLAYER_V0` ~**13.1%** directPlay (no Matroska; restricted codecs) — that gap is the argument for the Aether path. Matroska + wide codecs; client bridges audio AVPlayer rejects. Counts: `nightjar-meta/notes/t1-profile-counts-2026-08-02.txt`. |
 | Tizen / webOS model-year ids | Vendor Flutter shells | Capability varies by TV year; client must report what that stick can decode. |
 
 Ids are additive. Unknown id + full field bag still decides; unknown id with
@@ -74,24 +74,32 @@ encode path requires tone-map, and `zscale` is absent:
 - Session **start refuses before spawn** with **415** and that same reason.
   Hosts without zscale get a named failure, not a dead HLS session.
 
-**Packaging note (verified 2026-08-01, narrow).** Debian bookworm
-`libavfilter8` on **arm64** Declares `libzimg2` and the shared object contains
-the `zscale` filter string / zimg symbols (`Depends` + `strings` on the
-`.deb`). That is **not** a full ship-path proof: amd64 was not checked the
-same way, and the Nightjar Dockerfile still installs **no** FFmpeg, so a
-container that encodes must use a host FFmpeg with libzimg or gain an image
-packaging change. Missing `zscale` on a real host remains a packaging or
-install gap; decide+415 is what makes that survivable at runtime.
+**Dolby Vision Profile 5.** Probe stores `dolby_vision_p5` when ffprobe reports
+`dv_profile` 5. Decide returns **transcode** with reason
+`Dolby Vision Profile 5 cannot be tone-mapped (IPT-PQ; no P5→SDR path)`;
+session start **415**s with that reason. No tonemap attempt — P5 is IPT-PQ and
+has no path through the current zscale+hable chain. Product support (e.g.
+libplacebo+libdovi, or dovi_tool P5→P8.1 before encode) needs a new ADR before
+those dependencies enter the transcode path. Do not conflate with missing HEVC
+VUI colour tags on a fixture (same zscale error string, different cause).
+
+**Packaging note.** Product Docker image installs Debian `ffmpeg` + VA drivers
+(#19). Bookworm `libavfilter8` on **arm64** Declares `libzimg2` and contains
+`zscale` / zimg symbols (`Depends` + `strings`; 2026-08-01). Bare binary still
+accepts operator-provided FFmpeg on PATH. Missing `zscale` on a real host
+remains a packaging or install gap; decide+415 makes that survivable at
+runtime.
 
 Regression coverage for the graph: committed synthetic PQ (`hevc_hdr10_mp4`)
 and HLG (`hevc_hlg_mp4`) assert encode labels are BT.709; a measured
 retag-vs-tonemap MAD floor proves **not-retag only** (not beauty) —
 `notes/hdr-tonemap-delta-2026-08-01.md`.
 
-**Beauty (Proven by inspection, not measured).** Kit titles, stills + one
-browser play each, criteria and paths in
-`notes/hdr-tonemap-beauty-2026-08-01.md` (2026-08-01): HDR10-P8.1 FHD and
-HLG-P8.4 FHD. DV Profile 5 beauty is still open.
+**Beauty / product inspection (Proven by inspection, not measured).** Kit
+titles: `notes/hdr-tonemap-beauty-2026-08-01.md` (2026-08-01). Product HLS
+web-player inspection 2026-08-02 (Garrett): HDR10, P8.1, P7 MEL, P7 FEL
+correct; P8.4 visual unknown; P5 failed session via named refuse —
+`notes/hw/libplacebo-dv-spike-2026-08-02.md`.
 
 ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
@@ -136,17 +144,16 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   transcode; probe stores `video_bitrate_bps` and `hdr`.
 - Slice 2: encode targets (`scale` + `-b:v` from ceilings), real HDR→SDR
   tonemap (`zscale` + hable), field-bag query overrides, `AETHER_V0`
-  (T1-scored), host `zscale` probe with decide reason + **415
-  refuse-before-spawn** when tonemap is required and unavailable (packaging
-  gap is survivable: named reason, not a dead session). MAD regression is
-  not-retag only (`notes/hdr-tonemap-delta-2026-08-01.md`). Kit PQ/HLG
-  beauty is **Proven by inspection** per
-  `notes/hdr-tonemap-beauty-2026-08-01.md` — not a measured Gate metric.
+  (modelled decide rates; not a measured client bake-off), host `zscale`
+  probe with decide reason + **415 refuse-before-spawn** when tonemap is
+  required and unavailable. Profile 5: named refuse, no tonemap attempt.
+  MAD regression is not-retag only (`notes/hdr-tonemap-delta-2026-08-01.md`).
+  Kit / product picture claims are **Proven by inspection** where dated —
+  not measured Gate metrics.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
 - N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4
   for the scan carry). Unraid is the VAAPI/QSV verification host once iGPU
   enablement is confirmed.
-- Product Docker image still does **not** install FFmpeg; bookworm
-  `libavfilter8` arm64 has zscale when ffmpeg is installed on the host (see
-  §4 packaging note).
+- Product Docker image installs Debian `ffmpeg` + VA drivers (#19); see §4
+  packaging note.
