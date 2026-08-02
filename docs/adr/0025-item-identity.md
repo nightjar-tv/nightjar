@@ -204,3 +204,11 @@ key (§4); no third shape.
   version collapse UI.
 - Watch-state and playback-events ADRs (Block 2) consume `item_key`; they
   do not redefine it.
+- **Fragile watch state under the match floor (ADR-0026).** Items below
+  confidence 0.80 stay on the path key, so the below-floor rate is the
+  fraction of the library whose watch state dies on rename and on library
+  remove-and-re-add. Calibration sample: 17/280 (6.1%). Library-weighted
+  projection from those rates onto 24,940 dogfood files: about 11%. The
+  Gate 3 full-library measure at threshold 0.80 owns the real fraction;
+  raising coverage (cleaner, year extraction) shrinks it without changing
+  this identity rule.

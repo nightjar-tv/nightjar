@@ -66,8 +66,13 @@ the discrete method classes from the spike matcher:
 unmatched and keeps its path `item_key`. Do not write a provider key for a
 low-confidence hit.
 
-0.80 is the lowest threshold at which the spike's search path had 100%
-precision on both movies and episodes. On that sample:
+0.80 is calibrated against the 280-item stratified dogfood sample in
+`notes/fts-vs-search-match-quality-2026-08-02.md`: it is the lowest
+threshold at which that sample's search path had 100% precision on both
+movies and episodes. 100% precision here means no observed wrongs in 280
+scored rows, not a proof of no wrongs. Changing the floor requires
+re-calibration on a larger hand-scored sample (or the full dogfood Gate 3
+measure), not taste.
 
 | Threshold | Movies cov / prec | Episodes cov / prec |
 |---|---|---|
@@ -83,7 +88,7 @@ by accepting multi-hit title matches.
 
 Gate 3 still requires a hand-scored measure of auto-match rate and wrong
 rate at this threshold on the full dogfood library. The spike is the
-starting point, not that measure.
+calibration sample, not that measure.
 
 ### 3. Negative-result cache
 
@@ -173,7 +178,7 @@ present, metadata resolution fails with a clear operator-facing reason.
 
 The secrets file is the v1 home for third-party credentials. OpenSubtitles
 credentials later use this file rather than inventing a second store or
-putting tokens in SQLite (Phase 3 cross-cutting note). The application key
+putting tokens in SQLite. The application key
 is not copied into the secrets file.
 
 ## Alternatives considered
@@ -210,9 +215,20 @@ default; the user key is the escape hatch.
 ## Consequences
 
 - Matcher code owns the confidence function and the 0.80 constant; tests
-  assert method → score and threshold gating on fixture result lists.
+  assert method → score and threshold gating on fixture result lists. The
+  constant is sample-calibrated; raising or lowering it is a re-calibration
+  against a larger hand-scored set, recorded in an ADR amend.
 - Unmatched (below threshold, no results, or NFO-less miss) keeps the
   path `item_key` from ADR-0025 until a manual fix or a successful retry.
+  Path keys lose history on rename and do not survive library
+  remove-and-re-add, so the below-floor rate is also the fraction of the
+  library with fragile watch state. On the calibration sample that is
+  17/280 (6.1%; movies 5/180, episodes 12/100). Weighting those rates by
+  dogfood composition (1,864 movies + 23,076 episodes) projects about
+  11% of files (~2,800) onto path keys — episode-heavy, and the sample
+  oversampled anime, so the full-library Gate 3 measure owns the real
+  number. ADR-0025 did not know this interaction when it chose path keys
+  for unmatched.
 - Gate 3 measurement must report auto-match rate and wrong rate **at
   threshold 0.80** on the dogfood library, not top-1 with no floor.
 - Filename cleaner fold for `&`/`and` and apostrophes remains a separate
