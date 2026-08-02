@@ -27,6 +27,7 @@ impl MetadataSource for TmdbStub {
 
 const MOVIE_APPEND: &str = "images,credits,videos,release_dates,external_ids";
 const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggregate_credits";
+const SEASON_APPEND: &str = "images,credits,videos,external_ids";
 
 #[derive(Debug, Clone)]
 pub struct TmdbCredentials {
@@ -312,6 +313,23 @@ impl TmdbClient {
         Ok((meta, raw))
     }
 
+    /// Season detail keyed `{show_id}:{season_number}` (ADR-0026 §4).
+    pub fn season_detail(
+        &self,
+        show_id: i64,
+        season_number: i32,
+    ) -> Result<RawProviderPayload, ResolveError> {
+        let data = self.get_json(
+            &format!("/tv/{show_id}/season/{season_number}"),
+            &[("append_to_response", SEASON_APPEND), ("language", "en-US")],
+        )?;
+        Ok(RawProviderPayload {
+            entity_kind: "season".into(),
+            provider_id: format!("{show_id}:{season_number}"),
+            payload: data.to_string(),
+        })
+    }
+
     /// Search + floor gate + detail. Returns metadata when confidence ≥
     /// [`crate::match_score::AUTO_MATCH_FLOOR`] (ADR-0026 §2).
     pub fn resolve_title(
@@ -404,10 +422,11 @@ impl MetadataSource for TmdbClient {
             TmdbResolve::Matched {
                 metadata,
                 candidate,
-                ..
+                raw,
             } => Ok(ProviderResult::Hit {
                 metadata,
                 method: candidate.method,
+                raw: Some(raw),
             }),
             TmdbResolve::BelowThreshold { candidate } => Ok(ProviderResult::BelowThreshold {
                 confidence: candidate.confidence,
@@ -415,6 +434,12 @@ impl MetadataSource for TmdbClient {
             }),
             TmdbResolve::NoResults => Ok(ProviderResult::Miss),
         }
+    }
+}
+
+impl MetadataSource for &TmdbClient {
+    fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+        (*self).resolve(input)
     }
 }
 

@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 nightjar-core = { path = "../core" }
+nightjar-db = { path = "../db" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = "2.12"
@@ -18,3 +19,7 @@ tempfile = { workspace = true }
 [[bin]]
 name = "metadata-match-measure"
 path = "src/bin/match_measure.rs"
+
+[[bin]]
+name = "metadata-store-measure"
+path = "src/bin/store_measure.rs"

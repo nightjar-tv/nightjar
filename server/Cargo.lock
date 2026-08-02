@@ -726,6 +726,7 @@ name = "nightjar-metadata"
 version = "0.0.1"
 dependencies = [
  "nightjar-core",
+ "nightjar-db",
  "rusqlite",
  "serde",
  "serde_json",

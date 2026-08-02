@@ -4,6 +4,8 @@
 - Date: 2026-08-02
 - Amended: 2026-08-02 — TV multi-exact collision pin; title-fold corpus
   discipline; full-library match rates after pin + fold
+- Amended: 2026-08-02 — raw payload store measured at 317 MiB
+  (`SUM(LENGTH(payload))`); ship uncompressed
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -281,6 +283,16 @@ default; the user key is the escape hatch.
 - Filename cleaner folds (`and`↔`&`, apostrophes, colons, diacritics) share
   one `norm_key` path. New folds need a corpus fixture row
   (`fold_corpus.json`) before the rule — same discipline as a playback bug.
+- **Raw payload store size (measured 2026-08-02, dogfood, testdata
+  excluded):** `SUM(LENGTH(payload))` = **317 MiB** across 4,193 entity
+  rows (1,721 movie / 682 tv / 1,790 season). The §4 projection of
+  ~420 MB median was high but same order; ship **uncompressed** UTF-8
+  JSON so the SQLite file stays inspectable. Do not confuse this column
+  sum with the whole database file size (library rows + payloads). Gzip
+  remains a pure implementation option if the figure becomes a user
+  complaint; pruning `credits` from `append_to_response` is the better
+  design lever if bandwidth/storage need cutting (credits alone were
+  ~70% of movie payload bytes in a sample).
 - Artwork ADR consumes detail payloads (image paths) already stored here;
   it does not re-fetch metadata to learn poster URLs.
 - Release engineering must be able to rotate `NIGHTJAR_TMDB_APP_KEY` and

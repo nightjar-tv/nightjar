@@ -1,7 +1,14 @@
 //! Resolve NFO first, then TMDB (ADR-0026 resolution path).
 
+use rusqlite::Connection;
+
 use crate::model::{CanonicalMetadata, MetadataKind};
+use crate::negative_cache::{
+    self, CacheKind, NegativeReason, PROVIDER_TMDB, now_rfc3339, query_key,
+};
 use crate::nfo::{NfoError, parse_nfo};
+use crate::raw_payload;
+use crate::tmdb::RawProviderPayload;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataOrigin {
@@ -91,6 +98,8 @@ pub enum ProviderResult {
         metadata: Box<CanonicalMetadata>,
         /// Scorer method string (which table row / discriminator fired).
         method: &'static str,
+        /// Entity-keyed raw body for ADR-0026 §4 persistence (`None` for stubs).
+        raw: Option<RawProviderPayload>,
     },
     BelowThreshold {
         confidence: f64,
@@ -145,6 +154,28 @@ impl Default for Resolver<crate::tmdb::TmdbStub> {
 
 impl<T: MetadataSource> Resolver<T> {
     pub fn resolve(&self, input: &ResolveInput) -> Result<ResolveOutcome, ResolveError> {
+        self.resolve_inner(input, None)
+    }
+
+    /// Resolve with ADR-0026 §3 negative cache and §4 raw payload persistence.
+    ///
+    /// Cached `no_results` / `below_threshold` entries skip the provider until
+    /// `next_retry_at`. Provider errors are **not** cached. Hits upsert the
+    /// raw payload in a transaction (canonical writer is a no-op until that
+    /// table lands).
+    pub fn resolve_with_store(
+        &self,
+        input: &ResolveInput,
+        conn: &Connection,
+    ) -> Result<ResolveOutcome, ResolveError> {
+        self.resolve_inner(input, Some(conn))
+    }
+
+    fn resolve_inner(
+        &self,
+        input: &ResolveInput,
+        conn: Option<&Connection>,
+    ) -> Result<ResolveOutcome, ResolveError> {
         match NfoSource.attempt(input) {
             NfoAttempt::Parsed(metadata) => {
                 return Ok(ResolveOutcome::Resolved {
@@ -162,13 +193,71 @@ impl<T: MetadataSource> Resolver<T> {
             }
             NfoAttempt::Absent => {}
         }
-        match self.tmdb.resolve(input)? {
-            ProviderResult::Hit { metadata, method } => Ok(ResolveOutcome::Resolved {
+
+        let cache_kind = match input.kind.unwrap_or(MetadataKind::Movie) {
+            MetadataKind::Movie => CacheKind::Movie,
+            MetadataKind::Episode | MetadataKind::Show => CacheKind::Tv,
+        };
+        let qk = input
+            .title
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(|t| query_key(t, input.year));
+
+        if let (Some(conn), Some(qk)) = (conn, &qk) {
+            let now = now_rfc3339();
+            if let Ok(Some(entry)) =
+                negative_cache::should_skip(conn, PROVIDER_TMDB, cache_kind, qk, &now)
+            {
+                return Ok(match entry.reason {
+                    NegativeReason::BelowThreshold => ResolveOutcome::Unresolved {
+                        reason: UnresolvedReason::BelowThreshold {
+                            confidence: entry.confidence.unwrap_or(0.0),
+                            method: "negative_cache".into(),
+                        },
+                    },
+                    NegativeReason::NoResults | NegativeReason::ApiError => {
+                        ResolveOutcome::Unresolved {
+                            reason: UnresolvedReason::NoMatch,
+                        }
+                    }
+                });
+            }
+        }
+
+        match self.tmdb.resolve(input) {
+            Ok(ProviderResult::Hit {
                 metadata,
-                source: MetadataOrigin::Tmdb,
-                match_method: Some(method.to_string()),
-            }),
-            ProviderResult::BelowThreshold { confidence, method } => {
+                method,
+                raw,
+            }) => {
+                if let (Some(conn), Some(raw)) = (conn, raw.as_ref()) {
+                    if let Some(ref qk) = qk {
+                        let _ = negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, qk);
+                    }
+                    // Canonical table lands with writers; empty write keeps the
+                    // same-transaction contract (ADR-0026 §4).
+                    raw_payload::persist_hit_with_canonical(conn, PROVIDER_TMDB, raw, |_| Ok(()))
+                        .map_err(ResolveError::Provider)?;
+                }
+                Ok(ResolveOutcome::Resolved {
+                    metadata,
+                    source: MetadataOrigin::Tmdb,
+                    match_method: Some(method.to_string()),
+                })
+            }
+            Ok(ProviderResult::BelowThreshold { confidence, method }) => {
+                if let (Some(conn), Some(qk)) = (conn, &qk) {
+                    let _ = negative_cache::record_miss(
+                        conn,
+                        PROVIDER_TMDB,
+                        cache_kind,
+                        qk,
+                        NegativeReason::BelowThreshold,
+                        Some(confidence),
+                        &now_rfc3339(),
+                    );
+                }
                 Ok(ResolveOutcome::Unresolved {
                     reason: UnresolvedReason::BelowThreshold {
                         confidence,
@@ -176,9 +265,26 @@ impl<T: MetadataSource> Resolver<T> {
                     },
                 })
             }
-            ProviderResult::Miss => Ok(ResolveOutcome::Unresolved {
-                reason: UnresolvedReason::NoMatch,
-            }),
+            Ok(ProviderResult::Miss) => {
+                if let (Some(conn), Some(qk)) = (conn, &qk) {
+                    let _ = negative_cache::record_miss(
+                        conn,
+                        PROVIDER_TMDB,
+                        cache_kind,
+                        qk,
+                        NegativeReason::NoResults,
+                        None,
+                        &now_rfc3339(),
+                    );
+                }
+                Ok(ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::NoMatch,
+                })
+            }
+            Err(e) => {
+                // api_error: not cached — transient failures must not park a day.
+                Err(e)
+            }
         }
     }
 }
@@ -192,6 +298,9 @@ pub fn resolve(input: &ResolveInput) -> Result<ResolveOutcome, ResolveError> {
 mod tests {
     use super::*;
     use crate::tmdb::TmdbStub;
+    use nightjar_db::migrate;
+    use rusqlite::Connection;
+    use std::cell::Cell;
 
     fn fixture(name: &str) -> String {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -255,5 +364,78 @@ mod tests {
             }
             other => panic!("expected NfoInvalid, got {other:?}"),
         }
+    }
+
+    /// Always-miss provider that counts how many times it was asked.
+    struct CountingMiss {
+        calls: Cell<usize>,
+    }
+
+    impl MetadataSource for CountingMiss {
+        fn resolve(&self, _input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ProviderResult::Miss)
+        }
+    }
+
+    #[test]
+    fn second_resolve_issues_zero_provider_requests_for_cached_misses() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let resolver = Resolver {
+            tmdb: CountingMiss {
+                calls: Cell::new(0),
+            },
+        };
+
+        // Fixture set: unmatchable filenames (no NFO, titles that miss).
+        let fixtures = [
+            ResolveInput {
+                title: Some("ZzNightjarUnmatchableAlpha2099".into()),
+                year: Some(2099),
+                kind: Some(MetadataKind::Movie),
+                ..Default::default()
+            },
+            ResolveInput {
+                title: Some("ZzNightjarUnmatchableBeta".into()),
+                year: None,
+                kind: Some(MetadataKind::Movie),
+                ..Default::default()
+            },
+            ResolveInput {
+                title: Some("ZzNightjarUnmatchableShow".into()),
+                year: None,
+                kind: Some(MetadataKind::Episode),
+                ..Default::default()
+            },
+        ];
+
+        for input in &fixtures {
+            let out = resolver.resolve_with_store(input, &conn).unwrap();
+            assert!(matches!(
+                out,
+                ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::NoMatch
+                }
+            ));
+        }
+        let after_first = resolver.tmdb.calls.get();
+        assert_eq!(after_first, fixtures.len());
+
+        for input in &fixtures {
+            let out = resolver.resolve_with_store(input, &conn).unwrap();
+            assert!(matches!(
+                out,
+                ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::NoMatch
+                }
+            ));
+        }
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            after_first,
+            "second run must issue zero provider requests for cached misses"
+        );
     }
 }

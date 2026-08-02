@@ -15,6 +15,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/007_content_identity_keyframe_map.sql"),
     ),
     (8, include_str!("../migrations/008_probe_bitrate_hdr.sql")),
+    (
+        9,
+        include_str!("../migrations/009_metadata_cache_payloads.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -105,7 +109,23 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 8);
+        assert_eq!(v, 9);
+        let has_neg: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_neg, 1);
+        let has_raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_raw_payloads'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_raw, 1);
         let has_reachable: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('libraries') WHERE name = 'reachable'",
