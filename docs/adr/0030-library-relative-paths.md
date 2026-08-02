@@ -51,12 +51,13 @@ Both tables store paths **relative to `libraries.path`** for that row's
 
 | Rule | Form |
 |---|---|
-| Separator | `/` always (POSIX-style), including on Windows hosts |
+| Separator | `/` always |
 | Leading slash | **None** — `Season 1/ep.mkv`, not `/Season 1/ep.mkv` |
 | `.` / `..` segments | **Forbidden** after normalisation |
 | Empty path | **Forbidden** (a media file is never the library root itself) |
-| Library root `libraries.path` | Absolute; **no trailing slash** (strip on write). Root `/` alone is rejected for a media library |
+| Library root `libraries.path` | Absolute POSIX path; **no trailing slash** (strip on write). Root `/` alone is rejected for a media library |
 | Unicode | Store the path as returned by the walk after normalisation; no NFC/NFD forced in v1 |
+| Windows | **Out of scope for v1.** Drive letters, drive-relative forms (`C:foo`), and UNC (`\\server\share`) are not valid library roots or relpaths. `require_relpath` / `require_library_root` reject them on every host so a future Windows build cannot store them as "relative." |
 
 **Normalisation on every write (scan upsert, sidecar replace, migration):**
 
@@ -98,12 +99,13 @@ on-disk form is discriminated by `std::path::Path::is_absolute(stored)` on
 the server host (`is_absolute_stored` / `resolve_media_path`). That is the
 locked shape rule for the transitional mixed population and afterwards:
 
-- Legal relpaths are definitionally **not** absolute under that predicate
-  (no leading `/`, no Windows drive letter, no UNC). Writers (`to_relpath`,
-  scan upsert, sidecar associate, migration strip) must only store such
-  strings.
-- Library root `/` is rejected for media libraries, so a leading `/` cannot
-  be a relative segment under a valid root.
+- Legal relpaths are definitionally **not** absolute under that predicate.
+  **Enforcement is at the write boundary:** `require_relpath` runs in
+  `upsert_items_indexed`, `replace_item_sidecars`, and inside `to_relpath`
+  before any new relpath is returned — not by trusting call sites. Migration
+  may still leave absolute leftovers; those bypass `require_relpath` on
+  purpose until repair strips them.
+- Library root `/` is rejected via `require_library_root`.
 - When `paths_unresolved` is zero, every row is relpath by construction; the
   predicate still holds as the writer invariant.
 
@@ -237,6 +239,12 @@ real. Therefore: on a job with `kind=repoint`, the continuing index
 `delete_missing`. The next ordinary scan (`kind=scan`) deletes as usual.
 Operators (and later UI/doctor) can see the delta before the second pass.
 This makes the 0.90 default less load-bearing for quiet partial trees.
+`deferred_remove` is a **per-job counter** on the repoint job row (not a
+sticky library flag); unmatched rows remain until the next `kind=scan`
+runs `delete_missing` — that scan is the only clear. If no ordinary scan
+ever runs, orphans sit indefinitely with no UI beyond the job JSON (ASS
+pattern). A second repoint before that scan defers again and records a new
+`deferred_remove` on the new job; still no delete until a `kind=scan`.
 
 ### 4. What a successful repoint preserves; API `path`
 
@@ -367,10 +375,8 @@ if documented as unstable across repoint.
   unmatched count is `deferred_remove` until the next ordinary scan.
 - ADR-0025 §4 storage and grammar finally agree; derived path keys use
   the stored (sticky) relpath column.
-- Migration dry-run on a VACUUM copy of the household dogfood DB
-  (2026-08-03): schema 8→12, `media_items` 24940→24940,
-  `media_item_sidecars` 8583→8583, `paths_unresolved` sum 0, zero
-  absolute-shaped leftovers. Gate 3 remount / Docker path-move
+- Migration dry-run numbers: `notes/migration-012-dogfood-2026-08-03.md`
+  (24940/8583, zero leftovers). Gate 3 remount / Docker path-move
   verification against the live dogfood library remains outstanding.
 - v1 has no force-repoint: operators whose tree genuinely changed by more
   than 10% of relpaths must delete-and-re-add (new `library_id`, lose

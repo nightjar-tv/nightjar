@@ -1,6 +1,7 @@
 use crate::migrate;
 use crate::paths::{
-    fold_path, is_absolute_stored, normalize_library_root, resolve_media_path, to_relpath,
+    fold_path, is_absolute_stored, require_library_root, require_relpath, resolve_media_path,
+    to_relpath,
 };
 use crate::status::{parse_map_status, parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -181,7 +182,7 @@ impl Db {
     }
 
     pub fn create_library(&self, lib: &NewLibrary) -> Result<LibraryRow, String> {
-        let root = normalize_library_root(&lib.path);
+        let root = require_library_root(&lib.path)?;
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO libraries (name, path, kind) VALUES (?1, ?2, ?3)",
@@ -244,7 +245,7 @@ impl Db {
     }
 
     pub fn update_library_path(&self, library_id: i64, path: &str) -> Result<(), String> {
-        let root = normalize_library_root(path);
+        let root = require_library_root(path)?;
         let conn = self.lock()?;
         conn.execute(
             "UPDATE libraries SET path = ?2 WHERE id = ?1",
@@ -521,9 +522,10 @@ impl Db {
                 )
                 .map_err(|e| format!("prepare index upsert: {e}"))?;
             for item in items {
+                let path = require_relpath(&item.path)?;
                 stmt.execute(params![
                     library_id,
-                    item.path,
+                    path,
                     item.mtime_ms,
                     item.size_bytes,
                     item.title,
@@ -533,7 +535,7 @@ impl Db {
                     item.episode,
                     item.content_id,
                 ])
-                .map_err(|e| format!("upsert item {}: {e}", item.path))?;
+                .map_err(|e| format!("upsert item {path}: {e}"))?;
             }
         }
         {
@@ -998,10 +1000,11 @@ impl Db {
                 )
                 .map_err(|e| format!("prepare sidecar insert: {e}"))?;
             for s in sidecars {
+                let path = require_relpath(&s.path)?;
                 stmt.execute(params![
                     media_item_id,
                     s.track_id,
-                    s.path,
+                    path,
                     s.mtime_ms,
                     s.size_bytes,
                     s.format,
@@ -1067,7 +1070,7 @@ impl Db {
     }
 
     pub fn create_repoint_job(&self, library_id: i64, candidate_path: &str) -> Result<i64, String> {
-        let candidate = normalize_library_root(candidate_path);
+        let candidate = require_library_root(candidate_path)?;
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO scan_jobs (library_id, state, kind, candidate_path)
@@ -1362,7 +1365,7 @@ mod tests {
             .upsert_items_indexed(
                 lib.id,
                 &[UpsertItem {
-                    path: "/films/clip.mkv".into(),
+                    path: "clip.mkv".into(),
                     mtime_ms: 1,
                     size_bytes: 2,
                     title: "clip".into(),

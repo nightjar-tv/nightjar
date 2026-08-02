@@ -11,15 +11,67 @@ pub fn normalize_library_root(root: &str) -> String {
     s
 }
 
+/// Validate and normalise a media library root before write (ADR-0030).
+pub fn require_library_root(root: &str) -> Result<String, String> {
+    let root = normalize_library_root(root);
+    if root.is_empty() || root == "/" {
+        return Err("library root must be an absolute path other than /".into());
+    }
+    if looks_windows_path_form(&root) {
+        return Err(format!(
+            "library root rejects Windows path form (v1 is POSIX/Docker only): {root}"
+        ));
+    }
+    if !Path::new(&root).is_absolute() {
+        return Err(format!("library root must be absolute: {root}"));
+    }
+    Ok(root)
+}
+
 /// True when `stored` is still an absolute (unresolved) path.
 ///
 /// On-disk discriminator (ADR-0030, Rule 4.9): `std::path::Path::is_absolute`
 /// on the server host. Relpath writers must never produce a string that is
-/// absolute under that predicate (no leading `/`, no Windows drive/UNC form).
-/// Library root `/` is rejected for media libraries, so a leading `/` always
-/// means transitional absolute leftover, not a relative segment.
+/// absolute under that predicate — enforced at the write boundary by
+/// [`require_relpath`], not by call-site discipline alone.
 pub fn is_absolute_stored(stored: &str) -> bool {
     Path::new(stored).is_absolute()
+}
+
+/// Write-boundary check for library-relative path strings (ADR-0030).
+/// Call before every INSERT/UPDATE that stores a *relpath* (not migration
+/// leftovers that intentionally remain absolute).
+pub fn require_relpath(path: &str) -> Result<&str, String> {
+    if path.is_empty() {
+        return Err("relpath must not be empty".into());
+    }
+    if path.contains('\\') {
+        return Err(format!("relpath must use / separators only: {path}"));
+    }
+    if looks_windows_path_form(path) {
+        return Err(format!(
+            "relpath rejects Windows path form (v1 is POSIX/Docker only): {path}"
+        ));
+    }
+    if is_absolute_stored(path) {
+        return Err(format!("relpath must not be absolute: {path}"));
+    }
+    if path
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(format!("relpath has empty, '.', or '..' segment: {path}"));
+    }
+    Ok(path)
+}
+
+/// Drive letter, drive-relative (`C:foo`), or UNC — out of scope for v1.
+fn looks_windows_path_form(path: &str) -> bool {
+    if path.starts_with("\\\\") {
+        return true;
+    }
+    let b = path.as_bytes();
+    b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
 }
 
 /// One helper for every open/display site (ADR-0030 §1, Rule 4.11).
@@ -55,12 +107,7 @@ pub fn to_relpath(library_root: &str, absolute: &Path) -> Option<String> {
             .filter(|_| abs.len() >= prefix.len())
     })?;
     let rel = rel.replace('\\', "/");
-    if rel.is_empty() || rel.starts_with('/') {
-        return None;
-    }
-    if rel.split('/').any(|seg| seg == ".." || seg == ".") {
-        return None;
-    }
+    require_relpath(&rel).ok()?;
     Some(rel)
 }
 
@@ -116,5 +163,25 @@ mod tests {
     fn normalize_root_strips_slash() {
         assert_eq!(normalize_library_root("/media/TV/"), "/media/TV");
         assert_eq!(normalize_library_root("/"), "/");
+    }
+
+    #[test]
+    fn require_relpath_rejects_absolute_and_windows_forms() {
+        assert!(require_relpath("Show/ep.mkv").is_ok());
+        assert!(require_relpath("/Show/ep.mkv").is_err());
+        assert!(require_relpath("C:foo.mkv").is_err());
+        assert!(require_relpath("C:/Movies/a.mkv").is_err());
+        assert!(require_relpath("\\\\server\\share\\a.mkv").is_err());
+        assert!(require_relpath("a\\b.mkv").is_err());
+        assert!(require_relpath("../x.mkv").is_err());
+        assert!(require_relpath("").is_err());
+    }
+
+    #[test]
+    fn require_library_root_rejects_slash_and_relative() {
+        assert!(require_library_root("/media/TV").is_ok());
+        assert!(require_library_root("/").is_err());
+        assert!(require_library_root("media/TV").is_err());
+        assert!(require_library_root("C:\\Media").is_err());
     }
 }

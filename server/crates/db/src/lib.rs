@@ -12,8 +12,8 @@ pub use content_id::{
 };
 pub use migrate::migrate;
 pub use paths::{
-    fold_path, is_absolute_stored, normalize_library_root, paths_fold_equal, resolve_media_path,
-    to_relpath,
+    fold_path, is_absolute_stored, normalize_library_root, paths_fold_equal, require_library_root,
+    require_relpath, resolve_media_path, to_relpath,
 };
 pub use status::{
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
