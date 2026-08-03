@@ -69,6 +69,26 @@ impl TmdbClient {
     }
 
     fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, ResolveError> {
+        match self.get_json_status(path, query)? {
+            None => Err(ResolveError::Provider(format!("TMDB 404: {path}"))),
+            Some(v) => Ok(v),
+        }
+    }
+
+    /// Like `get_json`, but HTTP 404 → `Ok(None)` (missing season/episode rows).
+    fn get_json_optional(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<Value>, ResolveError> {
+        self.get_json_status(path, query)
+    }
+
+    fn get_json_status(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<Value>, ResolveError> {
         let _permit = self.limiter.acquire();
         self.http_requests.fetch_add(1, Ordering::Relaxed);
         let mut url = format!("https://api.themoviedb.org/3{path}");
@@ -85,11 +105,15 @@ impl TmdbClient {
         }
         push(&mut url, &mut first, "api_key", &self.creds.api_key);
 
-        let resp = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|e| ResolveError::Provider(e.to_string()))?;
+        let resp = match self.agent.get(&url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(404, _)) => return Ok(None),
+            Err(e) => {
+                return Err(ResolveError::Provider(scrub_tmdb_url_secret(
+                    &e.to_string(),
+                )));
+            }
+        };
         let status = resp.status();
         let body = resp
             .into_string()
@@ -100,13 +124,18 @@ impl TmdbClient {
         if let Some(err) = auth_rejected_error(status, &self.creds) {
             return Err(err);
         }
+        if status == 404 {
+            return Ok(None);
+        }
         if !(200..300).contains(&status) {
             return Err(ResolveError::Provider(format!(
                 "TMDB {status}: {}",
                 body.chars().take(200).collect::<String>()
             )));
         }
-        serde_json::from_str(&body).map_err(|e| ResolveError::Provider(e.to_string()))
+        serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|e| ResolveError::Provider(e.to_string()))
     }
 
     pub fn search(
@@ -276,10 +305,15 @@ impl TmdbClient {
         season: i32,
         episode: i32,
     ) -> Result<Option<String>, ResolveError> {
-        let data = self.get_json(
+        // Missing episode on a tied candidate is a decline signal for that
+        // row (ADR-0032), not a resolve failure for the show group.
+        let Some(data) = self.get_json_optional(
             &format!("/tv/{show_id}/season/{season}/episode/{episode}"),
             &[("language", "en-US")],
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         Ok(data
             .get("name")
             .and_then(|v| v.as_str())
@@ -496,6 +530,26 @@ fn urlencoding_encode(s: &str) -> String {
     out
 }
 
+/// ureq Status errors embed the request URL; strip the query api_key.
+fn scrub_tmdb_url_secret(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"api_key=") {
+            out.push_str("api_key=REDACTED");
+            i += "api_key=".len();
+            while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +558,15 @@ mod tests {
     #[test]
     fn resolve_title_floor_is_adr_value() {
         assert!((AUTO_MATCH_FLOOR - 0.80).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scrub_strips_api_key_from_ureq_status_text() {
+        let raw = "https://api.themoviedb.org/3/tv/1/season/1/episode/1?api_key=abc123secret: status code 404";
+        assert_eq!(
+            scrub_tmdb_url_secret(raw),
+            "https://api.themoviedb.org/3/tv/1/season/1/episode/1?api_key=REDACTED: status code 404"
+        );
     }
 
     #[test]
