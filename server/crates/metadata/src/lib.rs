@@ -20,9 +20,7 @@ mod raw_payload;
 mod resolve;
 mod tmdb;
 
-pub use artwork::{
-    ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key,
-};
+pub use artwork::{ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key};
 pub use canonical::{
     get_canonical, persist_mapped_hit, persist_season_projection, reproject_from_payload,
     upsert_canonical,
@@ -40,7 +38,6 @@ pub use item_links::{
     clear_all_links_for_media_item, effective_item_key, link_keys_for_item, path_item_key,
     replace_auto_link, replace_auto_links, set_manually_matched, upsert_link,
 };
-pub use migrator::{MigrateReport, migrate_item_keys};
 pub use match_score::{
     AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, LibrarySeriesShape, MatchCandidate,
     SearchHit, SearchKind, meets_auto_match_floor, needs_collision_detail, norm_key,
@@ -50,6 +47,7 @@ pub use measure_exclude::{
     MEASURE_EXCLUDE_LIBRARY_NAMES_DEFAULT, MEASURE_EXCLUDE_LIBRARY_NAMES_ENV,
     measure_exclude_libraries_sql_in, measure_exclude_library_names,
 };
+pub use migrator::{MigrateReport, migrate_item_keys};
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
     ProviderIds, Rating, item_key_for_metadata,

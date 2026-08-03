@@ -1373,7 +1373,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(s5_links, 0, "missing season stays unbound, not a hard error");
+        assert_eq!(
+            s5_links, 0,
+            "missing season stays unbound, not a hard error"
+        );
     }
 
     #[test]
@@ -1451,7 +1454,11 @@ mod tests {
         )
         .unwrap();
         let proxy = snapshot_visible_proxy_n(&c, 10).unwrap();
-        assert_eq!(proxy.units.len(), 1, "two soft keys collapse under one tmdb_show");
+        assert_eq!(
+            proxy.units.len(),
+            1,
+            "two soft keys collapse under one tmdb_show"
+        );
         assert_eq!(proxy.units[0].unit_key, "tv|tmdb:55");
         assert_eq!(proxy.units[0].item_ids.len(), 2);
     }

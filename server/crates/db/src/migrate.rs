@@ -31,10 +31,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         12,
         include_str!("../migrations/012_library_relative_paths.sql"),
     ),
-    (
-        13,
-        include_str!("../migrations/013_cleaner_version.sql"),
-    ),
+    (13, include_str!("../migrations/013_cleaner_version.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {

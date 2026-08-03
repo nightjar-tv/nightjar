@@ -169,7 +169,9 @@ pub fn assign<T: MetadataSource, A: ArtworkInvalidate>(
     let kind = req.kind.as_str();
     let (new_key, meta) = match kind {
         "movie" => {
-            let (meta, raw) = client.movie_detail(req.tmdb_id).map_err(|e| e.to_string())?;
+            let (meta, raw) = client
+                .movie_detail(req.tmdb_id)
+                .map_err(|e| e.to_string())?;
             canonical::persist_mapped_hit(conn, PROVIDER_TMDB, &raw, &meta)
                 .map_err(|e| e.to_string())?;
             let key = item_key_for_metadata(&meta)

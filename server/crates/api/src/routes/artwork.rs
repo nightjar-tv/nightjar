@@ -5,7 +5,7 @@ use crate::state::AppState;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
 };
 use nightjar_metadata::{ArtworkKind, ArtworkStore, poster_path_for_item_key};

@@ -75,16 +75,22 @@ fn migrate_watch_row(conn: &Connection, old_key: &str, new_key: &str) -> Result<
         Some(new) => {
             let keep_old = prefer_old(&old, &new);
             if keep_old {
-                conn.execute("DELETE FROM watch_state WHERE item_key = ?1", params![new_key])
-                    .map_err(|e| format!("delete new watch: {e}"))?;
+                conn.execute(
+                    "DELETE FROM watch_state WHERE item_key = ?1",
+                    params![new_key],
+                )
+                .map_err(|e| format!("delete new watch: {e}"))?;
                 conn.execute(
                     "UPDATE watch_state SET item_key = ?1 WHERE item_key = ?2",
                     params![new_key, old_key],
                 )
                 .map_err(|e| format!("promote old watch: {e}"))?;
             } else {
-                conn.execute("DELETE FROM watch_state WHERE item_key = ?1", params![old_key])
-                    .map_err(|e| format!("drop old watch: {e}"))?;
+                conn.execute(
+                    "DELETE FROM watch_state WHERE item_key = ?1",
+                    params![old_key],
+                )
+                .map_err(|e| format!("drop old watch: {e}"))?;
             }
             Ok(1)
         }
@@ -131,11 +137,7 @@ fn load_watch(conn: &Connection, key: &str) -> Result<Option<WatchRow>, String> 
     }
     let sql = format!(
         "SELECT position_ms, {}, {}, last_played_at FROM watch_state WHERE item_key = ?1 LIMIT 1",
-        if has_duration {
-            "duration_ms"
-        } else {
-            "NULL"
-        },
+        if has_duration { "duration_ms" } else { "NULL" },
         if has_played { "played" } else { "0" }
     );
     conn.query_row(&sql, params![key], |r| {

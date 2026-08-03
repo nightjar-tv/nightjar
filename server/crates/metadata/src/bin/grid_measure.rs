@@ -275,7 +275,11 @@ fn phase_a_fast(client: &TmdbClient, groups: &[Group]) -> FastReport {
         groups: groups.len(),
         wall_secs: wall,
         requests,
-        effective_req_per_sec: if wall > 0.0 { requests as f64 / wall } else { 0.0 },
+        effective_req_per_sec: if wall > 0.0 {
+            requests as f64 / wall
+        } else {
+            0.0
+        },
         matched,
         below_floor: below,
         miss,
@@ -319,9 +323,11 @@ fn phase_b_slow(
     if measure_db.exists() {
         std::fs::remove_file(measure_db).map_err(|e| format!("remove old measure db: {e}"))?;
     }
-    std::fs::copy(src_db, measure_db).map_err(|e| format!("copy {} -> {}: {e}", src_db.display(), measure_db.display()))?;
+    std::fs::copy(src_db, measure_db)
+        .map_err(|e| format!("copy {} -> {}: {e}", src_db.display(), measure_db.display()))?;
 
-    let conn = Connection::open(measure_db).map_err(|e| format!("open {}: {e}", measure_db.display()))?;
+    let conn =
+        Connection::open(measure_db).map_err(|e| format!("open {}: {e}", measure_db.display()))?;
     migrate(&conn).map_err(|e| format!("migrate: {e}"))?;
 
     if !exclude_names.is_empty() {
@@ -433,12 +439,14 @@ fn main() {
             .map(|h| h.join("nightjar-data/nightjar.db"))
             .expect("HOME")
     });
-    let measure_db = std::env::var("MEASURE_DB").map(PathBuf::from).unwrap_or_else(|_| {
-        src_db
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(format!("nightjar-grid-g{cap}.db"))
-    });
+    let measure_db = std::env::var("MEASURE_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            src_db
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(format!("nightjar-grid-g{cap}.db"))
+        });
 
     let creds = resolve_credentials().unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -463,7 +471,9 @@ fn main() {
     } else {
         let in_list = measure_exclude_libraries_sql_in(&exclude_names);
         let mut stmt = conn
-            .prepare(&format!("SELECT id FROM libraries WHERE name IN ({in_list})"))
+            .prepare(&format!(
+                "SELECT id FROM libraries WHERE name IN ({in_list})"
+            ))
             .unwrap();
         stmt.query_map([], |r| r.get::<_, i64>(0))
             .unwrap()
@@ -493,10 +503,12 @@ fn main() {
         None
     } else {
         eprintln!("PHASE B: slow tier (full drain on copy)");
-        Some(phase_b_slow(&client, &src_db, &measure_db, &exclude_names, cap).unwrap_or_else(|e| {
-            eprintln!("phase B failed: {e}");
-            std::process::exit(1);
-        }))
+        Some(
+            phase_b_slow(&client, &src_db, &measure_db, &exclude_names, cap).unwrap_or_else(|e| {
+                eprintln!("phase B failed: {e}");
+                std::process::exit(1);
+            }),
+        )
     };
 
     let ratio = match (&fast, &slow) {

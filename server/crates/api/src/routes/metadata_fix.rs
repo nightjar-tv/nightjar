@@ -102,8 +102,8 @@ pub async fn candidates(
         .map_err(ApiError::internal)?;
     let client = tmdb_client(&data_dir())?;
     // Network off the Db lock.
-    let list = search_candidates(&client, &item, q.q.as_deref(), q.year)
-        .map_err(ApiError::internal)?;
+    let list =
+        search_candidates(&client, &item, q.q.as_deref(), q.year).map_err(ApiError::internal)?;
     Ok(Json(CandidatesResponse {
         candidates: list
             .into_iter()
@@ -124,7 +124,9 @@ pub async fn assign_match(
     Json(body): Json<AssignBody>,
 ) -> ApiResult<Json<AssignResponse>> {
     if body.provider != "tmdb" {
-        return Err(ApiError::bad_request("only provider tmdb is supported in v1"));
+        return Err(ApiError::bad_request(
+            "only provider tmdb is supported in v1",
+        ));
     }
     let kind = body.kind.to_ascii_lowercase();
     if kind != "movie" && kind != "tv" {
