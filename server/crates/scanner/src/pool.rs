@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
@@ -111,6 +111,9 @@ pub struct LibraryPool {
     /// Path-hint upsert while a scan is active: skip delete_missing on that
     /// job (row may be outside the walk keep-set). Does not schedule follow-up.
     dirty_add: Mutex<HashSet<i64>>,
+    /// After repoint with deferred_remove > 0: poll skips full scans until
+    /// expiry or a successful ordinary scan (ADR-0030 Gate 3).
+    repoint_holdoff_until: Mutex<HashMap<i64, Instant>>,
     /// Process-wide exclusive index/walk epoch (ADR-0015). Holding this mutex
     /// is the only way to run a tree walk or index upsert pass.
     index_epoch: Mutex<()>,
@@ -155,6 +158,7 @@ impl LibraryPool {
             last_index_ms: AtomicU64::new(0),
             scan_dirty: Mutex::new(HashSet::new()),
             dirty_add: Mutex::new(HashSet::new()),
+            repoint_holdoff_until: Mutex::new(HashMap::new()),
             index_epoch: Mutex::new(()),
             index_active: AtomicUsize::new(0),
             extracting: Mutex::new(HashSet::new()),
@@ -242,6 +246,38 @@ impl LibraryPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&library_id)
+    }
+
+    /// Arm poll holdoff after repoint deferred deletes (default 1 h in product).
+    pub fn set_repoint_delete_holdoff(&self, library_id: i64, duration: Duration) {
+        let until = Instant::now() + duration;
+        self.repoint_holdoff_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(library_id, until);
+    }
+
+    /// True while poll should not start a full walk for this library.
+    pub fn repoint_delete_holdoff_active(&self, library_id: i64) -> bool {
+        let mut map = self
+            .repoint_holdoff_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(&library_id).copied() {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                map.remove(&library_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub fn clear_repoint_delete_holdoff(&self, library_id: i64) {
+        self.repoint_holdoff_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&library_id);
     }
 
     /// Block until no other library is indexing, then hold the epoch.
