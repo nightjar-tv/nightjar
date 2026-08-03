@@ -128,6 +128,97 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/items/{itemId}/metadata/candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search TMDB candidates for manual metadata fix (ADR-0028)
+         * @description Pre-accounts local-trust. Block 2 accounts work must make this admin-only first — assign rewrites watch state across profiles.
+         */
+        get: operations["searchMetadataCandidates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/items/{itemId}/metadata/assign": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Assign a TMDB id (manual match, ADR-0028)
+         * @description Ignores the 0.80 auto-match floor. Runs the ADR-0025 item_key migrator. Pre-accounts local-trust; must become admin-only with accounts.
+         */
+        post: operations["assignMetadata"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/items/{itemId}/metadata/clear": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Clear provider match; return to path item_key (ADR-0028) */
+        post: operations["clearMetadataMatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/items/{itemId}/metadata/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Bust negative-result cache and re-queue automatic match (ADR-0028) */
+        post: operations["retryMetadataMatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/artwork/{itemKey}/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Serve cached artwork for an item_key (ADR-0027) */
+        get: operations["getArtwork"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/items/{itemId}/playback-info": {
         parameters: {
             query?: never;
@@ -487,6 +578,49 @@ export interface components {
              * @description Async scan job started for this library.
              */
             jobId: number;
+        };
+        MetadataCandidate: {
+            /** @enum {string} */
+            provider: "tmdb";
+            /** @enum {string} */
+            kind: "movie" | "tv";
+            /** Format: int64 */
+            id: number;
+            title: string;
+            year?: number | null;
+        };
+        MetadataCandidatesResponse: {
+            candidates: components["schemas"]["MetadataCandidate"][];
+        };
+        MetadataAssignRequest: {
+            /**
+             * @default tmdb
+             * @enum {string}
+             */
+            provider: "tmdb";
+            /** @enum {string} */
+            kind: "movie" | "tv";
+            /**
+             * Format: int64
+             * @description TMDB movie id or TV series id
+             */
+            id: number;
+        };
+        MetadataAssignResponse: {
+            itemKey: string;
+            /** Format: int64 */
+            mediaItemId: number;
+        };
+        MetadataClearResponse: {
+            itemKey: string;
+            /** Format: int64 */
+            mediaItemId: number;
+        };
+        MetadataRetryResponse: {
+            /** Format: int64 */
+            mediaItemId: number;
+            /** @enum {string} */
+            status: "pending";
         };
         MediaItem: {
             /** Format: int64 */
@@ -953,6 +1087,183 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MediaItem"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    searchMetadataCandidates: {
+        parameters: {
+            query?: {
+                /** @description Override search title (default cleaned filename title) */
+                q?: string;
+                year?: number;
+            };
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Candidate list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MetadataCandidatesResponse"];
+                };
+            };
+            /** @description Item not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    assignMetadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MetadataAssignRequest"];
+            };
+        };
+        responses: {
+            /** @description Assigned */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MetadataAssignResponse"];
+                };
+            };
+            /** @description Bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Item not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    clearMetadataMatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cleared */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MetadataClearResponse"];
+                };
+            };
+            /** @description Item not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    retryMetadataMatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                itemId: components["parameters"]["ItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Queued pending */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MetadataRetryResponse"];
+                };
+            };
+            /** @description Item not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getArtwork: {
+        parameters: {
+            query?: {
+                /** @description Derived width; omitted serves original when present */
+                w?: 342 | 780;
+            };
+            header?: never;
+            path: {
+                /** @description Opaque item_key (e.g. tmdb:movie:550) */
+                itemKey: string;
+                kind: "poster" | "backdrop" | "banner" | "logo" | "still";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Image bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": string;
                 };
             };
             /** @description Not found */
