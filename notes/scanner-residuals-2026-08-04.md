@@ -277,7 +277,7 @@ Global probe budget or canonicalize reduction. Not before quiet measure.
 | 1 | **B′ notify/dirty coalesce** + ADR-0015 (load-bearing) | done (#46) |
 | 2 | B deferred_remove holdoff | `scanner/repoint-deferred-holdoff` |
 | 3 | C repoint walk reuse / cache rekey | `scanner/` + ADR-0030 |
-| 4 | E0 warm-walk measure note | `notes/` |
+| 4 | E0 warm-walk measure note | done (`notes/scan-warm-breakdown-2026-08-03.md`) |
 | 5 | D epoch-wait log | `scanner/` |
 | 6 | E1 | only with new timings |
 
