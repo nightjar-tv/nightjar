@@ -1,0 +1,111 @@
+{
+  "stamp": "20260803T050154Z",
+  "base": "http://127.0.0.1:18098",
+  "label": "n150-libx264",
+  "preferredH264Encoder": "libx264",
+  "encoders": [
+    {
+      "name": "h264_nvenc",
+      "backend": "nvenc",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 1: [h264_nvenc @ 0x5b5ee1b0f340] Cannot load libcuda.so.1\nError initializing output stream 0:0 -- Error while opening encoder for output stream #0:0 - maybe incorrect parameters such as bit_rate, rate, width or height"
+    },
+    {
+      "name": "h264_qsv",
+      "backend": "qsv",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 1: [h264_qsv @ 0x5df6e57c3340] Error initializing an internal MFX session: unsupported (-3)\nError initializing output stream 0:0 -- Error while opening encoder for output stream #0:0 - maybe incorrect parameters such as bit_rate, rate, width or height"
+    },
+    {
+      "name": "h264_vaapi",
+      "backend": "vaapi",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 1: [AVHWDeviceContext @ 0x57fad9387b00] No VA display found for device /dev/dri/renderD128.\nDevice creation failed: -22.\nFailed to set value '/dev/dri/renderD128' for option 'vaapi_device': Invalid argument\nError parsing global options: Invalid argument"
+    },
+    {
+      "name": "h264_v4l2m2m",
+      "backend": "v4l2m2m",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 1: [h264_v4l2m2m @ 0x6297d1dc0340] Could not find a valid device\n[h264_v4l2m2m @ 0x6297d1dc0340] can't configure encoder\nError initializing output stream 0:0 -- Error while opening encoder for output stream #0:0 - maybe incorrect parameters such as bit_rate, rate, width or height"
+    },
+    {
+      "name": "libx264",
+      "backend": "software",
+      "status": "verified",
+      "reason": null
+    }
+  ],
+  "ratioNeed": 0.9,
+  "warmupS": 15.0,
+  "sampleS": 40.0,
+  "itemIdsUsed": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "ceiling": {
+    "nFailRealtime": 3,
+    "lastOk": 2,
+    "limit": "below_realtime",
+    "minRealtimeRatio": 0.85
+  },
+  "rows": [
+    {
+      "n": 1,
+      "opened": 1,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        102.0
+      ],
+      "realtimeRatios": [
+        2.55
+      ],
+      "minRealtimeRatio": 2.55,
+      "errors": [],
+      "label": "n150-libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 2,
+      "opened": 2,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        52.0,
+        52.0
+      ],
+      "realtimeRatios": [
+        1.3,
+        1.3
+      ],
+      "minRealtimeRatio": 1.3,
+      "errors": [],
+      "label": "n150-libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 3,
+      "opened": 3,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        34.0,
+        36.0,
+        34.0
+      ],
+      "realtimeRatios": [
+        0.85,
+        0.9,
+        0.85
+      ],
+      "minRealtimeRatio": 0.85,
+      "errors": [],
+      "label": "n150-libx264",
+      "remuxAlongside": 0
+    }
+  ]
+}
