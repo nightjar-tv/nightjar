@@ -12,15 +12,20 @@
   (`exact_title_episode_title`); see ADR-0032
 - Amended: 2026-08-04 — pin order counts-before-year; empty-shell refuse;
   TV long-title prefix hit; season detail 404 soft-skip
+- Amended: 2026-08-04 — two-tier status (`matched`); adult first-screen
+  search-terminal; queue fairness (search vs enrich); sparse search write;
+  enrich id short-circuit; cert projection on detail for kids fail-closed
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
   rescan
 - Related: Continuity settled set (direct-to-TMDB, FTS rejected, application
   key); strategy note
-  (`nightjar-meta/notes/design/metadata-artwork-strategy.md`); match spike
-  (`nightjar-meta/notes/fts-vs-search-match-quality-2026-08-02.md`); Phase 3
-  Block 1 (`nightjar-meta/docs/PHASE_3_REVISED.md`)
+  (`nightjar-meta/notes/design/metadata-artwork-strategy.md`); two-tier
+  design (`nightjar-meta/notes/design/metadata-two-tier-grid-strategy.md`);
+  grid measure (`notes/grid-fast-vs-full-metadata-2026-08-04.md`); match
+  spike (`nightjar-meta/notes/fts-vs-search-match-quality-2026-08-02.md`);
+  Phase 3 Block 1 (`nightjar-meta/docs/PHASE_3_REVISED.md`)
 
 ## Context
 
@@ -50,10 +55,12 @@ the Gate 3 criterion met.
 
 ### 1. Resolution path (cited, not re-argued)
 
-NFO first, then TMDB search + detail. An NFO that already carries a TMDB id
-skips search. Matching uses TMDB search directly. Pipeline shape, queue
-priority, state machine, `append_to_response`, change lists, and long refresh
-windows are as in `metadata-artwork-strategy.md` and Phase 3 Block 1.
+NFO first, then TMDB **search** (fast tier) then **detail + seasons** (enrich
+tier) — §8. An NFO that already carries a TMDB id skips search and may go
+straight to detail. Matching uses TMDB search directly. Queue priority,
+`append_to_response`, change lists, and long refresh windows remain as in
+`metadata-artwork-strategy.md` and Phase 3 Block 1; status machine and
+first-screen criteria are owned by §8 of this ADR.
 **API request-rate limiting** (this ADR §7) applies only to
 `api.themoviedb.org`. Artwork uses a separate connection cap on
 `image.tmdb.org`, decided in the artwork ADR — not one shared limiter over
@@ -300,58 +307,145 @@ not a key property — a personal key measures it.
 
 ### 8. Metadata queue is a query, not a jobs table
 
-Enrichment state lives on the item row as `metadata_status`:
+Enrichment state lives on the item row as `metadata_status`. The pipeline
+is **two-tier**: a fast **search** tier that can paint an adult grid, and
+a slow **enrich** tier (detail + seasons + cert projection) that finishes
+identity and kids-safe fields without re-searching.
 
-| Value | Meaning |
-|---|---|
-| `pending` | Not yet resolved (default for new/scanned items) |
-| `ready` | Metadata written (NFO or TMDB hit + payload) |
-| `unmatched` | Resolve finished without a provider match (below floor, no results, invalid NFO) |
+#### 8.1 Status values
 
-The work queue is `SELECT` over `metadata_status = 'pending'`, skipping
-network when the negative-result cache (§3) says so. **No separate jobs
-table** — that would be a second structure tracking the same fact (Rule
-4.11). Resume-after-restart is automatic: still-`pending` rows are selected
-again; `ready` / `unmatched` are not.
+| Value | Meaning | Playable? | Provider `item_key`? |
+|---|---|---|---|
+| `pending` | Needs search (or NFO resolve) | Yes if file probed | No (path key) |
+| `matched` | Search (or NFO with TMDB id) accepted ≥ 0.80; **sparse** canonical + art path refs written | Yes | **Yes** for movies (`tmdb:movie:{id}`); TV show identity for browse/group only — episodes stay path-keyed until season bind |
+| `ready` | Detail applied; TV seasons bound where TMDB has them; cert projected when present; enrichment complete for v1 | Yes | Yes (episode keys when bound) |
+| `unmatched` | Search (or NFO resolve) finished without a provider match (below floor, no results, invalid NFO) | Yes | Path key only |
 
-This is deliberately a **second scheduling concept** beside the scan pool
-(`WorkKind::Probe | Extract | Map` with its own priority ordering). Metadata
-is HTTP-bound and gated by the API rate limiter (§7); scan work is
-disk/CPU-bound. Do not merge them from intuition — shared structure would
-couple unrelated backpressure.
+**Migration:** extend the `media_items.metadata_status` CHECK to include
+`matched` (next free migration after 013, expected **014**). Existing
+`ready` rows stay `ready` (already fully enriched under the pre-two-tier
+single-pass drain). Do not rewrite historical `ready` to `matched`.
 
-#### Band ordering (derive at SELECT — no priority column)
+**Playable ≠ metadata status.** Playback uses file path + probe; the
+stream path must not wait on `matched` or `ready`.
 
-Bands are predicates in the queue query, not a denormalised
-`queue_band` / `priority` column on `media_items` (Rule 4.9 / 4.11).
-Group fold is unchanged: one resolve per search `query_key`; a group's
-band is `min(member bands)` — so one episode in a higher band promotes
-the **entire show group** (intentional once Visible is show-unit).
+#### 8.2 Terminal surfaces
+
+| Surface | Terminal statuses | Notes |
+|---|---|---|
+| Adult first screen / Visible grid | `matched` \| `unmatched` \| `ready` | Poster path required only for the `matched` / `ready` subset |
+| Kids visibility | **`ready` only** (unmatched and missing cert deny) | Cert is **not** taken from search; fail-closed (Phase 3 Block 2) |
+| Episode provider watch key | After season bind on the path to `ready` | Until then path key (ADR-0025) |
+| Fix API assign | Prefer **`ready`** when assign fetches detail (+ bind for TV) in one shot | One server path (Rule 4.11); may briefly land `matched` only if enrich is deferred — prefer go to `ready` when detail is already in hand |
+
+#### 8.3 Fast tier (search → `matched` \| `unmatched`)
+
+Work set: `metadata_status = 'pending'`.
+
+On auto-match ≥ 0.80 (or NFO that already carries a TMDB id and is accepted
+into the same identity path):
+
+1. Upsert **sparse** `metadata_canonical` from the search hit (ADR-0029
+   entity row): title, original_title, year, plot/overview, vote ratings,
+   artwork poster/backdrop **paths**, provider ids (`tmdb` movie or
+   `tmdb_show` for TV).
+2. **Do not** invent cast, genre **names**, content certification,
+   collection, or episode canonical rows at this step. Empty cast/genre
+   on the sparse row is correct; detail overwrite fills them later
+   (ADR-0029 re-project upsert).
+3. Set file(s) in the resolve group to `matched`.
+4. Movies: write `media_item_links` → `tmdb:movie:{id}` (automatic, not
+   `manually_matched`).
+5. TV: **do not** write `tmdb:episode:{id}` until season bind. Browse may
+   use Visible unit / soft-key evolution (`tv|tmdb:{show_id}` when linked
+   elsewhere); that is not a watch key (ADR-0025).
+6. Artwork: when a poster (and optionally backdrop) path is present,
+   enqueue or allow first-serve download under ADR-0027 for Visible units
+   so the adult grid can paint without waiting for enrich.
+
+Below floor / miss / invalid NFO: set `unmatched`; **no** provider link;
+UI may show filename. Do **not** adopt top-1 below the floor for watch
+state. Display-only poster without identity is out of this slice.
+
+#### 8.4 Slow tier (enrich → `ready`)
+
+Work set: `metadata_status = 'matched'`.
+
+1. **Id short-circuit only.** Load the stored TMDB id (link or sparse
+   canonical). Call `movie_detail` / `tv_detail` by id. **Never re-search.**
+2. Map cast, genre names (const id→name map is fine, ~1 KB), collection on
+   movies (§6), and full artwork refs from detail.
+3. **Content certification projection (frozen here):** on detail write,
+   project TMDB certification into storage kids can query — the existing
+   canonical ratings / content-rating projection path (ADR-0029 §1.2 /
+   §1.5), not a second cert table. Movies: release-dates style cert when
+   present; TV: content ratings when present. Null after a successful
+   detail fetch is allowed when TMDB has no cert; kids fail-closed treats
+   missing/unknown cert as deny (Block 2). The **classification ladder**
+   and household region file/const are Block 2 — two-tier only guarantees
+   the string (or null) is stored so a third full-library pass is not
+   required for kids.
+4. TV: season bind via existing `bind_resolved_items` (ADR-0029 §3).
+   **HTTP 404 on a season remains a soft skip** (continue other seasons);
+   missing seasons leave those files path-keyed.
+5. Set `ready`.
+
+NFO-with-id may skip search and go straight to detail (same early path as
+today once the product drain loads NFO — separate implement slice). Manual
+assign that already holds detail should end `ready` when bind completes.
+
+#### 8.5 Queue classes and fairness (v1 constant, not a setting)
+
+**No separate jobs table** (Rule 4.11). Two SELECT classes over item
+status:
+
+1. Search work: `metadata_status = 'pending'`
+2. Enrich work: `metadata_status = 'matched'`
+
+Negative-result cache (§3) still applies to search only.
+
+**Order (product drain loop; derive at SELECT):**
+
+1. Search groups that intersect Visible  
+2. Enrich groups that intersect Visible  
+3. Search background  
+4. Enrich background  
+
+Bands still derive at SELECT (no denormalised priority column). Continue
+watching is empty until Block 2; Search boost remains reserved undesigned
+until Block 3. Group fold is unchanged: one resolve per search
+`query_key`; a group's band is `min(member bands)`.
+
+Resume-after-restart is automatic: still-`pending` and still-`matched`
+rows are selected again; `ready` / `unmatched` are not.
+
+This remains a **second scheduling concept** beside the scan pool
+(`WorkKind::Probe | Extract | Map`). Metadata is HTTP-bound and gated by
+the API rate limiter (§7); scan work is disk/CPU-bound. Do not merge them.
+
+#### 8.6 Band predicates and Visible proxy
 
 | Band | How the SELECT knows |
 |---|---|
 | Continue watching | Join on watch-progress when Block 2 exists; empty until then |
 | Visible | Server browse-unit proxy (below); expressible today |
 | Search | **Reserved, undesigned.** No boost table or expiry schema here (Rule 4.7); Block 3 designs the predicate with the use case |
-| Recently added / background | Remaining `pending`, `id DESC` |
+| Recently added / background | Remaining search or enrich work, `id DESC` |
 
 **Visible proxy (not client scroll hints):** first paint of the default
 library grid, keyed by library kind — **movies** for a movies library,
 **shows** (distinct series, not episodes) for a shows library. Rank is
 over **all** browse units in the library (not pending-only), so
-already-ready neighbours do not steal slots from pending units still on
-the first screen. **N ≈ 40** means roughly one cold first screen — a
+already-terminal neighbours do not steal slots from units still on the
+first screen. **N ≈ 40** means roughly one cold first screen — a
 constant (Rule 4.12), not a setting; the number may move with Block 3
 poster-card layout without amending this ADR. Try the proxy before any
 chatty client→server visibility hint.
 
-**Provisional show browse unit (v1):** there is no durable series row yet
-(ADR-0025 owns movie/episode `item_key` only). Until a series handle
-exists, a shows-library browse unit is the same soft key the resolve
-queue already uses: `clean_show_title` → yearless `query_key`. That is
-filename-derived and may split a show if episode titles clean differently;
-it is **not** a watch `item_key` and must not be mistaken for one. Durable
-series identity is a later schema/ADR.
+**Show browse unit:** when episode links exist, prefer
+`tv|tmdb:{show_id}` (ADR-0029 / shipped product); else the soft key
+`clean_show_title` → yearless `query_key`. Soft keys are **not** watch
+`item_key`s (ADR-0025).
 
 Episode-sorted item lists are the wrong unit for TV: top-N episodes
 collapse to one or two `query_key` groups and measure nothing.
@@ -362,42 +456,56 @@ snapshot concern. Do not ban writers from updating `media_items.title`
 to "solve" it; permanently sorting on filename while cards show canonical
 titles is worse than a one-time re-sort.
 
-#### First-screen success criterion
+#### 8.7 First-screen success criterion (adult)
 
-Full-library wall (~22 min movie+show drain) is an ordering problem
-wearing a throughput costume. Fan-out stays dead unless this gate fails.
+Full-library wall is an ordering problem wearing a throughput costume.
+Fan-out stays dead unless this gate fails for the right reason.
 
-**T_first_screen:** wall seconds from drain start on a cold pending
-dogfood library until every browse unit in the Visible proxy set is
-**terminal** (`metadata_status IN ('ready','unmatched')`). Poster
-reference (payload `poster_path` or NFO thumb) is required only for the
-**ready** subset; unmatched units are holes, not infinite waits. Report
-`proxy_ready` / `proxy_unmatched` beside the time. Image bytes remain
-ADR-0027.
+**Adult `T_first_screen`:** wall seconds from drain start on a cold
+pending dogfood library until every browse unit in the Visible proxy set
+is **search-terminal**
+(`metadata_status IN ('matched','unmatched','ready')`), with a poster
+**path** present for the `matched`/`ready` subset (CDN **bytes** optional
+for the pass bar — report both “path known” and “bytes cached”). Report
+`proxy_matched` / `proxy_ready` / `proxy_unmatched` beside the time.
+Image download remains ADR-0027.
 
-**Prediction:** dogfood Visible union ≈ 40 movie groups + 40 show groups.
-At measured serial-drain rates (~1.84 HTTP/group, ~4.9 req/s) that is
-~80 × 1.84 / 4.9 ≈ **30 s**. (Movies-only would be ~15 s; do not quote
-that for the union.) Show detail payloads are ~1.8× movie (§4) and may
-stretch wall slightly above the request-count model. Still well inside
-the pass bar.
+**Kids first screen** is not this metric: only units that are cert-ready
+for the profile (`ready` with cert policy; fail-closed) count. Block 2
+owns the evaluator.
 
-**Pass:** `T_first_screen ≤ 60`. ~30 s confirms the model; ~55 s means
-the proxy path costs ~1.8× the plain drain — investigate before fan-out.
+**Prediction (search tier):** dogfood Visible ~80 units; measured
+search-only + CDN model ≈ **~28 s** path-known
+(`notes/grid-fast-vs-full-metadata-2026-08-04.md`). Full enrich
+(detail + seasons) is ~5–14× slower depending on TV share and is **not**
+on the adult first-screen critical path once two-tier is live.
 
-v1 drain resolves movie and show (episode-group) search+detail, then on a
-hit **binds** files via season detail (`/tv/{id}/season/{n}`, ADR-0025
-episode ids / §4 season append) inside `bind_resolved_items` (ADR-0029 §3).
-Season fetch is therefore part of the drain for live `TmdbClient`, not a
-separate jobs table. **HTTP 404 on a season is a soft skip** (continue other
-seasons for that show); do not abort the whole bind on one missing season
-number. First-run request count and wall time must include those season
-requests; movie+show-only figures are incomplete.
+**Pass:** adult `T_first_screen` ≤ 60 s. ~30 s confirms the search-tier
+model; ~55 s means the proxy path costs ~1.8× plain search drain —
+investigate before fan-out. Pre-two-tier measures that gate on
+`ready`|`unmatched` alone remain valid **labeled** historical numbers;
+do not mix them with search-terminal claims.
 
-v1 `drain_pending` walks groups **serially** (one resolve at a time). While
-that holds, a concurrency knob does nothing — Rule 4.11: engage it with
-group-level fan-out or remove it; do not ship a dead tunable. Search→detail
-is inherently serial *within* a group; fan-out's only axis is across groups.
+#### 8.8 Drain execution shape
+
+Product drain (own SQLite connection; scan never waits):
+
+1. Select and run **search** work for the fairness order (§8.5).  
+2. Select and run **enrich** work for the fairness order.  
+3. Idle when neither class has rows.
+
+Within a group, search then detail remain serial where both run in one
+process path; after the split, search and enrich are separate selections.
+v1 walks groups **serially** (one resolve at a time). While that holds, a
+concurrency knob does nothing — Rule 4.11: engage it with group-level
+fan-out or remove it; do not ship a dead tunable. Fan-out's only axis is
+across groups.
+
+Season fetch is part of **enrich** for live `TmdbClient`, not a separate
+jobs table. First-run **request count** for leave measures must still
+publish search + detail + seasons (and rescan with no search on
+unchanged); wall for **adult first screen** uses the search-terminal
+definition above.
 
 Prefix probes (`QUEUE_MAX_GROUPS`) are not representative of full-library
 cost when the first N groups skew movie-heavy (show detail payloads are
@@ -460,10 +568,31 @@ has the use case.
 Rejected: permanently diverges filename sort from canonical card titles.
 Reordering-under-drain is a client snapshot concern (§8).
 
-**Gate on `metadata_status = 'ready'` alone for first screen.** Rejected:
-unmatched is terminal; at ~4.5% below-floor a 40-unit set is unmatched
-~84% of the time and the gate never closes. Use terminal status; posters
-only on the ready subset.
+**Gate on `metadata_status = 'ready'` alone for first screen.** Rejected
+for **adult** paint: unmatched is terminal, and requiring full detail +
+seasons before the grid paints makes first screen track full-library
+enrich cost (measured seasons dominate). Adult first screen is
+**search-terminal** (`matched` \| `unmatched` \| `ready`); posters on the
+matched/ready subset. Kids still require `ready` + cert (fail-closed).
+
+**Single-pass search+detail before any grid paint (pre-two-tier only).**
+Superseded for adult first screen by §8 once implementers land `matched`.
+Historical dogfood drains that wrote `ready` in one pass remain valid
+evidence for leave measures labeled pre-two-tier.
+
+**Staging table for sparse “matched” metadata.** Rejected (Rule 4.11): one
+canonical row per entity; sparse search write then detail overwrite
+(ADR-0029 upsert). No second matched table.
+
+**Re-search on enrich.** Rejected: wastes budget and risks identity churn;
+enrich is id short-circuit only (§8.4).
+
+**Content cert only at kids Block 2 (third library pass).** Rejected for
+projection: store cert on enrich now so kids can fail-closed without
+re-fetching 24.8k details. Ladder/region files remain Block 2.
+
+**TVDB season fallback.** Rejected (Continuity); soft season 404 + path
+keys only.
 
 ## Consequences
 
@@ -502,8 +631,22 @@ only on the ready subset.
   ~70% of movie payload bytes in a sample).
 - Artwork ADR owns the `image.tmdb.org` connection cap; it must not reuse
   the metadata API request-rate limiter.
-- Queue workers select `metadata_status = 'pending'`; writing `ready` /
-  `unmatched` is what makes progress durable across restarts.
+- Queue workers select `pending` (search) and `matched` (enrich);
+  writing `matched` / `ready` / `unmatched` is what makes progress durable
+  across restarts. Fairness order is §8.5 (Visible search before Visible
+  enrich, then background).
+- Adult `T_first_screen` is search-terminal (§8.7). Publish leave measures
+  with that definition after two-tier lands; keep pre-two-tier ready-gate
+  numbers only if labeled.
+- Sparse search write must not invent cast/genre names/cert/collection/
+  episode rows; detail overwrite fills them. Cert projection on enrich is
+  required for kids fail-closed without a third pass (§8.4).
+- Genre id→name may be a const map at detail map time. Kids classification
+  ladder remains Block 2.
+- Migration 014 (or next free after 013) extends the status CHECK for
+  `matched` before any writer of that value (Rule 4.9 / 6.1).
+- Artwork may warm at `matched` for Visible posters (ADR-0027); serve path
+  already keys on `item_key`.
 - Release engineering must be able to rotate `NIGHTJAR_TMDB_APP_KEY` and
   ship a new binary; document that beside the secrets-file override.
 - Ask TMDB whether embedding an application key in a self-hosted binary at

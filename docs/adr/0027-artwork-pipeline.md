@@ -2,9 +2,11 @@
 
 - Status: accepted
 - Date: 2026-08-04
+- Amended: 2026-08-04 — warm posters at `metadata_status = matched`
+  (ADR-0026 §8 two-tier)
 - Depends on: ADR-0026 (§7 CDN cap separate from API limiter; §8 first-screen
-  poster reference only); ADR-0028 (§5 keying `item_key` + kind); ADR-0029
-  (artwork_json on canonical)
+  poster path on matched/ready); ADR-0028 (§5 keying `item_key` + kind);
+  ADR-0029 (artwork_json on canonical)
 - Gate: Gate 3 — artwork served from Nightjar cache; disk measure for ~24.8k
   items at the chosen thumbnail set
 - Related: strategy note
@@ -62,9 +64,13 @@ Base URL: `https://image.tmdb.org/t/p/original{path}`.
 
 ### 5. Lazy acquisition
 
-Download on first serve miss for Visible/ready items, or when assign enqueues
-a new key. Background drain may warm posters for ready Visible units later;
-not required to ship serve.
+Download on first serve miss for Visible items that already have a poster
+path (`matched` or `ready`), or when assign enqueues a new key. Background
+drain **should warm posters for Visible units once they reach `matched`**
+(ADR-0026 §8.3) so the adult search-terminal first screen can paint without
+waiting for enrich. Warming at `ready` remains fine; waiting for `ready`
+before any warm is not required for adult grid paint. Palette/blurhash stay
+deferred (§3).
 
 ### 6. Serve API
 
