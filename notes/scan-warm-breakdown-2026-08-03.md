@@ -53,16 +53,24 @@ match. Product uses **mtime from the walk** (`MediaFile.mtime_ms`) and does
 not re-stat for the unchanged short-circuit. Treat TV `fold_match_ms` as an
 upper bound on “stat every file again,” **not** as product match cost.
 
-Product-like warm index estimate (walk mtimes, one canonicalize pass, no
-re-stat):
+### Product-ish remeasure (walk mtimes; match does not re-stat)
 
-| Lib | Warm walk | Canonicalize | DB + match (no re-stat) | Serial sum (approx) |
+Second pass after the first had warmed the tree. Match uses walk mtimes and
+only pays `resolve` for relpath (same shape as product index loop).
+
+| Lib | Warm walk | Canonicalize | Match (resolve+fold) | Serial sum |
 |---|---:|---:|---:|---:|
-| Movies | ~6 s | ~8 s | ~2 s | **~16 s** |
-| TV | ~2 s | ~14 s | small + resolve in loop | **~20–90 s** depending on whether resolve is paid once in the index loop |
+| Movies | **0.8 s** | **1.2 s** | **1.7 s** | **~3.7 s** |
+| TV | **86 s** | **906 s** | **620 s** | **~27 min** |
 
-Product concurrent walk (c=8) can cut the **walk** leg further when the share
-is quiet; it does not remove per-file canonicalize in `run_index_pass`.
+Movies quiet target is **seconds**. TV on the same afternoon was still
+**latency-bound / share-loaded** (warm walk alone 86 s vs 1.8 s in the first
+TV pass when the cache was freshly hot and the share quieter). Numbers move
+with SMB contention; treat Movies as the clean E0 read and TV as “can
+blow up under load.”
+
+Product concurrent walk (c=8) can cut the **walk** leg when quiet; it does
+not remove per-file canonicalize in `run_index_pass`.
 
 ## Reads
 
