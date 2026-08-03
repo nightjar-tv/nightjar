@@ -82,8 +82,9 @@ fn strip_year_parens(s: &str) -> String {
             i += 6;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -203,6 +204,42 @@ pub fn fold_title_orthography(s: &str) -> String {
     collapse_ws(&out)
 }
 
+fn strip_regional_parentheticals(s: &str) -> String {
+    // Matching soft key only; stored/parser titles keep (US)/(UK)/….
+    const TAGS: &[&str] = &["us", "uk", "au", "ca", "nz"];
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b')' {
+                j += 1;
+            }
+            if j < bytes.len() {
+                let inner = s[i + 1..j].trim();
+                if TAGS.iter().any(|t| inner.eq_ignore_ascii_case(t)) {
+                    out.push(' ');
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Turn remaining `(…)` into spaces so mid-title parens do not split the soft key
+/// (`(Impractical)` ↔ `impractical`). Year and regional tags are already gone.
+fn parens_to_spaces(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '(' || c == ')' { ' ' } else { c })
+        .collect()
+}
+
 pub fn clean_movie_title(raw: &str, year: Option<i32>) -> (String, Option<i32>) {
     let mut y = year.or_else(|| year_in_parens(raw));
     let mut t = strip_year_parens(raw.trim());
@@ -223,10 +260,18 @@ pub fn clean_movie_title(raw: &str, year: Option<i32>) -> (String, Option<i32>) 
     (t, y)
 }
 
+/// Show soft key for matcher grouping / search (ADR-0026 matcher path).
+///
+/// Folds `&`↔`and`, hyphen/en-dash/em-dash, case, and strips regional
+/// `(US)`/`(UK)`/`(AU)`/`(CA)`/`(NZ)` for matching only. Does not change the
+/// on-disk parser title.
 pub fn clean_show_title(raw: &str) -> (String, Option<i32>) {
     let y = first_year_in_parens(raw.trim());
     let mut t = strip_year_parens(raw.trim());
+    t = strip_regional_parentheticals(&t);
     t = fold_title_orthography(&t);
+    t = parens_to_spaces(&t);
+    t = t.to_ascii_lowercase();
     t = collapse_ws(&t)
         .trim_matches(|c: char| " .-_".contains(c))
         .to_string();
@@ -247,8 +292,53 @@ mod tests {
     #[test]
     fn show_year_tag() {
         let (t, y) = clean_show_title("Heartland (2007) (CA)");
-        assert_eq!(t, "Heartland (CA)");
+        assert_eq!(t, "heartland");
         assert_eq!(y, Some(2007));
+    }
+
+    #[test]
+    fn show_soft_key_near_dups_and_sample_below_floor() {
+        // Pairs that must share a soft key. Near-dup groups from
+        // notes/metadata-parse-baseline-2026-08-03.md; below-floor rows from
+        // notes/tmdb-show-coverage-sample-2026-08-03.md.
+        let maul_ascii = "Star Wars - Maul - Shadow Lord";
+        let maul_en = format!(
+            "Star Wars - Maul {} Shadow Lord",
+            char::from_u32(0x2013).unwrap()
+        );
+        let pairs: &[(&str, &str)] = &[
+            (
+                "The Inspired Unemployed (Impractical) Jokers",
+                "the inspired unemployed impractical jokers",
+            ),
+            (maul_ascii, maul_en.as_str()),
+            ("INVINCIBLE (2021)", "Invincible (2021)"),
+            ("Will and Grace", "Will & Grace"),
+            ("Shameless (US)", "Shameless"),
+            ("Top Gear", "Top Gear"),
+            ("Shameless (UK)", "Shameless"),
+            ("Show Name (AU)", "Show Name"),
+            ("Show Name (NZ)", "Show Name"),
+        ];
+        assert!(
+            maul_en.contains(char::from_u32(0x2013).unwrap()),
+            "test fixture must contain U+2013 en-dash"
+        );
+        for (a, b) in pairs {
+            let (ka, _) = clean_show_title(a);
+            let (kb, _) = clean_show_title(b);
+            assert_eq!(ka, kb, "soft key diverge for {a:?} vs {b:?}");
+            assert!(!ka.is_empty(), "empty soft key for {a:?}");
+        }
+
+        // Soft key is lowercased; year still extracted; regional tag gone.
+        let (t, y) = clean_show_title("INVINCIBLE (2021)");
+        assert_eq!(t, "invincible");
+        assert_eq!(y, Some(2021));
+        let (t, _) = clean_show_title("Will & Grace");
+        assert_eq!(t, "will and grace");
+        let (t, _) = clean_show_title("Shameless (US)");
+        assert_eq!(t, "shameless");
     }
 
     #[test]

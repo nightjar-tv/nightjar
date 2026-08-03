@@ -988,8 +988,8 @@ mod tests {
         let proxy = snapshot_visible_proxy_n(&c, 1).unwrap();
         assert_eq!(proxy.units.len(), 1);
         let groups = pending_query_groups(&c, &proxy).unwrap();
-        let alpha = groups.iter().find(|g| g.title == "Alpha").unwrap();
-        let zulu = groups.iter().find(|g| g.title == "Zulu").unwrap();
+        let alpha = groups.iter().find(|g| g.title == "alpha").unwrap();
+        let zulu = groups.iter().find(|g| g.title == "zulu").unwrap();
         assert_eq!(alpha.band, QueueBand::Visible);
         assert_eq!(alpha.item_ids.len(), 2);
         assert_eq!(zulu.band, QueueBand::RecentlyAdded);
