@@ -447,6 +447,20 @@ pub enum TmdbResolve {
 
 impl MetadataSource for TmdbClient {
     fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+        // Enrich by id (ADR-0026 §8.3): detail only, no search, no floor gate.
+        // Shares the same detail+raw mapping the fix `assign` path uses.
+        if let Some(id) = input.tmdb_id {
+            let kind = input.kind.unwrap_or(MetadataKind::Movie);
+            let (metadata, raw) = match kind {
+                MetadataKind::Movie => self.movie_detail(id)?,
+                MetadataKind::Show | MetadataKind::Episode => self.tv_detail(id)?,
+            };
+            return Ok(ProviderResult::Hit {
+                metadata: Box::new(metadata),
+                method: "tmdb_id",
+                raw: Some(raw),
+            });
+        }
         let Some(title) = input.title.as_deref().filter(|t| !t.is_empty()) else {
             return Ok(ProviderResult::Miss);
         };

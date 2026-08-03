@@ -33,6 +33,10 @@ pub struct ResolveInput {
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
     pub ref_episode_title: Option<String>,
+    /// Enrich by provider id (ADR-0026 §8.3): detail-only, never searches.
+    /// When set, the negative cache is skipped and the provider fetches the
+    /// detail payload for this id directly (no query key, no floor gate).
+    pub tmdb_id: Option<i64>,
     /// Search target; episodes search as TV (ADR-0026).
     pub kind: Option<MetadataKind>,
 }
@@ -211,11 +215,18 @@ impl<T: MetadataSource> Resolver<T> {
             MetadataKind::Movie => CacheKind::Movie,
             MetadataKind::Episode | MetadataKind::Show => CacheKind::Tv,
         };
-        let qk = input
-            .title
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(|t| query_key(t, input.year));
+        // Id resolve has no query key: the negative cache keys on search
+        // queries only, so an id-driven enrich must never consult or skip on
+        // a stale title miss (ADR-0026 §8.3).
+        let qk = if input.tmdb_id.is_some() {
+            None
+        } else {
+            input
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| query_key(t, input.year))
+        };
 
         if let (Some(conn), Some(qk)) = (conn, &qk) {
             let now = now_rfc3339();
@@ -445,6 +456,84 @@ mod tests {
             resolver.tmdb.calls.get(),
             after_first,
             "second run must issue zero provider requests for cached misses"
+        );
+    }
+
+    /// Id-only provider: counts search-style resolve calls (no `tmdb_id`) and
+    /// serves a hit for id resolves — enrichment must never re-search.
+    struct IdOnlyCounting {
+        search_calls: Cell<usize>,
+    }
+
+    impl MetadataSource for IdOnlyCounting {
+        fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            let Some(id) = input.tmdb_id else {
+                self.search_calls.set(self.search_calls.get() + 1);
+                return Ok(ProviderResult::Miss);
+            };
+            Ok(ProviderResult::Hit {
+                metadata: Box::new(CanonicalMetadata {
+                    kind: MetadataKind::Movie,
+                    title: "Fight Club".into(),
+                    original_title: None,
+                    year: Some(1999),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(id),
+                        tmdb_show: None,
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                }),
+                method: "tmdb_id",
+                raw: None,
+            })
+        }
+    }
+
+    #[test]
+    fn resolve_by_tmdb_id_never_searches() {
+        let resolver = Resolver {
+            tmdb: IdOnlyCounting {
+                search_calls: Cell::new(0),
+            },
+        };
+        let out = resolver
+            .resolve(&ResolveInput {
+                // Even with a search title present, the id short-circuits.
+                tmdb_id: Some(550),
+                title: Some("Fight Club".into()),
+                year: Some(1999),
+                kind: Some(MetadataKind::Movie),
+                ..Default::default()
+            })
+            .unwrap();
+        match out {
+            ResolveOutcome::Resolved {
+                metadata,
+                source,
+                match_method,
+            } => {
+                assert_eq!(metadata.ids.tmdb, Some(550));
+                assert_eq!(metadata.title, "Fight Club");
+                assert_eq!(source, MetadataOrigin::Tmdb);
+                assert_eq!(match_method.as_deref(), Some("tmdb_id"));
+            }
+            other => panic!("expected resolved, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.search_calls.get(),
+            0,
+            "id resolve must never issue a search"
         );
     }
 }
