@@ -2633,6 +2633,13 @@ fn spawn_ffmpeg(
         // deadlocks ffmpeg so the playlist never appears.
         .stderr(Stdio::null())
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
+    // VAAPI encode needs the device before any input (matches hwaccel verify).
+    // Without it, `-c:v h264_vaapi` + software yuv420p fails with exit 218 on
+    // AMD/Intel iGPU hosts even when verify_vaapi passed.
+    let is_vaapi = mode == SessionMode::Transcode && video_encoder == "h264_vaapi";
+    if is_vaapi {
+        cmd.args(["-vaapi_device", "/dev/dri/renderD128"]);
+    }
     // The Matroska splice already starts at the land Cluster, so seeking
     // inside it would land a second time (ADR-0023 §3a). MP4 keeps `-ss`:
     // its virtual file spans the whole title (§3b).
@@ -2678,15 +2685,20 @@ fn spawn_ffmpeg(
         _ => None,
     };
     let video_chain = if mode == SessionMode::Transcode {
-        Some(transcode_video_filter_chain(
-            encode_plan,
-            ass_vf.as_deref(),
-        )?)
+        Some(if is_vaapi {
+            vaapi_video_filter_chain(encode_plan, ass_vf.as_deref())?
+        } else {
+            transcode_video_filter_chain(encode_plan, ass_vf.as_deref())?
+        })
     } else {
         None
     };
     if let Some(ref complex) = pgs_overlay {
-        let tail = video_chain.as_deref().unwrap_or(SDR_RETAG_CHAIN);
+        let tail = video_chain.as_deref().unwrap_or(if is_vaapi {
+            "format=nv12,hwupload"
+        } else {
+            SDR_RETAG_CHAIN
+        });
         let full = format!("{complex},{tail}[vout]");
         cmd.args(["-filter_complex", &full]);
         cmd.args(["-map", "[vout]", "-map", &audio_map]);
@@ -2710,10 +2722,9 @@ fn spawn_ffmpeg(
             cmd.args(["-c:v", video_encoder]);
             if video_encoder == "libx264" {
                 cmd.args(["-preset", "veryfast", "-pix_fmt", "yuv420p"]);
-            } else {
-                // Hardware paths: keep pixel format explicit where the encoder
-                // accepts it; backends that need device-specific graphs failed
-                // verification.
+            } else if !is_vaapi {
+                // QSV/VT and similar system-memory paths. VAAPI needs nv12
+                // surfaces from hwupload — not yuv420p (see is_vaapi branch).
                 cmd.args(["-pix_fmt", "yuv420p"]);
             }
             if pgs_overlay.is_some() {
@@ -2848,6 +2859,34 @@ fn transcode_video_filter_chain(
     } else {
         parts.push(SDR_RETAG_CHAIN.to_string());
     }
+    Ok(parts.join(","))
+}
+
+/// VAAPI Transcode chain: software prep (ASS / scale / tonemap), then upload
+/// to the VA device. Ends in `format=nv12,hwupload` — required by h264_vaapi.
+/// Does not use the SDR retag graph alone (system yuv420p into vaapi fails).
+fn vaapi_video_filter_chain(
+    plan: VideoEncodePlan,
+    ass_vf: Option<&str>,
+) -> Result<String, String> {
+    if plan.tone_map && !ffmpeg_has_zscale() {
+        return Err(
+            "HDR tone-map requires FFmpeg with libzimg (zscale filter); \
+             install an FFmpeg build configured --enable-libzimg"
+                .into(),
+        );
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ass) = ass_vf {
+        parts.push(ass.to_string());
+    }
+    if let Some(h) = plan.max_height {
+        parts.push(format!("scale=-2:'min({h},ih)'"));
+    }
+    if plan.tone_map {
+        parts.push(HDR_TONEMAP_CHAIN.to_string());
+    }
+    parts.push("format=nv12,hwupload".into());
     Ok(parts.join(","))
 }
 
@@ -3087,6 +3126,25 @@ mod tests {
             panic!("NIGHTJAR_TEST_REQUIRE_FFMPEG is set but ffmpeg is not on PATH");
         }
         ok
+    }
+
+    #[test]
+    fn vaapi_filter_ends_in_hwupload() {
+        let plan = VideoEncodePlan {
+            max_height: Some(720),
+            max_bitrate_bps: None,
+            tone_map: false,
+        };
+        let vf = vaapi_video_filter_chain(plan, None).unwrap();
+        assert!(
+            vf.ends_with("format=nv12,hwupload"),
+            "vaapi chain must upload: {vf}"
+        );
+        assert!(vf.contains("scale=-2:'min(720,ih)'"), "{vf}");
+        assert!(
+            !vf.contains("setparams="),
+            "vaapi must not use software SDR retag alone: {vf}"
+        );
     }
 
     #[test]
