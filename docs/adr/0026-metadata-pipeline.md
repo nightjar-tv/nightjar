@@ -235,6 +235,13 @@ credentials later use this file rather than inventing a second store or
 putting tokens in SQLite. The application key
 is not copied into the secrets file.
 
+**On-disk encoding:** line-oriented `name=value`, `#` comments and blank
+lines ignored; the first `=` on a line separates name from value (values
+may contain `=`); when the same name appears more than once, the last
+assignment wins (an empty value clears that name). Mode `0600`. Settings
+UI writers and later provider fields inherit this shape — do not invent a
+second encoding.
+
 ### 6. Collections storage only
 
 On a successful movie detail write, persist `belongs_to_collection.id` and

@@ -1,5 +1,6 @@
 //! TMDB HTTP client and [`MetadataSource`] (ADR-0026).
 
+mod credentials;
 mod map;
 
 use std::sync::Arc;
@@ -16,6 +17,10 @@ use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::rate_limit::ApiRateLimiter;
 use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
 
+pub use credentials::{
+    CredError, TmdbCredentials, TmdbKeySource, embedded_application_key, resolve_credentials,
+    resolve_credentials_with,
+};
 pub use map::{RawProviderPayload, map_episodes_from_season, map_movie_detail, map_tv_detail};
 
 /// Placeholder until a live client is configured. Always [`ProviderResult::Miss`].
@@ -31,60 +36,6 @@ impl MetadataSource for TmdbStub {
 const MOVIE_APPEND: &str = "images,credits,videos,release_dates,external_ids";
 const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggregate_credits";
 const SEASON_APPEND: &str = "images,credits,videos,external_ids";
-
-#[derive(Debug, Clone)]
-pub struct TmdbCredentials {
-    /// v3 api_key query param and/or v4 bearer.
-    pub api_key: Option<String>,
-    pub bearer: Option<String>,
-}
-
-impl TmdbCredentials {
-    /// ADR-0026 override slot: env `NIGHTJAR_TMDB_API_KEY`, else `TMDB_API_KEY` /
-    /// `TMDB_BEARER`, else `~/.config/nightjar/tmdb_secret` (dev/dogfood).
-    pub fn from_env() -> Option<Self> {
-        let mut api_key = std::env::var("NIGHTJAR_TMDB_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("TMDB_API_KEY").ok().filter(|s| !s.is_empty()));
-        let mut bearer = std::env::var("TMDB_BEARER")
-            .ok()
-            .or_else(|| std::env::var("TMDB_ACCESS_TOKEN").ok())
-            .filter(|s| !s.is_empty());
-
-        if api_key.is_none() && bearer.is_none() {
-            let path = std::env::var_os("TMDB_SECRET_FILE")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    dirs_next_home()
-                        .map(|h| h.join(".config/nightjar/tmdb_secret"))
-                        .unwrap_or_default()
-                });
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                let t = raw.trim();
-                if t.starts_with("eyJ") {
-                    bearer = Some(t.to_string());
-                } else if !t.is_empty() {
-                    api_key = Some(t.to_string());
-                }
-            }
-        }
-        if let Some(ref k) = api_key
-            && k.starts_with("eyJ")
-            && bearer.is_none()
-        {
-            bearer = api_key.take();
-        }
-        if api_key.is_none() && bearer.is_none() {
-            return None;
-        }
-        Some(Self { api_key, bearer })
-    }
-}
-
-fn dirs_next_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
-}
 
 #[derive(Debug)]
 pub struct TmdbClient {
@@ -131,15 +82,11 @@ impl TmdbClient {
         for (k, v) in query {
             push(&mut url, &mut first, k, v);
         }
-        if let Some(ref key) = self.creds.api_key {
-            push(&mut url, &mut first, "api_key", key);
-        }
+        push(&mut url, &mut first, "api_key", &self.creds.api_key);
 
-        let mut req = self.agent.get(&url);
-        if let Some(ref bearer) = self.creds.bearer {
-            req = req.set("Authorization", &format!("Bearer {bearer}"));
-        }
-        let resp = req
+        let resp = self
+            .agent
+            .get(&url)
             .call()
             .map_err(|e| ResolveError::Provider(e.to_string()))?;
         let status = resp.status();
@@ -148,6 +95,9 @@ impl TmdbClient {
             .map_err(|e| ResolveError::Provider(e.to_string()))?;
         if status == 429 {
             self.http_429.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(err) = auth_rejected_error(status, &self.creds) {
+            return Err(err);
         }
         if !(200..300).contains(&status) {
             return Err(ResolveError::Provider(format!(
@@ -463,6 +413,17 @@ impl MetadataSource for &TmdbClient {
     }
 }
 
+/// Named refuse when TMDB rejects the active key (ADR-0031 §4).
+/// Does not consult embedded as a fallback — the active source already won
+/// precedence at resolve time.
+fn auth_rejected_error(status: u16, creds: &TmdbCredentials) -> Option<ResolveError> {
+    if status == 401 || status == 403 {
+        Some(ResolveError::Provider(creds.rejected_reason()))
+    } else {
+        None
+    }
+}
+
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -493,5 +454,49 @@ mod tests {
             TmdbStub.resolve(&ResolveInput::default()).unwrap(),
             ProviderResult::Miss
         );
+    }
+
+    #[test]
+    fn auth_reject_override_does_not_mention_fallback_to_embedded() {
+        for status in [401u16, 403] {
+            for source in [TmdbKeySource::SecretsFile, TmdbKeySource::Env] {
+                let creds = TmdbCredentials {
+                    api_key: "bad".into(),
+                    source,
+                };
+                let err = auth_rejected_error(status, &creds).expect("refuse");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("not falling back to embedded"),
+                    "status={status} source={source:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auth_reject_embedded_is_named() {
+        let creds = TmdbCredentials {
+            api_key: "bad".into(),
+            source: TmdbKeySource::Embedded,
+        };
+        let err = auth_rejected_error(401, &creds).expect("refuse");
+        assert!(
+            err.to_string()
+                .contains("embedded application key rejected"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn auth_reject_ignores_non_auth_status() {
+        let creds = TmdbCredentials {
+            api_key: "x".into(),
+            source: TmdbKeySource::Env,
+        };
+        assert!(auth_rejected_error(404, &creds).is_none());
+        assert!(auth_rejected_error(429, &creds).is_none());
+        assert!(auth_rejected_error(200, &creds).is_none());
     }
 }

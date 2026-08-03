@@ -20,9 +20,9 @@ use std::time::Instant;
 use nightjar_db::migrate;
 use nightjar_metadata::{
     ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions, Resolver,
-    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, TmdbCredentials,
-    VISIBLE_FIRST_SCREEN_N, drain_pending, measure_exclude_libraries_sql_in,
-    measure_exclude_library_names, snapshot_visible_proxy_filtered,
+    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, TmdbClient, VISIBLE_FIRST_SCREEN_N,
+    drain_pending, measure_exclude_libraries_sql_in, measure_exclude_library_names,
+    resolve_credentials, snapshot_visible_proxy_filtered,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -102,8 +102,8 @@ fn main() {
                 .join(format!("nightjar-queue-if{max_in_flight}-{tag}.db"))
         });
 
-    let creds = TmdbCredentials::from_env().unwrap_or_else(|| {
-        eprintln!("no TMDB credentials");
+    let creds = resolve_credentials().unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
     });
     let limiter = ApiRateLimiter::new(rps, max_in_flight);

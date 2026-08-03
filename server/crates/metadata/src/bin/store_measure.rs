@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use nightjar_db::migrate;
 use nightjar_metadata::{
-    MetadataKind, ResolveInput, ResolveOutcome, Resolver, TmdbClient, TmdbCredentials,
-    clean_movie_title, clean_show_title, counts_by_reason, payload_store_stats,
-    persist_hit_with_canonical, series_library_year, year_from_path,
+    MetadataKind, ResolveInput, ResolveOutcome, Resolver, TmdbClient, clean_movie_title,
+    clean_show_title, counts_by_reason, payload_store_stats, persist_hit_with_canonical,
+    resolve_credentials, series_library_year, year_from_path,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -85,8 +85,8 @@ fn main() {
                 .join("nightjar-store-measure.db")
         });
 
-    let creds = TmdbCredentials::from_env().unwrap_or_else(|| {
-        eprintln!("no TMDB credentials");
+    let creds = resolve_credentials().unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
     });
     let client = TmdbClient::new(creds);
