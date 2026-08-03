@@ -107,12 +107,33 @@ pub struct LibraryPool {
     walk_caches: Mutex<HashMap<i64, WalkCache>>,
     last_index_ms: AtomicU64,
     scan_dirty: Mutex<HashSet<i64>>,
+    /// Process-wide exclusive index/walk epoch (ADR-0015). Holding this mutex
+    /// is the only way to run a tree walk or index upsert pass.
+    index_epoch: Mutex<()>,
     index_active: AtomicUsize,
     /// Item ids whose extract worker is running (not merely queued).
     extracting: Mutex<HashSet<i64>>,
     /// Item ids whose map worker is running (not merely queued).
     mapping: Mutex<HashSet<i64>>,
     pub availability: Arc<Availability>,
+}
+
+/// RAII permit for one process-wide index/walk epoch (ADR-0015).
+///
+/// Drop releases the epoch so the next library can walk. While held,
+/// background extract/map wait unless play-priority (ADR-0013).
+pub struct IndexEpochGuard<'a> {
+    pool: &'a LibraryPool,
+    _lock: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for IndexEpochGuard<'_> {
+    fn drop(&mut self) {
+        let prev = self.pool.index_active.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.pool.available.notify_all();
+        }
+    }
 }
 
 impl LibraryPool {
@@ -129,6 +150,7 @@ impl LibraryPool {
             walk_caches: Mutex::new(HashMap::new()),
             last_index_ms: AtomicU64::new(0),
             scan_dirty: Mutex::new(HashSet::new()),
+            index_epoch: Mutex::new(()),
             index_active: AtomicUsize::new(0),
             extracting: Mutex::new(HashSet::new()),
             mapping: Mutex::new(HashSet::new()),
@@ -186,15 +208,19 @@ impl LibraryPool {
             .remove(&library_id)
     }
 
-    pub fn begin_index(&self) {
+    /// Block until no other library is indexing, then hold the epoch.
+    /// At most one walk/index upsert runs process-wide (ADR-0015).
+    pub fn enter_index_epoch(&self) -> IndexEpochGuard<'_> {
+        let lock = self.index_epoch.lock().unwrap_or_else(|e| e.into_inner());
         self.index_active.fetch_add(1, Ordering::SeqCst);
+        IndexEpochGuard {
+            pool: self,
+            _lock: lock,
+        }
     }
 
-    pub fn end_index(&self) {
-        let prev = self.index_active.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
-            self.available.notify_all();
-        }
+    pub fn index_epoch_held(&self) -> bool {
+        self.index_active.load(Ordering::SeqCst) != 0
     }
 
     pub fn is_library_reachable(&self, library_id: i64) -> bool {
@@ -956,5 +982,45 @@ mod tests {
         assert_eq!(queue.background[0].item_id, 2);
         assert!(queue.background[0].priority);
         assert_eq!(queue.background[1].item_id, 1);
+    }
+
+    #[test]
+    fn enter_index_epoch_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+        let pool = LibraryPool::spawn(db, subs);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let _epoch = holder.enter_index_epoch();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        assert!(pool.index_epoch_held());
+
+        let waiter = Arc::clone(&pool);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let _epoch = waiter.enter_index_epoch();
+            done_tx.send(started.elapsed()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "second enter_index_epoch must block while first holds"
+        );
+        release_tx.send(()).unwrap();
+        let waited = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter should acquire after release");
+        assert!(
+            waited >= Duration::from_millis(50),
+            "waiter elapsed {waited:?} too short to have blocked"
+        );
     }
 }

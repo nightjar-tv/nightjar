@@ -111,55 +111,60 @@ fn run_repoint_job(
     candidate_path: &str,
 ) -> Result<(), String> {
     db.set_scan_job_state(job_id, "indexing")?;
-    let candidate = std::fs::canonicalize(candidate_path)
-        .map(|p| nightjar_db::normalize_library_root(&p.to_string_lossy()))
-        .unwrap_or_else(|_| nightjar_db::normalize_library_root(candidate_path));
-    let root = Path::new(&candidate);
-    if !matches!(check_root(root), Reachability::Reachable) {
-        return Err(format!("repoint path is not reachable: {candidate}"));
-    }
-    let current = db.count_items(library_id)?;
-    let existing = db.list_item_paths(library_id)?;
-    let existing_folds: HashSet<String> = existing
-        .iter()
-        .filter(|r| !nightjar_db::is_absolute_stored(&r.path))
-        .map(|r| fold_path(&r.path))
-        .collect();
-
-    let outcome = walk::walk_media_files_cached(root, None)?;
-    let mut walked_folds = HashSet::new();
-    for file in &outcome.files {
-        if let Some(rel) = to_relpath(&candidate, &file.path) {
-            walked_folds.insert(fold_path(&rel));
+    let probe_queue = {
+        // One epoch for dry-run walk + commit index so another library cannot
+        // interleave a cold walk on the same share (ADR-0015).
+        let _epoch = pool.enter_index_epoch();
+        let candidate = std::fs::canonicalize(candidate_path)
+            .map(|p| nightjar_db::normalize_library_root(&p.to_string_lossy()))
+            .unwrap_or_else(|_| nightjar_db::normalize_library_root(candidate_path));
+        let root = Path::new(&candidate);
+        if !matches!(check_root(root), Reachability::Reachable) {
+            return Err(format!("repoint path is not reachable: {candidate}"));
         }
-    }
-    let matched = existing_folds
-        .iter()
-        .filter(|f| walked_folds.contains(*f))
-        .count() as i64;
-    let would_remove = current - matched;
+        let current = db.count_items(library_id)?;
+        let existing = db.list_item_paths(library_id)?;
+        let existing_folds: HashSet<String> = existing
+            .iter()
+            .filter(|r| !nightjar_db::is_absolute_stored(&r.path))
+            .map(|r| fold_path(&r.path))
+            .collect();
 
-    if current >= 1 && matched == 0 {
-        return Err(format!(
-            "repoint_empty_match: current={current} walked={} matched=0 would_remove={would_remove}",
-            walked_folds.len()
-        ));
-    }
-    if current > 0 {
-        let retain = matched as f64 / current as f64;
-        if retain < REPOINT_RETAIN_FRACTION {
+        let outcome = walk::walk_media_files_cached(root, None)?;
+        let mut walked_folds = HashSet::new();
+        for file in &outcome.files {
+            if let Some(rel) = to_relpath(&candidate, &file.path) {
+                walked_folds.insert(fold_path(&rel));
+            }
+        }
+        let matched = existing_folds
+            .iter()
+            .filter(|f| walked_folds.contains(*f))
+            .count() as i64;
+        let would_remove = current - matched;
+
+        if current >= 1 && matched == 0 {
             return Err(format!(
-                "repoint_below_retain_threshold: current={current} walked={} matched={matched} would_remove={would_remove} retain={retain:.3}",
+                "repoint_empty_match: current={current} walked={} matched=0 would_remove={would_remove}",
                 walked_folds.len()
             ));
         }
-    }
+        if current > 0 {
+            let retain = matched as f64 / current as f64;
+            if retain < REPOINT_RETAIN_FRACTION {
+                return Err(format!(
+                    "repoint_below_retain_threshold: current={current} walked={} matched={matched} would_remove={would_remove} retain={retain:.3}",
+                    walked_folds.len()
+                ));
+            }
+        }
 
-    db.update_library_path(library_id, &candidate)?;
-    let _ = db.repair_library_paths(library_id)?;
-    let _ = pool.set_library_reachability(library_id, &candidate, true);
-    // Continue as a normal index of the new root (same job id).
-    run_index_and_probe(db, pool, job_id, library_id)
+        db.update_library_path(library_id, &candidate)?;
+        let _ = db.repair_library_paths(library_id)?;
+        let _ = pool.set_library_reachability(library_id, &candidate, true);
+        run_index_pass(db, pool, job_id, library_id)?
+    };
+    finish_scan_probes(db, pool, job_id, library_id, probe_queue)
 }
 
 fn run_scan_job(
@@ -178,6 +183,51 @@ fn run_index_and_probe(
     job_id: i64,
     library_id: i64,
 ) -> Result<(), String> {
+    let probe_queue = {
+        let _epoch = pool.enter_index_epoch();
+        run_index_pass(db, pool, job_id, library_id)?
+    };
+    finish_scan_probes(db, pool, job_id, library_id, probe_queue)
+}
+
+fn finish_scan_probes(
+    db: &Arc<Db>,
+    pool: &Arc<LibraryPool>,
+    job_id: i64,
+    library_id: i64,
+    probe_queue: Vec<pool::WorkItem>,
+) -> Result<(), String> {
+    if !pool.is_library_reachable(library_id) {
+        db.complete_scan_job(job_id, 0)?;
+        return Ok(());
+    }
+
+    let probe_started = Instant::now();
+    let probe_ids: Vec<(i64, PathBuf)> = probe_queue
+        .iter()
+        .map(|item| (item.item_id, item.path.clone()))
+        .collect();
+    pool.enqueue_probe_batch(probe_queue).wait();
+    for (item_id, path) in &probe_ids {
+        pool.enqueue(pool::WorkItem::extract(*item_id, library_id, path.clone()));
+        pool.enqueue_map_rebuild(*item_id, library_id, path.clone());
+    }
+    pool.drain_pending_extracts()?;
+    pool.drain_pending_maps()?;
+    let probe_duration_ms = probe_started.elapsed().as_millis() as u64;
+    db.complete_scan_job(job_id, probe_duration_ms)?;
+
+    tracing::info!(job_id, library_id, probe_duration_ms, "scan job completed");
+    Ok(())
+}
+
+/// Walk + upsert only. Caller must hold [`LibraryPool::enter_index_epoch`].
+fn run_index_pass(
+    db: &Arc<Db>,
+    pool: &Arc<LibraryPool>,
+    job_id: i64,
+    library_id: i64,
+) -> Result<Vec<pool::WorkItem>, String> {
     let lib = db
         .get_library(library_id)?
         .ok_or_else(|| format!("library {library_id} not found"))?;
@@ -208,10 +258,7 @@ fn run_index_and_probe(
 
     let existing_count = db.count_items(library_id)?;
     let index_started = Instant::now();
-    // Hold extract workers off the share for the whole indexing phase (walk,
-    // upserts, sidecar rediscovery). One in-flight demux may still finish;
-    // new extracts wait until end_index, after set_scan_job_index_done.
-    pool.begin_index();
+    // Caller holds IndexEpochGuard for this walk/upsert (ADR-0013/0015).
     #[allow(clippy::type_complexity)]
     let index_result = (|| -> Result<(u32, u32, u32, u32, Vec<pool::WorkItem>, u64), String> {
         let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
@@ -559,31 +606,8 @@ fn run_index_and_probe(
             index_duration_ms,
         ))
     })();
-    pool.end_index();
     let (_added, _updated, _removed, _unchanged, probe_queue, _index_duration_ms) = index_result?;
-
-    if !pool.is_library_reachable(library_id) {
-        db.complete_scan_job(job_id, 0)?;
-        return Ok(());
-    }
-
-    let probe_started = Instant::now();
-    let probe_ids: Vec<(i64, PathBuf)> = probe_queue
-        .iter()
-        .map(|item| (item.item_id, item.path.clone()))
-        .collect();
-    pool.enqueue_probe_batch(probe_queue).wait();
-    for (item_id, path) in &probe_ids {
-        pool.enqueue(pool::WorkItem::extract(*item_id, library_id, path.clone()));
-        pool.enqueue_map_rebuild(*item_id, library_id, path.clone());
-    }
-    pool.drain_pending_extracts()?;
-    pool.drain_pending_maps()?;
-    let probe_duration_ms = probe_started.elapsed().as_millis() as u64;
-    db.complete_scan_job(job_id, probe_duration_ms)?;
-
-    tracing::info!(job_id, library_id, probe_duration_ms, "scan job completed");
-    Ok(())
+    Ok(probe_queue)
 }
 
 fn associate_sidecars(
