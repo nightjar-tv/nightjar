@@ -1,4 +1,5 @@
 use nightjar_db::Db;
+use nightjar_metadata::ArtworkStore;
 use nightjar_scanner::LibraryPool;
 use nightjar_transcode::{HlsSessionRegistry, SubsStore, TranscodeCapabilities};
 use std::sync::Arc;
@@ -12,4 +13,5 @@ pub struct AppState {
     pub tonemap_available: bool,
     pub subs: Arc<SubsStore>,
     pub pool: Arc<LibraryPool>,
+    pub artwork: Option<Arc<ArtworkStore>>,
 }

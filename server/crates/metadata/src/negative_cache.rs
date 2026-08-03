@@ -13,6 +13,10 @@ use crate::match_score::norm_key;
 
 pub const PROVIDER_TMDB: &str = "tmdb";
 
+/// Bump when `norm_key` / title-fold rules change (ADR-0026 §3).
+/// Mismatched rows are ignored (treated as cache miss) so old keys re-search.
+pub const CLEANER_VERSION: i32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
     Movie,
@@ -70,6 +74,7 @@ pub struct NegativeEntry {
     pub attempt_count: i32,
     pub attempted_at: String,
     pub next_retry_at: String,
+    pub cleaner_version: i32,
 }
 
 /// Search-input key: `norm_key(title)|year` with `-` sentinel when yearless.
@@ -189,7 +194,8 @@ pub fn lookup(
     query_key: &str,
 ) -> Result<Option<NegativeEntry>, String> {
     conn.query_row(
-        "SELECT reason, confidence, attempt_count, attempted_at, next_retry_at
+        "SELECT reason, confidence, attempt_count, attempted_at, next_retry_at,
+                cleaner_version
          FROM metadata_negative_cache
          WHERE provider = ?1 AND kind = ?2 AND query_key = ?3",
         params![provider, kind.as_str(), query_key],
@@ -201,6 +207,7 @@ pub fn lookup(
                 attempt_count: r.get(2)?,
                 attempted_at: r.get(3)?,
                 next_retry_at: r.get(4)?,
+                cleaner_version: r.get(5)?,
             })
         },
     )
@@ -208,7 +215,8 @@ pub fn lookup(
     .map_err(|e| format!("negative cache lookup: {e}"))
 }
 
-/// True when a durable miss is still inside its backoff window.
+/// True when a durable miss is still inside its backoff window and the
+/// cleaner stamp matches the current fold rules.
 pub fn should_skip(
     conn: &Connection,
     provider: &str,
@@ -219,6 +227,9 @@ pub fn should_skip(
     let Some(entry) = lookup(conn, provider, kind, query_key)? else {
         return Ok(None);
     };
+    if entry.cleaner_version != CLEANER_VERSION {
+        return Ok(None);
+    }
     if entry.next_retry_at.as_str() > now {
         Ok(Some(entry))
     } else {
@@ -241,18 +252,24 @@ pub fn record_miss(
         return Err("api_error is not cached (transient failures retry next resolve)".into());
     }
     let existing = lookup(conn, provider, kind, query_key)?;
-    let attempt_count = existing.map(|e| e.attempt_count + 1).unwrap_or(1);
+    // Stale cleaner stamp does not inherit attempt_count (new fold, new life).
+    let attempt_count = existing
+        .filter(|e| e.cleaner_version == CLEANER_VERSION)
+        .map(|e| e.attempt_count + 1)
+        .unwrap_or(1);
     let next = plus_days_rfc3339(now, backoff_days(attempt_count))?;
     conn.execute(
         "INSERT INTO metadata_negative_cache
-            (provider, kind, query_key, reason, confidence, attempt_count, attempted_at, next_retry_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            (provider, kind, query_key, reason, confidence, attempt_count,
+             attempted_at, next_retry_at, cleaner_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(provider, kind, query_key) DO UPDATE SET
             reason = excluded.reason,
             confidence = excluded.confidence,
             attempt_count = excluded.attempt_count,
             attempted_at = excluded.attempted_at,
-            next_retry_at = excluded.next_retry_at",
+            next_retry_at = excluded.next_retry_at,
+            cleaner_version = excluded.cleaner_version",
         params![
             provider,
             kind.as_str(),
@@ -262,10 +279,22 @@ pub fn record_miss(
             attempt_count,
             now,
             next,
+            CLEANER_VERSION,
         ],
     )
     .map_err(|e| format!("negative cache record: {e}"))?;
     Ok(())
+}
+
+/// Drop rows written under older cleaner versions (optional startup sweep).
+pub fn sweep_stale_cleaner_versions(conn: &Connection) -> Result<usize, String> {
+    let n = conn
+        .execute(
+            "DELETE FROM metadata_negative_cache WHERE cleaner_version != ?1",
+            params![CLEANER_VERSION],
+        )
+        .map_err(|e| format!("sweep stale cleaner versions: {e}"))?;
+    Ok(n)
 }
 
 /// Manual retry: delete the row so the next resolve hits the provider
@@ -393,6 +422,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn stale_cleaner_version_does_not_skip() {
+        let c = mem();
+        let qk = query_key("Old Fold", Some(2000));
+        record_miss(
+            &c,
+            PROVIDER_TMDB,
+            CacheKind::Movie,
+            &qk,
+            NegativeReason::NoResults,
+            None,
+            "2026-08-01T00:00:00Z",
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE metadata_negative_cache SET cleaner_version = 0 WHERE query_key = ?1",
+            params![qk],
+        )
+        .unwrap();
+        let skipped = should_skip(
+            &c,
+            PROVIDER_TMDB,
+            CacheKind::Movie,
+            &qk,
+            "2026-08-01T12:00:00Z",
+        )
+        .unwrap();
+        assert!(skipped.is_none());
+        let n = sweep_stale_cleaner_versions(&c).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

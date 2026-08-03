@@ -3,11 +3,14 @@
 //! Slice 4: metadata queue (query over `metadata_status`) and API
 //! request-rate limiter (ADR-0026 §7/§8).
 
+mod artwork;
 mod canonical;
 mod clean;
+mod fix;
 mod item_links;
 mod match_score;
 mod measure_exclude;
+mod migrator;
 mod model;
 mod negative_cache;
 mod nfo;
@@ -17,6 +20,7 @@ mod raw_payload;
 mod resolve;
 mod tmdb;
 
+pub use artwork::{ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key};
 pub use canonical::{
     get_canonical, persist_mapped_hit, persist_season_projection, reproject_from_payload,
     upsert_canonical,
@@ -26,9 +30,13 @@ pub use clean::{
     fold_title_orthography, pick_reference_episode, series_library_year, year_from_path,
     year_from_show_folder,
 };
+pub use fix::{
+    ArtworkInvalidate, AssignRequest, AssignResult, ClearResult, FixCandidate, FixItemView,
+    NoopArtwork, assign, clear_match, get_fix_item, retry_unmatched, search_candidates,
+};
 pub use item_links::{
-    effective_item_key, link_keys_for_item, path_item_key, replace_auto_link, replace_auto_links,
-    upsert_link,
+    clear_all_links_for_media_item, effective_item_key, link_keys_for_item, path_item_key,
+    replace_auto_link, replace_auto_links, set_manually_matched, upsert_link,
 };
 pub use match_score::{
     AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, LibrarySeriesShape, MatchCandidate,
@@ -39,20 +47,23 @@ pub use measure_exclude::{
     MEASURE_EXCLUDE_LIBRARY_NAMES_DEFAULT, MEASURE_EXCLUDE_LIBRARY_NAMES_ENV,
     measure_exclude_libraries_sql_in, measure_exclude_library_names,
 };
+pub use migrator::{MigrateReport, migrate_item_keys};
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
     ProviderIds, Rating, item_key_for_metadata,
 };
 pub use negative_cache::{
-    CacheKind, NegativeEntry, NegativeReason, PROVIDER_TMDB, ReasonCounts,
+    CLEANER_VERSION, CacheKind, NegativeEntry, NegativeReason, PROVIDER_TMDB, ReasonCounts,
     clear as clear_negative_cache, counts_by_reason, query_key, record_miss, should_skip,
+    sweep_stale_cleaner_versions,
 };
 pub use nfo::{NfoError, parse_nfo};
 pub use queue::{
-    DrainOptions, DrainStats, MetadataStatus, PendingItem, QueueBand, T_FIRST_SCREEN_PASS_SECS,
-    T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N, VisibleProxy, VisibleProxyUnit,
-    drain_pending, proxy_terminal_progress, queue_band_for_item, set_metadata_status,
-    snapshot_visible_proxy, snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
+    BindStats, DrainOptions, DrainStats, MetadataStatus, PendingItem, QueueBand,
+    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N, VisibleProxy,
+    VisibleProxyUnit, bind_resolved_items, drain_pending, proxy_terminal_progress,
+    queue_band_for_item, set_metadata_status, snapshot_visible_proxy,
+    snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
 };
 pub use rate_limit::{ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC};
 pub use raw_payload::{

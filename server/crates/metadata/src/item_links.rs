@@ -51,6 +51,29 @@ pub fn replace_auto_links(
     Ok(())
 }
 
+/// Drop every provider binding for a media file (clear-match / reassign prep).
+pub fn clear_all_links_for_media_item(
+    tx: &Transaction<'_>,
+    media_item_id: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM media_item_links WHERE media_item_id = ?1",
+        params![media_item_id],
+    )
+    .map_err(|e| format!("clear all links: {e}"))?;
+    Ok(())
+}
+
+/// Mark all links for a media file as manually matched (ADR-0028).
+pub fn set_manually_matched(tx: &Transaction<'_>, media_item_id: i64) -> Result<(), String> {
+    tx.execute(
+        "UPDATE media_item_links SET manually_matched = 1 WHERE media_item_id = ?1",
+        params![media_item_id],
+    )
+    .map_err(|e| format!("set manually_matched: {e}"))?;
+    Ok(())
+}
+
 pub fn delete_links_for_item_keys(
     tx: &Transaction<'_>,
     item_keys: &[String],

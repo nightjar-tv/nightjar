@@ -181,6 +181,16 @@ impl Db {
             .map_err(|_| "database lock poisoned".to_string())
     }
 
+    /// Run a short critical section against the shared connection.
+    /// Do not hold this across network I/O (metadata drain uses its own conn).
+    pub fn with_conn<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&Connection) -> Result<T, String>,
+    {
+        let conn = self.lock()?;
+        f(&conn)
+    }
+
     pub fn create_library(&self, lib: &NewLibrary) -> Result<LibraryRow, String> {
         let root = require_library_root(&lib.path)?;
         let conn = self.lock()?;

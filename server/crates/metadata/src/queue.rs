@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::canonical;
 use crate::clean::{
@@ -230,15 +230,15 @@ pub fn snapshot_visible_proxy_filtered(
                 }
             }
             "shows" => {
-                // Provisional: distinct show = resolve soft key (ADR-0026 §8).
+                // Prefer durable tmdb_show when episode links exist (ADR-0029 §2.5);
+                // otherwise resolve soft key (ADR-0026 §8 provisional).
                 let mut by_show: HashMap<String, Vec<&LibraryItemRow>> = HashMap::new();
                 for it in &items {
                     if it.kind != "episode" {
                         continue;
                     }
-                    let (ct, _) = clean_show_title(&it.title);
-                    let qk = query_key(&ct, None);
-                    by_show.entry(format!("tv|{qk}")).or_default().push(it);
+                    let unit_key = visible_show_unit_key(conn, it)?;
+                    by_show.entry(unit_key).or_default().push(it);
                 }
                 let mut show_units: Vec<(String, String, Vec<i64>, i64)> = by_show
                     .into_iter()
@@ -267,6 +267,47 @@ pub fn snapshot_visible_proxy_filtered(
         }
     }
     Ok(VisibleProxy { units })
+}
+
+/// Browse unit for one episode file: `tv|tmdb:{show_id}` when linked,
+/// else soft-key `tv|{query_key}`.
+fn visible_show_unit_key(conn: &Connection, it: &LibraryItemRow) -> Result<String, String> {
+    if let Some(show_id) = tmdb_show_for_media_item(conn, it.id)? {
+        return Ok(format!("tv|tmdb:{show_id}"));
+    }
+    let (ct, _) = clean_show_title(&it.title);
+    let qk = query_key(&ct, None);
+    Ok(format!("tv|{qk}"))
+}
+
+fn tmdb_show_for_media_item(conn: &Connection, media_item_id: i64) -> Result<Option<i64>, String> {
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT item_key FROM media_item_links
+             WHERE media_item_id = ?1 AND item_key LIKE 'tmdb:episode:%'
+             ORDER BY manually_matched DESC, item_key
+             LIMIT 1",
+            params![media_item_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("episode link for visible: {e}"))?;
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let Some(ep_id) = key.strip_prefix("tmdb:episode:") else {
+        return Ok(None);
+    };
+    let show: Option<i64> = conn
+        .query_row(
+            "SELECT tmdb_show FROM metadata_canonical
+             WHERE provider = 'tmdb' AND entity_kind = 'episode' AND provider_id = ?1",
+            params![ep_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("tmdb_show for visible: {e}"))?;
+    Ok(show)
 }
 
 fn band_for_item(
@@ -336,6 +377,25 @@ pub struct DrainStats {
     pub predicted_secs: f64,
     pub gate_pass: bool,
     pub stopped_early: bool,
+    /// Season detail fetches that returned a payload (live client or double).
+    pub seasons_fetched: usize,
+    /// Episode canonical rows projected from season payloads this drain.
+    pub episodes_projected: usize,
+    /// Media files that received at least one provider link this drain.
+    pub files_linked: usize,
+    /// Season fetches skipped (`fetch_season` → `None`, stub sources).
+    pub seasons_skipped: usize,
+    /// Bind failures (logged; items may still be marked ready).
+    pub bind_errors: usize,
+}
+
+/// Counters from one [`bind_resolved_items`] call.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BindStats {
+    pub seasons_fetched: usize,
+    pub episodes_projected: usize,
+    pub files_linked: usize,
+    pub seasons_skipped: usize,
 }
 
 fn has_poster(meta: &CanonicalMetadata) -> bool {
@@ -521,37 +581,41 @@ fn pending_query_groups(
 
 /// Write provider bindings (and season→episode projection when the source
 /// supports `fetch_season`). TV files without a season fetch stay unbound
-/// (derived path key — ADR-0029 §2 / §3). Stub sources skip seasons; that
-/// path is wired but unproven until live season enqueue runs.
-fn bind_resolved_items<T: MetadataSource>(
+/// (derived path key — ADR-0029 §2 / §3). Stub sources skip seasons; live
+/// `TmdbClient` fetches season detail inside this bind (ADR-0029 §3).
+///
+/// Public for manual assign (ADR-0028) and product drain.
+pub fn bind_resolved_items<T: MetadataSource>(
     conn: &Connection,
     resolver: &Resolver<T>,
     item_ids: &[i64],
     metadata: &CanonicalMetadata,
-) -> Result<(), String> {
+) -> Result<BindStats, String> {
+    let mut stats = BindStats::default();
     match metadata.kind {
         MetadataKind::Movie => {
             let Some(key) = item_key_for_metadata(metadata) else {
-                return Ok(());
+                return Ok(stats);
             };
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|e| format!("begin movie bind tx: {e}"))?;
             for id in item_ids {
                 item_links::replace_auto_link(&tx, *id, &key)?;
+                stats.files_linked += 1;
             }
             tx.commit().map_err(|e| format!("commit movie bind: {e}"))?;
-            Ok(())
+            Ok(stats)
         }
         MetadataKind::Show | MetadataKind::Episode => {
             let Some(show_id) = metadata.ids.tmdb.or(metadata.ids.tmdb_show) else {
-                return Ok(());
+                return Ok(stats);
             };
             let rows = episode_slots(conn, item_ids)?;
             let seasons: std::collections::HashSet<i32> =
                 rows.iter().filter_map(|r| r.season).collect();
             if seasons.is_empty() {
-                return Ok(());
+                return Ok(stats);
             }
             // One file may cover several episode numbers (ADR-0025 §2 range).
             let mut by_se: std::collections::HashMap<(i32, i32), i64> =
@@ -567,10 +631,13 @@ fn bind_resolved_items<T: MetadataSource>(
                     .fetch_season(show_id, sn)
                     .map_err(|e| e.to_string())?
                 else {
-                    // Stub / no season support — leave files unbound.
+                    // Stub, or TMDB 404 for this season number — skip and try others.
+                    stats.seasons_skipped += 1;
                     continue;
                 };
+                stats.seasons_fetched += 1;
                 let eps = canonical::persist_season_projection(conn, PROVIDER_TMDB, show_id, &raw)?;
+                stats.episodes_projected += eps.len();
                 let mut keys_by_media: std::collections::HashMap<i64, Vec<String>> =
                     std::collections::HashMap::new();
                 for ep in &eps {
@@ -590,11 +657,12 @@ fn bind_resolved_items<T: MetadataSource>(
                     .map_err(|e| format!("begin episode bind tx: {e}"))?;
                 for (media_id, keys) in &keys_by_media {
                     item_links::replace_auto_links(&tx, *media_id, keys)?;
+                    stats.files_linked += 1;
                 }
                 tx.commit()
                     .map_err(|e| format!("commit episode bind: {e}"))?;
             }
-            Ok(())
+            Ok(stats)
         }
     }
 }
@@ -778,9 +846,35 @@ pub fn drain_pending<T: MetadataSource>(
         };
         stats.provider_resolves += 1;
         match resolver.resolve_with_store(&input, conn) {
-            Ok(ResolveOutcome::Resolved { metadata, .. }) => {
-                if let Err(e) = bind_resolved_items(conn, resolver, &g.item_ids, &metadata) {
-                    eprintln!("  bind/season ({}): {e}", g.title);
+            Ok(ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            }) => {
+                let tmdb_id = metadata.ids.tmdb.or(metadata.ids.tmdb_show);
+                eprintln!(
+                    "  match {} → tmdb:{:?} method={}",
+                    g.title,
+                    tmdb_id,
+                    match_method.as_deref().unwrap_or("?")
+                );
+                match bind_resolved_items(conn, resolver, &g.item_ids, &metadata) {
+                    Ok(b) => {
+                        stats.seasons_fetched += b.seasons_fetched;
+                        stats.episodes_projected += b.episodes_projected;
+                        stats.files_linked += b.files_linked;
+                        stats.seasons_skipped += b.seasons_skipped;
+                        if b.seasons_skipped > 0 {
+                            eprintln!(
+                                "  bind {} seasons_fetched={} skipped={} linked={}",
+                                g.title, b.seasons_fetched, b.seasons_skipped, b.files_linked
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  bind/season ({}): {e}", g.title);
+                        stats.bind_errors += 1;
+                    }
                 }
                 set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
                 stats.items_ready += g.item_ids.len();
@@ -790,7 +884,8 @@ pub fn drain_pending<T: MetadataSource>(
                     .and_modify(|p| *p = *p || poster)
                     .or_insert(poster);
             }
-            Ok(ResolveOutcome::Unresolved { .. }) => {
+            Ok(ResolveOutcome::Unresolved { reason, .. }) => {
+                eprintln!("  unmatched {} reason={reason:?}", g.title);
                 set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
                 stats.items_unmatched += g.item_ids.len();
             }
@@ -1092,5 +1187,347 @@ mod tests {
         assert_eq!(s.ready_in_proxy, 0);
         assert_eq!(s.ready_missing_poster, 0);
         assert!(s.gate_pass, "unmatched-only proxy must pass poster check");
+    }
+
+    /// Season-returning double: prove bind path writes episode links (ADR-0029 §3).
+    struct SeasonBindSource;
+
+    impl MetadataSource for SeasonBindSource {
+        fn resolve(
+            &self,
+            input: &crate::resolve::ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+            let title = input.title.as_deref().unwrap_or("");
+            if title.is_empty() {
+                return Ok(crate::resolve::ProviderResult::Miss);
+            }
+            let meta = CanonicalMetadata {
+                kind: MetadataKind::Show,
+                title: title.to_string(),
+                original_title: None,
+                year: Some(2020),
+                air_date: None,
+                plot: None,
+                genres: Vec::new(),
+                runtime_minutes: None,
+                cast: Vec::new(),
+                ratings: Vec::new(),
+                ids: crate::model::ProviderIds {
+                    tmdb: Some(99),
+                    tmdb_show: Some(99),
+                    imdb: None,
+                    tvdb: None,
+                },
+                artwork: vec![crate::model::ArtworkRef {
+                    kind: ArtworkKind::Poster,
+                    path: "/p.jpg".into(),
+                }],
+                collection: None,
+                season: None,
+                episode: None,
+            };
+            let raw = crate::tmdb::RawProviderPayload {
+                entity_kind: "tv".into(),
+                provider_id: "99".into(),
+                payload: r#"{"id":99,"name":"Alpha","first_air_date":"2020-01-01"}"#.into(),
+            };
+            Ok(crate::resolve::ProviderResult::Hit {
+                metadata: Box::new(meta),
+                method: "exact_title_year",
+                raw: Some(raw),
+            })
+        }
+
+        fn fetch_season(
+            &self,
+            show_id: i64,
+            season_number: i32,
+        ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError> {
+            assert_eq!(show_id, 99);
+            assert_eq!(season_number, 1);
+            let payload = r#"{
+                "season_number": 1,
+                "episodes": [
+                  {"id": 1001, "name": "Pilot", "season_number": 1, "episode_number": 1, "air_date": "2020-01-01"},
+                  {"id": 1002, "name": "Next", "season_number": 1, "episode_number": 2, "air_date": "2020-01-08"}
+                ]
+            }"#;
+            Ok(Some(crate::tmdb::RawProviderPayload {
+                entity_kind: "season".into(),
+                provider_id: format!("{show_id}:{season_number}"),
+                payload: payload.into(),
+            }))
+        }
+    }
+
+    /// S1 present on TMDB, S5 missing (404 → None): bind S1, skip S5, no hard error.
+    struct PartialSeasonSource;
+
+    impl MetadataSource for PartialSeasonSource {
+        fn resolve(
+            &self,
+            input: &crate::resolve::ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+            let title = input.title.as_deref().unwrap_or("Beta");
+            let meta = CanonicalMetadata {
+                kind: MetadataKind::Show,
+                title: title.to_string(),
+                original_title: None,
+                year: Some(1999),
+                air_date: None,
+                plot: None,
+                genres: Vec::new(),
+                runtime_minutes: None,
+                cast: Vec::new(),
+                ratings: Vec::new(),
+                ids: crate::model::ProviderIds {
+                    tmdb: Some(77),
+                    tmdb_show: Some(77),
+                    imdb: None,
+                    tvdb: None,
+                },
+                artwork: Vec::new(),
+                collection: None,
+                season: None,
+                episode: None,
+            };
+            Ok(crate::resolve::ProviderResult::Hit {
+                metadata: Box::new(meta),
+                method: "exact_title",
+                raw: Some(crate::tmdb::RawProviderPayload {
+                    entity_kind: "tv".into(),
+                    provider_id: "77".into(),
+                    payload: r#"{"id":77,"name":"Beta"}"#.into(),
+                }),
+            })
+        }
+
+        fn fetch_season(
+            &self,
+            show_id: i64,
+            season_number: i32,
+        ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError> {
+            assert_eq!(show_id, 77);
+            if season_number == 5 {
+                // TMDB has no this season — product must soft-skip.
+                return Ok(None);
+            }
+            if season_number != 1 {
+                return Ok(None);
+            }
+            let payload = r#"{
+                "season_number": 1,
+                "episodes": [
+                  {"id": 2001, "name": "One", "season_number": 1, "episode_number": 1, "air_date": "1999-01-01"},
+                  {"id": 2002, "name": "Two", "season_number": 1, "episode_number": 2, "air_date": "1999-01-08"}
+                ]
+            }"#;
+            Ok(Some(crate::tmdb::RawProviderPayload {
+                entity_kind: "season".into(),
+                provider_id: format!("{show_id}:{season_number}"),
+                payload: payload.into(),
+            }))
+        }
+    }
+
+    #[test]
+    fn drain_binds_good_seasons_when_one_season_missing() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Beta/Season 01/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1),
+               (1, 'Beta/Season 01/Beta.S01E02.mkv', 1, 1, 'Beta', 'episode', 1, 2),
+               (1, 'Beta/Season 05/Beta.S05E01.mkv', 1, 1, 'Beta', 'episode', 5, 1);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: PartialSeasonSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 3);
+        assert_eq!(s.seasons_fetched, 1);
+        assert_eq!(s.seasons_skipped, 1);
+        assert_eq!(s.files_linked, 2);
+        assert_eq!(s.bind_errors, 0);
+        assert_eq!(s.episodes_projected, 2);
+
+        let linked: i64 = c
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(linked, 2);
+        let s5_links: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links l
+                 JOIN media_items m ON m.id = l.media_item_id
+                 WHERE m.season = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            s5_links, 0,
+            "missing season stays unbound, not a hard error"
+        );
+    }
+
+    #[test]
+    fn drain_binds_episode_keys_when_source_returns_season() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Alpha/Season 01/Alpha.S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1),
+               (1, 'Alpha/Season 01/Alpha.S01E02.mkv', 1, 1, 'Alpha', 'episode', 1, 2);",
+        )
+        .unwrap();
+        let resolver = Resolver {
+            tmdb: SeasonBindSource,
+        };
+        let s = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 2);
+        assert_eq!(s.seasons_fetched, 1);
+        assert_eq!(s.episodes_projected, 2);
+        assert_eq!(s.files_linked, 2);
+        assert_eq!(s.seasons_skipped, 0);
+        assert_eq!(s.bind_errors, 0);
+
+        let keys: Vec<String> = c
+            .prepare("SELECT item_key FROM media_item_links ORDER BY item_key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "tmdb:episode:1001".to_string(),
+                "tmdb:episode:1002".to_string()
+            ]
+        );
+
+        let ep_canon: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical WHERE entity_kind = 'episode'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ep_canon, 2);
+    }
+
+    #[test]
+    fn visible_uses_tmdb_show_when_episode_linked() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1),
+               (1, 'Alpha Alias/S01E01.mkv', 1, 1, 'Alpha Alias', 'episode', 1, 1);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z'),
+               ('tmdb', 'episode', '1002', 'Pilot', '{\"tmdb\":1002}', 55, '2026-01-01T00:00:00Z');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (1, 'tmdb:episode:1001', 0), (2, 'tmdb:episode:1002', 0);",
+        )
+        .unwrap();
+        let proxy = snapshot_visible_proxy_n(&c, 10).unwrap();
+        assert_eq!(
+            proxy.units.len(),
+            1,
+            "two soft keys collapse under one tmdb_show"
+        );
+        assert_eq!(proxy.units[0].unit_key, "tv|tmdb:55");
+        assert_eq!(proxy.units[0].item_ids.len(), 2);
+    }
+
+    #[test]
+    fn stub_source_skips_season_and_leaves_tv_unlinked() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        // Stub always misses — use SeasonBindSource without seasons... use a hit
+        // source that returns None from fetch_season (trait default).
+        struct HitNoSeason;
+        impl MetadataSource for HitNoSeason {
+            fn resolve(
+                &self,
+                _input: &crate::resolve::ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Show,
+                    title: "Alpha".into(),
+                    original_title: None,
+                    year: Some(2020),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(1),
+                        tmdb_show: Some(1),
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(crate::resolve::ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "tv".into(),
+                        provider_id: "1".into(),
+                        payload: r#"{"id":1,"name":"Alpha"}"#.into(),
+                    }),
+                })
+            }
+        }
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver { tmdb: HitNoSeason },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 1);
+        assert_eq!(s.seasons_skipped, 1);
+        assert_eq!(s.files_linked, 0);
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }
