@@ -297,8 +297,19 @@ impl LibraryPool {
 
     /// Block until no other library is indexing, then hold the epoch.
     /// At most one walk/index upsert runs process-wide (ADR-0015).
-    pub fn enter_index_epoch(&self) -> IndexEpochGuard<'_> {
+    /// Logs when waiting longer than 5s (ops: "indexing" while queued on epoch).
+    pub fn enter_index_epoch(&self, library_id: i64) -> IndexEpochGuard<'_> {
+        const WAIT_LOG: Duration = Duration::from_secs(5);
+        let started = Instant::now();
         let lock = self.index_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        let waited = started.elapsed();
+        if waited >= WAIT_LOG {
+            tracing::info!(
+                library_id,
+                waited_ms = waited.as_millis() as u64,
+                "index epoch wait (another library was walking)"
+            );
+        }
         self.index_active.fetch_add(1, Ordering::SeqCst);
         IndexEpochGuard {
             pool: self,
@@ -1082,7 +1093,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder = Arc::clone(&pool);
         std::thread::spawn(move || {
-            let _epoch = holder.enter_index_epoch();
+            let _epoch = holder.enter_index_epoch(1);
             ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
@@ -1093,7 +1104,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let _epoch = waiter.enter_index_epoch();
+            let _epoch = waiter.enter_index_epoch(2);
             done_tx.send(started.elapsed()).unwrap();
         });
         std::thread::sleep(Duration::from_millis(80));

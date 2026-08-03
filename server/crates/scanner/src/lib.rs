@@ -323,7 +323,7 @@ fn run_repoint_job(
     let probe_queue = {
         // One epoch for dry-run walk + commit index so another library cannot
         // interleave a cold walk on the same share (ADR-0015).
-        let _epoch = pool.enter_index_epoch();
+        let _epoch = pool.enter_index_epoch(library_id);
         let candidate = std::fs::canonicalize(candidate_path)
             .map(|p| nightjar_db::normalize_library_root(&p.to_string_lossy()))
             .unwrap_or_else(|_| nightjar_db::normalize_library_root(candidate_path));
@@ -397,7 +397,7 @@ fn run_index_and_probe(
     library_id: i64,
 ) -> Result<(), String> {
     let probe_queue = {
-        let _epoch = pool.enter_index_epoch();
+        let _epoch = pool.enter_index_epoch(library_id);
         run_index_pass(db, pool, job_id, library_id, None)?
     };
     finish_scan_probes(db, pool, job_id, library_id, probe_queue)

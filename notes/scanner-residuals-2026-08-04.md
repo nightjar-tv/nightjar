@@ -275,14 +275,25 @@ Global probe budget or canonicalize reduction. Not before quiet measure.
 |---:|---|---|
 | 0 | #44 + #45 shipped + N150 deploy | done |
 | 1 | **B′ notify/dirty coalesce** + ADR-0015 (load-bearing) | done (#46) |
-| 2 | B deferred_remove holdoff | `scanner/repoint-deferred-holdoff` |
-| 3 | C repoint walk reuse / cache rekey | `scanner/` + ADR-0030 |
-| 4 | E0 warm-walk measure note | done (`notes/scan-warm-breakdown-2026-08-03.md`) |
-| 5 | D epoch-wait log | `scanner/` |
-| 6 | E1 | only with new timings |
+| 2 | B deferred_remove holdoff | done (#47) |
+| 3 | C repoint walk reuse / cache rekey | done (#48) |
+| 4 | E0 warm-walk measure note | done (`notes/scan-warm-breakdown-2026-08-03.md`, #49) |
+| 5 | D epoch-wait log + hint log noise | `scanner/epoch-wait-and-hint-log` (#50) |
+| 6 | E1 | only if quiet product still slow (canonicalize) |
 
-One concern per PR. **B′ is the first implementation prompt** — only after
-this note’s poll-dirt rule (no skip-delete for poll).
+### Notify `Ignored` / `Unchanged` (N150 logs 2026-08-03)
+
+`outcome=Ignored` on paths like `/media/TV Shows/Rick and Morty` or
+`.../Season 3` is **expected**: those are **directories**, not media files.
+`.srt` is non-media. Hint only indexes container media (`is_media`).
+
+`outcome=Unchanged { item_id }` on existing `.mkv` is **expected**: SMB/notify
+re-fires on files already in the DB with the same mtime (not a new create).
+
+Neither should INFO-spam; only **Upserted** stays at info. Dirs/non-media are
+skipped before `hint_ingest` at debug.
+
+Scanner residual **code** is complete after #50.
 
 ## Explicit non-goals
 
