@@ -10,7 +10,10 @@ use std::time::Instant;
 use rusqlite::{Connection, params};
 
 use crate::canonical;
-use crate::clean::{clean_movie_title, clean_show_title, series_library_year, year_from_path};
+use crate::clean::{
+    clean_movie_title, clean_show_title, pick_reference_episode, series_library_year,
+    year_from_path,
+};
 use crate::item_links;
 use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind, item_key_for_metadata};
 use crate::negative_cache::{PROVIDER_TMDB, query_key};
@@ -301,6 +304,9 @@ struct QueryGroup {
     library_year: Option<i32>,
     library_episode_count: Option<u32>,
     library_season_count: Option<u32>,
+    ref_season: Option<i32>,
+    ref_episode: Option<i32>,
+    ref_episode_title: Option<String>,
     item_ids: Vec<i64>,
     max_id: i64,
     band: QueueBand,
@@ -445,6 +451,9 @@ fn pending_query_groups(
                         library_year: None,
                         library_episode_count: None,
                         library_season_count: None,
+                        ref_season: None,
+                        ref_episode: None,
+                        ref_episode_title: None,
                         item_ids: Vec::new(),
                         max_id: it.id,
                         band,
@@ -465,6 +474,19 @@ fn pending_query_groups(
                 let library_year = series_library_year(years, path0);
                 let seasons: std::collections::HashSet<i32> =
                     siblings.iter().filter_map(|s| s.season).collect();
+                let ref_eps: Vec<(i32, i32, &str)> = siblings
+                    .iter()
+                    .filter_map(|s| {
+                        let season = s.season?;
+                        let episode = s.episode?;
+                        let base = std::path::Path::new(&s.path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(s.path.as_str());
+                        Some((season, episode, base))
+                    })
+                    .collect();
+                let pref = pick_reference_episode(&ref_eps, &ct);
                 let qk = query_key(&ct, None);
                 let unit_key = format!("tv|{qk}");
                 let g = groups
@@ -476,6 +498,9 @@ fn pending_query_groups(
                         library_year,
                         library_episode_count: Some(siblings.len() as u32),
                         library_season_count: (!seasons.is_empty()).then_some(seasons.len() as u32),
+                        ref_season: pref.as_ref().map(|p| p.0),
+                        ref_episode: pref.as_ref().map(|p| p.1),
+                        ref_episode_title: pref.map(|p| p.2),
                         item_ids: Vec::new(),
                         max_id: it.id,
                         band,
@@ -711,6 +736,9 @@ pub fn drain_pending<T: MetadataSource>(
             library_year: g.library_year,
             library_episode_count: g.library_episode_count,
             library_season_count: g.library_season_count,
+            ref_season: g.ref_season,
+            ref_episode: g.ref_episode,
+            ref_episode_title: g.ref_episode_title.clone(),
             kind: Some(g.resolve_kind),
             ..Default::default()
         };

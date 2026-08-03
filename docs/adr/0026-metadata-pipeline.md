@@ -8,6 +8,8 @@
   (`SUM(LENGTH(payload))`); ship uncompressed
 - Amended: 2026-08-03 — API rate limiter is not shared with artwork;
   metadata queue is a query over item `metadata_status`, not a jobs table
+- Amended: 2026-08-03 — TV collision ladder step 4
+  (`exact_title_episode_title`); see ADR-0032
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -72,6 +74,7 @@ the discrete method classes from the spike matcher:
 | `exact_title_library_year` | 0.90 | Multi exact-title; library premiere year uniquely matched `first_air_date` year |
 | `exact_title_episode_count` | 0.90 | Multi exact-title; library episode count uniquely matched (soft) a candidate's `number_of_episodes` |
 | `exact_title_season_count` | 0.90 | Multi exact-title; library season count uniquely matched `number_of_seasons` |
+| `exact_title_episode_title` | 0.90 | Multi exact-title; reference episode name uniquely matched one candidate (ADR-0032; TV only) |
 | `exact_title_year_nearest` | 0.70 | Title hit; year present but no exact year row |
 | `top1_rank` | 0.45–0.65 | No exact title hit; took search ranking |
 
@@ -93,10 +96,15 @@ stay at 0.72 as `exact_title_collision_unpinned`.
 | 1 | Premiere year (earliest episode `year`, else show-folder `(YYYY)`) | `first_air_date` year (search hit) | Exact year |
 | 2 | Episode file count under the show | `/tv/{id}` `number_of_episodes` | Soft (±15% or ±5) |
 | 3 | Distinct season numbers present | `/tv/{id}` `number_of_seasons` | Exact |
+| 4 | Reference episode title (ADR-0032) | `/tv/{id}/season/{s}/episode/{e}` `name` | Folded title unique match |
 
-Detail shapes for (2) and (3) are fetched only when (1) did not pin — tens of
-ambiguous shows, not per file. Wrong series match remains worse than none:
-ambiguous residue goes to the fix flow (ADR-0028), not a looser floor.
+Step 4 is **TV multi-exact only**, capped at 5 tied candidates, and
+declines when the local reference title is on the ADR-0032 rejection list.
+Explicit provider ID skips search entirely (ADR-0032 precondition) — it is
+not a ladder step. Detail shapes for (2) and (3) are fetched only when (1)
+did not pin — tens of ambiguous shows, not per file. Wrong series match
+remains worse than none: ambiguous residue goes to the fix flow
+(ADR-0028), not a looser floor.
 
 The discrete mid-table weights (0.72 vs 0.55, etc.) are the spike's carried
 forward classes; the floor and the collision pin are what dogfood measured.

@@ -221,6 +221,7 @@ fn main() {
             year: key.library_year,
             episode_count: key.episode_count,
             season_count: key.season_count,
+            ..Default::default()
         };
         match client.match_search_with_series_shape(kind, &key.title, key.year, library) {
             Ok(Some(c)) if meets_auto_match_floor(c.confidence) => *matched += n,

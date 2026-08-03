@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::match_score::{
     CandidateShape, LibrarySeriesShape, MatchCandidate, SearchHit, SearchKind,
-    meets_auto_match_floor, needs_collision_detail, norm_key, score_search_with_shape,
+    meets_auto_match_floor, needs_collision_detail, norm_key, pin_episode_title,
+    score_search_with_shape,
 };
 use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::rate_limit::ApiRateLimiter;
@@ -168,7 +169,8 @@ impl TmdbClient {
     }
 
     /// Search + collision pin. Fetches `/tv/{id}` shapes only when multi-exact
-    /// survives the year discriminator (tens of shows, not per-file).
+    /// survives the year discriminator; episode-title pin (ADR-0032) when
+    /// counts still leave the tie and a usable reference episode is present.
     pub fn match_search_with_series_shape(
         &self,
         kind: SearchKind,
@@ -177,7 +179,7 @@ impl TmdbClient {
         library: LibrarySeriesShape,
     ) -> Result<Option<MatchCandidate>, ResolveError> {
         let results = self.search(kind, title, year)?;
-        if !needs_collision_detail(&results, title, year, kind, library) {
+        if !needs_collision_detail(&results, title, year, kind, library.clone()) {
             return Ok(score_search_with_shape(
                 &results, title, year, kind, library, None,
             ));
@@ -199,17 +201,54 @@ impl TmdbClient {
         for hit in &exact {
             shapes.push(self.tv_candidate_shape(hit)?);
         }
-        // Re-score using only the shaped exact subset as the result list so
-        // shape indices align; non-exact hits already lost for pinning.
         let shaped_results: Vec<SearchHit> = exact.iter().map(|h| (*h).clone()).collect();
-        Ok(score_search_with_shape(
+        let scored = score_search_with_shape(
             &shaped_results,
             title,
             year,
             kind,
-            library,
+            library.clone(),
             Some(&shapes),
-        ))
+        );
+        if let Some(ref c) = scored
+            && meets_auto_match_floor(c.confidence)
+        {
+            return Ok(scored);
+        }
+        // ADR-0032 step 4: episode-title pin on still-unpinned TV multi-exact.
+        let Some(ref_title) = library.ref_episode_title.as_deref() else {
+            return Ok(scored);
+        };
+        let (Some(ref_season), Some(ref_episode)) = (library.ref_season, library.ref_episode)
+        else {
+            return Ok(scored);
+        };
+        if kind != SearchKind::Tv || exact.is_empty() {
+            return Ok(scored);
+        }
+        let exact_owned: Vec<SearchHit> = exact.iter().map(|h| (*h).clone()).collect();
+        let exact_refs: Vec<&SearchHit> = exact_owned.iter().collect();
+        if exact_refs.len() > crate::match_score::EPISODE_TITLE_TIE_CAP {
+            return Ok(scored);
+        }
+        let mut names: Vec<Option<String>> = Vec::with_capacity(exact_refs.len());
+        for hit in &exact_refs {
+            names.push(self.tv_episode_name(hit.id, ref_season, ref_episode)?);
+        }
+        if let Some((hit, method)) = pin_episode_title(&exact_refs, &names, ref_title) {
+            return Ok(Some(MatchCandidate {
+                tmdb_id: hit.id,
+                confidence: 0.90,
+                method,
+                result_title: hit.name.clone().or_else(|| hit.original_name.clone()),
+                result_year: hit
+                    .first_air_date
+                    .as_deref()
+                    .and_then(|d| d.get(..4)?.parse().ok()),
+                n_results: results.len(),
+            }));
+        }
+        Ok(scored)
     }
 
     fn tv_candidate_shape(&self, hit: &SearchHit) -> Result<CandidateShape, ResolveError> {
@@ -229,6 +268,22 @@ impl TmdbClient {
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
         })
+    }
+
+    fn tv_episode_name(
+        &self,
+        show_id: i64,
+        season: i32,
+        episode: i32,
+    ) -> Result<Option<String>, ResolveError> {
+        let data = self.get_json(
+            &format!("/tv/{show_id}/season/{season}/episode/{episode}"),
+            &[("language", "en-US")],
+        )?;
+        Ok(data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
     }
 
     pub fn movie_detail(
@@ -371,6 +426,9 @@ impl MetadataSource for TmdbClient {
                 year: input.library_year,
                 episode_count: input.library_episode_count,
                 season_count: input.library_season_count,
+                ref_season: input.ref_season,
+                ref_episode: input.ref_episode,
+                ref_episode_title: input.ref_episode_title.clone(),
             },
         )? {
             TmdbResolve::Matched {
