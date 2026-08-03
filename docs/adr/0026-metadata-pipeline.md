@@ -10,6 +10,8 @@
   metadata queue is a query over item `metadata_status`, not a jobs table
 - Amended: 2026-08-03 — TV collision ladder step 4
   (`exact_title_episode_title`); see ADR-0032
+- Amended: 2026-08-04 — pin order counts-before-year; empty-shell refuse;
+  TV long-title prefix hit; season detail 404 soft-skip
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -68,12 +70,13 @@ the discrete method classes from the spike matcher:
 |---|---:|---|
 | `exact_title_year` (unique) | 0.98 | Normalised title hit and year match; one candidate |
 | `exact_title` (unique) | 0.90 | Title hit; no year on the file, one candidate |
+| `exact_title_empty_shell` | 0.72 | Sole title hit is a TMDB shell (`number_of_seasons`/`episodes` 0) — never auto-match |
 | `exact_title_year` (multi) | 0.80 | Title+year hit; more than one candidate |
 | `exact_title` (multi) | 0.72 | Title hit; more than one candidate; **superseded for TV** by the collision pin below when a discriminator fires |
 | `exact_title_collision_unpinned` | 0.72 | Multi exact-title; no discriminator selected exactly one candidate |
-| `exact_title_library_year` | 0.90 | Multi exact-title; library premiere year uniquely matched `first_air_date` year |
 | `exact_title_episode_count` | 0.90 | Multi exact-title; library episode count uniquely matched (soft) a candidate's `number_of_episodes` |
 | `exact_title_season_count` | 0.90 | Multi exact-title; library season count uniquely matched `number_of_seasons` |
+| `exact_title_library_year` | 0.90 | Multi exact-title; library premiere year uniquely matched `first_air_date` year |
 | `exact_title_episode_title` | 0.90 | Multi exact-title; reference episode name uniquely matched one candidate (ADR-0032; TV only) |
 | `exact_title_year_nearest` | 0.70 | Title hit; year present but no exact year row |
 | `top1_rank` | 0.45–0.65 | No exact title hit; took search ranking |
@@ -93,10 +96,20 @@ stay at 0.72 as `exact_title_collision_unpinned`.
 
 | Order | Library signal | Candidate field | Match |
 |---|---|---|---|
-| 1 | Premiere year (earliest episode `year`, else show-folder `(YYYY)`) | `first_air_date` year (search hit) | Exact year |
-| 2 | Episode file count under the show | `/tv/{id}` `number_of_episodes` | Soft (±15% or ±5) |
-| 3 | Distinct season numbers present | `/tv/{id}` `number_of_seasons` | Exact |
+| 1 | Episode file count under the show | `/tv/{id}` `number_of_episodes` | Soft (±15% or ±5) |
+| 2 | Distinct season numbers present | `/tv/{id}` `number_of_seasons` | Exact |
+| 3 | Premiere year (earliest episode `year`, else show-folder `(YYYY)`) | `first_air_date` year | Exact year |
 | 4 | Reference episode title (ADR-0032) | `/tv/{id}/season/{s}/episode/{e}` `name` | Folded title unique match |
+
+Counts before year so a folder year that uniquely matches a **miniseries**
+cannot beat a multi-season library shape (dogfood: Battlestar Galactica
+`(2003)` folder vs 2004 series). Empty shells (`number_of_seasons` 0 /
+`number_of_episodes` 0) never pin. Multi-exact with library counts always
+fetches `/tv/{id}` detail before scoring so count pins have data.
+
+TV title hit: exact fold **or** candidate name is the query as a prefix
+followed by more words (e.g. cleaned folder "The Continental" vs TMDB
+"The Continental: From the World of John Wick").
 
 Step 4 is **TV multi-exact only**, capped at 5 tied candidates, and
 declines when the local reference title is on the ADR-0032 rejection list.
@@ -372,10 +385,14 @@ the pass bar.
 **Pass:** `T_first_screen ≤ 60`. ~30 s confirms the model; ~55 s means
 the proxy path costs ~1.8× the plain drain — investigate before fan-out.
 
-v1 drain resolves **movie and show (episode-group) search+detail only**.
-Season detail (`/tv/{id}/season/{n}`, ADR-0025 episode ids / §4 season
-append) is not yet enqueued; first-run request count and wall time must
-not be quoted as complete until that pass exists.
+v1 drain resolves movie and show (episode-group) search+detail, then on a
+hit **binds** files via season detail (`/tv/{id}/season/{n}`, ADR-0025
+episode ids / §4 season append) inside `bind_resolved_items` (ADR-0029 §3).
+Season fetch is therefore part of the drain for live `TmdbClient`, not a
+separate jobs table. **HTTP 404 on a season is a soft skip** (continue other
+seasons for that show); do not abort the whole bind on one missing season
+number. First-run request count and wall time must include those season
+requests; movie+show-only figures are incomplete.
 
 v1 `drain_pending` walks groups **serially** (one resolve at a time). While
 that holds, a concurrency knob does nothing — Rule 4.11: engage it with
