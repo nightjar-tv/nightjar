@@ -415,7 +415,8 @@ fn find_episode_token_end(lower: &str, season: i32, episode: i32) -> Option<usiz
                     ed += 1;
                 }
                 if ed > 0 && s == season && e == episode && start > 0 {
-                    return Some(i);
+                    // Skip contiguous `-NN` range tail so it is not title text.
+                    return Some(skip_contiguous_dash_episodes(bytes, i, e));
                 }
             }
         } else {
@@ -423,6 +424,33 @@ fn find_episode_token_end(lower: &str, season: i32, episode: i32) -> Option<usiz
         }
     }
     None
+}
+
+fn skip_contiguous_dash_episodes(bytes: &[u8], mut j: usize, start: i32) -> usize {
+    let mut end = start;
+    while end - start + 1 < nightjar_core::MAX_EPISODE_RANGE {
+        if j >= bytes.len() || bytes[j] != b'-' {
+            break;
+        }
+        let after = j + 1;
+        if after >= bytes.len() || !bytes[after].is_ascii_digit() {
+            break;
+        }
+        let mut k = after;
+        let mut next = 0i32;
+        let mut nd = 0;
+        while k < bytes.len() && bytes[k].is_ascii_digit() && nd < 3 {
+            next = next * 10 + (bytes[k] - b'0') as i32;
+            k += 1;
+            nd += 1;
+        }
+        if nd == 0 || next != end + 1 {
+            break;
+        }
+        end = next;
+        j = k;
+    }
+    j
 }
 
 /// ADR-0032 reference pick: usable mid-season preferred; S01E01 only if usable.
@@ -535,6 +563,16 @@ mod tests {
         let (s, e, title) = pick_reference_episode(&eps, "show").unwrap();
         assert_eq!((s, e), (1, 5));
         assert_eq!(title, "The Crossing");
+
+        assert_eq!(
+            after_token_episode_title(
+                "Abbott Elementary - 3x01-02 - Career Day - WEBDL-1080p.mkv",
+                3,
+                1
+            )
+            .as_deref(),
+            Some("Career Day")
+        );
     }
 
     #[test]

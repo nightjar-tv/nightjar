@@ -553,10 +553,11 @@ fn bind_resolved_items<T: MetadataSource>(
             if seasons.is_empty() {
                 return Ok(());
             }
+            // One file may cover several episode numbers (ADR-0025 §2 range).
             let mut by_se: std::collections::HashMap<(i32, i32), i64> =
                 std::collections::HashMap::new();
             for row in &rows {
-                if let (Some(s), Some(e)) = (row.season, row.episode) {
+                for (s, e) in row.season_episodes() {
                     by_se.insert((s, e), row.id);
                 }
             }
@@ -570,9 +571,8 @@ fn bind_resolved_items<T: MetadataSource>(
                     continue;
                 };
                 let eps = canonical::persist_season_projection(conn, PROVIDER_TMDB, show_id, &raw)?;
-                let tx = conn
-                    .unchecked_transaction()
-                    .map_err(|e| format!("begin episode bind tx: {e}"))?;
+                let mut keys_by_media: std::collections::HashMap<i64, Vec<String>> =
+                    std::collections::HashMap::new();
                 for ep in &eps {
                     let (Some(s), Some(e)) = (ep.season, ep.episode) else {
                         continue;
@@ -583,7 +583,13 @@ fn bind_resolved_items<T: MetadataSource>(
                     let Some(key) = item_key_for_metadata(ep) else {
                         continue;
                     };
-                    item_links::replace_auto_link(&tx, *media_id, &key)?;
+                    keys_by_media.entry(*media_id).or_default().push(key);
+                }
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| format!("begin episode bind tx: {e}"))?;
+                for (media_id, keys) in &keys_by_media {
+                    item_links::replace_auto_links(&tx, *media_id, keys)?;
                 }
                 tx.commit()
                     .map_err(|e| format!("commit episode bind: {e}"))?;
@@ -597,12 +603,39 @@ struct EpisodeSlot {
     id: i64,
     season: Option<i32>,
     episode: Option<i32>,
+    path: String,
+}
+
+impl EpisodeSlot {
+    /// Season/episode pairs this file covers. Re-parses the basename for
+    /// `NxMM-NN` ranges so we do not need an `episode_end` column.
+    fn season_episodes(&self) -> Vec<(i32, i32)> {
+        let Some(season) = self.season else {
+            return Vec::new();
+        };
+        let Some(start) = self.episode else {
+            return Vec::new();
+        };
+        let base = std::path::Path::new(&self.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(self.path.as_str());
+        let parsed = nightjar_core::parse_filename(base);
+        if parsed.season == Some(season) && parsed.episode == Some(start) {
+            return parsed
+                .episode_numbers()
+                .into_iter()
+                .map(|e| (season, e))
+                .collect();
+        }
+        vec![(season, start)]
+    }
 }
 
 fn episode_slots(conn: &Connection, ids: &[i64]) -> Result<Vec<EpisodeSlot>, String> {
     let mut out = Vec::with_capacity(ids.len());
     let mut stmt = conn
-        .prepare("SELECT id, season, episode FROM media_items WHERE id = ?1")
+        .prepare("SELECT id, season, episode, path FROM media_items WHERE id = ?1")
         .map_err(|e| format!("prepare episode slots: {e}"))?;
     for id in ids {
         let row = stmt
@@ -611,6 +644,7 @@ fn episode_slots(conn: &Connection, ids: &[i64]) -> Result<Vec<EpisodeSlot>, Str
                     id: r.get(0)?,
                     season: r.get(1)?,
                     episode: r.get(2)?,
+                    path: r.get(3)?,
                 })
             })
             .map_err(|e| format!("episode slot {id}: {e}"))?;

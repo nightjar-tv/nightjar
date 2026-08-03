@@ -27,7 +27,8 @@ pub use clean::{
     year_from_show_folder,
 };
 pub use item_links::{
-    effective_item_key, link_keys_for_item, path_item_key, replace_auto_link, upsert_link,
+    effective_item_key, link_keys_for_item, path_item_key, replace_auto_link, replace_auto_links,
+    upsert_link,
 };
 pub use match_score::{
     AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, LibrarySeriesShape, MatchCandidate,

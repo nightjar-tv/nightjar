@@ -29,13 +29,26 @@ pub fn replace_auto_link(
     media_item_id: i64,
     item_key: &str,
 ) -> Result<(), String> {
+    replace_auto_links(tx, media_item_id, &[item_key.to_string()])
+}
+
+/// Replace automatic bindings with zero or more provider keys (ADR-0025 §2
+/// multi-episode file → multiple `item_key`s on one media row).
+pub fn replace_auto_links(
+    tx: &Transaction<'_>,
+    media_item_id: i64,
+    item_keys: &[String],
+) -> Result<(), String> {
     tx.execute(
         "DELETE FROM media_item_links
          WHERE media_item_id = ?1 AND manually_matched = 0",
         params![media_item_id],
     )
     .map_err(|e| format!("clear auto links: {e}"))?;
-    upsert_link(tx, media_item_id, item_key, false)
+    for key in item_keys {
+        upsert_link(tx, media_item_id, key, false)?;
+    }
+    Ok(())
 }
 
 pub fn delete_links_for_item_keys(
@@ -134,5 +147,16 @@ mod tests {
             effective_item_key(&c, 1, 1, "a.mkv").unwrap(),
             "tmdb:movie:550"
         );
+    }
+
+    #[test]
+    fn replace_auto_links_keeps_two_keys() {
+        let c = mem();
+        let tx = c.unchecked_transaction().unwrap();
+        replace_auto_links(&tx, 1, &["tmdb:episode:1".into(), "tmdb:episode:2".into()]).unwrap();
+        tx.commit().unwrap();
+        let mut keys = link_keys_for_item(&c, 1).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["tmdb:episode:1", "tmdb:episode:2"]);
     }
 }
