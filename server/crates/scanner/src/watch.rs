@@ -1,12 +1,11 @@
 //! Library discovery triggers: notify + fixed poll backstop (ADR-0015).
 //!
-//! Full walks still enter through [`crate::request_scan`]. Notify may also
-//! run path-hinted ingest for a concrete media path, then request_scan so
-//! deletes and missed paths heal on the next full keep-set. Notify never
-//! disables poll.
+//! Full walks enter through [`crate::request_scan`] (poll, manual, create).
+//! Notify media paths use [`crate::hint_ingest`] alone for creates; poll
+//! remains the delete/heal bound. Notify never disables poll.
 
 use crate::reachability::REACHABILITY_INTERVAL;
-use crate::{LibraryPool, hint_ingest, request_scan};
+use crate::{LibraryPool, ScanTrigger, hint_ingest, request_scan};
 use nightjar_db::Db;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
@@ -101,12 +100,13 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                         if !pool.is_library_reachable(id) {
                             continue;
                         }
+                        // Creates: hint only. No request_scan (poll heals deletes).
                         match hint_ingest(db.as_ref(), pool.as_ref(), id, &ev.path) {
-                            Ok(outcome) => tracing::debug!(
+                            Ok(outcome) => tracing::info!(
                                 library_id = id,
                                 path = %ev.path.display(),
                                 ?outcome,
-                                "hint ingest"
+                                "fs change; hint ingest"
                             ),
                             Err(e) => tracing::warn!(
                                 library_id = id,
@@ -114,19 +114,6 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                                 error = %e,
                                 "hint ingest failed"
                             ),
-                        }
-                        tracing::info!(
-                            library_id = id,
-                            path = %ev.path.display(),
-                            "fs change; requesting scan"
-                        );
-                        match request_scan(Arc::clone(&db), Arc::clone(&pool), id) {
-                            Ok(job_id) => {
-                                tracing::info!(library_id = id, job_id, "scan accepted")
-                            }
-                            Err(e) => {
-                                tracing::warn!(library_id = id, error = %e, "scan request failed")
-                            }
                         }
                     }
                 }
@@ -171,7 +158,12 @@ fn maybe_poll(
             poll_interval_s = poll_every.as_secs(),
             "poll; requesting scan"
         );
-        if let Err(e) = request_scan(Arc::clone(db), Arc::clone(pool), *library_id) {
+        if let Err(e) = request_scan(
+            Arc::clone(db),
+            Arc::clone(pool),
+            *library_id,
+            ScanTrigger::Poll,
+        ) {
             tracing::warn!(library_id, error = %e, "poll scan failed");
         }
     }

@@ -34,8 +34,10 @@ data loss, not a support nuisance.
    reachability is in doubt at any point, skip `delete_missing`, leave rows
    alone, mark the library unavailable, and end without item deletions.
    Path-hinted notify ingest (ADR-0015) never calls `delete_missing`; a
-   full walk that is dirty from a mid-scan hint also skips delete so the
-   incomplete keep-set cannot drop the hinted row (follow-up walk heals).
+   full walk with mid-scan **hint dirt** (`dirty_add`) also skips delete so
+   the incomplete keep-set cannot drop the hinted row (next poll heals
+   deletes). Mid-walk **poll** does not set dirty and does not suppress
+   `delete_missing` — the running walk is that poll.
 
 3. **Same failure vocabulary on probe and extract.** Status value
    `unavailable` on both `probe_status` and `subtitle_status`. `error` means

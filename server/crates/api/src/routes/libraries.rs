@@ -145,11 +145,12 @@ pub async fn create(
     let db = std::sync::Arc::clone(&state.db);
     let pool = std::sync::Arc::clone(&state.pool);
     let library_id = row.id;
-    let job_id =
-        tokio::task::spawn_blocking(move || nightjar_scanner::request_scan(db, pool, library_id))
-            .await
-            .map_err(|e| ApiError::internal(format!("scan on create join: {e}")))?
-            .map_err(ApiError::internal)?;
+    let job_id = tokio::task::spawn_blocking(move || {
+        nightjar_scanner::request_scan(db, pool, library_id, nightjar_scanner::ScanTrigger::Create)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("scan on create join: {e}")))?
+    .map_err(ApiError::internal)?;
     Ok((
         StatusCode::CREATED,
         Json(CreateLibraryResponse {
@@ -269,17 +270,18 @@ pub async fn scan(
 ) -> ApiResult<(StatusCode, Json<ScanJobAcceptedDto>)> {
     let db = std::sync::Arc::clone(&state.db);
     let pool = std::sync::Arc::clone(&state.pool);
-    let job_id =
-        tokio::task::spawn_blocking(move || nightjar_scanner::request_scan(db, pool, library_id))
-            .await
-            .map_err(|e| ApiError::internal(format!("scan start join: {e}")))?
-            .map_err(|e| {
-                if e.contains("not found") {
-                    ApiError::not_found(e)
-                } else {
-                    ApiError::internal(e)
-                }
-            })?;
+    let job_id = tokio::task::spawn_blocking(move || {
+        nightjar_scanner::request_scan(db, pool, library_id, nightjar_scanner::ScanTrigger::Manual)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("scan start join: {e}")))?
+    .map_err(|e| {
+        if e.contains("not found") {
+            ApiError::not_found(e)
+        } else {
+            ApiError::internal(e)
+        }
+    })?;
     Ok((
         StatusCode::ACCEPTED,
         Json(ScanJobAcceptedDto { job_id, library_id }),

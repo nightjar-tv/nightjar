@@ -29,12 +29,32 @@ pub const REPOINT_RETAIN_FRACTION: f64 = 0.90;
 
 const INDEX_BATCH: usize = 200;
 
-/// Request a library scan (ADR-0015). Sole entry point for creation, notify,
-/// poll, and manual scan. Returns the active or newly accepted job id.
+/// Who asked for a full-library walk (ADR-0015). Notify creates use
+/// [`hint_ingest`] alone and do not go through this entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanTrigger {
+    /// Periodic poll. While a scan is already active, no-op on the dirty bit
+    /// so long walks can still run `delete_missing`.
+    Poll,
+    /// `POST .../scan` (and tests that mean manual discovery). Coalesces to one
+    /// follow-up if a job is already active.
+    Manual,
+    /// Library create. Same coalesce as Manual if somehow concurrent.
+    Create,
+    /// Internal follow-up after a manual dirty bit.
+    FollowUp,
+}
+
+/// Request a full-library scan (ADR-0015). Entry for poll, manual scan, library
+/// create, and internal follow-up — not for notify creates ([`hint_ingest`]).
 ///
-/// If a scan is already running, marks the library dirty for exactly one
-/// follow-up when it finishes and returns the active job id.
-pub fn request_scan(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
+/// Returns the active or newly accepted job id.
+pub fn request_scan(
+    db: Arc<Db>,
+    pool: Arc<LibraryPool>,
+    library_id: i64,
+    trigger: ScanTrigger,
+) -> Result<i64, String> {
     let lib = db
         .get_library(library_id)?
         .ok_or_else(|| format!("library {library_id} not found"))?;
@@ -43,7 +63,13 @@ pub fn request_scan(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Res
         return Err(format!("library path is not reachable: {}", lib.path));
     }
     if let Some(existing) = db.active_scan_job(library_id)? {
-        pool.mark_scan_dirty(library_id);
+        match trigger {
+            // Running walk is this poll; do not suppress delete_missing.
+            ScanTrigger::Poll | ScanTrigger::FollowUp => {}
+            ScanTrigger::Manual | ScanTrigger::Create => {
+                pool.mark_scan_dirty(library_id);
+            }
+        }
         return Ok(existing);
     }
     let job_id = db.create_scan_job(library_id)?;
@@ -54,12 +80,19 @@ pub fn request_scan(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Res
                 tracing::error!(job_id, library_id, error = %e, "scan job failed");
                 let _ = db.fail_scan_job(job_id, &e);
             }
+            // Drop any leftover hint dirt so it cannot suppress a later job.
+            let _ = pool.take_dirty_add(library_id);
             if pool.take_scan_dirty(library_id) {
                 tracing::info!(
                     library_id,
                     "library dirty after scan; starting follow-up job"
                 );
-                if let Err(e) = request_scan(Arc::clone(&db), Arc::clone(&pool), library_id) {
+                if let Err(e) = request_scan(
+                    Arc::clone(&db),
+                    Arc::clone(&pool),
+                    library_id,
+                    ScanTrigger::FollowUp,
+                ) {
                     tracing::warn!(library_id, error = %e, "follow-up scan failed");
                 }
             }
@@ -68,19 +101,19 @@ pub fn request_scan(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Res
     Ok(job_id)
 }
 
-/// Alias kept for tests and call sites that mean "start discovery".
+/// Alias for manual / test discovery starts.
 pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
-    request_scan(db, pool, library_id)
+    request_scan(db, pool, library_id, ScanTrigger::Manual)
 }
 
 /// Path-hinted notify ingest (ADR-0015). Upserts one media file immediately so a
 /// new episode can appear without waiting for the full walk. Never calls
-/// `delete_missing` — full `request_scan` remains the heal/delete path.
+/// `delete_missing` — poll (or manual scan) remains the heal/delete path.
 ///
 /// Skips non-media, missing, non-file, and zero-size paths (copy-in-progress /
 /// debounce miss). Does not take the index epoch: concurrent with an in-flight
-/// walk is intentional. Caller should still `request_scan` so dirty/follow-up
-/// heals deletes and anything this path missed.
+/// walk is intentional. Does **not** call [`request_scan`]; callers must not
+/// force a full walk after a successful hint.
 pub fn hint_ingest(
     db: &Db,
     pool: &LibraryPool,
@@ -205,10 +238,11 @@ pub fn hint_ingest(
         ),
     }
     pool.enqueue_map_rebuild(item_id, library_id, abs);
-    // If a full walk is in flight, keep dirty so that job skips delete_missing
-    // (would otherwise drop this row) and a follow-up walk heals.
+    // If a full walk is in flight, mark dirty_add so that job skips
+    // delete_missing (would otherwise drop this row). Poll heals deletes later;
+    // do not schedule a follow-up full walk for the hint alone.
     if db.active_scan_job(library_id)?.is_some() {
-        pool.mark_scan_dirty(library_id);
+        pool.mark_dirty_add(library_id);
     }
     tracing::info!(
         library_id,
@@ -616,17 +650,19 @@ fn run_index_pass(
         }
         // First index after a successful repoint: report unmatched rows but do
         // not delete_missing (ADR-0030). Next ordinary scan deletes.
-        // Dirty during this job (path-hinted notify): skip delete_missing so a
-        // keep-set that never saw the hinted file cannot drop it (ADR-0015).
-        // Follow-up full walk heals deletes and missed paths.
+        // dirty_add (path-hint mid-walk): skip delete so keep-set cannot drop
+        // the hinted row. Poll-while-active does not set dirty — long walks may
+        // still delete (ADR-0015). Manual dirty also skips until follow-up.
         let job_kind = db
             .get_scan_job(job_id)?
             .map(|j| j.kind)
             .unwrap_or_else(|| "scan".into());
         let defer_repoint = job_kind == "repoint";
-        let dirty_during = pool.is_scan_dirty(library_id);
+        let dirty_add = pool.take_dirty_add(library_id);
+        let manual_dirty = pool.is_scan_dirty(library_id);
+        let skip_delete_hint_or_manual = dirty_add || manual_dirty;
         let allow_delete = !defer_repoint
-            && !dirty_during
+            && !skip_delete_hint_or_manual
             && allow_delete_missing(
                 true,
                 root_ok_after,
@@ -655,11 +691,17 @@ fn run_index_pass(
                     deferred_remove,
                     "repoint index: deferring delete_missing until next scan"
                 );
-            } else if dirty_during {
+            } else if dirty_add {
                 tracing::info!(
                     library_id,
                     job_id,
-                    "skipping delete_missing; library dirty during scan (follow-up will heal)"
+                    "skipping delete_missing; hint dirt during scan (next poll heals deletes)"
+                );
+            } else if manual_dirty {
+                tracing::info!(
+                    library_id,
+                    job_id,
+                    "skipping delete_missing; manual rescan pending follow-up"
                 );
             } else {
                 tracing::warn!(
@@ -1335,13 +1377,25 @@ mod tests {
             })
             .unwrap();
 
-        let job1 = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job1 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
 
         let mut overlapped = false;
         for _ in 0..400 {
             if db.active_scan_job(lib.id).unwrap() == Some(job1) {
                 for _ in 0..8 {
-                    let id = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+                    let id = request_scan(
+                        Arc::clone(&db),
+                        Arc::clone(&pool),
+                        lib.id,
+                        ScanTrigger::Manual,
+                    )
+                    .unwrap();
                     assert_eq!(id, job1, "must reuse active job");
                 }
                 overlapped = true;
@@ -1715,11 +1769,10 @@ mod tests {
     }
 
     #[test]
-    fn hint_during_active_scan_marks_dirty_for_follow_up() {
+    fn hint_during_active_scan_sets_dirty_add_not_follow_up() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
-        // Enough files that a scan stays active long enough to overlap.
         for i in 0..80 {
             fs::write(media.join(format!("f{i:03}.mp4")), b"x").unwrap();
         }
@@ -1734,14 +1787,19 @@ mod tests {
             })
             .unwrap();
 
-        let job1 = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job1 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
         let mut overlapped = false;
         for _ in 0..400 {
             if db.active_scan_job(lib.id).unwrap() == Some(job1) {
                 let late = media.join("late.mp4");
                 fs::write(&late, b"late").unwrap();
                 let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &late).unwrap();
-                // Walk may already have listed late.mp4 (Unchanged) or not (Upserted).
                 assert!(
                     matches!(
                         out,
@@ -1751,18 +1809,28 @@ mod tests {
                 );
                 if matches!(out, HintIngestOutcome::Upserted { .. }) {
                     assert!(
-                        pool.is_scan_dirty(lib.id),
-                        "upsert hint during active scan must set dirty"
+                        pool.is_dirty_add(lib.id),
+                        "upsert hint during active scan must set dirty_add"
+                    );
+                    assert!(
+                        !pool.is_scan_dirty(lib.id),
+                        "hint must not set manual follow-up dirty"
                     );
                 }
-                // request_scan while active dirty-coalesces either way.
+                // Poll while active is a dirty no-op.
                 assert_eq!(
-                    request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap(),
+                    request_scan(
+                        Arc::clone(&db),
+                        Arc::clone(&pool),
+                        lib.id,
+                        ScanTrigger::Poll
+                    )
+                    .unwrap(),
                     job1
                 );
                 assert!(
-                    pool.is_scan_dirty(lib.id),
-                    "request_scan during active job must leave dirty set"
+                    !pool.is_scan_dirty(lib.id),
+                    "poll while active must not set scan_dirty"
                 );
                 overlapped = true;
                 break;
@@ -1772,19 +1840,12 @@ mod tests {
         assert!(overlapped, "scan finished before hint overlap");
 
         wait_job(&db, job1);
-        let job1_row = db.get_scan_job(job1).unwrap().unwrap();
-        assert_eq!(
-            job1_row.removed, 0,
-            "dirty during scan must skip delete_missing on job1"
+        // No automatic follow-up from hint-only dirt.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            db.active_scan_job(lib.id).unwrap().is_none(),
+            "hint dirt must not schedule a follow-up scan"
         );
-
-        // Wait until idle; follow-up should run because dirty.
-        for _ in 0..800 {
-            if db.active_scan_job(lib.id).unwrap().is_none() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
         let paths: Vec<_> = db
             .list_items(lib.id)
             .unwrap()
@@ -1793,8 +1854,147 @@ mod tests {
             .collect();
         assert!(
             paths.iter().any(|p| p == "late.mp4"),
-            "hinted file must survive (dirty skip delete + follow-up): {paths:?}"
+            "hinted file must survive: {paths:?}"
         );
+    }
+
+    #[test]
+    fn poll_while_active_does_not_suppress_delete_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("keep.mp4"), b"data").unwrap();
+        fs::write(media.join("gone.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 2);
+
+        fs::remove_file(media.join("gone.mp4")).unwrap();
+        // Many files so the walk stays active long enough for a mid-walk poll.
+        for i in 0..120 {
+            fs::write(media.join(format!("extra{i:03}.mp4")), b"x").unwrap();
+        }
+
+        let job1 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
+        let mut polled = false;
+        for _ in 0..500 {
+            if db.active_scan_job(lib.id).unwrap() == Some(job1) {
+                let id = request_scan(
+                    Arc::clone(&db),
+                    Arc::clone(&pool),
+                    lib.id,
+                    ScanTrigger::Poll,
+                )
+                .unwrap();
+                assert_eq!(id, job1);
+                assert!(!pool.is_scan_dirty(lib.id));
+                assert!(!pool.is_dirty_add(lib.id));
+                polled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(polled, "job finished before mid-walk poll");
+
+        wait_job(&db, job1);
+        let job1_row = db.get_scan_job(job1).unwrap().unwrap();
+        assert!(
+            job1_row.removed >= 1,
+            "poll-while-active must not suppress delete_missing; removed={}",
+            job1_row.removed
+        );
+        let paths: std::collections::HashSet<_> = db
+            .list_items(lib.id)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
+        assert!(
+            !paths.contains("gone.mp4"),
+            "gone.mp4 must be deleted: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn manual_scan_while_active_still_coalesces_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        for i in 0..100 {
+            fs::write(media.join(format!("f{i:03}.mp4")), b"x").unwrap();
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job1 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
+        let mut overlapped = false;
+        for _ in 0..400 {
+            if db.active_scan_job(lib.id).unwrap() == Some(job1) {
+                assert_eq!(
+                    request_scan(
+                        Arc::clone(&db),
+                        Arc::clone(&pool),
+                        lib.id,
+                        ScanTrigger::Manual
+                    )
+                    .unwrap(),
+                    job1
+                );
+                assert!(pool.is_scan_dirty(lib.id));
+                overlapped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(overlapped);
+
+        let mut completed = 0;
+        for _ in 0..800 {
+            completed = 0;
+            for id in job1..job1 + 8 {
+                if let Ok(Some(j)) = db.get_scan_job(id)
+                    && j.library_id == lib.id
+                    && (j.state == "completed" || j.state == "failed")
+                {
+                    completed += 1;
+                }
+            }
+            if db.active_scan_job(lib.id).unwrap().is_none() && completed >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(completed, 2, "manual dirty must spawn one follow-up");
     }
 
     #[test]
@@ -1815,7 +2015,13 @@ mod tests {
             .unwrap();
 
         let t0 = std::time::Instant::now();
-        let job_id = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job_id = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(2),
             "request_scan must return before the walk finishes"
