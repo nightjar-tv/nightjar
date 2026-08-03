@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Fixed poll interval (ADR-0015). ~3% duty cycle at 1.7 s TV warm / 60 s.
-/// Override with `NIGHTJAR_POLL_INTERVAL_SECS`.
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
+/// Fixed poll interval (ADR-0015). Safety net when notify is mute; notify still
+/// accelerates local creates. Default 300 s after multi-library walk pile-up
+/// on shared mounts; override with `NIGHTJAR_POLL_INTERVAL_SECS`.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
 
 fn poll_interval() -> Duration {
     let secs = std::env::var("NIGHTJAR_POLL_INTERVAL_SECS")
@@ -231,10 +232,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn poll_interval_default_is_sixty() {
+    fn poll_interval_default_is_three_hundred() {
         // Avoid depending on ambient env in unit tests: clamp logic only.
-        assert_eq!(DEFAULT_POLL_INTERVAL_SECS, 60);
-        let secs = 60u64.clamp(5, 3600);
-        assert_eq!(Duration::from_secs(secs), Duration::from_secs(60));
+        assert_eq!(DEFAULT_POLL_INTERVAL_SECS, 300);
+        let secs = 300u64.clamp(5, 3600);
+        assert_eq!(Duration::from_secs(secs), Duration::from_secs(300));
     }
 }

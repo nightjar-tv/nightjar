@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-27
+- Amended: 2026-08-03 (global index epoch; poll default 300 s)
 
 ## Context
 
@@ -18,8 +19,18 @@ shares.
 
 After parallelising directory re-stats (ADR-0013 §8.7), TV Shows warm walk on
 the household SMB-over-Wi-Fi link is ~1.7 s at concurrency 8. A 60 s poll is
-about a 3% duty cycle. Walk cost no longer justifies adaptive intervals,
-confidence scoring, or per-library backoff.
+about a 3% duty cycle **for one library alone**. Dogfood after ADR-0030 remount
+(2026-08-03) showed the real failure mode: poll fires `request_scan` for
+**every** library at once; each walk uses up to eight directory workers; several
+libraries on one share pile up until even a tiny local library’s index takes
+~11 minutes while `unchanged` matches a quiet warm pass. Per-library
+coalescing (decision 3) does not stop cross-library walk thrash.
+
+Jellyfin’s shape (optional `FileSystemWatcher` + ~12 h scheduled full refresh)
+gets new files quickly only when realtime monitoring works; mute shares wait
+for the slow task or a manual scan. Nightjar keeps a stronger promise: poll
+always bounds mute-share detection latency. Notify stays an accelerator for
+local disks (the common non-SMB install), never a gate.
 
 ## Decision
 
@@ -41,7 +52,18 @@ confidence scoring, or per-library backoff.
    bit. Never two concurrent walks for one library; never a queue of N
    follow-ups.
 
-4. **Notify is a trigger, not a mode.** An FS event calls `request_scan`
+4. **One process-wide index/walk epoch.** At most one library may run a tree
+   walk or index upsert pass at a time (`LibraryPool::enter_index_epoch`).
+   Other libraries’ scan jobs wait for the epoch, then run. Probe, extract,
+   and map continue under the existing pool rules after the epoch releases
+   (extract/map still pause while any epoch is held unless play-priority —
+   ADR-0013). Repoint holds one epoch across dry-run walk and the commit
+   index so another library cannot interleave a cold walk on the same share.
+
+   Per-library coalescing (decision 3) remains. The epoch adds the missing
+   cross-library bound.
+
+5. **Notify is a trigger, not a mode.** An FS event calls `request_scan`
    sooner. It never disables polling. There is no gate that stops poll
    because notify armed, and there is **no notify-works detection**
    anywhere in the system by design.
@@ -63,15 +85,15 @@ confidence scoring, or per-library backoff.
    can be revisited; it must not be mistaken for a load-bearing
    correctness rule or removed/kept out of superstition.
 
-5. **Fixed poll interval.** Default **60 seconds**. Configurable via
+6. **Fixed poll interval.** Default **300 seconds**. Configurable via
    `NIGHTJAR_POLL_INTERVAL_SECS` (same class of knob as
-   `NIGHTJAR_WALK_CONCURRENCY`). Not derived from last walk duration.
-   Delete `max(60, 2 × duration_s)`: with parallel warm walks the 2× term
-   cannot engage, and a formula that never changes its answer implies
-   adaptivity that does not exist. At ~1.7 s TV warm / 60 s interval the
-   duty cycle is ~3% on the measured link.
+   `NIGHTJAR_WALK_CONCURRENCY`), clamp 5..=3600. Not derived from last walk
+   duration. Mute-share detection latency is bounded by this interval plus
+   one warm (or cold) walk under the global epoch. Operators who want faster
+   pickup on quiet local disks may lower the env; the epoch still prevents
+   multi-library pile-up.
 
-6. **Discovery vs indexing.** No new pipeline. The existing scan job already
+7. **Discovery vs indexing.** No new pipeline. The existing scan job already
    separates an index pass (walk → change list → upsert) from probe/extract
    (ADR-0004). Discovery scheduling only decides when `request_scan` runs;
    indexing remains that job's first phase.
@@ -81,10 +103,18 @@ confidence scoring, or per-library backoff.
 - **Adaptive poll intervals** based on last walk duration.
 - **Confidence scoring** of notify reliability per library.
 - **Per-library backoff** on quiet libraries.
+- **Notify-works verification** (tempfile probe or “saw an event ⇒ stop
+  polling”). Writes into library trees, fails on read-only mounts, and
+  recreates silent miss when SMB fires sometimes then goes mute.
+- **Deleting notify** in favour of poll-only. Punishes local-disk installs
+  where notify is the right accelerator.
+- **Mount-type classification** (fstype / “network vs local”) as a poll
+  gate. iSCSI, mergerfs/Unraid user shares, and Docker Desktop look wrong;
+  the table rots (see library-change-detection brief).
 
-At a ~3% duty cycle these add per-library mutable state that depends on
-hours of history, is hard to test, and is hard to explain when a user says
-a file did not appear. Do not reintroduce them from intuition.
+Path-hinted refresh that skips `delete_missing` (Jellyfin-style subtree
+refresh) remains a later design; full poll owns deletes under ADR-0014 until
+that ADR exists.
 
 ### Latency vs bandwidth (recurring principle)
 
@@ -93,23 +123,29 @@ concurrency hides wait time (directory stats → parallel walk). When
 per-item cost is bytes through one pipe, the work is **bandwidth-bound**
 and concurrency hurts (subtitle extract → stay serial). That distinction
 separates this stack from the Jellyfin core-count-scaling failure already
-noted in ADR-0013.
+noted in ADR-0013. Cross-library walk concurrency is the same class of
+mistake as parallel extract: more metadata IOPS on one share make every
+walker slower.
 
 ## Consequences
 
 **Gained.** Creation starts discovery immediately. One code path for every
 trigger. Poll remains the guarantee on mute notify. Interval is a readable
 constant. Coalescing is one dirty bit, already used for watch-during-scan.
+Multi-library installs no longer overrun one mount with N parallel walks.
+Notify still accelerates local creates without becoming a reliability gate.
 
 **Lost.** No automatic slowdown on quiet libraries; operators who need a
-longer interval set `NIGHTJAR_POLL_INTERVAL_SECS`. Clients that assumed
-`POST /libraries` returned only a `Library` must accept `jobId` on 201
-(additive field on the create response schema).
+shorter or longer interval set `NIGHTJAR_POLL_INTERVAL_SECS`. A library whose
+scan starts while another is indexing waits for the epoch (job exists;
+walk deferred). Clients that assumed `POST /libraries` returned only a
+`Library` must accept `jobId` on 201 (additive field on the create response
+schema).
 
 **API.** `POST /libraries` 201 body includes `jobId` (OpenAPI
 `CreateLibraryResponse`). Spec and implementation land together.
 
 **Tests.** Triggers during a running scan produce one follow-up. Creation
 enqueues without waiting for the walk. Notify + poll together do not start
-two concurrent walks. Unreachable libraries still dispatch no per-item work
-(ADR-0014).
+two concurrent walks for one library. Index epoch is exclusive across
+holders. Unreachable libraries still dispatch no per-item work (ADR-0014).
