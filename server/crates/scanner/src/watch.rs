@@ -5,7 +5,7 @@
 //! remains the delete/heal bound. Notify never disables poll.
 
 use crate::reachability::REACHABILITY_INTERVAL;
-use crate::{LibraryPool, ScanTrigger, hint_ingest, request_scan};
+use crate::{HintIngestOutcome, LibraryPool, ScanTrigger, hint_ingest, is_media, request_scan};
 use nightjar_db::Db;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
@@ -100,14 +100,57 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                         if !pool.is_library_reachable(id) {
                             continue;
                         }
-                        // Creates: hint only. No request_scan (poll heals deletes).
-                        match hint_ingest(db.as_ref(), pool.as_ref(), id, &ev.path) {
-                            Ok(outcome) => tracing::info!(
+                        // Show/season dirs and sidecars fire often on SMB; not media creates.
+                        // Ignored is expected — not "old files failed to index."
+                        if ev.path.is_dir() {
+                            tracing::debug!(
                                 library_id = id,
                                 path = %ev.path.display(),
-                                ?outcome,
-                                "fs change; hint ingest"
-                            ),
+                                "fs change; ignored directory (hint is media files only)"
+                            );
+                            continue;
+                        }
+                        if !is_media(&ev.path) {
+                            tracing::debug!(
+                                library_id = id,
+                                path = %ev.path.display(),
+                                "fs change; ignored non-media (sidecars/poll heal deletes)"
+                            );
+                            continue;
+                        }
+                        // Creates: hint only. No request_scan (poll heals deletes).
+                        match hint_ingest(db.as_ref(), pool.as_ref(), id, &ev.path) {
+                            Ok(HintIngestOutcome::Upserted { item_id }) => {
+                                tracing::info!(
+                                    library_id = id,
+                                    item_id,
+                                    path = %ev.path.display(),
+                                    "fs change; hint ingest upserted"
+                                );
+                            }
+                            Ok(HintIngestOutcome::Unchanged { item_id }) => {
+                                // SMB often re-notifies existing files; not a new create.
+                                tracing::debug!(
+                                    library_id = id,
+                                    item_id,
+                                    path = %ev.path.display(),
+                                    "fs change; hint ingest unchanged"
+                                );
+                            }
+                            Ok(HintIngestOutcome::Ignored) => {
+                                tracing::debug!(
+                                    library_id = id,
+                                    path = %ev.path.display(),
+                                    "fs change; hint ingest ignored"
+                                );
+                            }
+                            Ok(HintIngestOutcome::Collision) => {
+                                tracing::warn!(
+                                    library_id = id,
+                                    path = %ev.path.display(),
+                                    "fs change; hint ingest fold collision"
+                                );
+                            }
                             Err(e) => tracing::warn!(
                                 library_id = id,
                                 path = %ev.path.display(),
