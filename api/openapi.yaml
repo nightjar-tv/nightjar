@@ -218,6 +218,154 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/items/{itemId}/metadata/candidates:
+    get:
+      operationId: searchMetadataCandidates
+      summary: Search TMDB candidates for manual metadata fix (ADR-0028)
+      description: >
+        Pre-accounts local-trust. Block 2 accounts work must make this
+        admin-only first — assign rewrites watch state across profiles.
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Override search title (default cleaned filename title)
+        - name: year
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Candidate list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataCandidatesResponse"
+        "404":
+          description: Item not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/items/{itemId}/metadata/assign:
+    post:
+      operationId: assignMetadata
+      summary: Assign a TMDB id (manual match, ADR-0028)
+      description: >
+        Ignores the 0.80 auto-match floor. Runs the ADR-0025 item_key migrator.
+        Pre-accounts local-trust; must become admin-only with accounts.
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MetadataAssignRequest"
+      responses:
+        "200":
+          description: Assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataAssignResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Item not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/items/{itemId}/metadata/clear:
+    post:
+      operationId: clearMetadataMatch
+      summary: Clear provider match; return to path item_key (ADR-0028)
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "200":
+          description: Cleared
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataClearResponse"
+        "404":
+          description: Item not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/items/{itemId}/metadata/retry:
+    post:
+      operationId: retryMetadataMatch
+      summary: Bust negative-result cache and re-queue automatic match (ADR-0028)
+      parameters:
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "200":
+          description: Queued pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataRetryResponse"
+        "404":
+          description: Item not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/artwork/{itemKey}/{kind}:
+    get:
+      operationId: getArtwork
+      summary: Serve cached artwork for an item_key (ADR-0027)
+      parameters:
+        - name: itemKey
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Opaque item_key (e.g. tmdb:movie:550)
+        - name: kind
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [poster, backdrop, banner, logo, still]
+        - name: w
+          in: query
+          required: false
+          schema:
+            type: integer
+            enum: [342, 780]
+          description: Derived width; omitted serves original when present
+      responses:
+        "200":
+          description: Image bytes
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/items/{itemId}/playback-info:
     get:
       operationId: getPlaybackInfo
@@ -1004,6 +1152,81 @@ components:
           type: integer
           format: int64
           description: Async scan job started for this library.
+
+    MetadataCandidate:
+      type: object
+      required: [provider, kind, id, title]
+      properties:
+        provider:
+          type: string
+          enum: [tmdb]
+        kind:
+          type: string
+          enum: [movie, tv]
+        id:
+          type: integer
+          format: int64
+        title:
+          type: string
+        year:
+          type: integer
+          nullable: true
+
+    MetadataCandidatesResponse:
+      type: object
+      required: [candidates]
+      properties:
+        candidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/MetadataCandidate"
+
+    MetadataAssignRequest:
+      type: object
+      required: [kind, id]
+      properties:
+        provider:
+          type: string
+          enum: [tmdb]
+          default: tmdb
+        kind:
+          type: string
+          enum: [movie, tv]
+        id:
+          type: integer
+          format: int64
+          description: TMDB movie id or TV series id
+
+    MetadataAssignResponse:
+      type: object
+      required: [itemKey, mediaItemId]
+      properties:
+        itemKey:
+          type: string
+        mediaItemId:
+          type: integer
+          format: int64
+
+    MetadataClearResponse:
+      type: object
+      required: [itemKey, mediaItemId]
+      properties:
+        itemKey:
+          type: string
+        mediaItemId:
+          type: integer
+          format: int64
+
+    MetadataRetryResponse:
+      type: object
+      required: [mediaItemId, status]
+      properties:
+        mediaItemId:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [pending]
 
     MediaItem:
       type: object

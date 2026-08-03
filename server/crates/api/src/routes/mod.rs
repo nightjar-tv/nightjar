@@ -1,5 +1,7 @@
+mod artwork;
 pub mod items;
 mod libraries;
+mod metadata_fix;
 pub mod sessions;
 mod system;
 mod track_ids;
@@ -33,6 +35,26 @@ pub fn router(state: AppState) -> Router {
             get(libraries::list_items),
         )
         .route("/api/v0/items/{item_id}", get(items::get))
+        .route(
+            "/api/v0/artwork/{item_key}/{kind}",
+            get(artwork::get_artwork),
+        )
+        .route(
+            "/api/v0/items/{item_id}/metadata/candidates",
+            get(metadata_fix::candidates),
+        )
+        .route(
+            "/api/v0/items/{item_id}/metadata/assign",
+            post(metadata_fix::assign_match),
+        )
+        .route(
+            "/api/v0/items/{item_id}/metadata/clear",
+            post(metadata_fix::clear),
+        )
+        .route(
+            "/api/v0/items/{item_id}/metadata/retry",
+            post(metadata_fix::retry),
+        )
         .route(
             "/api/v0/items/{item_id}/playback-info",
             get(items::playback_info),

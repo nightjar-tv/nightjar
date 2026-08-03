@@ -1,4 +1,5 @@
 mod error;
+mod metadata_drain;
 mod routes;
 mod state;
 mod stream;
@@ -66,6 +67,13 @@ async fn main() {
             "FFmpeg lacks zscale (libzimg); HDR→SDR sessions will be refused (ADR-0022)"
         );
     }
+    let artwork = nightjar_metadata::ArtworkStore::new(&data_dir)
+        .map(std::sync::Arc::new)
+        .map_err(|e| {
+            tracing::warn!(error = %e, "artwork store init failed");
+            e
+        })
+        .ok();
     let state = AppState {
         db,
         hls,
@@ -73,8 +81,11 @@ async fn main() {
         tonemap_available,
         subs,
         pool: std::sync::Arc::clone(&pool),
+        artwork,
     };
     nightjar_scanner::spawn_library_watcher(std::sync::Arc::clone(&state.db), pool);
+    // ADR-0026: metadata is async; scan never waits. Own SQLite connection.
+    metadata_drain::spawn_metadata_drain(data_dir.clone());
 
     let app = routes::router(state)
         .fallback(static_handler)
