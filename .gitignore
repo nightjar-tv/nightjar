@@ -49,3 +49,15 @@ scripts/__pycache__/
 # Gate 2 orphan soak live logs (script is tracked; runs are local)
 notes/gate2/
 
+
+# Local toolchains / container caches (never ship)
+.tools/
+.cargo-docker/
+server/target-docker/
+dist/
+
+# Engine bake-off generated Flutter output
+apps/engine-bakeoff/build/
+apps/engine-bakeoff/macos/Pods/
+apps/engine-bakeoff/macos/Flutter/
+apps/engine-bakeoff/macos/ephemeral/
