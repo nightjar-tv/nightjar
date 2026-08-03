@@ -645,9 +645,15 @@ export interface components {
             sizeBytes: number;
             probeStatus: components["schemas"]["ProbeStatus"];
             subtitleStatus: components["schemas"]["SubtitleStatus"];
+            metadataStatus: components["schemas"]["MetadataStatus"];
             scanError?: string | null;
             playbackMethod: components["schemas"]["PlaybackMethod"];
         };
+        /**
+         * @description Metadata pipeline state (ADR-0026). `pending` = search tier queued; `matched` = identity found, detail enrichment pending; `ready` = full metadata bound; `unmatched` = search terminal no-match.
+         * @enum {string}
+         */
+        MetadataStatus: "pending" | "matched" | "ready" | "unmatched";
         ScanJobAccepted: {
             /** Format: int64 */
             jobId: number;
