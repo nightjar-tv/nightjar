@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-08-03
+- Amended: 2026-08-04 (poll holdoff after deferred_remove > 0)
 - Depends on: ADR-0025 §4 (path-key grammar); ADR-0014 (reachability /
   `delete_missing`); ADR-0015 (async library jobs); ADR-0029 (join stores
   provider keys only — path keys derived)
@@ -241,10 +242,18 @@ Operators (and later UI/doctor) can see the delta before the second pass.
 This makes the 0.90 default less load-bearing for quiet partial trees.
 `deferred_remove` is a **per-job counter** on the repoint job row (not a
 sticky library flag); unmatched rows remain until the next `kind=scan`
-runs `delete_missing` — that scan is the only clear. If no ordinary scan
-ever runs, orphans sit indefinitely with no UI beyond the job JSON (ASS
-pattern). A second repoint before that scan defers again and records a new
-`deferred_remove` on the new job; still no delete until a `kind=scan`.
+runs `delete_missing` — that scan is the only clear.
+
+**Poll holdoff after deferred_remove > 0 (Gate 3 dogfood).** When the
+repoint index records `deferred_remove > 0`, the process arms an in-memory
+holdoff (default **1 hour**): **poll** skips starting a full walk for that
+library so automatic discovery cannot apply the deferred deletes before
+review. **Manual `POST .../scan` is still allowed** (operator explicit).
+Holdoff clears when a successful ordinary scan completes, or when the
+duration expires (process restart also drops the holdoff — one delete scan
+may run; acceptable for v1). A second repoint before that scan defers
+again and records a new `deferred_remove` on the new job; still no delete
+until a `kind=scan`.
 
 ### 4. What a successful repoint preserves; API `path`
 

@@ -22,10 +22,14 @@ use nightjar_db::{Db, ItemPathRow, UpsertItem, fold_path, resolve_media_path, to
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// ADR-0030 §3: refuse repoint if matched/current < this fraction.
 pub const REPOINT_RETAIN_FRACTION: f64 = 0.90;
+
+/// After a repoint with deferred_remove > 0, poll skips full walks for this
+/// long so the operator can review before delete_missing runs (ADR-0030).
+pub const REPOINT_DELETE_HOLDOFF: Duration = Duration::from_secs(3600);
 
 const INDEX_BATCH: usize = 200;
 
@@ -72,16 +76,32 @@ pub fn request_scan(
         }
         return Ok(existing);
     }
+    // Poll must not apply deferred_remove until holdoff ends or manual scan.
+    if matches!(trigger, ScanTrigger::Poll) && pool.repoint_delete_holdoff_active(library_id) {
+        tracing::info!(
+            library_id,
+            "poll skipped; repoint deferred_remove holdoff active"
+        );
+        return Ok(0);
+    }
     let job_id = db.create_scan_job(library_id)?;
     std::thread::Builder::new()
         .name(format!("scan-job-{job_id}"))
         .spawn(move || {
-            if let Err(e) = run_scan_job(&db, &pool, job_id, library_id) {
-                tracing::error!(job_id, library_id, error = %e, "scan job failed");
-                let _ = db.fail_scan_job(job_id, &e);
-            }
+            let scan_ok = match run_scan_job(&db, &pool, job_id, library_id) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(job_id, library_id, error = %e, "scan job failed");
+                    let _ = db.fail_scan_job(job_id, &e);
+                    false
+                }
+            };
             // Drop any leftover hint dirt so it cannot suppress a later job.
             let _ = pool.take_dirty_add(library_id);
+            if scan_ok {
+                // Ordinary scan is the clear for deferred_remove holdoff.
+                pool.clear_repoint_delete_holdoff(library_id);
+            }
             if pool.take_scan_dirty(library_id) {
                 tracing::info!(
                     library_id,
@@ -717,6 +737,16 @@ fn run_index_pass(
         };
         let _ = db.set_scan_job_skipped_outside_root(job_id, skipped_outside_root);
         let _ = db.set_scan_job_deferred_remove(job_id, deferred_remove);
+        if defer_repoint && deferred_remove > 0 {
+            pool.set_repoint_delete_holdoff(library_id, REPOINT_DELETE_HOLDOFF);
+            tracing::info!(
+                library_id,
+                job_id,
+                deferred_remove,
+                holdoff_s = REPOINT_DELETE_HOLDOFF.as_secs(),
+                "repoint deferred_remove holdoff armed; poll will skip until clear or expiry"
+            );
+        }
         let unresolved = db
             .get_library(library_id)?
             .map(|l| l.paths_unresolved)
@@ -2029,5 +2059,152 @@ mod tests {
         assert!(job_id > 0);
         let job = db.get_scan_job(job_id).unwrap().unwrap();
         assert_eq!(job.library_id, lib.id);
+    }
+
+    #[test]
+    fn repoint_holdoff_blocks_poll_not_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("a.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+
+        pool.set_repoint_delete_holdoff(lib.id, Duration::from_secs(3600));
+        assert!(pool.repoint_delete_holdoff_active(lib.id));
+
+        let polled = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        assert_eq!(polled, 0, "poll must no-op under holdoff");
+        assert!(
+            db.active_scan_job(lib.id).unwrap().is_none(),
+            "poll must not start a job under holdoff"
+        );
+
+        let manual = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
+        assert!(manual > 0);
+        wait_job(&db, manual);
+        assert!(
+            !pool.repoint_delete_holdoff_active(lib.id),
+            "successful ordinary scan clears holdoff"
+        );
+
+        let after = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        assert!(after > 0, "poll works again after holdoff clear");
+        wait_job(&db, after);
+    }
+
+    #[test]
+    fn repoint_holdoff_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("a.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        pool.set_repoint_delete_holdoff(lib.id, Duration::from_millis(80));
+        assert!(pool.repoint_delete_holdoff_active(lib.id));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!pool.repoint_delete_holdoff_active(lib.id));
+        let polled = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        assert!(polled > 0);
+        wait_job(&db, polled);
+    }
+
+    #[test]
+    fn repoint_with_deferred_remove_arms_holdoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old");
+        let new_root = dir.path().join("new");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        // 10 keep + 1 gone → retain 10/11 ≥ 0.90, deferred_remove = 1.
+        for i in 0..10 {
+            let name = format!("keep{i}.mp4");
+            fs::write(old_root.join(&name), b"data").unwrap();
+            fs::write(new_root.join(&name), b"data").unwrap();
+        }
+        fs::write(old_root.join("gone.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: old_root.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 11);
+
+        let repoint_id = request_repoint(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            &new_root.to_string_lossy(),
+        )
+        .unwrap();
+        wait_job(&db, repoint_id);
+        let job = db.get_scan_job(repoint_id).unwrap().unwrap();
+        assert_eq!(job.state, "completed", "repoint: {:?}", job.error_message);
+        assert_eq!(job.deferred_remove, 1);
+        assert!(
+            pool.repoint_delete_holdoff_active(lib.id),
+            "deferred_remove > 0 must arm holdoff"
+        );
+        assert_eq!(
+            request_scan(
+                Arc::clone(&db),
+                Arc::clone(&pool),
+                lib.id,
+                ScanTrigger::Poll
+            )
+            .unwrap(),
+            0
+        );
     }
 }
