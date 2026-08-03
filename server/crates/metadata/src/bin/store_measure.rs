@@ -278,7 +278,7 @@ fn main() {
                 if let Some(id) = show_id {
                     for &sn in seasons {
                         match client.season_detail(id, sn) {
-                            Ok(raw) => {
+                            Ok(Some(raw)) => {
                                 match persist_hit_with_canonical(&conn, "tmdb", &raw, |_| Ok(())) {
                                     Ok(()) => seasons_stored += 1,
                                     Err(e) => {
@@ -286,6 +286,9 @@ fn main() {
                                         season_errors += 1;
                                     }
                                 }
+                            }
+                            Ok(None) => {
+                                // Missing season on TMDB — skip (same as product bind).
                             }
                             Err(e) => {
                                 eprintln!("season {id}/{sn}: {e}");

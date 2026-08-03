@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use nightjar_metadata::{
     AUTO_MATCH_FLOOR, LibrarySeriesShape, SearchKind, TmdbClient, clean_movie_title,
-    clean_show_title, meets_auto_match_floor, resolve_credentials, series_library_year,
-    year_from_path,
+    clean_show_title, meets_auto_match_floor, pick_reference_episode, resolve_credentials,
+    series_library_year, year_from_path,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -29,6 +29,9 @@ struct QueryKey {
     library_year: Option<i32>,
     episode_count: Option<u32>,
     season_count: Option<u32>,
+    ref_season: Option<i32>,
+    ref_episode: Option<i32>,
+    ref_episode_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +41,8 @@ struct EpisodeRow {
     year: Option<i32>,
     path: String,
     season: Option<i32>,
+    episode: Option<i32>,
+    library_id: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,7 +131,10 @@ fn main() {
     }
     {
         let mut stmt = con
-            .prepare("SELECT id, title, year, path, season FROM media_items WHERE kind = 'episode'")
+            .prepare(
+                "SELECT id, title, year, path, season, episode, library_id
+                 FROM media_items WHERE kind = 'episode'",
+            )
             .unwrap();
         let rows = stmt
             .query_map([], |r| {
@@ -136,11 +144,17 @@ fn main() {
                     year: r.get(2)?,
                     path: r.get(3)?,
                     season: r.get(4)?,
+                    episode: r.get(5)?,
+                    library_id: r.get(6)?,
                 })
             })
             .unwrap();
         for row in rows {
-            episodes.push(row.unwrap());
+            let row = row.unwrap();
+            if testdata_libs.contains(&row.library_id) {
+                continue;
+            }
+            episodes.push(row);
         }
     }
 
@@ -155,6 +169,9 @@ fn main() {
             library_year: None,
             episode_count: None,
             season_count: None,
+            ref_season: None,
+            ref_episode: None,
+            ref_episode_title: None,
         };
         movie_groups.entry(key).or_default().push(*id);
     }
@@ -175,6 +192,20 @@ fn main() {
         let episode_count = Some(rows.len() as u32);
         let seasons: HashSet<i32> = rows.iter().filter_map(|r| r.season).collect();
         let season_count = (!seasons.is_empty()).then_some(seasons.len() as u32);
+        let ep_triples: Vec<(i32, i32, &str)> = rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.season?,
+                    r.episode?,
+                    std::path::Path::new(&r.path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(r.path.as_str()),
+                ))
+            })
+            .collect();
+        let ref_ep = pick_reference_episode(&ep_triples, &ct);
         let key = QueryKey {
             kind: QueryKind::Tv,
             title: ct,
@@ -182,6 +213,9 @@ fn main() {
             library_year,
             episode_count,
             season_count,
+            ref_season: ref_ep.as_ref().map(|p| p.0),
+            ref_episode: ref_ep.as_ref().map(|p| p.1),
+            ref_episode_title: ref_ep.map(|p| p.2),
         };
         ep_groups
             .entry(key)
@@ -221,7 +255,9 @@ fn main() {
             year: key.library_year,
             episode_count: key.episode_count,
             season_count: key.season_count,
-            ..Default::default()
+            ref_season: key.ref_season,
+            ref_episode: key.ref_episode,
+            ref_episode_title: key.ref_episode_title.clone(),
         };
         match client.match_search_with_series_shape(kind, &key.title, key.year, library) {
             Ok(Some(c)) if meets_auto_match_floor(c.confidence) => *matched += n,

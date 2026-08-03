@@ -216,14 +216,7 @@ impl TmdbClient {
         let nk = norm_key(title);
         let exact: Vec<&SearchHit> = results
             .iter()
-            .filter(|r| {
-                let (primary, original) = match kind {
-                    SearchKind::Movie => (r.title.as_deref(), r.original_title.as_deref()),
-                    SearchKind::Tv => (r.name.as_deref(), r.original_name.as_deref()),
-                };
-                primary.is_some_and(|t| norm_key(t) == nk)
-                    || original.is_some_and(|t| norm_key(t) == nk)
-            })
+            .filter(|r| crate::match_score::title_hit(r, &nk, kind))
             .take(8)
             .collect();
         let mut shapes = Vec::with_capacity(exact.len());
@@ -357,20 +350,26 @@ impl TmdbClient {
     }
 
     /// Season detail keyed `{show_id}:{season_number}` (ADR-0026 §4).
+    /// HTTP 404 → `Ok(None)` so bind can skip a missing season and continue
+    /// with other seasons (library S2+ vs TMDB shape lag).
     pub fn season_detail(
         &self,
         show_id: i64,
         season_number: i32,
-    ) -> Result<RawProviderPayload, ResolveError> {
-        let data = self.get_json(
-            &format!("/tv/{show_id}/season/{season_number}"),
+    ) -> Result<Option<RawProviderPayload>, ResolveError> {
+        let path = format!("/tv/{show_id}/season/{season_number}");
+        let Some(data) = self.get_json_optional(
+            &path,
             &[("append_to_response", SEASON_APPEND), ("language", "en-US")],
-        )?;
-        Ok(RawProviderPayload {
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RawProviderPayload {
             entity_kind: "season".into(),
             provider_id: format!("{show_id}:{season_number}"),
             payload: data.to_string(),
-        })
+        }))
     }
 
     /// Search + floor gate + detail. Returns metadata when confidence ≥
@@ -487,7 +486,7 @@ impl MetadataSource for TmdbClient {
         show_id: i64,
         season_number: i32,
     ) -> Result<Option<RawProviderPayload>, ResolveError> {
-        Ok(Some(self.season_detail(show_id, season_number)?))
+        self.season_detail(show_id, season_number)
     }
 }
 

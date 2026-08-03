@@ -29,6 +29,12 @@ pub struct SearchHit {
     pub release_date: Option<String>,
     #[serde(default)]
     pub first_air_date: Option<String>,
+    /// Poster CDN path from the search response (two-tier fast capture; the
+    /// same string the detail payload carries, ADR-0027 §2).
+    #[serde(default)]
+    pub poster_path: Option<String>,
+    #[serde(default)]
+    pub backdrop_path: Option<String>,
 }
 
 /// Library-side series shape for collision pins (TV).
@@ -105,13 +111,40 @@ fn display_title(hit: &SearchHit, kind: SearchKind) -> Option<String> {
     }
 }
 
-fn title_hit(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
+pub fn title_hit(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
     let (primary, original) = match kind {
         SearchKind::Movie => (hit.title.as_deref(), hit.original_title.as_deref()),
         SearchKind::Tv => (hit.name.as_deref(), hit.original_name.as_deref()),
     };
-    primary.is_some_and(|t| norm_key(t) == query_norm)
-        || original.is_some_and(|t| norm_key(t) == query_norm)
+    primary.is_some_and(|t| name_matches_query(t, query_norm, kind))
+        || original.is_some_and(|t| name_matches_query(t, query_norm, kind))
+}
+
+/// Exact fold match, or (TV only) candidate is query plus a longer official name
+/// ("The Continental" → "The Continental: From the World of John Wick").
+fn name_matches_query(name: &str, query_norm: &str, kind: SearchKind) -> bool {
+    let nk = norm_key(name);
+    if nk == query_norm {
+        return true;
+    }
+    if kind != SearchKind::Tv || query_norm.is_empty() {
+        return false;
+    }
+    // Prefix: "the continental from the world…" after colon fold.
+    if nk.starts_with(query_norm)
+        && nk.len() > query_norm.len()
+        && nk.as_bytes().get(query_norm.len()) == Some(&b' ')
+    {
+        return true;
+    }
+    // Head before ':' if colon survived folding.
+    if let Some(head) = nk.split(':').next() {
+        let head = head.trim();
+        if head == query_norm {
+            return true;
+        }
+    }
+    false
 }
 
 /// Soft episode-count match: absolute or proportional slack so incomplete
@@ -122,8 +155,17 @@ fn episode_count_close(library: u32, candidate: u32) -> bool {
     diff <= tol.max(5)
 }
 
+/// Empty TMDB shells (0 seasons / 0 episodes) never auto-pin.
+fn is_empty_shell(shape: &CandidateShape) -> bool {
+    matches!(shape.season_count, Some(0))
+        || (matches!(shape.episode_count, Some(0)) && matches!(shape.season_count, Some(0)))
+        || (matches!(shape.episode_count, Some(0)) && shape.season_count.is_none())
+}
+
 /// First discriminator that selects exactly one of `exact` wins.
-/// Order: premiere year → episode count → season count (exact).
+/// Order: episode count → season count → premiere year.
+/// Counts first so folder year cannot pin a miniseries when the library is a
+/// multi-season series (Battlestar Galactica 2003 folder vs 2004 series).
 fn pin_collision<'a>(
     exact: &[&'a SearchHit],
     shapes: &[CandidateShape],
@@ -134,6 +176,9 @@ fn pin_collision<'a>(
     let try_pin = |pred: &dyn Fn(usize) -> bool, method: &'static str| {
         let mut hit: Option<&SearchHit> = None;
         for (i, h) in exact.iter().enumerate() {
+            if is_empty_shell(&shapes[i]) {
+                continue;
+            }
             if pred(i) {
                 if hit.is_some() {
                     return None; // two+
@@ -144,11 +189,6 @@ fn pin_collision<'a>(
         hit.map(|h| (h, method))
     };
 
-    if let Some(ly) = library.year
-        && let Some(p) = try_pin(&|i| shapes[i].year == Some(ly), "exact_title_library_year")
-    {
-        return Some(p);
-    }
     if let Some(le) = library.episode_count
         && let Some(p) = try_pin(
             &|i| {
@@ -166,6 +206,11 @@ fn pin_collision<'a>(
             &|i| shapes[i].season_count == Some(ls),
             "exact_title_season_count",
         )
+    {
+        return Some(p);
+    }
+    if let Some(ly) = library.year
+        && let Some(p) = try_pin(&|i| shapes[i].year == Some(ly), "exact_title_library_year")
     {
         return Some(p);
     }
@@ -271,27 +316,38 @@ pub fn score_search_with_shape(
             .unwrap();
         (hit, 0.70, "exact_title_year_nearest")
     } else if !exact.is_empty() {
+        // Build shapes from search years when caller omitted detail.
+        let owned: Vec<CandidateShape> = exact
+            .iter()
+            .map(|h| CandidateShape {
+                year: row_year(h, kind),
+                episode_count: None,
+                season_count: None,
+            })
+            .collect();
+        let shapes = match candidate_shapes {
+            Some(s) if s.len() == exact.len() => s,
+            _ => owned.as_slice(),
+        };
         if exact.len() == 1 {
-            (exact[0], 0.90, "exact_title")
-        } else {
-            // Build shapes from search years when caller omitted detail.
-            let owned: Vec<CandidateShape> = exact
-                .iter()
-                .map(|h| CandidateShape {
-                    year: row_year(h, kind),
-                    episode_count: None,
-                    season_count: None,
-                })
-                .collect();
-            let shapes = match candidate_shapes {
-                Some(s) if s.len() == exact.len() => s,
-                _ => owned.as_slice(),
-            };
-            if let Some((hit, method)) = pin_collision(&exact, shapes, library) {
-                (hit, 0.90, method)
+            // Sole exact hit that is an empty TMDB shell stays below floor.
+            if is_empty_shell(&shapes[0]) {
+                (exact[0], 0.72, "exact_title_empty_shell")
             } else {
-                (exact[0], 0.72, "exact_title_collision_unpinned")
+                (exact[0], 0.90, "exact_title")
             }
+        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library) {
+            (hit, 0.90, method)
+        } else {
+            // Prefer first non-empty candidate for the unpinned method payload,
+            // but stay below floor.
+            let hit = exact
+                .iter()
+                .enumerate()
+                .find(|(i, _)| !is_empty_shell(&shapes[*i]))
+                .map(|(_, h)| *h)
+                .unwrap_or(exact[0]);
+            (hit, 0.72, "exact_title_collision_unpinned")
         }
     } else {
         let hit = &results[0];
@@ -331,11 +387,20 @@ pub fn needs_collision_detail(
     if !has_count && !has_ref {
         return false;
     }
+    let nk = norm_key(title);
+    let exact_n = results.iter().filter(|r| title_hit(r, &nk, kind)).count();
+    // Multi-exact with library shape: always fetch counts so episode/season
+    // pins can outrank a misleading folder year (BSG 2003 mini vs 2004 series).
+    if exact_n > 1 && has_count {
+        return true;
+    }
     let Some(c) = score_search_with_shape(results, title, year, kind, library.clone(), None) else {
         return false;
     };
     // Still below floor after year-only pin → fetch detail counts / title tier.
-    c.confidence < AUTO_MATCH_FLOOR && c.method == "exact_title_collision_unpinned"
+    // Empty-shell sole hit also needs detail (or stays unmatched).
+    c.confidence < AUTO_MATCH_FLOOR
+        && (c.method == "exact_title_collision_unpinned" || c.method == "exact_title_empty_shell")
 }
 
 pub fn meets_auto_match_floor(confidence: f64) -> bool {
@@ -355,6 +420,8 @@ mod tests {
             original_name: None,
             release_date: Some(format!("{year}-01-01")),
             first_air_date: None,
+            poster_path: None,
+            backdrop_path: None,
         }
     }
 
@@ -367,6 +434,8 @@ mod tests {
             original_name: Some(name.into()),
             release_date: None,
             first_air_date: Some(format!("{year}-01-01")),
+            poster_path: None,
+            backdrop_path: None,
         }
     }
 
@@ -524,6 +593,151 @@ mod tests {
         .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
         assert_eq!(m.method, "exact_title_collision_unpinned");
+    }
+
+    /// Same title, long classic vs short reboot: episode count picks classic
+    /// even when both years could confuse a human.
+    #[test]
+    fn long_run_episode_count_pins_over_short_reboot() {
+        let results = vec![tv(10, "Alpha", 2001), tv(20, "Alpha", 2026)];
+        let shapes = [
+            CandidateShape {
+                year: Some(2001),
+                episode_count: Some(181),
+                season_count: Some(9),
+            },
+            CandidateShape {
+                year: Some(2026),
+                episode_count: Some(12),
+                season_count: Some(2),
+            },
+        ];
+        let m = score_search_with_shape(
+            &results,
+            "Alpha",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: Some(2001),
+                episode_count: Some(181),
+                season_count: Some(9),
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.tmdb_id, 10);
+        assert_eq!(m.method, "exact_title_episode_count");
+        assert!(meets_auto_match_floor(m.confidence));
+    }
+
+    /// Folder year uniquely matches a miniseries, but library shape is a
+    /// multi-season series — counts must outrank year.
+    #[test]
+    fn folder_year_miniseries_loses_to_library_shape() {
+        let results = vec![tv(100, "Bravo", 2004), tv(200, "Bravo", 2003)];
+        let shapes = [
+            CandidateShape {
+                year: Some(2004),
+                episode_count: Some(73),
+                season_count: Some(4),
+            },
+            CandidateShape {
+                year: Some(2003),
+                episode_count: Some(2),
+                season_count: Some(1),
+            },
+        ];
+        let m = score_search_with_shape(
+            &results,
+            "Bravo",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: Some(2003), // folder year — mini only
+                episode_count: Some(72),
+                season_count: Some(4),
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.tmdb_id, 100);
+        assert!(
+            m.method == "exact_title_episode_count" || m.method == "exact_title_season_count",
+            "method={}",
+            m.method
+        );
+        assert!(meets_auto_match_floor(m.confidence));
+    }
+
+    /// Cleaned folder title is a short prefix of the official TMDB name;
+    /// empty shell (0 seasons/eps) must not win.
+    #[test]
+    fn short_query_matches_long_official_title_over_empty_shell() {
+        let mut shell = tv(1, "Charlie", 0);
+        shell.first_air_date = None;
+        let long = SearchHit {
+            id: 2,
+            title: None,
+            name: Some("Charlie: Extended Official Title".into()),
+            original_title: None,
+            original_name: Some("Charlie: Extended Official Title".into()),
+            release_date: None,
+            first_air_date: Some("2023-09-22".into()),
+            poster_path: None,
+            backdrop_path: None,
+        };
+        let results = vec![shell, long];
+        let shapes = [
+            CandidateShape {
+                year: None,
+                episode_count: Some(0),
+                season_count: Some(0),
+            },
+            CandidateShape {
+                year: Some(2023),
+                episode_count: Some(3),
+                season_count: Some(1),
+            },
+        ];
+        let m = score_search_with_shape(
+            &results,
+            "Charlie",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: Some(2023),
+                episode_count: Some(3),
+                season_count: Some(1),
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.tmdb_id, 2);
+        assert!(meets_auto_match_floor(m.confidence));
+    }
+
+    #[test]
+    fn empty_shell_sole_exact_stays_below_floor() {
+        let results = vec![tv(1, "Delta", 2000)];
+        let shapes = [CandidateShape {
+            year: Some(2000),
+            episode_count: Some(0),
+            season_count: Some(0),
+        }];
+        let m = score_search_with_shape(
+            &results,
+            "Delta",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape::default(),
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.method, "exact_title_empty_shell");
+        assert!(!meets_auto_match_floor(m.confidence));
     }
 
     #[test]

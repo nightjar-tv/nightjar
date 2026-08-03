@@ -59,7 +59,15 @@ struct Report {
     visible_n: usize,
     exclude_libraries: Vec<String>,
     stopped_early: bool,
+    /// True when at least one season detail was fetched during bind.
     seasons_in_drain: bool,
+    seasons_fetched: usize,
+    episodes_projected: usize,
+    files_linked: usize,
+    seasons_skipped: usize,
+    bind_errors: usize,
+    /// Ready episode files with no provider link after drain (path-keyed).
+    ready_episodes_unlinked: i64,
     note: String,
 }
 
@@ -151,9 +159,12 @@ fn main() {
         conn.execute("UPDATE media_items SET metadata_status = 'pending'", [])
             .expect("reset pending");
     }
+    // Clean store so bind coverage is first-run, not residual from a prior measure.
     conn.execute_batch(
         "DELETE FROM metadata_raw_payloads;
-         DELETE FROM metadata_negative_cache;",
+         DELETE FROM metadata_negative_cache;
+         DELETE FROM metadata_canonical;
+         DELETE FROM media_item_links;",
     )
     .ok();
 
@@ -193,6 +204,18 @@ fn main() {
     let wall = t0.elapsed().as_secs_f64();
 
     let t_fs = stats.t_first_screen_secs;
+    let ready_episodes_unlinked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_items m
+             WHERE m.kind = 'episode' AND m.metadata_status = 'ready'
+               AND NOT EXISTS (
+                 SELECT 1 FROM media_item_links l WHERE l.media_item_id = m.id
+               )",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     let note = if first_screen {
         match t_fs {
             Some(t) if (t - predicted).abs() <= 10.0 => {
@@ -212,7 +235,10 @@ fn main() {
             None => "Proxy never reached terminal (provider errors left pending?).".into(),
         }
     } else {
-        "Not a first-screen run.".into()
+        format!(
+            "Full/probe drain. seasons_fetched={} files_linked={} ready_episodes_unlinked={ready_episodes_unlinked}.",
+            stats.seasons_fetched, stats.files_linked
+        )
     };
 
     let report = Report {
@@ -260,7 +286,13 @@ fn main() {
         visible_n: VISIBLE_FIRST_SCREEN_N,
         exclude_libraries: exclude_libs,
         stopped_early: stats.stopped_early,
-        seasons_in_drain: false,
+        seasons_in_drain: stats.seasons_fetched > 0,
+        seasons_fetched: stats.seasons_fetched,
+        episodes_projected: stats.episodes_projected,
+        files_linked: stats.files_linked,
+        seasons_skipped: stats.seasons_skipped,
+        bind_errors: stats.bind_errors,
+        ready_episodes_unlinked,
         note,
     };
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
