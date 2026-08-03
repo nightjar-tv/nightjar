@@ -278,6 +278,182 @@ pub fn clean_show_title(raw: &str) -> (String, Option<i32>) {
     (t, y)
 }
 
+/// ADR-0032 rejection list for reference episode titles. When uncertain,
+/// treat as rejected (decline rather than guess).
+pub fn episode_title_rejected(after_token: &str, show_soft_key: &str) -> bool {
+    let t = after_token.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let collapsed = fold_alnum_words(t);
+    if collapsed.is_empty() {
+        return true;
+    }
+    if let Some(rest) = collapsed.strip_prefix("episode ")
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    if let Some(rest) = collapsed.strip_prefix("ep ")
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    if let Some(rest) = collapsed.strip_prefix("ep")
+        && !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    let show = fold_alnum_words(show_soft_key);
+    if !show.is_empty() && collapsed == show {
+        return true;
+    }
+    false
+}
+
+fn fold_alnum_words(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+const RELEASE_JUNK: &[&str] = &[
+    "bluray", "blu-ray", "blu ray", "web-dl", "webdl", "webrip", "hdtv", "dvdrip", "remux",
+    "2160p", "1080p", "720p", "480p", "x264", "x265", "h264", "h265", "hevc", "aac", "dts",
+    "truehd", "atmos", "hdr10", "proper", "repack", "extended", "unrated", "multi", "subbed",
+    "dual", "internal",
+];
+
+fn strip_release_junk_fragment(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut cut = lower.len();
+    for tok in RELEASE_JUNK {
+        if let Some(idx) = lower.find(tok) {
+            let ok_boundary = idx == 0
+                || matches!(
+                    lower.as_bytes()[idx - 1],
+                    b'.' | b' ' | b'_' | b'-' | b'[' | b'('
+                );
+            if ok_boundary && idx < cut {
+                cut = idx;
+            }
+        }
+    }
+    s[..cut.min(s.len())]
+        .trim()
+        .trim_matches([' ', '-', '_', '.', '–', '—'])
+        .to_string()
+}
+
+/// Text after SxxExx / NxNN in a basename, release junk stripped.
+pub fn after_token_episode_title(basename: &str, season: i32, episode: i32) -> Option<String> {
+    let stem = match basename.rfind('.') {
+        Some(i) if i > 0 => &basename[..i],
+        _ => basename,
+    };
+    let lower = stem.to_ascii_lowercase();
+    let end = find_episode_token_end(&lower, season, episode)?;
+    if end >= stem.len() {
+        return Some(String::new());
+    }
+    let rest = stem[end..]
+        .trim_start_matches([' ', '-', '_', '.', '–', '—'])
+        .trim();
+    Some(strip_release_junk_fragment(rest))
+}
+
+fn find_episode_token_end(lower: &str, season: i32, episode: i32) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b's' {
+            let mut j = i + 1;
+            let mut s = 0i32;
+            let mut sd = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && sd < 3 {
+                s = s * 10 + (bytes[j] - b'0') as i32;
+                j += 1;
+                sd += 1;
+            }
+            if sd > 0 && j < bytes.len() && bytes[j] == b'e' {
+                j += 1;
+                let mut e = 0i32;
+                let mut ed = 0;
+                while j < bytes.len() && bytes[j].is_ascii_digit() && ed < 3 {
+                    e = e * 10 + (bytes[j] - b'0') as i32;
+                    j += 1;
+                    ed += 1;
+                }
+                if ed > 0 && s == season && e == episode {
+                    return Some(j);
+                }
+            }
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut s = 0i32;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                s = s * 10 + (bytes[i] - b'0') as i32;
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'x' {
+                i += 1;
+                let mut e = 0i32;
+                let mut ed = 0;
+                while i < bytes.len() && bytes[i].is_ascii_digit() && ed < 3 {
+                    e = e * 10 + (bytes[i] - b'0') as i32;
+                    i += 1;
+                    ed += 1;
+                }
+                if ed > 0 && s == season && e == episode && start > 0 {
+                    return Some(i);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// ADR-0032 reference pick: usable mid-season preferred; S01E01 only if usable.
+pub fn pick_reference_episode(
+    episodes: &[(i32, i32, &str)],
+    show_soft_key: &str,
+) -> Option<(i32, i32, String)> {
+    let mut usable: Vec<(i32, i32, String)> = Vec::new();
+    for &(season, episode, basename) in episodes {
+        let Some(title) = after_token_episode_title(basename, season, episode) else {
+            continue;
+        };
+        if episode_title_rejected(&title, show_soft_key) {
+            continue;
+        }
+        usable.push((season, episode, title));
+    }
+    if usable.is_empty() {
+        return None;
+    }
+    // Prefer non-pilot (not S01E01 / 1x01).
+    if let Some(p) = usable
+        .iter()
+        .find(|(s, e, _)| !(*s == 1 && *e == 1))
+        .cloned()
+    {
+        return Some(p);
+    }
+    usable.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +515,26 @@ mod tests {
         assert_eq!(t, "will and grace");
         let (t, _) = clean_show_title("Shameless (US)");
         assert_eq!(t, "shameless");
+    }
+
+    #[test]
+    fn episode_title_rejection_list_and_reference_pick() {
+        assert!(episode_title_rejected("Episode 1", "shameless"));
+        assert!(episode_title_rejected("Ep 02", "show"));
+        assert!(episode_title_rejected("Shameless", "shameless"));
+        assert!(!episode_title_rejected("7.1", "9 1 1"));
+        assert!(!episode_title_rejected(
+            "I Hate You, Stephen Hawking",
+            "shameless"
+        ));
+
+        let eps = [
+            (1, 1, "Show - 1x01 - Episode 1 - Bluray-1080p.mkv"),
+            (1, 5, "Show - 1x05 - The Crossing - Bluray-1080p.mkv"),
+        ];
+        let (s, e, title) = pick_reference_episode(&eps, "show").unwrap();
+        assert_eq!((s, e), (1, 5));
+        assert_eq!(title, "The Crossing");
     }
 
     #[test]

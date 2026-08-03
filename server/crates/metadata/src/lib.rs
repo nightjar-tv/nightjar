@@ -22,16 +22,17 @@ pub use canonical::{
     upsert_canonical,
 };
 pub use clean::{
-    clean_movie_title, clean_show_title, fold_title_orthography, series_library_year,
-    year_from_path, year_from_show_folder,
+    after_token_episode_title, clean_movie_title, clean_show_title, episode_title_rejected,
+    fold_title_orthography, pick_reference_episode, series_library_year, year_from_path,
+    year_from_show_folder,
 };
 pub use item_links::{
     effective_item_key, link_keys_for_item, path_item_key, replace_auto_link, upsert_link,
 };
 pub use match_score::{
-    AUTO_MATCH_FLOOR, CandidateShape, LibrarySeriesShape, MatchCandidate, SearchHit, SearchKind,
-    meets_auto_match_floor, needs_collision_detail, norm_key, score_search,
-    score_search_with_library_year, score_search_with_shape,
+    AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, LibrarySeriesShape, MatchCandidate,
+    SearchHit, SearchKind, meets_auto_match_floor, needs_collision_detail, norm_key,
+    pin_episode_title, score_search, score_search_with_library_year, score_search_with_shape,
 };
 pub use measure_exclude::{
     MEASURE_EXCLUDE_LIBRARY_NAMES_DEFAULT, MEASURE_EXCLUDE_LIBRARY_NAMES_ENV,

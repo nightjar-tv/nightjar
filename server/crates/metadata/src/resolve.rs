@@ -29,6 +29,10 @@ pub struct ResolveInput {
     /// Distinct episode files / seasons under the show (TV collision pin).
     pub library_episode_count: Option<u32>,
     pub library_season_count: Option<u32>,
+    /// ADR-0032 reference episode for title pin (usable after-token only).
+    pub ref_season: Option<i32>,
+    pub ref_episode: Option<i32>,
+    pub ref_episode_title: Option<String>,
     /// Search target; episodes search as TV (ADR-0026).
     pub kind: Option<MetadataKind>,
 }
@@ -357,10 +361,8 @@ mod tests {
             nfo_xml: Some(fixture("malformed.nfo")),
             title: Some("Fight Club".into()),
             year: Some(1999),
-            library_year: None,
-            library_episode_count: None,
-            library_season_count: None,
             kind: Some(MetadataKind::Movie),
+            ..Default::default()
         })
         .unwrap();
         match outcome {

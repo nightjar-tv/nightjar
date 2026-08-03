@@ -32,7 +32,7 @@ pub struct SearchHit {
 }
 
 /// Library-side series shape for collision pins (TV).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibrarySeriesShape {
     /// Premiere year: earliest episode year, else show-folder `(YYYY)`.
     pub year: Option<i32>,
@@ -40,7 +40,14 @@ pub struct LibrarySeriesShape {
     pub episode_count: Option<u32>,
     /// Distinct season numbers present (excludes null).
     pub season_count: Option<u32>,
+    /// ADR-0032 reference episode (usable after-token title only).
+    pub ref_season: Option<i32>,
+    pub ref_episode: Option<i32>,
+    pub ref_episode_title: Option<String>,
 }
+
+/// Max multi-exact candidates for the episode-title pin (ADR-0032).
+pub const EPISODE_TITLE_TIE_CAP: usize = 5;
 
 /// Per-candidate extras (search year always; counts from `/tv/{id}` detail).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -165,6 +172,35 @@ fn pin_collision<'a>(
     None
 }
 
+/// ADR-0032 step 4: unique folded match of local reference title vs candidate
+/// episode names (parallel to `exact`). Declines when over cap or no unique hit.
+pub fn pin_episode_title<'a>(
+    exact: &[&'a SearchHit],
+    candidate_episode_names: &[Option<String>],
+    local_title: &str,
+) -> Option<(&'a SearchHit, &'static str)> {
+    if exact.len() > EPISODE_TITLE_TIE_CAP || exact.len() != candidate_episode_names.len() {
+        return None;
+    }
+    let want = norm_key(local_title);
+    if want.is_empty() {
+        return None;
+    }
+    let mut hit: Option<&SearchHit> = None;
+    for (i, h) in exact.iter().enumerate() {
+        let Some(name) = candidate_episode_names[i].as_deref() else {
+            continue;
+        };
+        if norm_key(name) == want {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(*h);
+        }
+    }
+    hit.map(|h| (h, "exact_title_episode_title"))
+}
+
 /// Score TMDB search results (ADR-0026 table + collision pin).
 pub fn score_search(
     results: &[SearchHit],
@@ -276,7 +312,8 @@ pub fn score_search_with_shape(
     })
 }
 
-/// Whether multi-exact scoring needs `/tv/{id}` detail for count pins.
+/// Whether multi-exact scoring needs `/tv/{id}` detail for count pins and/or
+/// may need the episode-title pin path (ADR-0032).
 pub fn needs_collision_detail(
     results: &[SearchHit],
     title: &str,
@@ -287,13 +324,17 @@ pub fn needs_collision_detail(
     if kind != SearchKind::Tv {
         return false;
     }
-    if library.episode_count.is_none() && library.season_count.is_none() {
+    let has_count = library.episode_count.is_some() || library.season_count.is_some();
+    let has_ref = library.ref_episode_title.is_some()
+        && library.ref_season.is_some()
+        && library.ref_episode.is_some();
+    if !has_count && !has_ref {
         return false;
     }
-    let Some(c) = score_search_with_shape(results, title, year, kind, library, None) else {
+    let Some(c) = score_search_with_shape(results, title, year, kind, library.clone(), None) else {
         return false;
     };
-    // Still below floor after year-only pin → fetch detail counts.
+    // Still below floor after year-only pin → fetch detail counts / title tier.
     c.confidence < AUTO_MATCH_FLOOR && c.method == "exact_title_collision_unpinned"
 }
 
@@ -408,6 +449,7 @@ mod tests {
                 year: None,
                 episode_count: Some(311),
                 season_count: Some(15),
+                ..Default::default()
             },
             Some(&shapes),
         )
@@ -442,6 +484,7 @@ mod tests {
                 year: None,
                 episode_count: Some(42),
                 season_count: Some(5),
+                ..Default::default()
             },
             Some(&shapes),
         )
@@ -474,12 +517,42 @@ mod tests {
                 year: None,
                 episode_count: Some(40),
                 season_count: Some(1),
+                ..Default::default()
             },
             Some(&shapes),
         )
         .unwrap();
         assert!((m.confidence - 0.72).abs() < f64::EPSILON);
         assert_eq!(m.method, "exact_title_collision_unpinned");
+    }
+
+    #[test]
+    fn episode_title_pins_unique_match() {
+        let a = tv(1, "Shameless", 2011);
+        let b = tv(2, "Shameless", 2004);
+        let exact = vec![&a, &b];
+        let names = vec![
+            Some("Pilot".into()),
+            Some("I Hate You, Stephen Hawking".into()),
+        ];
+        let (hit, method) =
+            pin_episode_title(&exact, &names, "I Hate You, Stephen Hawking").unwrap();
+        assert_eq!(hit.id, 2);
+        assert_eq!(method, "exact_title_episode_title");
+    }
+
+    #[test]
+    fn episode_title_declines_when_both_match_or_over_cap() {
+        let a = tv(1, "Top Gear", 1977);
+        let b = tv(2, "Top Gear", 2002);
+        let exact = vec![&a, &b];
+        let names = vec![Some("Episode 1".into()), Some("Episode 1".into())];
+        assert!(pin_episode_title(&exact, &names, "Episode 1").is_none());
+
+        let many: Vec<SearchHit> = (0..6).map(|i| tv(i, "Show", 2000 + i as i32)).collect();
+        let refs: Vec<&SearchHit> = many.iter().collect();
+        let names: Vec<_> = (0..6).map(|i| Some(format!("Title {i}"))).collect();
+        assert!(pin_episode_title(&refs, &names, "Title 1").is_none());
     }
 
     #[test]
