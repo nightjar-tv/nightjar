@@ -413,28 +413,53 @@ impl LibraryPool {
         let items = self.db.list_indexed_unprobed()?;
         let n = items.len();
         for (item_id, path, library_id) in items {
-            self.enqueue(WorkItem::probe(
-                item_id,
-                library_id,
-                PathBuf::from(path),
-                None,
-            ));
+            let abs = match self.abs_media_path(library_id, &path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(item_id, library_id, error = %e, "resolve path for pending probe");
+                    continue;
+                }
+            };
+            self.enqueue(WorkItem::probe(item_id, library_id, abs, None));
         }
         Ok(n)
     }
 
     pub fn drain_pending_extracts(&self) -> Result<(), String> {
         for (item_id, path, _, _, library_id) in self.db.list_pending_subtitle_items()? {
-            self.enqueue(WorkItem::extract(item_id, library_id, PathBuf::from(path)));
+            let abs = match self.abs_media_path(library_id, &path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(item_id, library_id, error = %e, "resolve path for pending extract");
+                    continue;
+                }
+            };
+            self.enqueue(WorkItem::extract(item_id, library_id, abs));
         }
         Ok(())
     }
 
     pub fn drain_pending_maps(&self) -> Result<(), String> {
         for (item_id, path, library_id) in self.db.list_pending_map_items()? {
-            self.enqueue(WorkItem::map(item_id, library_id, PathBuf::from(path)));
+            let abs = match self.abs_media_path(library_id, &path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(item_id, library_id, error = %e, "resolve path for pending map");
+                    continue;
+                }
+            };
+            self.enqueue(WorkItem::map(item_id, library_id, abs));
         }
         Ok(())
+    }
+
+    /// ADR-0030: join library root to stored relpath (absolute leftovers pass through).
+    fn abs_media_path(&self, library_id: i64, stored: &str) -> Result<PathBuf, String> {
+        let lib = self
+            .db
+            .get_library(library_id)?
+            .ok_or_else(|| format!("library {library_id} not found"))?;
+        Ok(nightjar_db::resolve_media_path(&lib.path, stored))
     }
 
     pub fn remove_item_subtitles(&self, item_id: i64) -> Result<(), String> {
@@ -523,7 +548,40 @@ impl LibraryPool {
             Self::finish_batch(&item);
             return;
         }
-        let update = match probe::ffprobe(&item.path) {
+        // Prefer DB-stored path (relpath) so WorkItem can carry either form (ADR-0030).
+        let stored = self
+            .db
+            .get_item(item.item_id)
+            .ok()
+            .flatten()
+            .map(|r| r.path)
+            .unwrap_or_else(|| item.path.to_string_lossy().into_owned());
+        let abs = match self.abs_media_path(item.library_id, &stored) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(item_id = item.item_id, error = %e, "resolve path for probe");
+                let _ = self.db.apply_probe_update(&ProbeUpdate {
+                    item_id: item.item_id,
+                    duration_ms: None,
+                    container: None,
+                    video_codec: None,
+                    audio_codec: None,
+                    audio_channels: None,
+                    width: None,
+                    height: None,
+                    video_bitrate_bps: None,
+                    hdr: None,
+                    probe_status: "unavailable".into(),
+                    scan_error: Some(e),
+                });
+                if let Some(job_id) = item.scan_job_id {
+                    let _ = self.db.bump_scan_job_probe(job_id, false);
+                }
+                Self::finish_batch(&item);
+                return;
+            }
+        };
+        let update = match probe::ffprobe(&abs) {
             Ok(p) => ProbeUpdate {
                 item_id: item.item_id,
                 duration_ms: p.duration_ms,
@@ -557,7 +615,7 @@ impl LibraryPool {
                     };
                 if unavailable {
                     tracing::warn!(
-                        path = %item.path.display(),
+                        path = %abs.display(),
                         error = %e,
                         "ffprobe unavailable"
                     );
@@ -576,7 +634,7 @@ impl LibraryPool {
                         scan_error: Some(e),
                     }
                 } else {
-                    tracing::warn!(path = %item.path.display(), error = %e, "ffprobe failed");
+                    tracing::warn!(path = %abs.display(), error = %e, "ffprobe failed");
                     ProbeUpdate {
                         item_id: item.item_id,
                         duration_ms: None,
@@ -656,6 +714,7 @@ impl LibraryPool {
                 return;
             }
         };
+        let media_path = nightjar_db::resolve_media_path(&lib_root, &row.path);
         let sidecars = match self.db.list_item_sidecars(item.item_id) {
             Ok(rows) => rows
                 .into_iter()
@@ -671,7 +730,7 @@ impl LibraryPool {
                 return;
             }
         };
-        match extract_item_subtitles(&self.subs, item.item_id, &item.path, &sidecars) {
+        match extract_item_subtitles(&self.subs, item.item_id, &media_path, &sidecars) {
             Ok(ExtractOutcome::Ready) => {
                 if let Err(e) = self.db.set_subtitle_status(
                     item.item_id,
@@ -767,9 +826,18 @@ impl LibraryPool {
             finish();
             return;
         }
+        let media_path = match self.abs_media_path(item.library_id, &row.path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(item_id, error = %e, "resolve path for map");
+                let _ = self.db.set_map_status(item_id, "unavailable");
+                finish();
+                return;
+            }
+        };
         let content_id = match row.content_id.clone() {
             Some(id) => id,
-            None => match nightjar_db::content_id_for_path(&item.path) {
+            None => match nightjar_db::content_id_for_path(&media_path) {
                 Ok(id) => {
                     if let Err(e) = self.db.set_content_id(item_id, &id) {
                         tracing::warn!(item_id, error = %e, "store content_id failed");
@@ -786,7 +854,7 @@ impl LibraryPool {
                 }
             },
         };
-        match crate::keymap::build_keyframe_map(&item.path, row.duration_ms) {
+        match crate::keymap::build_keyframe_map(&media_path, row.duration_ms) {
             Ok(built) => {
                 let entries: Vec<(i64, i64)> = built
                     .entries
