@@ -32,6 +32,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/012_library_relative_paths.sql"),
     ),
     (13, include_str!("../migrations/013_cleaner_version.sql")),
+    (
+        14,
+        include_str!("../migrations/014_metadata_status_matched.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -226,7 +230,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 13);
+        assert_eq!(v, 14);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -276,6 +280,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_meta_status, 1);
+        // 014: two-tier 'matched' is admitted; unknown values still rejected.
+        conn.execute(
+            "INSERT INTO libraries (name, path, kind) VALUES ('l', '/tmp/l', 'movies')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+             VALUES (1, '/tmp/014.mkv', 1, 1, 'T', 'movie', 'matched')",
+            [],
+        )
+        .unwrap();
+        let rejected = conn.execute(
+            "INSERT INTO media_items
+                (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+             VALUES (1, '/tmp/014b.mkv', 1, 1, 'T', 'movie', 'bogus')",
+            [],
+        );
+        assert!(rejected.is_err(), "014: unknown status must be rejected");
         let has_reachable: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('libraries') WHERE name = 'reachable'",

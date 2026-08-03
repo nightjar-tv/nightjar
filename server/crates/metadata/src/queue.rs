@@ -68,6 +68,9 @@ fn search_boost_item_ids(_conn: &Connection) -> HashSet<i64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataStatus {
     Pending,
+    /// Search (or NFO with TMDB id) accepted >= 0.80; sparse canonical written;
+    /// enrich (detail) still pending (ADR-0026 §8.1).
+    Matched,
     Ready,
     Unmatched,
 }
@@ -76,6 +79,7 @@ impl MetadataStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Matched => "matched",
             Self::Ready => "ready",
             Self::Unmatched => "unmatched",
         }
@@ -84,14 +88,17 @@ impl MetadataStatus {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
+            "matched" => Some(Self::Matched),
             "ready" => Some(Self::Ready),
             "unmatched" => Some(Self::Unmatched),
             _ => None,
         }
     }
 
+    /// Terminal for the adult first screen / Visible grid (ADR-0026 §8.2):
+    /// `matched` | `ready` | `unmatched`. `pending` always remains work.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Ready | Self::Unmatched)
+        matches!(self, Self::Matched | Self::Ready | Self::Unmatched)
     }
 }
 
@@ -421,7 +428,8 @@ fn statuses_for_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<MetadataStatus
     Ok(out)
 }
 
-/// Proxy progress: terminal when every item is ready|unmatched.
+/// Proxy progress: terminal when every item is matched|ready|unmatched
+/// (ADR-0026 §8.2 adult first screen).
 pub fn proxy_terminal_progress(
     conn: &Connection,
     proxy: &VisibleProxy,

@@ -64,8 +64,8 @@ fn run_loop(data_dir: &Path) {
             }
         };
 
-        let pending: i64 = match conn.query_row(
-            "SELECT COUNT(*) FROM media_items WHERE metadata_status = 'pending'",
+        let remaining: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM media_items WHERE metadata_status IN ('pending', 'matched')",
             [],
             |r| r.get(0),
         ) {
@@ -76,7 +76,7 @@ fn run_loop(data_dir: &Path) {
                 continue;
             }
         };
-        if pending == 0 {
+        if remaining == 0 {
             std::thread::sleep(IDLE_SLEEP);
             continue;
         }
@@ -93,7 +93,7 @@ fn run_loop(data_dir: &Path) {
             tracing::info!(n, "swept stale negative-cache cleaner versions");
         }
 
-        tracing::info!(pending, "metadata drain starting");
+        tracing::info!(remaining, "metadata drain starting");
         match drain_pending(
             &conn,
             &resolver,
