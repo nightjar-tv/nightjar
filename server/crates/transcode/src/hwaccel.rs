@@ -593,7 +593,11 @@ mod tests {
         assert_eq!(leg.pix_fmt.as_deref(), Some("yuv420p"));
         assert!(leg.upload_vf.is_none());
         assert!(leg.pre_input.is_empty());
-        assert!(leg.encoder_extra.windows(2).any(|w| w == ["-preset", "veryfast"]));
+        assert!(
+            leg.encoder_extra
+                .windows(2)
+                .any(|w| w == ["-preset", "veryfast"])
+        );
     }
 
     #[test]
@@ -685,6 +689,9 @@ mod tests {
                     && e.name == caps.preferred_h264_encoder),
             "preferred must be a verified encoder: {caps:?}"
         );
-        assert_eq!(caps.preferred_encode_leg.encoder, caps.preferred_h264_encoder);
+        assert_eq!(
+            caps.preferred_encode_leg.encoder,
+            caps.preferred_h264_encoder
+        );
     }
 }

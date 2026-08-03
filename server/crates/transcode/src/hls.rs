@@ -924,7 +924,10 @@ impl HlsSessionRegistry {
     /// Creates the HLS cache root, sweeps leftover session dirs from a prior
     /// process, and starts the idle reaper. `encode_leg` is the preferred
     /// session-shaped leg from ADR-0009 (`libx264` if nothing else works).
-    pub fn new(root: PathBuf, encode_leg: impl Into<crate::EncodeLeg>) -> Result<Arc<Self>, String> {
+    pub fn new(
+        root: PathBuf,
+        encode_leg: impl Into<crate::EncodeLeg>,
+    ) -> Result<Arc<Self>, String> {
         Self::with_cap(root, DEFAULT_MAX_SESSIONS, encode_leg)
     }
 
