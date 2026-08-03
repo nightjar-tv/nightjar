@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use nightjar_metadata::{
-    AUTO_MATCH_FLOOR, LibrarySeriesShape, SearchKind, TmdbClient, TmdbCredentials,
-    clean_movie_title, clean_show_title, meets_auto_match_floor, series_library_year,
+    AUTO_MATCH_FLOOR, LibrarySeriesShape, SearchKind, TmdbClient, clean_movie_title,
+    clean_show_title, meets_auto_match_floor, resolve_credentials, series_library_year,
     year_from_path,
 };
 use rusqlite::Connection;
@@ -72,8 +72,8 @@ fn main() {
             .map(|h| h.join("nightjar-data/nightjar.db"))
             .expect("HOME")
     });
-    let creds = TmdbCredentials::from_env().unwrap_or_else(|| {
-        eprintln!("no TMDB credentials");
+    let creds = resolve_credentials().unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
     });
     let client = TmdbClient::new(creds);

@@ -62,6 +62,7 @@ pub use resolve::{
     ResolveOutcome, Resolver, UnresolvedReason, resolve,
 };
 pub use tmdb::{
-    RawProviderPayload, TmdbClient, TmdbCredentials, TmdbResolve, TmdbStub,
-    map_episodes_from_season, map_movie_detail, map_tv_detail,
+    CredError, RawProviderPayload, TmdbClient, TmdbCredentials, TmdbKeySource, TmdbResolve,
+    TmdbStub, embedded_application_key, map_episodes_from_season, map_movie_detail, map_tv_detail,
+    resolve_credentials, resolve_credentials_with,
 };
