@@ -663,7 +663,9 @@ paths:
       description: >
         Startup detection-by-verification (ADR-0009). Each candidate is
         verified | failed | unavailable with a reason when not verified.
-        preferredH264Encoder is what new HLS sessions use for -c:v.
+        preferredH264Encoder is the encoder name from the preferred encode leg
+        (ADR-0009). optional preferredDevice is the render node when the leg
+        binds one (e.g. VAAPI).
       responses:
         "200":
           description: Capability readout
@@ -1353,7 +1355,16 @@ components:
           nullable: true
         preferredH264Encoder:
           type: string
-          description: Encoder name used for new HLS sessions (-c:v)
+          description: >
+            Encoder name from the preferred session-shaped encode leg
+            (ADR-0009). Sessions use the full leg, not the name alone.
+        preferredDevice:
+          type: string
+          nullable: true
+          description: >
+            Device path recorded when the preferred leg binds one
+            (e.g. /dev/dri/renderD128 for VAAPI). Null for software, QSV
+            sysmem, and VideoToolbox.
         encoders:
           type: array
           items:

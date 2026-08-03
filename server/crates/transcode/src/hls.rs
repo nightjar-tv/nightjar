@@ -500,8 +500,8 @@ pub fn pending_waiter_action(
 pub struct HlsSessionRegistry {
     root: PathBuf,
     max_sessions: usize,
-    /// Verified H.264 encoder name from ADR-0009 probe (`libx264` fallback).
-    video_encoder: String,
+    /// Session-shaped encode leg from ADR-0009 probe (shared with startup verify).
+    encode_leg: crate::EncodeLeg,
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -543,7 +543,9 @@ struct Session {
     encode_plan: VideoEncodePlan,
     /// Keyframe map snapshot and the virtual file bound from it (ADR-0023).
     map_binding: MapBinding,
-    /// Actual encoder for this process. Future fallback updates this field.
+    /// Session-shaped encode leg (ADR-0009). Future fallback updates this field.
+    encode_leg: crate::EncodeLeg,
+    /// Encoder name for API / logs (`encode_leg.encoder`).
     video_encoder: String,
     /// Encode window start for the current run (`-ss` / lead-in).
     start_ms: u64,
@@ -920,16 +922,16 @@ fn session_view(session_id: &str, session: &Session) -> SessionView {
 
 impl HlsSessionRegistry {
     /// Creates the HLS cache root, sweeps leftover session dirs from a prior
-    /// process, and starts the idle reaper. `video_encoder` is the preferred
-    /// verified H.264 encoder from ADR-0009 (`libx264` if nothing else works).
-    pub fn new(root: PathBuf, video_encoder: impl Into<String>) -> Result<Arc<Self>, String> {
-        Self::with_cap(root, DEFAULT_MAX_SESSIONS, video_encoder)
+    /// process, and starts the idle reaper. `encode_leg` is the preferred
+    /// session-shaped leg from ADR-0009 (`libx264` if nothing else works).
+    pub fn new(root: PathBuf, encode_leg: impl Into<crate::EncodeLeg>) -> Result<Arc<Self>, String> {
+        Self::with_cap(root, DEFAULT_MAX_SESSIONS, encode_leg)
     }
 
     pub fn with_cap(
         root: PathBuf,
         max_sessions: usize,
-        video_encoder: impl Into<String>,
+        encode_leg: impl Into<crate::EncodeLeg>,
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(&root)
             .map_err(|e| format!("create hls cache dir {}: {e}", root.display()))?;
@@ -947,11 +949,11 @@ impl HlsSessionRegistry {
             }
         }
 
-        let video_encoder = video_encoder.into();
+        let encode_leg = encode_leg.into();
         let registry = Arc::new(Self {
             root,
             max_sessions,
-            video_encoder,
+            encode_leg,
             next_id: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
         });
@@ -1017,7 +1019,7 @@ impl HlsSessionRegistry {
             &run_dir,
             mode,
             audio.clone(),
-            &self.video_encoder,
+            &self.encode_leg,
             burn_in.as_ref(),
             encode_plan,
         )
@@ -1038,7 +1040,8 @@ impl HlsSessionRegistry {
             audio_stream = ?audio.stream_index,
             audio_channels = audio.channels,
             burn_in = burn_in.as_ref().map(|b| b.track_id.as_str()),
-            encoder = %self.video_encoder,
+            encoder = %self.encode_leg.encoder,
+            device = ?self.encode_leg.device,
             max_height = encode_plan.max_height,
             max_bitrate_bps = encode_plan.max_bitrate_bps,
             tone_map = encode_plan.tone_map,
@@ -1063,7 +1066,8 @@ impl HlsSessionRegistry {
                 burn_in,
                 encode_plan,
                 map_binding,
-                video_encoder: self.video_encoder.clone(),
+                encode_leg: self.encode_leg.clone(),
+                video_encoder: self.encode_leg.encoder.clone(),
                 start_ms,
                 play_start_ms,
                 landed_ms: start_ms,
@@ -1180,8 +1184,8 @@ impl HlsSessionRegistry {
             sync_segment_map(session);
             return Ok(session_view(session_id, session));
         }
-        let enc = session.video_encoder.clone();
-        match restart_at(session, aligned, &enc)? {
+        let leg = session.encode_leg.clone();
+        match restart_at(session, aligned, &leg)? {
             RestartAtOutcome::Applied => {
                 maybe_evict_finished_runs(session);
             }
@@ -1824,7 +1828,7 @@ enum RestartAtOutcome {
 fn restart_at(
     session: &mut Session,
     play_ms: u64,
-    video_encoder: &str,
+    _encode_leg: &crate::EncodeLeg,
 ) -> Result<RestartAtOutcome, PlaylistError> {
     let play_start_ms = align_to_segment(play_ms);
     let prior_play = session.play_start_ms;
@@ -1964,7 +1968,7 @@ fn restart_at(
         &run_dir,
         session.mode,
         session.audio.clone(),
-        video_encoder,
+        &session.encode_leg,
         session.burn_in.as_ref(),
         session.encode_plan,
     )
@@ -1991,7 +1995,8 @@ fn restart_at(
         play_start_ms,
         run_id,
         session_disk_bytes = session_disk_bytes(&session.dir),
-        encoder = video_encoder,
+        encoder = %session.encode_leg.encoder,
+        device = ?session.encode_leg.device,
         start_path = plan.start_path,
         container_kind = plan.container_kind,
         fingerprint_cost_ms = plan.fingerprint_cost_ms,
@@ -2104,8 +2109,8 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
         && allow_preempt
         && coalesce_preempt_before_land(cooking, pending)
         && since >= RESTART_MIN_INTERVAL;
-    let encoder = session.video_encoder.clone();
-    match restart_at(session, pending, &encoder)? {
+    let leg = session.encode_leg.clone();
+    match restart_at(session, pending, &leg)? {
         RestartAtOutcome::DeferredLandWaiter => {
             // restart_at already logged once per defer streak.
             Ok(())
@@ -2609,7 +2614,7 @@ fn spawn_ffmpeg(
     dir: &Path,
     mode: SessionMode,
     audio: AudioSelection,
-    video_encoder: &str,
+    encode_leg: &crate::EncodeLeg,
     burn_in: Option<&BurnInSelection>,
     encode_plan: VideoEncodePlan,
 ) -> Result<Child, String> {
@@ -2633,6 +2638,10 @@ fn spawn_ffmpeg(
         // deadlocks ffmpeg so the playlist never appears.
         .stderr(Stdio::null())
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
+    // Encode-leg pre-input (e.g. -vaapi_device) before any -i (ADR-0009).
+    if mode == SessionMode::Transcode {
+        encode_leg.push_pre_input(&mut cmd);
+    }
     // The Matroska splice already starts at the land Cluster, so seeking
     // inside it would land a second time (ADR-0023 §3a). MP4 keeps `-ss`:
     // its virtual file spans the whole title (§3b).
@@ -2677,7 +2686,7 @@ fn spawn_ffmpeg(
         Some(burn) if burn.kind == BurnInKind::Ass => Some(ass_burn_vf(burn, start_ms)?),
         _ => None,
     };
-    let video_chain = if mode == SessionMode::Transcode {
+    let software_chain = if mode == SessionMode::Transcode {
         Some(transcode_video_filter_chain(
             encode_plan,
             ass_vf.as_deref(),
@@ -2685,8 +2694,14 @@ fn spawn_ffmpeg(
     } else {
         None
     };
+    // Software scale/tonemap/burn then encode-leg upload (VAAPI hwupload).
+    let video_vf = if mode == SessionMode::Transcode {
+        encode_leg.compose_video_filter(software_chain.as_deref())
+    } else {
+        None
+    };
     if let Some(ref complex) = pgs_overlay {
-        let tail = video_chain.as_deref().unwrap_or(SDR_RETAG_CHAIN);
+        let tail = video_vf.as_deref().unwrap_or(SDR_RETAG_CHAIN);
         let full = format!("{complex},{tail}[vout]");
         cmd.args(["-filter_complex", &full]);
         cmd.args(["-map", "[vout]", "-map", &audio_map]);
@@ -2707,18 +2722,12 @@ fn spawn_ffmpeg(
             cmd.args(["-c", "copy"]);
         }
         SessionMode::Transcode => {
-            cmd.args(["-c:v", video_encoder]);
-            if video_encoder == "libx264" {
-                cmd.args(["-preset", "veryfast", "-pix_fmt", "yuv420p"]);
-            } else {
-                // Hardware paths: keep pixel format explicit where the encoder
-                // accepts it; backends that need device-specific graphs failed
-                // verification.
-                cmd.args(["-pix_fmt", "yuv420p"]);
-            }
+            // Encode leg owns -c:v, pix_fmt, and encoder extras (ADR-0009).
+            // No global non-x264 -pix_fmt yuv420p.
+            encode_leg.push_encoder_args(&mut cmd);
             if pgs_overlay.is_some() {
                 cmd.args(["-map_metadata", "-1"]);
-            } else if let Some(ref vf) = video_chain {
+            } else if let Some(ref vf) = video_vf {
                 cmd.args(["-map_metadata", "-1", "-vf", vf]);
             }
             cmd.args([
@@ -3206,7 +3215,7 @@ mod tests {
                 &enc,
                 SessionMode::Transcode,
                 stereo(),
-                "libx264",
+                &crate::EncodeLeg::software(),
                 None,
                 plan,
             )
@@ -3893,6 +3902,7 @@ mod tests {
             burn_in: None,
             encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
             video_encoder: "libx264".into(),
             start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
             play_start_ms: play_ms,
@@ -4788,12 +4798,13 @@ mod tests {
     ) -> PathBuf {
         let enc = dir.join("enc");
         fs::create_dir_all(&enc).unwrap();
+        let leg = crate::EncodeLeg::from(encoder);
         let mut child = spawn_ffmpeg(
             &ss_start_plan(src, 0, 0),
             &enc,
             mode,
             audio,
-            encoder,
+            &leg,
             None,
             VideoEncodePlan::default(),
         )
@@ -5137,7 +5148,7 @@ mod tests {
                 &enc,
                 SessionMode::Transcode,
                 stereo(),
-                "libx264",
+                &crate::EncodeLeg::software(),
                 None,
                 VideoEncodePlan::default(),
             )
@@ -5652,6 +5663,7 @@ mod tests {
             burn_in: None,
             encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
             video_encoder: "copy".into(),
             start_ms: 0,
             play_start_ms: 0,
@@ -5849,6 +5861,7 @@ mod tests {
             burn_in: None,
             encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
             video_encoder: "copy".into(),
             start_ms: 1_014_000,
             play_start_ms: 1_014_000,
@@ -5929,6 +5942,7 @@ mod tests {
             burn_in: None,
             encode_plan: VideoEncodePlan::default(),
             map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
             video_encoder: "libx264".into(),
             start_ms: 0,
             play_start_ms: 0,

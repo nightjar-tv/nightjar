@@ -1,0 +1,183 @@
+{
+  "stamp": "20260803T061851Z",
+  "base": "http://127.0.0.1:8096",
+  "label": "amd-h264_vaapi",
+  "preferredH264Encoder": "h264_vaapi",
+  "encoders": [
+    {
+      "name": "h264_nvenc",
+      "backend": "nvenc",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 255: [h264_nvenc @ 0x610434b66f80] Cannot load libcuda.so.1\n[vost#0:0/h264_nvenc @ 0x610434b66980] [enc:h264_nvenc @ 0x610434b66f00] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x610434b81fc0] Error sending frames to consumers: Operation not permitted\n[vf#0:0 @ 0x610434b81fc0] Task finished with error code: -1 (Operation not permitted)\n[vf#0:0 @ 0x610434b81fc0] Terminating thread with return code -1 (Operation not permitted)\n[vost#0:0/h264_nvenc @ 0x610434b66980] [enc:h264_nvenc @ 0x610434b66f00] Could not open encoder before EOF\n[vost#0:0/h264_nvenc @ 0x610434b66980] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_nvenc @ 0x610434b66980] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x610434b66480] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "h264_qsv",
+      "backend": "qsv",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 171: [h264_qsv @ 0x6340d6a20f80] Error creating a MFX session: -9.\n[vost#0:0/h264_qsv @ 0x6340d6a20980] [enc:h264_qsv @ 0x6340d6a20f00] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x6340d6a21c40] Error sending frames to consumers: Unknown error occurred\n[vf#0:0 @ 0x6340d6a21c40] Task finished with error code: -1313558101 (Unknown error occurred)\n[vf#0:0 @ 0x6340d6a21c40] Terminating thread with return code -1313558101 (Unknown error occurred)\n[vost#0:0/h264_qsv @ 0x6340d6a20980] [enc:h264_qsv @ 0x6340d6a20f00] Could not open encoder before EOF\n[vost#0:0/h264_qsv @ 0x6340d6a20980] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_qsv @ 0x6340d6a20980] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x6340d6a20480] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "h264_vaapi",
+      "backend": "vaapi",
+      "status": "verified",
+      "reason": null
+    },
+    {
+      "name": "h264_v4l2m2m",
+      "backend": "v4l2m2m",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 234: [h264_v4l2m2m @ 0x636b1f3e6f80] Could not find a valid device\n[h264_v4l2m2m @ 0x636b1f3e6f80] can't configure encoder\n[vost#0:0/h264_v4l2m2m @ 0x636b1f3e6980] [enc:h264_v4l2m2m @ 0x636b1f3e6f00] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x636b1f3e7500] Error sending frames to consumers: Invalid argument\n[vf#0:0 @ 0x636b1f3e7500] Task finished with error code: -22 (Invalid argument)\n[vf#0:0 @ 0x636b1f3e7500] Terminating thread with return code -22 (Invalid argument)\n[vost#0:0/h264_v4l2m2m @ 0x636b1f3e6980] [enc:h264_v4l2m2m @ 0x636b1f3e6f00] Could not open encoder before EOF\n[vost#0:0/h264_v4l2m2m @ 0x636b1f3e6980] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_v4l2m2m @ 0x636b1f3e6980] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x636b1f3e6480] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "libx264",
+      "backend": "software",
+      "status": "verified",
+      "reason": null
+    }
+  ],
+  "ratioNeed": 0.9,
+  "warmupS": 15.0,
+  "sampleS": 40.0,
+  "itemIdsUsed": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "ceiling": {
+    "nFailRealtime": 6,
+    "lastOk": 5,
+    "limit": "below_realtime",
+    "minRealtimeRatio": 0.0
+  },
+  "rows": [
+    {
+      "n": 1,
+      "opened": 1,
+      "ok": true,
+      "elapsedS": 40.001,
+      "mediaSecondsDeltas": [
+        218.0
+      ],
+      "realtimeRatios": [
+        5.45
+      ],
+      "minRealtimeRatio": 5.45,
+      "errors": [],
+      "label": "amd-h264_vaapi",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 2,
+      "opened": 2,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        116.0,
+        116.0
+      ],
+      "realtimeRatios": [
+        2.9,
+        2.9
+      ],
+      "minRealtimeRatio": 2.9,
+      "errors": [],
+      "label": "amd-h264_vaapi",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 3,
+      "opened": 3,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        76.0,
+        78.0,
+        80.0
+      ],
+      "realtimeRatios": [
+        1.9,
+        1.95,
+        2.0
+      ],
+      "minRealtimeRatio": 1.9,
+      "errors": [],
+      "label": "amd-h264_vaapi",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 4,
+      "opened": 4,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        58.0,
+        58.0,
+        60.0,
+        60.0
+      ],
+      "realtimeRatios": [
+        1.45,
+        1.45,
+        1.5,
+        1.5
+      ],
+      "minRealtimeRatio": 1.45,
+      "errors": [],
+      "label": "amd-h264_vaapi",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 5,
+      "opened": 5,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        46.0,
+        46.0,
+        48.0,
+        48.0,
+        50.0
+      ],
+      "realtimeRatios": [
+        1.15,
+        1.15,
+        1.2,
+        1.2,
+        1.25
+      ],
+      "minRealtimeRatio": 1.15,
+      "errors": [],
+      "label": "amd-h264_vaapi",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 6,
+      "opened": 6,
+      "ok": true,
+      "elapsedS": 40.0,
+      "mediaSecondsDeltas": [
+        44.0,
+        46.0,
+        48.0,
+        48.0,
+        48.0,
+        0.0
+      ],
+      "realtimeRatios": [
+        1.1,
+        1.15,
+        1.2,
+        1.2,
+        1.2,
+        0.0
+      ],
+      "minRealtimeRatio": 0.0,
+      "errors": [],
+      "label": "amd-h264_vaapi",
+      "remuxAlongside": 0
+    }
+  ]
+}

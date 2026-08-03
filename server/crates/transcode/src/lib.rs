@@ -18,8 +18,8 @@ pub use hls::{
     decide_segment_miss, decide_window_action, host_tonemap_available,
 };
 pub use hwaccel::{
-    EncoderCandidate, EncoderStatus, TranscodeCapabilities, probe_h264_encoders,
-    probe_h264_encoders_arc, select_preferred,
+    EncodeLeg, EncoderCandidate, EncoderStatus, TranscodeCapabilities, list_render_nodes,
+    probe_h264_encoders, probe_h264_encoders_arc, select_preferred,
 };
 pub use subs::{
     BurnInKind, BurnInSelection, BurnInSubtitleStream, DiscoveredSidecar, ExtractOutcome,
