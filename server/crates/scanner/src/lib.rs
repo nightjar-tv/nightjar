@@ -1016,7 +1016,10 @@ mod tests {
 
         // Drain with stored relpath only (dogfood failure mode) must still resolve.
         let n = pool.drain_pending_probes().unwrap();
-        assert_eq!(n, 0, "unavailable is not indexed; drain skips until requeue");
+        assert_eq!(
+            n, 0,
+            "unavailable is not indexed; drain skips until requeue"
+        );
 
         let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
         wait_scan(&db, job2);
@@ -1028,7 +1031,9 @@ mod tests {
             a2
         );
         assert!(
-            a2.probe_status == "error" || a2.probe_status == "probed" || a2.probe_status == "indexed",
+            a2.probe_status == "error"
+                || a2.probe_status == "probed"
+                || a2.probe_status == "indexed",
             "expected re-probe outcome, got {}",
             a2.probe_status
         );
