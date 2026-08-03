@@ -192,6 +192,20 @@ fn run_index_and_probe(
         return Err(format!("library path is not reachable: {library_root}"));
     }
 
+    // Scan library (and poll) re-try availability failures; permanent error stays
+    // until mtime change (ADR-0014). Must run before list_item_paths so the
+    // unchanged branch sees probe_status=indexed and re-queues probes.
+    let (rq_probes, rq_extracts, rq_maps) = db.requeue_unavailable_for_library(library_id)?;
+    if rq_probes > 0 || rq_extracts > 0 || rq_maps > 0 {
+        tracing::info!(
+            library_id,
+            probes = rq_probes,
+            extracts = rq_extracts,
+            maps = rq_maps,
+            "scan re-queued availability failures"
+        );
+    }
+
     let existing_count = db.count_items(library_id)?;
     let index_started = Instant::now();
     // Hold extract workers off the share for the whole indexing phase (walk,
@@ -935,6 +949,179 @@ mod tests {
             again.probe_status, "error",
             "permanent errors must not be re-queued by reachability recovery"
         );
+    }
+
+    fn wait_scan(db: &Db, job_id: i64) {
+        for _ in 0..200 {
+            let job = db.get_scan_job(job_id).unwrap().unwrap();
+            if job.state == "completed" || job.state == "failed" {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("scan job {job_id} did not finish");
+    }
+
+    /// Scan requeues probe_status=unavailable (ADR-0014 retryable) but not error.
+    #[test]
+    fn scan_requeues_unavailable_not_permanent_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("A.mp4"), b"x").unwrap();
+        fs::write(media.join("broken_moov.mp4"), b"not a real mp4").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job1 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_scan(&db, job1);
+
+        let items = db.list_items(lib.id).unwrap();
+        let a = items
+            .iter()
+            .find(|i| i.path.ends_with("A.mp4"))
+            .expect("A.mp4");
+        let broken = items
+            .iter()
+            .find(|i| i.path.ends_with("broken_moov.mp4"))
+            .expect("broken");
+        assert_eq!(broken.probe_status, "error");
+
+        // Simulate prior ENOENT-class failures on A; leave broken as permanent error.
+        db.apply_probe_update(&nightjar_db::ProbeUpdate {
+            item_id: a.id,
+            duration_ms: None,
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            audio_channels: None,
+            width: None,
+            height: None,
+            video_bitrate_bps: None,
+            hdr: None,
+            probe_status: "unavailable".into(),
+            scan_error: Some("no such file or directory".into()),
+        })
+        .unwrap();
+        db.set_subtitle_status(a.id, "unavailable", None, None)
+            .unwrap();
+
+        // Drain with stored relpath only (dogfood failure mode) must still resolve.
+        let n = pool.drain_pending_probes().unwrap();
+        assert_eq!(
+            n, 0,
+            "unavailable is not indexed; drain skips until requeue"
+        );
+
+        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_scan(&db, job2);
+
+        let a2 = db.get_item(a.id).unwrap().unwrap();
+        assert_ne!(
+            a2.probe_status, "unavailable",
+            "scan must requeue unavailable; got {:?}",
+            a2
+        );
+        assert!(
+            a2.probe_status == "error"
+                || a2.probe_status == "probed"
+                || a2.probe_status == "indexed",
+            "expected re-probe outcome, got {}",
+            a2.probe_status
+        );
+
+        let broken2 = db.get_item(broken.id).unwrap().unwrap();
+        assert_eq!(
+            broken2.probe_status, "error",
+            "permanent error must not be cleared by scan requeue"
+        );
+    }
+
+    /// drain_pending_probes joins library root to ADR-0030 relpaths.
+    #[test]
+    fn drain_pending_probes_resolves_relpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        // Real tiny mp4 when ffmpeg exists so probe can succeed; otherwise accept error.
+        let good = media.join("clip.mp4");
+        let _ = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=0.2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                good.to_str().unwrap(),
+            ])
+            .status();
+        if !good.exists() {
+            fs::write(&good, b"x").unwrap();
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_scan(&db, job);
+
+        let item = db.list_items(lib.id).unwrap().into_iter().next().unwrap();
+        // Force indexed with clear error as if restart mid-scan left the row.
+        db.apply_probe_update(&nightjar_db::ProbeUpdate {
+            item_id: item.id,
+            duration_ms: None,
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            audio_channels: None,
+            width: None,
+            height: None,
+            video_bitrate_bps: None,
+            hdr: None,
+            probe_status: "indexed".into(),
+            scan_error: None,
+        })
+        .unwrap();
+
+        assert!(item.path == "clip.mp4" || item.path.ends_with("clip.mp4"));
+        assert!(!item.path.starts_with('/'), "stored path should be relpath");
+
+        let n = pool.drain_pending_probes().unwrap();
+        assert_eq!(n, 1);
+        for _ in 0..100 {
+            let row = db.get_item(item.id).unwrap().unwrap();
+            if row.probe_status != "indexed" {
+                assert_ne!(
+                    row.probe_status, "unavailable",
+                    "relpath drain must not ENOENT: {:?}",
+                    row.scan_error
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("probe never left indexed");
     }
 
     #[test]
