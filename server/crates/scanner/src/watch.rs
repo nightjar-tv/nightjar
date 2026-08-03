@@ -1,9 +1,12 @@
 //! Library discovery triggers: notify + fixed poll backstop (ADR-0015).
 //!
-//! Every trigger calls [`crate::request_scan`]. Notify never disables poll.
+//! Full walks still enter through [`crate::request_scan`]. Notify may also
+//! run path-hinted ingest for a concrete media path, then request_scan so
+//! deletes and missed paths heal on the next full keep-set. Notify never
+//! disables poll.
 
 use crate::reachability::REACHABILITY_INTERVAL;
-use crate::{LibraryPool, request_scan};
+use crate::{LibraryPool, hint_ingest, request_scan};
 use nightjar_db::Db;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
@@ -97,6 +100,20 @@ fn run_with_notify(db: Arc<Db>, pool: Arc<LibraryPool>) -> Result<(), String> {
                     if let Some(id) = library_for_path(&watched, &ev.path) {
                         if !pool.is_library_reachable(id) {
                             continue;
+                        }
+                        match hint_ingest(db.as_ref(), pool.as_ref(), id, &ev.path) {
+                            Ok(outcome) => tracing::debug!(
+                                library_id = id,
+                                path = %ev.path.display(),
+                                ?outcome,
+                                "hint ingest"
+                            ),
+                            Err(e) => tracing::warn!(
+                                library_id = id,
+                                path = %ev.path.display(),
+                                error = %e,
+                                "hint ingest failed"
+                            ),
                         }
                         tracing::info!(
                             library_id = id,

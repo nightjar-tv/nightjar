@@ -2,7 +2,8 @@
 
 - Status: accepted
 - Date: 2026-07-27
-- Amended: 2026-08-03 (global index epoch; poll default 300 s)
+- Amended: 2026-08-03 (global index epoch; poll default 300 s;
+  path-hinted notify ingest)
 
 ## Context
 
@@ -68,8 +69,26 @@ local disks (the common non-SMB install), never a gate.
    because notify armed, and there is **no notify-works detection**
    anywhere in the system by design.
 
+   **Path-hinted ingest (same notify event).** When the debounced event
+   carries a concrete path that is a media file under a library root,
+   the watcher also runs `hint_ingest`: one stat + fold-aware upsert +
+   probe enqueue (same match rules as the index loop). That path **never**
+   calls `delete_missing` (ADR-0014 complete keep-set stays on full walk).
+   Non-media, directories, sidecars, missing paths, and zero-size files are
+   ignored (copy-in-progress / debounce miss — no stability sampler in
+   v1). Hint does **not** take the index epoch; concurrent with an
+   in-flight walk is intentional.
+
+   If a full scan is active for that library when the hint upserts, mark
+   the library dirty. The active job **skips `delete_missing`** when dirty
+   so a keep-set that never saw the new file cannot drop the hinted row;
+   the dirty follow-up full walk heals deletes and anything the hint
+   missed. Poll and manual scan remain full `request_scan` only — no
+   second discovery entry for them.
+
    What notify is for now: on a **local** library it shortens detection
-   from up to one poll interval down to a couple of seconds. On **network
+   from up to one poll interval down to a couple of seconds (and can
+   surface a new episode before the follow-up walk). On **network
    shares** where notify arms but never fires (SMB and similar), nothing
    breaks because poll is the guarantee. Notify is an accelerator, never
    a gate.
@@ -112,9 +131,9 @@ local disks (the common non-SMB install), never a gate.
   gate. iSCSI, mergerfs/Unraid user shares, and Docker Desktop look wrong;
   the table rots (see library-change-detection brief).
 
-Path-hinted refresh that skips `delete_missing` (Jellyfin-style subtree
-refresh) remains a later design; full poll owns deletes under ADR-0014 until
-that ADR exists.
+Path-hinted **single-file** ingest on notify is decision 5 above. Jellyfin-style
+**subtree** refresh (whole season/dir, still without `delete_missing`) remains
+a later design; full poll / full walk owns deletes under ADR-0014.
 
 ### Latency vs bandwidth (recurring principle)
 

@@ -12,7 +12,7 @@ pub use pool::LibraryPool;
 pub use probe::{ProbeResult, ffprobe};
 pub use reachability::{Reachability, allow_delete_missing, check_root};
 pub use walk::{
-    WalkCache, WalkOutcome, walk_concurrency, walk_media_files_cached,
+    WalkCache, WalkOutcome, is_media, walk_concurrency, walk_media_files_cached,
     walk_media_files_cached_with_concurrency,
 };
 pub use watch::spawn_library_watcher;
@@ -71,6 +71,161 @@ pub fn request_scan(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Res
 /// Alias kept for tests and call sites that mean "start discovery".
 pub fn start_scan_job(db: Arc<Db>, pool: Arc<LibraryPool>, library_id: i64) -> Result<i64, String> {
     request_scan(db, pool, library_id)
+}
+
+/// Path-hinted notify ingest (ADR-0015). Upserts one media file immediately so a
+/// new episode can appear without waiting for the full walk. Never calls
+/// `delete_missing` — full `request_scan` remains the heal/delete path.
+///
+/// Skips non-media, missing, non-file, and zero-size paths (copy-in-progress /
+/// debounce miss). Does not take the index epoch: concurrent with an in-flight
+/// walk is intentional. Caller should still `request_scan` so dirty/follow-up
+/// heals deletes and anything this path missed.
+pub fn hint_ingest(
+    db: &Db,
+    pool: &LibraryPool,
+    library_id: i64,
+    path: &Path,
+) -> Result<HintIngestOutcome, String> {
+    if !is_media(path) {
+        return Ok(HintIngestOutcome::Ignored);
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return Ok(HintIngestOutcome::Ignored),
+        Err(_) => return Ok(HintIngestOutcome::Ignored),
+    };
+    let size_bytes = meta.len() as i64;
+    if size_bytes <= 0 {
+        return Ok(HintIngestOutcome::Ignored);
+    }
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let lib = db
+        .get_library(library_id)?
+        .ok_or_else(|| format!("library {library_id} not found"))?;
+    if !pool.is_library_reachable(library_id) {
+        return Ok(HintIngestOutcome::Ignored);
+    }
+    let library_root = std::fs::canonicalize(&lib.path)
+        .map(|p| nightjar_db::normalize_library_root(&p.to_string_lossy()))
+        .unwrap_or_else(|_| nightjar_db::normalize_library_root(&lib.path));
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Some(rel) = to_relpath(&library_root, &resolved) else {
+        return Ok(HintIngestOutcome::Ignored);
+    };
+
+    let folded = fold_path(&rel);
+    let matches: Vec<ItemPathRow> = db
+        .list_item_paths(library_id)?
+        .into_iter()
+        .filter(|r| fold_path(&r.path) == folded)
+        .collect();
+
+    if matches.len() > 1 {
+        tracing::warn!(
+            library_id,
+            path = %rel,
+            count = matches.len(),
+            "hint ingest: fold-equal path collision; refusing upsert"
+        );
+        return Ok(HintIngestOutcome::Collision);
+    }
+
+    if let Some(row) = matches.first()
+        && row.mtime_ms == mtime_ms
+    {
+        if row.probe_status == "indexed" {
+            let abs = resolve_media_path(&library_root, &row.path);
+            pool.enqueue(pool::WorkItem::probe(row.id, library_id, abs, None));
+        }
+        return Ok(HintIngestOutcome::Unchanged { item_id: row.id });
+    }
+
+    let store_path = matches
+        .first()
+        .map(|r| r.path.clone())
+        .unwrap_or_else(|| rel.clone());
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| rel.clone());
+    let parsed = parse_filename(&file_name);
+    let content_id = match nightjar_db::content_id_for_path(path) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "content_id read failed; map rebuild will retry"
+            );
+            None
+        }
+    };
+    let item = UpsertItem {
+        path: store_path.clone(),
+        mtime_ms,
+        size_bytes,
+        title: parsed.title,
+        kind: parsed.kind.as_str().to_string(),
+        year: parsed.year,
+        season: parsed.season,
+        episode: parsed.episode,
+        content_id,
+    };
+    let ids = db.upsert_items_indexed(library_id, &[item])?;
+    let item_id = ids
+        .into_iter()
+        .next()
+        .ok_or_else(|| "hint upsert returned no id".to_string())?;
+    let abs = resolve_media_path(&library_root, &store_path);
+    pool.enqueue(pool::WorkItem::probe(
+        item_id,
+        library_id,
+        abs.clone(),
+        None,
+    ));
+    let mut sidecar_dirs = nightjar_transcode::SidecarDirCache::default();
+    match associate_sidecars(db, item_id, &library_root, &abs, &mut sidecar_dirs) {
+        Ok(true) => {
+            db.mark_items_subtitle_pending(&[item_id])?;
+            pool.enqueue(pool::WorkItem::extract(item_id, library_id, abs.clone()));
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            item_id,
+            path = %abs.display(),
+            error = %e,
+            "hint sidecar association failed"
+        ),
+    }
+    pool.enqueue_map_rebuild(item_id, library_id, abs);
+    // If a full walk is in flight, keep dirty so that job skips delete_missing
+    // (would otherwise drop this row) and a follow-up walk heals.
+    if db.active_scan_job(library_id)?.is_some() {
+        pool.mark_scan_dirty(library_id);
+    }
+    tracing::info!(
+        library_id,
+        item_id,
+        path = %rel,
+        "hint ingest upserted media file"
+    );
+    Ok(HintIngestOutcome::Upserted { item_id })
+}
+
+/// Result of [`hint_ingest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintIngestOutcome {
+    Ignored,
+    Unchanged { item_id: i64 },
+    Upserted { item_id: i64 },
+    Collision,
 }
 
 /// Async library repoint (ADR-0030 §3). Returns a job id immediately; dry-run
@@ -461,12 +616,17 @@ fn run_index_pass(
         }
         // First index after a successful repoint: report unmatched rows but do
         // not delete_missing (ADR-0030). Next ordinary scan deletes.
+        // Dirty during this job (path-hinted notify): skip delete_missing so a
+        // keep-set that never saw the hinted file cannot drop it (ADR-0015).
+        // Follow-up full walk heals deletes and missed paths.
         let job_kind = db
             .get_scan_job(job_id)?
             .map(|j| j.kind)
             .unwrap_or_else(|| "scan".into());
-        let defer_delete = job_kind == "repoint";
-        let allow_delete = !defer_delete
+        let defer_repoint = job_kind == "repoint";
+        let dirty_during = pool.is_scan_dirty(library_id);
+        let allow_delete = !defer_repoint
+            && !dirty_during
             && allow_delete_missing(
                 true,
                 root_ok_after,
@@ -474,7 +634,7 @@ fn run_index_pass(
                 keep_folds.is_empty(),
                 existing_count,
             );
-        let deferred_remove = if defer_delete {
+        let deferred_remove = if defer_repoint {
             db.count_missing_fold(library_id, &keep_folds)?
         } else {
             0
@@ -488,12 +648,18 @@ fn run_index_pass(
             }
             (deleted_ids.len() as u32, deleted_ids)
         } else {
-            if defer_delete {
+            if defer_repoint {
                 tracing::info!(
                     library_id,
                     job_id,
                     deferred_remove,
                     "repoint index: deferring delete_missing until next scan"
+                );
+            } else if dirty_during {
+                tracing::info!(
+                    library_id,
+                    job_id,
+                    "skipping delete_missing; library dirty during scan (follow-up will heal)"
                 );
             } else {
                 tracing::warn!(
@@ -1370,6 +1536,265 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         panic!("job {job_id} did not finish");
+    }
+
+    #[test]
+    fn hint_ingest_upserts_media_and_skips_non_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let ep = media.join("Show.S01E01.mkv");
+        fs::write(&ep, b"not empty").unwrap();
+        fs::write(media.join("notes.txt"), b"x").unwrap();
+        fs::write(media.join("Show.S01E01.en.srt"), b"1\n").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "shows".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &media.join("notes.txt")).unwrap(),
+            HintIngestOutcome::Ignored
+        );
+        assert_eq!(
+            hint_ingest(
+                db.as_ref(),
+                pool.as_ref(),
+                lib.id,
+                &media.join("Show.S01E01.en.srt")
+            )
+            .unwrap(),
+            HintIngestOutcome::Ignored
+        );
+        let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &ep).unwrap();
+        let HintIngestOutcome::Upserted { item_id } = out else {
+            panic!("expected Upserted, got {out:?}");
+        };
+        assert!(item_id > 0);
+        let items = db.list_items(lib.id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "Show.S01E01.mkv");
+        assert_eq!(items[0].probe_status, "indexed");
+
+        // Zero-size skipped (copy-in-progress).
+        let empty = media.join("empty.mp4");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &empty).unwrap(),
+            HintIngestOutcome::Ignored
+        );
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hint_ingest_unchanged_mtime_and_update_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let path = media.join("clip.mp4");
+        fs::write(&path, b"v1").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let first = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &path).unwrap();
+        let HintIngestOutcome::Upserted { item_id } = first else {
+            panic!("expected Upserted, got {first:?}");
+        };
+        let second = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &path).unwrap();
+        assert_eq!(second, HintIngestOutcome::Unchanged { item_id });
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 1);
+
+        // Bump mtime/size so the short-circuit does not apply.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"v2-longer").unwrap();
+        let third = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &path).unwrap();
+        let HintIngestOutcome::Upserted { item_id: id2 } = third else {
+            panic!("expected Upserted after mtime change, got {third:?}");
+        };
+        assert_eq!(id2, item_id, "same path must keep media_items.id");
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed");
+        assert_eq!(row.path, "clip.mp4");
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hint_ingest_fold_collision_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("a.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job);
+
+        db.upsert_items_indexed(
+            lib.id,
+            &[UpsertItem {
+                path: "A.mp4".into(),
+                mtime_ms: 1,
+                size_bytes: 1,
+                title: "A".into(),
+                kind: "movie".into(),
+                year: None,
+                season: None,
+                episode: None,
+                content_id: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 2);
+
+        let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &media.join("a.mp4")).unwrap();
+        assert_eq!(out, HintIngestOutcome::Collision);
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn hint_ingest_does_not_delete_missing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("keep.mp4"), b"data").unwrap();
+        fs::write(media.join("gone.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job);
+        assert_eq!(db.list_items(lib.id).unwrap().len(), 2);
+
+        fs::remove_file(media.join("gone.mp4")).unwrap();
+        let new_ep = media.join("new.mp4");
+        fs::write(&new_ep, b"fresh").unwrap();
+        // Hint only — no full scan. gone.mp4 must remain in DB.
+        hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &new_ep).unwrap();
+        let paths: std::collections::HashSet<_> = db
+            .list_items(lib.id)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
+        assert!(
+            paths.contains("gone.mp4"),
+            "hint must not delete_missing: {paths:?}"
+        );
+        assert!(paths.contains("new.mp4"), "hint must upsert: {paths:?}");
+        assert!(paths.contains("keep.mp4"));
+        assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn hint_during_active_scan_marks_dirty_for_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        // Enough files that a scan stays active long enough to overlap.
+        for i in 0..80 {
+            fs::write(media.join(format!("f{i:03}.mp4")), b"x").unwrap();
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job1 = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let mut overlapped = false;
+        for _ in 0..400 {
+            if db.active_scan_job(lib.id).unwrap() == Some(job1) {
+                let late = media.join("late.mp4");
+                fs::write(&late, b"late").unwrap();
+                let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &late).unwrap();
+                // Walk may already have listed late.mp4 (Unchanged) or not (Upserted).
+                assert!(
+                    matches!(
+                        out,
+                        HintIngestOutcome::Upserted { .. } | HintIngestOutcome::Unchanged { .. }
+                    ),
+                    "hint during scan: {out:?}"
+                );
+                if matches!(out, HintIngestOutcome::Upserted { .. }) {
+                    assert!(
+                        pool.is_scan_dirty(lib.id),
+                        "upsert hint during active scan must set dirty"
+                    );
+                }
+                // request_scan while active dirty-coalesces either way.
+                assert_eq!(
+                    request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap(),
+                    job1
+                );
+                assert!(
+                    pool.is_scan_dirty(lib.id),
+                    "request_scan during active job must leave dirty set"
+                );
+                overlapped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(overlapped, "scan finished before hint overlap");
+
+        wait_job(&db, job1);
+        let job1_row = db.get_scan_job(job1).unwrap().unwrap();
+        assert_eq!(
+            job1_row.removed, 0,
+            "dirty during scan must skip delete_missing on job1"
+        );
+
+        // Wait until idle; follow-up should run because dirty.
+        for _ in 0..800 {
+            if db.active_scan_job(lib.id).unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let paths: Vec<_> = db
+            .list_items(lib.id)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "late.mp4"),
+            "hinted file must survive (dirty skip delete + follow-up): {paths:?}"
+        );
     }
 
     #[test]

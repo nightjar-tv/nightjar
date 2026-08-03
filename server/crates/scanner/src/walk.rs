@@ -419,7 +419,8 @@ fn mtime_ms_from(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn is_media(path: &Path) -> bool {
+/// True when the path extension is a known media container (not sidecar/text).
+pub fn is_media(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| MEDIA_EXTS.iter().any(|x| x.eq_ignore_ascii_case(e)))

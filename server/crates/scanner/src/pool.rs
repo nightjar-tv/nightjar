@@ -201,6 +201,14 @@ impl LibraryPool {
             .insert(library_id);
     }
 
+    /// True when a follow-up scan is already requested (notify/hint during walk).
+    pub fn is_scan_dirty(&self, library_id: i64) -> bool {
+        self.scan_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&library_id)
+    }
+
     pub fn take_scan_dirty(&self, library_id: i64) -> bool {
         self.scan_dirty
             .lock()
