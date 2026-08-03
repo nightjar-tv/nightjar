@@ -346,7 +346,7 @@ export interface paths {
         };
         /**
          * Verified H.264 encode capabilities for this process
-         * @description Startup detection-by-verification (ADR-0009). Each candidate is verified | failed | unavailable with a reason when not verified. preferredH264Encoder is what new HLS sessions use for -c:v.
+         * @description Startup detection-by-verification (ADR-0009). Each candidate is verified | failed | unavailable with a reason when not verified. preferredH264Encoder is the encoder name from the preferred encode leg (ADR-0009). optional preferredDevice is the render node when the leg binds one (e.g. VAAPI).
          */
         get: operations["getTranscodeCapabilities"];
         put?: never;
@@ -652,8 +652,10 @@ export interface components {
         };
         TranscodeCapabilities: {
             ffmpegVersion?: string | null;
-            /** @description Encoder name used for new HLS sessions (-c:v) */
+            /** @description Encoder name from the preferred session-shaped encode leg (ADR-0009). Sessions use the full leg, not the name alone. */
             preferredH264Encoder: string;
+            /** @description Device path recorded when the preferred leg binds one (e.g. /dev/dri/renderD128 for VAAPI). Null for software, QSV sysmem, and VideoToolbox. */
+            preferredDevice?: string | null;
             encoders: components["schemas"]["EncoderCandidate"][];
         };
     };

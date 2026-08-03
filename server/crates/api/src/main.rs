@@ -39,7 +39,7 @@ async fn main() {
     let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
         data_dir.join("cache").join("hls"),
         hls_max_sessions(),
-        transcode_caps.preferred_h264_encoder.clone(),
+        transcode_caps.preferred_encode_leg.clone(),
     )
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
     let db = std::sync::Arc::new(db);
