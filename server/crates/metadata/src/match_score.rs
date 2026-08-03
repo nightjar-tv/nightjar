@@ -35,6 +35,15 @@ pub struct SearchHit {
     pub poster_path: Option<String>,
     #[serde(default)]
     pub backdrop_path: Option<String>,
+    /// Sparse fast-tier capture fields (ADR-0026 §8.1): overview/plot and
+    /// vote rating ride along on search so `matched` rows can be written
+    /// without a detail fetch. Empty/absent on older cached payloads.
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub vote_average: Option<f64>,
+    #[serde(default)]
+    pub vote_count: Option<i64>,
 }
 
 /// Library-side series shape for collision pins (TV).
@@ -422,6 +431,9 @@ mod tests {
             first_air_date: None,
             poster_path: None,
             backdrop_path: None,
+            overview: None,
+            vote_average: None,
+            vote_count: None,
         }
     }
 
@@ -436,6 +448,9 @@ mod tests {
             first_air_date: Some(format!("{year}-01-01")),
             poster_path: None,
             backdrop_path: None,
+            overview: None,
+            vote_average: None,
+            vote_count: None,
         }
     }
 
@@ -687,6 +702,9 @@ mod tests {
             first_air_date: Some("2023-09-22".into()),
             poster_path: None,
             backdrop_path: None,
+            overview: None,
+            vote_average: None,
+            vote_count: None,
         };
         let results = vec![shell, long];
         let shapes = [

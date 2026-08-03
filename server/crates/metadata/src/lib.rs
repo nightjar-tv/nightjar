@@ -22,8 +22,8 @@ mod tmdb;
 
 pub use artwork::{ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key};
 pub use canonical::{
-    get_canonical, persist_mapped_hit, persist_season_projection, reproject_from_payload,
-    upsert_canonical,
+    canonical_from_search_hit, get_canonical, persist_mapped_hit, persist_season_projection,
+    reproject_from_payload, upsert_canonical,
 };
 pub use clean::{
     after_token_episode_title, clean_movie_title, clean_show_title, episode_title_rejected,
