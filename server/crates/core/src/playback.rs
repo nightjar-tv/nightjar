@@ -42,7 +42,11 @@ impl HdrCapability {
         match s {
             "none" => Some(Self::None),
             "hdr10" => Some(Self::Hdr10),
-            "dolbyVision" | "dolby_vision" | "dolby_vision_p5" => Some(Self::DolbyVision),
+            // dolby_vision_sdr: BL compat id 2 (SDR). Still DV for ceilings;
+            // encode skips tonemap (see is_dolby_vision_sdr_bl).
+            "dolbyVision" | "dolby_vision" | "dolby_vision_p5" | "dolby_vision_sdr" => {
+                Some(Self::DolbyVision)
+            }
             _ => None,
         }
     }
@@ -76,6 +80,8 @@ pub struct ClientCapabilityProfile {
 }
 
 /// Phase 1 browser whitelist: H.264 family + AAC in MP4/M4V, stereo audio.
+/// Auto ceiling 1080: full-res UHD HDR→SDR tonemap is below realtime on
+/// founder Mac (CPU zscale); scale-before-tonemap restores >1× (Gate 2 dogfood).
 pub const BROWSER_V0: ClientCapabilityProfile = ClientCapabilityProfile {
     video_codecs: &["h264", "avc", "avc1"],
     audio_codecs: &["aac", "mp4a"],
@@ -83,7 +89,7 @@ pub const BROWSER_V0: ClientCapabilityProfile = ClientCapabilityProfile {
     extensions: &["mp4", "m4v"],
     max_audio_channels: Some(2),
     max_bitrate_bps: None,
-    max_height: None,
+    max_height: Some(1080),
     hdr: HdrCapability::None,
 };
 
@@ -267,8 +273,10 @@ pub fn video_encode_plan(
         },
         None => None,
     };
-    // Profile 5 is IPT-PQ; no tonemap attempt (decide refuses that session).
+    // Profile 5: refuse (no tonemap). SDR BL (compat id 2): encode without
+    // tonemap — BL is already BT.709-shaped; zscale fails on missing tags.
     let tone_map = !is_dolby_vision_profile5(source_hdr)
+        && !is_dolby_vision_sdr_bl(source_hdr)
         && matches!(
             source_hdr
                 .and_then(HdrCapability::parse)
@@ -285,6 +293,11 @@ pub fn video_encode_plan(
 /// Probed as `dolby_vision_p5` (ffprobe `dv_profile` 5).
 pub fn is_dolby_vision_profile5(source_hdr: Option<&str>) -> bool {
     matches!(source_hdr, Some("dolby_vision_p5"))
+}
+
+/// Probed as `dolby_vision_sdr` (ffprobe `dv_bl_signal_compatibility_id` 2).
+pub fn is_dolby_vision_sdr_bl(source_hdr: Option<&str>) -> bool {
+    matches!(source_hdr, Some("dolby_vision_sdr"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,6 +430,9 @@ pub fn decide_playback(
 }
 
 fn source_needs_tonemap(source_hdr: Option<&str>) -> bool {
+    if is_dolby_vision_profile5(source_hdr) || is_dolby_vision_sdr_bl(source_hdr) {
+        return false;
+    }
     matches!(
         source_hdr
             .and_then(HdrCapability::parse)
@@ -954,10 +970,39 @@ mod tests {
     fn encode_plan_tone_maps_hdr_sources() {
         let plan = video_encode_plan(Some(1080), None, Some("hdr10"), &BROWSER_V0);
         assert!(plan.tone_map);
+        assert_eq!(plan.max_height, None, "at ceiling: no scale");
+        let uhd = video_encode_plan(Some(2160), None, Some("hdr10"), &BROWSER_V0);
+        assert!(uhd.tone_map);
+        assert_eq!(uhd.max_height, Some(1080), "UHD Auto scales before tonemap");
         let dv = video_encode_plan(Some(1080), None, Some("dolby_vision"), &MEDIA3_V0);
         assert!(dv.tone_map);
+        assert_eq!(dv.max_height, None, "LAN engines keep null height ceiling");
         let p5 = video_encode_plan(Some(1080), None, Some("dolby_vision_p5"), &BROWSER_V0);
         assert!(!p5.tone_map, "P5 must not select a tonemap graph");
+        let sdr_bl = video_encode_plan(Some(2160), None, Some("dolby_vision_sdr"), &BROWSER_V0);
+        assert!(!sdr_bl.tone_map, "SDR BL must not select a tonemap graph");
+        assert_eq!(sdr_bl.max_height, Some(1080));
+    }
+
+    #[test]
+    fn decide_does_not_require_zscale_for_dv_sdr_bl() {
+        let d = decide_playback(
+            "/a/p4.mkv",
+            Some("matroska,webm"),
+            Some("hevc"),
+            Some("eac3"),
+            Some(6),
+            Some(2160),
+            None,
+            Some("dolby_vision_sdr"),
+            None,
+            "probed",
+            &BROWSER_V0,
+            false, // no zscale — still fine; encode uses SDR retag
+        );
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+        assert!(!d.reason.contains("zscale"), "{}", d.reason);
+        assert!(!d.reason.contains("Profile 5"), "{}", d.reason);
     }
 
     #[test]

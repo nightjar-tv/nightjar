@@ -14,8 +14,11 @@ pub struct ProbeResult {
     pub height: Option<i32>,
     /// Video stream bitrate when ffprobe reports it (ADR-0022).
     pub video_bitrate_bps: Option<i64>,
-    /// `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` (ADR-0022).
-    /// Profile 5 is distinct: IPT-PQ has no zscale tonemap path.
+    /// `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` |
+    /// `dolby_vision_sdr` (ADR-0022).
+    /// Profile 5 is IPT-PQ (no tonemap path). `dolby_vision_sdr` is a DV
+    /// base layer with BL signal compatibility id 2 (SDR/BT.709): encode
+    /// without tonemap — zscale has nothing to map and often no colour tags.
     pub hdr: Option<String>,
 }
 
@@ -50,6 +53,8 @@ struct FfSideData {
     side_data_type: Option<String>,
     /// Present on DOVI configuration records (ffprobe).
     dv_profile: Option<u64>,
+    /// BL cross-compat: 1=HDR10, 2=SDR/BT.709, 4=HLG (Dolby / libavutil).
+    dv_bl_signal_compatibility_id: Option<u64>,
 }
 
 const STDERR_TAIL: usize = 512;
@@ -166,6 +171,12 @@ fn classify_hdr(color_transfer: Option<&str>, side_data: &[FfSideData]) -> Strin
             if side.dv_profile == Some(5) {
                 return "dolby_vision_p5".into();
             }
+            // Compat id 2: BL is already SDR/BT.709. Tonemap fails on these
+            // titles (unknown VUI + nothing HDR to linearise) — P4 MakeMKV
+            // trailer is the corpus proof.
+            if side.dv_bl_signal_compatibility_id == Some(2) {
+                return "dolby_vision_sdr".into();
+            }
             return "dolby_vision".into();
         }
     }
@@ -243,6 +254,7 @@ mod tests {
                 &[FfSideData {
                     side_data_type: Some("DOVI configuration record".into()),
                     dv_profile: Some(8),
+                    dv_bl_signal_compatibility_id: Some(1),
                 }]
             ),
             "dolby_vision"
@@ -253,9 +265,21 @@ mod tests {
                 &[FfSideData {
                     side_data_type: Some("DOVI configuration record".into()),
                     dv_profile: Some(5),
+                    dv_bl_signal_compatibility_id: Some(0),
                 }]
             ),
             "dolby_vision_p5"
+        );
+        assert_eq!(
+            classify_hdr(
+                None,
+                &[FfSideData {
+                    side_data_type: Some("DOVI configuration record".into()),
+                    dv_profile: Some(4),
+                    dv_bl_signal_compatibility_id: Some(2),
+                }]
+            ),
+            "dolby_vision_sdr"
         );
     }
 }

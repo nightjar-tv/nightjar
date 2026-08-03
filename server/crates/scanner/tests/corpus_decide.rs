@@ -55,6 +55,8 @@ enum RenderedOutcome {
     DolbyVision,
     Hdr10Fallback,
     TonemappedSdr,
+    /// DV with SDR/BT.709 base layer (compat id 2): encode without tonemap.
+    SdrBaseLayer,
 }
 
 impl RenderedOutcome {
@@ -63,6 +65,7 @@ impl RenderedOutcome {
             Self::DolbyVision => "dolbyVision",
             Self::Hdr10Fallback => "hdr10Fallback",
             Self::TonemappedSdr => "tonemappedSdr",
+            Self::SdrBaseLayer => "sdrBaseLayer",
         }
     }
 }
@@ -114,6 +117,7 @@ const fn aether_prov(method: PlaybackMethod, rendered: Option<RenderedOutcome>) 
 const TM: Option<RenderedOutcome> = Some(RenderedOutcome::TonemappedSdr);
 const DV: Option<RenderedOutcome> = Some(RenderedOutcome::DolbyVision);
 const H10: Option<RenderedOutcome> = Some(RenderedOutcome::Hdr10Fallback);
+const SDR_BL: Option<RenderedOutcome> = Some(RenderedOutcome::SdrBaseLayer);
 
 /// ADR-0022 expectations for the HDR/DV corpus axis. DV profiles are one row
 /// each — method and rendered outcome are not collapsed.
@@ -166,11 +170,11 @@ const HDR_AXIS: &[HdrCase] = &[
         label: "P4",
         rel: "files/dolby-vision-makemkv/P4_LG_Dolby_Trailer_4K_Demo.mkv",
         optional: true,
-        browser: verified(PlaybackMethod::Transcode, TM),
-        // SDR-compatible BL (compat id 2). Whether Apple engages DV for P4 is
-        // unmeasured; method DirectPlay is the server floor only.
+        // Compat id 2 = SDR BL: transcoder uses SDR retag, not zscale tonemap.
+        browser: verified(PlaybackMethod::Transcode, SDR_BL),
+        // Whether Apple engages DV for P4 is unmeasured; method is the floor.
         aether: aether_prov(PlaybackMethod::DirectPlay, DV),
-        no_hdr: verified(PlaybackMethod::Transcode, TM),
+        no_hdr: verified(PlaybackMethod::Transcode, SDR_BL),
         hdr_source: true,
         ignore: None,
     },
@@ -448,6 +452,7 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
                 &BROWSER_V0,
             );
             let is_p5 = probe.hdr.as_deref() == Some("dolby_vision_p5");
+            let is_sdr_bl = probe.hdr.as_deref() == Some("dolby_vision_sdr");
             if is_p5 {
                 assert!(
                     !plan.tone_map,
@@ -458,6 +463,18 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
                     probe.hdr.as_deref(),
                     Some("dolby_vision_p5"),
                     "{}: probe must store dolby_vision_p5",
+                    case.rel
+                );
+            } else if is_sdr_bl {
+                assert!(
+                    !plan.tone_map,
+                    "{}: SDR BL encode plan must not tonemap",
+                    case.rel
+                );
+                assert_eq!(
+                    probe.hdr.as_deref(),
+                    Some("dolby_vision_sdr"),
+                    "{}: probe must store dolby_vision_sdr",
                     case.rel
                 );
             } else {
@@ -478,6 +495,13 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
                     assert!(
                         refused.reason.contains("Profile 5"),
                         "{}: expected P5 refuse-with-reason, got {}",
+                        case.rel,
+                        refused.reason
+                    );
+                } else if is_sdr_bl {
+                    assert!(
+                        !refused.reason.contains("zscale"),
+                        "{}: SDR BL must not require zscale, got {}",
                         case.rel,
                         refused.reason
                     );
