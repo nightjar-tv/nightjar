@@ -3,6 +3,7 @@
 //! Slice 4: metadata queue (query over `metadata_status`) and API
 //! request-rate limiter (ADR-0026 §7/§8).
 
+mod artwork;
 mod canonical;
 mod clean;
 mod fix;
@@ -19,6 +20,9 @@ mod raw_payload;
 mod resolve;
 mod tmdb;
 
+pub use artwork::{
+    ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key,
+};
 pub use canonical::{
     get_canonical, persist_mapped_hit, persist_season_projection, reproject_from_payload,
     upsert_canonical,
