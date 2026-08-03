@@ -203,6 +203,21 @@ impl LibraryPool {
         f(cache)
     }
 
+    /// Replace the per-library walk cache (e.g. after repoint to new absolute roots).
+    pub fn replace_walk_cache(&self, library_id: i64, cache: WalkCache) {
+        self.walk_caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(library_id, cache);
+    }
+
+    pub fn clear_walk_cache(&self, library_id: i64) {
+        self.walk_caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&library_id);
+    }
+
     /// Manual scan coalesce: one follow-up after the active job finishes.
     pub fn mark_scan_dirty(&self, library_id: i64) {
         self.scan_dirty

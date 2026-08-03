@@ -339,7 +339,10 @@ fn run_repoint_job(
             .map(|r| fold_path(&r.path))
             .collect();
 
-        let outcome = walk::walk_media_files_cached(root, None)?;
+        // Single cold walk: retain math + commit index reuse the same file list
+        // (ADR-0030). Seed WalkCache under the new absolute root for the next poll.
+        let mut dry_cache = walk::WalkCache::new();
+        let outcome = walk::walk_media_files_cached(root, Some(&mut dry_cache))?;
         let mut walked_folds = HashSet::new();
         for file in &outcome.files {
             if let Some(rel) = to_relpath(&candidate, &file.path) {
@@ -371,7 +374,8 @@ fn run_repoint_job(
         db.update_library_path(library_id, &candidate)?;
         let _ = db.repair_library_paths(library_id)?;
         let _ = pool.set_library_reachability(library_id, &candidate, true);
-        run_index_pass(db, pool, job_id, library_id)?
+        pool.replace_walk_cache(library_id, dry_cache);
+        run_index_pass(db, pool, job_id, library_id, Some(outcome))?
     };
     finish_scan_probes(db, pool, job_id, library_id, probe_queue)
 }
@@ -394,7 +398,7 @@ fn run_index_and_probe(
 ) -> Result<(), String> {
     let probe_queue = {
         let _epoch = pool.enter_index_epoch();
-        run_index_pass(db, pool, job_id, library_id)?
+        run_index_pass(db, pool, job_id, library_id, None)?
     };
     finish_scan_probes(db, pool, job_id, library_id, probe_queue)
 }
@@ -431,11 +435,15 @@ fn finish_scan_probes(
 }
 
 /// Walk + upsert only. Caller must hold [`LibraryPool::enter_index_epoch`].
+///
+/// When `prewalked` is `Some`, the file list is reused (repoint: same cold walk
+/// as the retain dry-run). Caller must have reseeded WalkCache for the new root.
 fn run_index_pass(
     db: &Arc<Db>,
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
+    prewalked: Option<walk::WalkOutcome>,
 ) -> Result<Vec<pool::WorkItem>, String> {
     let lib = db
         .get_library(library_id)?
@@ -470,10 +478,25 @@ fn run_index_pass(
     // Caller holds IndexEpochGuard for this walk/upsert (ADR-0013/0015).
     #[allow(clippy::type_complexity)]
     let index_result = (|| -> Result<(u32, u32, u32, u32, Vec<pool::WorkItem>, u64), String> {
-        let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
-        let outcome = pool.with_walk_cache(library_id, |cache| {
-            walk::walk_media_files_cached(root, Some(cache))
-        })?;
+        let reused = prewalked.is_some();
+        let (cache_warm, outcome) = if let Some(outcome) = prewalked {
+            // Repoint reseeded cache from the dry-run; treat as warm for next poll.
+            (true, outcome)
+        } else {
+            let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
+            let outcome = pool.with_walk_cache(library_id, |cache| {
+                walk::walk_media_files_cached(root, Some(cache))
+            })?;
+            (cache_warm, outcome)
+        };
+        if reused {
+            tracing::info!(
+                library_id,
+                job_id,
+                files = outcome.files.len(),
+                "index reusing repoint dry-run walk (no second readdir)"
+            );
+        }
         let files = outcome.files;
         let relisted_dirs = outcome.relisted_dirs;
         let listing_errors = outcome.listing_errors;
@@ -2205,6 +2228,56 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn repoint_reseeds_walk_cache_under_new_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old");
+        let new_root = dir.path().join("new");
+        fs::create_dir_all(old_root.join("Show")).unwrap();
+        fs::create_dir_all(new_root.join("Show")).unwrap();
+        fs::write(old_root.join("Show/ep.mp4"), b"data").unwrap();
+        fs::write(new_root.join("Show/ep.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: old_root.to_string_lossy().into_owned(),
+                kind: "shows".into(),
+            })
+            .unwrap();
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+
+        let repoint_id = request_repoint(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            &new_root.to_string_lossy(),
+        )
+        .unwrap();
+        wait_job(&db, repoint_id);
+        let job = db.get_scan_job(repoint_id).unwrap().unwrap();
+        assert_eq!(job.state, "completed", "{:?}", job.error_message);
+        assert_eq!(job.unchanged + job.added + job.updated, 1);
+
+        let dir_count = pool.with_walk_cache(lib.id, |c| c.dir_count());
+        assert!(
+            dir_count >= 1,
+            "repoint must reseed WalkCache under new root, dir_count={dir_count}"
+        );
+        let lib_row = db.get_library(lib.id).unwrap().unwrap();
+        let new_canon = std::fs::canonicalize(&new_root).unwrap();
+        assert!(
+            lib_row.path.contains("new")
+                || Path::new(&lib_row.path) == new_canon.as_path()
+                || lib_row.path == new_canon.to_string_lossy(),
+            "library path updated: {}",
+            lib_row.path
         );
     }
 }

@@ -2,7 +2,8 @@
 
 - Status: accepted
 - Date: 2026-08-03
-- Amended: 2026-08-04 (poll holdoff after deferred_remove > 0)
+- Amended: 2026-08-04 (poll holdoff after deferred_remove > 0;
+  repoint single-walk reuse + WalkCache rekey)
 - Depends on: ADR-0025 §4 (path-key grammar); ADR-0014 (reachability /
   `delete_missing`); ADR-0015 (async library jobs); ADR-0029 (join stores
   provider keys only — path keys derived)
@@ -254,6 +255,13 @@ duration expires (process restart also drops the holdoff — one delete scan
 may run; acceptable for v1). A second repoint before that scan defers
 again and records a new `deferred_remove` on the new job; still no delete
 until a `kind=scan`.
+
+**One cold walk for retain + commit index.** The dry-run readdir that
+computes retain also supplies the file list for the post-commit index in
+the same epoch. A second full readdir is not required when that list is
+reused. The dry-run populates `WalkCache` under the **new** absolute root
+so the next poll is warm (old absolute keys for the previous root are
+replaced, not left stale).
 
 ### 4. What a successful repoint preserves; API `path`
 
