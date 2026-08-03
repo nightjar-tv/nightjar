@@ -833,8 +833,37 @@ pub fn set_metadata_status(
     Ok(())
 }
 
+/// Poster warm hook fired on the search-tier → `matched` transition
+/// (ADR-0026 §8). No artwork store exists yet (ADR-0027 pending), so the
+/// default is a no-op; product wires a real implementation when the artwork
+/// cache pipeline lands. Never blocks the drain.
+pub trait PosterWarm: Send + Sync {
+    /// `item_ids` all landed `matched` with the same `metadata`.
+    fn on_matched(&self, item_ids: &[i64], metadata: &CanonicalMetadata);
+}
+
+/// Default: nothing to warm until an artwork store exists.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopPosterWarm;
+
+impl PosterWarm for NoopPosterWarm {
+    fn on_matched(&self, _item_ids: &[i64], _metadata: &CanonicalMetadata) {}
+}
+
+/// Named drain call-site helper: warms posters for a freshly `matched`
+/// group when a hook is wired in; no-ops when the store is missing.
+pub fn warm_poster_for_matched(
+    warm: Option<&dyn PosterWarm>,
+    item_ids: &[i64],
+    metadata: &CanonicalMetadata,
+) {
+    if let Some(w) = warm {
+        w.on_matched(item_ids, metadata);
+    }
+}
+
 /// Options for [`drain_pending`].
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct DrainOptions {
     /// Cap groups (short probes). Ignored when [`Self::stop_when_visible_terminal`].
     pub max_groups: Option<usize>,
@@ -842,6 +871,8 @@ pub struct DrainOptions {
     pub stop_when_visible_terminal: bool,
     /// Library names omitted from the Visible snapshot (measure excludes).
     pub exclude_library_names: Vec<String>,
+    /// Poster warm hook for the `matched` transition (see [`warm_poster_for_matched`]).
+    pub poster_warm: Option<Box<dyn PosterWarm>>,
 }
 
 /// Drain two-tier work (ADR-0026 §8):
@@ -963,6 +994,7 @@ pub fn drain_pending<T: MetadataSource>(
                     match_method.as_deref().unwrap_or("?")
                 );
                 apply_search_hit(conn, &g.item_ids, &metadata)?;
+                warm_poster_for_matched(opts.poster_warm.as_deref(), &g.item_ids, &metadata);
                 stats.items_matched += g.item_ids.len();
                 let poster = has_poster(&metadata);
                 unit_has_poster
@@ -1907,5 +1939,76 @@ mod tests {
             .unwrap();
         assert_eq!(status, "ready");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_calls_poster_warm_once_on_matched() {
+        use crate::resolve::ProviderResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WARMED: AtomicUsize = AtomicUsize::new(0);
+        struct Warm;
+        impl PosterWarm for Warm {
+            fn on_matched(&self, item_ids: &[i64], metadata: &CanonicalMetadata) {
+                assert_eq!(metadata.title, "Hit");
+                assert_eq!(item_ids.len(), 1);
+                WARMED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct HitSource;
+        impl MetadataSource for HitSource {
+            fn resolve(
+                &self,
+                _input: &ResolveInput,
+            ) -> Result<ProviderResult, crate::resolve::ResolveError> {
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Movie,
+                    title: "Hit".into(),
+                    original_title: None,
+                    year: Some(2020),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(42),
+                        tmdb_show: None,
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "movie".into(),
+                        provider_id: "42".into(),
+                        payload: r#"{"id":42,"title":"Hit"}"#.into(),
+                    }),
+                })
+            }
+        }
+        WARMED.store(0, Ordering::SeqCst);
+        let c = seeded_movies();
+        let opts = DrainOptions {
+            poster_warm: Some(Box::new(Warm)),
+            ..DrainOptions::default()
+        };
+        let s = drain_pending(
+            &c,
+            &Resolver { tmdb: HitSource },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            opts,
+        )
+        .unwrap();
+        assert_eq!(s.items_matched, 2);
+        // Once per matched group (two groups in `seeded_movies`), never on enrich.
+        assert_eq!(WARMED.load(Ordering::SeqCst), 2);
     }
 }
