@@ -71,6 +71,8 @@ pub struct MediaItemRow {
     pub usable_extent_content_id: Option<String>,
     pub map_status: String,
     pub map_content_id: Option<String>,
+    /// Metadata pipeline state: pending | matched | ready | unmatched (ADR-0026).
+    pub metadata_status: String,
 }
 
 /// A stored keyframe map (ADR-0023 §7) whose stamps match live identity.
@@ -415,7 +417,7 @@ impl Db {
                         probe_status, scan_error, subtitle_status, subtitle_source_mtime_ms,
                         subtitle_source_size_bytes, content_id, probed_content_id,
                         subtitle_content_id, usable_extent_ms, usable_extent_content_id,
-                        map_status, map_content_id
+                        map_status, map_content_id, metadata_status
                  FROM media_items
                  WHERE library_id = ?1
                  ORDER BY title COLLATE NOCASE, season, episode",
@@ -437,7 +439,7 @@ impl Db {
                     probe_status, scan_error, subtitle_status, subtitle_source_mtime_ms,
                     subtitle_source_size_bytes, content_id, probed_content_id,
                     subtitle_content_id, usable_extent_ms, usable_extent_content_id,
-                    map_status, map_content_id
+                    map_status, map_content_id, metadata_status
              FROM media_items WHERE id = ?1",
             [id],
             map_item,
@@ -1316,6 +1318,7 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         usable_extent_content_id: r.get(28)?,
         map_status: r.get(29)?,
         map_content_id: r.get(30)?,
+        metadata_status: r.get(31)?,
     })
 }
 
