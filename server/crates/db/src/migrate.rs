@@ -31,6 +31,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         12,
         include_str!("../migrations/012_library_relative_paths.sql"),
     ),
+    (
+        13,
+        include_str!("../migrations/013_cleaner_version.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -225,7 +229,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -234,6 +238,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_neg, 1);
+        let has_cleaner: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('metadata_negative_cache')
+                 WHERE name = 'cleaner_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_cleaner, 1);
         let has_raw: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_raw_payloads'",
@@ -528,6 +541,6 @@ mod tests {
         );
         assert_eq!(items_before, items_after, "media_items COUNT must hold");
         assert_eq!(sidecars_before, sidecars_after, "sidecars COUNT must hold");
-        assert_eq!(version_after, 12);
+        assert_eq!(version_after, 13);
     }
 }
