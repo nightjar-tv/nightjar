@@ -106,7 +106,11 @@ pub struct LibraryPool {
     available: Condvar,
     walk_caches: Mutex<HashMap<i64, WalkCache>>,
     last_index_ms: AtomicU64,
+    /// Manual POST .../scan while active: one follow-up after the job ends.
     scan_dirty: Mutex<HashSet<i64>>,
+    /// Path-hint upsert while a scan is active: skip delete_missing on that
+    /// job (row may be outside the walk keep-set). Does not schedule follow-up.
+    dirty_add: Mutex<HashSet<i64>>,
     /// Process-wide exclusive index/walk epoch (ADR-0015). Holding this mutex
     /// is the only way to run a tree walk or index upsert pass.
     index_epoch: Mutex<()>,
@@ -150,6 +154,7 @@ impl LibraryPool {
             walk_caches: Mutex::new(HashMap::new()),
             last_index_ms: AtomicU64::new(0),
             scan_dirty: Mutex::new(HashSet::new()),
+            dirty_add: Mutex::new(HashSet::new()),
             index_epoch: Mutex::new(()),
             index_active: AtomicUsize::new(0),
             extracting: Mutex::new(HashSet::new()),
@@ -194,6 +199,7 @@ impl LibraryPool {
         f(cache)
     }
 
+    /// Manual scan coalesce: one follow-up after the active job finishes.
     pub fn mark_scan_dirty(&self, library_id: i64) {
         self.scan_dirty
             .lock()
@@ -201,7 +207,6 @@ impl LibraryPool {
             .insert(library_id);
     }
 
-    /// True when a follow-up scan is already requested (notify/hint during walk).
     pub fn is_scan_dirty(&self, library_id: i64) -> bool {
         self.scan_dirty
             .lock()
@@ -211,6 +216,29 @@ impl LibraryPool {
 
     pub fn take_scan_dirty(&self, library_id: i64) -> bool {
         self.scan_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&library_id)
+    }
+
+    /// Hint upsert while a walk is active (ADR-0015 B′). Skips delete_missing
+    /// on that job only; does not schedule a follow-up walk.
+    pub fn mark_dirty_add(&self, library_id: i64) {
+        self.dirty_add
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(library_id);
+    }
+
+    pub fn is_dirty_add(&self, library_id: i64) -> bool {
+        self.dirty_add
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&library_id)
+    }
+
+    pub fn take_dirty_add(&self, library_id: i64) -> bool {
+        self.dirty_add
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&library_id)

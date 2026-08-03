@@ -3,7 +3,8 @@
 - Status: accepted
 - Date: 2026-07-27
 - Amended: 2026-08-03 (global index epoch; poll default 300 s;
-  path-hinted notify ingest)
+  path-hinted notify ingest); 2026-08-04 (notify/dirty coalesce — hint
+  without full scan; poll-while-active is not dirty)
 
 ## Context
 
@@ -35,23 +36,32 @@ local disks (the common non-SMB install), never a gate.
 
 ## Decision
 
-1. **One discovery entry point per library.** Every trigger (library
-   creation, filesystem notify, manual `POST .../scan`, periodic poll) calls
-   the same function (`request_scan`). That function is the only code that
-   starts a scan job.
+1. **Full-walk entry points.** Library create, manual `POST .../scan`,
+   periodic poll, and internal manual follow-up call `request_scan` (with a
+   `ScanTrigger`). That is the only code that **starts a full-library scan
+   job**. Notify media creates use `hint_ingest` and do **not** call
+   `request_scan` (decision 5).
 
 2. **Scan on create.** `POST /libraries` inserts the row, calls
-   `request_scan`, and returns **201** with the library and the enqueued
-   `jobId`. The walk is async (ADR-0004); the response does not wait for
-   index or probe. Cold TV on this link is ~150 s with parallel walk, still
-   too long to block the HTTP request.
+   `request_scan` (`Create`), and returns **201** with the library and the
+   enqueued `jobId`. The walk is async (ADR-0004); the response does not wait
+   for index or probe. Cold TV on this link is ~150 s with parallel walk,
+   still too long to block the HTTP request.
 
-3. **At most one running scan and one queued follow-up per library.** If a
-   trigger arrives while a scan is active, mark the library dirty and return
-   the active job id. When that job finishes, start exactly one follow-up if
-   dirty. Further triggers during the active job only set the same dirty
-   bit. Never two concurrent walks for one library; never a queue of N
-   follow-ups.
+3. **At most one running scan per library; follow-up only for manual
+   coalesce.** Never two concurrent walks for one library; never a queue of
+   N follow-ups.
+
+   | Mid-walk trigger | Dirty bit | Skip `delete_missing`? | Auto follow-up? |
+   |---|---|---|---|
+   | **Hint / `dirty_add`** (path-hint upsert while active) | `dirty_add` | **Yes** (row may be outside keep-set) | **No** — next poll heals deletes |
+   | **Poll** while active | **No** (no-op) | **No** — this walk **is** the poll | **No** |
+   | **Manual POST** while active | `scan_dirty` | Yes until follow-up | **Yes** — exactly one |
+
+   Treating poll-while-active as dirty that suppresses delete would starve
+   `delete_missing` on every library whose walk exceeds the poll interval
+   (N150 TV warm ~minutes, poll 300 s). Poll-while-active is therefore a
+   dirty no-op.
 
 4. **One process-wide index/walk epoch.** At most one library may run a tree
    walk or index upsert pass at a time (`LibraryPool::enter_index_epoch`).
@@ -64,34 +74,29 @@ local disks (the common non-SMB install), never a gate.
    Per-library coalescing (decision 3) remains. The epoch adds the missing
    cross-library bound.
 
-5. **Notify is a trigger, not a mode.** An FS event calls `request_scan`
-   sooner. It never disables polling. There is no gate that stops poll
-   because notify armed, and there is **no notify-works detection**
-   anywhere in the system by design.
+5. **Notify accelerates creates; it does not mandate a full walk.** An FS
+   event never disables polling. There is no gate that stops poll because
+   notify armed, and there is **no notify-works detection** by design.
 
-   **Path-hinted ingest (same notify event).** When the debounced event
-   carries a concrete path that is a media file under a library root,
-   the watcher also runs `hint_ingest`: one stat + fold-aware upsert +
-   probe enqueue (same match rules as the index loop). That path **never**
-   calls `delete_missing` (ADR-0014 complete keep-set stays on full walk).
-   Non-media, directories, sidecars, missing paths, and zero-size files are
-   ignored (copy-in-progress / debounce miss — no stability sampler in
-   v1). Hint does **not** take the index epoch; concurrent with an
-   in-flight walk is intentional.
+   **Path-hinted ingest (notify media paths).** When the debounced event
+   carries a concrete path that is a media file under a library root, the
+   watcher runs `hint_ingest` only: one stat + fold-aware upsert + probe
+   enqueue (same match rules as the index loop). That path **never** calls
+   `delete_missing` and **never** calls `request_scan`. Deletes wait for
+   the next poll (or manual scan), ≤ one poll interval. Non-media,
+   directories, sidecars, missing paths, and zero-size files are ignored
+   (copy-in-progress / debounce miss — no stability sampler in v1). Hint
+   does **not** take the index epoch; concurrent with an in-flight walk is
+   intentional.
 
-   If a full scan is active for that library when the hint upserts, mark
-   the library dirty. The active job **skips `delete_missing`** when dirty
-   so a keep-set that never saw the new file cannot drop the hinted row;
-   the dirty follow-up full walk heals deletes and anything the hint
-   missed. Poll and manual scan remain full `request_scan` only — no
-   second discovery entry for them.
+   If a full scan is active when the hint **upserts**, set `dirty_add` so
+   that job skips `delete_missing` (keep-set race). Do **not** schedule a
+   follow-up full walk for the hint alone; the next poll may delete.
 
-   What notify is for now: on a **local** library it shortens detection
-   from up to one poll interval down to a couple of seconds (and can
-   surface a new episode before the follow-up walk). On **network
-   shares** where notify arms but never fires (SMB and similar), nothing
-   breaks because poll is the guarantee. Notify is an accelerator, never
-   a gate.
+   What notify is for: on a library where FS events fire, a new media file
+   can appear in the index within seconds without a full tree walk. On
+   shares where notify is mute, poll remains the guarantee. Notify is an
+   accelerator for **adds**, never a gate and never the delete path.
 
    Recursive watches are still **deferred until the first index pass
    finishes**. Originally that avoided starving a cold SMB walk of
