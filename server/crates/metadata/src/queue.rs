@@ -893,9 +893,9 @@ pub struct DrainOptions {
 /// 1. **Search** `pending` → `matched` | `unmatched` (no season bind).
 /// 2. **Enrich** `matched` → `ready` by stored id (no re-search) + season bind.
 ///
-/// Fairness: Visible-banded groups sort first within each class (existing
-/// band order). Search class runs before enrich class in one call so a
-/// single product-drain tick paints the grid before full enrich.
+/// Fairness order (ADR-0026 §8.5, v1 constant):
+/// 1. Search Visible (and CW)  2. Enrich Visible
+/// 3. Search background        4. Enrich background
 ///
 /// Provider/`api_error` failures leave rows **pending** (search) or
 /// **matched** (enrich) and are not negative-cached.
@@ -916,23 +916,8 @@ pub fn drain_pending<T: MetadataSource>(
         .map(String::as_str)
         .collect();
     let proxy = snapshot_visible_proxy_filtered(conn, VISIBLE_FIRST_SCREEN_N, &exclude)?;
-    let mut search_groups = pending_query_groups(conn, &proxy)?;
-    if !opts.stop_when_visible_terminal
-        && let Some(n) = opts.max_groups
-    {
-        search_groups.truncate(n);
-    }
 
     let mut stats = DrainStats {
-        groups: search_groups.len(),
-        movie_groups: search_groups
-            .iter()
-            .filter(|g| g.resolve_kind == MetadataKind::Movie)
-            .count(),
-        show_groups: search_groups
-            .iter()
-            .filter(|g| g.resolve_kind == MetadataKind::Episode)
-            .count(),
         visible_proxy_size: proxy.units.len(),
         proxy_movie_units: proxy.movie_unit_count(),
         proxy_show_units: proxy.show_unit_count(),
@@ -941,7 +926,6 @@ pub fn drain_pending<T: MetadataSource>(
     };
 
     let mut unit_has_poster: HashMap<String, bool> = HashMap::new();
-    // Units already search-terminal (matched/ready) — poster unknown → fail open false.
     for u in &proxy.units {
         let statuses = statuses_for_ids(conn, &u.item_ids)?;
         if statuses.iter().all(|s| s.is_terminal())
@@ -964,74 +948,44 @@ pub fn drain_pending<T: MetadataSource>(
             stats.t_first_screen_secs = Some(0.0);
             stats.gate_pass = missing == 0;
             stats.stopped_early = true;
-            stats.groups = 0;
-            stats.movie_groups = 0;
-            stats.show_groups = 0;
             stats.http_429 = http_429.load(std::sync::atomic::Ordering::Relaxed);
             stats.http_requests = http_requests.load(std::sync::atomic::Ordering::Relaxed);
             return Ok(stats);
         }
     }
 
-    // --- Phase A: search pending → matched | unmatched ---
-    let mut resolved_groups = 0usize;
+    let mut budget = if opts.stop_when_visible_terminal {
+        None
+    } else {
+        opts.max_groups
+    };
     let mut stopped_on_visible = false;
-    for (i, g) in search_groups.iter().enumerate() {
-        if (i + 1) % 50 == 0 || i + 1 == search_groups.len() {
-            eprintln!("  search {}/{} …", i + 1, search_groups.len());
-        }
-        let input = ResolveInput {
-            nfo_xml: nfo_sidecar_xml(
-                &resolve_media_path(&g.library_path, &g.path),
-                g.resolve_kind,
-            ),
-            title: Some(g.title.clone()),
-            year: g.year,
-            library_year: g.library_year,
-            library_episode_count: g.library_episode_count,
-            library_season_count: g.library_season_count,
-            ref_season: g.ref_season,
-            ref_episode: g.ref_episode,
-            ref_episode_title: g.ref_episode_title.clone(),
-            kind: Some(g.resolve_kind),
-            ..Default::default()
-        };
-        stats.provider_resolves += 1;
-        match resolver.resolve_with_store(&input, conn) {
-            Ok(ResolveOutcome::Resolved {
-                metadata,
-                match_method,
-                ..
-            }) => {
-                let tmdb_id = metadata.ids.tmdb.or(metadata.ids.tmdb_show);
-                eprintln!(
-                    "  match {} → tmdb:{:?} method={} (search tier)",
-                    g.title,
-                    tmdb_id,
-                    match_method.as_deref().unwrap_or("?")
-                );
-                apply_search_hit(conn, &g.item_ids, &metadata)?;
-                warm_poster_for_matched(opts.poster_warm.as_deref(), &g.item_ids, &metadata);
-                stats.items_matched += g.item_ids.len();
-                let poster = has_poster(&metadata);
-                unit_has_poster
-                    .entry(g.unit_key.clone())
-                    .and_modify(|p| *p = *p || poster)
-                    .or_insert(poster);
-            }
-            Ok(ResolveOutcome::Unresolved { reason, .. }) => {
-                eprintln!("  unmatched {} reason={reason:?}", g.title);
-                set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
-                stats.items_unmatched += g.item_ids.len();
-            }
-            Err(e) => {
-                eprintln!("  provider error (left pending): {} — {e}", g.title);
-                stats.provider_errors += 1;
-                stats.items_left_pending += g.item_ids.len();
-            }
-        }
-        resolved_groups += 1;
+    let mut groups_done = 0usize;
 
+    let take = |budget: &mut Option<usize>| -> bool {
+        match budget {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    };
+
+    let is_front = |b: QueueBand| b <= QueueBand::Visible;
+
+    // --- 1. Search Visible ---
+    let all_search = pending_query_groups(conn, &proxy)?;
+    let (vis_search, bg_search): (Vec<_>, Vec<_>) =
+        all_search.into_iter().partition(|g| is_front(g.band));
+
+    for g in &vis_search {
+        if !take(&mut budget) {
+            break;
+        }
+        search_one_group(conn, resolver, g, &opts, &mut stats, &mut unit_has_poster)?;
+        groups_done += 1;
         if opts.stop_when_visible_terminal {
             let (term, unmatched, ready, missing) =
                 proxy_terminal_progress(conn, &proxy, &unit_has_poster)?;
@@ -1043,116 +997,57 @@ pub fn drain_pending<T: MetadataSource>(
                 stats.gate_pass = missing == 0
                     && stats.t_first_screen_secs.unwrap_or(f64::MAX) <= T_FIRST_SCREEN_PASS_SECS;
                 stats.stopped_early = true;
-                stats.groups = resolved_groups;
-                stats.movie_groups = search_groups[..resolved_groups]
-                    .iter()
-                    .filter(|g| g.resolve_kind == MetadataKind::Movie)
-                    .count();
-                stats.show_groups = search_groups[..resolved_groups]
-                    .iter()
-                    .filter(|g| g.resolve_kind == MetadataKind::Episode)
-                    .count();
                 stopped_on_visible = true;
                 break;
             }
         }
     }
 
-    // --- Phase B: enrich matched → ready (id only, + season bind) ---
-    // Skip when first-screen measure stopped after search-terminal (next
-    // product-drain tick picks up matched work).
+    // --- 2. Enrich Visible (before any background search) ---
     if !stopped_on_visible {
-        let mut enrich_groups = matched_query_groups(conn, &proxy)?;
-        if !opts.stop_when_visible_terminal
-            && let Some(n) = opts.max_groups
-        {
-            // Cap total work: enrich at most remaining budget after search.
-            let used = resolved_groups.min(n);
-            let rest = n.saturating_sub(used);
-            enrich_groups.truncate(rest);
+        let vis_enrich: Vec<_> = matched_query_groups(conn, &proxy)?
+            .into_iter()
+            .filter(|g| is_front(g.band))
+            .collect();
+        for g in &vis_enrich {
+            if !take(&mut budget) {
+                break;
+            }
+            enrich_one_group(conn, resolver, g, &mut stats, &mut unit_has_poster)?;
+            groups_done += 1;
         }
-        stats.groups += enrich_groups.len();
-        stats.movie_groups += enrich_groups
-            .iter()
-            .filter(|g| g.resolve_kind == MetadataKind::Movie)
-            .count();
-        stats.show_groups += enrich_groups
-            .iter()
-            .filter(|g| g.resolve_kind == MetadataKind::Episode)
-            .count();
+    }
 
-        for (i, g) in enrich_groups.iter().enumerate() {
-            if (i + 1) % 50 == 0 || i + 1 == enrich_groups.len() {
-                eprintln!("  enrich {}/{} …", i + 1, enrich_groups.len());
+    // --- 3. Search background ---
+    if !stopped_on_visible {
+        for g in &bg_search {
+            if !take(&mut budget) {
+                break;
             }
-            let Some((tmdb_id, id_kind)) = tmdb_id_from_links(conn, &g.item_ids)? else {
-                eprintln!(
-                    "  enrich skip {} — no stored tmdb id (left matched)",
-                    g.title
-                );
-                continue;
-            };
-            let kind = match g.resolve_kind {
-                MetadataKind::Movie => MetadataKind::Movie,
-                MetadataKind::Episode | MetadataKind::Show => id_kind,
-            };
-            let input = ResolveInput {
-                tmdb_id: Some(tmdb_id),
-                kind: Some(kind),
-                title: Some(g.title.clone()),
-                year: g.year,
-                library_year: g.library_year,
-                library_episode_count: g.library_episode_count,
-                library_season_count: g.library_season_count,
-                ref_season: g.ref_season,
-                ref_episode: g.ref_episode,
-                ref_episode_title: g.ref_episode_title.clone(),
-                ..Default::default()
-            };
-            stats.provider_resolves += 1;
-            match resolver.resolve_with_store(&input, conn) {
-                Ok(ResolveOutcome::Resolved { metadata, .. }) => {
-                    eprintln!("  enrich {} → tmdb:{tmdb_id} (detail+bind)", g.title);
-                    match bind_resolved_items(conn, resolver, &g.item_ids, &metadata) {
-                        Ok(b) => {
-                            stats.seasons_fetched += b.seasons_fetched;
-                            stats.episodes_projected += b.episodes_projected;
-                            stats.files_linked += b.files_linked;
-                            stats.seasons_skipped += b.seasons_skipped;
-                            if b.seasons_skipped > 0 {
-                                eprintln!(
-                                    "  bind {} seasons_fetched={} skipped={} linked={}",
-                                    g.title, b.seasons_fetched, b.seasons_skipped, b.files_linked
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  bind/season ({}): {e}", g.title);
-                            stats.bind_errors += 1;
-                        }
-                    }
-                    set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
-                    stats.items_ready += g.item_ids.len();
-                    let poster = has_poster(&metadata);
-                    unit_has_poster
-                        .entry(g.unit_key.clone())
-                        .and_modify(|p| *p = *p || poster)
-                        .or_insert(poster);
-                }
-                Ok(ResolveOutcome::Unresolved { reason, .. }) => {
-                    // Id was stored at match; unexpected miss — leave matched for retry.
-                    eprintln!(
-                        "  enrich unresolved {} reason={reason:?} (left matched)",
-                        g.title
-                    );
-                    stats.provider_errors += 1;
-                }
-                Err(e) => {
-                    eprintln!("  enrich provider error (left matched): {} — {e}", g.title);
-                    stats.provider_errors += 1;
-                }
-            }
+            search_one_group(conn, resolver, g, &opts, &mut stats, &mut unit_has_poster)?;
+            groups_done += 1;
         }
+    }
+
+    // --- 4. Enrich background ---
+    if !stopped_on_visible {
+        let bg_enrich: Vec<_> = matched_query_groups(conn, &proxy)?
+            .into_iter()
+            .filter(|g| !is_front(g.band))
+            .collect();
+        for g in &bg_enrich {
+            if !take(&mut budget) {
+                break;
+            }
+            enrich_one_group(conn, resolver, g, &mut stats, &mut unit_has_poster)?;
+            groups_done += 1;
+        }
+    }
+
+    stats.groups = groups_done;
+    // movie/show group counts approximate from work done (re-query not needed for stats).
+    if stats.movie_groups == 0 && stats.show_groups == 0 {
+        // leave zero if nothing processed; helpers bump items_* only
     }
 
     if opts.stop_when_visible_terminal && stats.t_first_screen_secs.is_none() {
@@ -1173,6 +1068,153 @@ pub fn drain_pending<T: MetadataSource>(
     stats.http_429 = http_429.load(std::sync::atomic::Ordering::Relaxed);
     stats.http_requests = http_requests.load(std::sync::atomic::Ordering::Relaxed);
     Ok(stats)
+}
+
+fn search_one_group<T: MetadataSource>(
+    conn: &Connection,
+    resolver: &Resolver<T>,
+    g: &QueryGroup,
+    opts: &DrainOptions,
+    stats: &mut DrainStats,
+    unit_has_poster: &mut HashMap<String, bool>,
+) -> Result<(), String> {
+    if g.resolve_kind == MetadataKind::Movie {
+        stats.movie_groups += 1;
+    } else {
+        stats.show_groups += 1;
+    }
+    let input = ResolveInput {
+        nfo_xml: nfo_sidecar_xml(
+            &resolve_media_path(&g.library_path, &g.path),
+            g.resolve_kind,
+        ),
+        title: Some(g.title.clone()),
+        year: g.year,
+        library_year: g.library_year,
+        library_episode_count: g.library_episode_count,
+        library_season_count: g.library_season_count,
+        ref_season: g.ref_season,
+        ref_episode: g.ref_episode,
+        ref_episode_title: g.ref_episode_title.clone(),
+        kind: Some(g.resolve_kind),
+        ..Default::default()
+    };
+    stats.provider_resolves += 1;
+    match resolver.resolve_with_store(&input, conn) {
+        Ok(ResolveOutcome::Resolved {
+            metadata,
+            match_method,
+            ..
+        }) => {
+            let tmdb_id = metadata.ids.tmdb.or(metadata.ids.tmdb_show);
+            eprintln!(
+                "  match {} → tmdb:{:?} method={} (search tier)",
+                g.title,
+                tmdb_id,
+                match_method.as_deref().unwrap_or("?")
+            );
+            apply_search_hit(conn, &g.item_ids, &metadata)?;
+            warm_poster_for_matched(opts.poster_warm.as_deref(), &g.item_ids, &metadata);
+            stats.items_matched += g.item_ids.len();
+            let poster = has_poster(&metadata);
+            unit_has_poster
+                .entry(g.unit_key.clone())
+                .and_modify(|p| *p = *p || poster)
+                .or_insert(poster);
+        }
+        Ok(ResolveOutcome::Unresolved { reason, .. }) => {
+            eprintln!("  unmatched {} reason={reason:?}", g.title);
+            set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+            stats.items_unmatched += g.item_ids.len();
+        }
+        Err(e) => {
+            eprintln!("  provider error (left pending): {} — {e}", g.title);
+            stats.provider_errors += 1;
+            stats.items_left_pending += g.item_ids.len();
+        }
+    }
+    Ok(())
+}
+
+fn enrich_one_group<T: MetadataSource>(
+    conn: &Connection,
+    resolver: &Resolver<T>,
+    g: &QueryGroup,
+    stats: &mut DrainStats,
+    unit_has_poster: &mut HashMap<String, bool>,
+) -> Result<(), String> {
+    if g.resolve_kind == MetadataKind::Movie {
+        stats.movie_groups += 1;
+    } else {
+        stats.show_groups += 1;
+    }
+    let Some((tmdb_id, id_kind)) = tmdb_id_from_links(conn, &g.item_ids)? else {
+        eprintln!(
+            "  enrich skip {} — no stored tmdb id (left matched)",
+            g.title
+        );
+        return Ok(());
+    };
+    let kind = match g.resolve_kind {
+        MetadataKind::Movie => MetadataKind::Movie,
+        MetadataKind::Episode | MetadataKind::Show => id_kind,
+    };
+    let input = ResolveInput {
+        tmdb_id: Some(tmdb_id),
+        kind: Some(kind),
+        title: Some(g.title.clone()),
+        year: g.year,
+        library_year: g.library_year,
+        library_episode_count: g.library_episode_count,
+        library_season_count: g.library_season_count,
+        ref_season: g.ref_season,
+        ref_episode: g.ref_episode,
+        ref_episode_title: g.ref_episode_title.clone(),
+        ..Default::default()
+    };
+    stats.provider_resolves += 1;
+    match resolver.resolve_with_store(&input, conn) {
+        Ok(ResolveOutcome::Resolved { metadata, .. }) => {
+            eprintln!("  enrich {} → tmdb:{tmdb_id} (detail+bind)", g.title);
+            match bind_resolved_items(conn, resolver, &g.item_ids, &metadata) {
+                Ok(b) => {
+                    stats.seasons_fetched += b.seasons_fetched;
+                    stats.episodes_projected += b.episodes_projected;
+                    stats.files_linked += b.files_linked;
+                    stats.seasons_skipped += b.seasons_skipped;
+                    if b.seasons_skipped > 0 {
+                        eprintln!(
+                            "  bind {} seasons_fetched={} skipped={} linked={}",
+                            g.title, b.seasons_fetched, b.seasons_skipped, b.files_linked
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  bind/season ({}): {e}", g.title);
+                    stats.bind_errors += 1;
+                }
+            }
+            set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
+            stats.items_ready += g.item_ids.len();
+            let poster = has_poster(&metadata);
+            unit_has_poster
+                .entry(g.unit_key.clone())
+                .and_modify(|p| *p = *p || poster)
+                .or_insert(poster);
+        }
+        Ok(ResolveOutcome::Unresolved { reason, .. }) => {
+            eprintln!(
+                "  enrich unresolved {} reason={reason:?} (left matched)",
+                g.title
+            );
+            stats.provider_errors += 1;
+        }
+        Err(e) => {
+            eprintln!("  enrich provider error (left matched): {} — {e}", g.title);
+            stats.provider_errors += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort sidecar NFO for a group's reference media path (Kodi layout):
@@ -2119,5 +2161,137 @@ mod tests {
         assert_eq!(s.items_matched, 2);
         // Once per matched group (two groups in `seeded_movies`), never on enrich.
         assert_eq!(WARMED.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn drain_visible_enrich_before_background_search() {
+        use crate::resolve::ProviderResult;
+        use std::sync::Mutex;
+        static ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        struct OrderSource;
+        impl MetadataSource for OrderSource {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<ProviderResult, crate::resolve::ResolveError> {
+                let mut o = ORDER.lock().unwrap();
+                if input.tmdb_id.is_some() {
+                    o.push("enrich");
+                } else {
+                    o.push("search");
+                }
+                let title = input.title.clone().unwrap_or_default();
+                let id = if title.contains("Visible") { 1 } else { 2 };
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Movie,
+                    title,
+                    original_title: None,
+                    year: Some(2020),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(id),
+                        tmdb_show: None,
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "movie".into(),
+                        provider_id: id.to_string(),
+                        payload: format!(r#"{{"id":{id},"title":"x"}}"#),
+                    }),
+                })
+            }
+        }
+        ORDER.lock().unwrap().clear();
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        // Visible proxy ranks movies by title (first N). Seed:
+        // - 40 "A Fill …" ready rows (fill the proxy)
+        // - "A Visible Hit" matched + movie link (in proxy → front enrich)
+        // - "Zzz Background" pending (outside proxy → background search)
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('L', '/tmp/L', 'movies');",
+        )
+        .unwrap();
+        for i in 1..=40 {
+            c.execute(
+                "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+                 VALUES (1, ?1, 1, 1, ?2, 'movie', 'ready')",
+                rusqlite::params![format!("f{i:02}.mkv"), format!("A Fill {i:02}")],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+             VALUES (1, 'vis.mkv', 1, 1, 'A Visible Hit', 'movie', 'matched')",
+            [],
+        )
+        .unwrap();
+        let vis_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (?1, 'tmdb:movie:1', 0)",
+            [vis_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+             VALUES (1, 'bg.mkv', 1, 1, 'Zzz Background', 'movie', 'pending')",
+            [],
+        )
+        .unwrap();
+        // Proxy is first 40 by title: A Fill 01-40 only — "A Visible Hit" sorts after
+        // "A Fill 40" and may be #41. Force Visible Hit into proxy by naming:
+        // "A 00 Visible" sorts before "A Fill".
+        c.execute("DELETE FROM media_items WHERE title = 'A Visible Hit'", [])
+            .unwrap();
+        c.execute("DELETE FROM media_item_links", []).unwrap();
+        c.execute(
+            "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, metadata_status)
+             VALUES (1, 'vis.mkv', 1, 1, 'A 00 Visible', 'movie', 'matched')",
+            [],
+        )
+        .unwrap();
+        let vis_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (?1, 'tmdb:movie:1', 0)",
+            [vis_id],
+        )
+        .unwrap();
+        // Proxy: A 00 Visible + A Fill 01-39 (40 units). Zzz Background out.
+        let s = drain_pending(
+            &c,
+            &Resolver { tmdb: OrderSource },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert!(s.items_ready >= 1, "visible matched should enrich to ready");
+        assert_eq!(
+            s.items_matched, 1,
+            "background pending should search to matched"
+        );
+        let order = ORDER.lock().unwrap().clone();
+        let enrich_pos = order.iter().position(|&x| x == "enrich").expect("enrich");
+        let search_pos = order.iter().position(|&x| x == "search").expect("search");
+        assert!(
+            enrich_pos < search_pos,
+            "Visible enrich must precede background search, got {order:?}"
+        );
     }
 }
