@@ -17,6 +17,9 @@
   enrich id short-circuit; cert projection on detail for kids fail-closed
 - Amended: 2026-08-04 — provisional non-watch `tmdb:show:{id}` link for
   enrich id only (§8.4)
+- Amended: 2026-08-04 — NFO display authority; complete movie NFO skips
+  TMDB (ready, zero HTTP); incomplete NFO merges over detail via
+  `merge_prefer_left` (§8.9)
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -515,6 +518,27 @@ Prefix probes (`QUEUE_MAX_GROUPS`) are not representative of full-library
 cost when the first N groups skew movie-heavy (show detail payloads are
 larger — §4). Record movie/show group split on every probe; do not
 extrapolate wall time from a prefix.
+
+#### 8.9 NFO display authority; skip TMDB when complete
+
+NFO fields are the display authority for the item they sit beside. A
+movie NFO is **complete** when it has a non-empty title **and** a TMDB id
+**and** meaningful content (plot, genres, or cast). TV never claims
+completeness — shows still fetch TMDB detail and seasons, so an NFO never
+starves a show of season data.
+
+- **Complete movie NFO:** search tier persists the NFO canonical row,
+  writes the `tmdb:movie:{id}` link, and sets `ready` directly — **zero
+  TMDB HTTP calls** for the item.
+- **Incomplete NFO:** TMDB search / detail runs as usual; enrich reloads
+  the sidecar and persists `merge_prefer_left(nfo, tmdb)` — every
+  non-empty NFO field wins (ids per field; arrays only when non-empty),
+  TMDB gap-fills the empties. Episode NFOs (`episodedetails.nfo`) never
+  merge into show-level detail (kind-mismatch guard).
+
+A movie NFO with a TMDB id but incomplete content still skips the
+search-tier TMDB search (existing id short-circuit); only the enrich
+detail call is skipped when the NFO is complete.
 
 ## Alternatives considered
 
