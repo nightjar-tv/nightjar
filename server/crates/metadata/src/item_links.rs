@@ -197,4 +197,15 @@ mod tests {
         keys.sort();
         assert_eq!(keys, vec!["tmdb:episode:1", "tmdb:episode:2"]);
     }
+
+    #[test]
+    fn show_key_is_not_a_watch_key() {
+        // Provisional `tmdb:show:` links (ADR-0026 §8.4) recover ids on the
+        // art path only; they must never own watch state.
+        assert!(!is_watch_item_key("tmdb:show:1396"));
+        assert!(is_watch_item_key("tmdb:movie:550"));
+        assert!(is_watch_item_key("tmdb:episode:1"));
+        assert!(is_watch_item_key("path:1:a.mkv"));
+        assert!(is_watch_item_key("tvdb:123"));
+    }
 }
