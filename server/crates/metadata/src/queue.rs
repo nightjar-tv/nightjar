@@ -9,6 +9,8 @@ use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use nightjar_db::resolve_media_path;
+
 use crate::canonical;
 use crate::clean::{
     clean_movie_title, clean_show_title, pick_reference_episode, series_library_year,
@@ -109,6 +111,8 @@ pub struct PendingItem {
     pub title: String,
     pub year: Option<i32>,
     pub path: String,
+    /// Library root `path` is relative to (ADR-0030).
+    pub library_path: String,
     pub season: Option<i32>,
     pub episode: Option<i32>,
 }
@@ -349,6 +353,8 @@ struct QueryGroup {
     resolve_kind: MetadataKind,
     /// Reference media file path for the group (sidecar NFO lookup, ADR-0026).
     path: String,
+    /// Library root `path` is relative to (ADR-0030).
+    library_path: String,
     title: String,
     year: Option<i32>,
     library_year: Option<i32>,
@@ -476,10 +482,11 @@ fn status_query_groups(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, title, year, path, season, episode
-             FROM media_items
-             WHERE metadata_status = ?1
-             ORDER BY id DESC",
+            "SELECT m.id, m.kind, m.title, m.year, m.path, m.season, m.episode, l.path
+             FROM media_items m
+             JOIN libraries l ON l.id = m.library_id
+             WHERE m.metadata_status = ?1
+             ORDER BY m.id DESC",
         )
         .map_err(|e| format!("prepare status groups: {e}"))?;
     let rows = stmt
@@ -490,6 +497,7 @@ fn status_query_groups(
                 title: r.get(2)?,
                 year: r.get(3)?,
                 path: r.get(4)?,
+                library_path: r.get(7)?,
                 season: r.get(5)?,
                 episode: r.get(6)?,
             })
@@ -523,6 +531,7 @@ fn status_query_groups(
                     .or_insert_with(|| QueryGroup {
                         resolve_kind: MetadataKind::Movie,
                         path: it.path.clone(),
+                        library_path: it.library_path.clone(),
                         title: ct,
                         year: cy,
                         library_year: None,
@@ -548,6 +557,10 @@ fn status_query_groups(
                     .first()
                     .map(|s| s.path.as_str())
                     .unwrap_or(it.path.as_str());
+                let library_path0 = siblings
+                    .first()
+                    .map(|s| s.library_path.as_str())
+                    .unwrap_or(it.library_path.as_str());
                 let library_year = series_library_year(years, path0);
                 let seasons: std::collections::HashSet<i32> =
                     siblings.iter().filter_map(|s| s.season).collect();
@@ -571,6 +584,7 @@ fn status_query_groups(
                     .or_insert_with(|| QueryGroup {
                         resolve_kind: MetadataKind::Episode,
                         path: path0.to_string(),
+                        library_path: library_path0.to_string(),
                         title: ct.clone(),
                         year: None,
                         library_year,
@@ -967,7 +981,10 @@ pub fn drain_pending<T: MetadataSource>(
             eprintln!("  search {}/{} …", i + 1, search_groups.len());
         }
         let input = ResolveInput {
-            nfo_xml: nfo_sidecar_xml(&g.path, g.resolve_kind),
+            nfo_xml: nfo_sidecar_xml(
+                &resolve_media_path(&g.library_path, &g.path),
+                g.resolve_kind,
+            ),
             title: Some(g.title.clone()),
             year: g.year,
             library_year: g.library_year,
@@ -1162,11 +1179,10 @@ pub fn drain_pending<T: MetadataSource>(
 /// `foo.mkv` → `foo.nfo` beside the file; episode groups also try
 /// `<dir>/episodedetails.nfo`. Read/IO failures are silent `None` — the
 /// resolver decides on NFO content (corrupt NFO → `NfoInvalid`, not fallthrough).
-fn nfo_sidecar_xml(path: &str, kind: MetadataKind) -> Option<String> {
-    let p = std::path::Path::new(path);
-    let mut candidates = vec![p.with_extension("nfo")];
+fn nfo_sidecar_xml(path: &std::path::Path, kind: MetadataKind) -> Option<String> {
+    let mut candidates = vec![path.with_extension("nfo")];
     if kind == MetadataKind::Episode
-        && let Some(dir) = p.parent()
+        && let Some(dir) = path.parent()
     {
         candidates.push(dir.join("episodedetails.nfo"));
     }
@@ -1939,6 +1955,99 @@ mod tests {
             .unwrap();
         assert_eq!(status, "ready");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_nfo_sidecar_resolves_library_relative_path() {
+        use crate::resolve::ProviderResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static REL_NFO_TMDB_CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct RelNfoHit;
+        impl MetadataSource for RelNfoHit {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<ProviderResult, crate::resolve::ResolveError> {
+                // Search tier must never reach the provider with a bare
+                // (no-tmdb-id) query: the sidecar NFO resolves it from a
+                // library-relative path. Enrich is id-driven and NFO-free.
+                assert!(input.nfo_xml.is_none(), "enrich must not see NFO");
+                assert!(input.tmdb_id.is_some(), "search tier reached provider");
+                REL_NFO_TMDB_CALLS.fetch_add(1, Ordering::SeqCst);
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Movie,
+                    title: "Film".into(),
+                    original_title: None,
+                    year: Some(2021),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(42),
+                        tmdb_show: None,
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "movie".into(),
+                        provider_id: "42".into(),
+                        payload: r#"{"id":42,"title":"Film"}"#.into(),
+                    }),
+                })
+            }
+        }
+        REL_NFO_TMDB_CALLS.store(0, Ordering::SeqCst);
+        // ADR-0030: media_items.path is *library-relative*. The library root
+        // (not the CWD) is where the sidecar NFO lives.
+        let root =
+            std::env::temp_dir().join(format!("nightjar-nfo-relpath-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("film.nfo"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<movie><title>Film</title><year>2021</year>
+<uniqueid type="tmdb">42</uniqueid></movie>"#,
+        )
+        .unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(&format!(
+            "INSERT INTO libraries (name, path, kind) VALUES ('L', '{}', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 'film.mkv', 1, 1, 'Film', 'movie');",
+            root.to_str().unwrap()
+        ))
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver { tmdb: RelNfoHit },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        // NFO at <root>/film.nfo matched at search tier with no provider call;
+        // enrich by id only (one provider call total).
+        assert_eq!(REL_NFO_TMDB_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(s.items_matched, 1);
+        assert_eq!(s.items_ready, 1);
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ready");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
