@@ -757,11 +757,30 @@ mod tests {
         nfo.plot = Some("NFO plot".into());
         nfo.genres = vec!["Action".into()];
         nfo.runtime_minutes = Some(120);
-        nfo.cast = vec![CastMember { name: "Actor".into(), role: Some("Role".into()), order: Some(0) }];
-        nfo.ratings = vec![Rating { source: "imdb".into(), value: 8.0, votes: Some(100) }];
-        nfo.ids = ProviderIds { tmdb: Some(1), tmdb_show: None, imdb: Some("tt123".into()), tvdb: None };
-        nfo.artwork = vec![ArtworkRef { kind: ArtworkKind::Poster, path: "/p.jpg".into() }];
-        nfo.collection = Some(CollectionRef { id: Some(10), name: Some("Col".into()) });
+        nfo.cast = vec![CastMember {
+            name: "Actor".into(),
+            role: Some("Role".into()),
+            order: Some(0),
+        }];
+        nfo.ratings = vec![Rating {
+            source: "imdb".into(),
+            value: 8.0,
+            votes: Some(100),
+        }];
+        nfo.ids = ProviderIds {
+            tmdb: Some(1),
+            tmdb_show: None,
+            imdb: Some("tt123".into()),
+            tvdb: None,
+        };
+        nfo.artwork = vec![ArtworkRef {
+            kind: ArtworkKind::Poster,
+            path: "/p.jpg".into(),
+        }];
+        nfo.collection = Some(CollectionRef {
+            id: Some(10),
+            name: Some("Col".into()),
+        });
 
         let mut tmdb = empty_meta(MetadataKind::Movie);
         tmdb.title = "TMDB Title".into();
@@ -770,11 +789,29 @@ mod tests {
         tmdb.plot = Some("TMDB plot".into());
         tmdb.genres = vec!["Drama".into()];
         tmdb.runtime_minutes = Some(130);
-        tmdb.cast = vec![CastMember { name: "TMDB Actor".into(), role: Some("R".into()), order: Some(1) }];
-        tmdb.ratings = vec![Rating { source: "tmdb".into(), value: 7.5, votes: Some(200) }];
-        tmdb.ids = ProviderIds { tmdb: Some(2), tvdb: Some(100), ..Default::default() };
-        tmdb.artwork = vec![ArtworkRef { kind: ArtworkKind::Backdrop, path: "/b.jpg".into() }];
-        tmdb.collection = Some(CollectionRef { id: Some(20), name: Some("Other".into()) });
+        tmdb.cast = vec![CastMember {
+            name: "TMDB Actor".into(),
+            role: Some("R".into()),
+            order: Some(1),
+        }];
+        tmdb.ratings = vec![Rating {
+            source: "tmdb".into(),
+            value: 7.5,
+            votes: Some(200),
+        }];
+        tmdb.ids = ProviderIds {
+            tmdb: Some(2),
+            tvdb: Some(100),
+            ..Default::default()
+        };
+        tmdb.artwork = vec![ArtworkRef {
+            kind: ArtworkKind::Backdrop,
+            path: "/b.jpg".into(),
+        }];
+        tmdb.collection = Some(CollectionRef {
+            id: Some(20),
+            name: Some("Other".into()),
+        });
         tmdb.season = Some(1);
         tmdb.episode = Some(2);
 
@@ -807,11 +844,30 @@ mod tests {
         tmdb.plot = Some("TMDB plot".into());
         tmdb.genres = vec!["Drama".into()];
         tmdb.runtime_minutes = Some(130);
-        tmdb.cast = vec![CastMember { name: "A".into(), role: None, order: None }];
-        tmdb.ratings = vec![Rating { source: "tmdb".into(), value: 7.0, votes: None }];
-        tmdb.ids = ProviderIds { tmdb: Some(99), imdb: Some("tt999".into()), tvdb: Some(88), ..Default::default() };
-        tmdb.artwork = vec![ArtworkRef { kind: ArtworkKind::Poster, path: "/t.jpg".into() }];
-        tmdb.collection = Some(CollectionRef { id: Some(1), name: Some("C".into()) });
+        tmdb.cast = vec![CastMember {
+            name: "A".into(),
+            role: None,
+            order: None,
+        }];
+        tmdb.ratings = vec![Rating {
+            source: "tmdb".into(),
+            value: 7.0,
+            votes: None,
+        }];
+        tmdb.ids = ProviderIds {
+            tmdb: Some(99),
+            imdb: Some("tt999".into()),
+            tvdb: Some(88),
+            ..Default::default()
+        };
+        tmdb.artwork = vec![ArtworkRef {
+            kind: ArtworkKind::Poster,
+            path: "/t.jpg".into(),
+        }];
+        tmdb.collection = Some(CollectionRef {
+            id: Some(1),
+            name: Some("C".into()),
+        });
         tmdb.season = Some(1);
         tmdb.episode = Some(3);
 
@@ -839,9 +895,18 @@ mod tests {
         // nfo tmdb overrides tmdb tmdb when set.
         let mut nfo = empty_meta(MetadataKind::Movie);
         nfo.title = "NFO".into();
-        nfo.ids = ProviderIds { tmdb: Some(1), imdb: Some("tt000".into()), tvdb: Some(42), ..Default::default() };
+        nfo.ids = ProviderIds {
+            tmdb: Some(1),
+            imdb: Some("tt000".into()),
+            tvdb: Some(42),
+            ..Default::default()
+        };
         let mut tmdb = empty_meta(MetadataKind::Movie);
-        tmdb.ids = ProviderIds { tmdb: Some(2), tvdb: Some(99), ..Default::default() };
+        tmdb.ids = ProviderIds {
+            tmdb: Some(2),
+            tvdb: Some(99),
+            ..Default::default()
+        };
         let m = merge_prefer_left(&nfo, &tmdb);
         assert_eq!(m.ids.tmdb, Some(1)); // nfo wins
         assert_eq!(m.ids.imdb.as_deref(), Some("tt000")); // nfo only

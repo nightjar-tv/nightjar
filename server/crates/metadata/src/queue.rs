@@ -20,7 +20,7 @@ use crate::item_links;
 use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind, item_key_for_metadata};
 use crate::negative_cache::{PROVIDER_TMDB, query_key};
 use crate::resolve::MetadataSource;
-use crate::resolve::{ResolveInput, ResolveOutcome, Resolver};
+use crate::resolve::{MetadataOrigin, ResolveInput, ResolveOutcome, Resolver};
 
 /// Roughly one cold first screen (ADR-0026 §8). Constant, not a setting.
 pub const VISIBLE_FIRST_SCREEN_N: usize = 40;
@@ -1131,6 +1131,7 @@ fn search_one_group<T: MetadataSource>(
     match resolver.resolve_with_store(&input, conn) {
         Ok(ResolveOutcome::Resolved {
             metadata,
+            source,
             match_method,
             ..
         }) => {
@@ -1141,27 +1142,43 @@ fn search_one_group<T: MetadataSource>(
                 tmdb_id,
                 match_method.as_deref().unwrap_or("?")
             );
-            match apply_search_hit(conn, &g.item_ids, &metadata) {
-                Ok(true) => {
-                    warm_poster_for_matched(opts.poster_warm.as_deref(), &g.item_ids, &metadata);
-                    stats.items_matched += g.item_ids.len();
-                    let poster = has_poster(&metadata);
-                    unit_has_poster
-                        .entry(g.unit_key.clone())
-                        .and_modify(|p| *p = *p || poster)
-                        .or_insert(poster);
+            // Complete NFO movie: skip TMDB entirely, persist and go Ready.
+            if source == MetadataOrigin::Nfo && metadata.is_nfo_complete() {
+                persist_nfo_ready_and_link(conn, &g.item_ids, &metadata)?;
+                warm_poster_for_matched(opts.poster_warm.as_deref(), &g.item_ids, &metadata);
+                stats.items_ready += g.item_ids.len();
+                let poster = has_poster(&metadata);
+                unit_has_poster
+                    .entry(g.unit_key.clone())
+                    .and_modify(|p| *p = *p || poster)
+                    .or_insert(poster);
+            } else {
+                match apply_search_hit(conn, &g.item_ids, &metadata) {
+                    Ok(true) => {
+                        warm_poster_for_matched(
+                            opts.poster_warm.as_deref(),
+                            &g.item_ids,
+                            &metadata,
+                        );
+                        stats.items_matched += g.item_ids.len();
+                        let poster = has_poster(&metadata);
+                        unit_has_poster
+                            .entry(g.unit_key.clone())
+                            .and_modify(|p| *p = *p || poster)
+                            .or_insert(poster);
+                    }
+                    Ok(false) => {
+                        // Resolved but nothing enrichable stored — never park
+                        // the group in `matched` without a stored id.
+                        eprintln!(
+                            "  unmatched {} — resolved without usable tmdb id (no stored key)",
+                            g.title
+                        );
+                        set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+                        stats.items_unmatched += g.item_ids.len();
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(false) => {
-                    // Resolved but nothing enrichable stored — never park the
-                    // group in `matched` without a stored id (human rule).
-                    eprintln!(
-                        "  unmatched {} — resolved without usable tmdb id (no stored key)",
-                        g.title
-                    );
-                    set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
-                    stats.items_unmatched += g.item_ids.len();
-                }
-                Err(e) => return Err(e),
             }
         }
         Ok(ResolveOutcome::Unresolved { reason, .. }) => {
@@ -1175,6 +1192,36 @@ fn search_one_group<T: MetadataSource>(
             stats.items_left_pending += g.item_ids.len();
         }
     }
+    Ok(())
+}
+
+/// Persist NFO-originated canonical metadata, write item links, and set
+/// status to Ready — all in one transaction. Used when a complete NFO
+/// makes a TMDB detail call unnecessary.
+fn persist_nfo_ready_and_link(
+    conn: &Connection,
+    item_ids: &[i64],
+    metadata: &CanonicalMetadata,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin nfo ready tx: {e}"))?;
+    canonical::upsert_canonical(&tx, PROVIDER_TMDB, metadata)?;
+    for id in item_ids {
+        if let Some(key) = item_key_for_metadata(metadata) {
+            item_links::replace_auto_link(&tx, *id, &key)?;
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare("UPDATE media_items SET metadata_status = ?1 WHERE id = ?2")
+            .map_err(|e| format!("prepare status update: {e}"))?;
+        for id in item_ids {
+            stmt.execute(params![MetadataStatus::Ready.as_str(), id])
+                .map_err(|e| format!("update status {id}: {e}"))?;
+        }
+    }
+    tx.commit().map_err(|e| format!("commit nfo ready: {e}"))?;
     Ok(())
 }
 
@@ -1201,6 +1248,28 @@ fn enrich_one_group<T: MetadataSource>(
         MetadataKind::Movie => MetadataKind::Movie,
         MetadataKind::Episode | MetadataKind::Show => id_kind,
     };
+
+    // Load NFO sidecar — enrich may merge NFO data over TMDB detail.
+    let nfo = nfo_sidecar_meta(
+        &resolve_media_path(&g.library_path, &g.path),
+        g.resolve_kind,
+    );
+
+    // Complete NFO (movie): skip TMDB detail entirely.
+    if let Some(ref nfo_meta) = nfo
+        && nfo_meta.is_nfo_complete()
+    {
+        eprintln!("  enrich {} → nfo complete (skip tmdb:{tmdb_id})", g.title);
+        persist_nfo_ready_and_link(conn, &g.item_ids, nfo_meta)?;
+        stats.items_ready += g.item_ids.len();
+        let poster = has_poster(nfo_meta);
+        unit_has_poster
+            .entry(g.unit_key.clone())
+            .and_modify(|p| *p = *p || poster)
+            .or_insert(poster);
+        return Ok(());
+    }
+
     let input = ResolveInput {
         tmdb_id: Some(tmdb_id),
         kind: Some(kind),
@@ -1217,8 +1286,29 @@ fn enrich_one_group<T: MetadataSource>(
     stats.provider_resolves += 1;
     match resolver.resolve_with_store(&input, conn) {
         Ok(ResolveOutcome::Resolved { metadata, .. }) => {
+            // If NFO is present but incomplete, merge NFO data over TMDB
+            // (only when kinds match — episode NFOs do not merge into show
+            // detail, ADR-0026 §8.2).
+            let final_meta = if let Some(ref nfo_meta) = nfo {
+                if nfo_meta.kind == kind {
+                    let merged = canonical::merge_prefer_left(nfo_meta, &metadata);
+                    // Re-persist merged canonical over TMDB-only row.
+                    let tx = conn
+                        .unchecked_transaction()
+                        .map_err(|e| format!("begin merge persist tx: {e}"))?;
+                    canonical::upsert_canonical(&tx, PROVIDER_TMDB, &merged)?;
+                    tx.commit()
+                        .map_err(|e| format!("commit merge persist: {e}"))?;
+                    Box::new(merged)
+                } else {
+                    metadata
+                }
+            } else {
+                metadata
+            };
+
             eprintln!("  enrich {} → tmdb:{tmdb_id} (detail+bind)", g.title);
-            match bind_resolved_items(conn, resolver, &g.item_ids, &metadata) {
+            match bind_resolved_items(conn, resolver, &g.item_ids, &final_meta) {
                 Ok(b) => {
                     stats.seasons_fetched += b.seasons_fetched;
                     stats.episodes_projected += b.episodes_projected;
@@ -1238,7 +1328,7 @@ fn enrich_one_group<T: MetadataSource>(
             }
             set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
             stats.items_ready += g.item_ids.len();
-            let poster = has_poster(&metadata);
+            let poster = has_poster(&final_meta);
             unit_has_poster
                 .entry(g.unit_key.clone())
                 .and_modify(|p| *p = *p || poster)
@@ -1278,6 +1368,15 @@ fn nfo_sidecar_xml(path: &std::path::Path, kind: MetadataKind) -> Option<String>
         }
     }
     None
+}
+
+/// Parse the sidecar NFO (if any) for a media path into [`CanonicalMetadata`].
+fn nfo_sidecar_meta(path: &std::path::Path, kind: MetadataKind) -> Option<CanonicalMetadata> {
+    let xml = nfo_sidecar_xml(path, kind)?;
+    if xml.trim().is_empty() {
+        return None;
+    }
+    crate::nfo::parse_nfo(&xml).ok()
 }
 
 #[cfg(test)]
@@ -2280,6 +2379,181 @@ mod tests {
             .unwrap();
         assert_eq!(ep_links, vec!["tmdb:episode:1001", "tmdb:episode:1002"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Complete movie NFO (title + tmdb id + plot) skips TMDB entirely:
+    /// search tier sets Ready directly and the mock provider is never called.
+    #[test]
+    fn drain_complete_movie_nfo_ready_zero_tmdb_http() {
+        use crate::resolve::ProviderResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COMPLETE_TMDB_CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct CompleteNfoProvider;
+        impl MetadataSource for CompleteNfoProvider {
+            fn resolve(
+                &self,
+                _input: &ResolveInput,
+            ) -> Result<ProviderResult, crate::resolve::ResolveError> {
+                COMPLETE_TMDB_CALLS.fetch_add(1, Ordering::SeqCst);
+                unreachable!("complete NFO must never call TMDB");
+            }
+        }
+        COMPLETE_TMDB_CALLS.store(0, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("nightjar-complete-nfo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("complete.mkv");
+        std::fs::write(
+            dir.join("complete.nfo"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<movie><title>Complete NFO</title><year>2025</year>
+<plot>Local plot data</plot>
+<uniqueid type="tmdb">42</uniqueid></movie>"#,
+        )
+        .unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(&format!(
+            "INSERT INTO libraries (name, path, kind) VALUES ('L', '{}', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, '{}', 1, 1, 'Complete NFO', 'movie');",
+            dir.to_str().unwrap(),
+            media.to_str().unwrap()
+        ))
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: CompleteNfoProvider,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(COMPLETE_TMDB_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(s.items_matched, 0);
+        assert_eq!(s.items_ready, 1);
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ready");
+        // Canonical was persisted from NFO.
+        let title: String = c
+            .query_row(
+                "SELECT title FROM metadata_canonical WHERE provider = 'tmdb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Complete NFO");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Incomplete movie NFO (no TMDB id) with plot LOCAL → search falls
+    /// through to TMDB → enrich loads NFO → merge_prefer_left preserves
+    /// LOCAL plot over TMDB REMOTE plot.
+    #[test]
+    fn drain_nfo_plot_local_wins_merge_over_tmdb_remote() {
+        use crate::resolve::ProviderResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MERGE_TMDB_CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct MergeNfoProvider;
+        impl MetadataSource for MergeNfoProvider {
+            fn resolve(
+                &self,
+                _input: &ResolveInput,
+            ) -> Result<ProviderResult, crate::resolve::ResolveError> {
+                MERGE_TMDB_CALLS.fetch_add(1, Ordering::SeqCst);
+                // Search tier: NFO has no TMDB id, so TMDB search is called.
+                // Enrich tier: id-driven, so NFO is not in input.
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Movie,
+                    title: "Merge NFO".into(),
+                    original_title: None,
+                    year: Some(2025),
+                    air_date: None,
+                    plot: Some("REMOTE tmdb plot".into()),
+                    genres: vec![],
+                    runtime_minutes: None,
+                    cast: vec![],
+                    ratings: vec![],
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(99),
+                        tmdb_show: None,
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: vec![],
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "movie".into(),
+                        provider_id: "99".into(),
+                        payload: r#"{"id":99,"title":"Merge NFO","overview":"REMOTE tmdb plot"}"#
+                            .into(),
+                    }),
+                })
+            }
+        }
+        MERGE_TMDB_CALLS.store(0, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("nightjar-merge-nfo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("merge.mkv");
+        // NFO has plot="LOCAL nfo plot" but NO tmdb uniqueid — incomplete.
+        std::fs::write(
+            dir.join("merge.nfo"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<movie><title>Merge NFO</title><year>2025</year>
+<plot>LOCAL nfo plot</plot></movie>"#,
+        )
+        .unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(&format!(
+            "INSERT INTO libraries (name, path, kind) VALUES ('L', '{}', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, '{}', 1, 1, 'Merge NFO', 'movie');",
+            dir.to_str().unwrap(),
+            media.to_str().unwrap()
+        ))
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: MergeNfoProvider,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        // Search + enrich: two TMDB calls (one search, one detail).
+        assert_eq!(MERGE_TMDB_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(s.items_matched, 1);
+        assert_eq!(s.items_ready, 1);
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ready");
+        // Canonical plot = LOCAL from NFO (merge_prefer_left wins).
+        let plot: String = c
+            .query_row(
+                "SELECT plot FROM metadata_canonical WHERE provider = 'tmdb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plot, "LOCAL nfo plot");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
