@@ -2191,7 +2191,8 @@ mod tests {
                 &self,
                 show_id: i64,
                 season_number: i32,
-            ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError> {
+            ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError>
+            {
                 assert_eq!(show_id, 77);
                 assert_eq!(season_number, 1);
                 let payload = r#"{
@@ -2210,8 +2211,10 @@ mod tests {
         }
         EP_NFO_SEARCHES.store(0, Ordering::SeqCst);
         // episodedetails.nfo in the show folder carries only an episode TMDB id.
-        let root = std::env::temp_dir()
-            .join(format!("nightjar-nfo-ep-fallback-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "nightjar-nfo-ep-fallback-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(

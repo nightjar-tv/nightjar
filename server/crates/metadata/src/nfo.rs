@@ -541,7 +541,10 @@ mod tests {
 </movie>"#,
         )
         .unwrap();
-        assert_eq!(meta.ids.tmdb, None, "actor tmdbid must not become the movie id");
+        assert_eq!(
+            meta.ids.tmdb, None,
+            "actor tmdbid must not become the movie id"
+        );
         assert_eq!(meta.ids.imdb, None);
         assert_eq!(meta.ids.tvdb, None);
         assert_eq!(item_key_for_metadata(&meta), None);
