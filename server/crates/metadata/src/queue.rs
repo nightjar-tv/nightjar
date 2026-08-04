@@ -848,15 +848,15 @@ pub fn set_metadata_status(
 }
 
 /// Poster warm hook fired on the search-tier → `matched` transition
-/// (ADR-0026 §8). No artwork store exists yet (ADR-0027 pending), so the
-/// default is a no-op; product wires a real implementation when the artwork
-/// cache pipeline lands. Never blocks the drain.
+/// (ADR-0026 §8). The crate default is a no-op so the queue has no I/O
+/// dependency; the product drain wires a store-backed implementation via
+/// [`crate::ArtworkStore`] (ADR-0027 §5). Never blocks the drain.
 pub trait PosterWarm: Send + Sync {
     /// `item_ids` all landed `matched` with the same `metadata`.
     fn on_matched(&self, item_ids: &[i64], metadata: &CanonicalMetadata);
 }
 
-/// Default: nothing to warm until an artwork store exists.
+/// Default: nothing to warm (product wires the store-backed hook).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopPosterWarm;
 
