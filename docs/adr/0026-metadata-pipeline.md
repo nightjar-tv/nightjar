@@ -15,6 +15,8 @@
 - Amended: 2026-08-04 — two-tier status (`matched`); adult first-screen
   search-terminal; queue fairness (search vs enrich); sparse search write;
   enrich id short-circuit; cert projection on detail for kids fail-closed
+- Amended: 2026-08-04 — provisional non-watch `tmdb:show:{id}` link for
+  enrich id only (§8.4)
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -371,8 +373,10 @@ state. Display-only poster without identity is out of this slice.
 
 Work set: `metadata_status = 'matched'`.
 
-1. **Id short-circuit only.** Load the stored TMDB id (link or sparse
-   canonical). Call `movie_detail` / `tv_detail` by id. **Never re-search.**
+1. **Id short-circuit only.** Load the stored TMDB id (link — movie
+   `tmdb:movie:{id}`, or provisional non-watch `tmdb:show:{id}` written at
+   search tier for enrich id only — or sparse canonical). Call
+   `movie_detail` / `tv_detail` by id. **Never re-search.**
 2. Map cast, genre names (const id→name map is fine, ~1 KB), collection on
    movies (§6), and full artwork refs from detail.
 3. **Content certification projection (frozen here):** on detail write,
