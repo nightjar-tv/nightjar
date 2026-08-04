@@ -158,6 +158,19 @@ impl NfoSource {
     }
 }
 
+/// Does the parsed NFO supply a TMDB id the search tier can actually store?
+/// Movies need a TMDB movie id; TV needs a TMDB **show** id. An episode
+/// `uniqueid` is an *episode* id (never a `tmdb:show:`), and TVDB/IMDB alone
+/// has no TMDB API path — both must fall through to TMDB search instead of
+/// landing a terminal `matched` with nothing enrichable.
+fn nfo_has_usable_id(meta: &CanonicalMetadata) -> bool {
+    match meta.kind {
+        MetadataKind::Movie => meta.ids.tmdb.is_some(),
+        MetadataKind::Show => meta.ids.tmdb.is_some() || meta.ids.tmdb_show.is_some(),
+        MetadataKind::Episode => meta.ids.tmdb_show.is_some(),
+    }
+}
+
 pub struct Resolver<T> {
     pub tmdb: T,
 }
@@ -195,11 +208,16 @@ impl<T: MetadataSource> Resolver<T> {
     ) -> Result<ResolveOutcome, ResolveError> {
         match NfoSource.attempt(input) {
             NfoAttempt::Parsed(metadata) => {
-                return Ok(ResolveOutcome::Resolved {
-                    metadata,
-                    source: MetadataOrigin::Nfo,
-                    match_method: None,
-                });
+                // NFO that cannot supply a usable TMDB id must fall through to
+                // TMDB search: never land a terminal `matched` with nothing
+                // enrichable stored (e.g. episode-only id, TVDB/IMDB only).
+                if nfo_has_usable_id(&metadata) {
+                    return Ok(ResolveOutcome::Resolved {
+                        metadata,
+                        source: MetadataOrigin::Nfo,
+                        match_method: None,
+                    });
+                }
             }
             NfoAttempt::Invalid(err) => {
                 return Ok(ResolveOutcome::Unresolved {
@@ -498,6 +516,157 @@ mod tests {
                 raw: None,
             })
         }
+    }
+
+    /// Always-hit provider that counts search-tier calls (no `tmdb_id`).
+    struct CountingHit {
+        search_calls: Cell<usize>,
+    }
+
+    impl CountingHit {
+        fn hit_meta(id: i64) -> CanonicalMetadata {
+            CanonicalMetadata {
+                kind: MetadataKind::Movie,
+                title: "Fight Club".into(),
+                original_title: None,
+                year: Some(1999),
+                air_date: None,
+                plot: None,
+                genres: Vec::new(),
+                runtime_minutes: None,
+                cast: Vec::new(),
+                ratings: Vec::new(),
+                ids: crate::model::ProviderIds {
+                    tmdb: Some(id),
+                    tmdb_show: None,
+                    imdb: None,
+                    tvdb: None,
+                },
+                artwork: Vec::new(),
+                collection: None,
+                season: None,
+                episode: None,
+            }
+        }
+    }
+
+    impl MetadataSource for CountingHit {
+        fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            let id = match input.tmdb_id {
+                Some(id) => id,
+                None => {
+                    self.search_calls.set(self.search_calls.get() + 1);
+                    42
+                }
+            };
+            Ok(ProviderResult::Hit {
+                metadata: Box::new(Self::hit_meta(id)),
+                method: "test",
+                raw: None,
+            })
+        }
+    }
+
+    #[test]
+    fn nfo_without_usable_id_falls_through_to_tmdb_search() {
+        // TVDB-only movie NFO: no TMDB id, so TMDB search must run — the NFO
+        // alone must not land a terminal Resolved (nothing enrichable stored).
+        let src = CountingHit {
+            search_calls: Cell::new(0),
+        };
+        let outcome = Resolver { tmdb: src }
+            .resolve(&ResolveInput {
+                nfo_xml: Some(
+                    r#"<movie><title>Fight Club</title><year>1999</year>
+                       <uniqueid type="tvdb">361</uniqueid></movie>"#
+                        .into(),
+                ),
+                title: Some("Fight Club".into()),
+                year: Some(1999),
+                kind: Some(MetadataKind::Movie),
+                ..Default::default()
+            })
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                source,
+                match_method,
+            } => {
+                assert_eq!(source, MetadataOrigin::Tmdb);
+                assert_eq!(metadata.ids.tmdb, Some(42));
+                assert!(match_method.is_some());
+            }
+            other => panic!("expected TMDB-resolved fall-through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn episode_nfo_with_only_episode_id_falls_through_to_tmdb_search() {
+        // episodedetails.nfo `uniqueid` is an *episode* id — not a usable show
+        // id, so the group must fall through to a TV search, not resolve.
+        let src = CountingHit {
+            search_calls: Cell::new(0),
+        };
+        let outcome = Resolver { tmdb: src }
+            .resolve(&ResolveInput {
+                nfo_xml: Some(
+                    r#"<episodedetails><title>Pilot</title><showtitle>Breaking Bad</showtitle>
+                       <season>1</season><episode>1</episode>
+                       <uniqueid type="tmdb">62085</uniqueid></episodedetails>"#
+                        .into(),
+                ),
+                title: Some("Breaking Bad".into()),
+                year: None,
+                kind: Some(MetadataKind::Episode),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ResolveOutcome::Resolved {
+                    source: MetadataOrigin::Tmdb,
+                    ..
+                }
+            ),
+            "episode-id-only NFO must fall through to TMDB search, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn nfo_with_usable_tmdb_id_never_calls_provider() {
+        let resolver = Resolver {
+            tmdb: CountingHit {
+                search_calls: Cell::new(0),
+            },
+        };
+        let outcome = resolver
+            .resolve(&ResolveInput {
+                nfo_xml: Some(fixture("movie.nfo")),
+                title: Some("Fight Club".into()),
+                year: Some(1999),
+                kind: Some(MetadataKind::Movie),
+                ..Default::default()
+            })
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                source,
+                match_method,
+            } => {
+                assert_eq!(source, MetadataOrigin::Nfo);
+                assert_eq!(metadata.ids.tmdb, Some(550));
+                assert_eq!(match_method, None);
+            }
+            other => panic!("expected NFO resolve, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.search_calls.get(),
+            0,
+            "usable NFO id must short-circuit the provider"
+        );
     }
 
     #[test]

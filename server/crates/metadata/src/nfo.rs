@@ -313,23 +313,79 @@ fn parse_ids(xml: &str) -> ProviderIds {
         }
         from = open_end + end_rel + "</uniqueid>".len();
     }
+    // Legacy root-level tags: `first_text` would also match a `<tmdbid>`
+    // nested inside `<actor>` (some exporters write actor-level TMDB ids), so
+    // scope these to direct children of the root element only.
     if ids.tmdb.is_none()
-        && let Some(v) = first_text(xml, "tmdbid").and_then(|s| s.trim().parse().ok())
+        && let Some(v) = first_root_text(xml, "tmdbid").and_then(|s| s.trim().parse().ok())
     {
         ids.tmdb = Some(v);
     }
     if ids.imdb.is_none()
-        && let Some(v) = first_text(xml, "imdbid").map(|s| s.trim().to_string())
+        && let Some(v) = first_root_text(xml, "imdbid").map(|s| s.trim().to_string())
         && !v.is_empty()
     {
         ids.imdb = Some(v);
     }
     if ids.tvdb.is_none()
-        && let Some(v) = first_text(xml, "tvdbid").and_then(|s| s.trim().parse().ok())
+        && let Some(v) = first_root_text(xml, "tvdbid").and_then(|s| s.trim().parse().ok())
     {
         ids.tvdb = Some(v);
     }
     ids
+}
+
+/// [`first_text`] restricted to direct children of the document root, so a
+/// `<tmdbid>` / `<imdbid>` / `<tvdbid>` nested inside `<actor>`, `<set>`,
+/// `<ratings>`, … never satisfies the provider-id fallback.
+fn first_root_text(xml: &str, tag: &str) -> Option<String> {
+    let root = detect_kind(xml).ok()?.as_str();
+    let lower = xml.to_ascii_lowercase();
+    let open = format!("<{root}");
+    let start = lower.find(&open)?;
+    let after_name = start + open.len();
+    let gt_rel = lower[after_name..].find('>')?;
+    let body_start = after_name + gt_rel + 1;
+    let close = format!("</{root}>");
+    let close_rel = lower[body_start..].rfind(&close)?;
+    let body_end = body_start + close_rel;
+
+    // Walk the root body top-level elements; nested subtrees are skipped whole
+    // so `<tag>` matches only at depth 1.
+    let mut i = body_start;
+    while i < body_end {
+        if lower[i..].starts_with("<!--") {
+            i = i + 4 + lower[i + 4..body_end].find("-->")? + 3;
+            continue;
+        }
+        if !lower[i..].starts_with('<') {
+            i += 1;
+            continue;
+        }
+        let gt_rel = lower[i..].find('>')?;
+        let open_end = i + gt_rel + 1;
+        let open_tag = &lower[i..open_end];
+        // Self-closing (`<thumb ... />`) — no body.
+        if open_tag[..open_tag.len() - 1].ends_with('/') {
+            i = open_end;
+            continue;
+        }
+        let name_end = open_tag[1..]
+            .find(|c: char| c.is_ascii_whitespace() || c == '>')
+            .map(|n| n + 1)
+            .unwrap_or(open_tag.len());
+        let name = &open_tag[1..name_end];
+        let content_start = open_end;
+        let close_tag = format!("</{name}>");
+        let end_rel = lower[content_start..body_end].find(&close_tag)?;
+        if name == tag {
+            let raw = strip_inner_tags(&xml[content_start..content_start + end_rel]);
+            let raw = raw.trim();
+            return (!raw.is_empty()).then(|| raw.to_string());
+        }
+        i = content_start + end_rel + close_tag.len();
+    }
+    None
 }
 
 fn parse_artwork(xml: &str) -> Vec<ArtworkRef> {
@@ -463,5 +519,55 @@ mod tests {
             err,
             NfoError::Malformed(_) | NfoError::MissingTitle | NfoError::UnknownRoot
         ));
+    }
+
+    /// An actor-level `<tmdbid>` must never satisfy the provider-id fallback:
+    /// `parse_ids` scopes legacy ids to direct children of the root.
+    #[test]
+    fn cast_tmdbid_is_not_a_provider_id() {
+        let meta = parse_nfo(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<movie>
+  <title>Fight Club</title>
+  <year>1999</year>
+  <actor>
+    <name>Brad Pitt</name>
+    <tmdbid>287</tmdbid>
+  </actor>
+  <actor>
+    <name>Edward Norton</name>
+    <tmdbid>819</tmdbid>
+  </actor>
+</movie>"#,
+        )
+        .unwrap();
+        assert_eq!(meta.ids.tmdb, None, "actor tmdbid must not become the movie id");
+        assert_eq!(meta.ids.imdb, None);
+        assert_eq!(meta.ids.tvdb, None);
+        assert_eq!(item_key_for_metadata(&meta), None);
+    }
+
+    /// Root-level legacy `<tmdbid>` still works as a fallback, even when a
+    /// cast block with `<tmdbid>` appears earlier in the document.
+    #[test]
+    fn root_tmdbid_fallback_ignores_actor_block_before_it() {
+        let meta = parse_nfo(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<movie>
+  <title>Fight Club</title>
+  <year>1999</year>
+  <actor>
+    <name>Brad Pitt</name>
+    <tmdbid>287</tmdbid>
+  </actor>
+  <tmdbid>550</tmdbid>
+</movie>"#,
+        )
+        .unwrap();
+        assert_eq!(meta.ids.tmdb, Some(550));
+        assert_eq!(
+            item_key_for_metadata(&meta).as_deref(),
+            Some("tmdb:movie:550")
+        );
     }
 }
