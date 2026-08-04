@@ -1230,7 +1230,7 @@ components:
 
     MediaItem:
       type: object
-      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, subtitleStatus, playbackMethod]
+      required: [id, libraryId, path, title, kind, sizeBytes, probeStatus, subtitleStatus, metadataStatus, playbackMethod]
       properties:
         id:
           type: integer
@@ -1283,11 +1283,21 @@ components:
           $ref: "#/components/schemas/ProbeStatus"
         subtitleStatus:
           $ref: "#/components/schemas/SubtitleStatus"
+        metadataStatus:
+          $ref: "#/components/schemas/MetadataStatus"
         scanError:
           type: string
           nullable: true
         playbackMethod:
           $ref: "#/components/schemas/PlaybackMethod"
+
+    MetadataStatus:
+      type: string
+      enum: [pending, matched, ready, unmatched]
+      description: >
+        Metadata pipeline state (ADR-0026). `pending` = search tier queued;
+        `matched` = identity found, detail enrichment pending; `ready` = full
+        metadata bound; `unmatched` = search terminal no-match.
 
     ScanJobAccepted:
       type: object

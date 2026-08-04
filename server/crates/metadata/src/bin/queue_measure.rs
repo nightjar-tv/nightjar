@@ -198,6 +198,7 @@ fn main() {
             max_groups,
             stop_when_visible_terminal: first_screen,
             exclude_library_names: exclude_libs.clone(),
+            poster_warm: None,
         },
     )
     .expect("drain");

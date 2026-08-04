@@ -47,6 +47,8 @@ pub struct MediaItemDto {
     pub size_bytes: i64,
     pub probe_status: String,
     pub subtitle_status: String,
+    /// Metadata pipeline state: pending | matched | ready | unmatched (ADR-0026).
+    pub metadata_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_error: Option<String>,
     pub playback_method: &'static str,
@@ -508,6 +510,7 @@ pub fn to_dto(row: MediaItemRow, library_root: &str) -> MediaItemDto {
         size_bytes: row.size_bytes,
         probe_status: row.probe_status,
         subtitle_status: row.subtitle_status,
+        metadata_status: row.metadata_status,
         scan_error: row.scan_error,
         playback_method: decision.method.as_str(),
     }

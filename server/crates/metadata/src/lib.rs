@@ -22,8 +22,8 @@ mod tmdb;
 
 pub use artwork::{ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key};
 pub use canonical::{
-    get_canonical, persist_mapped_hit, persist_season_projection, reproject_from_payload,
-    upsert_canonical,
+    canonical_from_search_hit, get_canonical, persist_mapped_hit, persist_season_projection,
+    reproject_from_payload, upsert_canonical,
 };
 pub use clean::{
     after_token_episode_title, clean_movie_title, clean_show_title, episode_title_rejected,
@@ -59,11 +59,11 @@ pub use negative_cache::{
 };
 pub use nfo::{NfoError, parse_nfo};
 pub use queue::{
-    BindStats, DrainOptions, DrainStats, MetadataStatus, PendingItem, QueueBand,
-    T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N, VisibleProxy,
-    VisibleProxyUnit, bind_resolved_items, drain_pending, proxy_terminal_progress,
+    BindStats, DrainOptions, DrainStats, MetadataStatus, NoopPosterWarm, PendingItem, PosterWarm,
+    QueueBand, T_FIRST_SCREEN_PASS_SECS, T_FIRST_SCREEN_PREDICTED_SECS, VISIBLE_FIRST_SCREEN_N,
+    VisibleProxy, VisibleProxyUnit, bind_resolved_items, drain_pending, proxy_terminal_progress,
     queue_band_for_item, set_metadata_status, snapshot_visible_proxy,
-    snapshot_visible_proxy_filtered, snapshot_visible_proxy_n,
+    snapshot_visible_proxy_filtered, snapshot_visible_proxy_n, warm_poster_for_matched,
 };
 pub use rate_limit::{ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC};
 pub use raw_payload::{

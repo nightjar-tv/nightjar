@@ -372,6 +372,7 @@ fn phase_b_slow(
             max_groups: Some(cap),
             stop_when_visible_terminal: false,
             exclude_library_names: exclude_names.to_vec(),
+            poster_warm: None,
         },
     )
     .map_err(|e| format!("drain: {e}"))?;

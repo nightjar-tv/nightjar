@@ -2,9 +2,11 @@
 
 - Status: accepted
 - Date: 2026-08-03
+- Amended: 2026-08-04 — sparse canonical upsert from search hit (ADR-0026
+  §8.3); detail overwrite; cert on enrich (ADR-0026 §8.4)
 - Depends on: ADR-0025 (item identity grammar; file↔item cardinality);
-  ADR-0026 (§4 raw payloads; §6 collections; §8 enrichment state on
-  `media_items`); season-detail enqueue (named below — not yet shipped)
+  ADR-0026 (§4 raw payloads; §6 collections; §8 two-tier status / sparse
+  write); season bind on enrich (ADR-0026 §8.4)
 - Gate: Gate 3 — auto-match coverage and requests per 1,000 items; watch
   history keys; fix flow under thirty seconds
 - Related: ADR-0028 (manual fix consumes these shapes); ADR-0027 (artwork,
@@ -139,8 +141,13 @@ Idempotent upsert on `(provider, entity_kind, provider_id)`.
 
 | Source | Upsert | Delete-absent |
 |---|---|---|
-| movie / tv payload | by entity PK | no |
+| **search hit (sparse, ADR-0026 §8.3)** | movie / tv row: title, year, plot, vote ratings, art paths, ids only — **no** cast, genre names, cert, collection, episode rows | no |
+| movie / tv **detail** payload | full projection including cast, genres, collection, **content cert** (ADR-0026 §8.4); overwrites sparse fields | no |
 | season payload → episodes | each episode id in the payload | **yes, season-scoped** |
+
+Sparse search write and detail write share the same canonical PK. Empty
+`Vec` cast/genres on a sparse row means “not filled yet,” not “inherit from
+parent.” Detail overwrite is the only path that fills them.
 
 **Season-scoped delete:** for episode canonical rows with `tmdb_show = S`
 and `season = N`, delete rows whose `provider_id` is not in that season

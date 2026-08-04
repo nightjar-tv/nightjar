@@ -5,8 +5,9 @@
 
 use nightjar_db::db_path;
 use nightjar_metadata::{
-    ApiRateLimiter, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions, Resolver,
-    TmdbClient, drain_pending, resolve_credentials_with, sweep_stale_cleaner_versions,
+    ApiRateLimiter, ArtworkKind, ArtworkStore, CanonicalMetadata, DEFAULT_MAX_IN_FLIGHT,
+    DEFAULT_REQUESTS_PER_SEC, DrainOptions, MetadataKind, PosterWarm, Resolver, TmdbClient,
+    drain_pending, resolve_credentials_with, sweep_stale_cleaner_versions,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,15 @@ pub fn spawn_metadata_drain(data_dir: PathBuf) {
 
 fn run_loop(data_dir: &Path) {
     let path = db_path(data_dir);
+    // Best-effort artwork cache for matched-time poster warm (ADR-0027 §5);
+    // a failed store only disables warming, never the drain.
+    let artwork_store: Option<Arc<ArtworkStore>> = match ArtworkStore::new(data_dir) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            tracing::warn!(error = %e, "poster warm disabled: artwork store init failed");
+            None
+        }
+    };
     let mut warned_no_key = false;
     loop {
         let env_key = std::env::var("NIGHTJAR_TMDB_API_KEY").ok();
@@ -64,8 +74,8 @@ fn run_loop(data_dir: &Path) {
             }
         };
 
-        let pending: i64 = match conn.query_row(
-            "SELECT COUNT(*) FROM media_items WHERE metadata_status = 'pending'",
+        let remaining: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM media_items WHERE metadata_status IN ('pending', 'matched')",
             [],
             |r| r.get(0),
         ) {
@@ -76,7 +86,7 @@ fn run_loop(data_dir: &Path) {
                 continue;
             }
         };
-        if pending == 0 {
+        if remaining == 0 {
             std::thread::sleep(IDLE_SLEEP);
             continue;
         }
@@ -93,17 +103,25 @@ fn run_loop(data_dir: &Path) {
             tracing::info!(n, "swept stale negative-cache cleaner versions");
         }
 
-        tracing::info!(pending, "metadata drain starting");
+        tracing::info!(remaining, "metadata drain starting");
         match drain_pending(
             &conn,
             &resolver,
             &http_429,
             &http_requests,
-            DrainOptions::default(),
+            DrainOptions {
+                poster_warm: artwork_store.as_ref().map(|store| {
+                    Box::new(StorePosterWarm {
+                        store: Arc::clone(store),
+                    }) as Box<dyn PosterWarm>
+                }),
+                ..Default::default()
+            },
         ) {
             Ok(stats) => {
                 tracing::info!(
                     groups = stats.groups,
+                    items_matched = stats.items_matched,
                     items_ready = stats.items_ready,
                     items_unmatched = stats.items_unmatched,
                     items_left_pending = stats.items_left_pending,
@@ -125,6 +143,64 @@ fn run_loop(data_dir: &Path) {
                 std::thread::sleep(IDLE_SLEEP);
             }
         }
+    }
+}
+
+/// Store-backed poster warm hook (ADR-0027 §5). Download runs on a detached
+/// thread so it never stalls the drain; failures log at debug and are ignored.
+struct StorePosterWarm {
+    store: Arc<ArtworkStore>,
+}
+
+impl PosterWarm for StorePosterWarm {
+    fn on_matched(&self, _item_ids: &[i64], metadata: &CanonicalMetadata) {
+        let Some(path) = metadata
+            .artwork
+            .iter()
+            .find(|a| a.kind == ArtworkKind::Poster && a.path.starts_with('/'))
+            .map(|a| a.path.clone())
+        else {
+            return;
+        };
+        let Some(key) = warm_item_key(metadata) else {
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        let closure_key = key.clone();
+        match std::thread::Builder::new()
+            .name("poster-warm".into())
+            .spawn(move || {
+                match store.ensure_tmdb_original(&closure_key, ArtworkKind::Poster, &path) {
+                    Ok(p) => tracing::debug!(
+                        item_key = %closure_key,
+                        path = %p.display(),
+                        "poster warmed at matched"
+                    ),
+                    Err(e) => {
+                        tracing::debug!(item_key = %closure_key, error = %e, "poster warm skipped")
+                    }
+                }
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(item_key = %key, error = %e, "poster warm thread spawn failed");
+            }
+        }
+    }
+}
+
+/// Key under which the freshly matched poster is served: movie watch key, or
+/// the provisional non-watch `tmdb:show:{id}` link the search tier wrote for
+/// enrich id recovery (ADR-0026 §8.3 / §8.4). Same keys `apply_search_hit`
+/// assigns on the matching path.
+fn warm_item_key(meta: &CanonicalMetadata) -> Option<String> {
+    match meta.kind {
+        MetadataKind::Movie => meta.ids.tmdb.map(|id| format!("tmdb:movie:{id}")),
+        MetadataKind::Show | MetadataKind::Episode => meta
+            .ids
+            .tmdb
+            .or(meta.ids.tmdb_show)
+            .map(|id| format!("tmdb:show:{id}")),
     }
 }
 

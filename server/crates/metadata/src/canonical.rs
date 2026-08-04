@@ -4,8 +4,10 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::item_links;
+use crate::match_score::SearchHit;
 use crate::model::{
-    ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind, ProviderIds, Rating,
+    ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
+    ProviderIds, Rating,
 };
 use crate::negative_cache::now_rfc3339;
 use crate::raw_payload;
@@ -123,6 +125,74 @@ fn entity_key(meta: &CanonicalMetadata) -> Result<(&'static str, String), String
         MetadataKind::Episode => "episode",
     };
     Ok((kind, id.to_string()))
+}
+
+/// Sparse fast-tier projection from a search hit (ADR-0026 §8.1): title,
+/// original title, year, overview, vote rating, poster/backdrop path refs and
+/// tmdb ids only. Cast/genres stay empty and no cert / collection / runtime /
+/// episode fields are set — the detail fetch fills those on the path to
+/// `ready`. Movies use `title`/`release_date`; TV shows use `name`/
+/// `first_air_date` (the same split `score_search` applies).
+pub fn canonical_from_search_hit(hit: &SearchHit, kind: MetadataKind) -> CanonicalMetadata {
+    let (title, original_title, air_date) = match kind {
+        MetadataKind::Movie => (
+            hit.title.clone().unwrap_or_default(),
+            hit.original_title.clone(),
+            hit.release_date.clone(),
+        ),
+        MetadataKind::Show | MetadataKind::Episode => (
+            hit.name.clone().unwrap_or_default(),
+            hit.original_name.clone(),
+            hit.first_air_date.clone(),
+        ),
+    };
+    let year = air_date
+        .as_deref()
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse().ok());
+    let mut artwork = Vec::new();
+    if let Some(path) = &hit.poster_path {
+        artwork.push(ArtworkRef {
+            kind: ArtworkKind::Poster,
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &hit.backdrop_path {
+        artwork.push(ArtworkRef {
+            kind: ArtworkKind::Backdrop,
+            path: path.clone(),
+        });
+    }
+    let ratings = match hit.vote_average {
+        Some(value) => vec![Rating {
+            source: "tmdb".into(),
+            value,
+            votes: hit.vote_count,
+        }],
+        None => Vec::new(),
+    };
+    CanonicalMetadata {
+        kind,
+        title,
+        original_title,
+        year,
+        air_date: None,
+        plot: hit.overview.clone(),
+        genres: Vec::new(),
+        runtime_minutes: None,
+        cast: Vec::new(),
+        ratings,
+        ids: ProviderIds {
+            tmdb: Some(hit.id),
+            tmdb_show: (kind == MetadataKind::Show).then_some(hit.id),
+            imdb: None,
+            tvdb: None,
+        },
+        artwork,
+        collection: None,
+        season: None,
+        episode: None,
+    }
 }
 
 /// Persist raw payload + canonical projection in one transaction.
@@ -517,5 +587,84 @@ mod tests {
             item_key_for_metadata(&ep).as_deref(),
             Some("tmdb:episode:100")
         );
+    }
+
+    fn movie_hit() -> SearchHit {
+        SearchHit {
+            id: 550,
+            title: Some("Fight Club".into()),
+            name: None,
+            original_title: Some("Fight Club".into()),
+            original_name: None,
+            release_date: Some("1999-10-15".into()),
+            first_air_date: None,
+            poster_path: Some("/p.jpg".into()),
+            backdrop_path: Some("/b.jpg".into()),
+            overview: Some("A man and soap.".into()),
+            vote_average: Some(8.4),
+            vote_count: Some(100),
+        }
+    }
+
+    #[test]
+    fn sparse_movie_from_search_hit() {
+        let meta = canonical_from_search_hit(&movie_hit(), MetadataKind::Movie);
+        assert_eq!(meta.kind, MetadataKind::Movie);
+        assert_eq!(meta.title, "Fight Club");
+        assert_eq!(meta.original_title.as_deref(), Some("Fight Club"));
+        assert_eq!(meta.year, Some(1999));
+        assert_eq!(meta.air_date, None);
+        assert_eq!(meta.plot.as_deref(), Some("A man and soap."));
+        assert!(meta.genres.is_empty());
+        assert!(meta.cast.is_empty());
+        assert_eq!(meta.runtime_minutes, None);
+        assert_eq!(meta.ids.tmdb, Some(550));
+        assert_eq!(meta.ids.tmdb_show, None);
+        assert_eq!(meta.ids.imdb, None);
+        assert_eq!(meta.ratings.len(), 1);
+        assert_eq!(meta.ratings[0].source, "tmdb");
+        assert_eq!(meta.ratings[0].value, 8.4);
+        assert_eq!(meta.ratings[0].votes, Some(100));
+        assert_eq!(meta.artwork.len(), 2);
+        assert_eq!(meta.artwork[0].kind, ArtworkKind::Poster);
+        assert_eq!(meta.artwork[0].path, "/p.jpg");
+        assert_eq!(meta.artwork[1].kind, ArtworkKind::Backdrop);
+        assert_eq!(meta.artwork[1].path, "/b.jpg");
+        assert_eq!(meta.collection, None);
+        assert_eq!(meta.season, None);
+        assert_eq!(meta.episode, None);
+    }
+
+    #[test]
+    fn sparse_show_from_search_hit() {
+        let mut hit = movie_hit();
+        hit.id = 37854;
+        hit.title = None;
+        hit.name = Some("One Piece".into());
+        hit.original_title = None;
+        hit.original_name = Some("ワンピース".into());
+        hit.release_date = None;
+        hit.first_air_date = Some("1999-10-20".into());
+        let meta = canonical_from_search_hit(&hit, MetadataKind::Show);
+        assert_eq!(meta.kind, MetadataKind::Show);
+        assert_eq!(meta.title, "One Piece");
+        assert_eq!(meta.original_title.as_deref(), Some("ワンピース"));
+        assert_eq!(meta.year, Some(1999));
+        assert_eq!(meta.ids.tmdb, Some(37854));
+        assert_eq!(meta.ids.tmdb_show, Some(37854));
+    }
+
+    #[test]
+    fn sparse_drops_absent_rating_and_art() {
+        let mut hit = movie_hit();
+        hit.overview = None;
+        hit.vote_average = None;
+        hit.vote_count = None;
+        hit.poster_path = None;
+        hit.backdrop_path = None;
+        let meta = canonical_from_search_hit(&hit, MetadataKind::Movie);
+        assert_eq!(meta.plot, None);
+        assert!(meta.ratings.is_empty());
+        assert!(meta.artwork.is_empty());
     }
 }
