@@ -8,7 +8,7 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
-use nightjar_metadata::{ArtworkKind, ArtworkStore, poster_path_for_item_key};
+use nightjar_metadata::{ArtworkKind, ArtworkStore, resolve_artwork_key};
 use serde::Deserialize;
 use std::fs;
 
@@ -30,9 +30,12 @@ pub async fn get_artwork(
         .as_ref()
         .ok_or_else(|| ApiError::internal("artwork store not configured"))?;
 
-    let tmdb_path = state
+    // Resolve the request key to the key the store warmed/serves under: a
+    // provider key straight up, or the provisional `tmdb:show:` / `tmdb:movie:`
+    // link for an effective path key (R2 — matched TV warms under show keys).
+    let (serve_key, tmdb_path) = state
         .db
-        .with_conn(|c| Ok(poster_path_for_item_key(c, &item_key)))
+        .with_conn(|c| resolve_artwork_key(c, &item_key))
         .map_err(ApiError::internal)?;
 
     // Prefer matching kind from path helper only for poster; backdrop later.
@@ -43,7 +46,7 @@ pub async fn get_artwork(
     };
 
     let file = store
-        .resolve_file(&item_key, kind, q.w, path_hint)
+        .resolve_file(&serve_key, kind, q.w, path_hint)
         .map_err(|e| {
             if e.contains("not cached") {
                 ApiError::not_found(e)

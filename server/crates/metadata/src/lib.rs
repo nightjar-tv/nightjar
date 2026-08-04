@@ -20,7 +20,10 @@ mod raw_payload;
 mod resolve;
 mod tmdb;
 
-pub use artwork::{ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key};
+pub use artwork::{
+    ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key,
+    resolve_artwork_key,
+};
 pub use canonical::{
     canonical_from_search_hit, get_canonical, persist_mapped_hit, persist_season_projection,
     reproject_from_payload, upsert_canonical,

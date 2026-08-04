@@ -262,15 +262,163 @@ fn parse_provider_key(item_key: &str) -> Option<(&'static str, String)> {
     if let Some(id) = item_key.strip_prefix("tmdb:episode:") {
         return Some(("episode", id.to_string()));
     }
+    // Provisional two-tier show key (ADR-0026 §8.4). Art-path lookup only:
+    // watch semantics live in `item_links::is_watch_item_key`, not here.
+    if let Some(id) = item_key.strip_prefix("tmdb:show:") {
+        return Some(("tv", id.to_string()));
+    }
     None
+}
+
+/// Resolve an artwork request key to the key to serve from.
+///
+/// Provider keys resolve straight to their canonical row. A path key — the
+/// effective key for matched TV before season bind (ADR-0026 §8.4) — falls
+/// back to the media item's `tmdb:movie:` / `tmdb:show:` link, the same keys
+/// the drain warms under, so a poster warmed under the provisional show key
+/// serves when the grid requests the effective key. Returns the serve key and
+/// the canonical poster path, if any.
+pub fn resolve_artwork_key(
+    conn: &rusqlite::Connection,
+    item_key: &str,
+) -> Result<(String, Option<String>), String> {
+    if let Some(path) = poster_path_for_item_key(conn, item_key) {
+        return Ok((item_key.to_string(), Some(path)));
+    }
+    if let Some((library_id, relpath)) = parse_path_key(item_key) {
+        for media_item_id in media_item_ids_for_path(conn, library_id, relpath)? {
+            for link in crate::item_links::link_keys_for_item(conn, media_item_id)? {
+                if (link.starts_with("tmdb:movie:") || link.starts_with("tmdb:show:"))
+                    && let Some(path) = poster_path_for_item_key(conn, &link)
+                {
+                    return Ok((link, Some(path)));
+                }
+            }
+        }
+    }
+    Ok((item_key.to_string(), None))
+}
+
+fn parse_path_key(item_key: &str) -> Option<(i64, &str)> {
+    let rest = item_key.strip_prefix("path:")?;
+    let (library_id, relpath) = rest.split_once(':')?;
+    Some((library_id.parse().ok()?, relpath))
+}
+
+fn media_item_ids_for_path(
+    conn: &rusqlite::Connection,
+    library_id: i64,
+    relpath: &str,
+) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM media_items WHERE library_id = ?1 AND path = ?2")
+        .map_err(|e| format!("prepare art path lookup: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![library_id, relpath], |r| r.get(0))
+        .map_err(|e| format!("query art path lookup: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("art path row: {e}"))?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nightjar_db::migrate;
+    use rusqlite::Connection;
 
     #[test]
     fn safe_key_strips_colons() {
         assert_eq!(ArtworkStore::safe_key("tmdb:movie:550"), "tmdb_movie_550");
+    }
+
+    #[test]
+    fn parse_provider_key_resolves_show_keys_on_art_path() {
+        assert_eq!(
+            parse_provider_key("tmdb:show:1396"),
+            Some(("tv", "1396".to_string()))
+        );
+        assert_eq!(
+            parse_provider_key("tmdb:movie:550"),
+            Some(("movie", "550".to_string()))
+        );
+        assert_eq!(parse_provider_key("path:1:Show/ep.mkv"), None);
+    }
+
+    fn mem_with_show() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('TV', '/TV', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 'Show/S01E01.mkv', 1, 1, 'S01E01', 'episode');
+             INSERT INTO metadata_canonical
+               (provider, entity_kind, provider_id, title, artwork_json, ids_json, projected_at)
+             VALUES ('tmdb', 'tv', '1396', 'Breaking Bad',
+               '[{\"kind\":\"poster\",\"path\":\"/abc.jpg\"}]', '{}', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        c
+    }
+
+    #[test]
+    fn poster_path_resolves_show_key() {
+        let c = mem_with_show();
+        assert_eq!(
+            poster_path_for_item_key(&c, "tmdb:show:1396").as_deref(),
+            Some("/abc.jpg")
+        );
+    }
+
+    #[test]
+    fn resolve_artwork_key_maps_path_key_to_provisional_show_link() {
+        let c = mem_with_show();
+        let tx = c.unchecked_transaction().unwrap();
+        crate::item_links::upsert_link(&tx, 1, "tmdb:show:1396", false).unwrap();
+        tx.commit().unwrap();
+        let (key, path) = resolve_artwork_key(&c, "path:1:Show/S01E01.mkv").unwrap();
+        assert_eq!(key, "tmdb:show:1396");
+        assert_eq!(path.as_deref(), Some("/abc.jpg"));
+    }
+
+    #[test]
+    fn resolve_artwork_key_keeps_unlinked_path_key() {
+        let c = mem_with_show();
+        let (key, path) = resolve_artwork_key(&c, "path:1:Show/S01E01.mkv").unwrap();
+        assert_eq!(key, "path:1:Show/S01E01.mkv");
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn resolve_artwork_key_keeps_provider_key() {
+        let c = mem_with_show();
+        let (key, path) = resolve_artwork_key(&c, "tmdb:show:1396").unwrap();
+        assert_eq!(key, "tmdb:show:1396");
+        assert_eq!(path.as_deref(), Some("/abc.jpg"));
+    }
+
+    #[test]
+    fn resolve_file_serves_warmed_show_poster_without_tmdb_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ArtworkStore::new(tmp.path()).unwrap();
+        let warm = store.original_path("tmdb:show:1396", ArtworkKind::Poster);
+        fs::create_dir_all(warm.parent().unwrap()).unwrap();
+        fs::write(&warm, b"poster").unwrap();
+        let resolved = store
+            .resolve_file("tmdb:show:1396", ArtworkKind::Poster, None, None)
+            .unwrap();
+        assert_eq!(resolved, warm);
+    }
+
+    #[test]
+    fn resolve_file_misses_unwarmed_show_without_tmdb_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ArtworkStore::new(tmp.path()).unwrap();
+        let err = store
+            .resolve_file("tmdb:show:1396", ArtworkKind::Poster, None, None)
+            .unwrap_err();
+        assert!(err.contains("not cached"), "{err}");
     }
 }
