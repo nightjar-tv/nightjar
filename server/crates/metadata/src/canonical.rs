@@ -450,6 +450,64 @@ pub fn reproject_from_payload(
     Ok(meta)
 }
 
+/// Merge two [`CanonicalMetadata`] records, preferring non-empty/non-default
+/// fields from `nfo` (left); fall back to `tmdb` (right) for empty fields.
+///
+/// Kind: nfo wins. Ids: per-field nfo wins when set. Arrays (cast, genres,
+/// ratings, artwork): nfo wins when non-empty.
+pub fn merge_prefer_left(nfo: &CanonicalMetadata, tmdb: &CanonicalMetadata) -> CanonicalMetadata {
+    CanonicalMetadata {
+        kind: nfo.kind,
+        title: if nfo.title.is_empty() {
+            tmdb.title.clone()
+        } else {
+            nfo.title.clone()
+        },
+        original_title: pick_str(&nfo.original_title, &tmdb.original_title),
+        year: nfo.year.or(tmdb.year),
+        air_date: pick_str(&nfo.air_date, &tmdb.air_date),
+        plot: pick_str(&nfo.plot, &tmdb.plot),
+        genres: if nfo.genres.is_empty() {
+            tmdb.genres.clone()
+        } else {
+            nfo.genres.clone()
+        },
+        runtime_minutes: nfo.runtime_minutes.or(tmdb.runtime_minutes),
+        cast: if nfo.cast.is_empty() {
+            tmdb.cast.clone()
+        } else {
+            nfo.cast.clone()
+        },
+        ratings: if nfo.ratings.is_empty() {
+            tmdb.ratings.clone()
+        } else {
+            nfo.ratings.clone()
+        },
+        ids: ProviderIds {
+            tmdb: nfo.ids.tmdb.or(tmdb.ids.tmdb),
+            tmdb_show: nfo.ids.tmdb_show.or(tmdb.ids.tmdb_show),
+            imdb: nfo.ids.imdb.clone().or_else(|| tmdb.ids.imdb.clone()),
+            tvdb: nfo.ids.tvdb.or(tmdb.ids.tvdb),
+        },
+        artwork: if nfo.artwork.is_empty() {
+            tmdb.artwork.clone()
+        } else {
+            nfo.artwork.clone()
+        },
+        collection: nfo.collection.clone().or_else(|| tmdb.collection.clone()),
+        season: nfo.season.or(tmdb.season),
+        episode: nfo.episode.or(tmdb.episode),
+    }
+}
+
+/// Pick `a` when it is `Some` and non-empty; otherwise fall back to `b`.
+fn pick_str(a: &Option<String>, b: &Option<String>) -> Option<String> {
+    match a {
+        Some(s) if !s.is_empty() => Some(s.clone()),
+        _ => b.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,5 +724,213 @@ mod tests {
         assert_eq!(meta.plot, None);
         assert!(meta.ratings.is_empty());
         assert!(meta.artwork.is_empty());
+    }
+
+    // --- merge_prefer_left tests ---
+
+    fn empty_meta(kind: MetadataKind) -> CanonicalMetadata {
+        CanonicalMetadata {
+            kind,
+            title: String::new(),
+            original_title: None,
+            year: None,
+            air_date: None,
+            plot: None,
+            genres: vec![],
+            runtime_minutes: None,
+            cast: vec![],
+            ratings: vec![],
+            ids: ProviderIds::default(),
+            artwork: vec![],
+            collection: None,
+            season: None,
+            episode: None,
+        }
+    }
+
+    #[test]
+    fn merge_prefer_left_nfo_wins_non_empty() {
+        let mut nfo = empty_meta(MetadataKind::Movie);
+        nfo.title = "NFO Title".into();
+        nfo.original_title = Some("NFO Original".into());
+        nfo.year = Some(2020);
+        nfo.plot = Some("NFO plot".into());
+        nfo.genres = vec!["Action".into()];
+        nfo.runtime_minutes = Some(120);
+        nfo.cast = vec![CastMember {
+            name: "Actor".into(),
+            role: Some("Role".into()),
+            order: Some(0),
+        }];
+        nfo.ratings = vec![Rating {
+            source: "imdb".into(),
+            value: 8.0,
+            votes: Some(100),
+        }];
+        nfo.ids = ProviderIds {
+            tmdb: Some(1),
+            tmdb_show: None,
+            imdb: Some("tt123".into()),
+            tvdb: None,
+        };
+        nfo.artwork = vec![ArtworkRef {
+            kind: ArtworkKind::Poster,
+            path: "/p.jpg".into(),
+        }];
+        nfo.collection = Some(CollectionRef {
+            id: Some(10),
+            name: Some("Col".into()),
+        });
+
+        let mut tmdb = empty_meta(MetadataKind::Movie);
+        tmdb.title = "TMDB Title".into();
+        tmdb.original_title = Some("TMDB Original".into());
+        tmdb.year = Some(2021);
+        tmdb.plot = Some("TMDB plot".into());
+        tmdb.genres = vec!["Drama".into()];
+        tmdb.runtime_minutes = Some(130);
+        tmdb.cast = vec![CastMember {
+            name: "TMDB Actor".into(),
+            role: Some("R".into()),
+            order: Some(1),
+        }];
+        tmdb.ratings = vec![Rating {
+            source: "tmdb".into(),
+            value: 7.5,
+            votes: Some(200),
+        }];
+        tmdb.ids = ProviderIds {
+            tmdb: Some(2),
+            tvdb: Some(100),
+            ..Default::default()
+        };
+        tmdb.artwork = vec![ArtworkRef {
+            kind: ArtworkKind::Backdrop,
+            path: "/b.jpg".into(),
+        }];
+        tmdb.collection = Some(CollectionRef {
+            id: Some(20),
+            name: Some("Other".into()),
+        });
+        tmdb.season = Some(1);
+        tmdb.episode = Some(2);
+
+        let m = merge_prefer_left(&nfo, &tmdb);
+        assert_eq!(m.title, "NFO Title");
+        assert_eq!(m.original_title.as_deref(), Some("NFO Original"));
+        assert_eq!(m.year, Some(2020));
+        assert_eq!(m.plot.as_deref(), Some("NFO plot"));
+        assert_eq!(m.genres, vec!["Action"]);
+        assert_eq!(m.runtime_minutes, Some(120));
+        assert_eq!(m.cast[0].name, "Actor");
+        assert_eq!(m.ratings[0].source, "imdb");
+        assert_eq!(m.ids.tmdb, Some(1));
+        assert_eq!(m.ids.imdb.as_deref(), Some("tt123"));
+        assert_eq!(m.ids.tvdb, Some(100)); // nfo None → tmdb
+        assert_eq!(m.artwork[0].kind, ArtworkKind::Poster);
+        assert_eq!(m.collection.as_ref().unwrap().id, Some(10));
+        assert_eq!(m.season, Some(1)); // nfo None → tmdb
+        assert_eq!(m.episode, Some(2));
+    }
+
+    #[test]
+    fn merge_prefer_left_nfo_empty_falls_back_to_tmdb() {
+        let nfo = empty_meta(MetadataKind::Movie);
+        let mut tmdb = empty_meta(MetadataKind::Movie);
+        tmdb.title = "TMDB Title".into();
+        tmdb.original_title = Some("TMDB Orig".into());
+        tmdb.year = Some(2021);
+        tmdb.air_date = Some("2021-01-01".into());
+        tmdb.plot = Some("TMDB plot".into());
+        tmdb.genres = vec!["Drama".into()];
+        tmdb.runtime_minutes = Some(130);
+        tmdb.cast = vec![CastMember {
+            name: "A".into(),
+            role: None,
+            order: None,
+        }];
+        tmdb.ratings = vec![Rating {
+            source: "tmdb".into(),
+            value: 7.0,
+            votes: None,
+        }];
+        tmdb.ids = ProviderIds {
+            tmdb: Some(99),
+            imdb: Some("tt999".into()),
+            tvdb: Some(88),
+            ..Default::default()
+        };
+        tmdb.artwork = vec![ArtworkRef {
+            kind: ArtworkKind::Poster,
+            path: "/t.jpg".into(),
+        }];
+        tmdb.collection = Some(CollectionRef {
+            id: Some(1),
+            name: Some("C".into()),
+        });
+        tmdb.season = Some(1);
+        tmdb.episode = Some(3);
+
+        let m = merge_prefer_left(&nfo, &tmdb);
+        assert_eq!(m.title, "TMDB Title");
+        assert_eq!(m.original_title.as_deref(), Some("TMDB Orig"));
+        assert_eq!(m.year, Some(2021));
+        assert_eq!(m.air_date.as_deref(), Some("2021-01-01"));
+        assert_eq!(m.plot.as_deref(), Some("TMDB plot"));
+        assert_eq!(m.genres, vec!["Drama"]);
+        assert_eq!(m.runtime_minutes, Some(130));
+        assert_eq!(m.cast.len(), 1);
+        assert_eq!(m.ratings.len(), 1);
+        assert_eq!(m.ids.tmdb, Some(99));
+        assert_eq!(m.ids.tvdb, Some(88));
+        assert_eq!(m.artwork.len(), 1);
+        assert_eq!(m.collection.as_ref().unwrap().id, Some(1));
+        assert_eq!(m.season, Some(1));
+        assert_eq!(m.episode, Some(3));
+    }
+
+    #[test]
+    fn merge_prefer_left_ids_per_field() {
+        // nfo has tvdb/imdb, tmdb has tmdb — each side supplies what it has;
+        // nfo tmdb overrides tmdb tmdb when set.
+        let mut nfo = empty_meta(MetadataKind::Movie);
+        nfo.title = "NFO".into();
+        nfo.ids = ProviderIds {
+            tmdb: Some(1),
+            imdb: Some("tt000".into()),
+            tvdb: Some(42),
+            ..Default::default()
+        };
+        let mut tmdb = empty_meta(MetadataKind::Movie);
+        tmdb.ids = ProviderIds {
+            tmdb: Some(2),
+            tvdb: Some(99),
+            ..Default::default()
+        };
+        let m = merge_prefer_left(&nfo, &tmdb);
+        assert_eq!(m.ids.tmdb, Some(1)); // nfo wins
+        assert_eq!(m.ids.imdb.as_deref(), Some("tt000")); // nfo only
+        assert_eq!(m.ids.tvdb, Some(42)); // nfo wins
+
+        // nfo has no tmdb — falls back
+        let mut nfo2 = empty_meta(MetadataKind::Movie);
+        nfo2.title = "NFO2".into();
+        nfo2.ids.tvdb = Some(42);
+        let mut tmdb2 = empty_meta(MetadataKind::Movie);
+        tmdb2.ids.tmdb = Some(99);
+        let m2 = merge_prefer_left(&nfo2, &tmdb2);
+        assert_eq!(m2.ids.tmdb, Some(99)); // from tmdb
+        assert_eq!(m2.ids.tvdb, Some(42)); // from nfo
+    }
+
+    #[test]
+    fn merge_prefer_left_empty_nfo_string_falls_back() {
+        let mut nfo = empty_meta(MetadataKind::Movie);
+        nfo.plot = Some("NFO plot".into()); // set, wins
+        let mut tmdb = empty_meta(MetadataKind::Movie);
+        tmdb.title = "TMDB Title".into(); // nfo title empty → tmdb
+        let m = merge_prefer_left(&nfo, &tmdb);
+        assert_eq!(m.title, "TMDB Title");
+        assert_eq!(m.plot.as_deref(), Some("NFO plot"));
     }
 }

@@ -103,6 +103,23 @@ impl CanonicalMetadata {
             MetadataKind::Show => MediaKind::Unknown,
         }
     }
+
+    /// NFO-originated movie metadata is "complete" when it has a non-empty
+    /// title + a TMDB id + meaningful content (plot, genres, or cast). TV
+    /// never claims completeness — it always merges with TMDB detail for
+    /// season data.
+    pub fn is_nfo_complete(&self) -> bool {
+        match self.kind {
+            MetadataKind::Movie => {
+                !self.title.is_empty()
+                    && self.ids.tmdb.is_some()
+                    && (self.plot.as_deref().is_some_and(|s| !s.is_empty())
+                        || !self.genres.is_empty()
+                        || !self.cast.is_empty())
+            }
+            MetadataKind::Show | MetadataKind::Episode => false,
+        }
+    }
 }
 
 /// Build an ADR-0025 `item_key` when a provider id is present.

@@ -25,8 +25,8 @@ pub use artwork::{
     resolve_artwork_key,
 };
 pub use canonical::{
-    canonical_from_search_hit, get_canonical, persist_mapped_hit, persist_season_projection,
-    reproject_from_payload, upsert_canonical,
+    canonical_from_search_hit, get_canonical, merge_prefer_left, persist_mapped_hit,
+    persist_season_projection, reproject_from_payload, upsert_canonical,
 };
 pub use clean::{
     after_token_episode_title, clean_movie_title, clean_show_title, episode_title_rejected,
