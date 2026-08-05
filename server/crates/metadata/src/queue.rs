@@ -20,7 +20,7 @@ use crate::item_links;
 use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind, item_key_for_metadata};
 use crate::negative_cache::{PROVIDER_TMDB, query_key};
 use crate::resolve::MetadataSource;
-use crate::resolve::{MetadataOrigin, ResolveInput, ResolveOutcome, Resolver};
+use crate::resolve::{MetadataOrigin, ResolveError, ResolveInput, ResolveOutcome, Resolver};
 
 /// Roughly one cold first screen (ADR-0026 §8). Constant, not a setting.
 pub const VISIBLE_FIRST_SCREEN_N: usize = 40;
@@ -303,22 +303,42 @@ fn tmdb_show_for_media_item(conn: &Connection, media_item_id: i64) -> Result<Opt
         )
         .optional()
         .map_err(|e| format!("episode link for visible: {e}"))?;
-    let Some(key) = key else {
-        return Ok(None);
-    };
-    let Some(ep_id) = key.strip_prefix("tmdb:episode:") else {
-        return Ok(None);
-    };
-    let show: Option<i64> = conn
+    if let Some(key) = key
+        && let Some(ep_id) = key.strip_prefix("tmdb:episode:")
+    {
+        let show: Option<i64> = conn
+            .query_row(
+                "SELECT tmdb_show FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND entity_kind = 'episode' AND provider_id = ?1",
+                params![ep_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("tmdb_show for visible: {e}"))?;
+        if let Some(show) = show {
+            return Ok(Some(show));
+        }
+    }
+    // Unbound episode (widened-`unmatched` keeps `tmdb:show:{id}`, ADR-0026
+    // §8.1): read the show link directly so the file keys with its bound
+    // siblings instead of falling back to a soft key.
+    let show_key: Option<String> = conn
         .query_row(
-            "SELECT tmdb_show FROM metadata_canonical
-             WHERE provider = 'tmdb' AND entity_kind = 'episode' AND provider_id = ?1",
-            params![ep_id],
+            "SELECT item_key FROM media_item_links
+             WHERE media_item_id = ?1 AND item_key LIKE 'tmdb:show:%'
+             ORDER BY manually_matched DESC, item_key
+             LIMIT 1",
+            params![media_item_id],
             |r| r.get(0),
         )
         .optional()
-        .map_err(|e| format!("tmdb_show for visible: {e}"))?;
-    Ok(show)
+        .map_err(|e| format!("show link for visible: {e}"))?;
+    if let Some(rest) = show_key.and_then(|k| k.strip_prefix("tmdb:show:").map(str::to_string))
+        && let Ok(n) = rest.parse::<i64>()
+    {
+        return Ok(Some(n));
+    }
+    Ok(None)
 }
 
 fn band_for_item(
@@ -1111,13 +1131,26 @@ fn search_one_group<T: MetadataSource>(
     } else {
         stats.show_groups += 1;
     }
+    let media_path = resolve_media_path(&g.library_path, &g.path);
+    // TV search year is the folder year (earliest episode year, else
+    // show-folder `(YYYY)`), mapped to `first_air_date_year`. It also enters
+    // the neg-cache key, so a yearless miss (`top gear|-`) re-searches under
+    // the year-keyed row — the intended re-search trigger.
+    let search_year = match g.resolve_kind {
+        MetadataKind::Movie => g.year,
+        MetadataKind::Episode | MetadataKind::Show => g.year.or(g.library_year),
+    };
     let input = ResolveInput {
-        nfo_xml: nfo_sidecar_xml(
-            &resolve_media_path(&g.library_path, &g.path),
-            g.resolve_kind,
-        ),
+        nfo_xml: nfo_sidecar_xml(&media_path, g.resolve_kind),
+        tvshow_nfo_xml: match g.resolve_kind {
+            // tvshow.nfo is series identity — TV groups only.
+            MetadataKind::Movie => None,
+            MetadataKind::Episode | MetadataKind::Show => {
+                show_root_nfo_xml(&media_path, &g.library_path)
+            }
+        },
         title: Some(g.title.clone()),
-        year: g.year,
+        year: search_year,
         library_year: g.library_year,
         library_episode_count: g.library_episode_count,
         library_season_count: g.library_season_count,
@@ -1308,7 +1341,8 @@ fn enrich_one_group<T: MetadataSource>(
             };
 
             eprintln!("  enrich {} → tmdb:{tmdb_id} (detail+bind)", g.title);
-            match bind_resolved_items(conn, resolver, &g.item_ids, &final_meta) {
+            let bind_complete = match bind_resolved_items(conn, resolver, &g.item_ids, &final_meta)
+            {
                 Ok(b) => {
                     stats.seasons_fetched += b.seasons_fetched;
                     stats.episodes_projected += b.episodes_projected;
@@ -1320,14 +1354,50 @@ fn enrich_one_group<T: MetadataSource>(
                             g.title, b.seasons_fetched, b.seasons_skipped, b.files_linked
                         );
                     }
+                    true
                 }
                 Err(e) => {
                     eprintln!("  bind/season ({}): {e}", g.title);
                     stats.bind_errors += 1;
+                    false
+                }
+            };
+            // One exit per item (ADR-0026 §8.4 step 5): an item that received
+            // a `tmdb:episode:` link is `ready`; one that did not, after the
+            // season fetch(es) it needed succeeded or soft-skipped, is
+            // `unmatched` — TMDB has the series but not this episode. Only a
+            // provider error (bind interrupted, `Ok(Unresolved)`, `Err`) keeps
+            // an item `matched`, and that is a retry, never a resting state.
+            match g.resolve_kind {
+                MetadataKind::Movie => {
+                    set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
+                    stats.items_ready += g.item_ids.len();
+                }
+                MetadataKind::Episode | MetadataKind::Show => {
+                    let bound = episode_bound_ids(conn, &g.item_ids)?;
+                    if !bound.is_empty() {
+                        set_metadata_status(conn, &bound, MetadataStatus::Ready)?;
+                        stats.items_ready += bound.len();
+                    }
+                    let unbound: Vec<i64> = g
+                        .item_ids
+                        .iter()
+                        .copied()
+                        .filter(|id| !bound.contains(id))
+                        .collect();
+                    if !unbound.is_empty() && bind_complete {
+                        eprintln!(
+                            "  enrich unmatched {} — {} file(s) without episode identity",
+                            g.title,
+                            unbound.len()
+                        );
+                        set_metadata_status(conn, &unbound, MetadataStatus::Unmatched)?;
+                        stats.items_unmatched += unbound.len();
+                    }
+                    // bind_complete == false: the bind provider error is a
+                    // retry; unbound items stay `matched` on purpose.
                 }
             }
-            set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
-            stats.items_ready += g.item_ids.len();
             let poster = has_poster(&final_meta);
             unit_has_poster
                 .entry(g.unit_key.clone())
@@ -1341,7 +1411,15 @@ fn enrich_one_group<T: MetadataSource>(
             );
             stats.provider_errors += 1;
         }
-        Err(e) => {
+        Err(ResolveError::NotFound(e)) => {
+            // A detail 404 on a stored id means the id itself is bad, not a
+            // transient failure: terminal `unmatched`, never a bare next-pass
+            // repeat of the same call (ADR-0026 §8.4). The link survives.
+            eprintln!("  enrich unmatched {} — stored id 404: {e}", g.title);
+            set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+            stats.items_unmatched += g.item_ids.len();
+        }
+        Err(ResolveError::Provider(e)) => {
             eprintln!("  enrich provider error (left matched): {} — {e}", g.title);
             stats.provider_errors += 1;
         }
@@ -1349,10 +1427,36 @@ fn enrich_one_group<T: MetadataSource>(
     Ok(())
 }
 
+/// Media ids that hold at least one `tmdb:episode:{id}` link after a bind.
+fn episode_bound_ids(conn: &Connection, item_ids: &[i64]) -> Result<Vec<i64>, String> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM media_item_links
+             WHERE media_item_id = ?1 AND item_key LIKE 'tmdb:episode:%'",
+        )
+        .map_err(|e| format!("prepare episode_bound_ids: {e}"))?;
+    for id in item_ids {
+        let count: i64 = stmt
+            .query_row(params![id], |r| r.get(0))
+            .map_err(|e| format!("episode_bound_ids check {id}: {e}"))?;
+        if count > 0 {
+            out.push(*id);
+        }
+    }
+    Ok(out)
+}
+
 /// Best-effort sidecar NFO for a group's reference media path (Kodi layout):
 /// `foo.mkv` → `foo.nfo` beside the file; episode groups also try
-/// `<dir>/episodedetails.nfo`. Read/IO failures are silent `None` — the
-/// resolver decides on NFO content (corrupt NFO → `NfoInvalid`, not fallthrough).
+/// `<dir>/episodedetails.nfo`. `tvshow.nfo` is deliberately **not** a
+/// candidate here — it is series identity, read separately by
+/// [`show_root_nfo_xml`], so it never masks the episode NFO (autopsy D5).
+/// Read/IO failures are silent `None` — the resolver decides on NFO content
+/// (corrupt NFO → `NfoInvalid`, not fallthrough).
 fn nfo_sidecar_xml(path: &std::path::Path, kind: MetadataKind) -> Option<String> {
     let mut candidates = vec![path.with_extension("nfo")];
     if kind == MetadataKind::Episode
@@ -1368,6 +1472,29 @@ fn nfo_sidecar_xml(path: &std::path::Path, kind: MetadataKind) -> Option<String>
         }
     }
     None
+}
+
+/// Series identity from `tvshow.nfo` at the show root (Kodi/Jellyfin layout).
+/// Walks up from the media file's parent, bounded by the library root: a
+/// `tvshow.nfo` above the library must never apply one show's ids to every
+/// group under it (autopsy D5). A file at the library root itself counts,
+/// for a library whose root is the show folder.
+fn show_root_nfo_xml(path: &std::path::Path, library_path: &str) -> Option<String> {
+    let library = std::path::Path::new(library_path);
+    let mut current = path.parent()?;
+    loop {
+        if !current.starts_with(library) {
+            return None;
+        }
+        let candidate = current.join("tvshow.nfo");
+        if candidate.is_file() {
+            return std::fs::read_to_string(&candidate).ok();
+        }
+        if current == library {
+            return None;
+        }
+        current = current.parent()?;
+    }
 }
 
 /// Parse the sidecar NFO (if any) for a media path into [`CanonicalMetadata`].
@@ -1387,6 +1514,7 @@ mod tests {
     use crate::tmdb::TmdbStub;
     use nightjar_db::migrate;
     use rusqlite::Connection;
+    use std::cell::Cell;
     use std::sync::atomic::AtomicU64;
 
     fn seeded_movies() -> Connection {
@@ -1790,14 +1918,16 @@ mod tests {
             DrainOptions::default(),
         )
         .unwrap();
-        assert_eq!(s.items_ready, 3);
+        assert_eq!(s.items_ready, 2);
+        assert_eq!(s.items_unmatched, 1);
         assert_eq!(s.seasons_fetched, 1);
         assert_eq!(s.seasons_skipped, 1);
         assert_eq!(s.files_linked, 2);
         assert_eq!(s.bind_errors, 0);
         assert_eq!(s.episodes_projected, 2);
 
-        // S01 files get episode keys; S05 keeps provisional tmdb:show for enrich id.
+        // S01 files get episode keys → ready; S05 (season 404 soft-skip) has
+        // no episode identity → terminal unmatched, keeping its show link.
         let linked: i64 = c
             .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
             .unwrap();
@@ -1815,6 +1945,24 @@ mod tests {
             s5_ep, 0,
             "missing season stays without episode keys, not a hard error"
         );
+        let s5_status: String = c
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE season = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s5_status, "unmatched");
+        let s5_link: String = c
+            .query_row(
+                "SELECT item_key FROM media_item_links l
+                 JOIN media_items m ON m.id = l.media_item_id
+                 WHERE m.season = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s5_link, "tmdb:show:77");
     }
 
     #[test]
@@ -1960,10 +2108,12 @@ mod tests {
             DrainOptions::default(),
         )
         .unwrap();
-        assert_eq!(s.items_ready, 1);
+        assert_eq!(s.items_ready, 0);
+        assert_eq!(s.items_unmatched, 1);
         assert_eq!(s.seasons_skipped, 1);
         assert_eq!(s.files_linked, 0);
-        // Provisional show handle for enrich id; not a watch key (path still effective).
+        // Season fetch soft-skipped and no episode identity exists: the file is
+        // terminal unmatched (ADR-0026 §8.4), keeping its show link for enrich id.
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
             .unwrap();
@@ -1972,6 +2122,10 @@ mod tests {
             .query_row("SELECT item_key FROM media_item_links", [], |r| r.get(0))
             .unwrap();
         assert_eq!(key, "tmdb:show:1");
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "unmatched");
     }
 
     #[test]
@@ -2757,5 +2911,605 @@ mod tests {
             enrich_pos < search_pos,
             "Visible enrich must precede background search, got {order:?}"
         );
+    }
+
+    /// Show hit with a counting `resolve`; `fetch_season` soft-skips every
+    /// season (`Ok(None)`, the TMDB-404 shape). Shares one `show_id`.
+    struct SoftSkipSeasonSource {
+        resolve_calls: Cell<usize>,
+        show_id: i64,
+    }
+
+    impl MetadataSource for SoftSkipSeasonSource {
+        fn resolve(
+            &self,
+            input: &ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+            self.resolve_calls.set(self.resolve_calls.get() + 1);
+            let id = input.tmdb_id.unwrap_or(self.show_id);
+            let meta = CanonicalMetadata {
+                kind: MetadataKind::Show,
+                title: "Alpha".into(),
+                original_title: None,
+                year: Some(2020),
+                air_date: None,
+                plot: None,
+                genres: Vec::new(),
+                runtime_minutes: None,
+                cast: Vec::new(),
+                ratings: Vec::new(),
+                ids: crate::model::ProviderIds {
+                    tmdb: Some(id),
+                    tmdb_show: Some(id),
+                    imdb: None,
+                    tvdb: None,
+                },
+                artwork: Vec::new(),
+                collection: None,
+                season: None,
+                episode: None,
+            };
+            Ok(crate::resolve::ProviderResult::Hit {
+                metadata: Box::new(meta),
+                method: "exact_title",
+                raw: Some(crate::tmdb::RawProviderPayload {
+                    entity_kind: "tv".into(),
+                    provider_id: id.to_string(),
+                    payload: format!(r#"{{"id":{id},"name":"Alpha"}}"#),
+                }),
+            })
+        }
+
+        fn fetch_season(
+            &self,
+            _show_id: i64,
+            _season_number: i32,
+        ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError> {
+            // TMDB has no season for this file (special outside the model):
+            // soft skip, never a hard error.
+            Ok(None)
+        }
+    }
+
+    /// RC3: an unbindable special (S00) soft-skips its season, lands terminal
+    /// `unmatched`, and the second drain pass makes zero provider calls.
+    #[test]
+    fn unbindable_special_is_terminal_unmatched_and_second_drain_makes_zero_calls() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha/Specials/Alpha.S00E01.mkv', 1, 1, 'Alpha', 'episode', 0, 1);",
+        )
+        .unwrap();
+        let src = SoftSkipSeasonSource {
+            resolve_calls: Cell::new(0),
+            show_id: 55,
+        };
+        let resolver = Resolver { tmdb: src };
+        let s1 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s1.items_matched, 1);
+        assert_eq!(s1.items_ready, 0);
+        assert_eq!(s1.items_unmatched, 1);
+        assert_eq!(s1.seasons_skipped, 1);
+        let calls_after_first = resolver.tmdb.resolve_calls.get();
+        assert_eq!(calls_after_first, 2, "one search + one id enrich");
+
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "unmatched");
+        let link: String = c
+            .query_row("SELECT item_key FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            link, "tmdb:show:55",
+            "show link survives on widened unmatched"
+        );
+
+        let s2 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s2.groups, 0);
+        assert_eq!(
+            resolver.tmdb.resolve_calls.get(),
+            calls_after_first,
+            "second drain must make zero provider calls"
+        );
+    }
+
+    /// RC3: a detail 404 on a stored id is a bad id, not a network hiccup —
+    /// terminal `unmatched`, and the next pass never repeats the call.
+    #[test]
+    fn stored_show_id_404_reaches_terminal_status_and_is_not_repeated() {
+        struct Detail404 {
+            resolve_calls: Cell<usize>,
+        }
+        impl MetadataSource for Detail404 {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                self.resolve_calls.set(self.resolve_calls.get() + 1);
+                assert!(
+                    input.tmdb_id.is_some(),
+                    "pre-seeded matched item must only run enrich"
+                );
+                Err(crate::resolve::ResolveError::NotFound(format!(
+                    "TMDB 404: /tv/{}",
+                    input.tmdb_id.unwrap()
+                )))
+            }
+        }
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode, metadata_status)
+             VALUES (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1, 'matched');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (1, 'tmdb:show:2682989', 0);",
+        )
+        .unwrap();
+        let src = Detail404 {
+            resolve_calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let s1 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s1.items_unmatched, 1);
+        assert_eq!(
+            s1.provider_errors, 0,
+            "404 is not a retryable provider error"
+        );
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "unmatched");
+        let calls_after_first = resolver.tmdb.resolve_calls.get();
+        assert_eq!(calls_after_first, 1);
+
+        let s2 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s2.groups, 0);
+        assert_eq!(
+            resolver.tmdb.resolve_calls.get(),
+            calls_after_first,
+            "bad stored id must not be re-fetched next pass"
+        );
+    }
+
+    /// RC3: a genuine provider error (timeout) is a retry — the item stays
+    /// `matched` and the next pass does attempt it again.
+    #[test]
+    fn provider_error_leaves_matched_and_next_pass_retries() {
+        struct Flaky {
+            resolve_calls: Cell<usize>,
+        }
+        impl MetadataSource for Flaky {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                self.resolve_calls.set(self.resolve_calls.get() + 1);
+                let id = input.tmdb_id.unwrap_or(77);
+                if self.resolve_calls.get() == 1 {
+                    return Err(crate::resolve::ResolveError::Provider("timeout".into()));
+                }
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Show,
+                    title: "Beta".into(),
+                    original_title: None,
+                    year: Some(2020),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(id),
+                        tmdb_show: Some(id),
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(crate::resolve::ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "tv".into(),
+                        provider_id: id.to_string(),
+                        payload: format!(r#"{{"id":{id},"name":"Beta"}}"#),
+                    }),
+                })
+            }
+
+            fn fetch_season(
+                &self,
+                show_id: i64,
+                season_number: i32,
+            ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError>
+            {
+                assert_eq!(show_id, 77);
+                assert_eq!(season_number, 1);
+                let payload = r#"{
+                    "season_number": 1,
+                    "episodes": [
+                      {"id": 2001, "name": "Pilot", "season_number": 1, "episode_number": 1, "air_date": "2020-01-01"}
+                    ]
+                }"#;
+                Ok(Some(crate::tmdb::RawProviderPayload {
+                    entity_kind: "season".into(),
+                    provider_id: format!("{show_id}:{season_number}"),
+                    payload: payload.into(),
+                }))
+            }
+        }
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode, metadata_status)
+             VALUES (1, 'Beta/S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1, 'matched');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (1, 'tmdb:show:77', 0);",
+        )
+        .unwrap();
+        let src = Flaky {
+            resolve_calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let s1 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s1.provider_errors, 1);
+        assert_eq!(s1.items_ready, 0);
+        assert_eq!(s1.items_unmatched, 0);
+        let status_after_first: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status_after_first, "matched",
+            "timeout is a retry, not terminal"
+        );
+
+        let s2 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolver.tmdb.resolve_calls.get(),
+            2,
+            "next pass must retry the item"
+        );
+        assert_eq!(s2.provider_errors, 0);
+        assert_eq!(s2.items_ready, 1);
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ready");
+        let ep_link: String = c
+            .query_row("SELECT item_key FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ep_link, "tmdb:episode:2001");
+    }
+
+    /// RC3: an episode holding only `tmdb:show:{id}` keys with its bound
+    /// siblings (same show, same browse card). Fails on main: the show-link
+    /// episode fell back to a soft key and split the show.
+    #[test]
+    fn episode_with_only_show_link_keys_with_bound_sibling() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1),
+               (1, 'Alpha Alias/S01E01.mkv', 1, 1, 'Alpha Alias', 'episode', 1, 1);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (1, 'tmdb:episode:1001', 0), (2, 'tmdb:show:55', 0);",
+        )
+        .unwrap();
+        let proxy = snapshot_visible_proxy_n(&c, 10).unwrap();
+        assert_eq!(proxy.units.len(), 1, "one show must be one browse unit");
+        assert_eq!(proxy.units[0].unit_key, "tv|tmdb:55");
+        assert_eq!(proxy.units[0].item_ids.len(), 2);
+    }
+
+    /// RC5: the folder year reaches the provider's search input for TV groups,
+    /// asserted on `ResolveInput.year` at the mock boundary, not on
+    /// `QueryGroup.library_year` (the reference branch only tested the latter).
+    #[test]
+    fn tv_folder_year_reaches_provider_search_input() {
+        struct YearCapture {
+            years: std::sync::Mutex<Vec<Option<i32>>>,
+        }
+        impl MetadataSource for YearCapture {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                self.years.lock().unwrap().push(input.year);
+                Ok(crate::resolve::ProviderResult::Miss)
+            }
+        }
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/L', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Top Gear (2002)/Season 1/Top.Gear.S01E01.mkv', 1, 1, 'Top Gear', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let src = YearCapture {
+            years: std::sync::Mutex::new(Vec::new()),
+        };
+        let resolver = Resolver { tmdb: src };
+        let s = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.groups, 1);
+        assert_eq!(
+            resolver.tmdb.years.lock().unwrap().as_slice(),
+            &[Some(2002)],
+            "folder (YYYY) must reach ResolveInput.year for TV search"
+        );
+    }
+
+    /// RC5: a `tvshow.nfo` one level above the library root is **not** read —
+    /// the walk-up is bounded by the library path, with the file present
+    /// (autopsy D5; replaces the vacuous branch test that proved only
+    /// termination).
+    #[test]
+    fn show_root_nfo_is_bounded_by_library_root() {
+        let base =
+            std::env::temp_dir().join(format!("nightjar-tvshow-bound-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("library");
+        std::fs::create_dir_all(library.join("Show/Season 1")).unwrap();
+        std::fs::write(
+            base.join("tvshow.nfo"),
+            "<tvshow><title>Not This</title></tvshow>",
+        )
+        .unwrap();
+        let media = library.join("Show/Season 1/ep.mkv");
+        assert_eq!(
+            show_root_nfo_xml(&media, library.to_str().unwrap()),
+            None,
+            "tvshow.nfo above the library root must not be read"
+        );
+        std::fs::write(
+            library.join("Show/tvshow.nfo"),
+            "<tvshow><title>Alpha</title><uniqueid type=\"tmdb\">55</uniqueid></tvshow>",
+        )
+        .unwrap();
+        let got = show_root_nfo_xml(&media, library.to_str().unwrap());
+        assert!(
+            got.as_deref().is_some_and(|x| x.contains("Alpha")),
+            "tvshow.nfo at the show root inside the library must be read"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RC5: an episode with both `tvshow.nfo` (show tmdb id) and
+    /// `episodedetails.nfo` (episode title) resolves series identity from the
+    /// former without discarding the latter — the episode NFO stays readable
+    /// on its own path (autopsy D5).
+    #[test]
+    fn episode_uses_tvshow_nfo_identity_and_keeps_episode_nfo_readable() {
+        use crate::resolve::ProviderResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TVSHOW_NFO_SEARCHES: AtomicUsize = AtomicUsize::new(0);
+        struct TvShowNfoSource;
+        impl MetadataSource for TvShowNfoSource {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<ProviderResult, crate::resolve::ResolveError> {
+                if input.tmdb_id.is_none() {
+                    TVSHOW_NFO_SEARCHES.fetch_add(1, Ordering::SeqCst);
+                }
+                let id = input.tmdb_id.unwrap_or(55);
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Show,
+                    title: "Alpha".into(),
+                    original_title: None,
+                    year: Some(2002),
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(id),
+                        tmdb_show: Some(id),
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: if input.tmdb_id.is_some() {
+                        "tmdb_id"
+                    } else {
+                        "nfo_show"
+                    },
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "tv".into(),
+                        provider_id: id.to_string(),
+                        payload: format!(r#"{{"id":{id},"name":"Alpha"}}"#),
+                    }),
+                })
+            }
+
+            fn fetch_season(
+                &self,
+                show_id: i64,
+                season_number: i32,
+            ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError>
+            {
+                assert_eq!(show_id, 55);
+                assert_eq!(season_number, 1);
+                let payload = r#"{
+                    "season_number": 1,
+                    "episodes": [
+                      {"id": 1001, "name": "Pilot", "season_number": 1, "episode_number": 1, "air_date": "2002-01-01"}
+                    ]
+                }"#;
+                Ok(Some(crate::tmdb::RawProviderPayload {
+                    entity_kind: "season".into(),
+                    provider_id: format!("{show_id}:{season_number}"),
+                    payload: payload.into(),
+                }))
+            }
+        }
+        TVSHOW_NFO_SEARCHES.store(0, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!(
+            "nightjar-tvshow-ep-nfo-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("library");
+        std::fs::create_dir_all(library.join("Alpha/Season 1")).unwrap();
+        std::fs::write(
+            library.join("Alpha/tvshow.nfo"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<tvshow><title>Alpha</title><year>2002</year>
+<uniqueid type="tmdb">55</uniqueid></tvshow>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("Alpha/Season 1/episodedetails.nfo"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<episodedetails><title>Pilot</title><season>1</season><episode>1</episode></episodedetails>"#,
+        )
+        .unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(&format!(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '{}', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha/Season 1/Alpha.S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1);",
+            library.to_str().unwrap()
+        ))
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: TvShowNfoSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            TVSHOW_NFO_SEARCHES.load(Ordering::SeqCst),
+            0,
+            "series identity must come from tvshow.nfo, not a search"
+        );
+        assert_eq!(s.items_ready, 1);
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ready");
+        // The show id could only have come from tvshow.nfo — zero searches
+        // ran, and the bind landed on show 55 (the mock asserts the id).
+        let tv_row: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND entity_kind = 'tv' AND provider_id = '55'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tv_row, 1,
+            "show 55 detail persisted (identity from tvshow.nfo)"
+        );
+        let ep_row: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND entity_kind = 'episode' AND provider_id = '1001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ep_row, 1,
+            "episode canonical projected from the season bind"
+        );
+        let ep_link: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links WHERE item_key = 'tmdb:episode:1001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ep_link, 1, "season bind lands the episode watch key");
+        let episode_nfo = nfo_sidecar_meta(
+            &resolve_media_path(library.to_str().unwrap(), "Alpha/Season 1/Alpha.S01E01.mkv"),
+            MetadataKind::Episode,
+        );
+        assert_eq!(
+            episode_nfo.as_ref().map(|m| m.title.as_str()),
+            Some("Pilot"),
+            "episodedetails.nfo must stay readable beside tvshow.nfo"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

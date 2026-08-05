@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::CanonicalMetadata;
+
 /// Auto-match only at or above this score (ADR-0026).
 pub const AUTO_MATCH_FLOOR: f64 = 0.80;
 
@@ -154,6 +156,43 @@ fn name_matches_query(name: &str, query_norm: &str, kind: SearchKind) -> bool {
         }
     }
     false
+}
+
+/// `/find` acceptance gate (strategy note §2, human open question 4): a show
+/// returned by an NFO external id must agree with the group's cleaned folder
+/// title and `(YYYY)` or the id is discarded and search runs instead — a
+/// wrong external id must fail into search, not win. Returns the discard
+/// reason, or `None` when the hit passes. Reuses the one TV title-match
+/// predicate (`name_matches_query`), including the prefix rule.
+pub fn find_hit_reject_reason(
+    metadata: &CanonicalMetadata,
+    kind: SearchKind,
+    query: &str,
+    folder_year: Option<i32>,
+) -> Option<String> {
+    let query_norm = norm_key(query);
+    if query_norm.is_empty() {
+        return Some("no folder title to cross-check against".into());
+    }
+    let name_ok = name_matches_query(&metadata.title, &query_norm, kind)
+        || metadata
+            .original_title
+            .as_deref()
+            .is_some_and(|t| name_matches_query(t, &query_norm, kind));
+    if !name_ok {
+        return Some(format!(
+            "name '{}' does not match folder title '{query}'",
+            metadata.title
+        ));
+    }
+    if let (Some(hit_year), Some(folder_year)) = (metadata.year, folder_year)
+        && hit_year != folder_year
+    {
+        return Some(format!(
+            "year {hit_year} does not match folder year {folder_year}"
+        ));
+    }
+    None
 }
 
 /// Soft episode-count match: absolute or proportional slack so incomplete
@@ -790,5 +829,96 @@ mod tests {
     #[test]
     fn floor_constant_matches_adr() {
         assert!((AUTO_MATCH_FLOOR - 0.80).abs() < f64::EPSILON);
+    }
+
+    fn show_meta(title: &str, year: Option<i32>) -> CanonicalMetadata {
+        CanonicalMetadata {
+            kind: crate::model::MetadataKind::Show,
+            title: title.into(),
+            original_title: None,
+            year,
+            air_date: None,
+            plot: None,
+            genres: Vec::new(),
+            runtime_minutes: None,
+            cast: Vec::new(),
+            ratings: Vec::new(),
+            ids: crate::model::ProviderIds {
+                tmdb: Some(1),
+                tmdb_show: Some(1),
+                imdb: None,
+                tvdb: None,
+            },
+            artwork: Vec::new(),
+            collection: None,
+            season: None,
+            episode: None,
+        }
+    }
+
+    #[test]
+    fn find_hit_accepts_matching_name_and_year() {
+        assert_eq!(
+            find_hit_reject_reason(
+                &show_meta("Top Gear", Some(2002)),
+                SearchKind::Tv,
+                "Top Gear",
+                Some(2002)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn find_hit_rejects_wrong_name() {
+        let reason = find_hit_reject_reason(
+            &show_meta("Wrong Show", Some(2002)),
+            SearchKind::Tv,
+            "Top Gear",
+            Some(2002),
+        );
+        assert!(reason.is_some(), "a different show must fail into search");
+        assert!(reason.unwrap().contains("does not match folder title"));
+    }
+
+    #[test]
+    fn find_hit_rejects_year_disagreement() {
+        let reason = find_hit_reject_reason(
+            &show_meta("Top Gear", Some(1977)),
+            SearchKind::Tv,
+            "Top Gear",
+            Some(2002),
+        );
+        assert!(reason.is_some(), "a same-named different year must fail");
+        assert!(reason.unwrap().contains("does not match folder year"));
+    }
+
+    #[test]
+    fn find_hit_yearless_folder_only_checks_name() {
+        assert_eq!(
+            find_hit_reject_reason(
+                &show_meta("Top Gear", Some(2002)),
+                SearchKind::Tv,
+                "Top Gear",
+                None
+            ),
+            None,
+            "no folder year, so there is no year to disagree on"
+        );
+    }
+
+    #[test]
+    fn find_hit_tv_prefix_name_still_passes() {
+        // "The Continental" folder vs TMDB's longer official name — the same
+        // TV prefix rule the search scorer uses (ADR-0026 §2).
+        assert_eq!(
+            find_hit_reject_reason(
+                &show_meta("The Continental: From the World of John Wick", Some(2023)),
+                SearchKind::Tv,
+                "The Continental",
+                Some(2023)
+            ),
+            None
+        );
     }
 }

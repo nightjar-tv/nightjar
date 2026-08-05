@@ -70,7 +70,7 @@ impl TmdbClient {
 
     fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, ResolveError> {
         match self.get_json_status(path, query)? {
-            None => Err(ResolveError::Provider(format!("TMDB 404: {path}"))),
+            None => Err(ResolveError::NotFound(format!("TMDB 404: {path}"))),
             Some(v) => Ok(v),
         }
     }
@@ -168,6 +168,30 @@ impl TmdbClient {
             })
             .unwrap_or_default();
         Ok(results)
+    }
+
+    /// Look up a TMDB show id by external id via `GET /3/find/{external_id}`
+    /// (NFO imdb/tvdb ids, strategy note §2 A2/A3). HTTP 404 (a stale or
+    /// malformed id) is a soft miss → `None` via `get_json_optional`, so the
+    /// resolve falls through to title search instead of erroring the group.
+    /// The caller owns the name+year cross-check on the fetched detail.
+    pub fn find_tv_by_external_id(
+        &self,
+        external_source: &str,
+        external_id: &str,
+    ) -> Result<Option<i64>, ResolveError> {
+        let path = format!("/find/{external_id}");
+        let Some(data) = self.get_json_optional(&path, &[("external_source", external_source)])?
+        else {
+            return Ok(None);
+        };
+        let id = data
+            .get("tv_results")
+            .and_then(|r| r.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|hit| hit.get("id"))
+            .and_then(|v| v.as_i64());
+        Ok(id)
     }
 
     pub fn match_search(
@@ -447,10 +471,10 @@ pub enum TmdbResolve {
 
 impl MetadataSource for TmdbClient {
     fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+        let kind = input.kind.unwrap_or(MetadataKind::Movie);
         // Enrich by id (ADR-0026 §8.3): detail only, no search, no floor gate.
         // Shares the same detail+raw mapping the fix `assign` path uses.
         if let Some(id) = input.tmdb_id {
-            let kind = input.kind.unwrap_or(MetadataKind::Movie);
             let (metadata, raw) = match kind {
                 MetadataKind::Movie => self.movie_detail(id)?,
                 MetadataKind::Show | MetadataKind::Episode => self.tv_detail(id)?,
@@ -461,10 +485,51 @@ impl MetadataSource for TmdbClient {
                 raw: Some(raw),
             });
         }
+        // NFO external id → TMDB `/find` (strategy note §2 A2/A3): an asserted
+        // id outranks inference. A miss — the find call 404s, or the found
+        // id's detail 404s — is reported to the resolver as `FindMiss`, which
+        // falls through to a title search gated on the negative cache instead
+        // of erroring the group into a repeat of the same find+404. The
+        // name+year cross-check on a find hit lives in the resolver.
+        if (kind == MetadataKind::Episode || kind == MetadataKind::Show)
+            && (input.nfo_imdb_id.is_some() || input.nfo_tvdb_id.is_some())
+        {
+            let find_hit: Option<(i64, &'static str)> = if let Some(ref imdb_id) = input.nfo_imdb_id
+                && let Some(tmdb_id) = self.find_tv_by_external_id("imdb_id", imdb_id)?
+            {
+                Some((tmdb_id, "nfo_imdb_find"))
+            } else if let Some(tvdb_id) = input.nfo_tvdb_id {
+                let tvdb_s = tvdb_id.to_string();
+                if let Some(tmdb_id) = self.find_tv_by_external_id("tvdb_id", &tvdb_s)? {
+                    Some((tmdb_id, "nfo_tvdb_find"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((tmdb_id, method)) = find_hit {
+                match self.tv_detail(tmdb_id) {
+                    Ok((metadata, raw)) => {
+                        return Ok(ProviderResult::Hit {
+                            metadata: Box::new(metadata),
+                            method,
+                            raw: Some(raw),
+                        });
+                    }
+                    // A find-listed id whose detail 404s (stale or wrong
+                    // external id) is a soft miss, not a resolve error: the
+                    // item must fail into search, not sit pending behind a
+                    // bare repeat of the same find+404.
+                    Err(ResolveError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok(ProviderResult::FindMiss);
+        }
         let Some(title) = input.title.as_deref().filter(|t| !t.is_empty()) else {
             return Ok(ProviderResult::Miss);
         };
-        let kind = input.kind.unwrap_or(MetadataKind::Movie);
         match self.resolve_title_with_series_shape(
             kind,
             title,
