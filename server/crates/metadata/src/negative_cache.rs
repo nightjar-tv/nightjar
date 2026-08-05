@@ -85,6 +85,15 @@ pub fn query_key(title: &str, year: Option<i32>) -> String {
     format!("{}|{year_part}", norm_key(title))
 }
 
+/// ADR-0033 Q4: a folder with stored series identity caches under its series
+/// id, not its title+year query key. Two fold-colliding folders write the
+/// same query for different shows, so one folder's miss must never suppress
+/// the other's fall-through search. `series:{id}` contains no `|`, so it can
+/// never collide with a title+year key (`{norm}|{year}` always has one).
+pub fn series_cache_key(show_id: i64) -> String {
+    format!("series:{show_id}")
+}
+
 fn backoff_days(attempt_count: i32) -> i64 {
     match attempt_count {
         1 => 1,
@@ -366,6 +375,19 @@ mod tests {
             query_key("Foo & Bar", None),
             format!("{}|-", norm_key("Foo & Bar"))
         );
+    }
+
+    #[test]
+    fn series_key_is_distinct_from_title_year_keys() {
+        assert_eq!(series_cache_key(55), "series:55");
+        assert!(
+            !series_cache_key(55).contains('|'),
+            "a series key must never look like a title+year key"
+        );
+        for title in ["Shameless", "Series", "A"] {
+            assert_ne!(series_cache_key(55), query_key(title, Some(55)));
+            assert_ne!(series_cache_key(55), query_key(title, None));
+        }
     }
 
     #[test]

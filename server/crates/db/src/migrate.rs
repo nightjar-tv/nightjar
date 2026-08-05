@@ -1,7 +1,7 @@
 use rusqlite::{Connection, params};
 use std::path::Path;
 
-use crate::paths::{normalize_library_root, to_relpath};
+use crate::paths::{normalize_library_root, show_folder_relpath, to_relpath};
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
@@ -40,6 +40,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         15,
         include_str!("../migrations/015_metadata_status_repairs.sql"),
     ),
+    (16, include_str!("../migrations/016_series_identity.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -109,6 +110,10 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
                     "migration 12 aborted: media_item_sidecars count {before_sidecars} -> {after_sidecars}"
                 ));
             }
+        }
+
+        if version == 16 {
+            derive_series_rows(&tx)?;
         }
 
         tx.execute(
@@ -211,6 +216,49 @@ fn strip_paths_to_relpath(tx: &rusqlite::Transaction<'_>) -> Result<(), String> 
     Ok(())
 }
 
+/// ADR-0033 Q5: one-shot retro-derive of folder-keyed series rows from the
+/// existing `ready` episode population. A path walk, not a re-match: those
+/// rows already carry `tmdb:episode:` links, so folder grouping needs no
+/// provider call. Idempotent at the SQL level (INSERT OR IGNORE); nothing
+/// inside `drain_pending` re-derives series rows (plan Decision 6).
+fn derive_series_rows(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    let rows: Vec<(i64, String, String, i64)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT m.library_id, m.path, l.path, c.tmdb_show
+                 FROM media_items m
+                 JOIN libraries l ON l.id = m.library_id
+                 JOIN media_item_links il ON il.media_item_id = m.id
+                 JOIN metadata_canonical c
+                   ON c.provider = 'tmdb' AND c.entity_kind = 'episode'
+                   AND il.item_key = 'tmdb:episode:' || c.provider_id
+                 WHERE m.metadata_status = 'ready'
+                   AND m.kind = 'episode'
+                   AND c.tmdb_show IS NOT NULL
+                 ORDER BY m.id",
+            )
+            .map_err(|e| format!("migration 16 prepare derive: {e}"))?;
+        let q = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| format!("migration 16 query derive: {e}"))?;
+        let mut out = Vec::new();
+        for row in q {
+            out.push(row.map_err(|e| format!("migration 16 derive row: {e}"))?);
+        }
+        out
+    };
+    for (library_id, path, root, tmdb_show) in rows {
+        let folder = show_folder_relpath(&path, &root);
+        tx.execute(
+            "INSERT OR IGNORE INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (?1, ?2, ?3)",
+            params![library_id, folder, tmdb_show],
+        )
+        .map_err(|e| format!("migration 16 insert series row: {e}"))?;
+    }
+    Ok(())
+}
+
 fn count_table(conn: &Connection, table: &str) -> Result<i64, String> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
         .map_err(|e| format!("count {table}: {e}"))
@@ -234,7 +282,15 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 15);
+        assert_eq!(v, 16);
+        let has_series: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_series, 1);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -345,109 +401,6 @@ mod tests {
             .unwrap();
         assert_eq!(has_map, 1);
         migrate(&conn).unwrap(); // idempotent
-    }
-
-    #[test]
-    fn migration_15_repairs_e1_ready_and_e2_pending() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            );",
-        )
-        .unwrap();
-        for &(version, sql) in MIGRATIONS.iter().take(14) {
-            conn.execute_batch(sql).unwrap();
-            conn.execute(
-                "INSERT INTO schema_migrations (version) VALUES (?1)",
-                [version],
-            )
-            .unwrap();
-        }
-        conn.execute_batch(
-            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
-             INSERT INTO media_items (
-                library_id, path, mtime_ms, size_bytes, title, kind, season, episode, metadata_status
-             ) VALUES
-                (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1, 'unmatched'),
-                (1, 'Stick/S01E10.mkv', 1, 1, 'Stick', 'episode', 1, 10, 'unmatched');
-             INSERT INTO metadata_canonical (
-                provider, entity_kind, provider_id, title, ids_json, tmdb_show, projected_at
-             ) VALUES
-                ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z'),
-                ('tmdb', 'episode', '5995804', 'Deja Vu All Over Again', '{\"tmdb\":5995804}', 66, '2026-01-01T00:00:00Z');
-             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
-             VALUES
-                (1, 'tmdb:episode:1001', 0),
-                (2, 'tmdb:show:5995804', 0);",
-        )
-        .unwrap();
-
-        let migration_15 = MIGRATIONS
-            .iter()
-            .find(|(version, _)| *version == 15)
-            .map(|(_, sql)| *sql)
-            .unwrap();
-        conn.execute_batch(migration_15).unwrap();
-
-        let e1_status: String = conn
-            .query_row(
-                "SELECT metadata_status FROM media_items WHERE path = 'Alpha/S01E01.mkv'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(e1_status, "ready", "E1: full episode identity means ready");
-        let e2_status: String = conn
-            .query_row(
-                "SELECT metadata_status FROM media_items WHERE path = 'Stick/S01E10.mkv'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(e2_status, "pending", "E2: mis-prefix falls back to pending");
-        let e1_link: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM media_item_links
-                 WHERE media_item_id = 1 AND item_key = 'tmdb:episode:1001'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(e1_link, 1, "E1 episode link must survive");
-        let e2_link: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM media_item_links
-                 WHERE media_item_id = 2 AND item_key LIKE 'tmdb:show:%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(e2_link, 0, "E2 mis-prefixed show link must be deleted");
-
-        // Idempotence at the SQL level: a second run changes nothing.
-        conn.execute_batch(migration_15).unwrap();
-        let e1_again: String = conn
-            .query_row(
-                "SELECT metadata_status FROM media_items WHERE path = 'Alpha/S01E01.mkv'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(e1_again, "ready");
-        let e2_again: String = conn
-            .query_row(
-                "SELECT metadata_status FROM media_items WHERE path = 'Stick/S01E10.mkv'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(e2_again, "pending");
-        let link_count_again: i64 = conn
-            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(link_count_again, 1);
     }
 
     #[test]
@@ -603,6 +556,195 @@ mod tests {
             )
             .unwrap();
         assert_eq!(moov_tables, 0);
+    }
+
+    /// 015 (RC4): one E1 row (episode link + canonical episode row, status
+    /// `unmatched`) becomes `ready`; one E2 row (`tmdb:show:{episode_id}`
+    /// mis-prefix) loses the link and falls back to `pending`. The harness
+    /// applies by version, so idempotence is asserted at the SQL level by
+    /// running the migration text twice.
+    #[test]
+    fn migration_15_repairs_e1_ready_and_e2_pending() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(14) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, season, episode, metadata_status
+             ) VALUES
+                (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1, 'unmatched'),
+                (1, 'Stick/S01E10.mkv', 1, 1, 'Stick', 'episode', 1, 10, 'unmatched');
+             INSERT INTO metadata_canonical (
+                provider, entity_kind, provider_id, title, ids_json, tmdb_show, projected_at
+             ) VALUES
+                ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z'),
+                ('tmdb', 'episode', '5995804', 'Deja Vu All Over Again', '{\"tmdb\":5995804}', 66, '2026-01-01T00:00:00Z');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES
+                (1, 'tmdb:episode:1001', 0),
+                (2, 'tmdb:show:5995804', 0);",
+        )
+        .unwrap();
+
+        let migration_15 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 15)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        conn.execute_batch(migration_15).unwrap();
+
+        let e1_status: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Alpha/S01E01.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e1_status, "ready", "E1: full episode identity means ready");
+        let e2_status: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Stick/S01E10.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e2_status, "pending", "E2: mis-prefix falls back to pending");
+        let e1_link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links
+                 WHERE media_item_id = 1 AND item_key = 'tmdb:episode:1001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e1_link, 1, "E1 episode link must survive");
+        let e2_link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links
+                 WHERE media_item_id = 2 AND item_key LIKE 'tmdb:show:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e2_link, 0, "E2 mis-prefixed show link must be deleted");
+
+        // Idempotence at the SQL level: a second run changes nothing.
+        conn.execute_batch(migration_15).unwrap();
+        let e1_again: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Alpha/S01E01.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e1_again, "ready");
+        let e2_again: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Stick/S01E10.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e2_again, "pending");
+        let link_count_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(link_count_again, 1);
+    }
+
+    /// 016 (RC8): one-shot series-row derive (ADR-0033 Q5). Ready episodes
+    /// with episode links produce one row per show folder — `Season N/` and
+    /// `Specials/` inherit the folder. Re-running the derive is a no-op.
+    #[test]
+    fn migration_16_derives_series_rows_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(15) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, season, episode, metadata_status
+             ) VALUES
+                (1, 'Alpha/Season 1/Alpha.S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1, 'ready'),
+                (1, 'Alpha/Season 2/Alpha.S02E01.mkv', 1, 1, 'Alpha', 'episode', 2, 1, 'ready'),
+                (1, 'Alpha/Specials/Alpha.S00E01.mkv', 1, 1, 'Alpha', 'episode', 0, 1, 'ready'),
+                (1, 'Beta/Season 1/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1, 'ready'),
+                (1, 'Gamma/pending.mkv', 1, 1, 'Gamma', 'episode', 1, 1, 'pending');
+             INSERT INTO metadata_canonical (
+                provider, entity_kind, provider_id, title, ids_json, tmdb_show, projected_at
+             ) VALUES
+                ('tmdb', 'episode', '1001', 'One', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z'),
+                ('tmdb', 'episode', '2001', 'Two', '{\"tmdb\":2001}', 55, '2026-01-01T00:00:00Z'),
+                ('tmdb', 'episode', '9001', 'Sp', '{\"tmdb\":9001}', 55, '2026-01-01T00:00:00Z'),
+                ('tmdb', 'episode', '3001', 'B1', '{\"tmdb\":3001}', 66, '2026-01-01T00:00:00Z');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES
+                (1, 'tmdb:episode:1001', 0),
+                (2, 'tmdb:episode:2001', 0),
+                (3, 'tmdb:episode:9001', 0),
+                (4, 'tmdb:episode:3001', 0);",
+        )
+        .unwrap();
+
+        let migration_16 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 16)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        conn.execute_batch(migration_16).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        derive_series_rows(&tx).unwrap();
+        tx.commit().unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT library_id, relpath, tmdb_show_id FROM series ORDER BY relpath")
+            .unwrap();
+        let rows: Vec<(i64, String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, "Alpha".to_string(), 55), (1, "Beta".to_string(), 66),],
+            "one row per show folder; Season 1/2 and Specials inherit Alpha"
+        );
+
+        // Idempotent at the SQL level: a second derive changes nothing.
+        let tx2 = conn.unchecked_transaction().unwrap();
+        derive_series_rows(&tx2).unwrap();
+        tx2.commit().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM series", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
     }
 
     /// Copy a real dogfood DB, migrate through 012, print strip leftovers.

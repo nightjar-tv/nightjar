@@ -111,6 +111,41 @@ pub fn to_relpath(library_root: &str, absolute: &Path) -> Option<String> {
     Some(rel)
 }
 
+/// Show folder relpath for an episode file (ADR-0033 Q2): the highest
+/// directory under the library root that contains episodes or season
+/// directories. `Season N/` and `Specials/` inherit the show folder's series
+/// row. Returns `""` when the library root is itself the show folder.
+///
+/// Path-walk only: the show folder is the first directory component (from the
+/// file up) that is not a season-named directory. Both the migration that
+/// retro-derives series rows and the queue's group formation call this, so
+/// the two always agree on the folder key.
+pub fn show_folder_relpath(stored: &str, library_root: &str) -> String {
+    let rel = if is_absolute_stored(stored) {
+        to_relpath(library_root, Path::new(stored)).unwrap_or_else(|| stored.to_string())
+    } else {
+        stored.to_string()
+    };
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop(); // filename
+    while parts.last().is_some_and(|seg| is_season_directory(seg)) {
+        parts.pop();
+    }
+    parts.join("/")
+}
+
+fn is_season_directory(seg: &str) -> bool {
+    let s = seg.trim().to_ascii_lowercase();
+    if matches!(s.as_str(), "specials" | "special" | "extras" | "extra") {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix("season ") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0] == b's' && b[1..].iter().all(u8::is_ascii_digit)
+}
+
 /// Case-fold each path segment for identity match (ADR-0030 §2).
 pub fn fold_path(path: &str) -> String {
     path.replace('\\', "/")
@@ -183,5 +218,54 @@ mod tests {
         assert!(require_library_root("/").is_err());
         assert!(require_library_root("media/TV").is_err());
         assert!(require_library_root("C:\\Media").is_err());
+    }
+
+    #[test]
+    fn show_folder_skips_season_dirs_and_specials() {
+        // Standard layout: the show folder is the first path component.
+        assert_eq!(
+            show_folder_relpath("Shameless (US)/Season 1/ep.mkv", "/media/TV"),
+            "Shameless (US)"
+        );
+        assert_eq!(
+            show_folder_relpath("Shameless (UK)/Season 01/ep.mkv", "/media/TV"),
+            "Shameless (UK)"
+        );
+        // Specials/ inherits the show folder.
+        assert_eq!(
+            show_folder_relpath("Alpha/Specials/S00E01.mkv", "/media/TV"),
+            "Alpha"
+        );
+        // Season 1 and Season 2 land on the same folder.
+        assert_eq!(
+            show_folder_relpath("Alpha/Season 2/ep.mkv", "/media/TV"),
+            "Alpha"
+        );
+        // A flat show folder (episodes directly under it).
+        assert_eq!(show_folder_relpath("Alpha/ep.mkv", "/media/TV"), "Alpha");
+        // Deep nesting: the folder under the top-level grouping dir.
+        assert_eq!(
+            show_folder_relpath("Anime/One Piece/Season 1/ep.mkv", "/media/TV"),
+            "Anime/One Piece"
+        );
+        // Library root is the show folder: season dirs walk up to nothing.
+        assert_eq!(show_folder_relpath("Season 1/ep.mkv", "/media/TV"), "");
+        assert_eq!(show_folder_relpath("ep.mkv", "/media/TV"), "");
+        // Absolute leftover paths are root-stripped before the walk.
+        assert_eq!(
+            show_folder_relpath("/media/TV/Shameless (US)/Season 1/ep.mkv", "/media/TV"),
+            "Shameless (US)"
+        );
+    }
+
+    #[test]
+    fn show_folder_distinguishes_fold_colliding_siblings() {
+        // The D2 class: two siblings that fold to one matcher key are still
+        // different folders with different series rows.
+        let us = show_folder_relpath("Shameless (US)/Season 1/ep.mkv", "/TV");
+        let uk = show_folder_relpath("Shameless (UK)/Season 1/ep.mkv", "/TV");
+        assert_ne!(us, uk);
+        assert_eq!(us, "Shameless (US)");
+        assert_eq!(uk, "Shameless (UK)");
     }
 }
