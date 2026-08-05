@@ -3260,6 +3260,56 @@ mod tests {
         assert_eq!(proxy.units[0].item_ids.len(), 2);
     }
 
+    /// RC4: `apply_search_hit`'s Episode branch accepts only `ids.tmdb_show`,
+    /// never `ids.tmdb` — an episode-only id must not be written as a show
+    /// key (autopsy D3; the repair is migration 015).
+    #[test]
+    fn apply_search_hit_episode_branch_refuses_episode_only_id() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let meta = CanonicalMetadata {
+            kind: MetadataKind::Episode,
+            title: "Alpha".into(),
+            original_title: None,
+            year: Some(2020),
+            air_date: None,
+            plot: None,
+            genres: Vec::new(),
+            runtime_minutes: None,
+            cast: Vec::new(),
+            ratings: Vec::new(),
+            ids: crate::model::ProviderIds {
+                tmdb: Some(62085), // an episode id, never a show id
+                tmdb_show: None,
+                imdb: None,
+                tvdb: None,
+            },
+            artwork: Vec::new(),
+            collection: None,
+            season: Some(1),
+            episode: Some(1),
+        };
+        let wrote = apply_search_hit(&c, &[1], &meta).unwrap();
+        assert!(
+            !wrote,
+            "episode-only id must not be accepted as an enrichable hit"
+        );
+        let links: i64 = c
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 0, "no link may be written for an episode-only id");
+        let status: String = c
+            .query_row("SELECT metadata_status FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "pending", "item must stay pending, not matched");
+    }
+
     /// RC5: the folder year reaches the provider's search input for TV groups,
     /// asserted on `ResolveInput.year` at the mock boundary, not on
     /// `QueryGroup.library_year` (the reference branch only tested the latter).
