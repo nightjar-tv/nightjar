@@ -36,6 +36,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         14,
         include_str!("../migrations/014_metadata_status_matched.sql"),
     ),
+    (
+        15,
+        include_str!("../migrations/015_metadata_status_repairs.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -230,7 +234,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 14);
+        assert_eq!(v, 15);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -341,6 +345,109 @@ mod tests {
             .unwrap();
         assert_eq!(has_map, 1);
         migrate(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn migration_15_repairs_e1_ready_and_e2_pending() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(14) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, season, episode, metadata_status
+             ) VALUES
+                (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1, 'unmatched'),
+                (1, 'Stick/S01E10.mkv', 1, 1, 'Stick', 'episode', 1, 10, 'unmatched');
+             INSERT INTO metadata_canonical (
+                provider, entity_kind, provider_id, title, ids_json, tmdb_show, projected_at
+             ) VALUES
+                ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z'),
+                ('tmdb', 'episode', '5995804', 'Deja Vu All Over Again', '{\"tmdb\":5995804}', 66, '2026-01-01T00:00:00Z');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES
+                (1, 'tmdb:episode:1001', 0),
+                (2, 'tmdb:show:5995804', 0);",
+        )
+        .unwrap();
+
+        let migration_15 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 15)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        conn.execute_batch(migration_15).unwrap();
+
+        let e1_status: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Alpha/S01E01.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e1_status, "ready", "E1: full episode identity means ready");
+        let e2_status: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Stick/S01E10.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e2_status, "pending", "E2: mis-prefix falls back to pending");
+        let e1_link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links
+                 WHERE media_item_id = 1 AND item_key = 'tmdb:episode:1001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e1_link, 1, "E1 episode link must survive");
+        let e2_link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links
+                 WHERE media_item_id = 2 AND item_key LIKE 'tmdb:show:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e2_link, 0, "E2 mis-prefixed show link must be deleted");
+
+        // Idempotence at the SQL level: a second run changes nothing.
+        conn.execute_batch(migration_15).unwrap();
+        let e1_again: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Alpha/S01E01.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e1_again, "ready");
+        let e2_again: String = conn
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE path = 'Stick/S01E10.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(e2_again, "pending");
+        let link_count_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(link_count_again, 1);
     }
 
     #[test]
