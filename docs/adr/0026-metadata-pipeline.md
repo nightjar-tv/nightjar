@@ -363,8 +363,12 @@ A `tmdb:show:{id}` link survives on these rows even though the item is
 and "TMDB has no episode for this" (`unmatched`, show link present, no
 episode link) distinguishable as a query over links rather than as a
 column value. It is also what the RC3 grouping fallback reads to keep
-the file's card grouped with its bound siblings (§8.4, Consequences);
-that fallback is separate code work, not yet in place.
+the file's card grouped with its bound siblings: `tmdb_show_for_media_item`
+(`queue.rs:337`) reads a `tmdb:episode:` link and, failing that, the
+`tmdb:show:{id}` link directly (§8.4, Consequences), and
+`visible_show_unit_key` (`queue.rs:289`) resolves a bound item through its
+links first, falling back to the folder's `series` row when no link exists
+(RC8).
 
 **Re-entry.** An item does not leave this widened `unmatched` on the next
 drain pass by itself; a drain that only repeats the same failed lookup
@@ -465,9 +469,11 @@ Work set: `metadata_status = 'matched'`.
    looping. Distinguishing the two is a code requirement, not a naming
    preference (RC3, this ADR's implement slice).
 
-NFO-with-id may skip search and go straight to detail (same early path as
-today once the product drain loads NFO — separate implement slice). Manual
-assign that already holds detail should end `ready` when bind completes.
+NFO-with-id may skip search and go straight to detail: the NFO resolve
+returns `MetadataOrigin::Nfo` (`resolve.rs:279-284`) and the queue
+persists it without a provider search (`queue.rs:1245-1250`; a complete
+movie NFO is `ready` with zero HTTP, §8.9). Manual assign that already
+holds detail should end `ready` when bind completes.
 
 #### 8.5 Queue classes and fairness (v1 constant, not a setting)
 
@@ -608,34 +614,58 @@ A movie NFO with a TMDB id but incomplete content still skips the
 search-tier TMDB search (existing id short-circuit); only the enrich
 detail call is skipped when the NFO is complete.
 
-#### 8.10 Series identity cascade (as landed, RC3–RC5)
+#### 8.10 Series identity cascade (as landed, RC3–RC8)
 
 This section records the series-identity order the search tier runs today,
-per resolve group, in one pass. It describes shipped behaviour: every
-claim maps to a `file:line` in `server/crates/metadata/`. It is the
-rewrite of the cascade the abandoned `metadata/s1-s2-status-and-series-cascade`
-branch described but never shipped; that branch's text is superseded by
-this one and nothing is cherry-picked from it.
+per resolve group (folder-scoped for TV since RC8), in one pass. It
+describes shipped behaviour: every claim maps to a `file:line` in
+`server/crates/metadata/`. It is the rewrite of the cascade the abandoned
+`metadata/s1-s2-status-and-series-cascade` branch described but never
+shipped; that branch's text is superseded by this one and nothing is
+cherry-picked from it.
 
 For a TV group the search tier resolves series identity in this order,
 and the first step that yields identity wins:
 
 1. **`tvshow.nfo` at the show root.** `search_one_group` loads the show
-   root NFO once per group via `show_root_nfo_xml` (`queue.rs:1482`),
+   root NFO once per group via `show_root_nfo_xml` (`queue.rs:1600`),
    walking up from the episode path and bounded by the **library path**,
    not by a hop count. A `tvshow.nfo` carrying a usable TMDB show id
    resolves the group with zero provider calls
-   (`resolve.rs:248-253`, `MetadataOrigin::Nfo`). A `tvshow.nfo` carrying
+   (`resolve.rs:253-258`, `MetadataOrigin::Nfo`). A `tvshow.nfo` carrying
    only imdb/tvdb ids carries them forward to `/find`
-   (`resolve.rs:255-256`). A corrupt `tvshow.nfo` is `NfoInvalid`:
+   (`resolve.rs:261-262`). A corrupt `tvshow.nfo` is `NfoInvalid`:
    terminal `unmatched`, fix-flow eligible — the same single concept as a
-   corrupt per-file NFO (`resolve.rs:260-264`).
-2. **Episode NFOs stay readable.** `nfo_sidecar_xml` (`queue.rs:1460`)
+   corrupt per-file NFO (`resolve.rs:289-294`).
+2. **Episode NFOs stay readable.** `nfo_sidecar_xml` (`queue.rs:1578`)
    returns the per-file `.nfo` / `episodedetails.nfo` and never
-   `tvshow.nfo`, so the episode NFO is not masked by the show NFO. Episode
-   NFO external ids are episode-level and are never sent as a show lookup
-   (`resolve.rs:280-281`); sending them can only miss `tv_results`.
-3. **NFO imdb/tvdb via `/find`, with a name-and-year cross-check.**
+   `tvshow.nfo`, so the episode NFO is not masked by the show NFO. A
+   per-file NFO that itself carries a usable TMDB id resolves the group
+   directly with zero provider calls (`resolve.rs:279-284`,
+   `MetadataOrigin::Nfo`). Episode NFO external ids are episode-level and
+   are never sent as a show lookup (`resolve.rs:286-287`); sending them
+   can only miss `tv_results`.
+3. **Stored folder series row (ADR-0033, landed RC8).** A folder whose
+   `series` row (migration 016) holds a show id binds with zero provider
+   calls when the already-persisted detail payload passes the folder
+   name/year cross-check (`resolve.rs:335-382`, `match_method` "series_row"):
+   a local read against the ADR-0029 payload, never a re-fetch, so a
+   rescan of an unchanged library issues zero requests for identified
+   folders (Gate 3). The cross-check reuses `find_hit_reject_reason`
+   (`match_score.rs:167`) — the same gate a `/find` hit must pass, one TV
+   title-match predicate (Rule 4.11). Disagreement, or a missing stored
+   detail, clears the id and falls through to search; a wrong stored id
+   never wins (ADR-0033 §8). The queue reads the row via
+   `series_show_id_for_folder` (`queue.rs:309`) and writes it on a fresh
+   TV match via `upsert_series_row` (`queue.rs:326`). Group formation is
+    folder-scoped: `status_query_groups` (`queue.rs:542`) keys TV groups on
+    `(library_id, show_folder)` instead of the folded title, so two
+    fold-colliding folders are separate groups and the D2 wrong-match
+    mechanism is gone by construction. Browse grouping follows the same
+    identity: `visible_show_unit_key` (`queue.rs:289`) resolves a bound item
+    through its links via `tmdb_show_for_media_item` (`queue.rs:337`) first,
+    then the folder's `series` row for an unbound item, then the soft key.
+4. **NFO imdb/tvdb via `/find`, with a name-and-year cross-check.**
    `TmdbClient::resolve` tries `/find` (`external_source=imdb_id`, then
    `tvdb_id`) before a title search when the attempt carries an external
    id (`tmdb/mod.rs:473`, `:500-504`). `find_tv_by_external_id`
@@ -646,24 +676,24 @@ and the first step that yields identity wins:
    (one TV title-match concept, Rule 4.11) against the group's cleaned
    folder title and `(YYYY)`. A hit that disagrees is discarded and the
    resolver falls through to a plain title search with the external id
-   cleared (`resolve.rs:395-409`) — a wrong external id fails into search,
+   cleared (`resolve.rs:479-490`) — a wrong external id fails into search,
    it never wins, and it is never written as a link. A `/find` 404 or a
-   find-derived detail 404 becomes `FindMiss` (`resolve.rs:137`), which
-   clears the external id and falls through to search (`resolve.rs:385-392`);
+   find-derived detail 404 becomes `FindMiss` (`resolve.rs:143`), which
+   clears the external id and falls through to search (`resolve.rs:472-478`);
    a genuine provider error (timeout, 5xx, 429) propagates as
    `ResolveError::Provider` and stays retryable. The search tier never
    surfaces the stored-id `NotFound` terminal from RC3's enrich path
    (below); there a 404 is terminal, here it is a find miss.
-4. **Folder year plus title search at the 0.80 floor.** The TV search
-   year is `g.year.or(g.library_year)` (`queue.rs:1141`) — the folder's
+5. **Folder year plus title search at the 0.80 floor.** The TV search
+   year is `g.year.or(g.library_year)` (`queue.rs:1242`) — the folder's
    `(YYYY)`, mapped to `first_air_date_year` in the provider search
    (`tmdb/mod.rs:156`). Title search runs at the 0.80 floor (§2); the year
    change also re-keys the negative-result cache (`top gear|-` →
    `top gear|2002`), which is the intended targeted re-search (§3).
-5. **Ids before the negative cache.** An id lookup is never suppressed by
+6. **Ids before the negative cache.** An id lookup is never suppressed by
    a stale title miss: the negative-cache `should_skip` gate applies in
    the attempt loop only when the attempt carries no NFO external id
-   (`resolve.rs:323-327`), so a `/find` for a tvshow.nfo imdb/tvdb id
+   (`resolve.rs:405-414`), so a `/find` for a tvshow.nfo imdb/tvdb id
    always runs. After a find miss the fall-through search **is**
    cache-gated, so a live `below_threshold` / `no_results` row suppresses
    it and a rescan before `next_retry_at` does not re-run find+search
@@ -675,27 +705,28 @@ identity, a series whose episode identity TMDB cannot supply is terminal
 successful enrich means a provider error (retry), not a resting state —
 all per §8.1 / §8.4 as amended 2026-08-05. A stored-show-id detail 404 is
 terminal `unmatched`, not a retryable provider error
-(`resolve.rs:103`; the enrich `Err(NotFound)` arm in `enrich_one_group`,
-`queue.rs:1414-1421`): that is the drain-fixpoint property, and it is why a
+(`resolve.rs:109`; the enrich `Err(NotFound)` arm in `enrich_one_group`,
+`queue.rs:1532`): that is the drain-fixpoint property, and it is why a
 drain of an unchanged library reaches `groups == 0` (Gate 3 "rescan
 generates no search requests"). On the browse side, `visible_show_unit_key`
-keys on the show id from `tmdb_show_for_media_item` (`queue.rs:294`),
-which reads a `tmdb:episode:` link and, failing that, the `tmdb:show:{id}`
-link directly, so a widened-`unmatched` episode with only a show link keys
-with its bound siblings instead of a soft key.
+(`queue.rs:289`) keys on the show id from `tmdb_show_for_media_item`
+(`queue.rs:337`) — which reads a `tmdb:episode:` link and, failing that,
+the `tmdb:show:{id}` link directly — and, only when no link exists, falls
+back to the folder's `series` row, so a widened-`unmatched` episode with
+only a show link keys with its bound siblings instead of a soft key.
 
 **Known miss clusters (unchanged, stated plainly):** specials and `S00`
-files parse as `kind='movie'` and search as standalone movies; absolute
-episode numbering for anime is unsupported; and series identity is scoped
-to the resolve **group**, not the show folder — two folders that fold to
-the same soft key currently collapse into **one** group and resolve
-together, sharing identity (`queue.rs:600-604` keys the group on the
-yearless folded title; `clean_show_title` strips regional tags,
-`clean.rs:207-233`). That shared identity is the wrong-match risk the
-autopsy names (D2/F7), not a property to enshrine. Folder-scoped series
-identity is not shipped; it is tracked separately (ADR-0033 / RC7-RC8)
-and no in-memory or link-derived substitute lands in the meantime
-(Decision 5).
+files parse as `kind='movie'` and search as standalone movies; and
+absolute episode numbering for anime is unsupported. Folder-scoped series
+identity, in contrast, **is shipped** (ADR-0033, RC8): group formation
+keys on the show folder (`status_query_groups`, `queue.rs:542`), so two
+fold-colliding folders (`Shameless (US)` / `Shameless (UK)`) are separate
+groups and no longer resolve together or share an id — the D2 wrong-match
+mechanism the autopsy named is gone by construction, and the regression
+test `fold_colliding_folders_resolve_to_different_series_ids`
+(`queue.rs` tests) fails on any tree that reintroduces fold-keyed
+grouping. No in-memory or link-derived substitute exists; the branch's
+`series_cache` is absent from the tree (the identifier has no hits), per Decision 5.
 
 ## Alternatives considered
 
@@ -840,8 +871,8 @@ keys only.
 - Manual-fix (ADR-0028) clears collection id/name on reassignment; writers
   must populate §6 on the initial detail write or the clear is a no-op forever.
 - **Browse grouping keys on links, not on `metadata_status`.**
-  `visible_show_unit_key` (`server/crates/metadata/src/queue.rs:285`) calls
-  `tmdb_show_for_media_item` (`queue.rs:294`) for a show id; that function
+  `visible_show_unit_key` (`server/crates/metadata/src/queue.rs:289`) calls
+  `tmdb_show_for_media_item` (`queue.rs:337`) for a show id; that function
   reads only `item_links`, never `metadata_status`. The API applies no
   status filter either: `list_items` (`server/crates/db/src/store.rs:410`)
   selects every row for the library and `to_dto`

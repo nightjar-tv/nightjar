@@ -1,6 +1,6 @@
 # ADR-0033: Durable series identity
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-05
 - Depends on: ADR-0025 (item identity / path keys §4); ADR-0026 (§3
   negative cache, §8.1/§8.4 two-tier, §8.6 Visible proxy, §8.10 cascade);
@@ -86,9 +86,11 @@ folder-keyed series row; two folders never merge by fold collision.**
 - Search suppression for identified folders is bounded by the cross-check: a
   folder whose stored detail disagrees falls through to search rather than
   binding a wrong id (plan Decision 3).
-- Group formation moves from the folded title to the folder scope, so the
-  Visible proxy (§8.6) and the negative cache both re-key with it; RC8 owns
-  that re-keying.
-- Status `proposed`: human sign-off recorded before RC8 starts. RC8
-  implements this shape (migration 016 + folder-scoped group formation + one
-  hit path) and deletes anything resembling the branch's `series_cache`.
+- Group formation moved from the folded title to the folder scope, and the
+  Visible proxy (§8.6) and the negative cache re-keyed with it in RC8.
+- Accepted 2026-08-05 with the human sign-off on all eight questions
+  recorded in `nightjar-meta/notes/design/adr-0033-questions-2026-08-05.md`
+  before RC8 started; every answer was option A. RC8 implemented this shape
+  (migration 016 + folder-scoped group formation + one hit path) and deleted
+  anything resembling the branch's `series_cache`; the identifier `series_cache`
+  is absent from the shipped tree.
