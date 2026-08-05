@@ -5,6 +5,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use nightjar_db::show_folder_relpath;
+
 use crate::canonical;
 use crate::clean::{clean_movie_title, clean_show_title, year_from_path};
 use crate::item_links::{
@@ -261,11 +263,134 @@ pub fn retry_unmatched(conn: &Connection, media_item_id: i64) -> Result<(), Stri
     };
     let qk = query_key(&title, year);
     negative_cache::clear(conn, PROVIDER_TMDB, kind, &qk)?;
+    // ADR-0033 Q4: an identified folder caches misses under `series:{id}`, not
+    // the title+year key. Clear that row too, or the next drain re-suppresses
+    // the fall-through search and the retry silently no-ops (ADR-0026 §3).
+    if kind == CacheKind::Tv
+        && let Some(show_id) = series_show_id_for_item(conn, &item)?
+    {
+        negative_cache::clear(
+            conn,
+            PROVIDER_TMDB,
+            kind,
+            &negative_cache::series_cache_key(show_id),
+        )?;
+    }
     queue::set_metadata_status(conn, &[item.id], MetadataStatus::Pending)?;
     Ok(())
+}
+
+/// ADR-0033 Q4: the stored series id for the item's show folder, when one
+/// exists. Same folder-key derivation (`show_folder_relpath`) and row lookup
+/// (`queue::series_show_id_for_folder`) the drain uses, so the manual-retry
+/// delete hits the exact row the next resolve consults.
+fn series_show_id_for_item(conn: &Connection, item: &FixItemView) -> Result<Option<i64>, String> {
+    let library_path: String = conn
+        .query_row(
+            "SELECT path FROM libraries WHERE id = ?1",
+            params![item.library_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("load library {}: {e}", item.library_id))?
+        .ok_or_else(|| format!("library {} not found", item.library_id))?;
+    let folder = show_folder_relpath(&item.path, &library_path);
+    queue::series_show_id_for_folder(conn, item.library_id, &folder)
 }
 
 /// Load item fields for API handlers.
 pub fn get_fix_item(conn: &Connection, id: i64) -> Result<FixItemView, String> {
     load_item(conn, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::{DrainOptions, drain_pending};
+    use crate::resolve::{ResolveError, ResolveInput, Resolver};
+    use nightjar_db::migrate;
+    use rusqlite::Connection;
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicU64;
+
+    struct CountingMiss {
+        calls: Cell<usize>,
+    }
+
+    impl MetadataSource for CountingMiss {
+        fn resolve(
+            &self,
+            _input: &ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, ResolveError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(crate::resolve::ProviderResult::Miss)
+        }
+    }
+
+    /// RC8 (verify round 1 issue): a manual retry on an identified folder must
+    /// clear the folder's series-keyed negative-cache row as well as the
+    /// title+year row. Without it, the next drain re-suppresses the
+    /// fall-through search and the retry silently no-ops (ADR-0026 §3,
+    /// ADR-0033 Q4).
+    #[test]
+    fn retry_clears_series_keyed_miss_and_next_drain_searches() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        // Identified folder: the series row exists, but its stored detail
+        // (year 2011) disagrees with the folder year (2002), so the next drain
+        // discards the id and falls through to search. Both a live series-keyed
+        // miss and a live title+year miss are seeded; the retry must clear both.
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha (2002)/Season 1/Alpha.S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1);
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Alpha (2002)', 55);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '55', 'Alpha', 2011, '{\"tmdb\":55,\"tmdb_show\":55}', 55,
+                '2026-01-01T00:00:00Z');
+             INSERT INTO metadata_negative_cache
+               (provider, kind, query_key, reason, confidence, attempt_count,
+                attempted_at, next_retry_at, cleaner_version)
+             VALUES
+               ('tmdb', 'tv', 'series:55', 'no_results', NULL, 3,
+                '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1),
+               ('tmdb', 'tv', 'alpha|-', 'no_results', NULL, 3,
+                '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1);",
+        )
+        .unwrap();
+
+        retry_unmatched(&c, 1).unwrap();
+
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM metadata_negative_cache", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "the manual retry must clear both the title+year row and the series-keyed row"
+        );
+
+        let src = CountingMiss {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let s = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_unmatched, 1);
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "after a retry, the identified folder's fall-through search must reach the provider"
+        );
+    }
 }

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use nightjar_db::resolve_media_path;
+use nightjar_db::{resolve_media_path, show_folder_relpath};
 
 use crate::canonical;
 use crate::clean::{
@@ -107,6 +107,7 @@ impl MetadataStatus {
 #[derive(Debug, Clone)]
 pub struct PendingItem {
     pub id: i64,
+    pub library_id: i64,
     pub kind: String,
     pub title: String,
     pub year: Option<i32>,
@@ -159,6 +160,8 @@ struct LibraryItemRow {
     title: String,
     year: Option<i32>,
     path: String,
+    /// Library root `path` is relative to (ADR-0030).
+    library_path: String,
 }
 
 /// All-items Visible proxy: movies by title; shows by provisional soft key
@@ -180,7 +183,7 @@ pub fn snapshot_visible_proxy_filtered(
 ) -> Result<VisibleProxy, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT m.id, m.library_id, l.kind, m.kind, m.title, m.year, m.path, l.name
+            "SELECT m.id, m.library_id, l.kind, m.kind, m.title, m.year, m.path, l.path, l.name
              FROM media_items m
              JOIN libraries l ON l.id = m.library_id
              ORDER BY m.library_id, m.id",
@@ -197,8 +200,9 @@ pub fn snapshot_visible_proxy_filtered(
                     title: r.get(4)?,
                     year: r.get(5)?,
                     path: r.get(6)?,
+                    library_path: r.get(7)?,
                 },
-                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })
         .map_err(|e| format!("query visible snapshot: {e}"))?;
@@ -280,15 +284,54 @@ pub fn snapshot_visible_proxy_filtered(
     Ok(VisibleProxy { units })
 }
 
-/// Browse unit for one episode file: `tv|tmdb:{show_id}` when linked,
-/// else soft-key `tv|{query_key}`.
+/// Browse unit for one episode file: `tv|tmdb:{show_id}` when linked or when
+/// the folder has stored series identity (ADR-0033), else soft-key `tv|{query_key}`.
 fn visible_show_unit_key(conn: &Connection, it: &LibraryItemRow) -> Result<String, String> {
     if let Some(show_id) = tmdb_show_for_media_item(conn, it.id)? {
+        return Ok(format!("tv|tmdb:{show_id}"));
+    }
+    // Folder-scoped identity: a folder with a series row keys with its bound
+    // siblings instead of folding to a shared soft key (two fold-colliding
+    // folders never merge into one card, ADR-0033 Q2/Q3).
+    let folder = show_folder_relpath(&it.path, &it.library_path);
+    if let Some(show_id) = series_show_id_for_folder(conn, it.library_id, &folder)? {
         return Ok(format!("tv|tmdb:{show_id}"));
     }
     let (ct, _) = clean_show_title(&it.title);
     let qk = query_key(&ct, None);
     Ok(format!("tv|{qk}"))
+}
+
+/// ADR-0033: stored series identity for a show folder, or `None` when the
+/// folder has no row yet (it will search fresh and write one on a match).
+/// Shared with the manual-retry path (fix.rs) so both consumers resolve the
+/// folder's identity through the same row lookup.
+pub(crate) fn series_show_id_for_folder(
+    conn: &Connection,
+    library_id: i64,
+    show_folder: &str,
+) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT tmdb_show_id FROM series WHERE library_id = ?1 AND relpath = ?2",
+        params![library_id, show_folder],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("series row lookup: {e}"))
+}
+
+/// ADR-0033: upsert the folder-keyed series row from a fresh TV match. A
+/// re-match updates the row (the folder's identity follows its last accepted
+/// match); nothing here runs inside a repair path.
+fn upsert_series_row(conn: &Connection, g: &QueryGroup, show_id: i64) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO series (library_id, relpath, tmdb_show_id)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(library_id, relpath) DO UPDATE SET tmdb_show_id = excluded.tmdb_show_id",
+        params![g.library_id, g.show_folder, show_id],
+    )
+    .map_err(|e| format!("upsert series row: {e}"))?;
+    Ok(())
 }
 
 fn tmdb_show_for_media_item(conn: &Connection, media_item_id: i64) -> Result<Option<i64>, String> {
@@ -375,6 +418,11 @@ struct QueryGroup {
     path: String,
     /// Library root `path` is relative to (ADR-0030).
     library_path: String,
+    library_id: i64,
+    /// ADR-0033 folder scope for TV groups: relpath of the show folder the
+    /// group's episodes live under. `""` when the library root is itself the
+    /// show folder. Movies never use it.
+    show_folder: String,
     title: String,
     year: Option<i32>,
     library_year: Option<i32>,
@@ -502,7 +550,8 @@ fn status_query_groups(
 
     let mut stmt = conn
         .prepare(
-            "SELECT m.id, m.kind, m.title, m.year, m.path, m.season, m.episode, l.path
+            "SELECT m.id, m.kind, m.title, m.year, m.path, m.season, m.episode,
+                    l.id as library_id, l.path
              FROM media_items m
              JOIN libraries l ON l.id = m.library_id
              WHERE m.metadata_status = ?1
@@ -517,9 +566,10 @@ fn status_query_groups(
                 title: r.get(2)?,
                 year: r.get(3)?,
                 path: r.get(4)?,
-                library_path: r.get(7)?,
+                library_path: r.get(8)?,
                 season: r.get(5)?,
                 episode: r.get(6)?,
+                library_id: r.get(7)?,
             })
         })
         .map_err(|e| format!("query status groups: {e}"))?;
@@ -529,15 +579,29 @@ fn status_query_groups(
         items.push(row.map_err(|e| format!("status group row: {e}"))?);
     }
 
-    let mut ep_by_show: HashMap<String, Vec<&PendingItem>> = HashMap::new();
+    // ADR-0033 Q2: TV groups are folder-scoped. The show folder is the highest
+    // directory under the library root that contains episodes or season
+    // directories; `Season N/` and `Specials/` inherit it. Two folders that
+    // fold to the same matcher key (`Shameless (US)` / `Shameless (UK)`) are
+    // separate groups and never share identity (the D2 wrong-match class).
+    let mut ep_by_show: HashMap<(i64, String), Vec<&PendingItem>> = HashMap::new();
     for it in &items {
         if it.kind == "episode" {
-            let (ct, _) = clean_show_title(&it.title);
-            ep_by_show.entry(ct).or_default().push(it);
+            let folder = show_folder_relpath(&it.path, &it.library_path);
+            ep_by_show
+                .entry((it.library_id, folder))
+                .or_default()
+                .push(it);
         }
     }
 
-    let mut groups: HashMap<String, QueryGroup> = HashMap::new();
+    // Stored folder series identity, loaded once so group unit keys follow
+    // the folder's row (`tv|tmdb:{show_id}`) instead of a soft key — a
+    // fold-colliding folder with identity keys with its own card.
+    let series_by_folder = load_series_rows(conn)?;
+
+    let mut movie_groups: HashMap<String, QueryGroup> = HashMap::new();
+    let mut ep_groups: HashMap<(i64, String), QueryGroup> = HashMap::new();
     for it in &items {
         let band = band_for_item(it.id, &visible_ids, &cw, &search);
         match it.kind.as_str() {
@@ -546,12 +610,14 @@ fn status_query_groups(
                 let (ct, cy) = clean_movie_title(&it.title, folder_year.or(it.year));
                 let qk = query_key(&ct, cy);
                 let unit_key = format!("movie|{qk}");
-                let g = groups
+                let g = movie_groups
                     .entry(unit_key.clone())
                     .or_insert_with(|| QueryGroup {
                         resolve_kind: MetadataKind::Movie,
                         path: it.path.clone(),
                         library_path: it.library_path.clone(),
+                        library_id: it.library_id,
+                        show_folder: String::new(),
                         title: ct,
                         year: cy,
                         library_year: None,
@@ -571,7 +637,12 @@ fn status_query_groups(
             }
             "episode" => {
                 let (ct, _) = clean_show_title(&it.title);
-                let siblings = ep_by_show.get(&ct).map(|v| v.as_slice()).unwrap_or(&[]);
+                let show_folder = show_folder_relpath(&it.path, &it.library_path);
+                let folder_key = (it.library_id, show_folder.clone());
+                let siblings = ep_by_show
+                    .get(&folder_key)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let years = siblings.iter().map(|s| s.year);
                 let path0 = siblings
                     .first()
@@ -597,27 +668,32 @@ fn status_query_groups(
                     })
                     .collect();
                 let pref = pick_reference_episode(&ref_eps, &ct);
-                let qk = query_key(&ct, None);
-                let unit_key = format!("tv|{qk}");
-                let g = groups
-                    .entry(unit_key.clone())
-                    .or_insert_with(|| QueryGroup {
-                        resolve_kind: MetadataKind::Episode,
-                        path: path0.to_string(),
-                        library_path: library_path0.to_string(),
-                        title: ct.clone(),
-                        year: None,
-                        library_year,
-                        library_episode_count: Some(siblings.len() as u32),
-                        library_season_count: (!seasons.is_empty()).then_some(seasons.len() as u32),
-                        ref_season: pref.as_ref().map(|p| p.0),
-                        ref_episode: pref.as_ref().map(|p| p.1),
-                        ref_episode_title: pref.map(|p| p.2),
-                        item_ids: Vec::new(),
-                        max_id: it.id,
-                        band,
-                        unit_key,
-                    });
+                // The group's browse unit: the folder's stored series id when
+                // it has one, else the soft key — matching
+                // [`visible_show_unit_key`] so poster attribution lands.
+                let unit_key = match series_by_folder.get(&folder_key) {
+                    Some(show_id) => format!("tv|tmdb:{show_id}"),
+                    None => format!("tv|{}", query_key(&ct, None)),
+                };
+                let g = ep_groups.entry(folder_key).or_insert_with(|| QueryGroup {
+                    resolve_kind: MetadataKind::Episode,
+                    path: path0.to_string(),
+                    library_path: library_path0.to_string(),
+                    library_id: it.library_id,
+                    show_folder,
+                    title: ct.clone(),
+                    year: None,
+                    library_year,
+                    library_episode_count: Some(siblings.len() as u32),
+                    library_season_count: (!seasons.is_empty()).then_some(seasons.len() as u32),
+                    ref_season: pref.as_ref().map(|p| p.0),
+                    ref_episode: pref.as_ref().map(|p| p.1),
+                    ref_episode_title: pref.map(|p| p.2),
+                    item_ids: Vec::new(),
+                    max_id: it.id,
+                    band,
+                    unit_key,
+                });
                 g.item_ids.push(it.id);
                 g.max_id = g.max_id.max(it.id);
                 g.band = g.band.min(band);
@@ -626,8 +702,33 @@ fn status_query_groups(
         }
     }
 
-    let mut out: Vec<QueryGroup> = groups.into_values().collect();
+    let mut out: Vec<QueryGroup> = movie_groups
+        .into_values()
+        .chain(ep_groups.into_values())
+        .collect();
     out.sort_by(|a, b| a.band.cmp(&b.band).then_with(|| b.max_id.cmp(&a.max_id)));
+    Ok(out)
+}
+
+/// ADR-0033: every folder-keyed series row, keyed `(library_id, relpath)`.
+fn load_series_rows(conn: &Connection) -> Result<HashMap<(i64, String), i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT library_id, relpath, tmdb_show_id FROM series")
+        .map_err(|e| format!("prepare series rows: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("query series rows: {e}"))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (library_id, relpath, tmdb_show_id) = row.map_err(|e| format!("series row: {e}"))?;
+        out.insert((library_id, relpath), tmdb_show_id);
+    }
     Ok(out)
 }
 
@@ -1157,6 +1258,15 @@ fn search_one_group<T: MetadataSource>(
         ref_season: g.ref_season,
         ref_episode: g.ref_episode,
         ref_episode_title: g.ref_episode_title.clone(),
+        // ADR-0033: the folder's stored series identity, when it has one.
+        // The resolver cross-checks it against the persisted detail and binds
+        // with zero provider calls; disagreement falls through to search.
+        series_show_id: match g.resolve_kind {
+            MetadataKind::Movie => None,
+            MetadataKind::Episode | MetadataKind::Show => {
+                series_show_id_for_folder(conn, g.library_id, &g.show_folder)?
+            }
+        },
         kind: Some(g.resolve_kind),
         ..Default::default()
     };
@@ -1188,6 +1298,14 @@ fn search_one_group<T: MetadataSource>(
             } else {
                 match apply_search_hit(conn, &g.item_ids, &metadata) {
                     Ok(true) => {
+                        // ADR-0033: a fresh TV match writes the folder-keyed
+                        // series row, so a later group under this folder binds
+                        // with zero search calls through the same hit path.
+                        if g.resolve_kind != MetadataKind::Movie
+                            && let Some(show_id) = tmdb_id
+                        {
+                            upsert_series_row(conn, g, show_id)?;
+                        }
                         warm_poster_for_matched(
                             opts.poster_warm.as_deref(),
                             &g.item_ids,
@@ -3561,5 +3679,412 @@ mod tests {
             "episodedetails.nfo must stay readable beside tvshow.nfo"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RC8: two folders that fold to the same matcher soft key resolve to
+    /// **different** series ids and neither inherits the other's (D2
+    /// regression, ADR-0033 Q2/Q3). Folder-scoped grouping means each folder
+    /// does its own resolve — the second folder cannot inherit the first's id
+    /// through any cache, and the browse proxy splits them into two cards.
+    #[test]
+    fn fold_colliding_folders_resolve_to_different_series_ids() {
+        struct ShamelessFoldSource {
+            searches: Cell<usize>,
+        }
+        impl MetadataSource for ShamelessFoldSource {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                if input.tmdb_id.is_none() {
+                    self.searches.set(self.searches.get() + 1);
+                }
+                let id = input.tmdb_id.unwrap_or(match input.year {
+                    // TMDB show ids for the US (2011) and UK (2004) versions.
+                    Some(2011) => 34343,
+                    Some(2004) => 20610,
+                    _ => 99999,
+                });
+                let meta = CanonicalMetadata {
+                    kind: MetadataKind::Show,
+                    title: "Shameless".into(),
+                    original_title: None,
+                    year: input.year,
+                    air_date: None,
+                    plot: None,
+                    genres: Vec::new(),
+                    runtime_minutes: None,
+                    cast: Vec::new(),
+                    ratings: Vec::new(),
+                    ids: crate::model::ProviderIds {
+                        tmdb: Some(id),
+                        tmdb_show: Some(id),
+                        imdb: None,
+                        tvdb: None,
+                    },
+                    artwork: Vec::new(),
+                    collection: None,
+                    season: None,
+                    episode: None,
+                };
+                Ok(crate::resolve::ProviderResult::Hit {
+                    metadata: Box::new(meta),
+                    method: "exact_title",
+                    raw: Some(crate::tmdb::RawProviderPayload {
+                        entity_kind: "tv".into(),
+                        provider_id: id.to_string(),
+                        payload: format!(r#"{{"id":{id},"name":"Shameless"}}"#),
+                    }),
+                })
+            }
+        }
+
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Shameless (US) (2011)/Season 1/Shameless.US.S01E01.mkv', 1, 1, 'Shameless (US)', 'episode', 1, 1),
+               (1, 'Shameless (UK) (2004)/Season 1/Shameless.UK.S01E01.mkv', 1, 1, 'Shameless (UK)', 'episode', 1, 1);",
+        )
+        .unwrap();
+
+        // Group formation is folder-scoped: two groups despite one soft key.
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        let groups = pending_query_groups(&c, &proxy).unwrap();
+        assert_eq!(
+            groups.len(),
+            2,
+            "fold-colliding folders must not share a group"
+        );
+        assert_ne!(groups[0].show_folder, groups[1].show_folder);
+
+        let src = ShamelessFoldSource {
+            searches: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let s = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_matched, 2);
+        assert_eq!(
+            resolver.tmdb.searches.get(),
+            2,
+            "each folder must resolve for itself — the second must not inherit the first's id"
+        );
+
+        let mut stmt = c
+            .prepare(
+                "SELECT m.title, l.item_key FROM media_item_links l
+                 JOIN media_items m ON m.id = l.media_item_id
+                 ORDER BY m.title",
+            )
+            .unwrap();
+        let links: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            links,
+            vec![
+                ("Shameless (UK)".to_string(), "tmdb:show:20610".to_string()),
+                ("Shameless (US)".to_string(), "tmdb:show:34343".to_string()),
+            ],
+            "the two folders must bind different shows"
+        );
+
+        // Durable rows are folder-keyed and never merge by fold collision.
+        let mut stmt = c
+            .prepare("SELECT relpath, tmdb_show_id FROM series ORDER BY relpath")
+            .unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Shameless (UK) (2004)".to_string(), 20610),
+                ("Shameless (US) (2011)".to_string(), 34343),
+            ]
+        );
+        assert_ne!(
+            rows[0].1, rows[1].1,
+            "no shared series identity across folders"
+        );
+
+        // Browse proxy: two cards, one per folder identity.
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        let keys: HashSet<_> = proxy.units.iter().map(|u| u.unit_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            HashSet::from(["tv|tmdb:34343", "tv|tmdb:20610"]),
+            "the fold-colliding folders must not share a browse card"
+        );
+    }
+
+    /// Show identity mock: one search per folder, a poster on the show hit,
+    /// and a season payload binding S1E1..E2.
+    struct AlphaFolderSource {
+        searches: Cell<usize>,
+        resolve_calls: Cell<usize>,
+    }
+
+    impl MetadataSource for AlphaFolderSource {
+        fn resolve(
+            &self,
+            input: &ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+            self.resolve_calls.set(self.resolve_calls.get() + 1);
+            if input.tmdb_id.is_none() {
+                self.searches.set(self.searches.get() + 1);
+            }
+            let id = input.tmdb_id.unwrap_or(55);
+            let meta = CanonicalMetadata {
+                kind: MetadataKind::Show,
+                title: "Alpha".into(),
+                original_title: None,
+                year: Some(2002),
+                air_date: None,
+                plot: None,
+                genres: Vec::new(),
+                runtime_minutes: None,
+                cast: Vec::new(),
+                ratings: Vec::new(),
+                ids: crate::model::ProviderIds {
+                    tmdb: Some(id),
+                    tmdb_show: Some(id),
+                    imdb: None,
+                    tvdb: None,
+                },
+                artwork: vec![crate::model::ArtworkRef {
+                    kind: ArtworkKind::Poster,
+                    path: "/p.jpg".into(),
+                }],
+                collection: None,
+                season: None,
+                episode: None,
+            };
+            Ok(crate::resolve::ProviderResult::Hit {
+                metadata: Box::new(meta),
+                method: if input.tmdb_id.is_some() {
+                    "tmdb_id"
+                } else {
+                    "exact_title"
+                },
+                raw: Some(crate::tmdb::RawProviderPayload {
+                    entity_kind: "tv".into(),
+                    provider_id: id.to_string(),
+                    payload: format!(r#"{{"id":{id},"name":"Alpha"}}"#),
+                }),
+            })
+        }
+
+        fn fetch_season(
+            &self,
+            show_id: i64,
+            season_number: i32,
+        ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError> {
+            assert_eq!(show_id, 55);
+            assert_eq!(season_number, 1);
+            let payload = r#"{
+                "season_number": 1,
+                "episodes": [
+                  {"id": 1001, "name": "One", "season_number": 1, "episode_number": 1, "air_date": "2002-01-01"},
+                  {"id": 1002, "name": "Two", "season_number": 1, "episode_number": 2, "air_date": "2002-01-08"}
+                ]
+            }"#;
+            Ok(Some(crate::tmdb::RawProviderPayload {
+                entity_kind: "season".into(),
+                provider_id: format!("{show_id}:{season_number}"),
+                payload: payload.into(),
+            }))
+        }
+    }
+
+    /// RC8: a new episode added under an already-identified folder binds with
+    /// zero search calls — asserted on the exact mock search count, not a
+    /// range (Gate 3 "rescan generates no search requests" for identified
+    /// folders, ADR-0033 §8).
+    #[test]
+    fn new_episode_in_identified_folder_binds_with_zero_search_calls() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha (2002)/Season 1/Alpha.S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let src = AlphaFolderSource {
+            searches: Cell::new(0),
+            resolve_calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let s1 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s1.items_matched, 1);
+        assert_eq!(s1.items_ready, 1);
+        assert_eq!(resolver.tmdb.searches.get(), 1, "first pass searches once");
+        let searches_after_first = resolver.tmdb.searches.get();
+
+        // A second episode lands in the same folder; the folder already has a
+        // series row from the first pass.
+        c.execute(
+            "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha (2002)/Season 1/Alpha.S01E02.mkv', 1, 1, 'Alpha', 'episode', 1, 2)",
+            [],
+        )
+        .unwrap();
+        let s2 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s2.items_ready, 1);
+        assert_eq!(
+            resolver.tmdb.searches.get(),
+            searches_after_first,
+            "stored folder identity must bind the new episode with zero search calls"
+        );
+        let status: String = c
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE season = 1 AND episode = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
+    }
+
+    /// RC8: a reused series id produces the same canonical, link, and
+    /// poster-warm effects as a fresh match — one hit path (Rule 4.11), the
+    /// reference branch's cache-hit fork that skipped all three is gone.
+    #[test]
+    fn reused_series_id_has_same_canonical_link_poster_effects_as_fresh_match() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WARMED: AtomicUsize = AtomicUsize::new(0);
+        static WARMED_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        struct RecordWarm;
+        impl PosterWarm for RecordWarm {
+            fn on_matched(&self, item_ids: &[i64], metadata: &CanonicalMetadata) {
+                assert_eq!(item_ids.len(), 1);
+                assert_eq!(
+                    metadata.artwork.first().map(|a| a.path.as_str()),
+                    Some("/p.jpg"),
+                    "the reused-id hit must carry the same artwork a fresh match does"
+                );
+                WARMED.fetch_add(1, Ordering::SeqCst);
+                WARMED_TITLES.lock().unwrap().push(metadata.title.clone());
+            }
+        }
+
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha (2002)/Season 1/Alpha.S01E01.mkv', 1, 1, 'Alpha', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let src = AlphaFolderSource {
+            searches: Cell::new(0),
+            resolve_calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let opts = DrainOptions {
+            poster_warm: Some(Box::new(RecordWarm)),
+            ..DrainOptions::default()
+        };
+        let s1 =
+            drain_pending(&c, &resolver, &AtomicU64::new(0), &AtomicU64::new(0), opts).unwrap();
+        assert_eq!(s1.items_ready, 1);
+        assert_eq!(WARMED.load(Ordering::SeqCst), 1, "fresh match warms once");
+
+        c.execute(
+            "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 'Alpha (2002)/Season 1/Alpha.S01E02.mkv', 1, 1, 'Alpha', 'episode', 1, 2)",
+            [],
+        )
+        .unwrap();
+        // Stamp the tv row so the reuse pass must prove it re-persists it: the
+        // stored-id bind re-upserts the canonical row with a fresh
+        // `projected_at`, so the row can no longer be pass 1's leftover
+        // (verify issue 2 — artwork/link/poster assertions alone cannot tell).
+        c.execute(
+            "UPDATE metadata_canonical SET projected_at = '2000-01-01T00:00:00Z'
+             WHERE provider = 'tmdb' AND entity_kind = 'tv' AND provider_id = '55'",
+            [],
+        )
+        .unwrap();
+        let s2 = drain_pending(
+            &c,
+            &resolver,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions {
+                poster_warm: Some(Box::new(RecordWarm)),
+                ..DrainOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s2.items_ready, 1);
+        assert_eq!(
+            WARMED.load(Ordering::SeqCst),
+            2,
+            "a reused id goes through the same poster-warm as a fresh match"
+        );
+        assert!(
+            WARMED_TITLES.lock().unwrap().iter().all(|t| t == "Alpha"),
+            "both paths must warm the same show metadata"
+        );
+
+        // Same canonical: the tv row persists across the reuse, artwork kept.
+        let (title, art, projected_at): (String, Option<String>, String) = c
+            .query_row(
+                "SELECT title, artwork_json, projected_at FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND entity_kind = 'tv' AND provider_id = '55'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Alpha");
+        assert!(
+            art.as_deref().is_some_and(|a| a.contains("/p.jpg")),
+            "the persisted show row keeps its artwork through a reused-id bind"
+        );
+        assert_ne!(
+            projected_at.as_str(),
+            "2000-01-01T00:00:00Z",
+            "the reuse pass re-persisted the canonical row; it is not pass 1's leftover"
+        );
+        // Same links: both episodes end bound through the same bind path.
+        let mut stmt = c
+            .prepare("SELECT item_key FROM media_item_links ORDER BY item_key")
+            .unwrap();
+        let links: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(links, vec!["tmdb:episode:1001", "tmdb:episode:1002"]);
     }
 }

@@ -47,6 +47,12 @@ pub struct ResolveInput {
     /// When set, the negative cache is skipped and the provider fetches the
     /// detail payload for this id directly (no query key, no floor gate).
     pub tmdb_id: Option<i64>,
+    /// Stored folder series identity (ADR-0033): the show id for this group's
+    /// folder, read from the `series` table by the queue. Skips the title
+    /// search when the already-persisted detail payload passes the folder
+    /// name/year cross-check; disagreement falls through to search. Local
+    /// read only — never a provider re-fetch.
+    pub series_show_id: Option<i64>,
     /// Search target; episodes search as TV (ADR-0026).
     pub kind: Option<MetadataKind>,
 }
@@ -307,11 +313,87 @@ impl<T: MetadataSource> Resolver<T> {
                 .map(|t| query_key(t, input.year))
         };
 
+        // ADR-0033 Q4: a folder with stored series identity caches under its
+        // series id, not its title+year query key — a fold-colliding sibling
+        // writes the same query for a different show, and one folder's miss
+        // must never suppress the other's fall-through search. Title+year
+        // keys remain for folders with no identity yet. An id-driven enrich
+        // (tmdb_id set) never consults the cache, so it gets no key either.
+        let series_key = input
+            .series_show_id
+            .filter(|_| input.tmdb_id.is_none())
+            .map(negative_cache::series_cache_key);
+
+        // ADR-0033 §8: a folder with stored series identity skips the title
+        // search but must pass a folder-level name/year cross-check against
+        // the already-persisted detail payload before binding — a local read,
+        // never a provider re-fetch. Disagreement (or a missing stored
+        // detail) clears the id and falls through to search; a wrong stored
+        // id never wins. The cross-check reuses the one TV title-match
+        // predicate (`find_hit_reject_reason`), so a reused id follows the
+        // same name/year gate a `/find` external id does.
+        if let Some(series_show_id) = input.series_show_id
+            && input.tmdb_id.is_none()
+            && let Some(conn) = conn
+            && let Some(meta) =
+                canonical::get_canonical(conn, PROVIDER_TMDB, "tv", &series_show_id.to_string())
+                    .map_err(ResolveError::Provider)?
+        {
+            if let Some(reason) = crate::match_score::find_hit_reject_reason(
+                &meta,
+                crate::match_score::SearchKind::Tv,
+                input.title.as_deref().unwrap_or_default(),
+                input.year,
+            ) {
+                eprintln!(
+                    "  discard stored series id {series_show_id} — {reason}; falling through to search"
+                );
+            } else {
+                // One hit path (Rule 4.11): the same persist and
+                // negative-cache clear a fresh provider match performs, then
+                // the same `Resolved` shape the queue applies links and
+                // poster-warm from. A rescan of an unchanged library issues
+                // zero requests (Gate 3 "no search requests" survives).
+                if let Some(qk) = &qk {
+                    negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, qk)
+                        .map_err(ResolveError::Provider)?;
+                }
+                // The series-id row too: a miss recorded under this folder's
+                // identity must not suppress the next cross-check-failure
+                // search after a successful re-bind.
+                negative_cache::clear(
+                    conn,
+                    PROVIDER_TMDB,
+                    cache_kind,
+                    &negative_cache::series_cache_key(series_show_id),
+                )
+                .map_err(ResolveError::Provider)?;
+                let tx = conn.unchecked_transaction().map_err(|e| {
+                    ResolveError::Provider(format!("begin series-row persist tx: {e}"))
+                })?;
+                canonical::upsert_canonical(&tx, PROVIDER_TMDB, &meta)
+                    .map_err(ResolveError::Provider)?;
+                tx.commit().map_err(|e| {
+                    ResolveError::Provider(format!("commit series-row persist: {e}"))
+                })?;
+                return Ok(ResolveOutcome::Resolved {
+                    metadata: Box::new(meta),
+                    source: MetadataOrigin::Tmdb,
+                    match_method: Some("series_row".to_string()),
+                });
+            }
+        }
+
         let mut attempt = ResolveInput {
             nfo_imdb_id: nfo_imdb_id.or(input.nfo_imdb_id.clone()),
             nfo_tvdb_id: nfo_tvdb_id.or(input.nfo_tvdb_id),
+            series_show_id: None,
             ..input.clone()
         };
+        // The key the fall-through search consults and records under: the
+        // folder's series id once identity is stored (ADR-0033 Q4), else the
+        // title+year query key.
+        let cache_key: Option<&str> = series_key.as_deref().or(qk.as_deref());
         // Two attempts at most: `/find` first (an id lookup a stale title
         // miss must not suppress, autopsy D4), then — only when the find
         // produced no accepted hit — a plain title search. The search attempt
@@ -322,7 +404,7 @@ impl<T: MetadataSource> Resolver<T> {
         for _round in 0..2 {
             if attempt.nfo_imdb_id.is_none()
                 && attempt.nfo_tvdb_id.is_none()
-                && let (Some(conn), Some(qk)) = (conn, &qk)
+                && let (Some(conn), Some(qk)) = (conn, cache_key)
                 && let Ok(Some(entry)) =
                     negative_cache::should_skip(conn, PROVIDER_TMDB, cache_kind, qk, &now)
             {
@@ -348,7 +430,7 @@ impl<T: MetadataSource> Resolver<T> {
                     raw,
                 } => (metadata, method, raw),
                 ProviderResult::BelowThreshold { confidence, method } => {
-                    if let (Some(conn), Some(qk)) = (conn, &qk) {
+                    if let (Some(conn), Some(qk)) = (conn, cache_key) {
                         let _ = negative_cache::record_miss(
                             conn,
                             PROVIDER_TMDB,
@@ -367,7 +449,7 @@ impl<T: MetadataSource> Resolver<T> {
                     });
                 }
                 ProviderResult::Miss => {
-                    if let (Some(conn), Some(qk)) = (conn, &qk) {
+                    if let (Some(conn), Some(qk)) = (conn, cache_key) {
                         let _ = negative_cache::record_miss(
                             conn,
                             PROVIDER_TMDB,
@@ -412,6 +494,12 @@ impl<T: MetadataSource> Resolver<T> {
             if let (Some(conn), Some(raw)) = (conn, raw.as_ref()) {
                 if let Some(ref qk) = qk {
                     let _ = negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, qk);
+                }
+                if let Some(ref key) = series_key {
+                    // The stored identity's row is dead once a fresh match
+                    // lands: the queue re-keys the folder's series row to the
+                    // hit, and its old series-id miss must not linger.
+                    let _ = negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, key);
                 }
                 canonical::persist_mapped_hit(conn, PROVIDER_TMDB, raw, &metadata)
                     .map_err(ResolveError::Provider)?;
@@ -1172,5 +1260,315 @@ mod tests {
             )
             .unwrap();
         assert_eq!(right, 1, "the search hit is persisted");
+    }
+
+    /// RC8 (ADR-0033 §8): a stored series id that agrees with the folder
+    /// binds with zero provider calls — the same hit shape a fresh match
+    /// produces — and clears the stale negative-cache row (one hit path,
+    /// Rule 4.11; the reference branch's cache-hit fork is gone).
+    #[test]
+    fn stored_series_id_matching_folder_binds_with_zero_provider_calls() {
+        struct PanicProvider;
+        impl MetadataSource for PanicProvider {
+            fn resolve(&self, _input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+                panic!("a folder with stored identity must not reach the provider");
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha (2002)', 55);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '55', 'Alpha', 2002, '{\"tmdb\":55,\"tmdb_show\":55}', 55,
+                '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        // A stale title miss must not survive a successful stored-id bind.
+        let qk = query_key("Alpha", Some(2002));
+        conn.execute(
+            "INSERT INTO metadata_negative_cache
+               (provider, kind, query_key, reason, confidence, attempt_count,
+                attempted_at, next_retry_at, cleaner_version)
+             VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 2,
+                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
+            params![qk],
+        )
+        .unwrap();
+        // A series-id miss (ADR-0033 Q4: identified folders cache under their
+        // series id) must be cleared by the re-bind just the same.
+        conn.execute(
+            "INSERT INTO metadata_negative_cache
+               (provider, kind, query_key, reason, confidence, attempt_count,
+                attempted_at, next_retry_at, cleaner_version)
+             VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 2,
+                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
+            params![negative_cache::series_cache_key(55)],
+        )
+        .unwrap();
+
+        let resolver = Resolver {
+            tmdb: PanicProvider,
+        };
+        let outcome = resolver
+            .resolve_with_store(
+                &ResolveInput {
+                    series_show_id: Some(55),
+                    title: Some("Alpha".into()),
+                    year: Some(2002),
+                    kind: Some(MetadataKind::Episode),
+                    ..Default::default()
+                },
+                &conn,
+            )
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            } => {
+                assert_eq!(metadata.ids.tmdb, Some(55));
+                assert_eq!(match_method.as_deref(), Some("series_row"));
+            }
+            other => panic!("stored identity must resolve locally, got {other:?}"),
+        }
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metadata_negative_cache", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "a reused id clears stale negative-cache rows (title+year and series-id)"
+        );
+    }
+
+    /// RC8 (ADR-0033 §8): a stored series id whose persisted detail disagrees
+    /// with the folder is discarded and the resolve falls through to search —
+    /// a wrong stored id never wins and is never bound (the Shameless
+    /// (UK)/(US) case: stored US detail, 2011, against a 2004 folder).
+    #[test]
+    fn stored_series_id_disagreeing_with_folder_falls_through_to_search() {
+        struct WrongStoredThenSearch {
+            calls: Cell<usize>,
+        }
+        impl MetadataSource for WrongStoredThenSearch {
+            fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+                self.calls.set(self.calls.get() + 1);
+                assert!(
+                    input.series_show_id.is_none(),
+                    "the stale id must be cleared before the fall-through search"
+                );
+                Ok(show_hit(20610, "Shameless", Some(2004), "exact_title"))
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Shameless (UK) (2004)', 34343);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '34343', 'Shameless', 2011, '{\"tmdb\":34343,\"tmdb_show\":34343}', 34343,
+                '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        let src = WrongStoredThenSearch {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let outcome = resolver
+            .resolve_with_store(
+                &ResolveInput {
+                    series_show_id: Some(34343),
+                    title: Some("Shameless".into()),
+                    year: Some(2004),
+                    kind: Some(MetadataKind::Episode),
+                    ..Default::default()
+                },
+                &conn,
+            )
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            } => {
+                assert_eq!(
+                    metadata.ids.tmdb,
+                    Some(20610),
+                    "the fall-through search hit wins, never the stored US id"
+                );
+                assert_eq!(match_method.as_deref(), Some("exact_title"));
+            }
+            other => panic!("expected search resolve, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "exactly one search after the stored id was discarded"
+        );
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links WHERE item_key LIKE 'tmdb:show:34343%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "the wrong stored id is never written as a link");
+    }
+
+    /// Q4 (verify issue 1): a folder with stored identity that fails its
+    /// name/year cross-check falls through to search, and that search must
+    /// not be suppressed by a live title+year miss recorded by a
+    /// fold-colliding sibling (identical query, different show). The
+    /// identified folder's cache rows key on its series id (ADR-0033 Q4), so
+    /// the sibling's shared-key row is invisible to it.
+    #[test]
+    fn stored_series_id_search_ignores_fold_colliding_sibling_miss() {
+        struct SiblingMissThenSearch {
+            calls: Cell<usize>,
+        }
+        impl MetadataSource for SiblingMissThenSearch {
+            fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+                assert!(
+                    input.series_show_id.is_none(),
+                    "the stale id must be cleared before the fall-through search"
+                );
+                self.calls.set(self.calls.get() + 1);
+                Ok(show_hit(20610, "Shameless", Some(2004), "exact_title"))
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Shameless (US) (2011)', 34343);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '34343', 'Shameless', 2011, '{\"tmdb\":34343,\"tmdb_show\":34343}', 34343,
+                '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        // The sibling's live miss under the *shared* title+year query — the
+        // exact query this folder's fall-through search would use.
+        let sibling_qk = query_key("Shameless", Some(2004));
+        conn.execute(
+            "INSERT INTO metadata_negative_cache
+               (provider, kind, query_key, reason, confidence, attempt_count,
+                attempted_at, next_retry_at, cleaner_version)
+             VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 2,
+                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
+            params![sibling_qk],
+        )
+        .unwrap();
+
+        let src = SiblingMissThenSearch {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let outcome = resolver
+            .resolve_with_store(
+                &ResolveInput {
+                    series_show_id: Some(34343),
+                    title: Some("Shameless".into()),
+                    year: Some(2004),
+                    kind: Some(MetadataKind::Episode),
+                    ..Default::default()
+                },
+                &conn,
+            )
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved { metadata, .. } => {
+                assert_eq!(metadata.ids.tmdb, Some(20610));
+            }
+            other => panic!("expected the fall-through search to run, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "the sibling's title+year miss must not suppress the identified folder's search"
+        );
+    }
+
+    /// Q4 (verify issue 1): an identified folder's failed search records its
+    /// miss under the series id — never the shared title+year key — and the
+    /// next resolve consults that same series-id row, so backoff works
+    /// without touching (or being touched by) a fold-colliding sibling.
+    #[test]
+    fn stored_series_id_miss_caches_under_series_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Alpha (2003)', 55);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '55', 'Alpha', 2002, '{\"tmdb\":55,\"tmdb_show\":55}', 55,
+                '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        let input = ResolveInput {
+            series_show_id: Some(55),
+            title: Some("Alpha".into()),
+            year: Some(2003),
+            kind: Some(MetadataKind::Episode),
+            ..Default::default()
+        };
+        let src = CountingMiss {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+
+        let out = resolver.resolve_with_store(&input, &conn).unwrap();
+        assert!(
+            matches!(out, ResolveOutcome::Unresolved { .. }),
+            "the fall-through search misses: {out:?}"
+        );
+        assert_eq!(resolver.tmdb.calls.get(), 1, "the search ran once");
+        let series_row: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_negative_cache
+                 WHERE provider = 'tmdb' AND kind = 'tv' AND query_key = ?1",
+                params![negative_cache::series_cache_key(55)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(series_row, 1, "the miss is cached under the series id");
+        let title_row: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_negative_cache
+                 WHERE provider = 'tmdb' AND kind = 'tv' AND query_key = ?1",
+                params![query_key("Alpha", Some(2003))],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            title_row, 0,
+            "an identified folder never writes the shared title+year key"
+        );
+
+        let out = resolver.resolve_with_store(&input, &conn).unwrap();
+        assert!(
+            matches!(out, ResolveOutcome::Unresolved { .. }),
+            "the series-id backoff suppresses the re-search: {out:?}"
+        );
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "the second resolve consults the series-id row"
+        );
     }
 }
