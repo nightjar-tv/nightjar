@@ -20,9 +20,12 @@ If the path is missing, report it; do not invent continuity or phase status.
 ## Plan → implement → review (required shape)
 
 1. **Grok plans** (high effort): multi-step plan with acceptance criteria and rule/ADR citations.
-2. **DeepSeek implements** one step at a time: no redesign, no new deps unless the plan and human explicitly require them, match existing patterns.
-3. **Grok reviews**: acceptance + constitution; bugs fail the step.
-4. Optional DeepSeek fix rounds; Grok re-checks.
+2. **DeepSeek implements** one step at a time: no redesign, no new deps unless the plan and human explicitly require them, match existing patterns. Working tree only; implementer report form (meta VERIFY_TEMPLATES).
+3. **Independent verify** (different agent, prefer Grok): structured checklist + acceptance + constitution; bugs fail the step. Verify does not edit code.
+4. DeepSeek fix **listed issues only** (max 2 rounds); Grok re-verifies; then escalate if still failing.
+
+Forms and hard gates: `../nightjar-meta/docs/AGENT_PIPELINE.md`,
+`../nightjar-meta/docs/VERIFY_TEMPLATES.md`.
 
 Use `/workflow plan-implement-review plan_path="…"` for automation, or the same loop manually with `/model`.
 
