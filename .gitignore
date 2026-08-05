@@ -1,5 +1,6 @@
 # Byte-compiled / build
 **/target/
+*.rlib
 web/node_modules/
 scripts/.tools/
 web/build/
