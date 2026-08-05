@@ -206,7 +206,7 @@ at **0.89** (or any `matched/current < 0.90`) **refuses** — it does not
 repoint and drop 11%. Job error prefix: `repoint_below_retain_threshold`.
 **Revisit trigger:** dogfood remount evidence that real keep-relpath remounts
 routinely land under 0.90 without being a wrong root, or that 0.90 still
-admits destructive mis-points. Not a setting (Rule 4.12).
+admits destructive mis-points. Not a setting.
 
 **Small libraries:** with fewer than 10 items, losing a single row is
 already >10%, so the threshold is effectively **all-or-nothing** (any
