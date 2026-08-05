@@ -20,6 +20,10 @@
 - Amended: 2026-08-04 — NFO display authority; complete movie NFO skips
   TMDB (ready, zero HTTP); incomplete NFO merges over detail via
   `merge_prefer_left` (§8.9)
+- Amended: 2026-08-05 — widen `unmatched` (§8.1) to cover a series whose
+  identity TMDB confirms but whose episode identity it cannot supply;
+  enrich has exactly one exit per item (§8.4); browse grouping keys on
+  links, not `metadata_status` (Consequences)
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -324,15 +328,55 @@ identity and kids-safe fields without re-searching.
 | `pending` | Needs search (or NFO resolve) | Yes if file probed | No (path key) |
 | `matched` | Search (or NFO with TMDB id) accepted ≥ 0.80; **sparse** canonical + art path refs written | Yes | **Yes** for movies (`tmdb:movie:{id}`); TV show identity for browse/group only — episodes stay path-keyed until season bind |
 | `ready` | Detail applied; TV seasons bound where TMDB has them; cert projected when present; enrichment complete for v1 | Yes | Yes (episode keys when bound) |
-| `unmatched` | Search (or NFO resolve) finished without a provider match (below floor, no results, invalid NFO) | Yes | Path key only |
+| `unmatched` | Search (or NFO resolve) finished without a provider match (below floor, no results, invalid NFO); **or** enrich finished and TMDB cannot supply episode identity for this file (season absent from TMDB, a TMDB renumber, a special outside the season model, absolute numbering) | Yes | Path key only |
 
 **Migration:** extend the `media_items.metadata_status` CHECK to include
 `matched` (next free migration after 013, expected **014**). Existing
 `ready` rows stay `ready` (already fully enriched under the pre-two-tier
-single-pass drain). Do not rewrite historical `ready` to `matched`.
+single-pass drain). Do not rewrite historical `ready` to `matched`. The
+2026-08-05 widening of `unmatched` adds no new CHECK value and needs no
+migration: the definition covers a second cause, not a second column
+value.
 
 **Playable ≠ metadata status.** Playback uses file path + probe; the
 stream path must not wait on `matched` or `ready`.
+
+**Widened `unmatched` (2026-08-05).** A series can be identified while an
+individual episode cannot: TMDB has the show but not the season, or
+renumbered the season after the file was named, or the file is a special
+outside TMDB's season model, or the file uses absolute numbering TMDB
+does not expose per-season. Today §8.1 only says "search (or NFO resolve)
+finished without a provider match"; that sentence now also admits "enrich
+finished without episode identity." Both are the same user-visible
+outcome — path-keyed, terminal, kids-denied (§8.2), fix-flow eligible
+(ADR-0028) — so this is one status widened, not a second status for one
+concept (Rule 4.11). A fourth status was considered and rejected: browse
+grouping does not read `metadata_status` at all (see Consequences), so a
+new value would change no client-visible behaviour and would only add a
+column value nothing reads.
+
+A `tmdb:show:{id}` link survives on these rows even though the item is
+`unmatched`. The link is what keeps "never searched" (`pending`, no link)
+and "TMDB has no episode for this" (`unmatched`, show link present, no
+episode link) distinguishable as a query over links rather than as a
+column value. It is also what the RC3 grouping fallback reads to keep
+the file's card grouped with its bound siblings (§8.4, Consequences);
+that fallback is separate code work, not yet in place.
+
+**Re-entry.** An item does not leave this widened `unmatched` on the next
+drain pass by itself; a drain that only repeats the same failed lookup
+does not converge (Gate 3 "rescan of an unchanged library generates no
+search requests"). What moves it out, exactly one of:
+
+- A manual fix (ADR-0028) assigns identity directly.
+- The underlying file changes (a rename, a re-mux, a new NFO) and gets a
+  new file parse.
+- A `cleaner_version` bump (§3) invalidates the row's negative-result
+  cache entry and the next drain re-attempts it under the new cleaner.
+- A bounded refresh window re-checks TMDB for season data that did not
+  exist yet at first enrich (TMDB adding a season after air is the
+  ordinary case this covers); the window is a scheduled sweep, not a
+  per-drain retry.
 
 #### 8.2 Terminal surfaces
 
@@ -394,8 +438,29 @@ Work set: `metadata_status = 'matched'`.
    required for kids.
 4. TV: season bind via existing `bind_resolved_items` (ADR-0029 §3).
    **HTTP 404 on a season remains a soft skip** (continue other seasons);
-   missing seasons leave those files path-keyed.
-5. Set `ready`.
+   missing seasons leave those files without an episode link from this
+   pass.
+5. **One exit per item, no non-terminal leftover on a successful pass.**
+   A successful enrich pass — the season fetch(es) it needed either
+   succeeded or soft-skipped, and the item was not blocked by a
+   provider error — sets exactly one of:
+   - `ready`, for an item that received a `tmdb:episode:{id}` link and
+     its canonical episode row from the bind.
+   - `unmatched` (§8.1, widened 2026-08-05), for an item in a group whose
+     season fetch(es) completed (or soft-skipped) but that did not
+     receive an episode link — TMDB has the series but not this episode's
+     identity. The series' `tmdb:show:{id}` link is kept.
+   An item left `matched` after enrich means a **provider error**
+   interrupted the pass (timeout, 5xx) — that is a retry, not a terminal
+   outcome, and the next drain pass must attempt it again. A detail 404
+   on a stored id is different: the id itself is bad, not the network
+   call, so it is not this retry class; RC3 makes that class terminal or
+   a negative-cached retry with backoff, never a bare next-pass repeat of
+   the same call. `matched` must never be the resting state
+   for an item enrich actually finished; that ambiguity (was this item
+   not tried, or did it fail?) is what left the pre-2026-08-05 drain
+   looping. Distinguishing the two is a code requirement, not a naming
+   preference (RC3, this ADR's implement slice).
 
 NFO-with-id may skip search and go straight to detail (same early path as
 today once the product drain loads NFO — separate implement slice). Manual
@@ -682,3 +747,17 @@ keys only.
   a favourable answer, but a public reply beats forum inference.
 - Manual-fix (ADR-0028) clears collection id/name on reassignment; writers
   must populate §6 on the initial detail write or the clear is a no-op forever.
+- **Browse grouping keys on links, not on `metadata_status`.**
+  `visible_show_unit_key` (`server/crates/metadata/src/queue.rs:286`) calls
+  `tmdb_show_for_media_item` (`queue.rs:295`) for a show id; that function
+  reads only `item_links`, never `metadata_status`. The API applies no
+  status filter either: `list_items` (`server/crates/db/src/store.rs:410`)
+  selects every row for the library and `to_dto`
+  (`server/crates/api/src/routes/items.rs:490`) passes `metadata_status`
+  through as a field, not a filter. Widening `unmatched` (§8.1) therefore
+  changes no client-visible grouping and implies no OpenAPI change: what
+  the user sees is controlled by which link a row carries, which this
+  amendment requires to survive (`tmdb:show:{id}` kept on a widened-
+  `unmatched` row), not by which status string the row has. A grouping
+  fallback so an episode with only a show link keys the same as its bound
+  siblings is separate code work (RC3), not this amendment.
