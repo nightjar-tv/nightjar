@@ -20,6 +20,16 @@ pub enum MetadataOrigin {
 pub struct ResolveInput {
     /// Raw NFO XML when a sidecar (or equivalent) is present.
     pub nfo_xml: Option<String>,
+    /// Raw `tvshow.nfo` XML at the show root (Kodi/Jellyfin layout). Series
+    /// identity only: show-level tmdb/imdb/tvdb ids, never episode fields —
+    /// the episode NFO stays the display authority for the item beside it.
+    pub tvshow_nfo_xml: Option<String>,
+    /// NFO imdb id (`tt…`) carried to the provider for TMDB `/find`
+    /// (strategy note §2 A2). Set from `tvshow.nfo`; episode NFO ids are
+    /// episode-level and are never a show lookup (A4 is separate work).
+    pub nfo_imdb_id: Option<String>,
+    /// NFO tvdb id carried to the provider for TMDB `/find` (A3).
+    pub nfo_tvdb_id: Option<i64>,
     /// Cleaned title for provider search when NFO is absent.
     pub title: Option<String>,
     pub year: Option<i32>,
@@ -84,14 +94,20 @@ pub enum ResolveOutcome {
 #[derive(Debug)]
 pub enum ResolveError {
     /// Provider-level failure (network, auth, …). NFO parse problems are
-    /// [`UnresolvedReason::NfoInvalid`], not this.
+    /// [`UnresolvedReason::NfoInvalid`], not this. Transient: the next drain
+    /// pass retries it.
     Provider(String),
+    /// A provider detail endpoint returned HTTP 404 for a **stored id**
+    /// (ADR-0026 §8.4). The id itself is bad, not the network call, so this
+    /// is terminal (`unmatched`), never a bare next-pass repeat of the call.
+    NotFound(String),
 }
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Provider(e) => write!(f, "provider error: {e}"),
+            Self::NotFound(e) => write!(f, "not found: {e}"),
         }
     }
 }
@@ -114,6 +130,11 @@ pub enum ProviderResult {
         method: &'static str,
     },
     Miss,
+    /// A `/find` id lookup (NFO external id) produced no accepted hit: the
+    /// find call 404'd, or the found id's detail 404'd. Not terminal — the
+    /// resolver clears the external id and falls through to a title search,
+    /// gated on the negative cache.
+    FindMiss,
 }
 
 /// One metadata backend (TMDB today; keep the trait thin — Rule 4.7).
@@ -145,7 +166,11 @@ enum NfoAttempt {
 
 impl NfoSource {
     fn attempt(self, input: &ResolveInput) -> NfoAttempt {
-        let Some(xml) = input.nfo_xml.as_deref() else {
+        self.attempt_xml(input.nfo_xml.as_deref())
+    }
+
+    fn attempt_xml(self, xml: Option<&str>) -> NfoAttempt {
+        let Some(xml) = xml else {
             return NfoAttempt::Absent;
         };
         if xml.trim().is_empty() {
@@ -206,6 +231,40 @@ impl<T: MetadataSource> Resolver<T> {
         input: &ResolveInput,
         conn: Option<&Connection>,
     ) -> Result<ResolveOutcome, ResolveError> {
+        // Series identity from tvshow.nfo outranks the episode NFO (strategy
+        // note §2 A1–A3). Episode fields stay with the episode NFO, which is
+        // read separately so tvshow.nfo never masks it (autopsy D5).
+        let mut nfo_imdb_id: Option<String> = None;
+        let mut nfo_tvdb_id: Option<i64> = None;
+        let tvshow_nfo = match input.kind {
+            Some(MetadataKind::Episode) | Some(MetadataKind::Show) => {
+                NfoSource.attempt_xml(input.tvshow_nfo_xml.as_deref())
+            }
+            _ => NfoAttempt::Absent,
+        };
+        match tvshow_nfo {
+            NfoAttempt::Parsed(metadata) => {
+                if nfo_has_usable_id(&metadata) {
+                    return Ok(ResolveOutcome::Resolved {
+                        metadata,
+                        source: MetadataOrigin::Nfo,
+                        match_method: None,
+                    });
+                }
+                // Show identified but no TMDB id: carry imdb/tvdb for `/find`.
+                nfo_imdb_id = metadata.ids.imdb.clone();
+                nfo_tvdb_id = metadata.ids.tvdb;
+            }
+            NfoAttempt::Invalid(err) => {
+                return Ok(ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::NfoInvalid {
+                        detail: err.to_string(),
+                    },
+                });
+            }
+            NfoAttempt::Absent => {}
+        }
+
         match NfoSource.attempt(input) {
             NfoAttempt::Parsed(metadata) => {
                 // NFO that cannot supply a usable TMDB id must fall through to
@@ -218,6 +277,8 @@ impl<T: MetadataSource> Resolver<T> {
                         match_method: None,
                     });
                 }
+                // Episode NFO external ids are episode-level (strategy note
+                // §2 A4 is separate work); never a show lookup.
             }
             NfoAttempt::Invalid(err) => {
                 return Ok(ResolveOutcome::Unresolved {
@@ -246,10 +307,24 @@ impl<T: MetadataSource> Resolver<T> {
                 .map(|t| query_key(t, input.year))
         };
 
-        if let (Some(conn), Some(qk)) = (conn, &qk) {
-            let now = now_rfc3339();
-            if let Ok(Some(entry)) =
-                negative_cache::should_skip(conn, PROVIDER_TMDB, cache_kind, qk, &now)
+        let mut attempt = ResolveInput {
+            nfo_imdb_id: nfo_imdb_id.or(input.nfo_imdb_id.clone()),
+            nfo_tvdb_id: nfo_tvdb_id.or(input.nfo_tvdb_id),
+            ..input.clone()
+        };
+        // Two attempts at most: `/find` first (an id lookup a stale title
+        // miss must not suppress, autopsy D4), then — only when the find
+        // produced no accepted hit — a plain title search. The search attempt
+        // is negative-cache gated: a live `below_threshold` / `no_results`
+        // row suppresses it even after a find miss, so a rescan before
+        // `next_retry_at` does not re-run find+search (ADR-0026 §3).
+        let now = now_rfc3339();
+        for _round in 0..2 {
+            if attempt.nfo_imdb_id.is_none()
+                && attempt.nfo_tvdb_id.is_none()
+                && let (Some(conn), Some(qk)) = (conn, &qk)
+                && let Ok(Some(entry)) =
+                    negative_cache::should_skip(conn, PROVIDER_TMDB, cache_kind, qk, &now)
             {
                 return Ok(match entry.reason {
                     NegativeReason::BelowThreshold => ResolveOutcome::Unresolved {
@@ -265,67 +340,89 @@ impl<T: MetadataSource> Resolver<T> {
                     }
                 });
             }
-        }
-
-        match self.tmdb.resolve(input) {
-            Ok(ProviderResult::Hit {
-                metadata,
-                method,
-                raw,
-            }) => {
-                if let (Some(conn), Some(raw)) = (conn, raw.as_ref()) {
-                    if let Some(ref qk) = qk {
-                        let _ = negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, qk);
-                    }
-                    canonical::persist_mapped_hit(conn, PROVIDER_TMDB, raw, &metadata)
-                        .map_err(ResolveError::Provider)?;
-                }
-                Ok(ResolveOutcome::Resolved {
+            let result = self.tmdb.resolve(&attempt)?;
+            let (metadata, method, raw) = match result {
+                ProviderResult::Hit {
                     metadata,
-                    source: MetadataOrigin::Tmdb,
-                    match_method: Some(method.to_string()),
-                })
-            }
-            Ok(ProviderResult::BelowThreshold { confidence, method }) => {
-                if let (Some(conn), Some(qk)) = (conn, &qk) {
-                    let _ = negative_cache::record_miss(
-                        conn,
-                        PROVIDER_TMDB,
-                        cache_kind,
-                        qk,
-                        NegativeReason::BelowThreshold,
-                        Some(confidence),
-                        &now_rfc3339(),
-                    );
+                    method,
+                    raw,
+                } => (metadata, method, raw),
+                ProviderResult::BelowThreshold { confidence, method } => {
+                    if let (Some(conn), Some(qk)) = (conn, &qk) {
+                        let _ = negative_cache::record_miss(
+                            conn,
+                            PROVIDER_TMDB,
+                            cache_kind,
+                            qk,
+                            NegativeReason::BelowThreshold,
+                            Some(confidence),
+                            &now_rfc3339(),
+                        );
+                    }
+                    return Ok(ResolveOutcome::Unresolved {
+                        reason: UnresolvedReason::BelowThreshold {
+                            confidence,
+                            method: method.to_string(),
+                        },
+                    });
                 }
-                Ok(ResolveOutcome::Unresolved {
-                    reason: UnresolvedReason::BelowThreshold {
-                        confidence,
-                        method: method.to_string(),
-                    },
-                })
-            }
-            Ok(ProviderResult::Miss) => {
-                if let (Some(conn), Some(qk)) = (conn, &qk) {
-                    let _ = negative_cache::record_miss(
-                        conn,
-                        PROVIDER_TMDB,
-                        cache_kind,
-                        qk,
-                        NegativeReason::NoResults,
-                        None,
-                        &now_rfc3339(),
-                    );
+                ProviderResult::Miss => {
+                    if let (Some(conn), Some(qk)) = (conn, &qk) {
+                        let _ = negative_cache::record_miss(
+                            conn,
+                            PROVIDER_TMDB,
+                            cache_kind,
+                            qk,
+                            NegativeReason::NoResults,
+                            None,
+                            &now_rfc3339(),
+                        );
+                    }
+                    return Ok(ResolveOutcome::Unresolved {
+                        reason: UnresolvedReason::NoMatch,
+                    });
                 }
-                Ok(ResolveOutcome::Unresolved {
-                    reason: UnresolvedReason::NoMatch,
-                })
+                ProviderResult::FindMiss => {
+                    // The `/find` id lookup produced no accepted hit (find
+                    // 404, or the found id's detail 404): clear the external
+                    // id so the next attempt is a plain title search — a
+                    // wrong external id must fail into search, not win.
+                    attempt.nfo_imdb_id = None;
+                    attempt.nfo_tvdb_id = None;
+                    continue;
+                }
+            };
+            if (attempt.nfo_imdb_id.is_some() || attempt.nfo_tvdb_id.is_some())
+                && matches!(method, "nfo_imdb_find" | "nfo_tvdb_find")
+                && let Some(reason) = crate::match_score::find_hit_reject_reason(
+                    &metadata,
+                    crate::match_score::SearchKind::Tv,
+                    attempt.title.as_deref().unwrap_or_default(),
+                    attempt.year,
+                )
+            {
+                eprintln!(
+                    "  discard /find hit {} — {reason}; falling through to search",
+                    attempt.title.as_deref().unwrap_or("?")
+                );
+                attempt.nfo_imdb_id = None;
+                attempt.nfo_tvdb_id = None;
+                continue;
             }
-            Err(e) => {
-                // api_error: not cached — transient failures must not park a day.
-                Err(e)
+            if let (Some(conn), Some(raw)) = (conn, raw.as_ref()) {
+                if let Some(ref qk) = qk {
+                    let _ = negative_cache::clear(conn, PROVIDER_TMDB, cache_kind, qk);
+                }
+                canonical::persist_mapped_hit(conn, PROVIDER_TMDB, raw, &metadata)
+                    .map_err(ResolveError::Provider)?;
             }
+            return Ok(ResolveOutcome::Resolved {
+                metadata,
+                source: MetadataOrigin::Tmdb,
+                match_method: Some(method.to_string()),
+            });
         }
+        unreachable!("a /find outcome (discard or miss) is followed by at most one search attempt")
     }
 }
 
@@ -339,7 +436,7 @@ mod tests {
     use super::*;
     use crate::tmdb::TmdbStub;
     use nightjar_db::migrate;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use std::cell::Cell;
 
     fn fixture(name: &str) -> String {
@@ -704,5 +801,376 @@ mod tests {
             0,
             "id resolve must never issue a search"
         );
+    }
+
+    /// Provider that emulates the `/find` protocol: with an NFO external id it
+    /// returns the *wrong* show (name and year disagree with the folder); with
+    /// the id cleared it searches and hits the right show.
+    struct WrongFindThenSearch {
+        calls: Cell<usize>,
+    }
+
+    fn show_hit(id: i64, title: &str, year: Option<i32>, method: &'static str) -> ProviderResult {
+        ProviderResult::Hit {
+            metadata: Box::new(CanonicalMetadata {
+                kind: MetadataKind::Show,
+                title: title.into(),
+                original_title: None,
+                year,
+                air_date: None,
+                plot: None,
+                genres: Vec::new(),
+                runtime_minutes: None,
+                cast: Vec::new(),
+                ratings: Vec::new(),
+                ids: crate::model::ProviderIds {
+                    tmdb: Some(id),
+                    tmdb_show: Some(id),
+                    imdb: None,
+                    tvdb: None,
+                },
+                artwork: Vec::new(),
+                collection: None,
+                season: None,
+                episode: None,
+            }),
+            method,
+            raw: Some(crate::tmdb::RawProviderPayload {
+                entity_kind: "tv".into(),
+                provider_id: id.to_string(),
+                payload: format!(r#"{{"id":{id},"name":"{title}"}}"#),
+            }),
+        }
+    }
+
+    impl MetadataSource for WrongFindThenSearch {
+        fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            self.calls.set(self.calls.get() + 1);
+            if input.nfo_tvdb_id.is_some() {
+                return Ok(show_hit(999, "Wrong Show", Some(1999), "nfo_tvdb_find"));
+            }
+            Ok(show_hit(55, "Alpha", Some(2002), "exact_title"))
+        }
+    }
+
+    /// RC5: `/find` returns a show whose name and year do not match the
+    /// folder — the resolve discards the id, falls through to search, and the
+    /// wrong id is never written (autopsy D4).
+    #[test]
+    fn find_hit_wrong_name_year_falls_through_to_search_and_never_writes_wrong_id() {
+        let src = WrongFindThenSearch {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let input = ResolveInput {
+            tvshow_nfo_xml: Some(
+                r#"<tvshow><title>Alpha</title>
+                   <uniqueid type="tvdb">73762</uniqueid></tvshow>"#
+                    .into(),
+            ),
+            title: Some("Alpha".into()),
+            year: Some(2002),
+            kind: Some(MetadataKind::Episode),
+            ..Default::default()
+        };
+        let outcome = resolver.resolve_with_store(&input, &conn).unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                source,
+                match_method,
+            } => {
+                assert_eq!(source, MetadataOrigin::Tmdb);
+                assert_eq!(metadata.ids.tmdb, Some(55), "search result wins");
+                assert_eq!(match_method.as_deref(), Some("exact_title"));
+            }
+            other => panic!("expected search resolve, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            2,
+            "the discarded /find hit is followed by exactly one search"
+        );
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND provider_id = '999'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "the wrong /find id must never be written");
+        let right: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND provider_id = '55'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(right, 1, "the search hit is persisted");
+    }
+
+    /// Provider that resolves a matching `/find` hit in one call (no search).
+    struct FindOkSource {
+        calls: Cell<usize>,
+    }
+
+    impl MetadataSource for FindOkSource {
+        fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            self.calls.set(self.calls.get() + 1);
+            let id = if input.nfo_tvdb_id.is_some() { 45 } else { 77 };
+            let method = if input.nfo_tvdb_id.is_some() {
+                "nfo_tvdb_find"
+            } else {
+                "exact_title"
+            };
+            Ok(show_hit(id, "Top Gear", Some(2002), method))
+        }
+    }
+
+    /// RC5: a stale `below_threshold` neg-cache row for the group's title
+    /// does not prevent the `/find` call — the id attempt runs ahead of the
+    /// cache check (autopsy D4).
+    #[test]
+    fn stale_below_threshold_row_does_not_suppress_find() {
+        fn seed_stale_row(conn: &Connection) {
+            let key = query_key("Top Gear", Some(2002));
+            conn.execute(
+                "INSERT INTO metadata_negative_cache
+                   (provider, kind, query_key, reason, confidence, attempt_count,
+                    attempted_at, next_retry_at, cleaner_version)
+                 VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 3,
+                         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
+                params![key],
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_stale_row(&conn);
+
+        let src = FindOkSource {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let input = ResolveInput {
+            tvshow_nfo_xml: Some(
+                r#"<tvshow><title>Top Gear</title>
+                   <uniqueid type="tvdb">7940</uniqueid></tvshow>"#
+                    .into(),
+            ),
+            title: Some("Top Gear".into()),
+            year: Some(2002),
+            kind: Some(MetadataKind::Episode),
+            ..Default::default()
+        };
+        let outcome = resolver.resolve_with_store(&input, &conn).unwrap();
+        match outcome {
+            ResolveOutcome::Resolved { match_method, .. } => {
+                assert_eq!(match_method.as_deref(), Some("nfo_tvdb_find"));
+            }
+            other => panic!("the cached miss must not suppress /find, got {other:?}"),
+        }
+        assert_eq!(resolver.tmdb.calls.get(), 1, "one find call, no cache skip");
+
+        // Control on a fresh DB: without the external id the same row *is*
+        // live and suppresses the provider — proving the row is real and that
+        // only the id lookup bypassed it.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_stale_row(&conn);
+        let control = Resolver {
+            tmdb: FindOkSource {
+                calls: Cell::new(0),
+            },
+        };
+        let suppressed = control
+            .resolve_with_store(
+                &ResolveInput {
+                    title: Some("Top Gear".into()),
+                    year: Some(2002),
+                    kind: Some(MetadataKind::Episode),
+                    ..Default::default()
+                },
+                &conn,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                suppressed,
+                ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::BelowThreshold { .. }
+                }
+            ),
+            "the seeded row must suppress a plain search: {suppressed:?}"
+        );
+        assert_eq!(
+            control.tmdb.calls.get(),
+            0,
+            "cache hit, zero provider calls"
+        );
+    }
+
+    /// A `/find` hit that agrees with the folder is accepted in one call —
+    /// the cross-check must not discard a correct external id.
+    #[test]
+    fn find_hit_matching_show_is_accepted_without_search() {
+        let src = FindOkSource {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let outcome = resolver
+            .resolve(&ResolveInput {
+                tvshow_nfo_xml: Some(
+                    r#"<tvshow><title>Top Gear</title>
+                       <uniqueid type="tvdb">7940</uniqueid></tvshow>"#
+                        .into(),
+                ),
+                title: Some("Top Gear".into()),
+                year: Some(2002),
+                kind: Some(MetadataKind::Episode),
+                ..Default::default()
+            })
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            } => {
+                assert_eq!(metadata.ids.tmdb, Some(45));
+                assert_eq!(match_method.as_deref(), Some("nfo_tvdb_find"));
+            }
+            other => panic!("expected find resolve, got {other:?}"),
+        }
+        assert_eq!(resolver.tmdb.calls.get(), 1);
+    }
+
+    /// Provider that mimics a `/find` soft miss: with an NFO external id the
+    /// id attempt reports [`ProviderResult::FindMiss`] (the real provider's
+    /// conversion for a find 404 or a find-derived id whose detail 404s); a
+    /// plain title search would hit the right show.
+    struct FindMissThenSearchHit {
+        calls: Cell<usize>,
+    }
+
+    impl MetadataSource for FindMissThenSearchHit {
+        fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            self.calls.set(self.calls.get() + 1);
+            if input.nfo_tvdb_id.is_some() {
+                return Ok(ProviderResult::FindMiss);
+            }
+            Ok(show_hit(55, "Top Gear", Some(2002), "exact_title"))
+        }
+    }
+
+    /// RC5 fix (verify issue 1): a live `below_threshold` neg-cache row must
+    /// not prevent the `/find` call, but it must suppress the fall-through
+    /// title search after the find misses — a rescan before `next_retry_at`
+    /// re-runs the find, not find+search (ADR-0026 §3).
+    #[test]
+    fn live_negative_cache_row_suppresses_search_after_find_miss() {
+        fn seed_live_row(conn: &Connection) {
+            let key = query_key("Top Gear", Some(2002));
+            conn.execute(
+                "INSERT INTO metadata_negative_cache
+                   (provider, kind, query_key, reason, confidence, attempt_count,
+                    attempted_at, next_retry_at, cleaner_version)
+                 VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 3,
+                         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
+                params![key],
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        seed_live_row(&conn);
+
+        let src = FindMissThenSearchHit {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let input = ResolveInput {
+            tvshow_nfo_xml: Some(
+                r#"<tvshow><title>Top Gear</title>
+                   <uniqueid type="tvdb">7940</uniqueid></tvshow>"#
+                    .into(),
+            ),
+            title: Some("Top Gear".into()),
+            year: Some(2002),
+            kind: Some(MetadataKind::Episode),
+            ..Default::default()
+        };
+        let outcome = resolver.resolve_with_store(&input, &conn).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ResolveOutcome::Unresolved {
+                    reason: UnresolvedReason::BelowThreshold { .. }
+                }
+            ),
+            "the live row must suppress the fall-through search: {outcome:?}"
+        );
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "the /find ran; the search was suppressed by the live row"
+        );
+    }
+
+    /// RC5 fix (verify issue 2): a find-derived id whose detail 404s is a
+    /// find soft-miss, not a resolve error — the resolve falls through to
+    /// title search and the search hit wins, instead of leaving the group
+    /// pending behind a repeat of the same find+404 (the D1 class).
+    #[test]
+    fn find_detail_404_falls_through_to_search_and_wins() {
+        let src = FindMissThenSearchHit {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let input = ResolveInput {
+            tvshow_nfo_xml: Some(
+                r#"<tvshow><title>Top Gear</title>
+                   <uniqueid type="tvdb">7940</uniqueid></tvshow>"#
+                    .into(),
+            ),
+            title: Some("Top Gear".into()),
+            year: Some(2002),
+            kind: Some(MetadataKind::Episode),
+            ..Default::default()
+        };
+        let outcome = resolver.resolve_with_store(&input, &conn).unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            } => {
+                assert_eq!(metadata.ids.tmdb, Some(55), "search hit wins");
+                assert_eq!(match_method.as_deref(), Some("exact_title"));
+            }
+            other => panic!("expected search resolve after find miss, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            2,
+            "one find attempt, then exactly one search"
+        );
+        let right: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical
+                 WHERE provider = 'tmdb' AND provider_id = '55'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(right, 1, "the search hit is persisted");
     }
 }
