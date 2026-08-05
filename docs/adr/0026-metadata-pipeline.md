@@ -445,7 +445,7 @@ library grid, keyed by library kind — **movies** for a movies library,
 over **all** browse units in the library (not pending-only), so
 already-terminal neighbours do not steal slots from units still on the
 first screen. **N ≈ 40** means roughly one cold first screen — a
-constant (Rule 4.12), not a setting; the number may move with Block 3
+constant, not a setting; the number may move with Block 3
 poster-card layout without amending this ADR. Try the proxy before any
 chatty client→server visibility hint.
 
@@ -568,7 +568,7 @@ back up casually; third-party credentials need a tighter file. Same
 decision OpenSubtitles will inherit.
 
 **Application key only in environment / secrets, not embedded.** Rejected:
-core behaviour must work by default (Rule 4.12). The embedded key is the
+core behaviour must work by default. The embedded key is the
 default; the user key is the escape hatch.
 
 **Separate metadata jobs table.** Rejected (Rule 4.11): item

@@ -58,7 +58,7 @@ brand still wants palette later (strategy note). Incomplete, not provisional
 
 Separate from the metadata API rate limiter (ADR-0026 §7). v1: **8**
 simultaneous downloads (under TMDB’s ~20 connection guidance). Constant, not
-a setting (Rule 4.12).
+a setting.
 
 Base URL: `https://image.tmdb.org/t/p/original{path}`.
 
