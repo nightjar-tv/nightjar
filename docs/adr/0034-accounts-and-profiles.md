@@ -2,6 +2,12 @@
 
 - Status: accepted
 - Date: 2026-08-06
+- Amended: 2026-08-06 — **item 2 is superseded by ADR-0040** (three roles under
+  Rule 6.4; see the marker on item 2). Item 3's unrestricted account-scope
+  browse and item 7's last-admin rule are qualified by ADR-0040 items 5 and 7.
+  ADR-0040 was accepted on the same sheet and the same day, so this amendment
+  landed **with** the record that defines the role model rather than ahead of it
+  by forward reference, which was the condition the ADR-0035–0038 sheet set
 - Depends on: ADR-0003 §3 (no auth in v0, ended by this ADR); ADR-0007
   (playback sessions, cap model); ADR-0011 (session sharing removed);
   ADR-0022 §5 (policy ceilings, no policy schema until accounts exist);
@@ -49,6 +55,19 @@ profile holds viewing identity and never holds authority.**
    set (Rule 4.7). A second axis of authority arrives with a second concrete use
    case or not at all.
 
+   > **Superseded 2026-08-06 by [ADR-0040](0040-account-roles.md), under Rule
+   > 6.4.** The second concrete use case arrived, which is the condition this
+   > item named. Under a boolean any account with `can_manage_server` can delete
+   > any other holding it — item 7 protects only the last one — so the person who
+   > installed the server can be evicted from it by someone trusted with a scan
+   > button; and three routes written since (ADR-0035 item 7, ADR-0037 items 11
+   > and 12) each need an answer between "the whole server" and "nothing". The
+   > model is three closed values on the account — owner, manager, member — not
+   > a roles table and not a permission set, so Rule 4.7's actual target is
+   > still refused. `can_manage_server` never shipped; it is replaced by a
+   > `role` column before B2-1's migration runs. Read every "`can_manage_server`"
+   > below as "role is owner or manager". ADR-0040 accepted 2026-08-06.
+
 3. **Authority is account scope, and profile scope never carries it.** A logged
    in session is in account scope until it selects a profile, and selecting a
    profile narrows it. Admin routes require `can_manage_server` **and** account
@@ -61,7 +80,10 @@ profile holds viewing identity and never holds authority.**
    by tapping a menu, which defeats B2-D before it ships.
 
    Account scope browses unrestricted, because the manual fix flow (ADR-0028)
-   has to see the item it is fixing. Account scope cannot write watch state and
+   has to see the item it is fixing. **Qualified by ADR-0040 item 5:** that
+   reason holds only for roles that can use the fix flow, so unrestricted browse
+   is an owner and manager capability and a member's account scope does not
+   reach item-returning routes at all. Account scope cannot write watch state and
    cannot start playback: those need a profile, and an account with no profile
    would have nowhere to write. **Cannot start playback means the byte routes
    refuse an account-scope token**, not that a client hides a button.
@@ -151,7 +173,10 @@ profile holds viewing identity and never holds authority.**
    continue-watching route in B2-4.
 
 7. **Profile deletion, one sentence used by this ADR and the watch-state and
-   playback-event ADRs.** Deleting a profile destroys its watch state and its
+   playback-event ADRs.** **Amended by ADR-0040 item 7:** the last sentence's
+   count-based rule ("the last account with `can_manage_server` …") is replaced
+   by the owner singleton — the owner cannot be deleted and its role changes
+   only through transfer. Deleting a profile destroys its watch state and its
    name, and leaves playback-event rows in place with their profile reference no
    longer resolving to anything. `watch_state.profile_id` cascades on delete;
    `playback_events.profile_ref` is a plain column with no foreign key and does
@@ -271,7 +296,9 @@ television without either sharing a password or managing another login, and
 switching viewer on a remote control becomes a typing exercise.
 
 **A roles or permissions table.** Rejected under Rule 4.7. There are two kinds of
-person in a household media server and a boolean says so.
+person in a household media server and a boolean says so. **ADR-0040 keeps this
+rejection** — it adds three closed values on the account, not a roles table and
+not a permission set — and overturns only the count, for the reasons on item 2.
 
 **JWTs or another stateless token.** Rejected. Revocation and "sign out
 everywhere" need server state regardless, so a stateless token buys a signing-key

@@ -1,16 +1,20 @@
 # ADR-0037: Kids scoping and parent overrides
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-06
-- Blocked on: the series ADR, which owns the episode-to-series edge item 5's
-  certification inheritance reads; and the three-role model, which item 11
-  qualifies against. Cannot be accepted before both are on disk
+- Accepted: 2026-08-06, once ADR-0039 and ADR-0040 were accepted. ADR-0039
+  item 6 owns the episode-to-series edge item 5's certification inheritance
+  reads — without it a capped profile sees no television at all; ADR-0040
+  supplies the role model items 9, 11 and 12 qualify against. Sign-off for both:
+  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`
 - Supersedes: ADR-0026 §8.4 item 3 (certification projection; see item 8)
 - Depends on: ADR-0034 (account and profile scope, the cap and simple-interface
-  columns, PIN deferred to B2-7); ADR-0026 status vocabulary; ADR-0029 §1.5
-  (canonical projection); ADR-0033 (series identity, which overrides are scoped
-  to); ADR-0028 (manual metadata fix, which is the repair for a wrong
-  certification); ADR-0031 (TMDB key and attribution)
+  columns, PIN deferred to B2-7), as amended by ADR-0040; ADR-0026 status
+  vocabulary; ADR-0029 §1.5 (canonical projection); ADR-0039 (`series_key`, which
+  overrides are scoped to, and the entity edge certification inherits along),
+  extending ADR-0033; ADR-0040 (account roles); ADR-0028 (manual metadata fix,
+  which is the repair for a wrong certification); ADR-0031 (TMDB key and
+  attribution)
 - Gate: Gate 3 — kids scoping and parent overrides are unreachable from a profile
   session including an adult-flagged one; kids denial verified on every
   item-returning endpoint
@@ -104,9 +108,16 @@ an account holder can override it.**
    board label of its own and never will. Read literally, the paragraph above
    would deny every episode in the library for missing certification, which means
    a capped profile sees no television at all. The evaluator therefore resolves an
-   episode's certification through its series' canonical row, and the series ADR
-   owns that inheritance because it owns the episode-to-series edge. That is why
-   this ADR cannot be accepted before the series ADR lands.
+   episode's certification through its series' canonical row.
+
+   **The edge is the entity edge, not the folder binding** (ADR-0039 item 6):
+   the episode canonical row's `tmdb_show`, then that show's
+   `certifications_json`. Two indexed local reads, no I/O, and the existing
+   partial index on `(provider, tmdb_show, season)` covers the first. It follows
+   what the item *is* rather than where it sits, so an ADR-0028 assign moves a
+   file's certification with it. An unmatched episode has no canonical row and
+   therefore no certification, and denies — which is item 5 unchanged, not a new
+   denial class.
 
 6. **Precedence has exactly one order: blocked, then allowed, then the ladder.**
    No weighting and no tie-breaks. A blocked title is invisible even if it is
@@ -119,6 +130,13 @@ an account holder can override it.**
    what scope it runs under. The two scopes are ADR-0034's: account scope browses
    unrestricted because the manual fix flow has to see the item it is fixing, and
    profile scope carries the cap.
+
+   The scope parameter stays **two-valued** under ADR-0040, which is what keeps
+   this guarantee intact. A member never reaches an item-returning route in
+   account scope at all — that is refused at the route layer by role (ADR-0040
+   item 5), because unrestricted browse exists for a fix flow a member cannot
+   use. Had that been modelled as a third scope value instead, every call site
+   would have gained a case to get wrong.
 
    A test that enumerates item-returning routes and asserts each denies is a
    backstop and is not the guarantee. An enumeration only covers what someone
@@ -173,15 +191,21 @@ an account holder can override it.**
    that a parent does not want in the house. Both record the acting account and
    the time.
 
-   **The scope column ships in v1** and defaults to server-wide, so one entry
-   applies to every capped profile unless it says otherwise. Server-wide is the
-   right default for most installs and the wrong one for two adults with
-   different parenting standards, and the earlier plan to add the column later
-   "without moving the rows" is a worse deal than it sounds: a nullable column
-   added afterwards means every reader written in between assumed one meaning,
-   and the migration is cheap while the assumption is not. Rule 4.9 wants the
-   shape now. Whether any surface lets a user set it to something other than
-   server-wide in v1 is a Block 3 question and does not change the column.
+   Both are scoped to the ADR-0039 `series_key` for shows, so one entry covers a
+   show including its unmatched folders, and a movie is a series of one.
+
+   **The scope column ships in v1**, and ADR-0040 item 8 decides who may write
+   which scope: an owner or a manager writes server-wide or account-scoped, and a
+   member writes account-scoped only, defaulting to their own account rather than
+   to the server. So the column has a v1 writer and a v1 meaning rather than
+   shipping unset. Server-wide is the right default for the single-household
+   install and the wrong one for two families on one server, and the earlier plan
+   to add the column later "without moving the rows" is a worse deal than it
+   sounds: a nullable column added afterwards means every reader written in
+   between assumed one meaning, and the migration is cheap while the assumption is
+   not. Rule 4.9 wants the shape now. Whether any surface lets a user *choose* a
+   scope, rather than take the default their role implies, is a Block 3 question
+   and does not change the column.
 
    A profile can never perform either action, including an adult-flagged one, and
    the actions do not render inside a profile session. Widening from profile scope
@@ -205,7 +229,7 @@ an account holder can override it.**
     findable later rather than invisible.
 
     **"Admin-only" no longer names one thing, so the route is qualified by
-    role.** Under the three-role model an owner and a manager see the counts for
+    role.** Under ADR-0040 an owner and a manager see the counts for
     every profile on the server; a member sees only their own profiles. The
     library-wide denial counts do not vary by role, because they are facts about
     the library rather than about a viewer. What varies is which profiles' caps
@@ -221,8 +245,8 @@ an account holder can override it.**
     than implying a guarantee.** An earlier draft read as though a teenager's
     history were private from the adult profile sitting next to it. It is not.
     The same person holds the account password, and ADR-0034 item 3 lets them
-    widen from profile scope to account scope by re-entering it. Under the
-    three-role model an owner or manager can do the same for accounts they
+    widen from profile scope to account scope by re-entering it. Under ADR-0040
+    an owner or manager can do the same for accounts they
     administer. What the rule actually buys is that history never appears
     incidentally in a profile session, so a child cannot read a sibling's history
     by picking their tile and an adult cannot read it by accident. Anyone who
@@ -284,9 +308,14 @@ notion of enforcement during playback that nothing else in the product has.
   unmatched rate and by regional certification coverage, and both are measured
   rather than assumed. On a library where coverage is poor, the kids experience is
   poor, and the fix is matching work rather than a threshold.
-- Overrides default to server-wide, which is wrong for two adults with different
-  parenting standards. The scope column ships in v1 so the fix is a surface
-  rather than a migration, but no v1 surface sets it.
+- An owner's or a manager's override defaults to server-wide, which is wrong for
+  two adults in one house with different parenting standards. ADR-0040 item 8
+  gives a member the account-scoped default, which covers the two-families case;
+  the two-adults-one-account case still needs a Block 3 surface that lets an
+  administrator choose the narrower scope.
+- A member cannot write a server-wide override, so a household with one member
+  adult and no manager has no way to allow a title for everyone. That is the
+  role boundary working, and the answer is to make them a manager.
 - Region is locked behind a subcommand, so an installation that picks wrong at
   setup needs shell access to change it. That is deliberate and it is a support
   cost.

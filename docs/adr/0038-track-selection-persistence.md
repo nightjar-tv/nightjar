@@ -1,14 +1,16 @@
 # ADR-0038: Track selection persistence
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-06
-- Blocked on: the series ADR, which supplies the `series_key` item 4 stores
-  against, including for unmatched show folders. Cannot be accepted before it is
-  on disk
+- Accepted: 2026-08-06, once ADR-0039 was accepted. It supplies the `series_key`
+  item 4 stores against, including for unmatched show folders, and the migrator
+  that rewrites it — in both directions, since a movie's series key is its own
+  `item_key` (sheet Q7). Sign-off: `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`
 - Depends on: ADR-0024 (the ranked selection rule and its reason strings, which
   this extends and does not restate); ADR-0012 (audio inventory, `trackId`);
-  ADR-0010 (subtitle inventory); ADR-0034 (profiles); ADR-0033 (series identity,
-  extended by the series ADR)
+  ADR-0010 (subtitle inventory); ADR-0034 (profiles); ADR-0039 (`series_key`,
+  its grammar, its opacity, and the migrator that rewrites it), extending
+  ADR-0033
 - Gate: Gate 3 — full v1 API frozen
 - Related: Block 2 plan B2-E and B2-8 (`nightjar-meta/docs/BLOCK_2_PLAN.md`);
   ADR-0024 §3, which named this slice as the Block 2 half of that decision
@@ -73,17 +75,25 @@ existing ADR-0024 rank function.**
    storage cannot tell "this viewer turned subtitles off for this show" from
    "this viewer has not chosen", and those two must behave differently.
 
-   **`series_key`, not a general `scope_key`.** Every series has one, including
-   an unmatched show folder, which now gets a `folder:`-keyed series row. A
-   movie's series key is its own, so a movie is a series of one and needs no
-   second column and no nullable case. The earlier `scope_key` framing had a hole
+   **`series_key`, not a general `scope_key`.** ADR-0039 item 2 defines it and
+   ADR-0039 item 3 guarantees every series has one, because every show folder
+   gets a row whether or not it matched. A movie's series key is its own
+   `item_key`, so a movie is a series of one and needs no second column and no
+   nullable case. The earlier `scope_key` framing had a hole
    in it that this closes: a path-keyed episode under an unmatched folder had no
    scope to hang a choice on, so the viewer who fixed the audio track on episode
    one of an unmatched show would have had to fix it again on episode two, which
    is exactly the population least likely to have a correct default.
 
    `series_key` is opaque on the wire for the same reason `item_key` is
-   (ADR-0035 item 11). Clients pass back what they received.
+   (ADR-0035 item 11, ADR-0039 item 2). Clients pass back what they received,
+   and they receive it as `seriesKey` on every item response (ADR-0039 item 10).
+
+   **When a folder binds, these rows are rewritten by the ADR-0039 item 7
+   migrator**, not by this table's writer, on the same discipline ADR-0025 §5
+   set for `item_key`. Two folders binding one show collide on
+   `(profile_id, series_key)` and the newer `updated_at` survives; a preference
+   has no partial state to merge the way a resume position does.
 
 5. **Every selection carries its reason, and the reason reaches the client.**
    ADR-0024 already produces one. This ADR puts it on the wire so the track menu
@@ -156,6 +166,10 @@ worse than no persistence at all because the viewer cannot predict it.
   reason string says so, which is visible behaviour rather than silence.
 - Series scope is wrong for anthologies and for shows whose dub quality changes
   between seasons. One correction per season is the accepted cost.
+- A choice stored against a `folder:` key is lost when that folder is renamed,
+  because the key is the path (ADR-0039). A choice against a `tmdb:show:` key is
+  not. That is the fragility ADR-0025 §3 accepted for path keys showing up in a
+  second place, and the viewer's cost is re-picking a track once.
 - The image-track cost term from ADR-0024 §2 is still untested pending the PGS
   corpus fixture, and persistence does not change that.
 - A profile with no language set behaves as ADR-0024's no-preference case, which
