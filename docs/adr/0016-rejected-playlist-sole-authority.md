@@ -1,9 +1,15 @@
 # ADR-0016: Reject playlist-as-sole-authority seek rewrite
 
+- Status: accepted
+- Date: 2026-07-28
+
 ## Status
 
-**Rejected** (2026-07-28). Kept as a record so the proposal is not revived
-without new evidence.
+The decision is **accepted**: the playlist-as-sole-authority rewrite is
+**rejected**. Kept as a record so the proposal is not revived without new
+evidence. (`Status: accepted` above refers to this ADR's own decision, which was
+to reject the proposal it describes. `rejected` on an ADR means the ADR's own
+proposal lost.)
 
 ## Context
 
