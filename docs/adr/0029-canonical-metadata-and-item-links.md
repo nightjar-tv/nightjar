@@ -252,6 +252,15 @@ Do not merge them by intuition. Soft key can split one TMDB show;
 `tmdb_show` can unite filenames the soft key split. Unification is future
 series-identity work (ADR-0026 already deferred durable series identity).
 
+> **Closed 2026-08-06 by [ADR-0039](0039-show-entity-and-series-key.md).**
+> ADR-0033 made the show *folder* the durable identity unit; ADR-0039 names the
+> reference `series_key` and makes it the browse unit. The soft key stays where
+> ADR-0033 item 3 put it — in the matcher, matching-only — and is no longer a
+> browse unit. `tmdb_show` keeps this section's role unchanged as the entity
+> edge, and ADR-0039 item 6 states why the entity edge and the folder binding
+> are deliberately not the same edge. Neither is a watch `item_key`; that part
+> of this section is unchanged.
+
 Until the season pass exists, Visible **stays** on the soft key: tv
 canonical rows from show detail may exist but are unreachable from
 `media_items` without episode bindings.

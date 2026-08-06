@@ -1,14 +1,16 @@
 # ADR-0035: Watch state and continue-watching
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-06
-- Blocked on: the series ADR, whose folder-scoped series rows change what item 8
-  can compute for unmatched episodes; and the three-role model, which item 7's
-  ownership rule reads. Cannot be accepted before both are on disk
-- Depends on: ADR-0034 (profiles, `profileRef`, deletion cascade); ADR-0025 §1
-  (`item_key`), §3 (lifecycle), §4 (path keys), §5 (key-change merge rule);
-  ADR-0033 (series identity, extended by the series ADR); ADR-0007 / ADR-0011
-  (playback sessions, the progress reporter)
+- Accepted: 2026-08-06, once ADR-0039 and ADR-0040 were accepted. ADR-0039
+  supplies the series entity and the `series_key` item 8 rolls up over; ADR-0040
+  supplies the role model item 7's ownership rule reads. Sign-off for both:
+  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`
+- Depends on: ADR-0034 (profiles, `profileRef`, deletion cascade), as amended by
+  ADR-0040; ADR-0025 §1 (`item_key`), §3 (lifecycle), §4 (path keys), §5
+  (key-change merge rule); ADR-0039 (`series_key` and the show entity),
+  extending ADR-0033; ADR-0040 (account roles); ADR-0007 / ADR-0011 (playback
+  sessions, the progress reporter)
 - Gate: Gate 3 — resume works across devices and survives server restarts;
   watch history survives rename, re-encode, and library remove-and-re-add;
   full v1 API frozen
@@ -108,7 +110,7 @@ over it. There is no series-level state row and no play count.**
 
 7. **Which `profileRef` a caller may address is a rule, not an assumption.** A
    profile-scope session may address only its own ref. From account scope, the
-   answer is the three-role model: an owner or a manager may address any profile
+   answer is ADR-0040's role model: an owner or a manager may address any profile
    on the server, and a member may address the profiles under their own account
    and no others. Anything else is the named forbidden error rather than a 404,
    because a 404 leaks whether a ref exists and the refs are guessable only if we
@@ -121,19 +123,22 @@ over it. There is no series-level state row and no play count.**
 8. **The rollup is computed server-side and collapses a series to one entry.**
    For a series, the entry is the in-progress episode with the most recent
    `last_played_at` if there is one, otherwise the next unwatched episode after
-   the highest completed episode in series order. Series identity comes from the
-   series entity and episode order from the canonical season and episode numbers,
-   not from filenames. Movies are one entry each. The rail sorts on
-   `last_played_at DESC`.
+   the highest completed episode in series order. Series identity is the
+   ADR-0039 `series_key`, resolved through the folder binding — the edge that has
+   an answer before a match — and episode order comes from the canonical season
+   and episode numbers, not from filenames. Movies are one entry each, and a
+   movie's series key is its own `item_key` (ADR-0039 item 2), so the rollup
+   needs no separate movie branch. The rail sorts on `last_played_at DESC`.
 
    Web, TV and Flutter must not each reimplement this. It is stated here in the
    ADR rather than left to the endpoint's implementation because the rule is the
    thing that drifts, and three clients each holding a slightly different idea of
    "next episode" is how a household stops trusting the rail.
 
-   **Unmatched episodes group but do not order.** An unmatched show folder now
-   gets a `folder:`-keyed series row, so its episodes do belong to a series and
-   the rail collapses them rather than listing each file. What they lack is
+   **Unmatched episodes group but do not order.** Every show folder gets a
+   series row and an unmatched one keys as `folder:{library_id}:{relpath}`
+   (ADR-0039 items 2 and 3), so its episodes do belong to a series and the rail
+   collapses them rather than listing each file. What they lack is
    canonical season and episode numbers, so there is no series order to walk:
    the rollup can show an in-progress episode, and it cannot compute a next
    unwatched one. Finishing an unmatched episode therefore ends that series'
