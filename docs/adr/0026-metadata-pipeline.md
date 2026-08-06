@@ -27,6 +27,9 @@
 - Amended: 2026-08-05 — rewrite §8.10 as the series identity cascade that
   landed (RC3-RC5), replacing the abandoned-branch cascade text; see
   `notes/block1-drift-autopsy-2026-08-05.md` D7
+- Amended: 2026-08-06 — §8.4 item 3's certification projection superseded
+  in place by ADR-0037 item 8; the projection it froze was never
+  implemented and the storage it named cannot hold a board label
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -433,16 +436,28 @@ Work set: `metadata_status = 'matched'`.
    `movie_detail` / `tv_detail` by id. **Never re-search.**
 2. Map cast, genre names (const id→name map is fine, ~1 KB), collection on
    movies (§6), and full artwork refs from detail.
-3. **Content certification projection (frozen here):** on detail write,
-   project TMDB certification into storage kids can query — the existing
-   canonical ratings / content-rating projection path (ADR-0029 §1.2 /
-   §1.5), not a second cert table. Movies: release-dates style cert when
-   present; TV: content ratings when present. Null after a successful
-   detail fetch is allowed when TMDB has no cert; kids fail-closed treats
-   missing/unknown cert as deny (Block 2). The **classification ladder**
-   and household region file/const are Block 2 — two-tier only guarantees
-   the string (or null) is stored so a third full-library pass is not
-   required for kids.
+3. **Content certification projection: SUPERSEDED by ADR-0037 item 8
+   (2026-08-06). Not implemented; do not read this clause as shipped.**
+
+   What it said: on detail write, project TMDB certification into the
+   existing canonical ratings / content-rating projection path (ADR-0029
+   §1.2 / §1.5), not a second cert table.
+
+   Why it is superseded: that path cannot hold a certification. The
+   shipped `Rating` type is `{source: String, value: f64, votes:
+   Option<i64>}` and `ratings_json` is a `Vec<Rating>`; a board label such
+   as `PG-13` has nowhere to go. Nothing in `server/crates/metadata`
+   parses `release_dates` or `content_ratings` today, so no projection
+   exists to correct. ADR-0037 decides the storage shape instead
+   (`certifications_json` on `metadata_canonical`) and owns building the
+   projection.
+
+   What survives unchanged: the intent, and the reason it was frozen
+   here. `MOVIE_APPEND` and `TV_APPEND` already request `release_dates`
+   and `content_ratings`, and `metadata_raw_payloads` stores the raw
+   body, so the labels are on disk and a third full-library TMDB pass is
+   not required for kids. Null after a successful detail fetch stays
+   allowed; kids fail-closed treats missing or unknown as deny.
 4. TV: season bind via existing `bind_resolved_items` (ADR-0029 §3).
    **HTTP 404 on a season remains a soft skip** (continue other seasons);
    missing seasons leave those files without an episode link from this
