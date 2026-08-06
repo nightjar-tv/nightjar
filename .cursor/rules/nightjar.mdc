@@ -145,8 +145,12 @@ that reads like a careful senior engineer wrote it.
 - Client state is UI state only (open menus, scroll position). Watch state,
   sort order, and permissions come from the server. Cache, don't compute
   (Rule 2.1).
-- Flutter: playback goes through the shared player core FFI, never a platform
-  video plugin (Rule 2.4).
+- Flutter: playback goes through the one Dart player interface, never a
+  bespoke per-platform playback path (Rule 2.4). The engine behind that
+  interface is per-platform by decision (Media3, media_kit/libmpv, Aether,
+  vendor TV players — ADR-0021); the interface, OSD, and scrubber are written
+  once. The client reports a capability profile as data; the server decides
+  direct play, remux, or session. Never decide the method client-side.
 - Web HLS: do not change `pickBackend` / native-vs-hls.js to make founder
   desktop dogfood pass while iOS stays on another path (Rule 2.4).
 - Accessibility floor is non-negotiable: keyboard/D-pad focus visible, labels

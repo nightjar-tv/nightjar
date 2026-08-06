@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "tool_output": {
+    "max_lines": 300,
+    "max_bytes": 16384
+  },
+  "compaction": {
+    "auto": true,
+    "tail_turns": 20
+  },
+  "instructions": [
+    "ENGINEERING_RULES.md",
+    ".cursor/rules/nightjar.mdc",
+    "docs/GIT_RULES.md",
+    "~/Documents/GitHub/nightjar-meta/docs/WRITING_RULES.md",
+    "~/Documents/GitHub/nightjar-meta/docs/AGENT_PIPELINE.md",
+    "~/Documents/GitHub/nightjar-meta/docs/CONTINUITY.md"
+  ]
+}

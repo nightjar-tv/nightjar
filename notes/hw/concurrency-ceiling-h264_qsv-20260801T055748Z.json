@@ -1,0 +1,80 @@
+{
+  "stamp": "20260801T055748Z",
+  "base": "http://RM400:18096",
+  "label": "h264_qsv",
+  "preferredH264Encoder": "h264_qsv",
+  "encoders": [
+    {
+      "name": "h264_nvenc",
+      "backend": "nvenc",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 255: [h264_nvenc @ 0x14db64cc3180] Cannot load libcuda.so.1\n[vost#0:0/h264_nvenc @ 0x14db64d24000] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x14db64c81700] Error sending frames to consumers: Operation not permitted\n[vf#0:0 @ 0x14db64c81700] Task finished with error code: -1 (Operation not permitted)\n[vf#0:0 @ 0x14db64c81700] Terminating thread with return code -1 (Operation not permitted)\n[vost#0:0/h264_nvenc @ 0x14db64d24000] Could not open encoder before EOF\n[vost#0:0/h264_nvenc @ 0x14db64d24000] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_nvenc @ 0x14db64d24000] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x14db64c814c0] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "h264_qsv",
+      "backend": "qsv",
+      "status": "verified",
+      "reason": null
+    },
+    {
+      "name": "h264_vaapi",
+      "backend": "vaapi",
+      "status": "verified",
+      "reason": null
+    },
+    {
+      "name": "h264_v4l2m2m",
+      "backend": "v4l2m2m",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 234: [h264_v4l2m2m @ 0x14cdc66c3180] Could not find a valid device\n[h264_v4l2m2m @ 0x14cdc66c3180] can't configure encoder\n[vost#0:0/h264_v4l2m2m @ 0x14cdc6724000] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x14cdc6681700] Error sending frames to consumers: Invalid argument\n[vf#0:0 @ 0x14cdc6681700] Task finished with error code: -22 (Invalid argument)\n[vf#0:0 @ 0x14cdc6681700] Terminating thread with return code -22 (Invalid argument)\n[vost#0:0/h264_v4l2m2m @ 0x14cdc6724000] Could not open encoder before EOF\n[vost#0:0/h264_v4l2m2m @ 0x14cdc6724000] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_v4l2m2m @ 0x14cdc6724000] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x14cdc66814c0] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "libx264",
+      "backend": "software",
+      "status": "verified",
+      "reason": null
+    }
+  ],
+  "ratioNeed": 0.9,
+  "warmupS": 8.0,
+  "sampleS": 20.0,
+  "itemIdsUsed": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "ceiling": {
+    "nFailRealtime": 1,
+    "lastOk": 0,
+    "limit": "below_realtime",
+    "minRealtimeRatio": 0.0
+  },
+  "rows": [
+    {
+      "n": 1,
+      "opened": 1,
+      "ok": true,
+      "elapsedS": 20.004,
+      "segDeltas": [
+        0
+      ],
+      "realtimeRatios": [
+        0.0
+      ],
+      "minRealtimeRatio": 0.0,
+      "errors": [],
+      "label": "h264_qsv",
+      "remuxAlongside": 1
+    }
+  ]
+}

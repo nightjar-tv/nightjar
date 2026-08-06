@@ -1,0 +1,186 @@
+{
+  "stamp": "20260801T062603Z",
+  "base": "http://RM400:18098",
+  "label": "libx264",
+  "preferredH264Encoder": "libx264",
+  "encoders": [
+    {
+      "name": "h264_nvenc",
+      "backend": "nvenc",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 255: [h264_nvenc @ 0x14ce420c3180] Cannot load libcuda.so.1\n[vost#0:0/h264_nvenc @ 0x14ce42124000] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x14ce42081700] Error sending frames to consumers: Operation not permitted\n[vf#0:0 @ 0x14ce42081700] Task finished with error code: -1 (Operation not permitted)\n[vf#0:0 @ 0x14ce42081700] Terminating thread with return code -1 (Operation not permitted)\n[vost#0:0/h264_nvenc @ 0x14ce42124000] Could not open encoder before EOF\n[vost#0:0/h264_nvenc @ 0x14ce42124000] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_nvenc @ 0x14ce42124000] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x14ce420814c0] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "h264_qsv",
+      "backend": "qsv",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 187: [h264_qsv @ 0x1519336c3180] Failed to create a VAAPI device.\n[vost#0:0/h264_qsv @ 0x151933724000] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x151933681700] Error sending frames to consumers: Generic error in an external library\n[vf#0:0 @ 0x151933681700] Task finished with error code: -542398533 (Generic error in an external library)\n[vf#0:0 @ 0x151933681700] Terminating thread with return code -542398533 (Generic error in an external library)\n[vost#0:0/h264_qsv @ 0x151933724000] Could not open encoder before EOF\n[vost#0:0/h264_qsv @ 0x151933724000] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_qsv @ 0x151933724000] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x1519336814c0] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "h264_vaapi",
+      "backend": "vaapi",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 234: [AVHWDeviceContext @ 0x14950e880bc0] No VA display found for device /dev/dri/renderD128.\nDevice creation failed: -22.\nFailed to set value '/dev/dri/renderD128' for option 'vaapi_device': Invalid argument\nError parsing global options: Invalid argument"
+    },
+    {
+      "name": "h264_v4l2m2m",
+      "backend": "v4l2m2m",
+      "status": "failed",
+      "reason": "ffmpeg exited exit status: 234: [h264_v4l2m2m @ 0x151425cc3180] Could not find a valid device\n[h264_v4l2m2m @ 0x151425cc3180] can't configure encoder\n[vost#0:0/h264_v4l2m2m @ 0x151425d24000] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n[vf#0:0 @ 0x151425c81700] Error sending frames to consumers: Invalid argument\n[vf#0:0 @ 0x151425c81700] Task finished with error code: -22 (Invalid argument)\n[vf#0:0 @ 0x151425c81700] Terminating thread with return code -22 (Invalid argument)\n[vost#0:0/h264_v4l2m2m @ 0x151425d24000] Could not open encoder before EOF\n[vost#0:0/h264_v4l2m2m @ 0x151425d24000] Task finished with error code: -22 (Invalid argument)\n[vost#0:0/h264_v4l2m2m @ 0x151425d24000] Terminating thread with return code -22 (Invalid argument)\n[out#0/mp4 @ 0x151425c814c0] Nothing was written into output file, because at least one of its streams received no packets."
+    },
+    {
+      "name": "libx264",
+      "backend": "software",
+      "status": "verified",
+      "reason": null
+    }
+  ],
+  "ratioNeed": 0.9,
+  "warmupS": 15.0,
+  "sampleS": 40.0,
+  "itemIdsUsed": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "ceiling": {
+    "nFailRealtime": 6,
+    "lastOk": 5,
+    "limit": "below_realtime",
+    "minRealtimeRatio": 0.0
+  },
+  "rows": [
+    {
+      "n": 1,
+      "opened": 1,
+      "ok": true,
+      "elapsedS": 40.007,
+      "mediaSecondsDeltas": [
+        432.012
+      ],
+      "realtimeRatios": [
+        10.799
+      ],
+      "minRealtimeRatio": 10.799,
+      "errors": [],
+      "label": "libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 2,
+      "opened": 2,
+      "ok": true,
+      "elapsedS": 40.013,
+      "mediaSecondsDeltas": [
+        287.994,
+        325.99
+      ],
+      "realtimeRatios": [
+        7.198,
+        8.147
+      ],
+      "minRealtimeRatio": 7.198,
+      "errors": [],
+      "label": "libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 3,
+      "opened": 3,
+      "ok": true,
+      "elapsedS": 40.005,
+      "mediaSecondsDeltas": [
+        197.988,
+        205.996,
+        156.03
+      ],
+      "realtimeRatios": [
+        4.949,
+        5.149,
+        3.9
+      ],
+      "minRealtimeRatio": 3.9,
+      "errors": [],
+      "label": "libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 4,
+      "opened": 4,
+      "ok": true,
+      "elapsedS": 40.005,
+      "mediaSecondsDeltas": [
+        149.982,
+        144.018,
+        117.992,
+        126.0
+      ],
+      "realtimeRatios": [
+        3.749,
+        3.6,
+        2.949,
+        3.15
+      ],
+      "minRealtimeRatio": 2.949,
+      "errors": [],
+      "label": "libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 5,
+      "opened": 5,
+      "ok": true,
+      "elapsedS": 40.008,
+      "mediaSecondsDeltas": [
+        94.01,
+        112.028,
+        86.002,
+        107.982,
+        132.006
+      ],
+      "realtimeRatios": [
+        2.35,
+        2.8,
+        2.15,
+        2.699,
+        3.3
+      ],
+      "minRealtimeRatio": 2.15,
+      "errors": [],
+      "label": "libx264",
+      "remuxAlongside": 0
+    },
+    {
+      "n": 6,
+      "opened": 6,
+      "ok": true,
+      "elapsedS": 40.006,
+      "mediaSecondsDeltas": [
+        157.99,
+        163.996,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "realtimeRatios": [
+        3.949,
+        4.099,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "minRealtimeRatio": 0.0,
+      "errors": [],
+      "label": "libx264",
+      "remuxAlongside": 0
+    }
+  ]
+}

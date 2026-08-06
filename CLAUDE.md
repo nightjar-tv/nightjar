@@ -24,10 +24,14 @@ Before generating any code or prose in this repository:
    [CONTRIBUTING.md](CONTRIBUTING.md) and meta `docs/WRITING_RULES.md` when
    available.
 6. Match existing patterns in the crate or module you touch.
-7. **Agent models (default):** Grok plans and reviews; DeepSeek implements one
-   step at a time against a written plan with acceptance criteria. Implementers
-   do not redesign or expand scope. Multi-step automation:
-   `/workflow plan-implement-review plan_path="…"`.
+7. **Frozen-plan pipeline (default):** a planning session freezes a PLAN.md and
+   is then discarded. Per slice, a fresh short dispatcher (`deepseek-v4-flash`,
+   input = slice id + plan path only) runs implement → green gate (test +
+   clippy) → independent verify → at most two review fix rounds → dispatch
+   report. Review is green-first: red gates fail mechanically before any model
+   review. Publish is async via PR (`nightjar-meta/scripts/slice_approval.py`),
+   not a live gate. Implementers do not redesign or expand scope. Multi-step
+   automation: `/workflow plan-implement-review plan_path="…"`.
 
 Design tokens used by the UI live in `web/src/app.css`. Architecture decisions
 live in [docs/adr/](docs/adr/). Working docs (plan, brand, copy deck, writing
