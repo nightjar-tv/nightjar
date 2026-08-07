@@ -75,6 +75,12 @@ remains a shared follow-up with the item player UI.
    [ADR-0019](0019-ass-burn-extract-at-scan.md) owns when extract runs and
    the durable path/keying. The encode graph (`ass=`) stays.
 
+   > **Superseded by [ADR-0019](0019-ass-burn-extract-at-scan.md).** The
+   > session-dir demux above is the way station named there; ADR-0019
+   > moves ASS extraction to scan time with a durable on-disk path and
+   > key. The encode graph (`ass=`) is unaffected — only where the file
+   > comes from changed.
+
 6. **Corpus.** Existing `h264_aac_ass_mkv.mkv` and `h264_aac_pgs_mkv.mkv`.
    The PGS fixture is a minimal synthetic SUP (ffprobe-friendly); CI
    asserts encode success and segments, not visible glyphs. Richer PGS for
