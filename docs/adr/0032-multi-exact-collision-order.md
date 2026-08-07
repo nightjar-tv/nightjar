@@ -9,8 +9,8 @@
   title); method `exact_title_episode_title` at 0.90; TV-only; accepted
 - Depends on: ADR-0026 §2 (floor + existing TV collision pin); ADR-0028
   (manual fix); ADR-0031 §7 coverage sample (soft-key re-run)
-- Related: `notes/tmdb-show-coverage-sample-2026-08-03-softkey.md`;
-  `notes/episode-title-availability-2026-08-03.md`
+- Related: `nightjar-meta/notes/tmdb-show-coverage-sample-2026-08-03-softkey.md`;
+  `nightjar-meta/notes/episode-title-availability-2026-08-03.md`
 - Numbering: next free after 0031. **0027 remains artwork.**
 
 ## Context

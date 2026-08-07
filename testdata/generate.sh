@@ -519,7 +519,7 @@ if [[ "${LARGE:-}" == "1" ]]; then
     "$OUT/large-open-ended-range.mp4"
 fi
 
-# Soak scrub resume fixture (scripts/soak_scrub.sh). HEVC forces Transcode
+# Soak scrub resume fixture (nightjar-meta/scripts/soak_scrub.sh). HEVC forces Transcode
 # (Rule 4.3 / first-scrub characterisation). Same file: soft SRT + ASS + PGS.
 # Gitignored; regenerate with SOAK=1. Duration must clear ALIGN_BEHIND (32s)
 # and leave room for far-ahead seeks past the encode head.
@@ -569,7 +569,7 @@ pds = bytes([0, 0])
 open(path, "wb").write(seg(0, 0x16, pcs) + seg(0, 0x17, wds) + seg(0, 0x14, pds) + seg(0, 0x80, b""))
 PY
   # Moderate bitrate so encode lags seeks without a delay-injection knob
-  # (Rule 4.7). Throttle further via THROTTLE_BPS in soak_scrub.sh.
+  # (Rule 4.7). Throttle further via THROTTLE_BPS in nightjar-meta/scripts/soak_scrub.sh.
   "$FFMPEG" -y -hide_banner -loglevel error \
     -f lavfi -i "testsrc=size=640x360:rate=24:duration=${SOAK_DUR}" \
     -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=${SOAK_DUR}" \

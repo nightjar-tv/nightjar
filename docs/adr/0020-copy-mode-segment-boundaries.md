@@ -39,7 +39,7 @@ as a first fork.
 
 ### Why the probe killed full-title VOD
 
-`scripts/playlist_shape_probe/RESULTS.md` tested three static shapes
+`nightjar-meta/scripts/playlist_shape_probe/RESULTS.md` tested three static shapes
 (mutated EVENT same URI; fresh EVENT per land; fresh VOD+ENDLIST per land)
 on AVPlayer and hls.js with ~40 s real windows from a healthy title (~1325 s
 claimed duration):

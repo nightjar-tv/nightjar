@@ -4,7 +4,7 @@
 - Date: 2026-07-26
 - Amended: 2026-08-03 — session-shaped verify; one encode-leg builder; pix_fmt
   ownership; supersede “land backend flags later” (§6). Research pointer:
-  `notes/hw/jellyfin-hw-encode-map-2026-08.md`.
+  `nightjar-meta/notes/hw/jellyfin-hw-encode-map-2026-08.md`.
 
 ## Context
 
@@ -137,7 +137,7 @@ constitution rule until ENGINEERING_RULES is amended).
     libplacebo spike host) must not be promoted as if they were usable encode
     capacity. Detection answers “can this process encode”; sizing and Gate
     concurrency floors answer “how many streams” — keep those claims separate.
-    Spike pointer: `notes/hw/libplacebo-dv-spike-2026-08-02.md`.
+    Spike pointer: `nightjar-meta/notes/hw/libplacebo-dv-spike-2026-08-02.md`.
 
 ## Consequences
 
@@ -178,4 +178,4 @@ Enumerated-but-slow software Vulkan (lavapipe) is a reminder that verify and
 realtime capacity are different claims; do not treat ICD presence as a Gate 2
 concurrency floor.
 
-Research only (not requirements): `notes/hw/jellyfin-hw-encode-map-2026-08.md`.
+Research only (not requirements): `nightjar-meta/notes/hw/jellyfin-hw-encode-map-2026-08.md`.

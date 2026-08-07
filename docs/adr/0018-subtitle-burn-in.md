@@ -133,14 +133,14 @@ mid-session encoder splice can cross parsers without
    viewer ([ADR-0019](0019-ass-burn-extract-at-scan.md) amendment).
    Tag-free encoder splice works on Chrome/hls.js, Safari native, and
    Firefox/hls.js with no `#EXT-X-DISCONTINUITY`
-   ([Spike C](../../scripts/spike_c_FINDINGS.md)); proven viable and
+   (Spike C, `nightjar-meta/scripts/spike_c_FINDINGS.md`); proven viable and
    deferred to a later slice (Rule 4.5). Do not re-litigate the
    discontinuity tag without new binding-client evidence.
 
 5. **Pre-splice captions.** Segments encoded before burn attaches carry
    no burned captions; captions start from the attach point
-   ([Spike C](../../scripts/spike_c_FINDINGS.md)). Documented limitation,
-   not a bug to paper with lead rewrite.
+   (Spike C, `nightjar-meta/scripts/spike_c_FINDINGS.md`). Documented
+   limitation, not a bug to paper with lead rewrite.
 
 6. **Forced-track auto-select is text-only.** V1_PLAN Phase 2 item 5
    (matching forced track when audio is foreign-language) applies to soft

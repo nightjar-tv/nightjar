@@ -503,8 +503,8 @@ mod tests {
     #[test]
     fn show_soft_key_near_dups_and_sample_below_floor() {
         // Pairs that must share a soft key. Near-dup groups from
-        // notes/metadata-parse-baseline-2026-08-03.md; below-floor rows from
-        // notes/tmdb-show-coverage-sample-2026-08-03.md.
+        // nightjar-meta/notes/metadata-parse-baseline-2026-08-03.md; below-floor rows from
+        // nightjar-meta/notes/tmdb-show-coverage-sample-2026-08-03.md.
         let maul_ascii = "Star Wars - Maul - Shadow Lord";
         let maul_en = format!(
             "Star Wars - Maul {} Shadow Lord",
