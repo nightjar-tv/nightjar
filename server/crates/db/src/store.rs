@@ -61,8 +61,6 @@ pub struct MediaItemRow {
     pub probe_status: String,
     pub scan_error: Option<String>,
     pub subtitle_status: String,
-    pub subtitle_source_mtime_ms: Option<i64>,
-    pub subtitle_source_size_bytes: Option<i64>,
     /// ADR-0023 live media-file fingerprint (NULL until scan computes it).
     pub content_id: Option<String>,
     pub probed_content_id: Option<String>,
@@ -429,8 +427,8 @@ impl Db {
                 "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
                         audio_codec, audio_channels, width, height, video_bitrate_bps, hdr,
-                        probe_status, scan_error, subtitle_status, subtitle_source_mtime_ms,
-                        subtitle_source_size_bytes, content_id, probed_content_id,
+                        probe_status, scan_error, subtitle_status,
+                        content_id, probed_content_id,
                         subtitle_content_id, usable_extent_ms, usable_extent_content_id,
                         map_status, map_content_id, metadata_status
                  FROM media_items
@@ -451,8 +449,8 @@ impl Db {
             "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                     year, season, episode, duration_ms, container, video_codec,
                     audio_codec, audio_channels, width, height, video_bitrate_bps, hdr,
-                    probe_status, scan_error, subtitle_status, subtitle_source_mtime_ms,
-                    subtitle_source_size_bytes, content_id, probed_content_id,
+                    probe_status, scan_error, subtitle_status,
+                    content_id, probed_content_id,
                     subtitle_content_id, usable_extent_ms, usable_extent_content_id,
                     map_status, map_content_id, metadata_status
              FROM media_items WHERE id = ?1",
@@ -537,8 +535,6 @@ impl Db {
                         scan_error = NULL,
                         probed_at = NULL,
                         subtitle_status = 'pending',
-                        subtitle_source_mtime_ms = NULL,
-                        subtitle_source_size_bytes = NULL,
                         content_id = excluded.content_id,
                         probed_content_id = NULL,
                         subtitle_content_id = NULL,
@@ -629,13 +625,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_subtitle_status(
-        &self,
-        item_id: i64,
-        status: &str,
-        source_mtime_ms: Option<i64>,
-        source_size_bytes: Option<i64>,
-    ) -> Result<(), String> {
+    pub fn set_subtitle_status(&self, item_id: i64, status: &str) -> Result<(), String> {
         let status = parse_subtitle_status(status)?;
         let conn = self.lock()?;
         if status == "unavailable" {
@@ -656,8 +646,6 @@ impl Db {
             conn.execute(
                 "UPDATE media_items SET
                     subtitle_status = 'unavailable',
-                    subtitle_source_mtime_ms = NULL,
-                    subtitle_source_size_bytes = NULL,
                     subtitle_content_id = NULL,
                     subtitle_attempt_count = subtitle_attempt_count + 1,
                     subtitle_next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
@@ -670,8 +658,6 @@ impl Db {
         conn.execute(
             "UPDATE media_items SET
                 subtitle_status = ?2,
-                subtitle_source_mtime_ms = ?3,
-                subtitle_source_size_bytes = ?4,
                 subtitle_content_id = CASE
                     WHEN ?2 IN ('ready', 'none') THEN content_id
                     ELSE NULL
@@ -679,7 +665,7 @@ impl Db {
                 subtitle_attempt_count = 0,
                 subtitle_next_retry_at = NULL
              WHERE id = ?1",
-            params![item_id, status, source_mtime_ms, source_size_bytes],
+            params![item_id, status],
         )
         .map_err(|e| format!("set subtitle status for item {item_id}: {e}"))?;
         Ok(())
@@ -847,8 +833,7 @@ impl Db {
             .map_err(|e| format!("requeue unavailable probes: {e}"))?;
         let extracts = conn
             .execute(
-                "UPDATE media_items SET subtitle_status = 'pending',
-                    subtitle_source_mtime_ms = NULL, subtitle_source_size_bytes = NULL
+                "UPDATE media_items SET subtitle_status = 'pending'
                  WHERE library_id = ?1 AND subtitle_status = 'unavailable'
                    AND (subtitle_next_retry_at IS NULL
                         OR subtitle_next_retry_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -1358,16 +1343,14 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         probe_status: r.get(19)?,
         scan_error: r.get(20)?,
         subtitle_status: r.get(21)?,
-        subtitle_source_mtime_ms: r.get(22)?,
-        subtitle_source_size_bytes: r.get(23)?,
-        content_id: r.get(24)?,
-        probed_content_id: r.get(25)?,
-        subtitle_content_id: r.get(26)?,
-        usable_extent_ms: r.get(27)?,
-        usable_extent_content_id: r.get(28)?,
-        map_status: r.get(29)?,
-        map_content_id: r.get(30)?,
-        metadata_status: r.get(31)?,
+        content_id: r.get(22)?,
+        probed_content_id: r.get(23)?,
+        subtitle_content_id: r.get(24)?,
+        usable_extent_ms: r.get(25)?,
+        usable_extent_content_id: r.get(26)?,
+        map_status: r.get(27)?,
+        map_content_id: r.get(28)?,
+        metadata_status: r.get(29)?,
     })
 }
 
@@ -1678,10 +1661,8 @@ mod tests {
         let (a, b, c) = (ids[0], ids[1], ids[2]);
 
         // First failure: attempt 1, deadline one day out (ADR-0026 §3).
-        db.set_subtitle_status(a, "unavailable", None, None)
-            .unwrap();
-        db.set_subtitle_status(b, "unavailable", None, None)
-            .unwrap();
+        db.set_subtitle_status(a, "unavailable").unwrap();
+        db.set_subtitle_status(b, "unavailable").unwrap();
         let retry_state = |id: i64| -> (i64, Option<String>) {
             db.lock()
                 .unwrap()
@@ -1700,8 +1681,7 @@ mod tests {
         assert!(retry_b.is_some());
 
         // A second failure escalates to 7 days.
-        db.set_subtitle_status(a, "unavailable", None, None)
-            .unwrap();
+        db.set_subtitle_status(a, "unavailable").unwrap();
         let (attempts_a2, retry_a2) = retry_state(a);
         assert_eq!(attempts_a2, 2);
         assert!(retry_a2.as_deref().unwrap() > retry_a.as_deref().unwrap());
@@ -1709,8 +1689,7 @@ mod tests {
         // Requeue gate: all three items are unavailable, but only the one
         // whose deadline has passed (c, expired by hand) is requeued. a and b
         // stay unavailable until their deadlines expire.
-        db.set_subtitle_status(c, "unavailable", None, None)
-            .unwrap();
+        db.set_subtitle_status(c, "unavailable").unwrap();
         db.lock()
             .unwrap()
             .execute(
@@ -1735,8 +1714,7 @@ mod tests {
         );
 
         // Any non-unavailable write resets the retry state.
-        db.set_subtitle_status(a, "eligible", Some(1), Some(2))
-            .unwrap();
+        db.set_subtitle_status(a, "eligible").unwrap();
         let (attempts_a3, retry_a3) = retry_state(a);
         assert_eq!(attempts_a3, 0);
         assert_eq!(retry_a3, None);

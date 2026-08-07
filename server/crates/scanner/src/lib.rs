@@ -85,39 +85,38 @@ pub fn request_scan(
         return Ok(0);
     }
     let job_id = db.create_scan_job(library_id)?;
-    std::thread::Builder::new()
-        .name(format!("scan-job-{job_id}"))
-        .spawn(move || {
-            let scan_ok = match run_scan_job(&db, &pool, job_id, library_id) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!(job_id, library_id, error = %e, "scan job failed");
-                    let _ = db.fail_scan_job(job_id, &e);
-                    false
-                }
-            };
-            // Drop any leftover hint dirt so it cannot suppress a later job.
-            let _ = pool.take_dirty_add(library_id);
-            if scan_ok {
-                // Ordinary scan is the clear for deferred_remove holdoff.
-                pool.clear_repoint_delete_holdoff(library_id);
+    let db_worker = Arc::clone(&db);
+    let pool_worker = Arc::clone(&pool);
+    spawn_job_worker(&db, job_id, "scan", None, move || {
+        let scan_ok = match run_scan_job(&db_worker, &pool_worker, job_id, library_id) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(job_id, library_id, error = %e, "scan job failed");
+                let _ = db_worker.fail_scan_job(job_id, &e);
+                false
             }
-            if pool.take_scan_dirty(library_id) {
-                tracing::info!(
-                    library_id,
-                    "library dirty after scan; starting follow-up job"
-                );
-                if let Err(e) = request_scan(
-                    Arc::clone(&db),
-                    Arc::clone(&pool),
-                    library_id,
-                    ScanTrigger::FollowUp,
-                ) {
-                    tracing::warn!(library_id, error = %e, "follow-up scan failed");
-                }
+        };
+        // Drop any leftover hint dirt so it cannot suppress a later job.
+        let _ = pool_worker.take_dirty_add(library_id);
+        if scan_ok {
+            // Ordinary scan is the clear for deferred_remove holdoff.
+            pool_worker.clear_repoint_delete_holdoff(library_id);
+        }
+        if pool_worker.take_scan_dirty(library_id) {
+            tracing::info!(
+                library_id,
+                "library dirty after scan; starting follow-up job"
+            );
+            if let Err(e) = request_scan(
+                Arc::clone(&db_worker),
+                Arc::clone(&pool_worker),
+                library_id,
+                ScanTrigger::FollowUp,
+            ) {
+                tracing::warn!(library_id, error = %e, "follow-up scan failed");
             }
-        })
-        .map_err(|e| format!("spawn scan job {job_id}: {e}"))?;
+        }
+    })?;
     Ok(job_id)
 }
 
@@ -297,16 +296,43 @@ pub fn request_repoint(
     }
     let job_id = db.create_repoint_job(library_id, candidate_path)?;
     let candidate = candidate_path.to_string();
-    std::thread::Builder::new()
-        .name(format!("repoint-job-{job_id}"))
-        .spawn(move || {
-            if let Err(e) = run_repoint_job(&db, &pool, job_id, library_id, &candidate) {
-                tracing::error!(job_id, library_id, error = %e, "repoint job failed");
-                let _ = db.fail_scan_job(job_id, &e);
-            }
-        })
-        .map_err(|e| format!("spawn repoint job {job_id}: {e}"))?;
+    let db_worker = Arc::clone(&db);
+    let pool_worker = Arc::clone(&pool);
+    spawn_job_worker(&db, job_id, "repoint", None, move || {
+        if let Err(e) = run_repoint_job(&db_worker, &pool_worker, job_id, library_id, &candidate) {
+            tracing::error!(job_id, library_id, error = %e, "repoint job failed");
+            let _ = db_worker.fail_scan_job(job_id, &e);
+        }
+    })?;
     Ok(job_id)
+}
+
+/// Spawn the worker thread for a scan/repoint job whose `queued` row was
+/// already inserted by the caller. A failed spawn fails that row immediately
+/// (Rule 4.8): leaving it `queued` would wedge the library until the next
+/// process start runs `fail_stale_scan_jobs`. `kind` is `scan` or `repoint`
+/// and shapes both the thread name and the error message. `stack_size` is
+/// `None` in production; tests pass an oversized value to force a
+/// deterministic spawn failure.
+fn spawn_job_worker(
+    db: &Db,
+    job_id: i64,
+    kind: &str,
+    stack_size: Option<usize>,
+    worker: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
+    let mut builder = std::thread::Builder::new().name(format!("{kind}-job-{job_id}"));
+    if let Some(size) = stack_size {
+        builder = builder.stack_size(size);
+    }
+    match builder.spawn(worker) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = format!("spawn {kind} job {job_id}: {e}");
+            let _ = db.fail_scan_job(job_id, &msg);
+            Err(msg)
+        }
+    }
 }
 
 fn run_repoint_job(
@@ -1118,8 +1144,7 @@ mod tests {
                 scan_error: Some("unavailable: test".into()),
             })
             .unwrap();
-            db.set_subtitle_status(item.id, "unavailable", None, None)
-                .unwrap();
+            db.set_subtitle_status(item.id, "unavailable").unwrap();
         }
 
         let before = pool.transition_count();
@@ -1274,8 +1299,7 @@ mod tests {
             scan_error: Some("no such file or directory".into()),
         })
         .unwrap();
-        db.set_subtitle_status(a.id, "unavailable", None, None)
-            .unwrap();
+        db.set_subtitle_status(a.id, "unavailable").unwrap();
 
         // Drain with stored relpath only (dogfood failure mode) must still resolve.
         let n = pool.drain_pending_probes().unwrap();
@@ -2075,6 +2099,46 @@ mod tests {
         assert_eq!(job.library_id, lib.id);
     }
 
+    /// A3.2: if the worker-thread spawn fails after the `queued` row was
+    /// inserted, the row must land `failed` immediately rather than wedge the
+    /// library until restart (Rule 4.8). Forced deterministically with
+    /// `stack_size(usize::MAX)` (plan Decisions); covers both the `scan` kind
+    /// (`request_scan`'s row) and the `repoint` kind (`request_repoint`'s row)
+    /// through the shared [`spawn_job_worker`] spawn path.
+    #[test]
+    fn spawn_failure_fails_queued_job_not_left_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: dir.path().join("media").to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        // `request_scan` path: a queued scan row, then a failing spawn.
+        let scan_job_id = db.create_scan_job(lib.id).unwrap();
+        let err = spawn_job_worker(&db, scan_job_id, "scan", Some(usize::MAX), || {}).unwrap_err();
+        assert!(err.starts_with("spawn scan job"), "{err}");
+        let job = db.get_scan_job(scan_job_id).unwrap().unwrap();
+        assert_eq!(
+            job.state, "failed",
+            "spawn failure must fail the queued scan row, not leave it queued"
+        );
+
+        // `request_repoint` path: a queued repoint row, then a failing spawn.
+        let repoint_job_id = db.create_repoint_job(lib.id, &lib.path).unwrap();
+        let err =
+            spawn_job_worker(&db, repoint_job_id, "repoint", Some(usize::MAX), || {}).unwrap_err();
+        assert!(err.starts_with("spawn repoint job"), "{err}");
+        let job = db.get_scan_job(repoint_job_id).unwrap().unwrap();
+        assert_eq!(
+            job.state, "failed",
+            "spawn failure must fail the queued repoint row, not leave it queued"
+        );
+    }
+
     #[test]
     fn repoint_holdoff_blocks_poll_not_manual() {
         let dir = tempfile::tempdir().unwrap();
@@ -2488,8 +2552,7 @@ mod tests {
             }],
         )
         .unwrap();
-        db.set_subtitle_status(item_id, "eligible", Some(1), Some(2))
-            .unwrap();
+        db.set_subtitle_status(item_id, "eligible").unwrap();
 
         pool.enqueue(pool::WorkItem::extract(
             item_id,
@@ -3084,6 +3147,138 @@ mod tests {
             pool.background_progress().completed,
             0,
             "a cancelled extract must not count as a completed run"
+        );
+    }
+
+    /// ADR-0041 Decision 8.7 (amended 2026-08-07) for the probe side: marking
+    /// a library unreachable while a probe is in flight kills the ffprobe
+    /// child and the item lands `unavailable`, never `probed` or `error`.
+    /// The fixture is an MKV carrying a large attachment: ffprobe reads the
+    /// whole Segment header (attachments live there), so the probe stays
+    /// observably in flight for hundreds of milliseconds instead of the few
+    /// tens of milliseconds a header-only fixture takes — the cancellation
+    /// races a real process, never a sleep-based fake.
+    #[test]
+    fn probe_in_flight_is_cancelled_when_library_unreachable() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let ffmpeg_ok = Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ffmpeg_ok {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        // Attachment content is generated, not copied from the host, so the
+        // fixture is portable across machines.
+        let blob = dir.path().join("blob.bin");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&blob).unwrap();
+            let chunk = vec![0xABu8; 1 << 20];
+            for _ in 0..200 {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+        let mkv = media.join("SlowProbe.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=5:r=30",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-attach",
+            ])
+            .arg(&blob)
+            .args([
+                "-metadata:s:t",
+                "mimetype=application/octet-stream",
+                "-metadata:s:t",
+                "filename=blob.bin",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg slow-probe fixture mux failed");
+            return;
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let size_bytes = fs::metadata(&mkv).unwrap().len() as i64;
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "SlowProbe.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes,
+                    title: "SlowProbe".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+
+        pool.enqueue(crate::pool::WorkItem::probe(item_id, lib.id, mkv, None));
+        // Wait until the worker has popped the probe: it is now in flight.
+        for _ in 0..400 {
+            if pool.background_progress().queued_probes == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            pool.background_progress().queued_probes,
+            0,
+            "probe never started"
+        );
+
+        pool.set_library_reachability(lib.id, &lib.path, false)
+            .unwrap();
+        for _ in 0..400 {
+            let row = db.get_item(item_id).unwrap().unwrap();
+            if row.probe_status != "indexed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(
+            row.probe_status, "unavailable",
+            "an in-flight probe must be cancelled, never probed or error: {:?}",
+            row
         );
     }
 

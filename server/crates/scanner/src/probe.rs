@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Debug, Default, Clone)]
 pub struct ProbeResult {
@@ -86,9 +87,22 @@ struct FfSideData {
 }
 
 const STDERR_TAIL: usize = 512;
+const CANCEL_POLL: Duration = Duration::from_millis(50);
 
-pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
-    let output = Command::new("ffprobe")
+/// Probe a media file with ffprobe. `should_cancel` is the library
+/// reachability signal (ADR-0014 / ADR-0041 Decision 8.7 amendment): when it
+/// turns true the ffprobe child is killed and the probe reports
+/// `unavailable`, never `probed` or `error`.
+///
+/// The output pipes are drained concurrently on reader threads, like
+/// `Command::output()` does: a stream-heavy title's JSON can exceed the pipe
+/// buffer, and a drain-after-exit loop would let ffprobe block on a full pipe
+/// forever (same shape as `keymap::packet_walk::walk`).
+pub fn ffprobe(
+    path: &Path,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<ProbeResult, String> {
+    let mut child = Command::new("ffprobe")
         .args([
             "-v",
             "error",
@@ -98,7 +112,10 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
             "-show_streams",
         ])
         .arg(path)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "spawn ffprobe: not found on PATH".into()
@@ -107,13 +124,40 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
             }
         })?;
 
-    if !output.status.success() {
-        let code = output
-            .status
+    // Drain both pipes now, not after exit: ffprobe blocks once a pipe fills,
+    // and the JSON of a many-stream title is far larger than the pipe buffer.
+    // The threads finish at EOF, which is guaranteed once the child exits or
+    // is killed below.
+    let stdout_reader = spawn_pipe_reader("ffprobe-stdout", child.stdout.take())?;
+    let stderr_reader = spawn_pipe_reader("ffprobe-stderr", child.stderr.take())?;
+
+    let status = loop {
+        // Cancel wins over a just-finished probe: once the library is
+        // unreachable the run is aborted, never reported probed (ADR-0041
+        // Decision 8.7). Stamped "unavailable:" for the pool's classifier.
+        if should_cancel.is_some_and(|c| c()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("unavailable: ffprobe cancelled (library unreachable)".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(CANCEL_POLL),
+            Err(e) => {
+                return Err(format!("wait ffprobe for {}: {e}", path.display()));
+            }
+        }
+    };
+
+    // The child has exited, so both pipes are at EOF and the readers are done.
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    if !status.success() {
+        let code = status
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
-        let stderr = String::from_utf8_lossy(&output.stderr);
         let tail = stderr_tail(stderr.trim());
         return Err(format!(
             "ffprobe failed for {} (exit {code}): {tail}",
@@ -121,7 +165,7 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
         ));
     }
 
-    let parsed: FfprobeJson = serde_json::from_slice(&output.stdout)
+    let parsed: FfprobeJson = serde_json::from_slice(stdout.as_bytes())
         .map_err(|e| format!("parse ffprobe json for {}: {e}", path.display()))?;
 
     let duration_ms = parsed
@@ -208,6 +252,25 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
     })
 }
 
+/// Drain one of ffprobe's pipes on a reader thread so the child can never
+/// block on a full pipe while the probe polls for exit or cancel.
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    name: &str,
+    pipe: Option<R>,
+) -> Result<std::thread::JoinHandle<String>, String> {
+    let Some(mut pipe) = pipe else {
+        return Err(format!("{name}: child pipe missing"));
+    };
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let mut buf = String::new();
+            let _ = pipe.read_to_string(&mut buf);
+            buf
+        })
+        .map_err(|e| format!("spawn {name} reader: {e}"))
+}
+
 fn classify_hdr(color_transfer: Option<&str>, side_data: &[FfSideData]) -> String {
     for side in side_data {
         let Some(t) = side.side_data_type.as_deref() else {
@@ -250,7 +313,7 @@ mod tests {
         let err = {
             let old = std::env::var_os("PATH");
             unsafe { std::env::set_var("PATH", "/var/empty-nightjar-no-ffprobe") };
-            let r = ffprobe(Path::new("/tmp/x.mkv"));
+            let r = ffprobe(Path::new("/tmp/x.mkv"), None);
             match old {
                 Some(v) => unsafe { std::env::set_var("PATH", v) },
                 None => unsafe { std::env::remove_var("PATH") },
@@ -276,7 +339,7 @@ mod tests {
             return;
         }
         let path = PathBuf::from("/tmp/nightjar-definitely-missing-probe-target.mkv");
-        let err = ffprobe(&path).unwrap_err();
+        let err = ffprobe(&path, None).unwrap_err();
         assert!(
             err.contains("exit ") || err.starts_with("spawn ffprobe"),
             "expected exit code or spawn, got {err}"

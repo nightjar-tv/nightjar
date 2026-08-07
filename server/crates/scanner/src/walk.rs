@@ -75,7 +75,7 @@ pub struct WalkOutcome {
     pub listing_errors: u32,
 }
 
-/// Walk concurrency from `NIGHTJAR_WALK_CONCURRENCY`, default 16, clamped to 1..=256.
+/// Walk concurrency from `NIGHTJAR_WALK_CONCURRENCY`, default 8, clamped to 1..=256.
 pub fn walk_concurrency() -> usize {
     std::env::var("NIGHTJAR_WALK_CONCURRENCY")
         .ok()

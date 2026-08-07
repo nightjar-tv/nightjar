@@ -1,6 +1,6 @@
 # ADR-0041: Subtitle classification and client-gated extraction
 
-- Status: accepted
+- Status: accepted; amended 2026-08-07 (Decision 8.7 scope note)
 - Date: 2026-08-06
 - Supersedes: [ADR-0013](0013-subtitle-extraction-at-scan.md) §1 and §2 (this
   ADR's Decision 1–2 replace them; ADR-0013 §1/§2 carry a pointer to this
@@ -235,6 +235,17 @@ waste:
       pause gates job *start*; a demux begun before a mount died keeps
       reading a dead share until it hits the timeout in (1). Cancel on the
       same reachability transition that pauses new starts.
+
+      **Amended 2026-08-07 (scanner audit):** this mechanism shipped for
+      both subtitle extract and the keyframe-map packet-walk
+      (`server/crates/scanner/src/pool.rs`, `keymap/packet_walk.rs`), not
+      extract alone — item 6's shared bulk-reader gate always covered both,
+      and 8.7's cancel followed the same path. Probe and the directory walk
+      do not have it: probe is a single blocking `ffprobe` call with no
+      cancellation hook, and the walk checks reachability once before
+      starting and not again. Both are common paths, not edge cases. Scope
+      for closing that gap is probe and the walk, not "probe/map/artwork/
+      walk" — map is done, artwork is not this crate's concern.
    8. **Progress observable:** queue depth, completed count, a rate
       estimate — enough for an operator running the eager pass to know it
       is moving, without a client polling an individual item.

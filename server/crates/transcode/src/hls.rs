@@ -2415,18 +2415,7 @@ fn publish_piggyback_if_complete(session: &mut Session) {
         );
         return;
     }
-    let (mtime_ms, size_bytes) = fs::metadata(&session.src)
-        .ok()
-        .map(|meta| {
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64);
-            (mtime, Some(meta.len() as i64))
-        })
-        .unwrap_or((None, None));
-    if let Err(e) = db.set_subtitle_status(session.item_id, "ready", mtime_ms, size_bytes) {
+    if let Err(e) = db.set_subtitle_status(session.item_id, "ready") {
         tracing::warn!(
             item_id = session.item_id,
             track_id = %piggyback.track_id,

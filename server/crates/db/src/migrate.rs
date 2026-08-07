@@ -49,6 +49,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         18,
         include_str!("../migrations/018_subtitle_extract_backoff.sql"),
     ),
+    (
+        19,
+        include_str!("../migrations/019_drop_subtitle_source_stamps.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -290,7 +294,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 18);
+        assert_eq!(v, 19);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -1045,7 +1049,7 @@ mod tests {
         );
         assert_eq!(items_before, items_after, "media_items COUNT must hold");
         assert_eq!(sidecars_before, sidecars_after, "sidecars COUNT must hold");
-        assert_eq!(version_after, 18);
+        assert_eq!(version_after, 19);
     }
 
     fn status_histogram(conn: &Connection, column: &str) -> Vec<(String, i64)> {
@@ -1066,7 +1070,8 @@ mod tests {
     /// discipline, applied in spirit — 017 is a CREATE TABLE plus a filtered
     /// UPDATE, not the ADD/DROP/RENAME copy dance §5 was written for, but the
     /// same class of "opaque error reset touching real rows at scale" migration
-    /// 006 and 012 got this treatment for).
+    /// 006 and 012 got this treatment for). Migrates through the latest schema
+    /// version (19 since migration 019 landed).
     /// Run: `NIGHTJAR_MIGRATE_COPY=/path/to/copy.db cargo test -p nightjar-db \
     ///   migrate_copy_through_017 -- --ignored --nocapture`
     #[test]
@@ -1123,7 +1128,7 @@ mod tests {
         );
 
         assert_eq!(items_before, items_after, "media_items COUNT must hold");
-        assert_eq!(version_after, 18);
+        assert_eq!(version_after, 19);
         assert_eq!(
             metadata_before, metadata_after,
             "metadata_status must be untouched"
@@ -1133,5 +1138,188 @@ mod tests {
             tracks_after, 0,
             "table created empty; probe populates it, not the migration"
         );
+    }
+
+    /// Copy a real dogfood DB, migrate through 019, confirm the two dropped
+    /// subtitle source-stamp columns are gone and that `subtitle_status` and
+    /// `subtitle_content_id` are unchanged for every row (ADR-0023 §6
+    /// amendment: `subtitle_content_id` is the sole validity stamp for
+    /// extracted subtitles, so a migration that only removes two now-unread
+    /// columns must not alter any subtitle classification outcome). A
+    /// column-drop migration (SQLite `ALTER TABLE ... DROP COLUMN`, same
+    /// mechanism as migrations 006/014) is exactly where a `NOT NULL` or a
+    /// default could quietly shift on a surviving column, so the
+    /// before/after bar is broader than the two named columns: the
+    /// `metadata_status`, `map_status`, and `probe_status` histograms, the
+    /// `media_item_subtitle_tracks` COUNT, and the non-NULL counts of
+    /// `content_id` / `map_content_id` are all asserted unchanged. The copy
+    /// is made at schema 16, so migrations 17 and 18 are applied first to
+    /// reach the pre-019 state; 017's `error` → `pending` reset is a real
+    /// `subtitle_status` change by design and would false-positive the
+    /// "nothing else changed" bar if the whole `migrate()` ran between the
+    /// two snapshots. 17 and 18 are pure SQL (no Rust hook in `migrate`).
+    /// Run: `NIGHTJAR_MIGRATE_COPY=/path/to/copy.db cargo test -p nightjar-db \
+    ///   migrate_copy_through_019 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: needs NIGHTJAR_MIGRATE_COPY pointing at a disposable DB copy"]
+    fn migrate_copy_through_019() {
+        let path = std::env::var("NIGHTJAR_MIGRATE_COPY")
+            .expect("NIGHTJAR_MIGRATE_COPY must point at a disposable .db copy");
+        let conn = Connection::open(&path).unwrap();
+
+        let version_before: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version_before, 16,
+            "the dogfood copy is expected to be at schema 16 (pre-017)"
+        );
+        for (version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v == 17 || *v == 18) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [*version],
+            )
+            .unwrap();
+        }
+        let items_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let subtitle_before = subtitle_rows(&conn);
+        let metadata_before = status_histogram(&conn, "metadata_status");
+        let map_before = status_histogram(&conn, "map_status");
+        let probe_before = status_histogram(&conn, "probe_status");
+        let tracks_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_subtitle_tracks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let content_id_nonnull_before = non_null_count(&conn, "content_id");
+        let map_content_id_nonnull_before = non_null_count(&conn, "map_content_id");
+        eprintln!(
+            "before-019: schema=18 items={items_before}\n  \
+             subtitle_rows={}\n  metadata_status={metadata_before:?}\n  \
+             map_status={map_before:?}\n  probe_status={probe_before:?}\n  \
+             subtitle_tracks={tracks_before} content_id_nonnull={content_id_nonnull_before} \
+             map_content_id_nonnull={map_content_id_nonnull_before}",
+            subtitle_before.len()
+        );
+
+        let migration_19 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 19)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        conn.execute_batch(migration_19).unwrap();
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (19)", [])
+            .unwrap();
+        let wall = t0.elapsed();
+
+        let version_after: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let items_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let subtitle_after = subtitle_rows(&conn);
+        let metadata_after = status_histogram(&conn, "metadata_status");
+        let map_after = status_histogram(&conn, "map_status");
+        let probe_after = status_histogram(&conn, "probe_status");
+        let tracks_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_subtitle_tracks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let content_id_nonnull_after = non_null_count(&conn, "content_id");
+        let map_content_id_nonnull_after = non_null_count(&conn, "map_content_id");
+        let stamp_columns_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_items')
+                 WHERE name IN ('subtitle_source_mtime_ms', 'subtitle_source_size_bytes')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "after-019: schema={version_after} items={items_after} wall_ms={} \n  \
+             subtitle_rows={} stamp_columns_left={}\n  \
+             metadata_status={metadata_after:?}\n  map_status={map_after:?}\n  \
+             probe_status={probe_after:?}\n  subtitle_tracks={tracks_after} \
+             content_id_nonnull={content_id_nonnull_after} \
+             map_content_id_nonnull={map_content_id_nonnull_after}",
+            wall.as_millis(),
+            subtitle_after.len(),
+            stamp_columns_left
+        );
+
+        assert_eq!(items_before, items_after, "media_items COUNT must hold");
+        assert_eq!(version_after, 19);
+        assert_eq!(
+            stamp_columns_left, 0,
+            "both subtitle source-stamp columns are gone from media_items"
+        );
+        assert_eq!(
+            subtitle_before, subtitle_after,
+            "subtitle_status / subtitle_content_id unchanged for every row"
+        );
+        assert_eq!(
+            metadata_before, metadata_after,
+            "metadata_status histogram must not move on a column-drop rebuild"
+        );
+        assert_eq!(
+            map_before, map_after,
+            "map_status histogram must not move on a column-drop rebuild"
+        );
+        assert_eq!(
+            probe_before, probe_after,
+            "probe_status histogram must not move on a column-drop rebuild"
+        );
+        assert_eq!(
+            tracks_before, tracks_after,
+            "media_item_subtitle_tracks must be untouched by migration 019"
+        );
+        assert_eq!(
+            content_id_nonnull_before, content_id_nonnull_after,
+            "content_id nullability must not shift on the rebuild"
+        );
+        assert_eq!(
+            map_content_id_nonnull_before, map_content_id_nonnull_after,
+            "map_content_id nullability must not shift on the rebuild"
+        );
+    }
+
+    /// Non-NULL row count for a `media_items` column — the nullability probe
+    /// for column-drop migrations, where a rebuild can quietly add a default
+    /// or flip a `NOT NULL` on a surviving column.
+    fn non_null_count(conn: &Connection, column: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM media_items WHERE {column} IS NOT NULL"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// (id, subtitle_status, subtitle_content_id) for every row — the per-row
+    /// "nothing else changed" bar for migrations that must not shift subtitle
+    /// classification outcomes.
+    fn subtitle_rows(conn: &Connection) -> Vec<(i64, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, subtitle_status, COALESCE(subtitle_content_id, '')
+                 FROM media_items ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 }

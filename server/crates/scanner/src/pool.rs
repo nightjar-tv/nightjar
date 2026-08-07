@@ -28,9 +28,12 @@ pub enum WorkKind {
 
 /// Eager-pass progress snapshot (ADR-0041 Decision 8.8): queue depth is
 /// sampled live, completion count and rate are pool-wide for both bulk-reader
-/// kinds (subtitle extract + keyframe map build).
+/// kinds (subtitle extract + keyframe map build). The probe queue depth is
+/// included so tests and operators can see probe work waiting behind the
+/// reachability gate.
 #[derive(Debug, Clone, Copy)]
 pub struct BackgroundProgress {
+    pub queued_probes: usize,
     pub queued_extracts: usize,
     pub queued_maps: usize,
     pub completed: u64,
@@ -227,8 +230,9 @@ impl LibraryPool {
     /// same way other pool-internal background-job counters are exposed
     /// (e.g. [`LibraryPool::transition_count`]); no new HTTP surface.
     pub fn background_progress(&self) -> BackgroundProgress {
-        let (queued_extracts, queued_maps) = {
+        let (queued_probes, queued_extracts, queued_maps) = {
             let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let probes = queue.probes.len();
             let mut extracts = 0usize;
             let mut maps = 0usize;
             for item in &queue.background {
@@ -238,7 +242,7 @@ impl LibraryPool {
                     WorkKind::Probe => {}
                 }
             }
-            (extracts, maps)
+            (probes, extracts, maps)
         };
         let mut times = self
             .completion_times
@@ -246,6 +250,7 @@ impl LibraryPool {
             .unwrap_or_else(|e| e.into_inner());
         prune_completion_times(&mut times);
         BackgroundProgress {
+            queued_probes,
             queued_extracts,
             queued_maps,
             completed: self.completed_background.load(Ordering::Relaxed),
@@ -793,7 +798,11 @@ impl LibraryPool {
                 return;
             }
         };
-        let update = match probe::ffprobe(&abs) {
+        // ADR-0014 reachability signal reused as the in-flight cancel: the
+        // same pause set that blocks new starts aborts a running probe
+        // (ADR-0041 Decision 8.7 amendment, 2026-08-07).
+        let should_cancel = || self.availability.pause.is_paused(item.library_id);
+        let update = match probe::ffprobe(&abs, Some(&should_cancel)) {
             Ok(p) => {
                 // ADR-0041: classify at probe time, not by a later extract pass.
                 if let Err(e) = self.apply_subtitle_classification(item.item_id, &p) {
@@ -912,12 +921,7 @@ impl LibraryPool {
             .collect();
         self.db.replace_item_subtitle_tracks(item_id, &rows)?;
         let status = classify_subtitle_status(&kinds, self.subtitle_sidecar_presence(item_id)?);
-        let row = self
-            .db
-            .get_item(item_id)?
-            .ok_or_else(|| format!("item {item_id} missing during subtitle classification"))?;
-        self.db
-            .set_subtitle_status(item_id, status, Some(row.mtime_ms), Some(row.size_bytes))
+        self.db.set_subtitle_status(item_id, status)
     }
 
     /// Sidecar verdict for the classifier from the index-pass sidecar rows.
@@ -1015,12 +1019,7 @@ impl LibraryPool {
             &should_cancel,
         ) {
             Ok(ExtractOutcome::Ready) => {
-                if let Err(e) = self.db.set_subtitle_status(
-                    item.item_id,
-                    "ready",
-                    Some(row.mtime_ms),
-                    Some(row.size_bytes),
-                ) {
+                if let Err(e) = self.db.set_subtitle_status(item.item_id, "ready") {
                     tracing::warn!(item_id = item.item_id, error = %e, "set subtitle ready failed");
                 }
                 // Only successful runs count toward the 8.8 progress counter:
@@ -1028,12 +1027,7 @@ impl LibraryPool {
                 self.record_background_completion();
             }
             Ok(ExtractOutcome::None) => {
-                if let Err(e) = self.db.set_subtitle_status(
-                    item.item_id,
-                    "none",
-                    Some(row.mtime_ms),
-                    Some(row.size_bytes),
-                ) {
+                if let Err(e) = self.db.set_subtitle_status(item.item_id, "none") {
                     tracing::warn!(item_id = item.item_id, error = %e, "set subtitle none failed");
                 }
                 self.record_background_completion();
@@ -1048,12 +1042,7 @@ impl LibraryPool {
                     failed,
                     "subtitle extract partial; item stays eligible"
                 );
-                if let Err(e) = self.db.set_subtitle_status(
-                    item.item_id,
-                    "eligible",
-                    Some(row.mtime_ms),
-                    Some(row.size_bytes),
-                ) {
+                if let Err(e) = self.db.set_subtitle_status(item.item_id, "eligible") {
                     tracing::warn!(
                         item_id = item.item_id,
                         error = %e,
@@ -1087,17 +1076,13 @@ impl LibraryPool {
                         "subtitle extract unavailable"
                     );
                     if let Err(status_err) =
-                        self.db
-                            .set_subtitle_status(item.item_id, "unavailable", None, None)
+                        self.db.set_subtitle_status(item.item_id, "unavailable")
                     {
                         tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle unavailable failed");
                     }
                 } else {
                     tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract failed");
-                    if let Err(status_err) =
-                        self.db
-                            .set_subtitle_status(item.item_id, "error", None, None)
-                    {
+                    if let Err(status_err) = self.db.set_subtitle_status(item.item_id, "error") {
                         tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle error failed");
                     }
                 }

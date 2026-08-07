@@ -1,5 +1,6 @@
 -- ADR-0023: media-file identity + keyframe map shapes (Rule 4.9).
--- Writers land in a later slice; columns are nullable / pending until then.
+-- Columns start NULL / 'pending' until the writers (set_map_status,
+-- replace_keyframe_map) fill them.
 --
 -- MP4 virtual moov': rebuild per session (not cached). No moov artifact table.
 -- Cached moov' would need content_id like every other derived artifact.
