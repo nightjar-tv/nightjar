@@ -292,7 +292,7 @@ fn decide_for(
     tonemap_available: bool,
 ) -> nightjar_core::PlaybackDecision {
     let path_str = path.to_string_lossy();
-    match ffprobe(path) {
+    match ffprobe(path, None) {
         Ok(p) => decide_playback(
             &path_str,
             p.container.as_deref(),
@@ -440,7 +440,7 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
         assert_profile(case, "NO_HDR_WIDE", case.no_hdr, &no_hdr);
 
         if case.hdr_source {
-            let probe = ffprobe(&path).expect("ffprobe HDR axis file");
+            let probe = ffprobe(&path, None).expect("ffprobe HDR axis file");
             let plan = video_encode_plan(
                 probe.height.and_then(|h| u32::try_from(h).ok()),
                 probe.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),

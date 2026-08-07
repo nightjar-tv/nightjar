@@ -1,7 +1,7 @@
 # ADR-0023: Keyframe map and byte-offset session start
 
 - Status: accepted; amended 2026-08-06 (§2, §9, measured numbers — in place,
-  Rule 6.4)
+  Rule 6.4); amended 2026-08-07 (§6, subtitle mtime/size columns dropped)
 - Date: 2026-08-01
 - Gate: Phase 2 / Gate 2 (priority over remaining ADR-0022 profile work;
   schemas stay separate)
@@ -273,6 +273,19 @@ mtime/size alone is rejected for map invalidation.
 The fingerprint is an identity check, not a security boundary. SHA-256 is
 the digest in tree today; a lighter non-cryptographic hash is a fair later
 argument if cost shows up — do not hand-roll one.
+
+**Amended 2026-08-07 (scanner audit, Rule 4.11).** Extracted subtitles were
+already listed above as a `content_id`-governed derived artifact, but the
+scanner code that wrote `media_items.subtitle_status` never caught up: it
+still stamped `subtitle_source_mtime_ms` / `subtitle_source_size_bytes`
+(added in migration `005_subtitle_status.sql`, before this ADR existed)
+alongside `subtitle_content_id`, and nothing ever read the mtime/size pair
+back. Two invalidation stamps for one artifact, one of them dead weight —
+exactly the duplication Rule 4.11 names. `content_id` was already the
+decided mechanism; the columns were the pre-ADR leftover. Both columns are
+dropped in migration `019`. `subtitle_content_id` is the sole validity
+stamp for extracted subtitles, same as every other derived artifact this
+section lists.
 
 ### 7. On-disk / on-wire shapes (Rule 4.9 — before any writer)
 
