@@ -1,13 +1,17 @@
 # ADR-0023: Keyframe map and byte-offset session start
 
-- Status: accepted
+- Status: accepted; amended 2026-08-06 (§2, §9, measured numbers — in place,
+  Rule 6.4)
 - Date: 2026-08-01
 - Gate: Phase 2 / Gate 2 (priority over remaining ADR-0022 profile work;
   schemas stay separate)
 - Related: [ADR-0020](0020-copy-mode-segment-boundaries.md) (`landedMs`),
   [ADR-0022](0022-capability-profiles.md) (client reports; this is how the
   server reads), [ADR-0013](0013-subtitle-extraction-at-scan.md) /
-  [ADR-0019](0019-ass-burn-extract-at-scan.md) (derived artifacts)
+  [ADR-0019](0019-ass-burn-extract-at-scan.md) (derived artifacts),
+  [ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md)
+  (Rule 4.13 companion — the same on-demand rule applied to subtitle
+  extraction), Rule 4.13 (derived, on demand)
 
 ## Context
 
@@ -46,7 +50,7 @@ modes (§3). Do not let “byte-offset start” collapse them in prose or code.
 | Transcode sidx vs request (Matroska) | exact | same |
 | Copy offset = request → Cluster PTS | far Δ +1.42 s → +0.083 s | same + copy-offset note |
 | Library Matroska / MP4-family | 84.9% / **13.1%** | dogfood DB 24877 items |
-| MP4 faststart (moov before mdat), n=300 | **17%** faststart / **83%** end-moov | `mp4-faststart-2026-08-01` |
+| MP4 faststart (moov before mdat), n=300 | ~~**17%** faststart / **83%** end-moov~~ **superseded 2026-08-06: 25% / 75%**, n=32 (24 end-moov / 8 faststart) | `mp4-faststart-2026-08-01`; superseding sample size-confounded per the discipline note below — cite with n and transport |
 | End-moov dogfood `-ss 60` (historical cost class) | ~19 seeks / ~12 s | `far-seek-cluster-spawn` |
 | MP4 virtual faststart + `-ss` (warm spawn) | TC land ~1.3–1.6 s; sidx exact | `mp4-virtual-faststart-spawn-2026-08-01` |
 | MP4 virtual faststart + `-ss` (**after purge**, mid-seek) | Grey’s TC **1453 ms**; Mincemeat TC **1740 ms**; sidx exact | same harness post-purge; mincemeat-cold JSON |
@@ -84,23 +88,47 @@ sample offsets.
 Sparse enough for seek: one entry per video keyframe (or Cluster that starts
 a keyframe), ordered by PTS. Exact on-disk encoding is §7.
 
-### 2. Storage and scan cost
+### 2. Storage and scan cost (amended 2026-08-06, Rule 6.4 — build trigger changes; mechanism unchanged)
 
 **Index-first.** After `find_stream_info`, read the container index (Matroska
-Cues; MP4 `stss` / sample tables). That is a header-scale read for items with
-a usable index — estimated ~84% of the library (Matroska-dominated; Cues
-present on healthy remuxes).
+Cues; MP4 `stss` / sample tables). That is a header-scale read.
 
-**Packet walk** only where the index is missing or truncated — roughly the
-remaining ~16%, estimated on the order of **~10 hours** wall across this
-library at household NAS rates. One-time, **incremental on identity change**,
-**resumable**, and **must never block a rescan** (same scheduling class as
-subtitle extract under ADR-0013: probe/index finish; map builds in
-background).
+~~estimated ~84% of the library index-usable~~ **superseded: measured 100%
+(295 of 295), n=300, WiFi over a degraded array — an upper bound, cite with
+n and transport.** Median build 130 ms (Matroska) / 147 ms (MP4), p95 617 ms
+/ 340 ms, max 1,545 ms (Matroska). Coverage 99.9% median; 2 of 295 under
+98% (the DEF-8519 truncated-index class); 1 genuine `invalid EBML vint`
+(damaged file, parser must survive, not crash).
+
+**Packet walk** only where the index is missing or truncated.
+~~estimated on the order of **~10 hours** wall across this library~~
+**superseded: that population does not exist on this library — 0 of 295.**
+Measured packet-walk cost where it does apply (n=20): 21.8 s median, 261 s
+max, 141× the index cost, 39.8 MB/s. Keep the packet-walk fallback in code
+— it is the correct answer for a damaged index — but the design is no
+longer sized around a ~10-hour population that the measurement did not
+find. One-time, **incremental on identity change**, **resumable**.
 
 The truncation / usable-extent check is the same read as the DEF-8519 damage
 signal. Record **usable extent** and map completeness from that one pass
 when walking; do not schedule a second full demux for damage alone.
+
+**Trigger changes under Rule 4.13 (this amendment).** The map is no longer a
+scan-time, whole-library `pending` queue. It is built when a consumer asks:
+see §9. The mechanism above (index-first, packet-walk fallback, one-time,
+incremental, resumable) is unchanged; only when it runs changes. Retire the
+whole-library `map_status='pending'` enqueue at scan/index time — no schema
+change, `map_status` keeps its four values, scan simply stops writing
+`pending` rows for every item.
+
+**Shared pass with subtitle extract: rejected, not merely unmeasured.** The
+packet walk runs only where the index is missing or truncated (~1% of the
+library measured: 2 of 295 under 98% coverage, 1 EBML parse failure — on the
+order of 250 items at library scale). Standalone subtitle extraction
+(ADR-0041 §4) is ~199 items, all MP4-family `mov_text`. The intersection of
+two sub-1% populations is a handful of files or none. A shared ffmpeg pass
+would pay its complexity cost on every file needing *both* — do not build it
+and do not spend a measurement proving it further.
 
 ### 3. Session start — two mechanisms
 
@@ -311,11 +339,58 @@ covered. The old inode under an open FD may keep the in-flight producer
 honest until it exits; the next bind is the check.
 
 **Concurrency bound.** Map rebuild shares the existing library worker pool
-(ADR-0004 / ADR-0013): same 2–16 workers, probes first, background work
-(subtitle extract and map) behind the index gate unless priority. Do not
+(ADR-0004 / ADR-0013 / ADR-0041): same 2–16 workers, probes first. Do not
 grow a second unbounded walker queue — a season-wide *arr upgrade would
-otherwise saturate the share with packet walks on the ~16% without a usable
-index while someone is watching.
+otherwise saturate the share with packet walks on files without a usable
+index while someone is watching. **One bulk-reader gate covers map build
+too, not only subtitle extract (Rule 4.13, amended here).** A whole-file
+packet walk and a whole-file subtitle extract are the same class of reader
+against the same share; one library-root gate serialises both, whatever the
+trigger, so two independently-serial queues never become two concurrent
+readers.
+
+### 9. First-seek build trigger (added 2026-08-06, Rule 4.13)
+
+Retiring the whole-library `map_status='pending'` queue (§2) requires
+deciding what does build the map, and when a seek is allowed to use it.
+
+A session starting at position zero needs no map: the Matroska path opens
+the real file with no `-ss`. The map is required only when a seek happens.
+The client already fetches `GET /playbackInfo` when the item page opens,
+typically seconds before play — a 130 ms median build started there is warm
+before a session exists.
+
+1. **Build on `playbackInfo`.** Requesting playback info for an item with no
+   ready map (or a stale one, §6) enqueues a map build for that item,
+   from the container index, at above-background priority. Demand-driven:
+   this is a consumer asking, not a library sweep, so Rule 4.13 holds. Cost
+   of a title browsed and not watched: 130 ms and 333 KB (Matroska median).
+2. **Guarantee by session create, asynchronously.** If `playbackInfo` was
+   skipped or the build has not finished, session create starts (or joins)
+   the build. Never block the first segment: a play-from-start session
+   waits for nothing, because §3a/§3b only consult the map on seek.
+3. **On seek before the map is ready, wait for it — bounded.** ~1.5 s
+   against the 1,545 ms measured Matroska worst case (§2). This is the
+   inversion that decides the design: waiting ~600 ms beats the 7.1 s cold
+   `-ss` baseline (Context) by an order of magnitude, so **falling through
+   to `-ss` is worse than waiting**, and waiting is correct while the wait
+   is bounded and the build is already in flight.
+4. **`-ss` fallback (§8) fires only when the map genuinely failed** — the
+   damaged-index population, ~1% of the library (§2) — not merely because
+   the bounded wait in (3) has not yet elapsed.
+
+Jellyfin has no prior art here because they never built the map; their seek
+is `-ss -noaccurate_seek` and pays the cold cost every time.
+
+**Gate 2 gap, recorded plainly.** The claim table (Context) says the
+Matroska and MP4 mechanisms are proven, and they are — on the harness
+titles. Population is a separate claim: at the time of this amendment the
+dogfood DB shows 3 of 24,935 items mapped. *Mechanism proven* and
+*population covered* are different claims; do not let a cold reader infer
+far seek works today across the library from the mechanism claim alone. The
+demand-driven trigger in this section is what grows population coverage
+going forward, on titles that are actually browsed or played, rather than a
+scan-time sweep.
 
 ## Consequences
 
@@ -329,6 +404,14 @@ index while someone is watching.
   per-session, not a derived artifact.
 - Full-title playlist cook remains dead for cold-seek latency.
 - ADR-0022 stays a separate schema and slice.
+- **2026-08-06 amendment:** the map moves from a scan-time whole-library
+  queue to a per-session, `playbackInfo`-triggered build (Rule 4.13; §9).
+  Index-usable rate corrected to 100% (n=300, was ~84% estimated); the
+  ~10-hour packet-walk population does not exist on this library though the
+  fallback stays in code; MP4 faststart share corrected to 25% (n=32, was
+  17%). Population coverage (3 of 24,935 mapped) is recorded as a residual,
+  not closed by this amendment — it closes as titles are browsed/played
+  under the new trigger.
 
 ## Out of scope
 
@@ -348,4 +431,8 @@ index while someone is watching.
 - `nightjar-meta/notes/mp4-virtual-faststart-spawn-2026-08-01.md`
 - `nightjar-meta/notes/gate2-cold-purge-matrix-2026-08-01.md`
 - `nightjar-meta/notes/gate2-live-replace-dogfood.md`
+- `nightjar-meta/docs/derived-artifacts-slice-brief.md` (2026-08-06 amendment
+  source; `keyframe_index_probe.py` runs, n=300/n=20, WiFi over a degraded
+  array — figures are upper bounds, re-run without `--sample` once the array
+  rebuild finishes)
 - `nightjar-meta/notes/cut-rule-gating-2026-07-31.md` (elst / priming ~83 ms)

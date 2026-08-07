@@ -94,16 +94,6 @@ pub fn series_cache_key(show_id: i64) -> String {
     format!("series:{show_id}")
 }
 
-fn backoff_days(attempt_count: i32) -> i64 {
-    match attempt_count {
-        1 => 1,
-        2 => 7,
-        3 => 30,
-        _ => 90,
-    }
-}
-
-/// RFC3339 UTC timestamp for `now + days`.
 fn plus_days_rfc3339(now: &str, days: i64) -> Result<String, String> {
     // Keep deps thin: parse YYYY-MM-DDTHH:MM:SS… and add days via unix seconds.
     let secs = parse_rfc3339_secs(now)?;
@@ -266,7 +256,7 @@ pub fn record_miss(
         .filter(|e| e.cleaner_version == CLEANER_VERSION)
         .map(|e| e.attempt_count + 1)
         .unwrap_or(1);
-    let next = plus_days_rfc3339(now, backoff_days(attempt_count))?;
+    let next = plus_days_rfc3339(now, nightjar_db::backoff_days(i64::from(attempt_count)))?;
     conn.execute(
         "INSERT INTO metadata_negative_cache
             (provider, kind, query_key, reason, confidence, attempt_count,

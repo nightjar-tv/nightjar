@@ -10,8 +10,8 @@ pub use models::{LibraryKind, MediaKind};
 pub use playback::{
     AETHER_V0, BROWSER_V0, ClientCapabilityProfile, HdrCapability, MEDIA3_V0, MPV_V0,
     PlaybackDecision, PlaybackMethod, VideoEncodePlan, decide_playback, is_dolby_vision_profile5,
-    known_profile, method_from_manifest_expect, mime_for_path, resolve_profile,
-    resolve_profile_bag, video_encode_plan,
+    known_profile, method_from_manifest_expect, mime_for_path, needs_standalone_subtitle_extract,
+    resolve_profile, resolve_profile_bag, video_encode_plan,
 };
 pub use track_select::{
     DEFAULT_PREFERENCE_LANGUAGE, TrackCandidate, TrackSelection, select_audio_track,

@@ -17,6 +17,22 @@ pub struct ProbeResult {
     /// `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` (ADR-0022).
     /// Profile 5 is distinct: IPT-PQ has no zscale tonemap path.
     pub hdr: Option<String>,
+    /// Subtitle streams the container carries (ADR-0041 Decision 1). The
+    /// parser no longer drops them; the probe persists one row per stream.
+    pub subtitle_streams: Vec<ProbeSubtitleStream>,
+}
+
+/// One ffprobe-reported subtitle stream (ADR-0041 Decision 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSubtitleStream {
+    /// Absolute stream index (`index` from ffprobe).
+    pub stream_index: u32,
+    /// `codec_name`; `unknown` when ffprobe reports an unmapped codec.
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub forced: bool,
+    pub sdh: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +50,7 @@ struct FfFormat {
 
 #[derive(Debug, Deserialize)]
 struct FfStream {
+    index: Option<u32>,
     codec_type: Option<String>,
     codec_name: Option<String>,
     channels: Option<i64>,
@@ -42,7 +59,23 @@ struct FfStream {
     bit_rate: Option<String>,
     color_transfer: Option<String>,
     #[serde(default)]
+    tags: Option<FfTags>,
+    #[serde(default)]
+    disposition: Option<FfDisposition>,
+    #[serde(default)]
     side_data_list: Vec<FfSideData>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfTags {
+    language: Option<String>,
+    title: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfDisposition {
+    forced: Option<i64>,
+    hearing_impaired: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +150,7 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
     let mut height = None;
     let mut video_bitrate_bps = None;
     let mut hdr = None;
+    let mut subtitle_streams = Vec::new();
     for stream in parsed.streams.unwrap_or_default() {
         match stream.codec_type.as_deref() {
             Some("video") if video_codec.is_none() => {
@@ -138,6 +172,24 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
                 audio_codec = stream.codec_name;
                 audio_channels = stream.channels;
             }
+            Some("subtitle") => {
+                // A stream without an index cannot be keyed in the inventory
+                // table; ffprobe always reports `index` for -show_streams, so
+                // this is defensive only.
+                let Some(index) = stream.index else {
+                    continue;
+                };
+                let tags = stream.tags.unwrap_or_default();
+                let disp = stream.disposition.unwrap_or_default();
+                subtitle_streams.push(ProbeSubtitleStream {
+                    stream_index: index,
+                    codec: stream.codec_name.unwrap_or_else(|| "unknown".to_string()),
+                    language: tags.language,
+                    title: tags.title.filter(|t| !t.is_empty()),
+                    forced: disp.forced == Some(1),
+                    sdh: disp.hearing_impaired == Some(1),
+                });
+            }
             _ => {}
         }
     }
@@ -152,6 +204,7 @@ pub fn ffprobe(path: &Path) -> Result<ProbeResult, String> {
         height,
         video_bitrate_bps,
         hdr,
+        subtitle_streams,
     })
 }
 

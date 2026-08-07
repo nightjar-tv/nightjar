@@ -1,13 +1,22 @@
 use crate::probe;
 use crate::reachability::{self, Availability, Reachability, message_looks_unavailable};
 use crate::walk::WalkCache;
-use nightjar_db::{Db, ProbeUpdate};
-use nightjar_transcode::{ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles};
+use nightjar_db::{
+    Db, ProbeUpdate, SidecarPresence, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
+};
+use nightjar_transcode::{
+    ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles, is_burn_in_sidecar_format,
+    is_serveable_sidecar_format, subtitle_codec_kind,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+/// How recent a background completion must be to count in the rate estimate
+/// (ADR-0041 Decision 8.8).
+const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
@@ -15,6 +24,18 @@ pub enum WorkKind {
     Extract,
     /// Keyframe map build (ADR-0023). Shares the background queue with Extract.
     Map,
+}
+
+/// Eager-pass progress snapshot (ADR-0041 Decision 8.8): queue depth is
+/// sampled live, completion count and rate are pool-wide for both bulk-reader
+/// kinds (subtitle extract + keyframe map build).
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundProgress {
+    pub queued_extracts: usize,
+    pub queued_maps: usize,
+    pub completed: u64,
+    /// Completions per minute over the trailing 60 s window.
+    pub rate_per_min: f64,
 }
 
 #[derive(Clone)]
@@ -122,6 +143,16 @@ pub struct LibraryPool {
     extracting: Mutex<HashSet<i64>>,
     /// Item ids whose map worker is running (not merely queued).
     mapping: Mutex<HashSet<i64>>,
+    /// One bulk-reader gate (ADR-0041 Decision 8.6 / ADR-0023 §2 amendment):
+    /// a whole-file reader against a library root is the same class of load
+    /// whether it is a subtitle extract or a keyframe-map build; one gate
+    /// serialises both, whatever the trigger. Acquired at pop time in
+    /// [`LibraryPool::run_worker`]; `pub(crate)` so tests can hold it.
+    pub(crate) bulk_reader: Mutex<()>,
+    /// Completed background bulk-reader runs (ADR-0041 Decision 8.8).
+    completed_background: AtomicU64,
+    /// Completion timestamps within [`RATE_WINDOW`], for the rate estimate.
+    completion_times: Mutex<VecDeque<Instant>>,
     pub availability: Arc<Availability>,
 }
 
@@ -163,6 +194,9 @@ impl LibraryPool {
             index_active: AtomicUsize::new(0),
             extracting: Mutex::new(HashSet::new()),
             mapping: Mutex::new(HashSet::new()),
+            bulk_reader: Mutex::new(()),
+            completed_background: AtomicU64::new(0),
+            completion_times: Mutex::new(VecDeque::new()),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -187,6 +221,57 @@ impl LibraryPool {
 
     pub fn transition_count(&self) -> u64 {
         self.availability.transitions.load(Ordering::Relaxed)
+    }
+
+    /// Eager-pass progress snapshot (ADR-0041 Decision 8.8). Queryable the
+    /// same way other pool-internal background-job counters are exposed
+    /// (e.g. [`LibraryPool::transition_count`]); no new HTTP surface.
+    pub fn background_progress(&self) -> BackgroundProgress {
+        let (queued_extracts, queued_maps) = {
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut extracts = 0usize;
+            let mut maps = 0usize;
+            for item in &queue.background {
+                match item.kind {
+                    WorkKind::Extract => extracts += 1,
+                    WorkKind::Map => maps += 1,
+                    WorkKind::Probe => {}
+                }
+            }
+            (extracts, maps)
+        };
+        let mut times = self
+            .completion_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        prune_completion_times(&mut times);
+        BackgroundProgress {
+            queued_extracts,
+            queued_maps,
+            completed: self.completed_background.load(Ordering::Relaxed),
+            rate_per_min: times.len() as f64 / RATE_WINDOW.as_secs_f64() * 60.0,
+        }
+    }
+
+    /// Record one finished background bulk-reader run (extract or map) for the
+    /// Decision 8.8 counters.
+    fn record_background_completion(&self) {
+        self.completed_background.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut times = self
+                .completion_times
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            prune_completion_times(&mut times);
+            times.push_back(Instant::now());
+            if times.len() > 4096 {
+                times.pop_front();
+            }
+        }
+        tracing::debug!(
+            completed = self.completed_background.load(Ordering::Relaxed),
+            "background bulk-reader run finished"
+        );
     }
 
     pub fn record_index_duration_ms(&self, ms: u64) {
@@ -357,8 +442,6 @@ impl LibraryPool {
             }
             self.purge_queue_for_library(library_id);
             self.drain_pending_probes()?;
-            self.drain_pending_extracts()?;
-            self.drain_pending_maps()?;
         } else {
             tracing::info!(library_id, path, "library unreachable");
             self.purge_queue_for_library(library_id);
@@ -549,32 +632,24 @@ impl LibraryPool {
         Ok(n)
     }
 
-    pub fn drain_pending_extracts(&self) -> Result<(), String> {
-        for (item_id, path, _, _, library_id) in self.db.list_pending_subtitle_items()? {
-            let abs = match self.abs_media_path(library_id, &path) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(item_id, library_id, error = %e, "resolve path for pending extract");
-                    continue;
-                }
-            };
-            self.enqueue(WorkItem::extract(item_id, library_id, abs));
+    /// Whether a keyframe-map build for `item_id` is queued or in flight
+    /// (ADR-0023 §9.3). The API wires this to the session seek path so a
+    /// seek can wait, bounded, for a build a consumer already triggered
+    /// instead of paying the cold `-ss` cost.
+    pub fn map_build_pending(&self, item_id: i64) -> bool {
+        if self
+            .mapping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&item_id)
+        {
+            return true;
         }
-        Ok(())
-    }
-
-    pub fn drain_pending_maps(&self) -> Result<(), String> {
-        for (item_id, path, library_id) in self.db.list_pending_map_items()? {
-            let abs = match self.abs_media_path(library_id, &path) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(item_id, library_id, error = %e, "resolve path for pending map");
-                    continue;
-                }
-            };
-            self.enqueue(WorkItem::map(item_id, library_id, abs));
-        }
-        Ok(())
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue
+            .background
+            .iter()
+            .any(|w| w.kind == WorkKind::Map && w.item_id == item_id)
     }
 
     /// ADR-0030: join library root to stored relpath (absolute leftovers pass through).
@@ -613,7 +688,7 @@ impl LibraryPool {
 
     fn run_worker(&self) {
         loop {
-            let item = {
+            let (item, bulk_gate) = {
                 let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if let Some(item) = queue.probes.pop_front() {
@@ -628,19 +703,26 @@ impl LibraryPool {
                             }
                             continue;
                         }
-                        break item;
+                        break (item, None);
                     }
                     let index_busy = self.index_active.load(Ordering::SeqCst) != 0;
                     let should_pop = queue
                         .background
                         .front()
                         .is_some_and(|front| !index_busy || front.priority);
-                    let next_bg = should_pop.then(|| queue.background.pop_front()).flatten();
-                    if let Some(item) = next_bg {
-                        if self.availability.pause.is_paused(item.library_id) {
-                            continue;
+                    // One bulk-reader gate for extract and map (ADR-0041
+                    // Decision 8.6 / ADR-0023 §2): a whole-file reader never
+                    // starts while another is in flight. Acquired at pop time
+                    // so a queued item stays visible in the queue depth while
+                    // it waits, and probes can always preempt the wait.
+                    if should_pop && let Ok(gate) = self.bulk_reader.try_lock() {
+                        match queue.background.pop_front() {
+                            Some(item) if !self.availability.pause.is_paused(item.library_id) => {
+                                break (item, Some(gate));
+                            }
+                            // Paused or front changed: drop the gate and re-check.
+                            _ => continue,
                         }
-                        break item;
                     }
                     queue = self
                         .available
@@ -653,6 +735,12 @@ impl LibraryPool {
                 WorkKind::Probe => self.probe(item),
                 WorkKind::Extract => self.extract(item),
                 WorkKind::Map => self.map_item(item),
+            }
+            let gate_held = bulk_gate.is_some();
+            drop(bulk_gate);
+            if gate_held {
+                // Wake a worker waiting on the bulk-reader gate.
+                self.available.notify_all();
             }
         }
     }
@@ -706,20 +794,26 @@ impl LibraryPool {
             }
         };
         let update = match probe::ffprobe(&abs) {
-            Ok(p) => ProbeUpdate {
-                item_id: item.item_id,
-                duration_ms: p.duration_ms,
-                container: p.container,
-                video_codec: p.video_codec,
-                audio_codec: p.audio_codec,
-                audio_channels: p.audio_channels,
-                width: p.width,
-                height: p.height,
-                video_bitrate_bps: p.video_bitrate_bps,
-                hdr: p.hdr,
-                probe_status: "probed".into(),
-                scan_error: None,
-            },
+            Ok(p) => {
+                // ADR-0041: classify at probe time, not by a later extract pass.
+                if let Err(e) = self.apply_subtitle_classification(item.item_id, &p) {
+                    tracing::warn!(item_id = item.item_id, error = %e, "subtitle classification failed");
+                }
+                ProbeUpdate {
+                    item_id: item.item_id,
+                    duration_ms: p.duration_ms,
+                    container: p.container,
+                    video_codec: p.video_codec,
+                    audio_codec: p.audio_codec,
+                    audio_channels: p.audio_channels,
+                    width: p.width,
+                    height: p.height,
+                    video_bitrate_bps: p.video_bitrate_bps,
+                    hdr: p.hdr,
+                    probe_status: "probed".into(),
+                    scan_error: None,
+                }
+            }
             Err(e) => {
                 let unavailable = self.availability.pause.is_paused(item.library_id)
                     || message_looks_unavailable(&e)
@@ -788,6 +882,61 @@ impl LibraryPool {
         Self::finish_batch(&item);
     }
 
+    /// ADR-0041 Decisions 1–2: persist the probe's subtitle-stream inventory
+    /// and derive `subtitle_status` from it plus sidecar presence. Only runs
+    /// on a successful probe; a failed probe leaves the prior status (a fresh
+    /// item stays `pending`), so classification never guesses an outcome.
+    fn apply_subtitle_classification(
+        &self,
+        item_id: i64,
+        p: &probe::ProbeResult,
+    ) -> Result<(), String> {
+        let kinds: Vec<SubtitleTrackKind> = p
+            .subtitle_streams
+            .iter()
+            .map(|s| subtitle_codec_kind(&s.codec))
+            .collect();
+        let rows: Vec<SubtitleTrackRow> = p
+            .subtitle_streams
+            .iter()
+            .map(|s| SubtitleTrackRow {
+                media_item_id: item_id,
+                stream_index: i64::from(s.stream_index),
+                codec: s.codec.clone(),
+                language: s.language.clone(),
+                title: s.title.clone(),
+                forced: s.forced,
+                sdh: s.sdh,
+                kind: subtitle_codec_kind(&s.codec).as_str().to_string(),
+            })
+            .collect();
+        self.db.replace_item_subtitle_tracks(item_id, &rows)?;
+        let status = classify_subtitle_status(&kinds, self.subtitle_sidecar_presence(item_id)?);
+        let row = self
+            .db
+            .get_item(item_id)?
+            .ok_or_else(|| format!("item {item_id} missing during subtitle classification"))?;
+        self.db
+            .set_subtitle_status(item_id, status, Some(row.mtime_ms), Some(row.size_bytes))
+    }
+
+    /// Sidecar verdict for the classifier from the index-pass sidecar rows.
+    /// The convert rule stays single-implementation in transcode
+    /// (`is_serveable_sidecar_format` / `is_burn_in_sidecar_format`, Rule 4.11).
+    fn subtitle_sidecar_presence(&self, item_id: i64) -> Result<SidecarPresence, String> {
+        let mut presence = SidecarPresence::None;
+        for sidecar in self.db.list_item_sidecars(item_id)? {
+            if is_serveable_sidecar_format(&sidecar.format) {
+                presence = SidecarPresence::ConvertsToWebVtt;
+                break;
+            }
+            if is_burn_in_sidecar_format(&sidecar.format) {
+                presence = SidecarPresence::BurnInOnly;
+            }
+        }
+        Ok(presence)
+    }
+
     fn extract(&self, item: WorkItem) {
         if self.availability.pause.is_paused(item.library_id) {
             return;
@@ -854,7 +1003,17 @@ impl LibraryPool {
                 return;
             }
         };
-        match extract_item_subtitles(&self.subs, item.item_id, &media_path, &sidecars) {
+        // ADR-0014 reachability signal reused as the in-flight cancel: the
+        // same pause set that blocks new starts aborts a running demux
+        // (ADR-0041 Decision 8.7).
+        let should_cancel = || self.availability.pause.is_paused(item.library_id);
+        match extract_item_subtitles(
+            &self.subs,
+            item.item_id,
+            &media_path,
+            &sidecars,
+            &should_cancel,
+        ) {
             Ok(ExtractOutcome::Ready) => {
                 if let Err(e) = self.db.set_subtitle_status(
                     item.item_id,
@@ -864,6 +1023,9 @@ impl LibraryPool {
                 ) {
                     tracing::warn!(item_id = item.item_id, error = %e, "set subtitle ready failed");
                 }
+                // Only successful runs count toward the 8.8 progress counter:
+                // a cancelled / failed / refused pass must not look productive.
+                self.record_background_completion();
             }
             Ok(ExtractOutcome::None) => {
                 if let Err(e) = self.db.set_subtitle_status(
@@ -874,6 +1036,31 @@ impl LibraryPool {
                 ) {
                     tracing::warn!(item_id = item.item_id, error = %e, "set subtitle none failed");
                 }
+                self.record_background_completion();
+            }
+            Ok(ExtractOutcome::Partial { written, failed }) => {
+                // ADR-0041 Decision 8.4 / 6: never claim full `ready` for a
+                // partial result. The item stays eligible so a later pass can
+                // finish the missing tracks; the landed tracks are serveable.
+                tracing::warn!(
+                    item_id = item.item_id,
+                    written,
+                    failed,
+                    "subtitle extract partial; item stays eligible"
+                );
+                if let Err(e) = self.db.set_subtitle_status(
+                    item.item_id,
+                    "eligible",
+                    Some(row.mtime_ms),
+                    Some(row.size_bytes),
+                ) {
+                    tracing::warn!(
+                        item_id = item.item_id,
+                        error = %e,
+                        "set subtitle eligible failed"
+                    );
+                }
+                self.record_background_completion();
             }
             Err(e) if e.starts_with("subtitle extract refused:") => {
                 tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract deferred");
@@ -978,7 +1165,12 @@ impl LibraryPool {
                 }
             },
         };
-        match crate::keymap::build_keyframe_map(&media_path, row.duration_ms) {
+        // ADR-0014 reachability signal reused as the in-flight cancel for the
+        // packet-walk fallback (ADR-0041 Decision 8.7); the index read is a
+        // header-scale read and runs regardless.
+        let should_cancel = || self.availability.pause.is_paused(item.library_id);
+        match crate::keymap::build_keyframe_map(&media_path, row.duration_ms, Some(&should_cancel))
+        {
             Ok(built) => {
                 let entries: Vec<(i64, i64)> = built
                     .entries
@@ -1002,6 +1194,9 @@ impl LibraryPool {
                         kind = built.container_kind,
                         "keyframe map ready"
                     );
+                    // Only a stored map counts toward the 8.8 counter: a
+                    // cancelled / failed walk must not look productive.
+                    self.record_background_completion();
                 }
             }
             Err(e) => {
@@ -1029,6 +1224,14 @@ impl LibraryPool {
             }
         }
         finish();
+    }
+}
+
+/// Drop completion timestamps older than [`RATE_WINDOW`] (ADR-0041 8.8).
+fn prune_completion_times(times: &mut VecDeque<Instant>) {
+    let window = Instant::now() - RATE_WINDOW;
+    while times.front().is_some_and(|t| *t < window) {
+        times.pop_front();
     }
 }
 

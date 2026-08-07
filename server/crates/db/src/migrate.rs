@@ -41,6 +41,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/015_metadata_status_repairs.sql"),
     ),
     (16, include_str!("../migrations/016_series_identity.sql")),
+    (
+        17,
+        include_str!("../migrations/017_subtitle_track_inventory.sql"),
+    ),
+    (
+        18,
+        include_str!("../migrations/018_subtitle_extract_backoff.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -282,7 +290,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 16);
+        assert_eq!(v, 18);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -291,6 +299,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_series, 1);
+        let has_subtitle_tracks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_item_subtitle_tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_subtitle_tracks, 1);
+        let subtitle_track_kind_check: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_item_subtitle_tracks')
+                 WHERE name = 'kind'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(subtitle_track_kind_check, 1);
+        let has_subtitle_tracks_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_media_item_subtitle_tracks_item'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_subtitle_tracks_index, 1);
         let has_neg: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata_negative_cache'",
@@ -368,6 +402,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_reachable, 1);
+        // 018 (ADR-0041 Decision 8.3): subtitle retry state columns exist.
+        let has_attempt_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'subtitle_attempt_count'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_attempt_count, 1);
+        let has_next_retry_at: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'subtitle_next_retry_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_next_retry_at, 1);
         let has_content_id: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'content_id'",
@@ -747,6 +798,189 @@ mod tests {
         assert_eq!(n, 2);
     }
 
+    /// 017 (ADR-0041): the inventory table exists and `subtitle_status =
+    /// 'error'` rows reset to `pending` with their source stamps cleared, so a
+    /// re-probe re-derives them through Decision 2's classifier (Decision 9,
+    /// same pattern as migration 006's subtitle reset). `ready` rows and rows
+    /// with other statuses are untouched.
+    #[test]
+    fn migration_17_adds_inventory_and_resets_errors_to_pending() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(16) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, probe_status, subtitle_status,
+                subtitle_source_mtime_ms, subtitle_source_size_bytes
+             ) VALUES
+                (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie', 'probed', 'error', 7, 9),
+                (1, '/tmp/t/b.mkv', 1, 2, 'B', 'movie', 'probed', 'ready', 7, 9),
+                (1, '/tmp/t/c.mkv', 1, 2, 'C', 'movie', 'probed', 'unavailable', NULL, NULL);",
+        )
+        .unwrap();
+
+        let migration_17 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 17)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        conn.execute_batch(migration_17).unwrap();
+
+        let a_status: String = conn
+            .query_row(
+                "SELECT subtitle_status FROM media_items WHERE path = '/tmp/t/a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_status, "pending", "opaque error rows reset to pending");
+        let a_mtime: Option<i64> = conn
+            .query_row(
+                "SELECT subtitle_source_mtime_ms FROM media_items WHERE path = '/tmp/t/a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_mtime, None, "source stamps cleared like migration 006");
+        let b_status: String = conn
+            .query_row(
+                "SELECT subtitle_status FROM media_items WHERE path = '/tmp/t/b.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_status, "ready", "non-error rows untouched");
+        let c_status: String = conn
+            .query_row(
+                "SELECT subtitle_status FROM media_items WHERE path = '/tmp/t/c.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(c_status, "unavailable", "unavailable rows untouched");
+        let error_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items WHERE subtitle_status = 'error'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(error_count, 0);
+
+        let has_tracks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_item_subtitle_tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_tracks, 1);
+        // The new CHECK admits exactly the four kinds the classifier consumes.
+        let rejected = conn.execute(
+            "INSERT INTO media_item_subtitle_tracks
+                (media_item_id, stream_index, codec, kind)
+             VALUES (1, 0, 'bogus', 'bogus')",
+            [],
+        );
+        assert!(rejected.is_err(), "unknown kind must be rejected");
+        let accepted = conn.execute(
+            "INSERT INTO media_item_subtitle_tracks
+                (media_item_id, stream_index, codec, kind)
+             VALUES (1, 0, 'subrip', 'text')",
+            [],
+        );
+        assert!(accepted.is_ok(), "the four admitted kinds insert cleanly");
+    }
+
+    /// 018 (ADR-0041 Decision 8.3): the subtitle retry-state columns exist
+    /// with sane defaults and existing rows keep their status. Pure ADD
+    /// COLUMN, so idempotence is asserted at the SQL level by re-applying.
+    #[test]
+    fn migration_18_adds_subtitle_retry_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(17) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, subtitle_status
+             ) VALUES
+                (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie', 'unavailable'),
+                (1, '/tmp/t/b.mkv', 1, 2, 'B', 'movie', 'ready');",
+        )
+        .unwrap();
+
+        let migration_18 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 18)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        conn.execute_batch(migration_18).unwrap();
+
+        let status_a: String = conn
+            .query_row(
+                "SELECT subtitle_status FROM media_items WHERE path = '/tmp/t/a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_a, "unavailable", "existing status untouched");
+        let attempts_a: i64 = conn
+            .query_row(
+                "SELECT subtitle_attempt_count FROM media_items WHERE path = '/tmp/t/a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts_a, 0, "retry count defaults to 0");
+        let retry_a: Option<String> = conn
+            .query_row(
+                "SELECT subtitle_next_retry_at FROM media_items WHERE path = '/tmp/t/a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retry_a, None,
+            "no retry deadline until a failure is recorded"
+        );
+        let status_b: String = conn
+            .query_row(
+                "SELECT subtitle_status FROM media_items WHERE path = '/tmp/t/b.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_b, "ready");
+    }
+
     /// Copy a real dogfood DB, migrate through 012, print strip leftovers.
     /// Run: `NIGHTJAR_MIGRATE_COPY=/path/to/copy.db cargo test -p nightjar-db \
     ///   migrate_copy_through_012 -- --ignored --nocapture`
@@ -811,6 +1045,93 @@ mod tests {
         );
         assert_eq!(items_before, items_after, "media_items COUNT must hold");
         assert_eq!(sidecars_before, sidecars_after, "sidecars COUNT must hold");
-        assert_eq!(version_after, 13);
+        assert_eq!(version_after, 18);
+    }
+
+    fn status_histogram(conn: &Connection, column: &str) -> Vec<(String, i64)> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {column}, COUNT(*) FROM media_items GROUP BY {column} ORDER BY {column}"
+            ))
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Copy a real dogfood DB, migrate through 018, confirm the 783-row
+    /// `subtitle_status = 'error'` -> `pending` reset (migration 017) moved
+    /// exactly those rows and nothing else (ADR-0014 §5's before-equals-after
+    /// discipline, applied in spirit — 017 is a CREATE TABLE plus a filtered
+    /// UPDATE, not the ADD/DROP/RENAME copy dance §5 was written for, but the
+    /// same class of "opaque error reset touching real rows at scale" migration
+    /// 006 and 012 got this treatment for).
+    /// Run: `NIGHTJAR_MIGRATE_COPY=/path/to/copy.db cargo test -p nightjar-db \
+    ///   migrate_copy_through_017 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: needs NIGHTJAR_MIGRATE_COPY pointing at a disposable DB copy"]
+    fn migrate_copy_through_017() {
+        let path = std::env::var("NIGHTJAR_MIGRATE_COPY")
+            .expect("NIGHTJAR_MIGRATE_COPY must point at a disposable .db copy");
+        let conn = Connection::open(&path).unwrap();
+
+        let version_before: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let items_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let subtitle_before = status_histogram(&conn, "subtitle_status");
+        let metadata_before = status_histogram(&conn, "metadata_status");
+        let map_before = status_histogram(&conn, "map_status");
+        eprintln!(
+            "before: schema={version_before} items={items_before}\n  \
+             subtitle_status={subtitle_before:?}\n  metadata_status={metadata_before:?}\n  \
+             map_status={map_before:?}"
+        );
+
+        let t0 = std::time::Instant::now();
+        migrate(&conn).unwrap();
+        let wall = t0.elapsed();
+
+        let version_after: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let items_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let subtitle_after = status_histogram(&conn, "subtitle_status");
+        let metadata_after = status_histogram(&conn, "metadata_status");
+        let map_after = status_histogram(&conn, "map_status");
+        let tracks_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_item_subtitle_tracks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        eprintln!(
+            "after: schema={version_after} items={items_after} wall_ms={} \n  \
+             subtitle_status={subtitle_after:?}\n  metadata_status={metadata_after:?}\n  \
+             map_status={map_after:?}\n  subtitle_tracks_rows={tracks_after}",
+            wall.as_millis()
+        );
+
+        assert_eq!(items_before, items_after, "media_items COUNT must hold");
+        assert_eq!(version_after, 18);
+        assert_eq!(
+            metadata_before, metadata_after,
+            "metadata_status must be untouched"
+        );
+        assert_eq!(map_before, map_after, "map_status must be untouched");
+        assert_eq!(
+            tracks_after, 0,
+            "table created empty; probe populates it, not the migration"
+        );
     }
 }

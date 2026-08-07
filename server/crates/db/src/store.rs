@@ -3,7 +3,7 @@ use crate::paths::{
     fold_path, is_absolute_stored, require_library_root, require_relpath, resolve_media_path,
     to_relpath,
 };
-use crate::status::{parse_map_status, parse_probe_status, parse_subtitle_status};
+use crate::status::{backoff_days, parse_map_status, parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
@@ -160,6 +160,21 @@ pub struct SidecarRow {
     pub language: Option<String>,
     pub forced: bool,
     pub sdh: bool,
+}
+
+/// One persisted subtitle stream row in `media_item_subtitle_tracks`
+/// (ADR-0041 Decision 1). Written at probe time; a re-probe replaces the rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTrackRow {
+    pub media_item_id: i64,
+    pub stream_index: i64,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub forced: bool,
+    pub sdh: bool,
+    /// `text` | `ass` | `image` | `unknown` (migration 017 CHECK).
+    pub kind: String,
 }
 
 impl Db {
@@ -623,6 +638,35 @@ impl Db {
     ) -> Result<(), String> {
         let status = parse_subtitle_status(status)?;
         let conn = self.lock()?;
+        if status == "unavailable" {
+            // ADR-0041 Decision 8.3: every availability failure increments the
+            // attempt count and pushes the re-queue deadline out on the
+            // ADR-0026 §3 schedule (1d/7d/30d/90d cap), so a flapping mount
+            // cannot re-drain an unfinishable title on every reachability
+            // transition. `requeue_unavailable_for_library` gates on
+            // `subtitle_next_retry_at`.
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT subtitle_attempt_count FROM media_items WHERE id = ?1",
+                    params![item_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("read subtitle attempts for item {item_id}: {e}"))?;
+            let days = backoff_days(attempts.saturating_add(1));
+            conn.execute(
+                "UPDATE media_items SET
+                    subtitle_status = 'unavailable',
+                    subtitle_source_mtime_ms = NULL,
+                    subtitle_source_size_bytes = NULL,
+                    subtitle_content_id = NULL,
+                    subtitle_attempt_count = subtitle_attempt_count + 1,
+                    subtitle_next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
+                 WHERE id = ?1",
+                params![item_id, format!("+{days} days")],
+            )
+            .map_err(|e| format!("set subtitle unavailable for item {item_id}: {e}"))?;
+            return Ok(());
+        }
         conn.execute(
             "UPDATE media_items SET
                 subtitle_status = ?2,
@@ -631,7 +675,9 @@ impl Db {
                 subtitle_content_id = CASE
                     WHEN ?2 IN ('ready', 'none') THEN content_id
                     ELSE NULL
-                END
+                END,
+                subtitle_attempt_count = 0,
+                subtitle_next_retry_at = NULL
              WHERE id = ?1",
             params![item_id, status, source_mtime_ms, source_size_bytes],
         )
@@ -739,27 +785,6 @@ impl Db {
         Ok(())
     }
 
-    /// Returns (item_id, path, library_id) for maps that need building.
-    pub fn list_pending_map_items(&self) -> Result<Vec<(i64, String, i64)>, String> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, path, library_id FROM media_items
-                 WHERE map_status = 'pending'
-                    OR (map_status = 'ready' AND (
-                        map_content_id IS NULL
-                        OR content_id IS NULL
-                        OR map_content_id IS NOT content_id
-                    ))
-                 ORDER BY id",
-            )
-            .map_err(|e| format!("prepare pending map items: {e}"))?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(|e| format!("list pending map items: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read pending map items: {e}"))
-    }
-
     /// Keyframe map for a session start, or None when there is nothing
     /// usable: no ready map, or stamps that no longer match live identity.
     ///
@@ -824,7 +849,9 @@ impl Db {
             .execute(
                 "UPDATE media_items SET subtitle_status = 'pending',
                     subtitle_source_mtime_ms = NULL, subtitle_source_size_bytes = NULL
-                 WHERE library_id = ?1 AND subtitle_status = 'unavailable'",
+                 WHERE library_id = ?1 AND subtitle_status = 'unavailable'
+                   AND (subtitle_next_retry_at IS NULL
+                        OR subtitle_next_retry_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
                 [library_id],
             )
             .map_err(|e| format!("requeue unavailable extracts: {e}"))?;
@@ -856,27 +883,6 @@ impl Db {
     }
 
     /// Returns (item_id, path, mtime_ms, size_bytes, library_id).
-    #[allow(clippy::type_complexity)]
-    pub fn list_pending_subtitle_items(&self) -> Result<Vec<(i64, String, i64, i64, i64)>, String> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, path, mtime_ms, size_bytes, library_id FROM media_items
-                 WHERE subtitle_status = 'pending'
-                    OR (subtitle_status = 'ready' AND (
-                        subtitle_source_mtime_ms IS NOT mtime_ms
-                        OR subtitle_source_size_bytes IS NOT size_bytes
-                    ))",
-            )
-            .map_err(|e| format!("prepare pending subtitle items: {e}"))?;
-        stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
-        .map_err(|e| format!("list pending subtitle items: {e}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("read pending subtitle items: {e}"))
-    }
-
     pub fn list_all_item_ids(&self) -> Result<Vec<i64>, String> {
         let conn = self.lock()?;
         let mut stmt = conn
@@ -886,31 +892,6 @@ impl Db {
             .map_err(|e| format!("list item ids: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("read item ids: {e}"))
-    }
-
-    pub fn mark_items_subtitle_pending(&self, ids: &[i64]) -> Result<(), String> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let conn = self.lock()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin subtitle pending update: {e}"))?;
-        let mut stmt = tx
-            .prepare(
-                "UPDATE media_items SET subtitle_status = 'pending',
-                    subtitle_source_mtime_ms = NULL, subtitle_source_size_bytes = NULL
-                 WHERE id = ?1",
-            )
-            .map_err(|e| format!("prepare subtitle pending update: {e}"))?;
-        for id in ids {
-            stmt.execute([id])
-                .map_err(|e| format!("mark subtitle pending for item {id}: {e}"))?;
-        }
-        drop(stmt);
-        tx.commit()
-            .map_err(|e| format!("commit subtitle pending update: {e}"))?;
-        Ok(())
     }
 
     /// Delete items whose path fold is not in `keep_folds`. Never deletes
@@ -1049,6 +1030,74 @@ impl Db {
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(|e| format!("map sidecar: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Replace all subtitle-stream inventory rows for one media item
+    /// (ADR-0041 Decision 1, probe-time write; re-probe replaces the rows).
+    pub fn replace_item_subtitle_tracks(
+        &self,
+        media_item_id: i64,
+        tracks: &[SubtitleTrackRow],
+    ) -> Result<(), String> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin subtitle track replace: {e}"))?;
+        tx.execute(
+            "DELETE FROM media_item_subtitle_tracks WHERE media_item_id = ?1",
+            [media_item_id],
+        )
+        .map_err(|e| format!("clear subtitle tracks for item {media_item_id}: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO media_item_subtitle_tracks (
+                        media_item_id, stream_index, codec, language, title,
+                        forced, sdh, kind
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .map_err(|e| format!("prepare subtitle track insert: {e}"))?;
+            for t in tracks {
+                stmt.execute(params![
+                    media_item_id,
+                    t.stream_index,
+                    t.codec,
+                    t.language,
+                    t.title,
+                    t.forced as i64,
+                    t.sdh as i64,
+                    t.kind,
+                ])
+                .map_err(|e| format!("insert subtitle track {}: {e}", t.stream_index))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit subtitle track replace: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_item_subtitle_tracks(
+        &self,
+        media_item_id: i64,
+    ) -> Result<Vec<SubtitleTrackRow>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT media_item_id, stream_index, codec, language, title,
+                        forced, sdh, kind
+                 FROM media_item_subtitle_tracks
+                 WHERE media_item_id = ?1
+                 ORDER BY stream_index",
+            )
+            .map_err(|e| format!("prepare list subtitle tracks: {e}"))?;
+        let rows = stmt
+            .query_map([media_item_id], map_subtitle_track)
+            .map_err(|e| format!("list subtitle tracks for item {media_item_id}: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("map subtitle track: {e}"))?);
         }
         Ok(out)
     }
@@ -1361,6 +1410,21 @@ fn map_sidecar(r: &rusqlite::Row<'_>) -> rusqlite::Result<SidecarRow> {
     })
 }
 
+fn map_subtitle_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubtitleTrackRow> {
+    let forced: i64 = r.get(5)?;
+    let sdh: i64 = r.get(6)?;
+    Ok(SubtitleTrackRow {
+        media_item_id: r.get(0)?,
+        stream_index: r.get(1)?,
+        codec: r.get(2)?,
+        language: r.get(3)?,
+        title: r.get(4)?,
+        forced: forced != 0,
+        sdh: sdh != 0,
+        kind: r.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,6 +1466,70 @@ mod tests {
         item_id
     }
 
+    /// ADR-0023 §6/§8: a re-index of a changed file clears the stale map
+    /// rows; the item is left unmapped so the §9 demand trigger (playbackInfo
+    /// / session create) rebuilds it. The scan path never queues the whole
+    /// library, but the replace invalidation still holds.
+    #[test]
+    fn reindex_upsert_clears_stale_map_for_replaced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("nightjar.db")).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "films".into(),
+                path: "/films".into(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "clip.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 2,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some("1-aaa-bbb".into()),
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.replace_keyframe_map(item_id, "1-aaa-bbb", "matroska", &[(0, 100)], None)
+            .unwrap();
+        assert!(db.keyframe_map(item_id).unwrap().is_some());
+
+        // File replaced under the path: mtime and size moved.
+        db.upsert_items_indexed(
+            lib.id,
+            &[UpsertItem {
+                path: "clip.mkv".into(),
+                mtime_ms: 2,
+                size_bytes: 3,
+                title: "clip".into(),
+                kind: "movie".into(),
+                year: None,
+                season: None,
+                episode: None,
+                content_id: Some("2-ccc-ddd".into()),
+            }],
+        )
+        .unwrap();
+        assert!(
+            db.keyframe_map(item_id).unwrap().is_none(),
+            "stale byte offsets must not survive a replace"
+        );
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(
+            row.map_status, "pending",
+            "replaced item is unmapped until a consumer asks (ADR-0023 §9)"
+        );
+        assert!(row.map_content_id.is_none());
+    }
+
     /// ADR-0023 §4: a map is only usable while its stamp still matches the
     /// item's identity, so a replaced file reads as no map at all.
     #[test]
@@ -1417,5 +1545,200 @@ mod tests {
 
         db.set_content_id(item_id, "2-ccc-ddd").unwrap();
         assert!(db.keyframe_map(item_id).unwrap().is_none());
+    }
+
+    /// ADR-0041 Decision 1: probe-time inventory replace is delete+insert, so
+    /// a re-probe can never leave stale rows, and kind values survive the
+    /// migration-017 CHECK round-trip.
+    #[test]
+    fn subtitle_tracks_replace_and_list_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("nightjar.db")).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: "/t".into(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "clip.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 2,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        let first = vec![
+            SubtitleTrackRow {
+                media_item_id: item_id,
+                stream_index: 2,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                title: None,
+                forced: false,
+                sdh: true,
+                kind: "text".into(),
+            },
+            SubtitleTrackRow {
+                media_item_id: item_id,
+                stream_index: 3,
+                codec: "hdmv_pgs_subtitle".into(),
+                language: None,
+                title: None,
+                forced: false,
+                sdh: false,
+                kind: "image".into(),
+            },
+        ];
+        db.replace_item_subtitle_tracks(item_id, &first).unwrap();
+        assert_eq!(db.list_item_subtitle_tracks(item_id).unwrap(), first);
+
+        // A re-probe replaces, never appends: drop the image track, add an
+        // unknown-codec one.
+        let second = vec![SubtitleTrackRow {
+            media_item_id: item_id,
+            stream_index: 4,
+            codec: "".into(),
+            language: None,
+            title: None,
+            forced: false,
+            sdh: false,
+            kind: "unknown".into(),
+        }];
+        db.replace_item_subtitle_tracks(item_id, &second).unwrap();
+        assert_eq!(db.list_item_subtitle_tracks(item_id).unwrap(), second);
+    }
+
+    /// ADR-0041 Decision 8.3: an `unavailable` write records the attempt and
+    /// sets a re-queue deadline on the ADR-0026 §3 schedule; a later
+    /// reachability re-queue skips items still inside their backoff window and
+    /// requeues only those past it. Any non-`unavailable` write resets the
+    /// retry state.
+    #[test]
+    fn subtitle_unavailable_backs_off_across_requeue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("nightjar.db")).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: "/t".into(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[
+                    UpsertItem {
+                        path: "a.mkv".into(),
+                        mtime_ms: 1,
+                        size_bytes: 2,
+                        title: "a".into(),
+                        kind: "movie".into(),
+                        year: None,
+                        season: None,
+                        episode: None,
+                        content_id: None,
+                    },
+                    UpsertItem {
+                        path: "b.mkv".into(),
+                        mtime_ms: 1,
+                        size_bytes: 2,
+                        title: "b".into(),
+                        kind: "movie".into(),
+                        year: None,
+                        season: None,
+                        episode: None,
+                        content_id: None,
+                    },
+                    UpsertItem {
+                        path: "c.mkv".into(),
+                        mtime_ms: 1,
+                        size_bytes: 2,
+                        title: "c".into(),
+                        kind: "movie".into(),
+                        year: None,
+                        season: None,
+                        episode: None,
+                        content_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        // First failure: attempt 1, deadline one day out (ADR-0026 §3).
+        db.set_subtitle_status(a, "unavailable", None, None)
+            .unwrap();
+        db.set_subtitle_status(b, "unavailable", None, None)
+            .unwrap();
+        let retry_state = |id: i64| -> (i64, Option<String>) {
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT subtitle_attempt_count, subtitle_next_retry_at
+                     FROM media_items WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(retry_state(a).0, 1);
+        let (_, retry_a) = retry_state(a);
+        assert!(retry_a.is_some(), "first failure must set a retry deadline");
+        let (_, retry_b) = retry_state(b);
+        assert!(retry_b.is_some());
+
+        // A second failure escalates to 7 days.
+        db.set_subtitle_status(a, "unavailable", None, None)
+            .unwrap();
+        let (attempts_a2, retry_a2) = retry_state(a);
+        assert_eq!(attempts_a2, 2);
+        assert!(retry_a2.as_deref().unwrap() > retry_a.as_deref().unwrap());
+
+        // Requeue gate: all three items are unavailable, but only the one
+        // whose deadline has passed (c, expired by hand) is requeued. a and b
+        // stay unavailable until their deadlines expire.
+        db.set_subtitle_status(c, "unavailable", None, None)
+            .unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE media_items SET subtitle_next_retry_at = '2000-01-01T00:00:00.000Z'
+                 WHERE id = ?1",
+                [c],
+            )
+            .unwrap();
+        let (probes, extracts, maps) = db.requeue_unavailable_for_library(lib.id).unwrap();
+        assert_eq!(probes, 0);
+        assert_eq!(extracts, 1, "only c (deadline passed) may requeue now");
+        assert_eq!(maps, 0);
+        assert_eq!(
+            db.get_item(a).unwrap().unwrap().subtitle_status,
+            "unavailable",
+            "a stays inside its backoff window"
+        );
+        assert_eq!(
+            db.get_item(c).unwrap().unwrap().subtitle_status,
+            "pending",
+            "c requeued past its deadline"
+        );
+
+        // Any non-unavailable write resets the retry state.
+        db.set_subtitle_status(a, "eligible", Some(1), Some(2))
+            .unwrap();
+        let (attempts_a3, retry_a3) = retry_state(a);
+        assert_eq!(attempts_a3, 0);
+        assert_eq!(retry_a3, None);
     }
 }

@@ -59,14 +59,24 @@ const MAP_SHORTFALL_PCT: f64 = 0.02;
 /// Build the keyframe map for the video stream at `path`. `duration_ms` is
 /// the probed title duration, if known, used only to derive
 /// [`KeyframeMapBuild::usable_extent_ms`].
+///
+/// `should_cancel` is the library reachability signal (ADR-0014) checked
+/// while the packet-walk fallback runs: a whole-file reader is cancelled in
+/// flight when its library goes unreachable (ADR-0041 Decision 8.7). The
+/// index read is a header-scale read and is not cancellable.
 pub fn build_keyframe_map(
     path: &Path,
     duration_ms: Option<i64>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<KeyframeMapBuild, String> {
     let kind = detect_container_kind(path)?;
     let (entries, source) = match kind {
-        ContainerKind::Matroska => index_then_packet_walk(path, matroska::build_from_cues),
-        ContainerKind::Mp4 => index_then_packet_walk(path, mp4::build_from_sample_tables),
+        ContainerKind::Matroska => {
+            index_then_packet_walk(path, matroska::build_from_cues, should_cancel)
+        }
+        ContainerKind::Mp4 => {
+            index_then_packet_walk(path, mp4::build_from_sample_tables, should_cancel)
+        }
     }?;
 
     Ok(KeyframeMapBuild {
@@ -80,6 +90,7 @@ pub fn build_keyframe_map(
 fn index_then_packet_walk(
     path: &Path,
     build_index: impl Fn(&Path) -> Result<Vec<KeyframeEntry>, String>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<(Vec<KeyframeEntry>, &'static str), String> {
     match build_index(path) {
         Ok(entries) if !entries.is_empty() => return Ok((entries, "index")),
@@ -90,7 +101,7 @@ fn index_then_packet_walk(
             "keyframe index read failed; falling back to packet walk"
         ),
     }
-    let entries = packet_walk::walk(path)?;
+    let entries = packet_walk::walk(path, should_cancel)?;
     if entries.is_empty() {
         return Err(format!(
             "no keyframes found via index or packet walk: {}",
@@ -213,7 +224,7 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let build = build_keyframe_map(&path, Some(2000)).unwrap();
+        let build = build_keyframe_map(&path, Some(2000), None).unwrap();
         assert_eq!(build.container_kind, "matroska");
         assert!(!build.entries.is_empty());
         assert!(build.entries.windows(2).all(|w| w[0].pts_ms <= w[1].pts_ms));
@@ -225,7 +236,7 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let build = build_keyframe_map(&path, Some(2000)).unwrap();
+        let build = build_keyframe_map(&path, Some(2000), None).unwrap();
         assert_eq!(build.container_kind, "mp4");
         assert!(!build.entries.is_empty());
         assert!(build.entries.windows(2).all(|w| w[0].pts_ms <= w[1].pts_ms));
