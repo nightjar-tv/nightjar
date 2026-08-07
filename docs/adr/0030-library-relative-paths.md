@@ -392,7 +392,7 @@ if documented as unstable across repoint.
   unmatched count is `deferred_remove` until the next ordinary scan.
 - ADR-0025 §4 storage and grammar finally agree; derived path keys use
   the stored (sticky) relpath column.
-- Migration dry-run numbers: `notes/migration-012-dogfood-2026-08-03.md`
+- Migration dry-run numbers: `nightjar-meta/notes/migration-012-dogfood-2026-08-03.md`
   (24940/8583, zero leftovers). Gate 3 remount / Docker path-move
   verification against the live dogfood library remains outstanding.
 - v1 has no force-repoint: operators whose tree genuinely changed by more

@@ -137,7 +137,7 @@ path iOS/tvOS need).
    **fresh playlist URI per run** replace the synthetic full-title grid.
    Scrubber range comes from item / usable duration; far seek is
    `?startMs=` + new playlist URI (probe:
-   `scripts/playlist_shape_probe/RESULTS.md`). Transcode still force-IDRs
+   `nightjar-meta/scripts/playlist_shape_probe/RESULTS.md`). Transcode still force-IDRs
    on `SEGMENT_MS` (ADR-0008 §3); its time-keys fall on that grid.
 
 7. **Out-of-window segment requests are load-bearing 503s, not 404s.**

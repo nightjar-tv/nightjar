@@ -38,7 +38,7 @@
   key); strategy note
   (`nightjar-meta/notes/design/metadata-artwork-strategy.md`); two-tier
   design (`nightjar-meta/notes/design/metadata-two-tier-grid-strategy.md`);
-  grid measure (`notes/grid-fast-vs-full-metadata-2026-08-04.md`); match
+  grid measure (`nightjar-meta/notes/grid-fast-vs-full-metadata-2026-08-04.md`); match
   spike (`nightjar-meta/notes/fts-vs-search-match-quality-2026-08-02.md`);
   Phase 3 Block 1 (`nightjar-meta/docs/PHASE_3_REVISED.md`)
 
@@ -572,7 +572,7 @@ owns the evaluator.
 
 **Prediction (search tier):** dogfood Visible ~80 units; measured
 search-only + CDN model ≈ **~28 s** path-known
-(`notes/grid-fast-vs-full-metadata-2026-08-04.md`). Full enrich
+(`nightjar-meta/notes/grid-fast-vs-full-metadata-2026-08-04.md`). Full enrich
 (detail + seasons) is ~5–14× slower depending on TV share and is **not**
 on the adult first-screen critical path once two-tier is live.
 

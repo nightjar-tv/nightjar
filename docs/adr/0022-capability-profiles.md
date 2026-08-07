@@ -93,13 +93,13 @@ runtime.
 Regression coverage for the graph: committed synthetic PQ (`hevc_hdr10_mp4`)
 and HLG (`hevc_hlg_mp4`) assert encode labels are BT.709; a measured
 retag-vs-tonemap MAD floor proves **not-retag only** (not beauty) —
-`notes/hdr-tonemap-delta-2026-08-01.md`.
+`nightjar-meta/notes/hdr-tonemap-delta-2026-08-01.md`.
 
 **Beauty / product inspection (Proven by inspection, not measured).** Kit
-titles: `notes/hdr-tonemap-beauty-2026-08-01.md` (2026-08-01). Product HLS
+titles: `nightjar-meta/notes/hdr-tonemap-beauty-2026-08-01.md` (2026-08-01). Product HLS
 web-player inspection 2026-08-02 (Garrett): HDR10, P8.1, P7 MEL, P7 FEL
 correct; P8.4 visual unknown; P5 failed session via named refuse —
-`notes/hw/libplacebo-dv-spike-2026-08-02.md`.
+`nightjar-meta/notes/hw/libplacebo-dv-spike-2026-08-02.md`.
 
 ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
@@ -190,7 +190,7 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   (modelled decide rates; not a measured client bake-off), host `zscale`
   probe with decide reason + **415 refuse-before-spawn** when tonemap is
   required and unavailable. Profile 5: named refuse, no tonemap attempt.
-  MAD regression is not-retag only (`notes/hdr-tonemap-delta-2026-08-01.md`).
+  MAD regression is not-retag only (`nightjar-meta/notes/hdr-tonemap-delta-2026-08-01.md`).
   Kit / product picture claims are **Proven by inspection** where dated —
   not measured Gate metrics.
 - Amendment (2026-08-02): §5 splits capability from policy so Phase 3 does not
