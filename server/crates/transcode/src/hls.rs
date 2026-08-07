@@ -1069,6 +1069,23 @@ impl HlsSessionRegistry {
 
         let spawn_started = Instant::now();
         let mut map_binding = MapBinding::new(keyframe_map);
+        // ADR-0023 §9.3: a session create that arrives before the keyframe
+        // map is ready waits, bounded, for the build the consumer already
+        // triggered (playbackInfo or this session create), then uses the
+        // fresh map. Position zero never waits — the Matroska path opens the
+        // real file there. The §8 `-ss` fallback stays for genuine map
+        // failure (§9.4), not for a bounded wait that has not yet elapsed.
+        // The predicate is cloned out of the lock so the blocking wait below
+        // never holds the registry mutex.
+        if play_start_ms > 0 && map_binding.map.is_none() {
+            let map_build_in_flight = self
+                .map_build_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            map_binding.map =
+                wait_for_map_build(item_id, self.db.as_ref(), map_build_in_flight.as_ref());
+        }
         let mut plan = map_binding.plan(src, play_start_ms);
         let start_ms = plan.window_start_ms;
         write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
@@ -2033,7 +2050,11 @@ fn restart_at(
     // §8 `-ss` fallback stays for genuine map failure (§9.4), not for a
     // bounded wait that has not yet elapsed.
     if play_start_ms > 0 && session.map_binding.map.is_none() {
-        session.map_binding.map = wait_for_map_build(session);
+        session.map_binding.map = wait_for_map_build(
+            session.item_id,
+            session.db.as_ref(),
+            session.map_build_in_flight.as_ref(),
+        );
     }
     let mut plan = session.map_binding.plan(&session.src, play_start_ms);
     let start_ms = plan.window_start_ms;
@@ -2732,6 +2753,10 @@ impl MapBinding {
     /// (ADR-0023 §8). A map problem never fails the session.
     fn plan(&mut self, src: &Path, play_start_ms: u64) -> StartPlan {
         let Some(map) = self.map.take() else {
+            tracing::info!(
+                path = %src.display(),
+                "no keyframe map yet; using -ss, build enqueued"
+            );
             return ss_start_plan(src, play_start_ms, 0);
         };
         let cost_ms = match crate::virtual_input::verify_identity(src, &map.content_id) {
@@ -2795,20 +2820,26 @@ fn ss_start_plan(src: &Path, play_start_ms: u64, fingerprint_cost_ms: u128) -> S
 /// worth paying while a build is actually running, so the predicate is
 /// consulted; a never-built item falls through immediately (§9.4: the `-ss`
 /// fallback is for genuine map failure, not for a wait that has not elapsed).
-fn wait_for_map_build(session: &Session) -> Option<crate::virtual_input::KeyframeMap> {
-    let db = session.db.as_ref()?;
+/// `start()` calls it before the session exists, so the three values a live
+/// `Session` carries are passed explicitly.
+fn wait_for_map_build(
+    item_id: i64,
+    db: Option<&Arc<Db>>,
+    in_flight: Option<&Arc<MapBuildInFlight>>,
+) -> Option<crate::virtual_input::KeyframeMap> {
+    let db = db?;
     // The build may have landed since the session started (or since the last
     // seek): use it without waiting.
-    if let Some(rows) = db.keyframe_map(session.item_id).ok().flatten() {
+    if let Some(rows) = db.keyframe_map(item_id).ok().flatten() {
         return crate::virtual_input::KeyframeMap::from_db_rows(&rows);
     }
-    let in_flight = session.map_build_in_flight.as_ref()?;
-    if !in_flight(session.item_id) {
+    let in_flight = in_flight?;
+    if !in_flight(item_id) {
         return None;
     }
     let deadline = Instant::now() + MAP_BUILD_WAIT;
     loop {
-        if let Some(rows) = db.keyframe_map(session.item_id).ok().flatten() {
+        if let Some(rows) = db.keyframe_map(item_id).ok().flatten() {
             return crate::virtual_input::KeyframeMap::from_db_rows(&rows);
         }
         let now = Instant::now();
@@ -7434,6 +7465,222 @@ mod tests {
             );
             assert_eq!(session.start_ms, 2000, "-ss respawn at the seek point");
             assert!(!session.primed, "a respawn, not a segment-map serve");
+        }
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.3: the bounded wait is not only for seeks. A session
+    /// create at a mid-title position whose keyframe map has not been built
+    /// waits, bounded, for the build a consumer already triggered, then
+    /// starts from the fresh map instead of paying the §8 `-ss` cost. This
+    /// is `seek_waits_for_in_flight_map_build_then_lands_mapped` applied to
+    /// `start()` directly, without the initial zero-start run.
+    #[test]
+    fn start_waits_for_in_flight_map_build_then_lands_mapped() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let content_id = nightjar_db::content_id_for_path(&src).unwrap();
+        let db = map_item_db(dir.path(), &content_id);
+        let entries: Vec<(i64, i64)> = matroska_entries(&src)
+            .iter()
+            .map(|e| {
+                (
+                    i64::try_from(e.pts_ms).unwrap(),
+                    i64::try_from(e.byte_offset).unwrap(),
+                )
+            })
+            .collect();
+        let land_ms = matroska_entries(&src)
+            .iter()
+            .rev()
+            .find(|e| e.pts_ms <= 2000)
+            .map(|e| e.pts_ms)
+            .expect("land at or before the start point");
+
+        let reg = HlsSessionRegistry::with_cap(
+            dir.path().join("hls"),
+            3,
+            "libx264",
+            None,
+            Some(db.clone()),
+        )
+        .unwrap();
+        // The predicate is what start consults to decide the wait is worth
+        // it; it also tells the build thread the session is asking.
+        let build_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let build_go_in_pred = Arc::clone(&build_go);
+        let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let consulted_in_pred = Arc::clone(&consulted);
+        reg.set_map_build_in_flight(Some(Arc::new(move |_item_id: i64| {
+            consulted_in_pred.store(true, Ordering::SeqCst);
+            build_go_in_pred.store(true, Ordering::SeqCst);
+            true
+        })));
+        let build_db = Arc::clone(&db);
+        let build_entries = entries.clone();
+        std::thread::spawn(move || {
+            while !build_go.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Land inside the §9.3 bound, the way a real index read does.
+            std::thread::sleep(Duration::from_millis(250));
+            build_db
+                .replace_keyframe_map(1, &content_id, "matroska", &build_entries, None)
+                .unwrap();
+        });
+
+        let id = reg
+            .start(
+                1,
+                &src,
+                2000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            consulted.load(Ordering::SeqCst),
+            "mid-title start must consult the build-in-flight state"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_some(),
+                "start must use the map the bounded wait produced"
+            );
+            assert_eq!(
+                session.start_ms, land_ms,
+                "encode window is the land Cluster PTS, not an -ss lead-in"
+            );
+        }
+        assert!(!reg.map_fallback(&id), "map landed; no §8 fallback");
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.3/§9.4: the create-path wait is bounded too. A build that
+    /// never lands (the damaged-index class) must fall through to the §8
+    /// `-ss` plan after the ~1.5 s bound — not hang, and not fall through
+    /// early. This is `seek_wait_is_bounded_when_build_never_lands` applied
+    /// to `start()` directly.
+    #[test]
+    fn start_wait_is_bounded_when_build_never_lands() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let db = map_item_db(dir.path(), &nightjar_db::content_id_for_path(&src).unwrap());
+
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, Some(db))
+                .unwrap();
+        reg.set_map_build_in_flight(Some(Arc::new(|_item_id: i64| true)));
+
+        let before = Instant::now();
+        let id = reg
+            .start(
+                1,
+                &src,
+                2000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        let waited = before.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1200),
+            "start must wait the bound for the in-flight build: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "start wait must be bounded, not hang: {waited:?}"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_none(),
+                "no map landed; the run must be a plain -ss start"
+            );
+            assert_eq!(session.start_ms, 2000, "-ss start at the seek point");
+        }
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.2: a position-zero session create never waits on the map.
+    /// When the build-in-flight predicate says a build is running, `start()`
+    /// at `start_ms: 0` still returns near-instantly (no `MAP_BUILD_WAIT`
+    /// delay) and lands `-ss` — the Matroska path opens the real file there.
+    /// This is `seek_with_no_build_in_flight_falls_to_ss_without_waiting`'s
+    /// sibling for the create path.
+    #[test]
+    fn position_zero_start_does_not_wait_for_map_build() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let db = map_item_db(dir.path(), &nightjar_db::content_id_for_path(&src).unwrap());
+
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, Some(db))
+                .unwrap();
+        // A build is running: if start waited, this call would block for the
+        // whole bound.
+        reg.set_map_build_in_flight(Some(Arc::new(|_item_id: i64| true)));
+
+        let before = Instant::now();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        let waited = before.elapsed();
+        assert!(
+            waited < Duration::from_millis(1200),
+            "position-zero start must not wait on the build: {waited:?}"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert_eq!(session.play_start_ms, 0);
+            assert_eq!(session.start_ms, 0, "-ss start at the play point");
+            assert!(
+                session.map_binding.bound.is_none(),
+                "real file at zero; no virtual file"
+            );
         }
         reg.stop(&id);
     }
