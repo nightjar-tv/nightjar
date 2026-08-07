@@ -15,11 +15,12 @@ use nightjar_core::{
     select_audio_track, select_subtitle_track, video_encode_plan,
 };
 use nightjar_db::MediaItemRow;
+use nightjar_db::SubtitleTrackRow;
 use nightjar_db::resolve_media_path;
 use nightjar_transcode::{
-    AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeEntry, KeyframeMap,
-    MapContainerKind, PlaylistError, SessionMode, StartSessionError, burn_in_kind_for_codec,
-    list_audio_tracks, list_burn_in_subtitles,
+    AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeMap, PiggybackExtract,
+    PlaylistError, SessionMode, StartSessionError, burn_in_kind_for_codec, list_audio_tracks,
+    list_burn_in_subtitles,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -176,14 +177,6 @@ pub async fn start(
         }
     };
 
-    // First-play: sessions (remux/transcode) hit the same cold-title latency
-    // as direct play, so bump extract here too (ADR-0013 §11).
-    if row.subtitle_status == "pending" {
-        state
-            .pool
-            .prioritize_extract(row.id, row.library_id, abs_path(&lib_root, &row.path));
-    }
-
     let start_ms = query.start_ms.unwrap_or(0);
     let keyframe_map = keyframe_map_for(&state, &row);
     let encode_plan = video_encode_plan(
@@ -206,6 +199,14 @@ pub async fn start(
             message: decision.reason.clone(),
         });
     }
+    let piggyback = match state.db.list_item_subtitle_tracks(row.id) {
+        Ok(tracks) => piggyback_track_for(&row.subtitle_status, &tracks)
+            .map(|track_id| PiggybackExtract { track_id }),
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "piggyback eligibility read failed");
+            None
+        }
+    };
     let hls = Arc::clone(&state.hls);
     let hls_for_start = Arc::clone(&hls);
     let src = abs_path(&lib_root, &row.path);
@@ -222,6 +223,7 @@ pub async fn start(
             burn_in,
             keyframe_map,
             encode_plan,
+            piggyback,
         )
     })
     .await
@@ -255,30 +257,14 @@ pub async fn start(
 /// on the real file and a rebuild goes on the library pool. Identity is
 /// re-checked against the bytes on disk at every bind, inside the session.
 fn keyframe_map_for(state: &AppState, row: &MediaItemRow) -> Option<KeyframeMap> {
-    let rows = match state.db.keyframe_map(row.id) {
-        Ok(rows) => rows,
+    let map = match state.db.keyframe_map(row.id) {
+        Ok(Some(rows)) => KeyframeMap::from_db_rows(&rows),
+        Ok(None) => None,
         Err(e) => {
             tracing::warn!(item_id = row.id, error = %e, "keyframe map read failed at session start");
             None
         }
     };
-    let map = rows.and_then(|rows| {
-        let container_kind = MapContainerKind::parse(&rows.container_kind)?;
-        Some(KeyframeMap {
-            container_kind,
-            content_id: rows.content_id,
-            entries: rows
-                .entries
-                .iter()
-                .filter_map(|&(pts_ms, byte_offset)| {
-                    Some(KeyframeEntry {
-                        pts_ms: u64::try_from(pts_ms).ok()?,
-                        byte_offset: u64::try_from(byte_offset).ok()?,
-                    })
-                })
-                .collect(),
-        })
-    });
     if map.is_none() {
         request_map_rebuild(state, row);
     }
@@ -287,7 +273,7 @@ fn keyframe_map_for(state: &AppState, row: &MediaItemRow) -> Option<KeyframeMap>
 
 /// Puts a map build at the front of the library pool's background work
 /// (ADR-0023 §8). Already pending or in flight is a no-op.
-fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
+pub(crate) fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
     let Ok(root) = library_root(state, row.library_id) else {
         return;
     };
@@ -445,6 +431,27 @@ fn stored_channels(row: &MediaItemRow) -> u32 {
     row.audio_channels
         .and_then(|c| u32::try_from(c).ok())
         .unwrap_or(u32::MAX)
+}
+
+/// ADR-0041 Decision 7: piggyback target for a session on an `eligible` item.
+/// The session's ffmpeg side output (`-map 0:s?` + `-c:s webvtt`) is only
+/// safe when the source holds exactly one embedded text or ASS track: the
+/// HLS muxer accepts a single WebVTT subtitle stream — a second subtitle
+/// output, an image stream (PGS/VobSub), or an unknown codec fails the whole
+/// session. Every other `eligible` item stays `eligible` for a standalone or
+/// later pass. Returns the library track id to publish on completion.
+fn piggyback_track_for(status: &str, tracks: &[SubtitleTrackRow]) -> Option<String> {
+    if status != "eligible" {
+        return None;
+    }
+    if tracks.len() != 1 {
+        return None;
+    }
+    let t = &tracks[0];
+    if !matches!(t.kind.as_str(), "text" | "ass") {
+        return None;
+    }
+    Some(format!("e{}", t.stream_index))
 }
 
 fn snapshot_hls_tracks(
@@ -864,5 +871,53 @@ pub async fn delete(
         // Idempotent teardown: already gone is fine for player unmount.
         log_hls_client_req(&session_id, "DELETE /sessions", None, 204, None);
         Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(stream_index: i64, kind: &str) -> SubtitleTrackRow {
+        SubtitleTrackRow {
+            media_item_id: 1,
+            stream_index,
+            codec: "subrip".into(),
+            language: None,
+            title: None,
+            forced: false,
+            sdh: false,
+            kind: kind.into(),
+        }
+    }
+
+    /// ADR-0041 Decision 7 gate, table-driven: the piggyback fires only for
+    /// an `eligible` item holding exactly one embedded text or ASS track.
+    #[test]
+    fn piggyback_track_gate() {
+        let cases: &[(&str, &[SubtitleTrackRow], Option<&str>)] = &[
+            // Not eligible: no piggyback, whatever the inventory says.
+            ("ready", &[row(2, "text")], None),
+            ("none", &[row(2, "text")], None),
+            ("pending", &[row(2, "text")], None),
+            // Eligible with exactly one text track → piggyback it.
+            ("eligible", &[row(2, "text")], Some("e2")),
+            ("eligible", &[row(7, "ass")], Some("e7")),
+            // Multi-track eligible items stay on a standalone/later pass
+            // (the HLS muxer accepts one WebVTT subtitle stream per session).
+            ("eligible", &[row(2, "text"), row(3, "text")], None),
+            ("eligible", &[row(2, "text"), row(3, "image")], None),
+            ("eligible", &[row(2, "unknown")], None),
+            ("eligible", &[row(2, "image")], None),
+            // Eligible with no embedded rows (sidecar-only) has no side output.
+            ("eligible", &[], None),
+        ];
+        for (status, tracks, expected) in cases {
+            assert_eq!(
+                piggyback_track_for(status, tracks).as_deref(),
+                *expected,
+                "status={status} tracks={tracks:?}"
+            );
+        }
     }
 }

@@ -50,6 +50,23 @@ scripts/__pycache__/
 # Gate 2 orphan soak live logs (script is tracked; runs are local)
 notes/gate2/
 
+# Hardware encode-leg spike output: raw .mp4 test clips (GIT_RULES.md §4 bars
+# media outside testdata/, which is Git LFS only). Local scratch, never ship.
+notes/hw/encode-leg-spike-mac/
+
+# Stray npm lockfile from a misdirected `npm init`/`npm install` in notes/ —
+# no package.json alongside it, empty dependency graph, not part of any
+# tracked tool. Local scratch, never ship.
+notes/package-lock.json
+
+# Raw (unhashed) probe CSVs from subtitle_inventory_scan.py /
+# keyframe_index_probe.py / client_timeline_probe.py: real filesystem paths,
+# never committed. Run those scripts with --hash-paths for anything meant to
+# be committed; if you must keep a raw copy locally, name it with -raw so it
+# is caught here.
+notes/*-raw*.csv
+notes/*.raw.csv
+
 
 # Local toolchains / container caches (never ship)
 .tools/

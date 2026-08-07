@@ -1,6 +1,9 @@
 # ADR-0013: Subtitle extraction at scan time
 
-- Status: accepted
+- Status: accepted; **§1 and §2 superseded 2026-08-06 by
+  [ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md)**
+  (probe-time classification and client/method-gated on-demand trigger,
+  replacing the unconditional scan-time enqueue below). §3–§12 stand.
 - Date: 2026-07-26
 - Supersedes: ADR-0010 §7 (byte-capped subtitle cache and playback-time extract)
 
@@ -38,6 +41,14 @@ and playback serves the wrong language. Our `trackId` discipline
 this ADR records that as the reason, and the tests below lock it.
 
 ## Decision
+
+**§1 and §2 below are superseded by
+[ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md)**:
+extraction is no longer enqueued unconditionally at scan time; it is
+classified at probe time and triggered on demand, gated by client and
+method. Read them here only for the "never at playback" and "below probe
+priority" framing that ADR-0041 keeps; the enqueue trigger they describe no
+longer runs.
 
 1. **Extract at scan time, never at playback.** Subtitle extraction is a
    background job enqueued when an item is indexed or its source

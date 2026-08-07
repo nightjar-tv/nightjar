@@ -9,7 +9,8 @@ use axum::{
 };
 use nightjar_core::{
     BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
-    known_profile, resolve_profile_bag, title_looks_forced, title_looks_sdh,
+    known_profile, needs_standalone_subtitle_extract, resolve_profile_bag, title_looks_forced,
+    title_looks_sdh,
 };
 use nightjar_db::{MediaItemRow, SidecarRow, resolve_media_path};
 use nightjar_transcode::{
@@ -231,12 +232,26 @@ pub async fn playback_info(
         }
     };
 
-    // First-play: bump this title's extract ahead of the background drain so
-    // progressive cues can start while the user is watching (ADR-0013 §11).
-    if row.subtitle_status == "pending" {
+    // ADR-0041 Decision 5: the on-demand trigger. Standalone extraction runs
+    // only for an `eligible` item on a client that cannot read embedded
+    // container subtitles (Decision 3) via a method that will not produce the
+    // rendition as a side output (Decision 4). Replaces ADR-0013 §11's
+    // unconditional `pending` bump; remux/transcode sessions get subtitles as
+    // a side output instead (ADR-0041 Decision 7, step 4).
+    if row.subtitle_status == "eligible"
+        && needs_standalone_subtitle_extract(query.profile_id.as_deref(), decision.method)
+    {
         state
             .pool
             .prioritize_extract(row.id, row.library_id, abs.clone());
+    }
+
+    // ADR-0023 §9.1: playback info is the demand trigger for the keyframe
+    // map. An item with no ready/valid map gets a priority build (index-first,
+    // §2 mechanism unchanged) so the map is warm before a session exists; the
+    // scan path no longer queues the whole library (§2 amendment).
+    if state.db.keyframe_map(row.id).ok().flatten().is_none() {
+        crate::routes::sessions::request_map_rebuild(&state, &row);
     }
 
     Ok(Json(PlaybackInfoDto {

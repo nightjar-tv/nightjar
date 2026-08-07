@@ -227,6 +227,28 @@ pub fn resolve_profile_bag(
     profile
 }
 
+/// ADR-0041 Decisions 3–4: does this client/method need a standalone
+/// subtitle extraction job, or is the rendition produced elsewhere?
+///
+/// Decision 3 (client): `BROWSER_V0` cannot read embedded container
+/// subtitles and needs the extracted file; `MPV_V0` / `MEDIA3_V0` /
+/// `AETHER_V0` read subtitles from the container themselves and never need
+/// a standalone extract. Omitted, empty, or unknown profile ids carry
+/// `BROWSER_V0` semantics (ADR-0022 §2 fallback), so they need it too.
+///
+/// Decision 4 (method): only `directPlay` triggers standalone extraction.
+/// Remux and transcode already run ffmpeg on the file and produce the
+/// subtitle rendition as a side output (ADR-0041 Decision 7, step 4).
+pub fn needs_standalone_subtitle_extract(profile_id: Option<&str>, method: PlaybackMethod) -> bool {
+    if method != PlaybackMethod::DirectPlay {
+        return false;
+    }
+    !matches!(
+        profile_id,
+        Some("MPV_V0") | Some("MEDIA3_V0") | Some("AETHER_V0")
+    )
+}
+
 /// Encode knobs for an HLS re-encode session (ADR-0022). Applied only when
 /// `SessionMode::Transcode`; remux/copy never scales or tone-maps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1018,6 +1040,35 @@ mod tests {
         assert_eq!(p.hdr, HdrCapability::Hdr10);
         // Unknown id keeps browser codec floor until the bag grows codecs.
         assert_eq!(p.video_codecs, BROWSER_V0.video_codecs);
+    }
+
+    /// ADR-0041 Decisions 3–4, table-driven: standalone extraction fires
+    /// only for a `BROWSER_V0`-class client on a direct-play method.
+    #[test]
+    fn standalone_extract_gating() {
+        let cases = [
+            // Decision 3: BROWSER_V0 and its ADR-0022 fallbacks need the file.
+            (Some("BROWSER_V0"), PlaybackMethod::DirectPlay, true),
+            (None, PlaybackMethod::DirectPlay, true),
+            (Some(""), PlaybackMethod::DirectPlay, true),
+            (Some("unknown-id"), PlaybackMethod::DirectPlay, true),
+            // Decision 3: container-reading clients never need a standalone job.
+            (Some("MPV_V0"), PlaybackMethod::DirectPlay, false),
+            (Some("MEDIA3_V0"), PlaybackMethod::DirectPlay, false),
+            (Some("AETHER_V0"), PlaybackMethod::DirectPlay, false),
+            // Decision 4: remux/transcode produce the rendition as a side output.
+            (Some("BROWSER_V0"), PlaybackMethod::Remux, false),
+            (Some("BROWSER_V0"), PlaybackMethod::Transcode, false),
+            (Some("MPV_V0"), PlaybackMethod::Remux, false),
+            (Some("MPV_V0"), PlaybackMethod::Transcode, false),
+        ];
+        for (profile, method, expected) in cases {
+            assert_eq!(
+                needs_standalone_subtitle_extract(profile, method),
+                expected,
+                "profile {profile:?} method {method:?}"
+            );
+        }
     }
 
     #[test]

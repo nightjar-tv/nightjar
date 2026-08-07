@@ -25,39 +25,51 @@ async fn main() {
         .init();
 
     let data_dir = data_dir();
-    let db = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
-    match db.fail_stale_scan_jobs() {
+    let db_raw = nightjar_db::open(&data_dir).unwrap_or_else(|e| panic!("database: {e}"));
+    match db_raw.fail_stale_scan_jobs() {
         Ok(n) if n > 0 => {
             tracing::info!(count = n, "cleared scan jobs left active by a prior exit")
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "clear stale scan jobs failed"),
     }
-    let subs = nightjar_transcode::SubsStore::new(data_dir.join("subs"))
-        .unwrap_or_else(|e| panic!("subtitle store: {e}"));
+    let subs = std::sync::Arc::new(
+        nightjar_transcode::SubsStore::new(data_dir.join("subs"))
+            .unwrap_or_else(|e| panic!("subtitle store: {e}")),
+    );
+    let db = std::sync::Arc::new(db_raw);
     // ADR-0009: verify encoders once at startup; sessions reuse this Arc.
     let transcode_caps = nightjar_transcode::probe_h264_encoders_arc(&data_dir.join("cache"));
     let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
         data_dir.join("cache").join("hls"),
         hls_max_sessions(),
         transcode_caps.preferred_encode_leg.clone(),
+        Some(subs.clone()),
+        Some(db.clone()),
     )
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
-    let db = std::sync::Arc::new(db);
-    let subs = std::sync::Arc::new(subs);
     let pool = nightjar_scanner::LibraryPool::spawn(
         std::sync::Arc::clone(&db),
         std::sync::Arc::clone(&subs),
     );
+    // ADR-0023 §9.3: a seek that arrives before the keyframe map is ready
+    // waits, bounded, for a build the consumer already triggered; the pool
+    // answers whether one is queued or in flight.
+    hls.set_map_build_in_flight(Some(std::sync::Arc::new({
+        let pool = std::sync::Arc::clone(&pool);
+        move |item_id: i64| pool.map_build_pending(item_id)
+    })));
     match pool.drain_pending_probes() {
         Ok(n) if n > 0 => tracing::info!(count = n, "resumed indexed items awaiting probe"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "enqueue pending probes failed"),
     }
-    pool.drain_pending_extracts()
-        .unwrap_or_else(|e| tracing::warn!(error = %e, "enqueue pending subtitle extracts failed"));
-    pool.drain_pending_maps()
-        .unwrap_or_else(|e| tracing::warn!(error = %e, "enqueue pending keyframe maps failed"));
+    // No startup subtitle-extract drain: ADR-0041 Decision 9 — a first-start
+    // backfill is exactly the scan-time surprise this slice removes; the probe
+    // drain above reclassifies `pending` items, and extraction is on-demand.
+    // No startup keyframe-map drain either (ADR-0023 §2/§9): a map builds
+    // when a consumer asks — playbackInfo, session create, or a seek's
+    // bounded wait — never as a whole-library consequence of starting up.
     if let Err(e) = pool.cleanup_orphan_subtitles() {
         tracing::warn!(error = %e, "subtitle orphan cleanup failed");
     }

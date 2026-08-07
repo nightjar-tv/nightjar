@@ -244,20 +244,17 @@ pub fn hint_ingest(
         None,
     ));
     let mut sidecar_dirs = nightjar_transcode::SidecarDirCache::default();
-    match associate_sidecars(db, item_id, &library_root, &abs, &mut sidecar_dirs) {
-        Ok(true) => {
-            db.mark_items_subtitle_pending(&[item_id])?;
-            pool.enqueue(pool::WorkItem::extract(item_id, library_id, abs.clone()));
-        }
-        Ok(false) => {}
-        Err(e) => tracing::warn!(
+    // Sidecar association stays index-time; extraction is no longer enqueued
+    // at scan (ADR-0041 Decision 10 — the probe classifies this item and the
+    // on-demand path in ADR-0013 §11 / ADR-0041 Decision 5 triggers extracts).
+    if let Err(e) = associate_sidecars(db, item_id, &library_root, &abs, &mut sidecar_dirs) {
+        tracing::warn!(
             item_id,
             path = %abs.display(),
             error = %e,
             "hint sidecar association failed"
-        ),
+        );
     }
-    pool.enqueue_map_rebuild(item_id, library_id, abs);
     // If a full walk is in flight, mark dirty_add so that job skips
     // delete_missing (would otherwise drop this row). Poll heals deletes later;
     // do not schedule a follow-up full walk for the hint alone.
@@ -416,17 +413,13 @@ fn finish_scan_probes(
     }
 
     let probe_started = Instant::now();
-    let probe_ids: Vec<(i64, PathBuf)> = probe_queue
-        .iter()
-        .map(|item| (item.item_id, item.path.clone()))
-        .collect();
     pool.enqueue_probe_batch(probe_queue).wait();
-    for (item_id, path) in &probe_ids {
-        pool.enqueue(pool::WorkItem::extract(*item_id, library_id, path.clone()));
-        pool.enqueue_map_rebuild(*item_id, library_id, path.clone());
-    }
-    pool.drain_pending_extracts()?;
-    pool.drain_pending_maps()?;
+    // No scan-time subtitle extract enqueue: the probe already classified each
+    // item (ADR-0041 Decision 2), and extraction is triggered on demand only
+    // (ADR-0041 Decision 10, deleting the ADR-0013 §1 scan-time enqueue).
+    // No scan-time keyframe-map enqueue either (ADR-0023 §2/§9 amendment):
+    // the map builds when a consumer asks — playbackInfo, session create, or
+    // a seek's bounded wait — never as a whole-library consequence of scanning.
     let probe_duration_ms = probe_started.elapsed().as_millis() as u64;
     db.complete_scan_job(job_id, probe_duration_ms)?;
 
@@ -518,7 +511,6 @@ fn run_index_pass(
         }
 
         let flush = |db: &Db,
-                     pool: &LibraryPool,
                      library_id: i64,
                      library_root: &str,
                      pending: &mut Vec<UpsertItem>,
@@ -548,22 +540,15 @@ fn run_index_pass(
                     abs_paths[i].clone(),
                     Some(job_id),
                 ));
-                match associate_sidecars(db, id, library_root, &abs_paths[i], sidecar_dirs) {
-                    Ok(true) => {
-                        db.mark_items_subtitle_pending(&[id])?;
-                        pool.enqueue(pool::WorkItem::extract(
-                            id,
-                            library_id,
-                            abs_paths[i].clone(),
-                        ));
-                    }
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
+                if let Err(e) =
+                    associate_sidecars(db, id, library_root, &abs_paths[i], sidecar_dirs)
+                {
+                    tracing::warn!(
                         item_id = id,
                         path = %abs_paths[i].display(),
                         error = %e,
                         "sidecar association failed"
-                    ),
+                    );
                 }
             }
             pending.clear();
@@ -657,7 +642,6 @@ fn run_index_pass(
                     if pending_upserts.len() >= INDEX_BATCH {
                         flush(
                             db,
-                            pool,
                             library_id,
                             &library_root,
                             &mut pending_upserts,
@@ -674,7 +658,6 @@ fn run_index_pass(
 
         flush(
             db,
-            pool,
             library_id,
             &library_root,
             &mut pending_upserts,
@@ -813,23 +796,18 @@ fn run_index_pass(
                     continue;
                 }
                 sidecar_checked += 1;
-                match associate_sidecars(db, item_id, &library_root, &file.path, &mut sidecar_dirs)
+                // Sidecar rows stay fresh at index time; a re-probe of the item
+                // (mtime change, operator pass) reclassifies it — no extract is
+                // enqueued at scan (ADR-0041 Decision 10).
+                if let Err(e) =
+                    associate_sidecars(db, item_id, &library_root, &file.path, &mut sidecar_dirs)
                 {
-                    Ok(true) => {
-                        db.mark_items_subtitle_pending(&[item_id])?;
-                        pool.enqueue(pool::WorkItem::extract(
-                            item_id,
-                            library_id,
-                            file.path.clone(),
-                        ));
-                    }
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
+                    tracing::warn!(
                         item_id,
                         path = %file.path.display(),
                         error = %e,
                         "sidecar association failed"
-                    ),
+                    );
                 }
             }
         }
@@ -1734,7 +1712,20 @@ mod tests {
         };
         assert_eq!(id2, item_id, "same path must keep media_items.id");
         let row = db.get_item(item_id).unwrap().unwrap();
-        assert_eq!(row.probe_status, "indexed");
+        // `hint_ingest` enqueues a background probe on every upsert (line
+        // ~240), including this one, against a real `test_pool` with live
+        // worker threads. Under load that probe can dequeue, spawn ffprobe
+        // against the 9-byte garbage content, fail, and land `error` before
+        // this read runs — a real race, not a bug in the assertion below it.
+        // Both `indexed` (probe has not landed yet) and `error` (it has, and
+        // correctly rejected non-media) are the only outcomes reachable here;
+        // anything else means stale data leaked through the upsert, which is
+        // the actual invariant this test protects.
+        assert!(
+            matches!(row.probe_status.as_str(), "indexed" | "error"),
+            "unexpected probe_status after mtime-changed upsert: {}",
+            row.probe_status
+        );
         assert_eq!(row.path, "clip.mp4");
         assert_eq!(db.list_items(lib.id).unwrap().len(), 1);
     }
@@ -2278,6 +2269,1090 @@ mod tests {
                 || lib_row.path == new_canon.to_string_lossy(),
             "library path updated: {}",
             lib_row.path
+        );
+    }
+
+    // ---- ADR-0041 probe-time classification (plan step 2) ----
+
+    fn corpus_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files")
+            .join(name)
+    }
+
+    fn copy_corpus_into(media: &Path, name: &str) -> PathBuf {
+        let src = corpus_fixture(name);
+        assert!(
+            src.exists(),
+            "corpus fixture missing (run testdata/generate.sh): {}",
+            src.display()
+        );
+        let dest = media.join(name);
+        fs::copy(&src, &dest).unwrap();
+        dest
+    }
+
+    fn require_ffprobe() -> bool {
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_some() {
+            return true;
+        }
+        Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Install an executable fake `ffmpeg` that logs invocations referencing
+    /// `marker_path` and exits 1, so the "extract path is never invoked"
+    /// assertion is a process-count check (subtitle demux is the only ffmpeg
+    /// user in the scan pipeline). PATH manipulation matches the probe.rs
+    /// test pattern; the marker filter keeps concurrent tests' ffmpeg spawns
+    /// (which reference their own tempdirs) out of this test's log.
+    fn with_fake_ffmpeg<T>(log: &Path, marker_path: &Path, f: impl FnOnce() -> T) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = log.parent().unwrap().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("ffmpeg");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *{}*) echo invoked >> '{}' ;;\n  esac\ndone\nexit 1\n",
+                marker_path.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+        let old = std::env::var_os("PATH");
+        let new_path = match &old {
+            Some(v) => format!("{}:{}", bin.display(), v.to_string_lossy()),
+            None => bin.display().to_string(),
+        };
+        unsafe { std::env::set_var("PATH", new_path) };
+        let result = f();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        result
+    }
+
+    /// No subtitle streams, no sidecar → `none`, and the ffmpeg subtitle-extract
+    /// path is never invoked (ADR-0041 Decision 2 acceptance).
+    #[test]
+    fn probe_no_subtitles_classifies_none_without_extract() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        copy_corpus_into(&media, "h264_aac_mkv.mkv");
+        let log = dir.path().join("ffmpeg-invocations.log");
+        let marker = media.join("h264_aac_mkv.mkv");
+
+        with_fake_ffmpeg(&log, &marker, || {
+            let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+            let pool = test_pool(&db, dir.path());
+            let lib = db
+                .create_library(&NewLibrary {
+                    name: "t".into(),
+                    path: media.to_string_lossy().into_owned(),
+                    kind: "movies".into(),
+                })
+                .unwrap();
+            let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+            wait_job(&db, job_id);
+            // Give a wrongly-enqueued extract time to run if the wiring regressed.
+            std::thread::sleep(Duration::from_millis(300));
+
+            let items = db.list_items(lib.id).unwrap();
+            assert_eq!(items.len(), 1, "{items:?}");
+            let item = &items[0];
+            assert_eq!(item.probe_status, "probed");
+            assert_eq!(item.subtitle_status, "none");
+            assert!(
+                db.list_item_subtitle_tracks(item.id).unwrap().is_empty(),
+                "no subtitle streams must persist no inventory rows"
+            );
+            let invoked = fs::read_to_string(&log).unwrap_or_default();
+            assert!(
+                invoked.is_empty(),
+                "ffmpeg subtitle-extract path must never run during probe classification: {invoked}"
+            );
+        });
+    }
+
+    /// Image-only (PGS) → `none`, no extract job, and the persisted inventory
+    /// row carries `kind = image` (ADR-0041 Decision 1–2 acceptance).
+    #[test]
+    fn probe_image_only_classifies_none_and_persists_kind_image() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        copy_corpus_into(&media, "h264_aac_pgs_mkv.mkv");
+        let log = dir.path().join("ffmpeg-invocations.log");
+        let marker = media.join("h264_aac_pgs_mkv.mkv");
+
+        with_fake_ffmpeg(&log, &marker, || {
+            let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+            let pool = test_pool(&db, dir.path());
+            let lib = db
+                .create_library(&NewLibrary {
+                    name: "t".into(),
+                    path: media.to_string_lossy().into_owned(),
+                    kind: "movies".into(),
+                })
+                .unwrap();
+            let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+            wait_job(&db, job_id);
+            std::thread::sleep(Duration::from_millis(300));
+
+            let items = db.list_items(lib.id).unwrap();
+            assert_eq!(items.len(), 1, "{items:?}");
+            let item = &items[0];
+            assert_eq!(item.probe_status, "probed");
+            assert_eq!(item.subtitle_status, "none");
+            let tracks = db.list_item_subtitle_tracks(item.id).unwrap();
+            assert_eq!(tracks.len(), 1, "{tracks:?}");
+            assert_eq!(tracks[0].kind, "image");
+            assert_eq!(tracks[0].codec, "hdmv_pgs_subtitle");
+            assert_eq!(tracks[0].stream_index, 2);
+            let invoked = fs::read_to_string(&log).unwrap_or_default();
+            assert!(
+                invoked.is_empty(),
+                "image-only must not enqueue an extract job: {invoked}"
+            );
+        });
+    }
+
+    /// ADR-0041 Decision 8.2 / 8.3 acceptance: a simulated I/O failure during
+    /// extract lands `subtitle_status = unavailable` (never `error`) and
+    /// records the first backoff attempt. The sidecar read fails with an
+    /// ENOENT-class error, the pool's single classifier routes it to
+    /// `unavailable`, and `subtitle_attempt_count` advances so the re-queue
+    /// gate can pace retries (ADR-0026 §3 schedule).
+    #[test]
+    fn extract_io_failure_marks_item_unavailable_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[nightjar_db::UpsertItem {
+                    path: "Video.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 2,
+                    title: "Video".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        // Sidecar row pointing at a file that does not exist on disk.
+        db.replace_item_sidecars(
+            item_id,
+            &[nightjar_db::SidecarRow {
+                media_item_id: item_id,
+                track_id: "s-en".into(),
+                path: "Video.en.srt".into(),
+                mtime_ms: 1,
+                size_bytes: 2,
+                format: "srt".into(),
+                language: Some("en".into()),
+                forced: false,
+                sdh: false,
+            }],
+        )
+        .unwrap();
+        db.set_subtitle_status(item_id, "eligible", Some(1), Some(2))
+            .unwrap();
+
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            media.join("Video.mp4"),
+        ));
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = db.get_item(item_id).unwrap().unwrap().subtitle_status;
+            if status == "unavailable" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            status, "unavailable",
+            "an extract I/O failure must classify unavailable, not error"
+        );
+        // ADR-0041 Decision 8.3 end-to-end: the first failure's backoff
+        // deadline (1 day) gates the reachability re-queue, so the item is
+        // not re-drained immediately even on a library transition.
+        let (_, extracts, _) = db.requeue_unavailable_for_library(lib.id).unwrap();
+        assert_eq!(
+            extracts, 0,
+            "first attempt is inside its 1-day backoff window"
+        );
+    }
+
+    /// Sidecar-only → classified `eligible` at probe time, then converted
+    /// in-process on the on-demand extract path; the source video is never
+    /// opened (a non-media "video" still converts — existing sidecar-path
+    /// test pattern). ADR-0041 Decision 2 acceptance.
+    #[test]
+    fn probe_sidecar_only_classifies_eligible_and_converts_in_process() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::copy(corpus_fixture("sidecar_beside/Movie.mp4"), &video).unwrap();
+        fs::copy(
+            corpus_fixture("sidecar_beside/Movie.en.srt"),
+            media.join("Movie.en.srt"),
+        )
+        .unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job_id);
+
+        let items = db.list_items(lib.id).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.probe_status, "probed");
+        assert_eq!(
+            item.subtitle_status, "eligible",
+            "sidecar convertible to WebVTT must classify eligible"
+        );
+        assert!(
+            db.list_item_subtitle_tracks(item.id).unwrap().is_empty(),
+            "no embedded streams to persist for a sidecar-only item"
+        );
+
+        // On-demand extract (the ADR-0013 §11 path step 3 gates): the sidecar
+        // converts in-process and the item flips to ready.
+        pool.enqueue(pool::WorkItem::extract(item.id, lib.id, video.clone()));
+        let mut ready = false;
+        for _ in 0..200 {
+            if db.get_item(item.id).unwrap().unwrap().subtitle_status == "ready" {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready, "sidecar extract never reached ready");
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        assert!(
+            store.has_vtt(item.id, "s-en"),
+            "sidecar webvtt missing under {}",
+            store.vtt_path(item.id, "s-en").display()
+        );
+        let body = fs::read_to_string(store.vtt_path(item.id, "s-en")).unwrap();
+        assert!(body.contains("WEBVTT"), "not webvtt: {body}");
+
+        // Source video never opened: a fake "video" + sidecar still converts
+        // in-process (any real source read would fail on a non-media file).
+        fs::write(media.join("Fake.mp4"), b"not a real mp4").unwrap();
+        fs::copy(
+            corpus_fixture("sidecar_beside/Movie.en.srt"),
+            media.join("Fake.en.srt"),
+        )
+        .unwrap();
+        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job2);
+        let fake = db
+            .list_items(lib.id)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.path.ends_with("Fake.mp4"))
+            .expect("fake video indexed");
+        assert_eq!(
+            fake.subtitle_status, "pending",
+            "probe of a non-media file fails; status must stay pending, got {:?}",
+            fake
+        );
+        pool.enqueue(pool::WorkItem::extract(
+            fake.id,
+            lib.id,
+            media.join("Fake.mp4"),
+        ));
+        let mut fake_ready = false;
+        for _ in 0..200 {
+            if db.get_item(fake.id).unwrap().unwrap().subtitle_status == "ready" {
+                fake_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            fake_ready,
+            "sidecar must convert without reading the fake source video"
+        );
+        assert!(store.has_vtt(fake.id, "s-en"));
+    }
+
+    /// ≥3 embedded text tracks including one unrecognised codec → all rows
+    /// persisted, `kind = 'unknown'` for the unrecognised one, and the item
+    /// classifies `eligible` (ADR-0041 Decision 1 acceptance).
+    #[test]
+    fn probe_persists_multi_track_inventory_with_unknown_kind() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let mkv = media.join("multi.mkv");
+        let srt_a = dir.path().join("a.srt");
+        let srt_b = dir.path().join("b.srt");
+        let srt_c = dir.path().join("c.srt");
+        fs::write(&srt_a, "1\n00:00:00,000 --> 00:00:01,000\nTrack A\n").unwrap();
+        fs::write(&srt_b, "1\n00:00:00,000 --> 00:00:01,000\nTrack B\n").unwrap();
+        fs::write(&srt_c, "1\n00:00:00,000 --> 00:00:01,000\nTrack C\n").unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=0.3",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-i",
+            ])
+            .arg(&srt_a)
+            .arg("-i")
+            .arg(&srt_b)
+            .arg("-i")
+            .arg(&srt_c)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:0",
+                "-map",
+                "3:0",
+                "-map",
+                "4:0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
+                "-shortest",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg multi-sub mux failed");
+            return;
+        }
+        // ffprobe reports an unmapped CodecID as no codec_name; make the third
+        // track unrecognised by patching its CodecID (same-length swap).
+        let mut bytes = fs::read(&mkv).unwrap();
+        let needle = b"S_TEXT/UTF8";
+        let mut last = None;
+        for i in 0..bytes.len().saturating_sub(needle.len()) {
+            if &bytes[i..i + needle.len()] == needle {
+                last = Some(i);
+            }
+        }
+        let Some(pos) = last else {
+            eprintln!("skipping: no S_TEXT/UTF8 CodecID found to patch");
+            return;
+        };
+        bytes[pos..pos + 11].copy_from_slice(b"S_TEXT/FOO!");
+        fs::write(&mkv, &bytes).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job_id);
+
+        let items = db.list_items(lib.id).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.probe_status, "probed");
+        assert_eq!(item.subtitle_status, "eligible");
+        let tracks = db.list_item_subtitle_tracks(item.id).unwrap();
+        assert_eq!(tracks.len(), 3, "{tracks:?}");
+        assert_eq!(tracks[0].kind, "text");
+        assert_eq!(tracks[0].codec, "subrip");
+        assert_eq!(tracks[1].kind, "text");
+        assert_eq!(tracks[1].codec, "subrip");
+        assert_eq!(
+            tracks[2].kind, "unknown",
+            "unrecognised codec must be counted, never dropped: {tracks:?}"
+        );
+        assert_eq!(tracks[2].codec, "unknown");
+    }
+
+    /// Two media rows and a pool for the bulk-reader gate / cancel tests.
+    fn gate_fixture(
+        dir: &tempfile::TempDir,
+        files: &[(&str, usize)],
+    ) -> (Arc<Db>, Arc<LibraryPool>, nightjar_db::LibraryRow, Vec<i64>) {
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let mut paths = Vec::new();
+        for (name, fill) in files {
+            let path = media.join(name);
+            fs::write(&path, vec![b'x'; *fill]).unwrap();
+            paths.push(path);
+        }
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let items: Vec<UpsertItem> = files
+            .iter()
+            .enumerate()
+            .map(|(i, (name, fill))| UpsertItem {
+                path: (*name).to_string(),
+                mtime_ms: (i as i64) + 1,
+                size_bytes: *fill as i64,
+                title: format!("T{i}"),
+                kind: "movie".into(),
+                year: None,
+                season: None,
+                episode: None,
+                content_id: None,
+            })
+            .collect();
+        let ids = db.upsert_items_indexed(lib.id, &items).unwrap();
+        (db, pool, lib, ids)
+    }
+
+    /// Wait until the background queue drains and `item_ids` have left
+    /// `pending` (their extract/map runs actually finished, not just popped).
+    fn wait_items_terminal(
+        db: &Db,
+        pool: &LibraryPool,
+        item_ids: &[i64],
+    ) -> crate::pool::BackgroundProgress {
+        for _ in 0..400 {
+            let p = pool.background_progress();
+            if p.queued_extracts == 0 && p.queued_maps == 0 {
+                let all_terminal = item_ids.iter().all(|id| {
+                    db.get_item(*id).ok().flatten().is_some_and(|row| {
+                        row.subtitle_status != "pending" || row.map_status != "pending"
+                    })
+                });
+                if all_terminal {
+                    return p;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!(
+            "background work never drained: {:?}",
+            pool.background_progress()
+        );
+    }
+
+    /// ADR-0041 Decision 8.6 acceptance: one bulk-reader gate serialises a
+    /// subtitle extract and a keyframe-map build. While the gate is held (the
+    /// in-flight reader case from the dogfood race), neither kind starts;
+    /// releasing it lets both drain. The Decision 8.8 progress counters are
+    /// queryable through the same pool accessor, and a failing pass must not
+    /// inflate them (the junk fixtures fail both runs).
+    #[test]
+    fn bulk_reader_gate_serializes_extract_and_map_with_queryable_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, lib, ids) = gate_fixture(&dir, &[("A.mp4", 16), ("B.mp4", 16)]);
+        let media = dir.path().join("media");
+        let a = media.join("A.mp4");
+        let b = media.join("B.mp4");
+
+        // Hold the gate exactly as an in-flight reader would.
+        let _gate = pool.bulk_reader.lock().unwrap();
+        pool.enqueue(crate::pool::WorkItem::extract(ids[0], lib.id, a.clone()));
+        pool.enqueue_map_rebuild(ids[1], lib.id, b.clone());
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let held = pool.background_progress();
+        assert_eq!(held.queued_extracts, 1, "{held:?}");
+        assert_eq!(held.queued_maps, 1, "{held:?}");
+        assert_eq!(
+            held.completed, 0,
+            "the gate must block starts, not just queue them: {held:?}"
+        );
+
+        drop(_gate);
+        let drained = wait_items_terminal(&db, &pool, &[ids[0], ids[1]]);
+        assert_eq!(drained.queued_extracts, 0, "{drained:?}");
+        assert_eq!(drained.queued_maps, 0, "{drained:?}");
+        assert_eq!(
+            drained.completed, 0,
+            "failed runs must not inflate the 8.8 counter: {drained:?}"
+        );
+        assert_eq!(
+            drained.rate_per_min, 0.0,
+            "no successful completions, no rate: {drained:?}"
+        );
+        let _ = (lib, ids);
+    }
+
+    /// The ADR-0013 §8.4 index-phase pause covers keyframe-map builds too
+    /// (ADR-0023 §2 amendment): neither an extract nor a map build starts
+    /// while the index epoch is held, from begin_index through
+    /// set_scan_job_index_done.
+    #[test]
+    fn index_epoch_pause_covers_extract_and_map_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, lib, ids) = gate_fixture(&dir, &[("A.mp4", 16), ("B.mp4", 16)]);
+        let media = dir.path().join("media");
+        let a = media.join("A.mp4");
+        let b = media.join("B.mp4");
+
+        let _epoch = pool.enter_index_epoch(lib.id);
+        pool.enqueue(crate::pool::WorkItem::extract(ids[0], lib.id, a.clone()));
+        pool.enqueue_map_rebuild(ids[1], lib.id, b.clone());
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let held = pool.background_progress();
+        assert_eq!(held.queued_extracts + held.queued_maps, 2, "{held:?}");
+        assert_eq!(
+            held.completed, 0,
+            "the index phase must pause background starts: {held:?}"
+        );
+
+        drop(_epoch);
+        let drained = wait_items_terminal(&db, &pool, &[ids[0], ids[1]]);
+        assert_eq!(
+            drained.queued_extracts + drained.queued_maps,
+            0,
+            "{drained:?}"
+        );
+        let _ = (lib, ids);
+    }
+
+    /// Decision 8.8 positive case: a genuinely successful extract counts
+    /// toward the completed counter — the operator's "is it moving" signal.
+    /// (The negative case, failures never counting, is locked by the gate
+    /// test above.)
+    #[test]
+    fn successful_extract_counts_as_background_completion() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let ffmpeg_ok = Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ffmpeg_ok {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let stored = media.join("Subs.mkv");
+        fs::copy(&corpus, &stored).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let size_bytes = fs::metadata(&stored).unwrap().len() as i64;
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Subs.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes,
+                    title: "Subs".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+
+        pool.enqueue(crate::pool::WorkItem::extract(item_id, lib.id, stored));
+        for _ in 0..400 {
+            let row = db.get_item(item_id).unwrap().unwrap();
+            if row.subtitle_status != "pending" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.subtitle_status, "ready", "{row:?}");
+        let p = pool.background_progress();
+        assert_eq!(
+            p.completed, 1,
+            "a successful extract must count toward the 8.8 counter: {p:?}"
+        );
+        assert!(p.rate_per_min > 0.0, "{p:?}");
+    }
+
+    /// ADR-0041 Decision 8.7 acceptance: marking a library unreachable while
+    /// an extract is in flight cancels that extract (kills the demux); it
+    /// does not merely stop new starts. The fixture's only SRT cue sits at
+    /// 29 s of a 30 s title, so a cancelled demux can never have flushed it
+    /// and the run lands `unavailable`, never `ready`.
+    #[test]
+    fn extract_in_flight_is_cancelled_when_library_unreachable() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let srt = dir.path().join("late.srt");
+        fs::write(&srt, "1\n00:00:29,000 --> 00:00:30,000\nLate cue\n").unwrap();
+        let mkv = media.join("Slow.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=30:r=30",
+                "-i",
+            ])
+            .arg(&srt)
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:s",
+                "srt",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:0",
+                "-shortest",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg slow-fixture mux failed");
+            return;
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let size_bytes = fs::metadata(&mkv).unwrap().len() as i64;
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Slow.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes,
+                    title: "Slow".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+
+        pool.enqueue(crate::pool::WorkItem::extract(item_id, lib.id, mkv));
+        // Wait until the worker has popped the extract: it is now in flight.
+        for _ in 0..400 {
+            if pool.background_progress().queued_extracts == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            pool.background_progress().queued_extracts,
+            0,
+            "extract never started"
+        );
+
+        pool.set_library_reachability(lib.id, &lib.path, false)
+            .unwrap();
+        for _ in 0..400 {
+            let row = db.get_item(item_id).unwrap().unwrap();
+            if row.subtitle_status != "pending" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(
+            row.subtitle_status, "unavailable",
+            "an in-flight extract must be cancelled, never claimed ready: {:?}",
+            row
+        );
+        assert_eq!(
+            pool.background_progress().completed,
+            0,
+            "a cancelled extract must not count as a completed run"
+        );
+    }
+
+    /// ADR-0041 Decision 8.7 for the map side: a packet walk (whole-file
+    /// reader) is cancelled in flight when its library goes unreachable and
+    /// the item lands `unavailable`, never a ready map. The fixture is a
+    /// tail-truncated MKV (Cues live at the end), so the index read cannot
+    /// succeed and the build must take the packet-walk fallback.
+    #[test]
+    fn map_packet_walk_in_flight_is_cancelled_when_library_unreachable() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let muxed = media.join("Muxed.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=30:r=30",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&muxed)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg fixture mux failed");
+            return;
+        }
+        let data = fs::read(&muxed).unwrap();
+        let cut = (data.len() as f64 * 0.80) as usize;
+        let mkv = media.join("NoCues.mkv");
+        fs::write(&mkv, &data[..cut]).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let size_bytes = cut as i64;
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "NoCues.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes,
+                    title: "NoCues".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+
+        pool.enqueue_map_rebuild(item_id, lib.id, mkv);
+        for _ in 0..400 {
+            if pool.background_progress().queued_maps == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            pool.background_progress().queued_maps,
+            0,
+            "map build never started"
+        );
+
+        pool.set_library_reachability(lib.id, &lib.path, false)
+            .unwrap();
+        for _ in 0..400 {
+            let row = db.get_item(item_id).unwrap().unwrap();
+            if row.map_status != "pending" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(
+            row.map_status, "unavailable",
+            "an in-flight packet walk must be cancelled, never a ready map: {:?}",
+            row
+        );
+        assert_eq!(
+            pool.background_progress().completed,
+            0,
+            "a cancelled packet walk must not count as a completed run"
+        );
+    }
+
+    /// ADR-0023 §2/§9: the scan/index path no longer enqueues keyframe-map
+    /// builds. A fresh item that goes through a full scan (walk + probe)
+    /// ends unmapped: nothing is queued, no map was built, and `map_status`
+    /// is the column default (`pending` = unmapped, not queued — the
+    /// whole-library pending sweep is retired). The map builds when a
+    /// consumer asks.
+    #[test]
+    fn scan_index_path_does_not_enqueue_map_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let junk = media.join("A.mp4");
+        fs::write(&junk, b"not a real mp4").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        for _ in 0..200 {
+            let job = db.get_scan_job(job_id).unwrap().unwrap();
+            if job.state == "completed" || job.state == "failed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // Let any mis-scheduled background work surface.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let progress = pool.background_progress();
+        assert_eq!(
+            progress.queued_maps, 0,
+            "scan must not queue map builds: {progress:?}"
+        );
+        let rows = db.list_items(lib.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].map_status, "pending",
+            "fresh item is unmapped (`pending` default), never queued for a sweep"
+        );
+        assert!(
+            db.keyframe_map(rows[0].id).unwrap().is_none(),
+            "the scan must not build a map for a fresh item"
+        );
+
+        // The demand trigger is what builds it. Hold the bulk-reader gate so
+        // the build cannot pop before we observe it queued (ADR-0041 8.6).
+        let _gate = pool.bulk_reader.lock().unwrap();
+        pool.prioritize_map_rebuild(rows[0].id, lib.id, junk);
+        assert!(
+            pool.map_build_pending(rows[0].id),
+            "the demand trigger queues the build"
+        );
+    }
+
+    /// ADR-0023 §9.1: the demand trigger (what playbackInfo calls) builds the
+    /// map for an unmapped item — index-first — and the pool reports the
+    /// build as pending until it lands as a ready, usable map.
+    #[test]
+    fn demand_trigger_builds_map_and_reports_pending_until_ready() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let mkv = media.join("clip.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=2:r=30",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg fixture mux failed");
+            return;
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "clip.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 100,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        assert_eq!(
+            pool.background_progress().queued_maps,
+            0,
+            "indexing alone must not queue a map build"
+        );
+
+        pool.prioritize_map_rebuild(item_id, lib.id, mkv);
+        // Hold the bulk-reader gate so the build cannot pop before we observe
+        // it queued (ADR-0041 8.6): the pool must report the build pending
+        // until it actually runs.
+        let _gate = pool.bulk_reader.lock().unwrap();
+        assert!(
+            pool.map_build_pending(item_id),
+            "the build must be visible as queued while the gate is held"
+        );
+        drop(_gate);
+        for _ in 0..400 {
+            let row = db.get_item(item_id).unwrap().unwrap();
+            if row.map_status == "ready" || row.map_status == "error" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            db.keyframe_map(item_id).unwrap().is_some(),
+            "a demand-triggered build must land a ready, usable map"
+        );
+        assert!(
+            !pool.map_build_pending(item_id),
+            "build done, nothing pending"
         );
     }
 }

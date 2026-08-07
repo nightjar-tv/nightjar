@@ -67,6 +67,26 @@ pub struct KeyframeMap {
 }
 
 impl KeyframeMap {
+    /// Map as read from the item store (ADR-0023 §7). Bind-time identity
+    /// revalidation against the bytes on disk still runs at every bind (§4).
+    pub fn from_db_rows(rows: &nightjar_db::KeyframeMapRows) -> Option<Self> {
+        let container_kind = MapContainerKind::parse(&rows.container_kind)?;
+        Some(Self {
+            container_kind,
+            content_id: rows.content_id.clone(),
+            entries: rows
+                .entries
+                .iter()
+                .filter_map(|&(pts_ms, byte_offset)| {
+                    Some(KeyframeEntry {
+                        pts_ms: u64::try_from(pts_ms).ok()?,
+                        byte_offset: u64::try_from(byte_offset).ok()?,
+                    })
+                })
+                .collect(),
+        })
+    }
+
     /// Greatest entry at or before `pts_ms` — the land this session snaps to.
     pub fn entry_at_or_before(&self, pts_ms: u64) -> Option<KeyframeEntry> {
         let index = match self.entries.binary_search_by_key(&pts_ms, |e| e.pts_ms) {

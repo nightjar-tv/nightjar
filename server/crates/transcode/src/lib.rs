@@ -13,9 +13,9 @@ mod virtual_input;
 
 pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
-    AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PlaylistError,
-    SegmentMissAction, SessionEncoder, SessionMode, SessionView, StartSessionError, WindowAction,
-    decide_segment_miss, decide_window_action, host_tonemap_available,
+    AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PiggybackExtract,
+    PlaylistError, SegmentMissAction, SessionEncoder, SessionMode, SessionView, StartSessionError,
+    WindowAction, decide_segment_miss, decide_window_action, host_tonemap_available,
 };
 pub use hwaccel::{
     EncodeLeg, EncoderCandidate, EncoderStatus, TranscodeCapabilities, list_render_nodes,
@@ -24,12 +24,12 @@ pub use hwaccel::{
 pub use subs::{
     BurnInKind, BurnInSelection, BurnInSubtitleStream, DiscoveredSidecar, ExtractOutcome,
     SessionSubInput, SidecarDirCache, SidecarInput, SubsStore, SubtitleRender, SubtitleSourceKind,
-    TextSubtitleStream, TrackReadiness, burn_in_kind_for_codec, decode_subtitle_bytes,
-    discover_sidecars, discover_sidecars_cached, extract_embedded_ass, extract_item_subtitles,
-    io_error_is_availability, is_burn_in_codec, is_burn_in_sidecar_format,
+    TextSubtitleStream, TrackReadiness, burn_in_kind_for_codec, concat_webvtt_segments,
+    decode_subtitle_bytes, discover_sidecars, discover_sidecars_cached, extract_embedded_ass,
+    extract_item_subtitles, io_error_is_availability, is_burn_in_codec, is_burn_in_sidecar_format,
     is_serveable_sidecar_format, is_text_subtitle_codec, list_burn_in_subtitles,
     list_text_subtitles, normalize_language, prepare_session_subtitles, slice_webvtt,
-    srt_to_webvtt, stored_webvtt, webvtt_max_cue_end_ms,
+    srt_to_webvtt, stored_webvtt, subtitle_codec_kind, webvtt_max_cue_end_ms,
 };
 pub use virtual_input::{KeyframeEntry, KeyframeMap, MapContainerKind};
 

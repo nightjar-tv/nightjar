@@ -18,7 +18,7 @@ pub use srt::{decode_subtitle_bytes, srt_to_webvtt};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -30,12 +30,28 @@ const TEXT_SUB_CODECS: &[&str] = &["subrip", "srt", "webvtt", "mov_text", "text"
 /// Codecs that need burn-in (ADR-0018). Soft WebVTT extract is not possible.
 const BURN_IN_CODECS: &[&str] = &["ass", "ssa", "hdmv_pgs_subtitle"];
 
-/// Kill a runaway extract rather than leave ffmpeg demuxing forever on a NAS.
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Measured standalone-extract throughput, MiB/s (ADR-0041 Decision 4: 235 MB
+/// median source at 55 MB/s, 5.0 s median wall). The extract timeout budget is
+/// sized from this rate (Decision 8.1) instead of the fixed 300 s constant
+/// (an unstated ~16 GB ceiling, below the 22–33 GB top of the dogfood queue).
+const EXTRACT_MIB_PER_SEC: u64 = 55;
 
-/// ASS burn-in demux can take many minutes on a large NAS remux (full interleaved
-/// read). Longer than text extract: session start waits for a local `.ass` so
-/// libass does not re-open the container at filter init (ADR-0018).
+/// Startup + probe allowance added to the size-derived extract budget. The
+/// 55 MB/s figure is an upper bound over a degraded array, so the size term
+/// alone would give a small source a sub-second budget that kills slow
+/// small-file demuxes before they finish.
+const EXTRACT_TIMEOUT_STARTUP_SECS: u64 = 60;
+
+/// Per-file extract timeout budget from source size at the measured 55 MiB/s
+/// rate plus a startup allowance (ADR-0041 Decision 8.1). Deletes the fixed
+/// 300 s constant (Decision 10: "the fixed 300 s extract timeout constant").
+pub fn extract_timeout_budget(src_bytes: u64) -> Duration {
+    let secs = src_bytes / (EXTRACT_MIB_PER_SEC * 1024 * 1024) + EXTRACT_TIMEOUT_STARTUP_SECS;
+    Duration::from_secs(secs)
+}
+
+/// Kill a runaway ASS burn demux rather than leave ffmpeg reading the NAS
+/// forever. Fixed: ADR-0018's session-start path, not the size-scaled budget.
 const ASS_BURN_EXTRACT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// How often to publish a growing WebVTT while FFmpeg demuxes (ADR-0013 §11).
@@ -186,6 +202,10 @@ pub enum ExtractOutcome {
     None,
     /// All serveable tracks written under the item directory.
     Ready,
+    /// Some tracks landed, the rest did not (ADR-0041 Decision 8.4). The item
+    /// must not claim `ready`; a later pass finishes the missing tracks and
+    /// previously-good files were never touched (Decision 8.5).
+    Partial { written: usize, failed: usize },
 }
 
 pub fn is_text_subtitle_codec(codec: &str) -> bool {
@@ -203,6 +223,25 @@ pub fn burn_in_kind_for_codec(codec: &str) -> Option<BurnInKind> {
         "ass" | "ssa" => Some(BurnInKind::Ass),
         "hdmv_pgs_subtitle" => Some(BurnInKind::Pgs),
         _ => None,
+    }
+}
+
+/// ADR-0041 Decision 1: derive a subtitle stream's persisted inventory `kind`
+/// from the codec name ffprobe reports. Text codecs → `Text`; ASS/SSA → `Ass`;
+/// bitmap subtitle codecs (PGS, VobSub) → `Image`; anything else (including an
+/// empty/absent codec name) counts as `Unknown` — never silently dropped as
+/// harmless (measured library: n_unknown = 0).
+pub fn subtitle_codec_kind(codec: &str) -> nightjar_db::SubtitleTrackKind {
+    use nightjar_db::SubtitleTrackKind as K;
+    let c = codec.to_ascii_lowercase();
+    if is_text_subtitle_codec(&c) {
+        K::Text
+    } else if matches!(c.as_str(), "ass" | "ssa") {
+        K::Ass
+    } else if matches!(c.as_str(), "hdmv_pgs_subtitle" | "dvd_subtitle") {
+        K::Image
+    } else {
+        K::Unknown
     }
 }
 
@@ -245,7 +284,9 @@ pub fn extract_embedded_ass(src: &Path, stream_index: u32, dest: &Path) -> Resul
         }
     })?;
 
-    if let Err(e) = wait_extract_child(&mut child, ASS_BURN_EXTRACT_TIMEOUT, || {}) {
+    // Session-scoped burn extract: not a library bulk reader, so the pool's
+    // cancel signal (ADR-0041 Decision 8.7) never fires here.
+    if let Err(e) = wait_extract_child(&mut child, ASS_BURN_EXTRACT_TIMEOUT, &|| false, || {}) {
         let _ = fs::remove_file(&tmp);
         return Err(format!(
             "ASS burn extract failed for {} stream {stream_index}: {e}",
@@ -547,6 +588,79 @@ impl SubsStore {
         }
         Ok(removed)
     }
+
+    /// Publish one track's completed WebVTT without touching any other file
+    /// in the item directory (ADR-0041 Decision 7 / 8.5 share this invariant:
+    /// a piggyback or a failed pass never deletes a previously-good track).
+    /// The item directory is created on demand; existing tracks stay intact.
+    pub fn publish_item_vtt(&self, item_id: i64, track_id: &str, body: &str) -> Result<(), String> {
+        write_webvtt(&self.vtt_path(item_id, track_id), body)
+    }
+
+    /// Drop WebVTT files in the item directory whose track id is not in
+    /// `keep`. Runs only after a fully successful pass replaces the prior
+    /// generation; a failed or partial pass never deletes (ADR-0041 Decision
+    /// 8.5 — the old code wiped the whole item dir up front, which a failed
+    /// retry could turn into data loss).
+    pub fn sweep_item_vtts(&self, item_id: i64, keep: &[String]) -> Result<usize, String> {
+        let dir = self.item_dir(item_id);
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(format!("read subtitle dir {}: {e}", dir.display())),
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".vtt") {
+                continue;
+            }
+            let track_id = name.trim_end_matches(".vtt");
+            if keep.iter().any(|k| k == track_id) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!(
+                    item_id,
+                    path = %entry.path().display(),
+                    error = %e,
+                    "stale subtitle track cleanup failed"
+                ),
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Join per-segment WebVTT bodies (each carries its own `WEBVTT` header) into
+/// one document: the header once, then every cue block in order. Blocks that
+/// are not cues (NOTE/STYLE/header lines) are dropped, matching the block
+/// filter `slice_webvtt` uses, so a concatenated document slices identically.
+pub fn concat_webvtt_segments(bodies: &[String]) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    for body in bodies {
+        let normalised = body.replace("\r\n", "\n").replace('\r', "\n");
+        for block in normalised.split("\n\n") {
+            let block = block.trim();
+            if block.is_empty()
+                || block.starts_with("WEBVTT")
+                || block.starts_with("NOTE")
+                || block.starts_with("STYLE")
+            {
+                continue;
+            }
+            if !block.contains("-->") {
+                continue;
+            }
+            out.push_str(block);
+            out.push_str("\n\n");
+        }
+    }
+    out
 }
 
 fn write_webvtt(dest: &Path, body: &str) -> Result<(), String> {
@@ -554,9 +668,17 @@ fn write_webvtt(dest: &Path, body: &str) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("create subtitle dir {}: {e}", parent.display()))?;
     }
+    // Temp write + fsync + atomic rename per track: a reader never sees a
+    // half-written WebVTT, and a crash mid-write cannot corrupt a
+    // previously-good track (ADR-0041 Decision 8.4).
     let tmp = dest.with_extension("tmp.vtt");
-    fs::write(&tmp, body.as_bytes())
+    let mut file =
+        fs::File::create(&tmp).map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
+    file.write_all(body.as_bytes())
         .map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("fsync subtitle tmp {}: {e}", tmp.display()))?;
+    drop(file);
     fs::rename(&tmp, dest).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("rename subtitle {}: {e}", dest.display())
@@ -686,8 +808,19 @@ fn demux_embedded_into_session(
         }
     })?;
 
+    // Per-file budget from source size (ADR-0041 Decision 8.1), same function
+    // as the library extract path — one schedule, Rule 4.11.
+    let src_bytes = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let budget = extract_timeout_budget(src_bytes);
+    tracing::info!(
+        path = %src.display(),
+        src_bytes,
+        timeout_budget_ms = budget.as_millis() as u64,
+        "session subtitle demux timeout budget"
+    );
+
     let mut last_sizes: HashMap<String, u64> = HashMap::new();
-    if let Err(e) = wait_extract_child(&mut child, EXTRACT_TIMEOUT, || {
+    if let Err(e) = wait_extract_child(&mut child, budget, &|| false, || {
         for (track_id, tmp) in &tmp_srts {
             let Ok(meta) = fs::metadata(tmp) else {
                 continue;
@@ -738,11 +871,17 @@ fn demux_embedded_into_session(
 /// demux fills all embedded text tracks; sidecars convert in-process.
 /// Embedded demux publishes growing WebVTT so first play can show cues before
 /// the full demux finishes (ADR-0013 §11).
+///
+/// `should_cancel` is the library reachability signal (ADR-0014): when it
+/// turns true the demux child is killed and the run reports `unavailable`,
+/// never `ready` (ADR-0041 Decision 8.7 — cancel in flight, not just block
+/// new starts). The same signal already gates job *start* at the pool.
 pub fn extract_item_subtitles(
     store: &SubsStore,
     item_id: i64,
     src: &Path,
     sidecars: &[SidecarInput],
+    should_cancel: &dyn Fn() -> bool,
 ) -> Result<ExtractOutcome, String> {
     let _guard = store
         .extract_lock
@@ -774,8 +913,9 @@ pub fn extract_item_subtitles(
         return Ok(ExtractOutcome::None);
     }
 
-    // Fresh directory so a prior generation cannot leave a stale track.
-    store.remove_item(item_id)?;
+    // The prior generation is NOT wiped up front: a pass that fails must not
+    // delete previously-good tracks (ADR-0041 Decision 8.5). Stale tracks from
+    // an older generation are swept only after a full success below.
     fs::create_dir_all(store.item_dir(item_id))
         .map_err(|e| format!("create subtitle dir for item {item_id}: {e}"))?;
 
@@ -786,14 +926,75 @@ pub fn extract_item_subtitles(
         store.set_progress(item_id, &s.track_id, TrackReadiness::Preparing, 0);
     }
 
+    // Per-file timeout budget from source size at the measured 55 MiB/s rate
+    // (ADR-0041 Decision 8.1); the old fixed 300 s constant is gone.
+    let src_bytes = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let budget = extract_timeout_budget(src_bytes);
+    tracing::info!(
+        path = %src.display(),
+        src_bytes,
+        timeout_budget_ms = budget.as_millis() as u64,
+        "subtitle extract timeout budget"
+    );
+
+    let mut written = 0usize;
+    let mut failed = 0usize;
     if !embedded.is_empty() {
         let refs: Vec<&TextSubtitleStream> = embedded.iter().collect();
-        extract_embedded_srt_batch(store, item_id, src, &refs)?;
+        let (w, f) = extract_embedded_srt_batch(store, item_id, src, &refs, budget, should_cancel)?;
+        written += w;
+        failed += f;
     }
 
+    let mut first_sidecar_err: Option<String> = None;
     for s in serveable_sidecars {
-        write_sidecar_webvtt(store, item_id, s)?;
-        store.mark_complete(item_id, &s.track_id);
+        if should_cancel() {
+            return Err("unavailable: subtitle extract cancelled (library unreachable)".into());
+        }
+        match write_sidecar_webvtt(store, item_id, s) {
+            Ok(()) => {
+                store.mark_complete(item_id, &s.track_id);
+                written += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                if first_sidecar_err.is_none() {
+                    first_sidecar_err = Some(e);
+                } else {
+                    tracing::warn!(
+                        item_id,
+                        track_id = %s.track_id,
+                        error = %e,
+                        "sidecar subtitle extract failed"
+                    );
+                }
+            }
+        }
+    }
+
+    if written == 0 {
+        return Err(first_sidecar_err.unwrap_or_else(|| {
+            format!(
+                "subtitle extract produced no usable tracks for {}",
+                src.display()
+            )
+        }));
+    }
+
+    if failed > 0 {
+        // Per-track partial success: keep the item eligible for a later pass
+        // and delete nothing (ADR-0041 Decision 8.4 / 8.5).
+        tracing::warn!(item_id, written, failed, "subtitle extract partial");
+        return Ok(ExtractOutcome::Partial { written, failed });
+    }
+
+    // Full success replaces the prior generation: drop vtt files whose track
+    // is no longer in the inventory (the old code wiped the whole item dir up
+    // front; only a success may delete — Decision 8.5).
+    let mut keep: Vec<String> = embedded.iter().map(|s| s.track_id()).collect();
+    keep.extend(sidecars.iter().map(|s| s.track_id.clone()));
+    if let Err(e) = store.sweep_item_vtts(item_id, &keep) {
+        tracing::warn!(item_id, error = %e, "stale subtitle sweep failed");
     }
 
     Ok(ExtractOutcome::Ready)
@@ -839,12 +1040,18 @@ fn write_sidecar_webvtt(
     write_webvtt(&store.vtt_path(item_id, &sidecar.track_id), &body)
 }
 
+/// Demux every embedded text stream in one ffmpeg run, then publish each
+/// track's WebVTT independently (ADR-0041 Decision 8.4: one bad stream must
+/// not lose tracks that completed). Returns (written, failed) track counts;
+/// an `Err` means the demux failed AND no track produced usable output.
 fn extract_embedded_srt_batch(
     store: &SubsStore,
     item_id: i64,
     src: &Path,
     streams: &[&TextSubtitleStream],
-) -> Result<(), String> {
+    timeout: Duration,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<(usize, usize), String> {
     let item_dir = store.item_dir(item_id);
     let mut tmp_srts: Vec<(u32, PathBuf)> = Vec::with_capacity(streams.len());
     let mut cmd = Command::new("ffmpeg");
@@ -882,42 +1089,78 @@ fn extract_embedded_srt_batch(
     })?;
 
     let mut last_sizes: HashMap<u32, u64> = HashMap::new();
-    if let Err(e) = wait_extract_child(&mut child, EXTRACT_TIMEOUT, || {
+    let demux = wait_extract_child(&mut child, timeout, should_cancel, || {
         publish_growing_srts(store, item_id, &tmp_srts, &mut last_sizes);
-    }) {
-        for (_, tmp) in &tmp_srts {
-            let _ = fs::remove_file(tmp);
+    });
+
+    // Salvage each track's tmp independently. A failed demux leaves whatever
+    // each track produced before the abort; tracks that produced nothing
+    // count as failed and the rest land (Decision 8.4).
+    let mut written = 0usize;
+    let mut failed = 0usize;
+    for (stream_index, tmp_srt) in &tmp_srts {
+        match salvage_track_vtt(store, item_id, *stream_index, tmp_srt) {
+            Ok(()) => written += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    item_id,
+                    stream_index = *stream_index,
+                    error = %e,
+                    "embedded subtitle track extract failed"
+                );
+            }
         }
+    }
+    for (_, tmp) in &tmp_srts {
+        let _ = fs::remove_file(tmp);
+    }
+
+    if written == 0 {
         store.clear_item_progress(item_id);
+        let msg = match &demux {
+            Err(e) => e.clone(),
+            Ok(()) => format!(
+                "subtitle extract produced no usable tracks for {}",
+                src.display()
+            ),
+        };
+        return Err(msg);
+    }
+    if let Err(e) = demux {
         tracing::warn!(
             path = %src.display(),
             error = %e,
-            "subtitle extract failed or timed out"
+            "subtitle demux failed after per-track salvage"
         );
+    }
+    Ok((written, failed))
+}
+
+/// Publish one embedded track's completed WebVTT from its demux tmp. A tmp
+/// with no cue text (empty stream, or a stream whose packets were never
+/// reached) fails the track without touching any other file.
+fn salvage_track_vtt(
+    store: &SubsStore,
+    item_id: i64,
+    stream_index: u32,
+    tmp_srt: &Path,
+) -> Result<(), String> {
+    let bytes = fs::read(tmp_srt).map_err(|e| {
+        format!(
+            "read extracted srt for stream {stream_index} ({}): {e}",
+            tmp_srt.display()
+        )
+    })?;
+    let body = srt_bytes_to_webvtt(&bytes);
+    if body.trim() == "WEBVTT" {
         return Err(format!(
-            "ffmpeg subtitle extract failed for {}: {e}",
-            src.display()
+            "no cue text in extracted srt for stream {stream_index}"
         ));
     }
-
-    for (stream_index, tmp_srt) in tmp_srts {
-        let track_id = format!("e{stream_index}");
-        let dest = store.vtt_path(item_id, &track_id);
-        let result = (|| {
-            let bytes = fs::read(&tmp_srt).map_err(|e| {
-                format!(
-                    "read extracted srt for stream {stream_index} ({}): {e}",
-                    tmp_srt.display()
-                )
-            })?;
-            let body = srt_bytes_to_webvtt(&bytes);
-            write_webvtt(&dest, &body)?;
-            store.mark_complete(item_id, &track_id);
-            Ok::<(), String>(())
-        })();
-        let _ = fs::remove_file(&tmp_srt);
-        result?;
-    }
+    let track_id = format!("e{stream_index}");
+    write_webvtt(&store.vtt_path(item_id, &track_id), &body)?;
+    store.mark_complete(item_id, &track_id);
     Ok(())
 }
 
@@ -964,11 +1207,21 @@ fn publish_growing_srts(
 fn wait_extract_child(
     child: &mut std::process::Child,
     timeout: Duration,
+    should_cancel: &dyn Fn() -> bool,
     mut on_tick: impl FnMut(),
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut next_progress = Instant::now();
     loop {
+        // Cancel wins over a just-completed demux: once the library is
+        // unreachable the run is aborted and never reported done (ADR-0041
+        // Decision 8.7). Stamped "unavailable:" so the pool's single
+        // classifier (ADR-0014) routes it to `unavailable`, never `error`.
+        if should_cancel() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("unavailable: subtitle extract cancelled (library unreachable)".into());
+        }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
@@ -990,7 +1243,11 @@ fn wait_extract_child(
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("ffmpeg timed out after {timeout:?}"));
+                // "unavailable:" stamps the timeout as mount/IO absence, not a
+                // corrupt file, so the pool's single classifier (ADR-0014,
+                // ADR-0041 Decision 8.2) routes it to `unavailable`, never
+                // `error`.
+                return Err(format!("unavailable: ffmpeg timed out after {timeout:?}"));
             }
             Ok(None) => {
                 if Instant::now() >= next_progress {
@@ -1121,6 +1378,24 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_codec_kind_covers_all_ffprobe_codecs() {
+        use nightjar_db::SubtitleTrackKind as K;
+        assert_eq!(subtitle_codec_kind("subrip"), K::Text);
+        assert_eq!(subtitle_codec_kind("srt"), K::Text);
+        assert_eq!(subtitle_codec_kind("mov_text"), K::Text);
+        assert_eq!(subtitle_codec_kind("webvtt"), K::Text);
+        assert_eq!(subtitle_codec_kind("text"), K::Text);
+        assert_eq!(subtitle_codec_kind("ass"), K::Ass);
+        assert_eq!(subtitle_codec_kind("SSA"), K::Ass);
+        assert_eq!(subtitle_codec_kind("hdmv_pgs_subtitle"), K::Image);
+        assert_eq!(subtitle_codec_kind("dvd_subtitle"), K::Image);
+        // Unrecognised codecs are counted, never silently dropped (ADR-0041
+        // Decision 1: an absent/unmapped codec name is exactly the unknown case).
+        assert_eq!(subtitle_codec_kind("dvb_subtitle"), K::Unknown);
+        assert_eq!(subtitle_codec_kind(""), K::Unknown);
+    }
+
+    #[test]
     fn lists_ass_and_pgs_corpus_as_burn_in() {
         if skip_without_ffmpeg() {
             return;
@@ -1184,7 +1459,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
-        let outcome = extract_item_subtitles(&store, 1, &corpus, &[]).expect("extract");
+        let outcome = extract_item_subtitles(&store, 1, &corpus, &[], &|| false).expect("extract");
         assert_eq!(outcome, ExtractOutcome::Ready);
         let track_id = streams[0].track_id();
         let vtt = stored_webvtt(&store, 1, &track_id).unwrap();
@@ -1274,13 +1549,279 @@ mod tests {
             "expected two text subs, got {streams:?}"
         );
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
-        extract_item_subtitles(&store, 9, &mkv, &[]).expect("extract");
+        extract_item_subtitles(&store, 9, &mkv, &[], &|| false).expect("extract");
         assert!(store.has_vtt(9, &streams[0].track_id()));
         assert!(store.has_vtt(9, &streams[1].track_id()));
         let a = fs::read_to_string(store.vtt_path(9, &streams[0].track_id())).unwrap();
         let b = fs::read_to_string(store.vtt_path(9, &streams[1].track_id())).unwrap();
         assert!(a.contains("Track A") || b.contains("Track A"));
         assert!(a.contains("Track B") || b.contains("Track B"));
+    }
+
+    /// ADR-0041 Decision 8.1: the per-file timeout budget is computed from
+    /// source size at the measured 55 MiB/s rate plus a startup allowance —
+    /// asserted as computed values, not a hardcoded constant, and it must
+    /// scale with the declared size.
+    #[test]
+    fn extract_timeout_budget_scales_with_source_size() {
+        let one_gib = 1024 * 1024 * 1024;
+        let small = extract_timeout_budget(one_gib);
+        let large = extract_timeout_budget(16 * one_gib);
+        assert_eq!(
+            small,
+            Duration::from_secs(18 + EXTRACT_TIMEOUT_STARTUP_SECS)
+        );
+        assert_eq!(
+            large,
+            Duration::from_secs(297 + EXTRACT_TIMEOUT_STARTUP_SECS)
+        );
+        assert!(large > small, "budget must scale with declared source size");
+        assert!(
+            extract_timeout_budget(1024) >= Duration::from_secs(EXTRACT_TIMEOUT_STARTUP_SECS),
+            "a tiny source still gets a startup allowance, never a zero budget"
+        );
+    }
+
+    /// ADR-0041 Decision 8.4 acceptance: one deliberately unmappable subtitle
+    /// stream among good ones → per-track partial success. The third text
+    /// stream's cue lies beyond the title's end, so `-shortest` drops the
+    /// packet: the track lists as text but demuxes to nothing. The good tracks
+    /// land as vtt files, the bad one does not, no panic, and the outcome is
+    /// Partial (the pool keeps the item eligible — never full `ready`).
+    #[test]
+    fn one_unmappable_stream_keeps_good_tracks() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let srt_a = dir.path().join("a.srt");
+        let srt_b = dir.path().join("b.srt");
+        let srt_late = dir.path().join("late.srt");
+        fs::write(&srt_a, "1\n00:00:00,000 --> 00:00:01,000\nGood A\n").unwrap();
+        fs::write(&srt_b, "1\n00:00:00,000 --> 00:00:01,000\nGood B\n").unwrap();
+        // Cue beyond the 4 s title: -shortest never muxes the packet.
+        fs::write(
+            &srt_late,
+            "1\n00:00:05,000 --> 00:00:06,000\nUnmappable C\n",
+        )
+        .unwrap();
+        let mkv = dir.path().join("three_track.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo:d=4",
+                "-i",
+            ])
+            .arg(&srt_a)
+            .arg("-i")
+            .arg(&srt_b)
+            .arg("-i")
+            .arg(&srt_late)
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:0",
+                "-map",
+                "3:0",
+                "-map",
+                "4:0",
+                "-shortest",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg multi-sub mux failed");
+            return;
+        }
+        let streams = list_text_subtitles(&mkv).expect("list");
+        assert_eq!(streams.len(), 3, "expected three text tracks: {streams:?}");
+
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let item_id = 21i64;
+        let outcome =
+            extract_item_subtitles(&store, item_id, &mkv, &[], &|| false).expect("extract");
+        let ExtractOutcome::Partial { written, failed } = outcome else {
+            panic!("expected per-track partial success, got {outcome:?}");
+        };
+        assert_eq!((written, failed), (2, 1), "{outcome:?}");
+        let landed: Vec<&TextSubtitleStream> = streams
+            .iter()
+            .filter(|s| store.has_vtt(item_id, &s.track_id()))
+            .collect();
+        let missing: Vec<&TextSubtitleStream> = streams
+            .iter()
+            .filter(|s| !store.has_vtt(item_id, &s.track_id()))
+            .collect();
+        assert_eq!(landed.len(), 2, "{streams:?}");
+        assert_eq!(missing.len(), 1, "{streams:?}");
+        let a = fs::read_to_string(store.vtt_path(item_id, &landed[0].track_id())).unwrap();
+        let b = fs::read_to_string(store.vtt_path(item_id, &landed[1].track_id())).unwrap();
+        assert!(
+            (a.contains("Good A") && b.contains("Good B"))
+                || (a.contains("Good B") && b.contains("Good A")),
+            "{a}\n---\n{b}"
+        );
+        assert!(
+            !store.has_vtt(item_id, &missing[0].track_id()),
+            "the unmappable track must not land"
+        );
+    }
+
+    /// Decision 8.4's demux-abort case: a container truncated mid-file makes
+    /// the single ffmpeg invocation fail, but tracks whose cues were already
+    /// demuxed survive the abort and land independently. The late cue (8–9 s)
+    /// sits in clusters cut off at 35 % of a 10 s file; the early cues
+    /// (0–1 s) were written before the abort.
+    #[test]
+    fn demux_abort_salvages_completed_tracks() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let srt_a = dir.path().join("a.srt");
+        let srt_b = dir.path().join("b.srt");
+        let srt_late = dir.path().join("late.srt");
+        fs::write(&srt_a, "1\n00:00:00,000 --> 00:00:01,000\nGood A\n").unwrap();
+        fs::write(&srt_b, "1\n00:00:00,000 --> 00:00:01,000\nGood B\n").unwrap();
+        fs::write(&srt_late, "1\n00:00:08,000 --> 00:00:09,000\nLate C\n").unwrap();
+        let mkv = dir.path().join("noisy.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=10:r=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo:d=10",
+                "-i",
+            ])
+            .arg(&srt_a)
+            .arg("-i")
+            .arg(&srt_b)
+            .arg("-i")
+            .arg(&srt_late)
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:0",
+                "-map",
+                "3:0",
+                "-map",
+                "4:0",
+                "-shortest",
+            ])
+            .arg(&mkv)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: could not spawn ffmpeg");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg multi-sub mux failed");
+            return;
+        }
+        // Cut mid-file: clusters are time-ordered, so the early cues survive
+        // and the late one is beyond the cut.
+        let data = fs::read(&mkv).unwrap();
+        let cut = (data.len() as f64 * 0.35) as usize;
+        let truncated = dir.path().join("trunc.mkv");
+        fs::write(&truncated, &data[..cut]).unwrap();
+
+        let streams = list_text_subtitles(&truncated).expect("list");
+        assert_eq!(streams.len(), 3, "{streams:?}");
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let item_id = 22i64;
+        let outcome =
+            extract_item_subtitles(&store, item_id, &truncated, &[], &|| false).expect("extract");
+        let ExtractOutcome::Partial { written, failed } = outcome else {
+            panic!("expected per-track partial success, got {outcome:?}");
+        };
+        assert!(
+            written >= 2,
+            "completed tracks must survive the abort: {outcome:?}"
+        );
+        assert!(failed >= 1, "the cut-off track must not land: {outcome:?}");
+        let landed: Vec<&TextSubtitleStream> = streams
+            .iter()
+            .filter(|s| store.has_vtt(item_id, &s.track_id()))
+            .collect();
+        assert_eq!(landed.len(), 2, "{streams:?}");
+        let a = fs::read_to_string(store.vtt_path(item_id, &landed[0].track_id())).unwrap();
+        let b = fs::read_to_string(store.vtt_path(item_id, &landed[1].track_id())).unwrap();
+        assert!(
+            (a.contains("Good A") && b.contains("Good B"))
+                || (a.contains("Good B") && b.contains("Good A")),
+            "{a}\n---\n{b}"
+        );
+    }
+
+    /// ADR-0041 Decision 8.5: a pass that fails after producing zero usable
+    /// output must not remove a previously-good track. The old code wiped the
+    /// whole item directory up front; now the prior vtt survives any failure.
+    #[test]
+    fn failed_pass_keeps_previously_good_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let item_id = 31i64;
+        let prior = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior cue\n";
+        write_webvtt(&store.vtt_path(item_id, "e2"), prior).unwrap();
+        let missing = dir.path().join("gone").join("Movie.mkv");
+        let err = extract_item_subtitles(&store, item_id, &missing, &[], &|| false)
+            .expect_err("probe must fail on a missing source");
+        assert!(!err.is_empty(), "{err:?}");
+        assert!(
+            store.has_vtt(item_id, "e2"),
+            "a failed pass must not delete a previously-good track"
+        );
+        assert_eq!(
+            fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap(),
+            prior,
+            "prior track body must be byte-identical"
+        );
     }
 
     #[test]
@@ -1347,6 +1888,7 @@ mod tests {
                 path: srt_path,
                 format: "srt".into(),
             }],
+            &|| false,
         )
         .expect("sidecar-only extract");
         assert_eq!(outcome, ExtractOutcome::Ready);
@@ -1371,9 +1913,44 @@ mod tests {
                 path: missing,
                 format: "srt".into(),
             }],
+            &|| false,
         )
         .unwrap_err();
         assert!(err.starts_with("unavailable:"), "{err}");
+    }
+
+    /// ADR-0041 Decision 8.7: the library-reachability cancel signal kills an
+    /// in-flight demux and stamps the run `unavailable`, never `ready`. The
+    /// signal is checked before completion, so a library that flips
+    /// unreachable exactly as the demux finishes still aborts the run.
+    #[test]
+    fn extract_cancel_kills_demux_and_stamps_unavailable() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let err = extract_item_subtitles(&store, 51, &corpus, &[], &|| true).unwrap_err();
+        assert!(err.starts_with("unavailable:"), "{err}");
+        // Killed before any cue was flushed: no track may land as complete.
+        let dir = store.item_dir(51);
+        let landed = fs::read_dir(&dir)
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "vtt"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            landed, 0,
+            "a cancelled extract must not leave tracks behind"
+        );
     }
 
     #[test]
@@ -1403,14 +1980,14 @@ mod tests {
             return;
         }
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
-        extract_item_subtitles(&store, 3, &corpus, &[]).unwrap();
+        extract_item_subtitles(&store, 3, &corpus, &[], &|| false).unwrap();
         let streams = list_text_subtitles(&corpus).unwrap();
         let track = streams[0].track_id();
         let first = fs::read_to_string(store.vtt_path(3, &track)).unwrap();
         // Stale marker file that must disappear when we re-extract into a fresh dir.
         write_webvtt(&store.vtt_path(3, "e999"), "WEBVTT\n\nstale\n").unwrap();
         assert!(store.has_vtt(3, "e999"));
-        extract_item_subtitles(&store, 3, &corpus, &[]).unwrap();
+        extract_item_subtitles(&store, 3, &corpus, &[], &|| false).unwrap();
         assert!(
             !store.has_vtt(3, "e999"),
             "re-extract must clear prior generation"
@@ -1517,5 +2094,62 @@ mod tests {
         assert!(body.contains("Nightjar SRT sample"), "{body}");
         let seg0 = slice_webvtt(&body, 0, 2000);
         assert!(seg0.contains("\nNightjar SRT sample\n"), "{seg0}");
+    }
+
+    /// A piggyback publish must add one track and leave every other file in
+    /// the item directory untouched (ADR-0041 Decision 7 / 8.5: never delete
+    /// a previously-good track).
+    #[test]
+    fn publish_item_vtt_adds_without_wiping_prior_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let item_id = 17i64;
+        write_webvtt(
+            &store.vtt_path(item_id, "e2"),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior cue\n",
+        )
+        .unwrap();
+        store
+            .publish_item_vtt(
+                item_id,
+                "s-en",
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNew cue\n",
+            )
+            .unwrap();
+        assert!(store.has_vtt(item_id, "e2"), "prior track must survive");
+        assert!(store.has_vtt(item_id, "s-en"));
+        assert_eq!(
+            fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap(),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior cue\n",
+            "prior track body must be byte-identical"
+        );
+        let new = fs::read_to_string(store.vtt_path(item_id, "s-en")).unwrap();
+        assert!(new.contains("New cue"), "{new}");
+    }
+
+    /// Concatenated segment bodies keep the header once and every cue in
+    /// order, dropping per-segment headers and non-cue blocks so the result
+    /// slices identically to a single-document extract.
+    #[test]
+    fn concat_webvtt_segments_merges_cue_blocks_in_order() {
+        let segs = [
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFirst cue\n".to_string(),
+            "WEBVTT\n\n00:00:02.000 --> 00:00:03.000\nSecond cue\n".to_string(),
+        ];
+        let joined = concat_webvtt_segments(&segs);
+        assert!(joined.starts_with("WEBVTT\n\n"), "{joined}");
+        assert_eq!(joined.matches("WEBVTT").count(), 1, "{joined}");
+        assert_eq!(joined.matches("-->").count(), 2, "{joined}");
+        let first = joined.find("First cue").unwrap();
+        let second = joined.find("Second cue").unwrap();
+        assert!(first < second, "cues must keep segment order: {joined}");
+        assert!(!joined.contains("STYLE"), "{joined}");
+        // Slicing the concatenation must yield the same windows a single
+        // document would.
+        let seg0 = slice_webvtt(&joined, 0, 2000);
+        assert!(
+            seg0.contains("First cue") && !seg0.contains("Second cue"),
+            "{seg0}"
+        );
     }
 }

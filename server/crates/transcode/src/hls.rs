@@ -17,10 +17,11 @@
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
-    BurnInKind, BurnInSelection, SessionSubInput, extract_embedded_ass, prepare_session_subtitles,
-    slice_webvtt, webvtt_max_cue_end_ms,
+    BurnInKind, BurnInSelection, SessionSubInput, SubsStore, concat_webvtt_segments,
+    extract_embedded_ass, prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms,
 };
 use nightjar_core::VideoEncodePlan;
+use nightjar_db::Db;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,13 @@ const CATCH_UP_SEGMENTS: u64 = 2;
 /// Safari retried refused segments at one-second intervals. A two-second floor
 /// prevents adjacent prefetch misses from repeatedly moving the encode window.
 const RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// ADR-0023 §9.3: how long a seek waits for an in-flight keyframe-map build
+/// before falling through to the §8 `-ss` path. ~1.5 s against the 1,545 ms
+/// measured Matroska worst case (§2); waiting ~600 ms beats the 7.1 s cold
+/// `-ss` baseline by an order of magnitude.
+const MAP_BUILD_WAIT: Duration = Duration::from_millis(1500);
+/// Poll interval while waiting for the build to land (§9.3).
+const MAP_BUILD_WAIT_POLL: Duration = Duration::from_millis(50);
 /// After the latest scrub intent while the prior encode has already landed,
 /// wait this quiet period before killing FFmpeg. Rapid scrubs only update
 /// the pending target (dogfood: three `seek restart` lines in ~9s; the last
@@ -502,8 +510,29 @@ pub struct HlsSessionRegistry {
     max_sessions: usize,
     /// Session-shaped encode leg from ADR-0009 probe (shared with startup verify).
     encode_leg: crate::EncodeLeg,
+    /// Library subtitle store for piggyback publish (ADR-0041 Decision 7).
+    subs: Option<Arc<SubsStore>>,
+    /// Item store for the piggyback `ready` flip at run EOF.
+    db: Option<Arc<Db>>,
+    /// ADR-0023 §9.3: whether a keyframe-map build for an item is queued or
+    /// in flight. The API wires it to the library pool; a seek consults it
+    /// before waiting, bounded, for a build a consumer already triggered.
+    map_build_in_flight: Mutex<Option<Arc<MapBuildInFlight>>>,
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, Session>>,
+}
+
+/// ADR-0041 Decision 7: a piggyback target for a session on an `eligible`
+/// item. When set, the session's ffmpeg gains `-map 0:s?` + `-c:s webvtt`
+/// (a WebVTT side output alongside the video/audio maps); on a natural run
+/// EOF that started at title 0 the assembled WebVTT is published to
+/// `{subs}/{itemId}/{track_id}.vtt` and the item flips to `ready`. A killed
+/// or offset run never publishes and leaves the item `eligible` for a later
+/// pass (standalone or another piggyback) to finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiggybackExtract {
+    /// Library track id (`e{stream_index}`) the side output is published as.
+    pub track_id: String,
 }
 
 /// Serveable text track snapshot taken at session create (ADR-0010 / ADR-0013).
@@ -585,6 +614,16 @@ struct Session {
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
+    /// Piggyback target when this session runs on an `eligible` item
+    /// (ADR-0041 Decision 7); `None` once the side output is published.
+    piggyback: Option<PiggybackExtract>,
+    /// Library subtitle store + item store for the piggyback publish.
+    subs: Option<Arc<SubsStore>>,
+    db: Option<Arc<Db>>,
+    /// ADR-0023 §9.3: whether a keyframe-map build for this item is queued or
+    /// in flight. The API wires it to the library pool; a seek consults it
+    /// before deciding to wait, bounded, for the build to land.
+    map_build_in_flight: Option<Arc<MapBuildInFlight>>,
     /// Refcount of in-flight [`HlsSessionRegistry::asset_wait`] calls keyed by
     /// aligned want_ms. Used to defer preempt kill while a client still holds
     /// the cooking land (native dig-back / land-ensure).
@@ -928,13 +967,15 @@ impl HlsSessionRegistry {
         root: PathBuf,
         encode_leg: impl Into<crate::EncodeLeg>,
     ) -> Result<Arc<Self>, String> {
-        Self::with_cap(root, DEFAULT_MAX_SESSIONS, encode_leg)
+        Self::with_cap(root, DEFAULT_MAX_SESSIONS, encode_leg, None, None)
     }
 
     pub fn with_cap(
         root: PathBuf,
         max_sessions: usize,
         encode_leg: impl Into<crate::EncodeLeg>,
+        subs: Option<Arc<SubsStore>>,
+        db: Option<Arc<Db>>,
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(&root)
             .map_err(|e| format!("create hls cache dir {}: {e}", root.display()))?;
@@ -957,6 +998,9 @@ impl HlsSessionRegistry {
             root,
             max_sessions,
             encode_leg,
+            subs,
+            db,
+            map_build_in_flight: Mutex::new(None),
             next_id: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
         });
@@ -968,11 +1012,23 @@ impl HlsSessionRegistry {
         Ok(registry)
     }
 
+    /// ADR-0023 §9.3: attach the map-build-in-flight predicate (the API wires
+    /// it to the library pool). A seek consults it before waiting, bounded,
+    /// for a keyframe-map build a consumer already triggered. Without it,
+    /// seeks never wait and fall straight to the §8 `-ss` plan.
+    pub fn set_map_build_in_flight(&self, f: Option<Arc<MapBuildInFlight>>) {
+        *self
+            .map_build_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = f;
+    }
+
     /// Starts a session at `start_ms` (aligned). Every call creates its own
     /// session; seeking restarts that session in place (ADR-0011). Switching
     /// audio or burn-in does not: it starts a fresh session (ADR-0012 /
     /// ADR-0018). `subtitle_tracks` is snapshotted here and never revisited.
-    /// `encode_plan` applies only in Transcode mode (ADR-0022).
+    /// `encode_plan` applies only in Transcode mode (ADR-0022). `piggyback`
+    /// arms the ADR-0041 Decision 7 side output for an `eligible` item.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
@@ -986,6 +1042,7 @@ impl HlsSessionRegistry {
         burn_in: Option<BurnInSelection>,
         keyframe_map: Option<crate::virtual_input::KeyframeMap>,
         encode_plan: VideoEncodePlan,
+        piggyback: Option<PiggybackExtract>,
     ) -> Result<String, StartSessionError> {
         let play_start_ms = align_to_segment(start_ms);
         let sessions = self
@@ -1025,6 +1082,7 @@ impl HlsSessionRegistry {
             &self.encode_leg,
             burn_in.as_ref(),
             encode_plan,
+            piggyback.is_some(),
         )
         .map_err(StartSessionError::Spawn)?;
         map_binding.bound = plan.virtual_input.take();
@@ -1090,6 +1148,14 @@ impl HlsSessionRegistry {
                 stale_retain_refuse_until: None,
                 failed: None,
                 subtitle_tracks,
+                piggyback,
+                subs: self.subs.clone(),
+                db: self.db.clone(),
+                map_build_in_flight: self
+                    .map_build_in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
                 segment_waiters: HashMap::new(),
                 preempt_defer_logged: false,
             },
@@ -1960,6 +2026,15 @@ fn restart_at(
     let run_dir = session.dir.join(format!("run_{run_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
+    // ADR-0023 §9.3: a seek that arrives before the keyframe map is ready
+    // waits, bounded, for the build the consumer already triggered
+    // (playbackInfo or session create), then uses the fresh map. Position
+    // zero never waits — the Matroska path opens the real file there. The
+    // §8 `-ss` fallback stays for genuine map failure (§9.4), not for a
+    // bounded wait that has not yet elapsed.
+    if play_start_ms > 0 && session.map_binding.map.is_none() {
+        session.map_binding.map = wait_for_map_build(session);
+    }
     let mut plan = session.map_binding.plan(&session.src, play_start_ms);
     let start_ms = plan.window_start_ms;
     write_run_encode_start(&run_dir, start_ms).map_err(PlaylistError::Failed)?;
@@ -1974,6 +2049,7 @@ fn restart_at(
         &session.encode_leg,
         session.burn_in.as_ref(),
         session.encode_plan,
+        session.piggyback.is_some(),
     )
     .map_err(PlaylistError::Failed)?;
     session.map_binding.bound = plan.virtual_input.take();
@@ -2282,6 +2358,111 @@ fn apply_run_eof(session: &mut Session) {
             "hls usable extent recorded (EOF short of claimed duration)"
         );
     }
+    publish_piggyback_if_complete(session);
+}
+
+/// ADR-0041 Decision 7: publish the piggybacked WebVTT side output once a
+/// run that started at title 0 reaches natural EOF, and only then flip the
+/// item to `ready`. A run killed by seek (ADR-0007) or stopped mid-way never
+/// reaches this point, so the item stays `eligible` and no previously-good
+/// track is deleted (the same invariant as Decision 8.5).
+fn publish_piggyback_if_complete(session: &mut Session) {
+    let Some(piggyback) = &session.piggyback else {
+        return;
+    };
+    // A run that started at an offset only demuxed a suffix of the title.
+    if session.start_ms != 0 {
+        return;
+    }
+    let (Some(subs), Some(db)) = (&session.subs, &session.db) else {
+        return;
+    };
+    let segments = vtt_segments_in(&run_dir(session));
+    if segments.is_empty() {
+        return;
+    }
+    let mut bodies = Vec::with_capacity(segments.len());
+    for path in &segments {
+        match fs::read_to_string(path) {
+            Ok(body) => bodies.push(body),
+            Err(e) => {
+                tracing::warn!(
+                    item_id = session.item_id,
+                    track_id = %piggyback.track_id,
+                    path = %path.display(),
+                    error = %e,
+                    "piggyback subtitle segment read failed; item stays eligible"
+                );
+                return;
+            }
+        }
+    }
+    let body = concat_webvtt_segments(&bodies);
+    if body.trim() == "WEBVTT" {
+        tracing::warn!(
+            item_id = session.item_id,
+            track_id = %piggyback.track_id,
+            "piggyback produced no cues; item stays eligible"
+        );
+        return;
+    }
+    if let Err(e) = subs.publish_item_vtt(session.item_id, &piggyback.track_id, &body) {
+        tracing::warn!(
+            item_id = session.item_id,
+            track_id = %piggyback.track_id,
+            error = %e,
+            "piggyback publish failed; item stays eligible"
+        );
+        return;
+    }
+    let (mtime_ms, size_bytes) = fs::metadata(&session.src)
+        .ok()
+        .map(|meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64);
+            (mtime, Some(meta.len() as i64))
+        })
+        .unwrap_or((None, None));
+    if let Err(e) = db.set_subtitle_status(session.item_id, "ready", mtime_ms, size_bytes) {
+        tracing::warn!(
+            item_id = session.item_id,
+            track_id = %piggyback.track_id,
+            error = %e,
+            "piggyback ready flip failed; item stays eligible"
+        );
+        return;
+    }
+    tracing::info!(
+        item_id = session.item_id,
+        track_id = %piggyback.track_id,
+        segment_count = segments.len(),
+        cue_bytes = body.len(),
+        run_id = session.current_run_id,
+        "piggyback extract published and item marked ready"
+    );
+    session.piggyback = None;
+}
+
+/// WebVTT side-output segments (`index{N}.vtt`) the HLS muxer wrote next to
+/// `index.m3u8` in a run dir (ffmpeg names subtitle segments after the
+/// playlist). Empty when the session had no subtitle output.
+fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(run) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.starts_with("index") && name.ends_with(".vtt")
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 fn align_to_segment(ms: u64) -> u64 {
@@ -2512,6 +2693,11 @@ fn escape_hls_quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// ADR-0023 §9.3: whether a keyframe-map build for an item is queued or in
+/// flight. The API wires it to the library pool so a seek can wait, bounded,
+/// for a build a consumer already triggered.
+type MapBuildInFlight = dyn Fn(i64) -> bool + Send + Sync;
+
 /// What one producer run opens, and how that run is timed (ADR-0023 §3).
 struct StartPlan {
     /// `-i` argument: the real file, or a session-scoped virtual-file URL.
@@ -2612,6 +2798,39 @@ fn ss_start_plan(src: &Path, play_start_ms: u64, fingerprint_cost_ms: u128) -> S
     }
 }
 
+/// ADR-0023 §9.3: bounded wait for an in-flight keyframe-map build.
+///
+/// Returns the freshly built map when it lands inside the bound; None when
+/// no build is in flight to wait for, the bound expires, or the build failed
+/// — the caller then falls through to the §8 `-ss` plan. The wait is only
+/// worth paying while a build is actually running, so the predicate is
+/// consulted; a never-built item falls through immediately (§9.4: the `-ss`
+/// fallback is for genuine map failure, not for a wait that has not elapsed).
+fn wait_for_map_build(session: &Session) -> Option<crate::virtual_input::KeyframeMap> {
+    let db = session.db.as_ref()?;
+    // The build may have landed since the session started (or since the last
+    // seek): use it without waiting.
+    if let Some(rows) = db.keyframe_map(session.item_id).ok().flatten() {
+        return crate::virtual_input::KeyframeMap::from_db_rows(&rows);
+    }
+    let in_flight = session.map_build_in_flight.as_ref()?;
+    if !in_flight(session.item_id) {
+        return None;
+    }
+    let deadline = Instant::now() + MAP_BUILD_WAIT;
+    loop {
+        if let Some(rows) = db.keyframe_map(session.item_id).ok().flatten() {
+            return crate::virtual_input::KeyframeMap::from_db_rows(&rows);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        std::thread::sleep((deadline - now).min(MAP_BUILD_WAIT_POLL));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_ffmpeg(
     input: &StartPlan,
     dir: &Path,
@@ -2620,6 +2839,7 @@ fn spawn_ffmpeg(
     encode_leg: &crate::EncodeLeg,
     burn_in: Option<&BurnInSelection>,
     encode_plan: VideoEncodePlan,
+    piggyback_subs: bool,
 ) -> Result<Child, String> {
     let start_ms = input.window_start_ms;
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
@@ -2766,6 +2986,16 @@ fn spawn_ffmpeg(
             ]);
             push_audio_encode(&mut cmd, downmix.as_deref());
         }
+    }
+    if piggyback_subs {
+        // ADR-0041 Decision 7: the session's ffmpeg is already open on the
+        // file, so the subtitle rendition is a free side output. The HLS
+        // muxer writes WebVTT segments (`index{N}.vtt` + `index_vtt.m3u8`)
+        // into the run dir; it accepts a single subtitle stream, which the
+        // caller's gate guarantees (an image/unknown stream or a second
+        // subtitle output fails the whole session). `-c:s webvtt` overrides
+        // the global `-c copy` in Copy mode for subtitle streams only.
+        cmd.args(["-map", "0:s?", "-c:s", "webvtt"]);
     }
     cmd.args([
         "-f",
@@ -3221,6 +3451,7 @@ mod tests {
                 &crate::EncodeLeg::software(),
                 None,
                 plan,
+                false,
             )
             .unwrap_or_else(|e| panic!("spawn tonemap session for {name}: {e}"));
             let deadline = Instant::now() + Duration::from_secs(45);
@@ -3928,6 +4159,10 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
         };
         session
             .segment_map
@@ -4082,7 +4317,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4095,6 +4331,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4125,7 +4362,8 @@ mod tests {
         let play_ms = 40_000;
         assert_eq!(ENCODE_LEAD_SEGMENTS, 0);
         assert_eq!(encode_start_ms(play_ms), play_ms);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4138,6 +4376,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         let (land, land_ms) = wait_land_near(&reg, &id, play_ms);
@@ -4169,7 +4408,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4182,6 +4422,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &id);
@@ -4231,7 +4472,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 60);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4244,6 +4486,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4302,7 +4545,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 120);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4315,6 +4559,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -4371,7 +4616,8 @@ mod tests {
         make_fixture_secs(&src, 60);
         let duration_ms = 60_000;
         let play_ms = 40_000;
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
 
         let prior = reg
             .start(
@@ -4385,6 +4631,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &prior);
@@ -4406,6 +4653,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &switched);
@@ -4460,7 +4708,8 @@ mod tests {
         make_fixture_secs(&src, 60);
         let duration_ms = 60_000;
         let play_ms = 40_000;
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4473,6 +4722,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         let playlist = wait_playlist(&reg, &id);
@@ -4498,7 +4748,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4511,6 +4762,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -4549,7 +4801,8 @@ mod tests {
         let track = &streams[0];
         let track_id = track.track_id();
         let dir = tempfile::tempdir().unwrap();
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         // Short window: we only need first video seg + first subtitle slice.
         let id = reg
             .start(
@@ -4575,6 +4828,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4602,6 +4856,215 @@ mod tests {
         reg.stop(&id);
     }
 
+    /// Open a database with one `probed` item carrying `subtitle_status`.
+    fn item_db(dir: &Path, subtitle_status: &str) -> Arc<Db> {
+        let db = Arc::new(nightjar_db::open(dir).unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(&format!(
+                "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+                 INSERT INTO media_items (
+                    library_id, path, mtime_ms, size_bytes, title, kind, probe_status,
+                    subtitle_status
+                 ) VALUES (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie', 'probed', '{subtitle_status}');"
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        db
+    }
+
+    /// Color+sine MKV with exactly one embedded SRT track.
+    fn make_fixture_with_sub_secs(path: &Path, secs: u32) {
+        let d = secs.to_string();
+        let srt = path.with_extension("srt");
+        fs::write(
+            &srt,
+            "1\n00:00:00,000 --> 00:00:01,000\nNightjar piggyback cue\n",
+        )
+        .unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=black:s=64x64:d={d}"),
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={d}"),
+                "-i",
+            ])
+            .arg(&srt)
+            .args([
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "srt", "-map",
+                "0:v:0", "-map", "1:a:0", "-map", "2:0",
+            ])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture with subtitle encode failed");
+        let _ = fs::remove_file(&srt);
+        // No -shortest: an SRT stream's length is its last cue end, which
+        // would truncate the fixture to the cue range instead of `secs`.
+        let dur = ffprobe_duration_ms(path);
+        assert!(
+            dur >= secs.saturating_mul(900) as i64,
+            "fixture too short for a mid-piggyback kill: {dur}ms for {secs}s"
+        );
+    }
+
+    /// ADR-0041 Decision 7 acceptance (remux and transcode): a session on an
+    /// `eligible` item writes the subtitle WebVTT under `{subs}/{itemId}/`
+    /// with no standalone extract job in the loop — the session's own ffmpeg
+    /// produced the rendition — and flips the item to `ready` only once the
+    /// run reaches natural EOF from title 0.
+    #[test]
+    fn piggyback_session_publishes_item_vtt_and_flips_ready() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        assert_eq!(streams.len(), 1, "piggyback gate expects one text track");
+        let track_id = streams[0].track_id();
+        for mode in [SessionMode::Copy, SessionMode::Transcode] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = item_db(dir.path(), "eligible");
+            let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+            let reg = HlsSessionRegistry::with_cap(
+                dir.path().join("hls"),
+                2,
+                "libx264",
+                Some(subs.clone()),
+                Some(db.clone()),
+            )
+            .unwrap();
+            let id = reg
+                .start(
+                    1,
+                    &corpus,
+                    0,
+                    4000,
+                    mode,
+                    stereo(),
+                    vec![],
+                    None,
+                    None,
+                    VideoEncodePlan::default(),
+                    Some(PiggybackExtract {
+                        track_id: track_id.clone(),
+                    }),
+                )
+                .unwrap();
+            // Drive to natural EOF: view/playlist polls observe the child
+            // exit, which triggers the publish + ready flip.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut status = String::new();
+            loop {
+                if let Some(row) = db.get_item(1).unwrap() {
+                    status = row.subtitle_status;
+                }
+                if status == "ready" && subs.has_vtt(1, &track_id) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "piggyback never published; status={status}"
+                );
+                let run_id = reg.view(&id).map(|v| v.run_id).unwrap_or(0);
+                let _ = reg.playlist(&id, run_id);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let body = fs::read_to_string(subs.vtt_path(1, &track_id)).unwrap();
+            assert!(body.contains("Nightjar SRT sample"), "{body}");
+            assert_eq!(
+                db.get_item(1).unwrap().unwrap().subtitle_status,
+                "ready",
+                "complete piggyback run flips the item to ready"
+            );
+            reg.stop(&id);
+        }
+    }
+
+    /// ADR-0041 Decision 7 acceptance: a session killed mid-piggyback leaves
+    /// the item `eligible`, never `ready`, and does not delete a
+    /// previously-good track file for the item (Decision 8.5's invariant).
+    #[test]
+    fn piggyback_killed_session_leaves_eligible_and_keeps_prior_track() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long_sub.mkv");
+        make_fixture_with_sub_secs(&src, 60);
+        let streams = crate::list_text_subtitles(&src).expect("list");
+        assert_eq!(streams.len(), 1);
+        let track_id = streams[0].track_id();
+        let db = item_db(dir.path(), "eligible");
+        let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+        // A previously-good track the killed piggyback must not touch.
+        subs.publish_item_vtt(
+            1,
+            &track_id,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior ready cue\n",
+        )
+        .unwrap();
+        let reg = HlsSessionRegistry::with_cap(
+            dir.path().join("hls"),
+            2,
+            "libx264",
+            Some(subs.clone()),
+            Some(db.clone()),
+        )
+        .unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                60_000,
+                SessionMode::Copy,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                Some(PiggybackExtract {
+                    track_id: track_id.clone(),
+                }),
+            )
+            .unwrap();
+        // Kill immediately, without any playlist/view poll: a poll would
+        // observe the child exit and could publish before the kill. Stopping
+        // right after spawn is mid-piggyback by construction — a 60s copy
+        // cannot reach natural EOF in the milliseconds since spawn, and
+        // nothing observed the child exit before the stop.
+        assert!(reg.stop(&id), "kill mid-piggyback");
+        let row = db.get_item(1).unwrap().expect("item row");
+        assert_eq!(
+            row.subtitle_status, "eligible",
+            "killed piggyback must not flip the item to ready"
+        );
+        assert!(subs.has_vtt(1, &track_id), "prior track must survive");
+        assert_eq!(
+            fs::read_to_string(subs.vtt_path(1, &track_id)).unwrap(),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior ready cue\n",
+            "killed piggyback must not overwrite the prior track"
+        );
+    }
+
     /// One session per start, even for the same item at the same offset, and
     /// stopping one leaves the other playing (ADR-0011).
     #[test]
@@ -4613,7 +5076,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let a = reg
             .start(
                 1,
@@ -4626,6 +5090,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         let b = reg
@@ -4640,6 +5105,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         assert_ne!(a, b);
@@ -4655,6 +5121,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             ),
             Err(StartSessionError::CapFull)
         ));
@@ -4676,7 +5143,8 @@ mod tests {
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
         let reg =
-            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "no_such_encoder").unwrap();
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "no_such_encoder", None, None)
+                .unwrap();
         let id = reg
             .start(
                 1,
@@ -4689,6 +5157,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -4715,7 +5184,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture(&src);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -4728,6 +5198,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -4810,6 +5281,7 @@ mod tests {
             &leg,
             None,
             VideoEncodePlan::default(),
+            false,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -4857,6 +5329,28 @@ mod tests {
             path.display()
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn ffprobe_duration_ms(path: &Path) -> i64 {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ffprobe duration failed for {}",
+            path.display()
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        (text.trim().parse::<f64>().unwrap_or(0.0) * 1000.0) as i64
     }
 
     /// ADR-0012 decision 2: a 5.1 track above the ceiling forces an audio
@@ -5043,7 +5537,8 @@ mod tests {
             "WEBVTT\n\n1\n00:00:00.500 --> 00:00:01.500\nHello\n\n2\n00:00:02.500 --> 00:00:03.500\nWorld\n\n",
         )
         .unwrap();
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -5068,6 +5563,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5154,6 +5650,7 @@ mod tests {
                 &crate::EncodeLeg::software(),
                 None,
                 VideoEncodePlan::default(),
+                false,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -5487,7 +5984,8 @@ mod tests {
             sidecar_path: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -5500,6 +5998,7 @@ mod tests {
                 Some(selection),
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -5540,7 +6039,8 @@ mod tests {
             subtitle_ordinal: None,
             sidecar_path: Some(ass),
         };
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -5553,6 +6053,7 @@ mod tests {
                 Some(selection),
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5621,7 +6122,8 @@ mod tests {
             sidecar_path: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -5634,6 +6136,7 @@ mod tests {
                 Some(selection),
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5689,6 +6192,10 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
         };
         let pl = build_run_media_playlist("s1", &session);
         let text = String::from_utf8_lossy(&pl);
@@ -5722,7 +6229,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.mp4");
         make_fixture_secs(&src, 12);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -5735,6 +6243,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -5887,6 +6396,10 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
         };
         apply_run_eof(&mut session);
         assert!(session.current_run_eof);
@@ -5968,6 +6481,10 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
         };
 
         // Budget between orphan (10k) and total (~60k): one eviction of orphan.
@@ -6283,7 +6800,8 @@ mod tests {
         let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
         let land_ms = map.entry_at_or_before(6000).unwrap().pts_ms;
 
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6296,6 +6814,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -6331,7 +6850,8 @@ mod tests {
 
         // Start late and scrub back: the running encode cannot cover the new
         // land, so the seek has to respawn rather than retarget.
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6344,6 +6864,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
@@ -6376,7 +6897,8 @@ mod tests {
         let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
         let land_ms = map.entry_at_or_before(4000).unwrap().pts_ms;
 
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6389,6 +6911,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         let joined = run_to_eof_and_join(&reg, &id, dir.path());
@@ -6411,7 +6934,8 @@ mod tests {
         let map = keyframe_map(MapContainerKind::Mp4, &src, mp4_entries(&src));
         let land_ms = map.entry_at_or_before(6000).unwrap().pts_ms;
 
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6424,6 +6948,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -6464,7 +6989,8 @@ mod tests {
         let map = keyframe_map(MapContainerKind::Mp4, &src, mp4_entries(&src));
         let land_ms = map.entry_at_or_before(6000).unwrap().pts_ms;
 
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6477,6 +7003,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -6506,7 +7033,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("clip.mp4");
         make_mapped_fixture(&src, 12);
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6519,6 +7047,7 @@ mod tests {
                 None,
                 None,
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -6547,7 +7076,8 @@ mod tests {
         let map = keyframe_map(MapContainerKind::Matroska, &src, matroska_entries(&src));
         make_mapped_fixture(&src, 10);
 
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6560,6 +7090,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -6591,7 +7122,8 @@ mod tests {
             entry.byte_offset += 18;
         }
 
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6604,6 +7136,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {
@@ -6612,6 +7145,359 @@ mod tests {
         }
         assert!(reg.map_fallback(&id), "bind refusal must enqueue a rebuild");
         let _ = wait_land_near(&reg, &id, 6000);
+    }
+
+    /// One probed item stamped with `content_id` and no map — the item store
+    /// state after an index+probe pass under ADR-0023 §9 (the map builds on
+    /// demand, never at scan).
+    fn map_item_db(dir: &Path, content_id: &str) -> Arc<Db> {
+        let db = Arc::new(nightjar_db::open(dir).unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(&format!(
+                "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+                 INSERT INTO media_items (
+                    library_id, path, mtime_ms, size_bytes, title, kind, probe_status, content_id
+                 ) VALUES (1, '/tmp/t/a.mkv', 1, 2, 'A', 'movie', 'probed', '{content_id}');"
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        db
+    }
+
+    /// ADR-0023 §9.2/§9.3: a play-from-start session never waits on the map.
+    /// A position-zero session on an unmapped item must not consult the
+    /// map-build-in-flight state at all — the Matroska path opens the real
+    /// file with no `-ss`, so session start latency is unaffected by build
+    /// state. (The build may be queued by playbackInfo; start just does not
+    /// look at it.)
+    #[test]
+    fn position_zero_session_start_never_consults_map_build_state() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let db = map_item_db(dir.path(), &nightjar_db::content_id_for_path(&src).unwrap());
+
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, Some(db))
+                .unwrap();
+        let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&consulted);
+        reg.set_map_build_in_flight(Some(Arc::new(move |_item_id: i64| {
+            flag.store(true, Ordering::SeqCst);
+            true
+        })));
+
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            !consulted.load(Ordering::SeqCst),
+            "position-zero start must not consult the map build state"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert_eq!(session.play_start_ms, 0);
+            assert!(
+                session.map_binding.bound.is_none(),
+                "real file at zero; no virtual file"
+            );
+        }
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.3: a seek that arrives before the keyframe map is ready
+    /// waits, bounded, for the in-flight build to land, then starts from the
+    /// fresh map instead of paying the §8 `-ss` cost. The session starts late
+    /// and seeks back so the cooking run does not cover the new land (a
+    /// covered seek would be served from the segment map, not this path).
+    #[test]
+    fn seek_waits_for_in_flight_map_build_then_lands_mapped() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let content_id = nightjar_db::content_id_for_path(&src).unwrap();
+        let db = map_item_db(dir.path(), &content_id);
+        let entries: Vec<(i64, i64)> = matroska_entries(&src)
+            .iter()
+            .map(|e| {
+                (
+                    i64::try_from(e.pts_ms).unwrap(),
+                    i64::try_from(e.byte_offset).unwrap(),
+                )
+            })
+            .collect();
+        let land_ms = matroska_entries(&src)
+            .iter()
+            .rev()
+            .find(|e| e.pts_ms <= 2000)
+            .map(|e| e.pts_ms)
+            .expect("land at or before the seek point");
+
+        let reg = HlsSessionRegistry::with_cap(
+            dir.path().join("hls"),
+            3,
+            "libx264",
+            None,
+            Some(db.clone()),
+        )
+        .unwrap();
+        // The predicate is what a seek consults to decide the wait is worth
+        // it; it also tells the build thread the seek has started asking.
+        let build_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let build_go_in_pred = Arc::clone(&build_go);
+        let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let consulted_in_pred = Arc::clone(&consulted);
+        reg.set_map_build_in_flight(Some(Arc::new(move |_item_id: i64| {
+            consulted_in_pred.store(true, Ordering::SeqCst);
+            build_go_in_pred.store(true, Ordering::SeqCst);
+            true
+        })));
+        let build_db = Arc::clone(&db);
+        let build_entries = entries.clone();
+        std::thread::spawn(move || {
+            while !build_go.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Land inside the §9.3 bound, the way a real index read does.
+            std::thread::sleep(Duration::from_millis(250));
+            build_db
+                .replace_keyframe_map(1, &content_id, "matroska", &build_entries, None)
+                .unwrap();
+        });
+
+        let id = reg
+            .start(
+                1,
+                &src,
+                8000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+        let view = reg.seek(&id, 2000).expect("seek");
+        assert_ne!(view.run_id, 0, "fresh run after seek");
+        assert!(
+            consulted.load(Ordering::SeqCst),
+            "seek must consult the build-in-flight state"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_some(),
+                "seek must use the map the bounded wait produced"
+            );
+            assert_eq!(
+                session.start_ms, land_ms,
+                "encode window is the land Cluster PTS, not an -ss lead-in"
+            );
+        }
+        assert!(!reg.map_fallback(&id), "map landed; no §8 fallback");
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.3/§9.4: the wait is bounded. A build that never lands
+    /// (the damaged-index class) must fall through to the §8 `-ss` plan after
+    /// the ~1.5 s bound — not hang, and not fall through early. The session
+    /// starts late and seeks back so the seek must respawn rather than be
+    /// served from the segment map.
+    #[test]
+    fn seek_wait_is_bounded_when_build_never_lands() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let db = map_item_db(dir.path(), &nightjar_db::content_id_for_path(&src).unwrap());
+
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, Some(db))
+                .unwrap();
+        reg.set_map_build_in_flight(Some(Arc::new(|_item_id: i64| true)));
+
+        let id = reg
+            .start(
+                1,
+                &src,
+                8000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+        let before = Instant::now();
+        let view = reg.seek(&id, 2000).expect("seek");
+        let waited = before.elapsed();
+        assert_ne!(view.run_id, 0, "fresh run after seek");
+        assert!(
+            waited >= Duration::from_millis(1200),
+            "seek must wait the bound for the in-flight build: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "wait must be bounded, not hang: {waited:?}"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_none(),
+                "no map landed; the run must be a plain -ss start"
+            );
+            assert_eq!(session.start_ms, 2000, "-ss respawn at the seek point");
+        }
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.3: when no map build is in flight there is nothing to
+    /// wait for. A never-built item's seek falls through to the §8 `-ss`
+    /// plan immediately — the bounded wait is only worth paying while a
+    /// build the consumer already triggered is actually running. The session
+    /// starts late and seeks back so the seek respawns rather than being
+    /// served from the segment map.
+    #[test]
+    fn seek_with_no_build_in_flight_falls_to_ss_without_waiting() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let db = map_item_db(dir.path(), &nightjar_db::content_id_for_path(&src).unwrap());
+
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, Some(db))
+                .unwrap();
+        reg.set_map_build_in_flight(Some(Arc::new(|_item_id: i64| false)));
+
+        let id = reg
+            .start(
+                1,
+                &src,
+                8000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+        let before = Instant::now();
+        let view = reg.seek(&id, 2000).expect("seek");
+        let waited = before.elapsed();
+        assert_ne!(view.run_id, 0, "fresh run after seek");
+        assert!(
+            waited < Duration::from_millis(1200),
+            "no build in flight: seek must not wait: {waited:?}"
+        );
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_none(),
+                "no map and no build: plain -ss start"
+            );
+            assert_eq!(session.start_ms, 2000, "-ss respawn at the seek point");
+            assert!(!session.primed, "a respawn, not a segment-map serve");
+        }
+        reg.stop(&id);
+    }
+
+    /// ADR-0023 §9.4 / §8: a genuinely failed map build (`map_status =
+    /// 'error'`, the end state of a demand-triggered build on a damaged
+    /// index) falls through to today's `-ss` start and the session still
+    /// plays. Confirms the §8 fallback holds through the new on-demand
+    /// trigger path.
+    #[test]
+    fn failed_map_build_falls_through_to_ss_and_plays() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mkv");
+        make_mapped_fixture(&src, 12);
+        let db = map_item_db(dir.path(), &nightjar_db::content_id_for_path(&src).unwrap());
+        db.set_map_status(1, "error").unwrap();
+
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, Some(db))
+                .unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                6000,
+                MAPPED_FIXTURE_MS,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                session.map_binding.bound.is_none(),
+                "a failed map must not serve byte offsets"
+            );
+            assert_eq!(
+                session.start_ms, 6000,
+                "-ss start at the request on the real file"
+            );
+        }
+        let _ = wait_land_near(&reg, &id, 6000);
+        reg.stop(&id);
     }
 
     /// The naive MP4 splice stamped honest sidx and broke AAC on real
@@ -6646,7 +7532,8 @@ mod tests {
         let land_ms = map.entry_at_or_before(request_ms).unwrap().pts_ms;
 
         let dir = tempfile::tempdir().unwrap();
-        let reg = HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy").unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy", None, None).unwrap();
         let id = reg
             .start(
                 1,
@@ -6659,6 +7546,7 @@ mod tests {
                 None,
                 Some(map),
                 VideoEncodePlan::default(),
+                None,
             )
             .unwrap();
         {

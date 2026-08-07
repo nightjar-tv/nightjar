@@ -16,11 +16,12 @@ pub use paths::{
     require_relpath, resolve_media_path, show_folder_relpath, to_relpath,
 };
 pub use status::{
+    SidecarPresence, SubtitleTrackKind, backoff_days, classify_subtitle_status,
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
 };
 pub use store::{
     Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate,
-    ScanJobRow, SidecarRow, UpsertItem,
+    ScanJobRow, SidecarRow, SubtitleTrackRow, UpsertItem,
 };
 
 use std::path::{Path, PathBuf};
