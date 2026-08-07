@@ -80,6 +80,13 @@ pass (Rule 6.1 / 4.9).
    or an HLS session starts, embedded tracks are warmed in the background so
    the first caption request does not race a cold NAS demux alone.
 
+   > **Superseded by [ADR-0013](0013-subtitle-extraction-at-scan.md).**
+   > Byte-capped LRU cache and playback-time extract are replaced by
+   > extraction at scan time with no cache eviction; extraction is
+   > unconditional there and (as of
+   > [ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md))
+   > probe-time-classified and client/method-gated instead.
+
 8. **API.** `PlaybackInfo.subtitleTracks` is an array of
    `{ trackId, source, codec, language?, label?, forced, sdh, url?, streamIndex? }`.
    `url` is present only when the track is served as WebVTT. Listed the same
