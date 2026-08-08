@@ -97,6 +97,14 @@ struct Queue {
     background: VecDeque<WorkItem>,
 }
 
+/// Which queue a worker takes from next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextKind {
+    Probe,
+    Background,
+    Idle,
+}
+
 /// Completion barrier for the probes one scan job enqueues (ADR-0004 §2.4).
 ///
 /// `remaining` starts at zero and rises as the index pass discovers items,
@@ -778,11 +786,63 @@ impl LibraryPool {
         result
     }
 
+    /// Which queue a worker takes from next.
+    ///
+    /// A `priority` item at the head of `background` is user-triggered work —
+    /// the extract or keyframe map for a title someone is playing right now,
+    /// put there by [`Self::prioritize_extract`] or
+    /// [`Self::prioritize_map_rebuild`] (ADR-0013 §11, ADR-0023 §8). It runs
+    /// ahead of the probe backlog, which is sweep work with nobody waiting on
+    /// it, and ahead of the index-walk pause that holds ordinary background
+    /// work back.
+    ///
+    /// Before this, `priority` only reordered `background`, and `background`
+    /// was reached only once `probes` was empty — so an interactive map still
+    /// queued behind every probe. On the 2026-08-07 cold scan that was 35
+    /// minutes behind 23,244 probes, and the four maps then built in 1.3 s the
+    /// moment the probe queue drained. Priority reordered a queue nobody was
+    /// reading.
+    ///
+    /// Everything else is unchanged: probes go first, and non-priority
+    /// background waits for both an empty probe queue and an idle index walk.
+    fn next_kind(queue: &Queue, index_busy: bool) -> NextKind {
+        if queue.background.front().is_some_and(|front| front.priority) {
+            return NextKind::Background;
+        }
+        if !queue.probes.is_empty() {
+            return NextKind::Probe;
+        }
+        if !index_busy && !queue.background.is_empty() {
+            return NextKind::Background;
+        }
+        NextKind::Idle
+    }
+
     fn run_worker(&self) {
         loop {
             let (item, bulk_gate) = {
                 let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
+                    let index_busy = self.index_active.load(Ordering::SeqCst) != 0;
+                    // One bulk-reader gate for extract and map (ADR-0041
+                    // Decision 8.6 / ADR-0023 §2): a whole-file reader never
+                    // starts while another is in flight. Acquired at pop time
+                    // so a queued item stays visible in the queue depth while
+                    // it waits. When the gate is held the worker takes a probe
+                    // rather than idling behind it.
+                    let gate = match Self::next_kind(&queue, index_busy) {
+                        NextKind::Background => self.bulk_reader.try_lock().ok(),
+                        NextKind::Probe | NextKind::Idle => None,
+                    };
+                    if let Some(gate) = gate {
+                        match queue.background.pop_front() {
+                            Some(item) if !self.availability.pause.is_paused(item.library_id) => {
+                                break (item, Some(gate));
+                            }
+                            // Paused or front changed: drop the gate and re-check.
+                            _ => continue,
+                        }
+                    }
                     if let Some(item) = queue.probes.pop_front() {
                         if self.availability.pause.is_paused(item.library_id) {
                             if let Some(batch) = &item.batch {
@@ -796,25 +856,6 @@ impl LibraryPool {
                             continue;
                         }
                         break (item, None);
-                    }
-                    let index_busy = self.index_active.load(Ordering::SeqCst) != 0;
-                    let should_pop = queue
-                        .background
-                        .front()
-                        .is_some_and(|front| !index_busy || front.priority);
-                    // One bulk-reader gate for extract and map (ADR-0041
-                    // Decision 8.6 / ADR-0023 §2): a whole-file reader never
-                    // starts while another is in flight. Acquired at pop time
-                    // so a queued item stays visible in the queue depth while
-                    // it waits, and probes can always preempt the wait.
-                    if should_pop && let Ok(gate) = self.bulk_reader.try_lock() {
-                        match queue.background.pop_front() {
-                            Some(item) if !self.availability.pause.is_paused(item.library_id) => {
-                                break (item, Some(gate));
-                            }
-                            // Paused or front changed: drop the gate and re-check.
-                            _ => continue,
-                        }
                     }
                     queue = self
                         .available
@@ -1516,6 +1557,72 @@ mod tests {
         assert_eq!(queue.background[0].item_id, 2);
         assert!(queue.background[0].priority);
         assert_eq!(queue.background[1].item_id, 1);
+    }
+
+    fn queue_with(probes: usize, background: Vec<WorkItem>) -> Queue {
+        let mut queue = Queue {
+            probes: VecDeque::new(),
+            background: VecDeque::new(),
+        };
+        for i in 0..probes {
+            queue
+                .probes
+                .push_back(WorkItem::probe(i as i64, 1, PathBuf::from("/p"), None));
+        }
+        queue.background = background.into();
+        queue
+    }
+
+    fn priority_map(item_id: i64) -> WorkItem {
+        let mut item = WorkItem::map(item_id, 1, PathBuf::from("/m.mkv"));
+        item.priority = true;
+        item
+    }
+
+    #[test]
+    fn priority_background_preempts_the_probe_backlog() {
+        // The 2026-08-07 cold scan: a session-requested map behind 23,244
+        // probes waited 35 minutes because background was only reached once
+        // probes drained.
+        let queue = queue_with(23_244, vec![priority_map(7)]);
+        assert_eq!(LibraryPool::next_kind(&queue, false), NextKind::Background);
+        // And it preempts while an index walk is running, which is what
+        // ADR-0013 §11 already promised for play-priority work.
+        assert_eq!(LibraryPool::next_kind(&queue, true), NextKind::Background);
+    }
+
+    #[test]
+    fn non_priority_background_still_waits_for_probes_and_the_walk() {
+        let queue = queue_with(3, vec![WorkItem::map(7, 1, PathBuf::from("/m.mkv"))]);
+        assert_eq!(LibraryPool::next_kind(&queue, false), NextKind::Probe);
+
+        let queue = queue_with(0, vec![WorkItem::map(7, 1, PathBuf::from("/m.mkv"))]);
+        assert_eq!(LibraryPool::next_kind(&queue, false), NextKind::Background);
+        assert_eq!(LibraryPool::next_kind(&queue, true), NextKind::Idle);
+    }
+
+    #[test]
+    fn empty_queues_are_idle_and_probes_alone_are_probes() {
+        let queue = queue_with(0, Vec::new());
+        assert_eq!(LibraryPool::next_kind(&queue, false), NextKind::Idle);
+
+        let queue = queue_with(2, Vec::new());
+        assert_eq!(LibraryPool::next_kind(&queue, true), NextKind::Probe);
+    }
+
+    #[test]
+    fn only_the_head_of_background_preempts() {
+        // prioritize_* pushes to the front, so a priority item deeper in the
+        // queue is not a state the pool produces; assert the rule anyway so a
+        // future scan of the whole queue is a deliberate change, not a drift.
+        let queue = queue_with(
+            5,
+            vec![
+                WorkItem::map(1, 1, PathBuf::from("/a.mkv")),
+                priority_map(2),
+            ],
+        );
+        assert_eq!(LibraryPool::next_kind(&queue, false), NextKind::Probe);
     }
 
     #[test]
