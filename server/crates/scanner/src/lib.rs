@@ -343,7 +343,10 @@ fn run_repoint_job(
     candidate_path: &str,
 ) -> Result<(), String> {
     db.set_scan_job_state(job_id, "indexing")?;
-    let probe_queue = {
+    // Probes enqueue as the walk discovers them, so the barrier opens before
+    // the epoch and closes in `finish_scan_probes` (ADR-0004 §2.4).
+    let probes = pool.start_probe_batch();
+    {
         // One epoch for dry-run walk + commit index so another library cannot
         // interleave a cold walk on the same share (ADR-0015).
         let _epoch = pool.enter_index_epoch(library_id);
@@ -398,9 +401,9 @@ fn run_repoint_job(
         let _ = db.repair_library_paths(library_id)?;
         let _ = pool.set_library_reachability(library_id, &candidate, true);
         pool.replace_walk_cache(library_id, dry_cache);
-        run_index_pass(db, pool, job_id, library_id, Some(outcome))?
-    };
-    finish_scan_probes(db, pool, job_id, library_id, probe_queue)
+        run_index_pass(db, pool, job_id, library_id, Some(outcome), &probes)?;
+    }
+    finish_scan_probes(db, pool, job_id, library_id, probes)
 }
 
 fn run_scan_job(
@@ -419,11 +422,12 @@ fn run_index_and_probe(
     job_id: i64,
     library_id: i64,
 ) -> Result<(), String> {
-    let probe_queue = {
+    let probes = pool.start_probe_batch();
+    {
         let _epoch = pool.enter_index_epoch(library_id);
-        run_index_pass(db, pool, job_id, library_id, None)?
-    };
-    finish_scan_probes(db, pool, job_id, library_id, probe_queue)
+        run_index_pass(db, pool, job_id, library_id, None, &probes)?;
+    }
+    finish_scan_probes(db, pool, job_id, library_id, probes)
 }
 
 fn finish_scan_probes(
@@ -431,22 +435,26 @@ fn finish_scan_probes(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
-    probe_queue: Vec<pool::WorkItem>,
+    probes: pool::ProbeBatch,
 ) -> Result<(), String> {
     if !pool.is_library_reachable(library_id) {
         db.complete_scan_job(job_id, 0)?;
         return Ok(());
     }
 
-    let probe_started = Instant::now();
-    pool.enqueue_probe_batch(probe_queue).wait();
+    // Measured from the first push, not from here, so it still means "how long
+    // probing took" now that probing overlaps the walk. It therefore overlaps
+    // `index_duration_ms` and the two no longer sum to job wall time. It has
+    // also never covered the fs-notify or `drain_pending_probes` paths, which
+    // enqueue outside any batch.
+    let probe_duration = probes.wait();
     // No scan-time subtitle extract enqueue: the probe already classified each
     // item (ADR-0041 Decision 2), and extraction is triggered on demand only
     // (ADR-0041 Decision 10, deleting the ADR-0013 §1 scan-time enqueue).
     // No scan-time keyframe-map enqueue either (ADR-0023 §2/§9 amendment):
     // the map builds when a consumer asks — playbackInfo, session create, or
     // a seek's bounded wait — never as a whole-library consequence of scanning.
-    let probe_duration_ms = probe_started.elapsed().as_millis() as u64;
+    let probe_duration_ms = probe_duration.as_millis() as u64;
     db.complete_scan_job(job_id, probe_duration_ms)?;
 
     tracing::info!(job_id, library_id, probe_duration_ms, "scan job completed");
@@ -457,13 +465,20 @@ fn finish_scan_probes(
 ///
 /// When `prewalked` is `Some`, the file list is reused (repoint: same cold walk
 /// as the retain dry-run). Caller must have reseeded WalkCache for the new root.
+///
+/// Probes are pushed into `probes` as they are discovered rather than returned
+/// as a batch for the caller to enqueue afterwards (ADR-0004 §2.4). Returns how
+/// many were pushed. Note that the readdir walk still runs to completion before
+/// the upsert loop begins, so the first probe lands at readdir plus one
+/// `INDEX_BATCH` flush — not at the start of the pass.
 fn run_index_pass(
     db: &Arc<Db>,
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
     prewalked: Option<walk::WalkOutcome>,
-) -> Result<Vec<pool::WorkItem>, String> {
+    probes: &pool::ProbeBatch,
+) -> Result<usize, String> {
     let lib = db
         .get_library(library_id)?
         .ok_or_else(|| format!("library {library_id} not found"))?;
@@ -496,8 +511,9 @@ fn run_index_pass(
     let index_started = Instant::now();
     // Caller holds IndexEpochGuard for this walk/upsert (ADR-0013/0015).
     #[allow(clippy::type_complexity)]
-    let index_result = (|| -> Result<(u32, u32, u32, u32, Vec<pool::WorkItem>, u64), String> {
+    let index_result = (|| -> Result<(u32, u32, u32, u32, usize, u64), String> {
         let reused = prewalked.is_some();
+        let walk_started = Instant::now();
         let (cache_warm, outcome) = if let Some(outcome) = prewalked {
             // Repoint reseeded cache from the dry-run; treat as warm for next poll.
             (true, outcome)
@@ -508,6 +524,11 @@ fn run_index_pass(
             })?;
             (cache_warm, outcome)
         };
+        // `index_duration_ms` covers readdir and upsert together, which is why
+        // no run so far can say which of the two the cold-scan minutes were
+        // spent in. Split here; the scan-job row and the Gate 1 harness keep
+        // reading `index_duration_ms` unchanged.
+        let walk_ms = walk_started.elapsed().as_millis() as u64;
         if reused {
             tracing::info!(
                 library_id,
@@ -527,7 +548,7 @@ fn run_index_pass(
         let mut keep_folds: HashSet<String> = HashSet::with_capacity(files.len());
         let mut pending_upserts: Vec<UpsertItem> = Vec::with_capacity(INDEX_BATCH);
         let mut pending_were_existing: Vec<bool> = Vec::with_capacity(INDEX_BATCH);
-        let mut probe_queue = Vec::new();
+        let mut to_probe = 0usize;
         // One listing per parent for the whole index job (flat 10k dirs).
         let mut sidecar_dirs = nightjar_transcode::SidecarDirCache::default();
 
@@ -541,7 +562,7 @@ fn run_index_pass(
                      library_root: &str,
                      pending: &mut Vec<UpsertItem>,
                      were_existing: &mut Vec<bool>,
-                     probe_queue: &mut Vec<pool::WorkItem>,
+                     to_probe: &mut usize,
                      added: &mut u32,
                      updated: &mut u32,
                      sidecar_dirs: &mut nightjar_transcode::SidecarDirCache|
@@ -560,12 +581,11 @@ fn run_index_pass(
                 } else {
                     *added += 1;
                 }
-                probe_queue.push(pool::WorkItem::probe(
-                    id,
-                    library_id,
-                    abs_paths[i].clone(),
-                    Some(job_id),
-                ));
+                pool.enqueue_probe_in_batch(
+                    pool::WorkItem::probe(id, library_id, abs_paths[i].clone(), Some(job_id)),
+                    probes,
+                );
+                *to_probe += 1;
                 if let Err(e) =
                     associate_sidecars(db, id, library_root, &abs_paths[i], sidecar_dirs)
                 {
@@ -610,12 +630,11 @@ fn run_index_pass(
                     unchanged += 1;
                     if row.probe_status == "indexed" {
                         let abs = resolve_media_path(&library_root, &row.path);
-                        probe_queue.push(pool::WorkItem::probe(
-                            row.id,
-                            library_id,
-                            abs,
-                            Some(job_id),
-                        ));
+                        pool.enqueue_probe_in_batch(
+                            pool::WorkItem::probe(row.id, library_id, abs, Some(job_id)),
+                            probes,
+                        );
+                        to_probe += 1;
                     }
                 }
                 other => {
@@ -672,7 +691,7 @@ fn run_index_pass(
                             &library_root,
                             &mut pending_upserts,
                             &mut pending_were_existing,
-                            &mut probe_queue,
+                            &mut to_probe,
                             &mut added,
                             &mut updated,
                             &mut sidecar_dirs,
@@ -688,7 +707,7 @@ fn run_index_pass(
             &library_root,
             &mut pending_upserts,
             &mut pending_were_existing,
-            &mut probe_queue,
+            &mut to_probe,
             &mut added,
             &mut updated,
             &mut sidecar_dirs,
@@ -839,6 +858,17 @@ fn run_index_pass(
         }
 
         let index_duration_ms = index_started.elapsed().as_millis() as u64;
+        // Everything after the readdir: stat comparison, upsert batches,
+        // sidecar association, delete_missing.
+        let upsert_ms = index_duration_ms.saturating_sub(walk_ms);
+        // `to_probe` and the batch counter increment at the same two sites; a
+        // future push that updates one and not the other is the realistic
+        // mistake this catches.
+        debug_assert_eq!(
+            to_probe,
+            probes.pushed(),
+            "index-pass probe count disagrees with the batch"
+        );
         pool.record_index_duration_ms(index_duration_ms);
         db.set_scan_job_index_done(
             job_id,
@@ -858,7 +888,9 @@ fn run_index_pass(
             unchanged,
             sidecar_checked,
             relisted_dirs = relisted_dirs.len(),
-            to_probe = probe_queue.len(),
+            to_probe,
+            walk_ms,
+            upsert_ms,
             index_duration_ms,
             "index pass done"
         );
@@ -867,12 +899,12 @@ fn run_index_pass(
             updated,
             removed,
             unchanged,
-            probe_queue,
+            to_probe,
             index_duration_ms,
         ))
     })();
-    let (_added, _updated, _removed, _unchanged, probe_queue, _index_duration_ms) = index_result?;
-    Ok(probe_queue)
+    let (_added, _updated, _removed, _unchanged, to_probe, _index_duration_ms) = index_result?;
+    Ok(to_probe)
 }
 
 fn associate_sidecars(
