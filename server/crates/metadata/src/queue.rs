@@ -1049,8 +1049,10 @@ pub struct DrainOptions {
 /// Provider/`api_error` failures leave rows **pending** (search) or
 /// **matched** (enrich) and are not negative-cached.
 ///
-/// Sidecar NFO (Kodi layout) feeds the search tier only: same-stem `.nfo`
-/// beside the media file, or `<dir>/episodedetails.nfo` for episode groups.
+/// Sidecar NFO (Kodi layout) feeds the search tier only, from the ordered
+/// candidate list in [`nfo_sidecar_xml`]: same-stem `.nfo` beside the media
+/// file, then `movie.nfo` / `<foldername>.nfo` for movies or
+/// `episodedetails.nfo` for episode groups.
 /// Enrich stays TMDB-id-driven so a sparse NFO never blocks season detail.
 pub fn drain_pending<T: MetadataSource>(
     conn: &Connection,
@@ -1242,7 +1244,7 @@ fn search_one_group<T: MetadataSource>(
         MetadataKind::Episode | MetadataKind::Show => g.year.or(g.library_year),
     };
     let input = ResolveInput {
-        nfo_xml: nfo_sidecar_xml(&media_path, g.resolve_kind),
+        nfo_xml: nfo_sidecar_xml(&media_path, g.resolve_kind, &g.library_path),
         tvshow_nfo_xml: match g.resolve_kind {
             // tvshow.nfo is series identity — TV groups only.
             MetadataKind::Movie => None,
@@ -1404,6 +1406,7 @@ fn enrich_one_group<T: MetadataSource>(
     let nfo = nfo_sidecar_meta(
         &resolve_media_path(&g.library_path, &g.path),
         g.resolve_kind,
+        &g.library_path,
     );
 
     // Complete NFO (movie): skip TMDB detail entirely.
@@ -1568,19 +1571,54 @@ fn episode_bound_ids(conn: &Connection, item_ids: &[i64]) -> Result<Vec<i64>, St
     Ok(out)
 }
 
-/// Best-effort sidecar NFO for a group's reference media path (Kodi layout):
-/// `foo.mkv` → `foo.nfo` beside the file; episode groups also try
-/// `<dir>/episodedetails.nfo`. `tvshow.nfo` is deliberately **not** a
-/// candidate here — it is series identity, read separately by
-/// [`show_root_nfo_xml`], so it never masks the episode NFO (autopsy D5).
-/// Read/IO failures are silent `None` — the resolver decides on NFO content
-/// (corrupt NFO → `NfoInvalid`, not fallthrough).
-fn nfo_sidecar_xml(path: &std::path::Path, kind: MetadataKind) -> Option<String> {
+/// Best-effort sidecar NFO for a group's reference media path (Kodi layout),
+/// as an ordered candidate list per kind. First candidate that **reads** wins:
+/// a corrupt NFO yields `NfoInvalid` from the resolver rather than falling
+/// through to a different file, which is the existing contract (autopsy D5) and
+/// the reason this is not "first that parses".
+///
+/// - **Movie:** `<stem>.nfo`, then `<dir>/movie.nfo`, then
+///   `<dir>/<foldername>.nfo`.
+/// - **Episode:** `<stem>.nfo`, then `<dir>/episodedetails.nfo`.
+/// - **Show:** `<stem>.nfo` only.
+///
+/// The movie folder candidates cover the Kodi/Emby/Jellyfin layout, which is
+/// what Radarr writes and what every movie in the 2026-08-08 dogfood library
+/// uses: 1,748 of 1,756 movie NFOs are `movie.nfo`, so same-stem alone found
+/// eight of them and every other movie was fetched from TMDB with a complete
+/// NFO sitting beside it.
+///
+/// Not a folder scan, deliberately: `Breaking Bad/Season 1/` holds `season.nfo`
+/// beside twenty episode NFOs, so "any NFO here" would give an episode the
+/// season's metadata, and movie folders hold extras and trailers with NFOs of
+/// their own.
+///
+/// `tvshow.nfo` is deliberately **not** a candidate — it is series identity,
+/// read separately by [`show_root_nfo_xml`], so it never masks the episode NFO
+/// (autopsy D5). Read/IO failures are silent `None`.
+fn nfo_sidecar_xml(
+    path: &std::path::Path,
+    kind: MetadataKind,
+    library_path: &str,
+) -> Option<String> {
     let mut candidates = vec![path.with_extension("nfo")];
-    if kind == MetadataKind::Episode
-        && let Some(dir) = path.parent()
-    {
-        candidates.push(dir.join("episodedetails.nfo"));
+    if let Some(dir) = path.parent() {
+        match kind {
+            // Folder-level names only mean "this title" when the folder *is*
+            // the title. Flat `Movies/Eagle Eye (2008).mkv` would otherwise
+            // take `Movies/movie.nfo`, applying one stray file's metadata to
+            // every movie in the library — autopsy D5 in a new place.
+            MetadataKind::Movie if !is_library_root(dir, library_path) => {
+                candidates.push(dir.join("movie.nfo"));
+                if let Some(name) = dir.file_name() {
+                    let mut folder_named = name.to_os_string();
+                    folder_named.push(".nfo");
+                    candidates.push(dir.join(folder_named));
+                }
+            }
+            MetadataKind::Episode => candidates.push(dir.join("episodedetails.nfo")),
+            MetadataKind::Movie | MetadataKind::Show => {}
+        }
     }
     for c in candidates {
         if c.is_file()
@@ -1590,6 +1628,20 @@ fn nfo_sidecar_xml(path: &std::path::Path, kind: MetadataKind) -> Option<String>
         }
     }
     None
+}
+
+/// Whether `dir` is the library root itself, so a folder-level NFO in it would
+/// describe the library rather than one title. Compares canonicalised paths so
+/// a symlinked or `/var` vs `/private/var` root still matches (ADR-0030 §1).
+fn is_library_root(dir: &std::path::Path, library_path: &str) -> bool {
+    let library = std::path::Path::new(library_path);
+    if dir == library {
+        return true;
+    }
+    match (dir.canonicalize(), library.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Series identity from `tvshow.nfo` at the show root (Kodi/Jellyfin layout).
@@ -1616,8 +1668,12 @@ fn show_root_nfo_xml(path: &std::path::Path, library_path: &str) -> Option<Strin
 }
 
 /// Parse the sidecar NFO (if any) for a media path into [`CanonicalMetadata`].
-fn nfo_sidecar_meta(path: &std::path::Path, kind: MetadataKind) -> Option<CanonicalMetadata> {
-    let xml = nfo_sidecar_xml(path, kind)?;
+fn nfo_sidecar_meta(
+    path: &std::path::Path,
+    kind: MetadataKind,
+    library_path: &str,
+) -> Option<CanonicalMetadata> {
+    let xml = nfo_sidecar_xml(path, kind, library_path)?;
     if xml.trim().is_empty() {
         return None;
     }
@@ -3473,6 +3529,168 @@ mod tests {
         );
     }
 
+    fn movie_nfo_xml(title: &str, tmdb: u32) -> String {
+        format!(
+            "<movie><title>{title}</title><uniqueid type=\"tmdb\">{tmdb}</uniqueid>\
+             <plot>A plot.</plot></movie>"
+        )
+    }
+
+    /// The Kodi/Emby/Jellyfin movie layout, which is what Radarr writes and
+    /// what 1,748 of 1,756 movie NFOs in the dogfood library use. Same-stem
+    /// alone found eight of them, so every other movie was fetched from TMDB
+    /// with a complete NFO beside it.
+    #[test]
+    fn movie_nfo_in_the_title_folder_is_found() {
+        let base = std::env::temp_dir().join(format!(
+            "nightjar-movie-nfo-folder-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("Movies");
+        let folder = library.join("Eagle Eye (2008)");
+        std::fs::create_dir_all(&folder).unwrap();
+        let media = folder.join("Eagle Eye (2008).mkv");
+        std::fs::write(folder.join("movie.nfo"), movie_nfo_xml("Eagle Eye", 9982)).unwrap();
+
+        let meta = nfo_sidecar_meta(&media, MetadataKind::Movie, library.to_str().unwrap())
+            .expect("movie.nfo beside the media file must be read");
+        assert_eq!(meta.title, "Eagle Eye");
+        assert_eq!(meta.ids.tmdb, Some(9982));
+        assert!(meta.is_nfo_complete(), "and it must skip the TMDB fetch");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Third candidate, for layouts that name the NFO after the folder rather
+    /// than the file or the literal `movie.nfo`.
+    #[test]
+    fn folder_named_movie_nfo_is_found() {
+        let base = std::env::temp_dir().join(format!(
+            "nightjar-movie-nfo-folder-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("Movies");
+        let folder = library.join("Eagle Eye (2008)");
+        std::fs::create_dir_all(&folder).unwrap();
+        // Media file stem differs from the folder name, so `<stem>.nfo` misses.
+        let media = folder.join("Eagle Eye (2008) Bluray-1080p.mkv");
+        std::fs::write(
+            folder.join("Eagle Eye (2008).nfo"),
+            movie_nfo_xml("Eagle Eye", 9982),
+        )
+        .unwrap();
+
+        let meta = nfo_sidecar_meta(&media, MetadataKind::Movie, library.to_str().unwrap())
+            .expect("<foldername>.nfo must be read when the stem does not match");
+        assert_eq!(meta.ids.tmdb, Some(9982));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Candidate order: the file-specific NFO describes *this* file, the folder
+    /// ones describe the title, so the specific one wins when both exist.
+    #[test]
+    fn same_stem_nfo_beats_movie_nfo() {
+        let base = std::env::temp_dir().join(format!(
+            "nightjar-movie-nfo-folder-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("Movies");
+        let folder = library.join("Eagle Eye (2008)");
+        std::fs::create_dir_all(&folder).unwrap();
+        let media = folder.join("Eagle Eye (2008).mkv");
+        std::fs::write(
+            folder.join("Eagle Eye (2008).nfo"),
+            movie_nfo_xml("From The Stem", 1),
+        )
+        .unwrap();
+        std::fs::write(folder.join("movie.nfo"), movie_nfo_xml("From movie.nfo", 2)).unwrap();
+
+        let meta = nfo_sidecar_meta(&media, MetadataKind::Movie, library.to_str().unwrap())
+            .expect("same-stem NFO must still be read");
+        assert_eq!(meta.title, "From The Stem");
+        assert_eq!(meta.ids.tmdb, Some(1));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Autopsy D5 applied to movies: with a flat layout the media file's parent
+    /// *is* the library root, so `Movies/movie.nfo` describes no single title.
+    /// Reading it would apply one stray file's metadata to every movie in the
+    /// library — the same failure as a `tvshow.nfo` above the library root.
+    #[test]
+    fn movie_nfo_at_the_library_root_is_not_read() {
+        let base = std::env::temp_dir().join(format!(
+            "nightjar-movie-nfo-folder-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("Movies");
+        std::fs::create_dir_all(&library).unwrap();
+        // No title folder: the movie sits directly in the library root.
+        let media = library.join("Eagle Eye (2008).mkv");
+        std::fs::write(library.join("movie.nfo"), movie_nfo_xml("Wrong Movie", 1)).unwrap();
+        std::fs::write(library.join("Movies.nfo"), movie_nfo_xml("Also Wrong", 2)).unwrap();
+
+        assert_eq!(
+            nfo_sidecar_xml(&media, MetadataKind::Movie, library.to_str().unwrap()),
+            None,
+            "a folder-level NFO at the library root must not describe one title"
+        );
+
+        // The same-stem candidate is unambiguous and still applies there.
+        std::fs::write(
+            library.join("Eagle Eye (2008).nfo"),
+            movie_nfo_xml("Eagle Eye", 9982),
+        )
+        .unwrap();
+        let meta = nfo_sidecar_meta(&media, MetadataKind::Movie, library.to_str().unwrap())
+            .expect("same-stem NFO is unambiguous even at the library root");
+        assert_eq!(meta.ids.tmdb, Some(9982));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// First candidate that *reads* wins, not first that parses. A corrupt
+    /// `movie.nfo` surfaces as `NfoInvalid` rather than silently resolving from
+    /// a stale `<foldername>.nfo` that may describe a different cut entirely.
+    #[test]
+    fn corrupt_movie_nfo_does_not_fall_through_to_the_next_candidate() {
+        let base = std::env::temp_dir().join(format!(
+            "nightjar-movie-nfo-folder-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let library = base.join("Movies");
+        let folder = library.join("Eagle Eye (2008)");
+        std::fs::create_dir_all(&folder).unwrap();
+        // Stem does not match, so `movie.nfo` is the first candidate and the
+        // folder-named NFO is the one it must not fall through to.
+        let media = folder.join("Eagle Eye (2008) Bluray-1080p.mkv");
+        std::fs::write(folder.join("movie.nfo"), "<movie><title>truncated").unwrap();
+        std::fs::write(
+            folder.join("Eagle Eye (2008).nfo"),
+            movie_nfo_xml("Stale Fallback", 7),
+        )
+        .unwrap();
+
+        let xml = nfo_sidecar_xml(&media, MetadataKind::Movie, library.to_str().unwrap())
+            .expect("the corrupt NFO is still what gets read");
+        assert!(
+            xml.contains("truncated"),
+            "movie.nfo must win on read, not on parse"
+        );
+        assert!(
+            crate::nfo::parse_nfo(&xml).is_err(),
+            "and the resolver decides on its content"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// RC5: a `tvshow.nfo` one level above the library root is **not** read —
     /// the walk-up is bounded by the library path, with the file present
     /// (autopsy D5; replaces the vacuous branch test that proved only
@@ -3672,6 +3890,7 @@ mod tests {
         let episode_nfo = nfo_sidecar_meta(
             &resolve_media_path(library.to_str().unwrap(), "Alpha/Season 1/Alpha.S01E01.mkv"),
             MetadataKind::Episode,
+            library.to_str().unwrap(),
         );
         assert_eq!(
             episode_nfo.as_ref().map(|m| m.title.as_str()),
