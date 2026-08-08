@@ -1,6 +1,6 @@
 //! Serve cached artwork (ADR-0027).
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -22,6 +22,16 @@ pub async fn get_artwork(
     State(state): State<AppState>,
     Path((item_key, kind_s)): Path<(String, String)>,
     Query(q): Query<ArtworkQuery>,
+) -> ApiResult<Response> {
+    // A DB read plus a cache-file read, on every poster in the grid.
+    blocking(move || get_artwork_blocking(state, item_key, kind_s, q)).await
+}
+
+fn get_artwork_blocking(
+    state: AppState,
+    item_key: String,
+    kind_s: String,
+    q: ArtworkQuery,
 ) -> ApiResult<Response> {
     let kind = ArtworkStore::parse_kind(&kind_s)
         .ok_or_else(|| ApiError::bad_request(format!("unknown artwork kind {kind_s}")))?;
