@@ -1,7 +1,7 @@
 # ADR-0004: Async scan jobs and Gate 1 index-pass criterion
 
 - Status: accepted; amended 2026-08-08 (§2.2, §2.4 and a new §3 — in place,
-  Rule 6.4)
+  Rule 6.4); amended 2026-08-09 (Consequences — walk/probe contention measured)
 - Date: 2026-07-25
 
 ## Context
@@ -144,7 +144,38 @@ Schema migration `002` adds `scan_jobs` and `media_items.probe_status`
 
 Probing overlapping the walk means ffprobe children now read from the share
 while the walk stats it, where before the two phases were strictly sequential.
-On a bandwidth-bound mount that could slow the walk. It is not gated
-speculatively: the walk/probe split in the index-pass log and the FUSE queue
-sampler are there to answer it with a measurement, on healthy hardware, rather
-than a guess.
+
+**Measured 2026-08-09, and the cost is real.** Recomputed from the 2026-08-07
+run's `probed_at` series, matched on the same 2,223 paths so file population,
+host and array are all controlled: those items probed at **0.45/s while the walk
+was still running, and 3.41/s once it had finished — 7.6× slower**. Nothing else
+distinguishes the two windows. That is probes contending with eight directory
+workers over SMB, and it is the interference this section previously called
+unmeasured.
+
+**The trade is accepted, not resolved.** §2.4 moves probing ~78 minutes earlier,
+deliberately, into precisely the window where probes run slowest. Time to first
+playable item improves enormously and that remains the right call — it is the
+decision §2.4 exists to make. But aggregate throughput may be *worse*, and
+nothing measured so far separates the two goals. A later reader should find the
+cost recorded next to the benefit rather than infer it from a regression.
+
+The one countervailing sample is weak: a short run on 2026-08-09 measured 6.7/s
+*during* a walk, which would suggest the penalty is small under §2.4. Its walk
+had barely started and was in shallow directories — the easiest possible sample,
+and it cannot carry the claim.
+
+**Still not gated speculatively**, for an updated reason. There is now half a
+measurement pointing at a cost, not a design for what to do about it. Reducing
+walk concurrency, throttling probes during the walk, or gating probes on walk
+state might each fix it or might simply move the cost into the phase that is
+now 93% of the pass — and choosing between them without evidence would be the
+same speculative move, for better-sounding reasons.
+
+What settles it is a **shape, not an aggregate**: probe rate plotted against
+walk state across one full run — during readdir, during the upsert loop, and
+after the walk ends. An aggregate cannot answer it, because averaging the
+0.45/s window with the 3.41/s window returns 2.14/s, which describes neither.
+`probed_at` supports this directly and §2.4's `walk_ms` / `upsert_ms` give the
+phase boundaries. Evidence:
+`nightjar-meta/notes/probe-rate-matched-2026-08-09.md`.
