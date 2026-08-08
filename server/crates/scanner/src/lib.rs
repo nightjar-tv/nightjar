@@ -88,21 +88,44 @@ pub fn request_scan(
     let db_worker = Arc::clone(&db);
     let pool_worker = Arc::clone(&pool);
     spawn_job_worker(&db, job_id, "scan", None, move || {
-        let scan_ok = match run_scan_job(&db_worker, &pool_worker, job_id, library_id) {
-            Ok(()) => true,
+        let outcome = match run_scan_job(&db_worker, &pool_worker, job_id, library_id) {
+            Ok(probe_duration_ms) => Some(probe_duration_ms),
             Err(e) => {
                 tracing::error!(job_id, library_id, error = %e, "scan job failed");
                 let _ = db_worker.fail_scan_job(job_id, &e);
-                false
+                None
             }
         };
-        // Drop any leftover hint dirt so it cannot suppress a later job.
+
+        // Every pool-state side effect this job owns runs *before* the row goes
+        // terminal. The row is the only thing an outside observer can wait on,
+        // so a job that reads `completed` while its worker is still mutating
+        // pool state is making a promise it does not keep. That window is what
+        // made `repoint_holdoff_blocks_poll_not_manual` flaky on CI: a holdoff
+        // armed after wait_job returned was wiped by this tail a moment later,
+        // and the next poll started a job it should have skipped.
+        //
+        // Ordering matters within the tail too: take_scan_dirty must be
+        // consumed here, before the row is terminal, so a trigger that arrives
+        // during the scan is not lost.
         let _ = pool_worker.take_dirty_add(library_id);
-        if scan_ok {
+        if outcome.is_some() {
             // Ordinary scan is the clear for deferred_remove holdoff.
             pool_worker.clear_repoint_delete_holdoff(library_id);
         }
-        if pool_worker.take_scan_dirty(library_id) {
+        let dirty = pool_worker.take_scan_dirty(library_id);
+
+        if let Some(probe_duration_ms) = outcome {
+            complete_job(&db_worker, job_id, library_id, probe_duration_ms);
+        }
+
+        // The follow-up is the one thing that cannot move ahead of completion:
+        // request_scan refuses to start a job while this one is still active
+        // (one job per library), so asking earlier would return this job's id
+        // and silently drop the follow-up. A new job appearing after this one
+        // goes terminal is correct -- it is a different job, not this job's
+        // unfinished business.
+        if dirty {
             tracing::info!(
                 library_id,
                 "library dirty after scan; starting follow-up job"
@@ -299,9 +322,16 @@ pub fn request_repoint(
     let db_worker = Arc::clone(&db);
     let pool_worker = Arc::clone(&pool);
     spawn_job_worker(&db, job_id, "repoint", None, move || {
-        if let Err(e) = run_repoint_job(&db_worker, &pool_worker, job_id, library_id, &candidate) {
-            tracing::error!(job_id, library_id, error = %e, "repoint job failed");
-            let _ = db_worker.fail_scan_job(job_id, &e);
+        match run_repoint_job(&db_worker, &pool_worker, job_id, library_id, &candidate) {
+            // Repoint owns no pool-state tail; it arms the holdoff inside its
+            // own index pass and never clears it.
+            Ok(probe_duration_ms) => {
+                complete_job(&db_worker, job_id, library_id, probe_duration_ms)
+            }
+            Err(e) => {
+                tracing::error!(job_id, library_id, error = %e, "repoint job failed");
+                let _ = db_worker.fail_scan_job(job_id, &e);
+            }
         }
     })?;
     Ok(job_id)
@@ -341,7 +371,7 @@ fn run_repoint_job(
     job_id: i64,
     library_id: i64,
     candidate_path: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     db.set_scan_job_state(job_id, "indexing")?;
     // Probes enqueue as the walk discovers them, so the barrier opens before
     // the epoch and closes in `finish_scan_probes` (ADR-0004 §2.4).
@@ -403,7 +433,7 @@ fn run_repoint_job(
         pool.replace_walk_cache(library_id, dry_cache);
         run_index_pass(db, pool, job_id, library_id, Some(outcome), &probes)?;
     }
-    finish_scan_probes(db, pool, job_id, library_id, probes)
+    finish_scan_probes(pool, library_id, probes)
 }
 
 fn run_scan_job(
@@ -411,7 +441,7 @@ fn run_scan_job(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     db.set_scan_job_state(job_id, "indexing")?;
     run_index_and_probe(db, pool, job_id, library_id)
 }
@@ -421,25 +451,24 @@ fn run_index_and_probe(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let probes = pool.start_probe_batch();
     {
         let _epoch = pool.enter_index_epoch(library_id);
         run_index_pass(db, pool, job_id, library_id, None, &probes)?;
     }
-    finish_scan_probes(db, pool, job_id, library_id, probes)
+    finish_scan_probes(pool, library_id, probes)
 }
 
+/// Wait out this job's probes and report how long probing took. Does **not**
+/// mark the job terminal -- see [`complete_job`].
 fn finish_scan_probes(
-    db: &Arc<Db>,
     pool: &Arc<LibraryPool>,
-    job_id: i64,
     library_id: i64,
     probes: pool::ProbeBatch,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if !pool.is_library_reachable(library_id) {
-        db.complete_scan_job(job_id, 0)?;
-        return Ok(());
+        return Ok(0);
     }
 
     // Measured from the first push, not from here, so it still means "how long
@@ -454,11 +483,18 @@ fn finish_scan_probes(
     // No scan-time keyframe-map enqueue either (ADR-0023 §2/§9 amendment):
     // the map builds when a consumer asks — playbackInfo, session create, or
     // a seek's bounded wait — never as a whole-library consequence of scanning.
-    let probe_duration_ms = probe_duration.as_millis() as u64;
-    db.complete_scan_job(job_id, probe_duration_ms)?;
+    Ok(probe_duration.as_millis() as u64)
+}
 
+/// Mark a job terminal. Call this **after** every side effect the job owns, so
+/// a caller that observes `completed` sees finished state (see
+/// [`request_scan`]'s worker).
+fn complete_job(db: &Db, job_id: i64, library_id: i64, probe_duration_ms: u64) {
+    if let Err(e) = db.complete_scan_job(job_id, probe_duration_ms) {
+        tracing::error!(job_id, library_id, error = %e, "complete scan job");
+        return;
+    }
     tracing::info!(job_id, library_id, probe_duration_ms, "scan job completed");
-    Ok(())
 }
 
 /// Walk + upsert only. Caller must hold [`LibraryPool::enter_index_epoch`].
