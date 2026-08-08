@@ -44,6 +44,17 @@ pub fn upsert_raw_payload(
 ///
 /// Canonical writers pass their SQL into `canonical_write` so both lands
 /// atomically (see [`crate::canonical::persist_mapped_hit`]).
+///
+/// **`canonical_write` must write before it reads.** The transaction here is
+/// `BEGIN DEFERRED`, and `canonical_write` runs as its first statement — so a
+/// closure that SELECTs first takes a read snapshot and then has to upgrade it
+/// to a write. In WAL that upgrade fails with `SQLITE_BUSY_SNAPSHOT` the moment
+/// any other connection has committed in between, immediately and without
+/// consulting `busy_timeout`. Both callers today write first, which is the only
+/// reason this function is safe; nothing about the signature enforces it, so a
+/// read-first closure would move the hazard here without changing this file.
+/// A closure that must read first belongs on
+/// [`nightjar_db::with_write_tx`] instead.
 pub fn persist_hit_with_canonical<F>(
     conn: &Connection,
     provider: &str,

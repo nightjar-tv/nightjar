@@ -21,7 +21,7 @@ pub use status::{
 };
 pub use store::{
     Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate,
-    ScanJobRow, SidecarRow, SubtitleTrackRow, UpsertItem,
+    ScanJobRow, SidecarRow, SubtitleTrackRow, UpsertItem, with_write_tx, write_tx,
 };
 
 use std::path::{Path, PathBuf};
