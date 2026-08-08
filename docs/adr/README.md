@@ -59,6 +59,7 @@ not here — this page is the reference, not the tour.
 | [0039](0039-show-entity-and-series-key.md) | The show entity and `series_key` | Accepted | — | — |
 | [0040](0040-account-roles.md) | Account roles | Accepted | — | — |
 | [0041](0041-subtitle-classification-and-client-gated-extraction.md) | Subtitle classification and client-gated extraction | Accepted | [0013](0013-subtitle-extraction-at-scan.md) §1–§2 | — |
+| [0042](0042-derived-artifact-versioning-and-reconciliation.md) | Derived artifact versioning and library reconciliation | **Proposed** | — | — |
 
 ## Reading this table
 
