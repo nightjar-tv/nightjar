@@ -1,4 +1,4 @@
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, blocking};
 use crate::routes::items::{
     abs_path, decide, library_root, profile_from_query, subtitle_tracks_for,
 };
@@ -110,6 +110,19 @@ pub async fn start(
     Path(item_id): Path<i64>,
     Query(query): Query<StartQuery>,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
+    // The whole body blocks: DB reads, two ffprobe children over SMB in
+    // `subtitle_tracks_for` and `resolve_audio`, then the session spawn. It
+    // used to run on a Tokio worker with only `hls.start` moved off, so the
+    // most expensive part of the most latency-sensitive route was the part
+    // still parking the runtime.
+    blocking(move || start_blocking(state, item_id, query)).await
+}
+
+fn start_blocking(
+    state: AppState,
+    item_id: i64,
+    query: StartQuery,
+) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
     let row = state
         .db
         .get_item(item_id)
@@ -208,26 +221,20 @@ pub async fn start(
         }
     };
     let hls = Arc::clone(&state.hls);
-    let hls_for_start = Arc::clone(&hls);
     let src = abs_path(&lib_root, &row.path);
-    let tracks_for_start = subtitle_tracks;
-    let started = tokio::task::spawn_blocking(move || {
-        hls_for_start.start(
-            item_id,
-            &src,
-            start_ms,
-            duration_ms as u64,
-            mode,
-            audio,
-            tracks_for_start,
-            burn_in,
-            keyframe_map,
-            encode_plan,
-            piggyback,
-        )
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("hls start task: {e}")))?;
+    let started = hls.start(
+        item_id,
+        &src,
+        start_ms,
+        duration_ms as u64,
+        mode,
+        audio,
+        subtitle_tracks,
+        burn_in,
+        keyframe_map,
+        encode_plan,
+        piggyback,
+    );
 
     match started {
         Ok(session_id) => {
@@ -576,12 +583,18 @@ pub async fn seek(
     Path(session_id): Path<String>,
     Query(query): Query<SeekQuery>,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
-    let hls = Arc::clone(&state.hls);
-    let sid = session_id.clone();
+    // The map-fallback branch reads the item and pushes a priority rebuild, so
+    // the whole handler blocks, not just `hls.seek`.
+    blocking(move || seek_blocking(state, session_id, query)).await
+}
+
+fn seek_blocking(
+    state: AppState,
+    session_id: String,
+    query: SeekQuery,
+) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
     let start_ms = query.start_ms;
-    let result = tokio::task::spawn_blocking(move || hls.seek(&sid, start_ms))
-        .await
-        .map_err(|e| ApiError::internal(format!("hls seek task: {e}")))?;
+    let result = state.hls.seek(&session_id, start_ms);
     match result {
         Ok(view) => {
             // A seek restart re-binds the virtual file, so this is where a

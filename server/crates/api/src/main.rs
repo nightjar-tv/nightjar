@@ -8,7 +8,9 @@ use rust_embed::Embed;
 use state::AppState;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tower_http::trace::TraceLayer;
+use tower_http::LatencyUnit;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 #[derive(Embed)]
 #[folder = "../../../web/build"]
@@ -101,7 +103,21 @@ async fn main() {
 
     let app = routes::router(state)
         .fallback(static_handler)
-        .layer(TraceLayer::new_for_http());
+        // Per-request latency at INFO. TraceLayer's defaults emit at DEBUG,
+        // which the default `nightjar=info,tower_http=info` filter drops, so
+        // before this the logs carried no request-level timing at all and two
+        // reported symptoms (UI stall, UI unavailable) could not be checked
+        // against a mechanism that was clear in the code. Response only —
+        // on_request stays at DEBUG so a segment poll logs one line, not two.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        );
 
     let addr = listen_addr();
     let listener = tokio::net::TcpListener::bind(addr)

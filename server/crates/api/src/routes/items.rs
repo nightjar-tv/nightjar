@@ -1,4 +1,4 @@
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
     Json,
@@ -126,13 +126,16 @@ pub async fn get(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
 ) -> ApiResult<Json<MediaItemDto>> {
-    let row = state
-        .db
-        .get_item(item_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let root = library_root(&state, row.library_id)?;
-    Ok(Json(to_dto(row, &root)))
+    blocking(move || {
+        let row = state
+            .db
+            .get_item(item_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
+        let root = library_root(&state, row.library_id)?;
+        Ok(Json(to_dto(row, &root)))
+    })
+    .await
 }
 
 pub(crate) fn library_root(state: &AppState, library_id: i64) -> ApiResult<String> {
@@ -186,6 +189,16 @@ pub async fn playback_info(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
     Query(query): Query<ProfileQuery>,
+) -> ApiResult<Json<PlaybackInfoDto>> {
+    // Every step below blocks: two DB reads, and `subtitle_tracks_for` /
+    // `audio_tracks_for` each wait on an ffprobe child reading over SMB.
+    blocking(move || playback_info_blocking(state, item_id, query)).await
+}
+
+fn playback_info_blocking(
+    state: AppState,
+    item_id: i64,
+    query: ProfileQuery,
 ) -> ApiResult<Json<PlaybackInfoDto>> {
     let row = state
         .db
@@ -280,26 +293,32 @@ pub async fn subtitle_vtt(
         .filter(|id| super::track_ids::is_valid_track_id(id))
         .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?
         .to_string();
-    let row = state
-        .db
-        .get_item(item_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
+    // The DB read and the subs-store lookups block; the body read does not.
+    let (path, cache) = blocking(move || {
+        let row = state
+            .db
+            .get_item(item_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
 
-    // ADR-0013: playback never extracts; serve a stored file or 404.
-    let path = stored_webvtt(&state.subs, item_id, &track_id).map_err(ApiError::not_found)?;
+        // ADR-0013: playback never extracts; serve a stored file or 404.
+        let path = stored_webvtt(&state.subs, item_id, &track_id).map_err(ApiError::not_found)?;
+
+        let (readiness, _) = state
+            .subs
+            .track_readiness(item_id, &track_id, &row.subtitle_status);
+        // A growing partial must not be cached: the next GET needs the newer body.
+        let cache = match readiness {
+            TrackReadiness::Complete if row.subtitle_status == "ready" => "private, max-age=3600",
+            _ => "private, no-cache",
+        };
+        Ok((path, cache))
+    })
+    .await?;
 
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| ApiError::internal(format!("read subtitle {}: {e}", path.display())))?;
-    let (readiness, _) = state
-        .subs
-        .track_readiness(item_id, &track_id, &row.subtitle_status);
-    // A growing partial must not be cached: the next GET needs the newer body.
-    let cache = match readiness {
-        TrackReadiness::Complete if row.subtitle_status == "ready" => "private, max-age=3600",
-        _ => "private, no-cache",
-    };
     let mut res = Response::new(Body::from(bytes));
     *res.status_mut() = StatusCode::OK;
     res.headers_mut().insert(

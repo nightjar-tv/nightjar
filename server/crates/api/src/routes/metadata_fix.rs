@@ -3,7 +3,7 @@
 //! Pre-accounts: local-trust like the rest of `/api/v0`. Block 2 must make
 //! these admin-only first — assign rewrites watch state across profiles.
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
     Json,
@@ -96,6 +96,15 @@ pub async fn candidates(
     Path(item_id): Path<i64>,
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<CandidatesResponse>> {
+    // A store read plus a blocking TMDB round trip.
+    blocking(move || candidates_blocking(state, item_id, q)).await
+}
+
+fn candidates_blocking(
+    state: AppState,
+    item_id: i64,
+    q: CandidatesQuery,
+) -> ApiResult<Json<CandidatesResponse>> {
     let item = state
         .db
         .with_conn(|c| get_fix_item(c, item_id))
@@ -122,6 +131,15 @@ pub async fn assign_match(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
     Json(body): Json<AssignBody>,
+) -> ApiResult<Json<AssignResponse>> {
+    // Opens its own SQLite connection and drives TMDB HTTP synchronously.
+    blocking(move || assign_match_blocking(state, item_id, body)).await
+}
+
+fn assign_match_blocking(
+    state: AppState,
+    item_id: i64,
+    body: AssignBody,
 ) -> ApiResult<Json<AssignResponse>> {
     if body.provider != "tmdb" {
         return Err(ApiError::bad_request(
@@ -178,6 +196,10 @@ pub async fn clear(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
 ) -> ApiResult<Json<ClearResponse>> {
+    blocking(move || clear_blocking(state, item_id)).await
+}
+
+fn clear_blocking(state: AppState, item_id: i64) -> ApiResult<Json<ClearResponse>> {
     let conn = open_db_conn(&data_dir())?;
     let result = if let Some(art) = state.artwork.as_ref() {
         clear_match(&conn, art.as_ref(), item_id)
@@ -201,6 +223,10 @@ pub async fn retry(
     State(_state): State<AppState>,
     Path(item_id): Path<i64>,
 ) -> ApiResult<Json<RetryResponse>> {
+    blocking(move || retry_blocking(item_id)).await
+}
+
+fn retry_blocking(item_id: i64) -> ApiResult<Json<RetryResponse>> {
     let conn = open_db_conn(&data_dir())?;
     retry_unmatched(&conn, item_id).map_err(|e| {
         if e.contains("not found") {
