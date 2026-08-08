@@ -1018,6 +1018,33 @@ impl Db {
         // retry and nothing to revisit the item. The external subtitle was
         // simply never associated.
         let conn = self.lock()?;
+
+        // Nothing found beside the file and nothing stored: there is nothing to
+        // reconcile, so do not open a write transaction at all.
+        //
+        // The index pass calls this for *every* item it upserts, and on a
+        // typical library most items have no sidecar. Without this the pass
+        // pays one `BEGIN IMMEDIATE` and one no-op `DELETE` per item —
+        // ~25,000 of them on a cold scan of the dogfood library — each holding
+        // the write lock across its own SELECT. Taking the lock up front is
+        // what makes the read-then-write path correct, so this is the other
+        // half of that change: keep the lock for the items that need it and
+        // stop taking it for the ones that do not.
+        //
+        // It is deliberately **not** enough that nothing was found. No
+        // sidecars on disk with rows still stored is the sidecar-was-deleted
+        // case, and those rows have to go — that path must still reach the
+        // transaction below.
+        //
+        // The existence check runs under `self.lock()` on the shared
+        // connection, and this function is the only writer of
+        // `media_item_sidecars`, so no row can appear between the check and
+        // the return. It is an index lookup
+        // (`idx_media_item_sidecars_item`), not a scan.
+        if sidecars.is_empty() && !has_stored_sidecars(&conn, media_item_id)? {
+            return Ok(false);
+        }
+
         with_write_tx(&conn, |tx| {
             let existing: Vec<SidecarRow> = {
                 let mut stmt = tx
@@ -1472,6 +1499,21 @@ fn map_sidecar(r: &rusqlite::Row<'_>) -> rusqlite::Result<SidecarRow> {
     })
 }
 
+/// Whether any sidecar row is stored for this item.
+///
+/// Index lookup on `idx_media_item_sidecars_item` (migration 003), not a scan.
+/// Used to skip the reconcile transaction entirely when nothing was found on
+/// disk and nothing is stored.
+fn has_stored_sidecars(conn: &Connection, media_item_id: i64) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM media_item_sidecars WHERE media_item_id = ?1)",
+        [media_item_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+    .map_err(|e| format!("check stored sidecars for item {media_item_id}: {e}"))
+}
+
 fn map_subtitle_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubtitleTrackRow> {
     let forced: i64 = r.get(5)?;
     let sdh: i64 = r.get(6)?;
@@ -1581,6 +1623,115 @@ mod write_tx_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One indexed item, no keyframe map, for the sidecar reconcile tests.
+    fn item_for_sidecars(db: &Db) -> i64 {
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "films".into(),
+                path: "/films".into(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        db.upsert_items_indexed(
+            lib.id,
+            &[UpsertItem {
+                path: "clip.mkv".into(),
+                mtime_ms: 1,
+                size_bytes: 2,
+                title: "clip".into(),
+                kind: "movie".into(),
+                year: None,
+                season: None,
+                episode: None,
+                content_id: None,
+            }],
+        )
+        .unwrap()[0]
+    }
+
+    fn sidecar(item_id: i64, track_id: &str) -> SidecarRow {
+        SidecarRow {
+            media_item_id: item_id,
+            track_id: track_id.into(),
+            path: "clip.en.srt".into(),
+            mtime_ms: 10,
+            size_bytes: 20,
+            format: "srt".into(),
+            language: Some("en".into()),
+            forced: false,
+            sdh: false,
+        }
+    }
+
+    /// Nothing found and nothing stored must not open a write transaction.
+    ///
+    /// Proved by behaviour rather than by inspection: another connection holds
+    /// the write lock for the whole call. A path that opens `BEGIN IMMEDIATE`
+    /// blocks on it and fails when `busy_timeout` expires; the fast path never
+    /// asks for the lock and returns immediately.
+    ///
+    /// The index pass calls this once per upserted item, so before this the
+    /// cost was one write transaction and one no-op DELETE per item on every
+    /// cold scan — and it is independent of `INDEX_BATCH`, so no flush-size
+    /// change reaches it.
+    #[test]
+    fn nothing_found_and_nothing_stored_takes_no_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        // Second connection, as the metadata drain is, holding the write lock.
+        let other = Connection::open(&path).unwrap();
+        other
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50;")
+            .unwrap();
+        let blocker = Transaction::new_unchecked(&other, TransactionBehavior::Immediate).unwrap();
+        blocker
+            .execute(
+                "UPDATE media_items SET title = 'held' WHERE id = ?1",
+                [item_id],
+            )
+            .unwrap();
+
+        let changed = db
+            .replace_item_sidecars(item_id, &[])
+            .expect("must not need the write lock when there is nothing to reconcile");
+        assert!(!changed, "nothing to reconcile is not a change");
+
+        drop(blocker);
+    }
+
+    /// The case the fast path must not swallow: the sidecar file was deleted,
+    /// so nothing is found, but stored rows still have to go. "Nothing found"
+    /// alone is not the condition — "nothing found and nothing stored" is.
+    #[test]
+    fn nothing_found_still_deletes_stored_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        assert!(
+            db.replace_item_sidecars(item_id, &[sidecar(item_id, "s1")])
+                .unwrap(),
+            "storing the first sidecar is a change"
+        );
+        assert_eq!(db.list_item_sidecars(item_id).unwrap().len(), 1);
+
+        // Sidecar file removed from disk: discovery finds nothing.
+        assert!(
+            db.replace_item_sidecars(item_id, &[]).unwrap(),
+            "removing the last sidecar is a change"
+        );
+        assert!(
+            db.list_item_sidecars(item_id).unwrap().is_empty(),
+            "stored rows must be deleted when the sidecar is gone"
+        );
+
+        // And now that both sides are empty, the fast path applies.
+        assert!(!db.replace_item_sidecars(item_id, &[]).unwrap());
+    }
 
     /// One indexed item with a ready map, both stamped with `content_id`.
     fn mapped_item(db: &Db, content_id: &str) -> i64 {
