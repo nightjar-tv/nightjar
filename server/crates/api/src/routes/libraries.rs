@@ -1,4 +1,4 @@
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
     Json,
@@ -98,50 +98,59 @@ pub struct ScanJobDto {
 }
 
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<LibrariesResponse>> {
-    let libraries = state
-        .db
-        .list_libraries()
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .map(to_dto)
-        .collect();
-    Ok(Json(LibrariesResponse { libraries }))
+    blocking(move || {
+        let libraries = state
+            .db
+            .list_libraries()
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(to_dto)
+            .collect();
+        Ok(Json(LibrariesResponse { libraries }))
+    })
+    .await
 }
 
 pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateLibraryRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateLibraryResponse>)> {
-    let name = body.name.trim();
-    let path = body.path.trim();
-    if name.is_empty() || path.is_empty() {
-        return Err(ApiError::bad_request("name and path are required"));
-    }
-    let kind = LibraryKind::parse(&body.kind)
-        .ok_or_else(|| ApiError::bad_request("kind must be movies or shows"))?;
-    let path_buf = std::path::PathBuf::from(path);
-    if !path_buf.is_dir() {
-        return Err(ApiError::bad_request(format!(
-            "path is not a directory: {path}"
-        )));
-    }
-    let abs = std::fs::canonicalize(&path_buf)
-        .map_err(|e| ApiError::bad_request(format!("resolve path {path}: {e}")))?;
-    let abs = normalize_library_root(&abs.to_string_lossy());
-    let row = state
-        .db
-        .create_library(&NewLibrary {
-            name: name.to_string(),
-            path: abs,
-            kind: kind.as_str().to_string(),
-        })
-        .map_err(|e| {
-            if e.contains("UNIQUE") {
-                ApiError::bad_request("a library with that path already exists")
-            } else {
-                ApiError::internal(e)
+    // `is_dir` and `canonicalize` stat a possibly-remote root, and
+    // `create_library` takes the store mutex.
+    let row = {
+        let db = std::sync::Arc::clone(&state.db);
+        blocking(move || {
+            let name = body.name.trim();
+            let path = body.path.trim();
+            if name.is_empty() || path.is_empty() {
+                return Err(ApiError::bad_request("name and path are required"));
             }
-        })?;
+            let kind = LibraryKind::parse(&body.kind)
+                .ok_or_else(|| ApiError::bad_request("kind must be movies or shows"))?;
+            let path_buf = std::path::PathBuf::from(path);
+            if !path_buf.is_dir() {
+                return Err(ApiError::bad_request(format!(
+                    "path is not a directory: {path}"
+                )));
+            }
+            let abs = std::fs::canonicalize(&path_buf)
+                .map_err(|e| ApiError::bad_request(format!("resolve path {path}: {e}")))?;
+            let abs = normalize_library_root(&abs.to_string_lossy());
+            db.create_library(&NewLibrary {
+                name: name.to_string(),
+                path: abs,
+                kind: kind.as_str().to_string(),
+            })
+            .map_err(|e| {
+                if e.contains("UNIQUE") {
+                    ApiError::bad_request("a library with that path already exists")
+                } else {
+                    ApiError::internal(e)
+                }
+            })
+        })
+        .await?
+    };
     let db = std::sync::Arc::clone(&state.db);
     let pool = std::sync::Arc::clone(&state.pool);
     let library_id = row.id;
@@ -171,12 +180,15 @@ pub async fn get(
     State(state): State<AppState>,
     Path(library_id): Path<i64>,
 ) -> ApiResult<Json<LibraryDto>> {
-    let row = state
-        .db
-        .get_library(library_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
-    Ok(Json(to_dto(row)))
+    blocking(move || {
+        let row = state
+            .db
+            .get_library(library_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
+        Ok(Json(to_dto(row)))
+    })
+    .await
 }
 
 /// ADR-0030 §3: name-only → 200; path change → 202 + async repoint job.
@@ -187,50 +199,56 @@ pub async fn patch(
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
 
-    let row = state
-        .db
-        .get_library(library_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
+    // Validate, apply the name, and decide whether the path moved — all of it
+    // stats the root or takes the store mutex.
+    let path_change = {
+        let db = std::sync::Arc::clone(&state.db);
+        blocking(move || {
+            let row = db
+                .get_library(library_id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
 
-    let name = body.name.as_ref().map(|n| n.trim().to_string());
-    if let Some(ref n) = name
-        && n.is_empty()
-    {
-        return Err(ApiError::bad_request("name must not be empty"));
-    }
+            let name = body.name.as_ref().map(|n| n.trim().to_string());
+            if let Some(ref n) = name
+                && n.is_empty()
+            {
+                return Err(ApiError::bad_request("name must not be empty"));
+            }
 
-    let path_change = match body.path.as_ref().map(|p| p.trim()) {
-        Some("") => return Err(ApiError::bad_request("path must not be empty")),
-        Some(p) => {
-            let path_buf = std::path::PathBuf::from(p);
-            if !path_buf.is_dir() {
-                return Err(ApiError::bad_request(format!(
-                    "path is not a directory: {p}"
-                )));
+            let path_change = match body.path.as_ref().map(|p| p.trim()) {
+                Some("") => return Err(ApiError::bad_request("path must not be empty")),
+                Some(p) => {
+                    let path_buf = std::path::PathBuf::from(p);
+                    if !path_buf.is_dir() {
+                        return Err(ApiError::bad_request(format!(
+                            "path is not a directory: {p}"
+                        )));
+                    }
+                    let abs = std::fs::canonicalize(&path_buf)
+                        .map_err(|e| ApiError::bad_request(format!("resolve path {p}: {e}")))?;
+                    let abs = normalize_library_root(&abs.to_string_lossy());
+                    if abs != normalize_library_root(&row.path) {
+                        Some(abs)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+
+            if name.is_none() && path_change.is_none() && body.path.is_none() {
+                return Err(ApiError::bad_request("name or path is required"));
             }
-            let abs = std::fs::canonicalize(&path_buf)
-                .map_err(|e| ApiError::bad_request(format!("resolve path {p}: {e}")))?;
-            let abs = normalize_library_root(&abs.to_string_lossy());
-            if abs != normalize_library_root(&row.path) {
-                Some(abs)
-            } else {
-                None
+
+            if let Some(n) = name {
+                db.update_library_name(library_id, &n)
+                    .map_err(ApiError::internal)?;
             }
-        }
-        None => None,
+            Ok(path_change)
+        })
+        .await?
     };
-
-    if name.is_none() && path_change.is_none() && body.path.is_none() {
-        return Err(ApiError::bad_request("name or path is required"));
-    }
-
-    if let Some(n) = name {
-        state
-            .db
-            .update_library_name(library_id, &n)
-            .map_err(ApiError::internal)?;
-    }
 
     if let Some(candidate) = path_change {
         let db = std::sync::Arc::clone(&state.db);
@@ -256,11 +274,14 @@ pub async fn patch(
             .into_response());
     }
 
-    let updated = state
-        .db
-        .get_library(library_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
+    let updated = blocking(move || {
+        state
+            .db
+            .get_library(library_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))
+    })
+    .await?;
     Ok((StatusCode::OK, Json(to_dto(updated))).into_response())
 }
 
@@ -292,32 +313,40 @@ pub async fn get_scan_job(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
 ) -> ApiResult<Json<ScanJobDto>> {
-    let row = state
-        .db
-        .get_scan_job(job_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("scan job {job_id} not found")))?;
-    Ok(Json(job_to_dto(row)))
+    blocking(move || {
+        let row = state
+            .db
+            .get_scan_job(job_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("scan job {job_id} not found")))?;
+        Ok(Json(job_to_dto(row)))
+    })
+    .await
 }
 
 pub async fn list_items(
     State(state): State<AppState>,
     Path(library_id): Path<i64>,
 ) -> ApiResult<Json<ItemsResponse>> {
-    let lib = state
-        .db
-        .get_library(library_id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
-    let root = lib.path.clone();
-    let items = state
-        .db
-        .list_items(library_id)
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .map(|row| super::items::to_dto(row, &root))
-        .collect();
-    Ok(Json(ItemsResponse { items }))
+    // The whole-library read behind the grid. On a 23k-item library this holds
+    // the store mutex long enough to matter, and it ran on a Tokio worker.
+    blocking(move || {
+        let lib = state
+            .db
+            .get_library(library_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
+        let root = lib.path.clone();
+        let items = state
+            .db
+            .list_items(library_id)
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|row| super::items::to_dto(row, &root))
+            .collect();
+        Ok(Json(ItemsResponse { items }))
+    })
+    .await
 }
 
 fn to_dto(row: nightjar_db::LibraryRow) -> LibraryDto {

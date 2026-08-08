@@ -4,13 +4,88 @@ use crate::paths::{
     to_relpath,
 };
 use crate::status::{backoff_days, parse_map_status, parse_probe_status, parse_subtitle_status};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 pub struct Db {
     conn: Mutex<Connection>,
+}
+
+/// How many times [`with_write_tx`] re-runs a transaction that could not take
+/// the write lock. Contention here is another connection's commit, which is
+/// short; if three attempts do not clear it the caller sees the error rather
+/// than the request hanging.
+const WRITE_TX_ATTEMPTS: u32 = 3;
+
+/// Begin a write transaction up front — `BEGIN IMMEDIATE`.
+///
+/// `Connection::unchecked_transaction` is `BEGIN DEFERRED`. A deferred
+/// transaction that SELECTs before it writes takes a read snapshot and then
+/// tries to upgrade it to a write. In WAL, if any other connection committed
+/// in the interim, SQLite fails that upgrade with `SQLITE_BUSY_SNAPSHOT`
+/// **immediately, without consulting `busy_timeout`** — the snapshot is stale
+/// and no amount of waiting can make it current. Taking the write lock before
+/// the first read means there is nothing to upgrade.
+///
+/// Use this for any transaction that reads before it writes. A transaction
+/// whose first statement is a write already acquires the lock at that
+/// statement and does not need it.
+pub fn write_tx(conn: &Connection) -> Result<Transaction<'_>, String> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|e| format!("begin write transaction: {e}"))
+}
+
+/// True for the two lock failures worth another attempt: `SQLITE_BUSY` (the
+/// write lock was held past `busy_timeout`) and `SQLITE_BUSY_SNAPSHOT` (a
+/// stale read snapshot, which `write_tx` is meant to prevent but which a
+/// caller still holding a deferred transaction elsewhere could produce).
+fn is_busy_error(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Run a read-then-write transaction, retrying while the write lock is busy.
+///
+/// `f` must be safe to run more than once: it is re-invoked from the start on
+/// a retry, against a fresh transaction. Anything it returns from an earlier
+/// attempt is discarded.
+///
+/// `BEGIN IMMEDIATE` honours `busy_timeout`, so a retry here is for the case
+/// where that timeout is itself exhausted. It exists because the alternative
+/// at the sidecar call site was a WARN and silent data loss: nothing revisited
+/// the item, so an external subtitle simply never got associated.
+pub fn with_write_tx<T, F>(conn: &Connection, mut f: F) -> Result<T, String>
+where
+    F: FnMut(&Transaction<'_>) -> Result<T, String>,
+{
+    let mut last = String::new();
+    for attempt in 1..=WRITE_TX_ATTEMPTS {
+        let tx = match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) if is_busy_error(&e) => {
+                last = format!("begin write transaction: {e}");
+                tracing::debug!(attempt, error = %last, "write transaction busy; retrying");
+                continue;
+            }
+            Err(e) => return Err(format!("begin write transaction: {e}")),
+        };
+        let value = f(&tx)?;
+        match tx.commit() {
+            Ok(()) => return Ok(value),
+            Err(e) if is_busy_error(&e) => {
+                last = format!("commit write transaction: {e}");
+                tracing::debug!(attempt, error = %last, "write transaction busy; retrying");
+            }
+            Err(e) => return Err(format!("commit write transaction: {e}")),
+        }
+    }
+    Err(last)
 }
 
 #[derive(Debug, Clone)]
@@ -935,67 +1010,71 @@ impl Db {
         media_item_id: i64,
         sidecars: &[SidecarRow],
     ) -> Result<bool, String> {
+        // Reads before it writes, so it takes the write lock up front. As a
+        // deferred transaction this SELECT took a read snapshot that the
+        // metadata drain's next commit invalidated, and the DELETE below then
+        // failed instantly with SQLITE_BUSY_SNAPSHOT — 285 times on the
+        // 2026-08-07 cold scan, median 93 µs apart, each one a WARN with no
+        // retry and nothing to revisit the item. The external subtitle was
+        // simply never associated.
         let conn = self.lock()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin sidecar replace: {e}"))?;
-        let existing: Vec<SidecarRow> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+        with_write_tx(&conn, |tx| {
+            let existing: Vec<SidecarRow> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                                format, language, forced, sdh
+                         FROM media_item_sidecars WHERE media_item_id = ?1 ORDER BY track_id",
+                    )
+                    .map_err(|e| format!("prepare existing sidecars: {e}"))?;
+                stmt.query_map([media_item_id], map_sidecar)
+                    .map_err(|e| format!("list existing sidecars: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("read existing sidecars: {e}"))?
+            };
+            let changed = existing.len() != sidecars.len()
+                || existing.iter().zip(sidecars).any(|(a, b)| {
+                    a.track_id != b.track_id
+                        || a.path != b.path
+                        || a.mtime_ms != b.mtime_ms
+                        || a.size_bytes != b.size_bytes
+                        || a.format != b.format
+                        || a.language != b.language
+                        || a.forced != b.forced
+                        || a.sdh != b.sdh
+                });
+            tx.execute(
+                "DELETE FROM media_item_sidecars WHERE media_item_id = ?1",
+                [media_item_id],
+            )
+            .map_err(|e| format!("clear sidecars for item {media_item_id}: {e}"))?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO media_item_sidecars (
+                            media_item_id, track_id, path, mtime_ms, size_bytes,
                             format, language, forced, sdh
-                     FROM media_item_sidecars WHERE media_item_id = ?1 ORDER BY track_id",
-                )
-                .map_err(|e| format!("prepare existing sidecars: {e}"))?;
-            stmt.query_map([media_item_id], map_sidecar)
-                .map_err(|e| format!("list existing sidecars: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("read existing sidecars: {e}"))?
-        };
-        let changed = existing.len() != sidecars.len()
-            || existing.iter().zip(sidecars).any(|(a, b)| {
-                a.track_id != b.track_id
-                    || a.path != b.path
-                    || a.mtime_ms != b.mtime_ms
-                    || a.size_bytes != b.size_bytes
-                    || a.format != b.format
-                    || a.language != b.language
-                    || a.forced != b.forced
-                    || a.sdh != b.sdh
-            });
-        tx.execute(
-            "DELETE FROM media_item_sidecars WHERE media_item_id = ?1",
-            [media_item_id],
-        )
-        .map_err(|e| format!("clear sidecars for item {media_item_id}: {e}"))?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO media_item_sidecars (
-                        media_item_id, track_id, path, mtime_ms, size_bytes,
-                        format, language, forced, sdh
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )
-                .map_err(|e| format!("prepare sidecar insert: {e}"))?;
-            for s in sidecars {
-                let path = require_relpath(&s.path)?;
-                stmt.execute(params![
-                    media_item_id,
-                    s.track_id,
-                    path,
-                    s.mtime_ms,
-                    s.size_bytes,
-                    s.format,
-                    s.language,
-                    s.forced as i64,
-                    s.sdh as i64,
-                ])
-                .map_err(|e| format!("insert sidecar {}: {e}", s.track_id))?;
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )
+                    .map_err(|e| format!("prepare sidecar insert: {e}"))?;
+                for s in sidecars {
+                    let path = require_relpath(&s.path)?;
+                    stmt.execute(params![
+                        media_item_id,
+                        s.track_id,
+                        path,
+                        s.mtime_ms,
+                        s.size_bytes,
+                        s.format,
+                        s.language,
+                        s.forced as i64,
+                        s.sdh as i64,
+                    ])
+                    .map_err(|e| format!("insert sidecar {}: {e}", s.track_id))?;
+                }
             }
-        }
-        tx.commit()
-            .map_err(|e| format!("commit sidecar replace: {e}"))?;
-        Ok(changed)
+            Ok(changed)
+        })
     }
 
     pub fn list_item_sidecars(&self, media_item_id: i64) -> Result<Vec<SidecarRow>, String> {
@@ -1406,6 +1485,97 @@ fn map_subtitle_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubtitleTrackRo
         sdh: sdh != 0,
         kind: r.get(7)?,
     })
+}
+
+#[cfg(test)]
+mod write_tx_tests {
+    use super::*;
+
+    /// Two connections on one WAL database, as the process actually runs: the
+    /// store's shared connection and the metadata drain's private one.
+    fn two_conns() -> (tempfile::TempDir, Connection, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let open = || {
+            let c = Connection::open(&path).unwrap();
+            // Short timeout: these tests deliberately collide, and the
+            // production 5,000 ms would just make them slow.
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA busy_timeout=50;",
+            )
+            .unwrap();
+            c
+        };
+        let a = open();
+        a.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .unwrap();
+        let b = open();
+        (dir, a, b)
+    }
+
+    #[test]
+    fn deferred_read_then_write_loses_its_snapshot_to_another_connection() {
+        // The defect, reproduced: this is what `replace_item_sidecars` did 285
+        // times on the 2026-08-07 cold scan. It is here so the fix below is
+        // measured against a failure that actually happens.
+        let (_dir, a, b) = two_conns();
+        let tx = a.unchecked_transaction().unwrap();
+        let _: i64 = tx
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        b.execute("INSERT INTO t (v) VALUES (1)", []).unwrap();
+
+        let err = tx.execute("INSERT INTO t (v) VALUES (2)", []).unwrap_err();
+        assert!(
+            is_busy_error(&err),
+            "expected a busy/snapshot failure upgrading a stale read, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_tx_survives_a_commit_from_another_connection() {
+        let (_dir, a, b) = two_conns();
+        let wrote = with_write_tx(&a, |tx| {
+            let n: i64 = tx
+                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            // The interleaving that broke the deferred version. Taking the
+            // write lock first means this connection cannot get in here at
+            // all, so there is no stale snapshot to upgrade.
+            assert!(b.execute("INSERT INTO t (v) VALUES (1)", []).is_err());
+            tx.execute("INSERT INTO t (v) VALUES (2)", [])
+                .map_err(|e| e.to_string())?;
+            Ok(n)
+        })
+        .expect("write transaction should commit");
+        assert_eq!(wrote, 0, "read saw the pre-write state");
+
+        let total: i64 = a
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "only the transaction's own insert landed");
+    }
+
+    #[test]
+    fn with_write_tx_returns_the_closure_error_unchanged() {
+        let (_dir, a, _b) = two_conns();
+        let err = with_write_tx(&a, |_tx| Err::<(), _>("nope".to_string())).unwrap_err();
+        assert_eq!(
+            err, "nope",
+            "a caller error must not be retried or reworded"
+        );
+        assert!(
+            a.is_autocommit(),
+            "a failed attempt must roll back, not leave the connection in a transaction"
+        );
+        with_write_tx(&a, |tx| {
+            tx.execute("INSERT INTO t (v) VALUES (1)", [])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .expect("connection is usable after a rolled-back attempt");
+    }
 }
 
 #[cfg(test)]

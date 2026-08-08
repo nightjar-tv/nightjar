@@ -51,3 +51,23 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// Run handler work that blocks — SQLite, the filesystem, or an ffprobe child
+/// — off the async runtime.
+///
+/// The database is one `Connection` behind a `Mutex`, so a scanner index batch
+/// can hold it for the length of a 200-item transaction. Taking that mutex on
+/// a Tokio worker thread parks the worker, which degrades routes that never
+/// touch the database at all; `list_audio_tracks` and `list_text_subtitles`
+/// are worse still, since they wait on a child process reading over SMB.
+///
+/// Handlers that touch any of the three run their whole body in here.
+pub async fn blocking<T, F>(f: F) -> ApiResult<T>
+where
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::internal(format!("blocking handler task: {e}")))?
+}

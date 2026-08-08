@@ -1,5 +1,6 @@
 //! Entity-keyed canonical projection store (ADR-0029 §1).
 
+use nightjar_db::with_write_tx;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::Value;
 
@@ -229,20 +230,21 @@ pub fn persist_season_projection(
         .filter_map(|e| e.ids.tmdb.map(|id| id.to_string()))
         .collect();
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| format!("begin season project tx: {e}"))?;
+    // `stale_episode_item_keys` reads before the deletes write, so this takes
+    // the write lock up front rather than upgrading a read snapshot. Deferred,
+    // it was the drain's half of the same race the scanner lost on sidecars,
+    // and it surfaced as `bind_errors` that discarded a whole show's bind.
+    with_write_tx(conn, |tx| {
+        let stale_keys = stale_episode_item_keys(tx, provider, show_id, season_number, &present)?;
+        item_links::delete_links_for_item_keys(tx, &stale_keys)?;
+        delete_absent_episode_rows(tx, provider, show_id, season_number, &present)?;
 
-    let stale_keys = stale_episode_item_keys(&tx, provider, show_id, season_number, &present)?;
-    item_links::delete_links_for_item_keys(&tx, &stale_keys)?;
-    delete_absent_episode_rows(&tx, provider, show_id, season_number, &present)?;
-
-    for ep in &episodes {
-        upsert_canonical(&tx, provider, ep)?;
-    }
-    raw_payload::upsert_raw_payload(&tx, provider, raw, &now_rfc3339())?;
-    tx.commit()
-        .map_err(|e| format!("commit season project: {e}"))?;
+        for ep in &episodes {
+            upsert_canonical(tx, provider, ep)?;
+        }
+        raw_payload::upsert_raw_payload(tx, provider, raw, &now_rfc3339())?;
+        Ok(())
+    })?;
     Ok(episodes)
 }
 
