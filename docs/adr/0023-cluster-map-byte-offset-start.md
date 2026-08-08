@@ -395,6 +395,25 @@ before a session exists.
 Jellyfin has no prior art here because they never built the map; their seek
 is `-ss -noaccurate_seek` and pays the cold cost every time.
 
+**The bounded wait's premise, recorded (added 2026-08-07).** Every number in
+(1)–(3) — the 130 ms median build, the 1,545 ms worst case, the ~1.5 s bound —
+assumes the build starts promptly once requested. It assumes an idle pool.
+
+On the 2026-08-07 cold scan it did not start promptly. `prioritize_map_rebuild`
+put the build at the head of the pool's background queue as designed, but the
+worker loop drained the probe queue in full before it ever looked at background,
+so a map requested at 10:40:11 arrived at 11:15:19 — 35 minutes, behind 23,244
+probes. The bounded wait then did exactly what (3) and (4) say: it timed out and
+fell through to `-ss`. Nothing in this section was wrong; its premise was not
+true during a scan, and `map_status` was `pending` for 25,025 of 25,029 items,
+so effectively every seek during and after that scan took the slow path.
+
+The fix is in the pool, not here: a `priority` item now preempts the probe
+backlog rather than only being reordered within background. That restores the
+premise rather than changing the wait. Recorded so that a future reader who
+finds the wait timing out asks whether the pool is saturated before concluding
+the bound is wrong.
+
 **Gate 2 gap, recorded plainly.** The claim table (Context) says the
 Matroska and MP4 mechanisms are proven, and they are — on the harness
 titles. Population is a separate claim: at the time of this amendment the
