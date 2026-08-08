@@ -10,7 +10,7 @@ use nightjar_transcode::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,9 +97,43 @@ struct Queue {
     background: VecDeque<WorkItem>,
 }
 
+/// Completion barrier for the probes one scan job enqueues (ADR-0004 §2.4).
+///
+/// `remaining` starts at zero and rises as the index pass discovers items,
+/// rather than being sized up front from a finished queue. It may legitimately
+/// fall back to zero mid-walk — every probe pushed so far drains, or
+/// [`LibraryPool::purge_queue_for_library`] discards them when a library goes
+/// unreachable — and then rise again on the next push. See the invariant on
+/// [`ProbeBatch::wait`] for why that is safe.
 struct ProbeBatchState {
     remaining: Mutex<usize>,
     ready: Condvar,
+    /// Total pushes over the batch's life. Monotone, never decremented; the
+    /// index pass reconciles its own `to_probe` count against it.
+    pushed: AtomicUsize,
+    /// When the first probe was pushed. Probing now overlaps the walk, so
+    /// measuring from here is what keeps `probe_duration_ms` meaning "how long
+    /// probing took" rather than "how long probing outlived the walk".
+    started: Mutex<Option<Instant>>,
+    /// Set by [`ProbeBatch::wait`]. A tripwire, not a lock — see `wait`.
+    sealed: AtomicBool,
+}
+
+impl ProbeBatchState {
+    /// Count one probe into the barrier.
+    ///
+    /// Callers must hold the work-queue lock across this and the `push_back`
+    /// that follows: a worker that popped and finished the item first would
+    /// decrement past zero and panic in [`LibraryPool::finish_batch`].
+    fn push(&self) {
+        {
+            let mut remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+            *remaining += 1;
+        }
+        self.pushed.fetch_add(1, Ordering::SeqCst);
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        started.get_or_insert_with(Instant::now);
+    }
 }
 
 pub struct ProbeBatch {
@@ -107,19 +141,46 @@ pub struct ProbeBatch {
 }
 
 impl ProbeBatch {
-    pub fn wait(self) {
-        let mut remaining = self
-            .state
-            .remaining
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        while *remaining != 0 {
-            remaining = self
+    /// Probes pushed into this batch so far.
+    pub fn pushed(&self) -> usize {
+        self.state.pushed.load(Ordering::SeqCst)
+    }
+
+    /// Block until every probe pushed into this batch has finished, and return
+    /// how long probing took — measured from the **first push**, not from this
+    /// call, so the span covers the part that overlapped the index walk.
+    ///
+    /// **Invariant: every push must happen before `wait` is called.**
+    /// `remaining` reaching zero is only proof of completion once no further
+    /// push can arrive; mid-walk it means "nothing queued right now". Taking
+    /// `self` by value is what enforces this —
+    /// [`LibraryPool::enqueue_probe_in_batch`] borrows the batch, so no push is
+    /// reachable once `wait` is callable in the same scope.
+    ///
+    /// `sealed` is the tripwire for the one way that enforcement can be lost:
+    /// `ProbeBatchState` is `Arc`-shared into every [`WorkItem`], so a future
+    /// refactor that runs the walk on its own thread could push through that
+    /// handle after `wait` has started. The `debug_assert` in
+    /// `enqueue_probe_in_batch` fires at that moment rather than silently
+    /// completing a scan job with probes still queued.
+    pub fn wait(self) -> Duration {
+        self.state.sealed.store(true, Ordering::SeqCst);
+        {
+            let mut remaining = self
                 .state
-                .ready
-                .wait(remaining)
+                .remaining
+                .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            while *remaining != 0 {
+                remaining = self
+                    .state
+                    .ready
+                    .wait(remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
         }
+        let started = self.state.started.lock().unwrap_or_else(|e| e.into_inner());
+        started.map(|t| t.elapsed()).unwrap_or_default()
     }
 }
 
@@ -598,27 +659,53 @@ impl LibraryPool {
         self.available.notify_one();
     }
 
-    pub fn enqueue_probe_batch(&self, items: Vec<WorkItem>) -> ProbeBatch {
-        let state = Arc::new(ProbeBatchState {
-            remaining: Mutex::new(items.len()),
-            ready: Condvar::new(),
-        });
-        if items.is_empty() {
-            return ProbeBatch { state };
+    /// Open an empty completion barrier for one scan job's probes.
+    ///
+    /// Pair with [`Self::enqueue_probe_in_batch`] during the index pass and
+    /// [`ProbeBatch::wait`] once the pass is done.
+    pub fn start_probe_batch(&self) -> ProbeBatch {
+        ProbeBatch {
+            state: Arc::new(ProbeBatchState {
+                remaining: Mutex::new(0),
+                ready: Condvar::new(),
+                pushed: AtomicUsize::new(0),
+                started: Mutex::new(None),
+                sealed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Queue one probe against `batch`, as the index pass discovers it
+    /// (ADR-0004 §2.4).
+    ///
+    /// This replaces handing the pool a finished `Vec` after the walk. The
+    /// batch was never an ordering or dedup mechanism — only a counter and a
+    /// condvar — and `drain_pending_probes` already enqueues probes one at a
+    /// time, so nothing but the counter arithmetic had to move. Before this,
+    /// nothing was queued to probe until the walk finished, which made time to
+    /// first playable item the whole index pass: 78 minutes on the 2026-08-07
+    /// dogfood library, with not one of 23,283 TV items carrying a `probed_at`
+    /// before the walk ended.
+    ///
+    /// A paused library is skipped without incrementing, so the barrier stays
+    /// correct when a library goes unreachable mid-walk.
+    pub fn enqueue_probe_in_batch(&self, mut item: WorkItem, batch: &ProbeBatch) {
+        debug_assert!(
+            !batch.state.sealed.load(Ordering::SeqCst),
+            "probe pushed into a batch already being waited on; every push must \
+             happen before ProbeBatch::wait"
+        );
+        if self.availability.pause.is_paused(item.library_id) {
+            return;
         }
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        for mut item in items {
-            if self.availability.pause.is_paused(item.library_id) {
-                let mut remaining = state.remaining.lock().unwrap_or_else(|e| e.into_inner());
-                *remaining = remaining.saturating_sub(1);
-                continue;
-            }
-            item.kind = WorkKind::Probe;
-            item.batch = Some(Arc::clone(&state));
-            queue.probes.push_back(item);
-        }
-        self.available.notify_all();
-        ProbeBatch { state }
+        // Counted before it is poppable, under the queue lock.
+        batch.state.push();
+        item.kind = WorkKind::Probe;
+        item.batch = Some(Arc::clone(&batch.state));
+        queue.probes.push_back(item);
+        drop(queue);
+        self.available.notify_one();
     }
 
     pub fn drain_pending_probes(&self) -> Result<usize, String> {
@@ -1223,6 +1310,167 @@ fn prune_completion_times(times: &mut VecDeque<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_batch() -> ProbeBatch {
+        ProbeBatch {
+            state: Arc::new(ProbeBatchState {
+                remaining: Mutex::new(0),
+                ready: Condvar::new(),
+                pushed: AtomicUsize::new(0),
+                started: Mutex::new(None),
+                sealed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn remaining_of(batch: &ProbeBatch) -> usize {
+        *batch
+            .state
+            .remaining
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A probe stamped with `batch`, as the enqueue path stamps it, so
+    /// [`LibraryPool::finish_batch`] decrements the real barrier.
+    fn batched_item(item_id: i64, batch: &ProbeBatch) -> WorkItem {
+        let mut item = WorkItem::probe(item_id, 1, PathBuf::from("/p.mkv"), None);
+        item.batch = Some(Arc::clone(&batch.state));
+        item
+    }
+
+    fn test_pool(dir: &std::path::Path) -> (Arc<Db>, Arc<LibraryPool>) {
+        let db = Arc::new(nightjar_db::open(dir).unwrap());
+        let subs = Arc::new(SubsStore::new(dir.join("subs")).unwrap());
+        let pool = LibraryPool::spawn(Arc::clone(&db), subs);
+        (db, pool)
+    }
+
+    /// The counter starting at zero and rising with the walk means it can also
+    /// *fall back* to zero mid-walk, when every probe pushed so far drains
+    /// before the walk finds the next one. That is not completion, and `wait`
+    /// must not treat it as such — the batch is only closed once the caller
+    /// stops pushing, which is why `wait` takes `self` by value.
+    ///
+    /// This is the failure the old up-front `items.len()` counter could not
+    /// have: it was never zero until the work was genuinely done.
+    #[test]
+    fn wait_does_not_return_when_the_count_returns_to_zero_mid_walk() {
+        let batch = empty_batch();
+
+        // Two items discovered early in the walk, both probed before the walk
+        // finds the next one.
+        batch.state.push();
+        batch.state.push();
+        assert_eq!(remaining_of(&batch), 2);
+        LibraryPool::finish_batch(&batched_item(1, &batch));
+        LibraryPool::finish_batch(&batched_item(2, &batch));
+        assert_eq!(remaining_of(&batch), 0, "drained mid-walk");
+
+        // The walk keeps going and finds a third.
+        batch.state.push();
+        let third = batched_item(3, &batch);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let d = batch.wait();
+            tx.send(()).unwrap();
+            d
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "wait returned while a pushed probe was still outstanding"
+        );
+        LibraryPool::finish_batch(&third);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("wait must return once the last pushed probe finishes");
+        let elapsed = waiter.join().unwrap();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "probe duration is measured from the first push, not from the wait call"
+        );
+    }
+
+    /// A library going unreachable mid-walk must leave the barrier arithmetic
+    /// correct. Pushes after the pause are skipped rather than counted, so
+    /// `wait` is not left holding a count for work that will never run.
+    #[test]
+    fn pushes_after_a_library_pauses_are_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let (db, pool) = test_pool(dir.path());
+        let library_id = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+
+        let batch = pool.start_probe_batch();
+        pool.availability.pause.set_paused(library_id, true);
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(1, library_id, media.join("a.mkv"), None),
+            &batch,
+        );
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(2, library_id, media.join("b.mkv"), None),
+            &batch,
+        );
+
+        assert_eq!(batch.pushed(), 0, "a paused library must not be counted");
+        assert_eq!(remaining_of(&batch), 0);
+        batch.wait();
+    }
+
+    /// `purge_queue_for_library` discards queued probes and decrements for
+    /// each, while a worker may already have popped one and be decrementing it
+    /// through `finish_batch`. Both paths are correct and exactly one runs per
+    /// item; a double decrement would underflow and panic the worker, and a
+    /// missed one would wedge `wait` forever.
+    #[test]
+    fn unreachable_mid_walk_leaves_the_barrier_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let (db, pool) = test_pool(dir.path());
+        let library_id = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+
+        let batch = pool.start_probe_batch();
+        for item_id in 1..=64 {
+            pool.enqueue_probe_in_batch(
+                WorkItem::probe(item_id, library_id, media.join("x.mkv"), None),
+                &batch,
+            );
+        }
+        assert_eq!(batch.pushed(), 64);
+
+        // Mid-walk unreachability: pauses the library and purges the queue,
+        // racing the workers already draining it.
+        pool.set_library_reachability(library_id, &media.to_string_lossy(), false)
+            .unwrap();
+
+        // Pushes after the pause are skipped, so the count cannot rise again
+        // until the library comes back.
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(65, library_id, media.join("y.mkv"), None),
+            &batch,
+        );
+        assert_eq!(batch.pushed(), 64);
+
+        // Must return rather than wedge, and must not have underflowed.
+        batch.wait();
+    }
 
     #[test]
     fn enqueue_background_unique_skips_duplicate_kind_item() {
