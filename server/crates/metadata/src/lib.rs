@@ -4,6 +4,7 @@
 //! request-rate limiter (ADR-0026 §7/§8).
 
 mod artwork;
+mod browse;
 mod canonical;
 mod clean;
 mod fix;
@@ -25,6 +26,10 @@ pub use artwork::{
     ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, artwork_path_for_item_key,
     artwork_refs_for_item_key, resolve_artwork_key,
 };
+pub use browse::{
+    BrowseUnit, LibraryUnits, SeriesDetail, SeriesEpisode, SeriesSeason, UnitCounts, UnitIdentity,
+    UnitKind, get_series, list_library_units,
+};
 pub use canonical::{
     canonical_from_search_hit, get_canonical, merge_prefer_left, persist_mapped_hit,
     persist_season_projection, reproject_from_payload, upsert_canonical,
@@ -40,8 +45,9 @@ pub use fix::{
 };
 pub use item_detail::{ItemArtwork, ItemMetadata, item_metadata};
 pub use item_links::{
-    clear_all_links_for_media_item, effective_item_key, link_keys_for_item, path_item_key,
-    replace_auto_link, replace_auto_links, set_manually_matched, upsert_link,
+    clear_all_links_for_media_item, effective_item_key, effective_item_keys_for_library,
+    link_keys_for_item, path_item_key, replace_auto_link, replace_auto_links,
+    series_key_for_show_folder, set_manually_matched, upsert_link,
 };
 pub use match_score::{
     AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, LibrarySeriesShape, MatchCandidate,

@@ -62,6 +62,18 @@ export const api = {
 		request<Resp<'/api/v0/libraries/{libraryId}/items', 'get'>>(
 			`/api/v0/libraries/${libraryId}/items`
 		),
+	listUnits: (libraryId: number) =>
+		request<Resp<'/api/v0/libraries/{libraryId}/units', 'get'>>(
+			`/api/v0/libraries/${libraryId}/units`
+		),
+	getSeries: (seriesKey: string) => {
+		const params = new URLSearchParams({ seriesKey });
+		return request<Resp<'/api/v0/series', 'get'>>(`/api/v0/series?${params}`);
+	},
+	getScanProgress: (libraryId: number) =>
+		request<Resp<'/api/v0/libraries/{libraryId}/scan-progress', 'get'>>(
+			`/api/v0/libraries/${libraryId}/scan-progress`
+		),
 	getItem: (itemId: number) =>
 		request<Resp<'/api/v0/items/{itemId}', 'get'>>(`/api/v0/items/${itemId}`),
 	getPlaybackInfo: (itemId: number) =>

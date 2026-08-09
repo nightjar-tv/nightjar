@@ -1,6 +1,7 @@
 //! File↔item join (ADR-0029 §2). Provider keys only; path keys are derived.
 
 use rusqlite::{Connection, Transaction, params};
+use std::collections::{HashMap, HashSet};
 
 /// The `item_key` / `series_key` prefixes (ADR-0025 §1, ADR-0039 item 2).
 ///
@@ -11,6 +12,8 @@ use rusqlite::{Connection, Transaction, params};
 pub const EPISODE_KEY_PREFIX: &str = "tmdb:episode:";
 pub const MOVIE_KEY_PREFIX: &str = "tmdb:movie:";
 pub const SHOW_KEY_PREFIX: &str = "tmdb:show:";
+pub const FOLDER_KEY_PREFIX: &str = "folder:";
+pub const PATH_KEY_PREFIX: &str = "path:";
 
 /// Upsert one provider binding. Does not store path keys.
 pub fn upsert_link(
@@ -158,6 +161,73 @@ pub fn path_item_key(library_id: i64, relpath: &str) -> String {
     format!("path:{library_id}:{relpath}")
 }
 
+/// Bulk [`effective_item_key`] for a whole library, keyed by media item id.
+///
+/// Same rule as the single-item form: the first watch-shaped provider binding
+/// in `(manually_matched DESC, item_key)` order, else the path key. The two
+/// share [`is_watch_item_key`] and that ordering deliberately, and
+/// `bulk_agrees_with_single` pins them together, because a listing that keyed
+/// items differently from the rest of the server would be a second answer to
+/// "what is this item" (Rule 4.11).
+pub fn effective_item_keys_for_library(
+    conn: &Connection,
+    library_id: i64,
+) -> Result<HashMap<i64, String>, String> {
+    let mut keys = HashMap::new();
+    let mut items = conn
+        .prepare("SELECT id, path FROM media_items WHERE library_id = ?1")
+        .map_err(|e| format!("prepare library item keys: {e}"))?;
+    let rows = items
+        .query_map(params![library_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("query library item keys: {e}"))?;
+    for row in rows {
+        let (id, path) = row.map_err(|e| format!("library item key row: {e}"))?;
+        keys.insert(id, path_item_key(library_id, &path));
+    }
+
+    let mut links = conn
+        .prepare(
+            "SELECT l.media_item_id, l.item_key
+             FROM media_item_links l
+             JOIN media_items m ON m.id = l.media_item_id
+             WHERE m.library_id = ?1
+             ORDER BY l.media_item_id, l.manually_matched DESC, l.item_key",
+        )
+        .map_err(|e| format!("prepare library links: {e}"))?;
+    let rows = links
+        .query_map(params![library_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("query library links: {e}"))?;
+    let mut bound: HashSet<i64> = HashSet::new();
+    for row in rows {
+        let (id, key) = row.map_err(|e| format!("library link row: {e}"))?;
+        if is_watch_item_key(&key) && bound.insert(id) {
+            keys.insert(id, key);
+        }
+    }
+    Ok(keys)
+}
+
+/// ADR-0039 item 2: the series key of a show folder.
+///
+/// The grammar is documented for debugging and is not a parse contract; the
+/// key is opaque on the wire, permanently. It is derived from the folder's
+/// `series` row rather than stored, so a folder that binds later does not
+/// leave a stale key behind (ADR-0039 item 5).
+pub fn series_key_for_show_folder(
+    library_id: i64,
+    show_folder: &str,
+    tmdb_show_id: Option<i64>,
+) -> String {
+    match tmdb_show_id {
+        Some(id) => format!("tmdb:show:{id}"),
+        None => format!("folder:{library_id}:{show_folder}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +276,57 @@ mod tests {
         let mut keys = link_keys_for_item(&c, 1).unwrap();
         keys.sort();
         assert_eq!(keys, vec!["tmdb:episode:1", "tmdb:episode:2"]);
+    }
+
+    #[test]
+    fn bulk_agrees_with_single() {
+        let c = mem();
+        c.execute_batch(
+            "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 'b.mkv', 1, 1, 'B', 'movie'),
+                    (1, 'c.mkv', 1, 1, 'C', 'movie');",
+        )
+        .unwrap();
+        let tx = c.unchecked_transaction().unwrap();
+        // A provider binding, a manual binding that must outrank an automatic
+        // one, and a non-watch `tmdb:show:` link that must lose to the path key.
+        upsert_link(&tx, 1, "tmdb:movie:550", false).unwrap();
+        upsert_link(&tx, 2, "tmdb:movie:11", false).unwrap();
+        upsert_link(&tx, 2, "tmdb:movie:99", true).unwrap();
+        upsert_link(&tx, 3, "tmdb:show:1396", false).unwrap();
+        tx.commit().unwrap();
+
+        let bulk = effective_item_keys_for_library(&c, 1).unwrap();
+        for (id, relpath) in [(1, "a.mkv"), (2, "b.mkv"), (3, "c.mkv")] {
+            assert_eq!(
+                bulk.get(&id).map(String::as_str),
+                Some(effective_item_key(&c, id, 1, relpath).unwrap().as_str()),
+                "item {id}"
+            );
+        }
+        assert_eq!(bulk[&2], "tmdb:movie:99", "manual binding wins");
+        assert_eq!(bulk[&3], "path:1:c.mkv", "tmdb:show: is not a watch key");
+    }
+
+    /// ADR-0039 item 2: bound folders key on the entity, unbound ones on the
+    /// folder, and an unbound folder at the library root keys on the empty
+    /// relpath rather than dropping out of the grammar.
+    #[test]
+    fn series_key_grammar() {
+        assert_eq!(
+            series_key_for_show_folder(2, "Shameless (US)", Some(1396)),
+            "tmdb:show:1396"
+        );
+        assert_eq!(
+            series_key_for_show_folder(2, "Shameless (US)", None),
+            "folder:2:Shameless (US)"
+        );
+        assert_eq!(series_key_for_show_folder(2, "", None), "folder:2:");
+        // The D2 class: two fold-colliding folders are two keys.
+        assert_ne!(
+            series_key_for_show_folder(2, "Shameless (US)", None),
+            series_key_for_show_folder(2, "Shameless (UK)", None)
+        );
     }
 
     #[test]
