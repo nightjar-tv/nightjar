@@ -17,6 +17,7 @@ use crate::match_score::SearchKind;
 use crate::migrator::{self, MigrateReport};
 use crate::model::item_key_for_metadata;
 use crate::negative_cache::{self, CacheKind, PROVIDER_TMDB, query_key};
+use crate::queue::BindStats;
 use crate::queue::{self, MetadataStatus};
 use crate::resolve::{MetadataSource, Resolver};
 use crate::tmdb::TmdbClient;
@@ -154,6 +155,10 @@ pub fn search_candidates(
 pub struct AssignResult {
     pub item_key: String,
     pub migrate: MigrateReport,
+    /// Season/link counters from this assign's bind, so a manual fix's provider
+    /// work is visible the way the drain's is. Default for a movie assign,
+    /// which does not bind seasons.
+    pub bind: BindStats,
 }
 
 /// Assign a TMDB id below the auto floor is allowed (ADR-0028 §4).
@@ -169,6 +174,7 @@ pub fn assign<T: MetadataSource, A: ArtworkInvalidate>(
     let old_effective = effective_item_key(conn, item.id, item.library_id, &item.path)?;
 
     let kind = req.kind.as_str();
+    let mut bind = BindStats::default();
     let (new_key, meta) = match kind {
         "movie" => {
             let (meta, raw) = client
@@ -191,7 +197,11 @@ pub fn assign<T: MetadataSource, A: ArtworkInvalidate>(
             canonical::persist_mapped_hit(conn, PROVIDER_TMDB, &raw, &meta)
                 .map_err(|e| e.to_string())?;
             // Bind season→episode for this file (and multi-ep ranges).
-            let _bind = queue::bind_resolved_items(conn, resolver, &[item.id], &meta)?;
+            // Counters are carried out on AssignResult rather than dropped: a
+            // manual assign fetches seasons and persists projections exactly as
+            // the drain does, and discarding them here left that work in no
+            // counter anywhere.
+            bind = queue::bind_resolved_items(conn, resolver, &[item.id], &meta)?;
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|e| format!("begin assign tv tx: {e}"))?;
@@ -221,6 +231,7 @@ pub fn assign<T: MetadataSource, A: ArtworkInvalidate>(
     Ok(AssignResult {
         item_key: new_key,
         migrate,
+        bind,
     })
 }
 
