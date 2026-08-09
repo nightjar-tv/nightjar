@@ -224,10 +224,34 @@ function clearVideoSubtitleCues(video: HTMLVideoElement): void {
 export function attachHls(
 	video: HTMLVideoElement,
 	playlistBase: string,
-	startAtSeconds = 0
+	startAtSeconds = 0,
+	/**
+	 * The session behind this attach no longer exists (idle reap, ADR-0007 §4,
+	 * or a server restart). Called once; the handle has stopped loading by
+	 * then, so the surface can offer play again instead of the caller
+	 * discovering it from a stream of failures.
+	 */
+	onSessionGone?: () => void
 ): HlsHandle {
 	let hls: Hls | null = null;
 	let destroyed = false;
+	let sessionGone = false;
+
+	/**
+	 * A dead session is not a network blip, and retrying one is how a left-open
+	 * tab produced 5,012 `hls asset not found` at ~9/s for 9.5 minutes on
+	 * 2026-08-07. Stop loading and tell the surface once.
+	 */
+	function reportSessionGone() {
+		if (sessionGone || destroyed) return;
+		sessionGone = true;
+		try {
+			hls?.stopLoad();
+		} catch {
+			// Already torn down.
+		}
+		onSessionGone?.();
+	}
 	/**
 	 * Seek-notify suppress generation. Non-zero = ignore user scrub handlers.
 	 * Bumped on each arm so a stale rAF/timeout cannot clear a newer suppress.
@@ -859,6 +883,21 @@ export function attachHls(
 
 	if (backend === 'native-hls') {
 		logSubs('native-hls attach — filter console for [nj-subs]');
+		// Native HLS surfaces a dead session as a generic media error with no
+		// status code, so ask the server once rather than guessing. One request
+		// settles it; the hls.js path reads the 404 off the error directly.
+		// Both backends must reach the same answer (Rule 2.4) — a session-death
+		// fix that only works on MSE leaves iOS on the old behaviour.
+		video.addEventListener('error', () => {
+			if (destroyed || sessionGone) return;
+			void fetch(currentPlaylist.split('#')[0] ?? currentPlaylist)
+				.then((res) => {
+					if (res.status === 404) reportSessionGone();
+				})
+				.catch(() => {
+					// Offline or aborted: not a dead session.
+				});
+		});
 		// Window-relative: session already lands at landedMs; no title #t=.
 		video.src = playlistBase;
 		video.addEventListener(
@@ -891,6 +930,14 @@ export function attachHls(
 			}
 			if (!data.fatal) return;
 			if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+				// 404 is the server saying the session is gone, not that the
+				// request failed. Restarting the load re-asks the same missing
+				// URL forever; every other network failure is still worth a
+				// retry, so only this code exits the loop.
+				if (data.response?.code === 404) {
+					reportSessionGone();
+					return;
+				}
 				hls?.startLoad();
 			} else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
 				hls?.recoverMediaError();

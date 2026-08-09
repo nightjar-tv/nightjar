@@ -13,6 +13,7 @@ use nightjar_core::{
     title_looks_sdh,
 };
 use nightjar_db::{MediaItemRow, SidecarRow, resolve_media_path};
+use nightjar_metadata::{ArtworkKind, ItemMetadata, item_metadata};
 use nightjar_transcode::{
     TrackReadiness, is_burn_in_sidecar_format, is_serveable_sidecar_format, list_audio_tracks,
     list_burn_in_subtitles, list_text_subtitles, stored_webvtt,
@@ -53,6 +54,73 @@ pub struct MediaItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_error: Option<String>,
     pub playback_method: &'static str,
+}
+
+/// One item with its canonical metadata (ADR-0029 §1.2).
+///
+/// A superset of [`MediaItemDto`] rather than a second endpoint: the page that
+/// renders a synopsis needs the file facts on the same screen, and ADR-0029's
+/// link table makes it one join. The library listing keeps the bulk shape,
+/// because a 23k-row response has no use for 23k synopses.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaItemDetailDto {
+    #[serde(flatten)]
+    pub item: MediaItemDto,
+    /// Opaque item_key (ADR-0035 item 11).
+    pub item_key: String,
+    /// Canonical title when the item has a canonical row; `title` stays the
+    /// scan-derived one so a mismatch between them is visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub air_date: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ratings: Vec<RatingDto>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cast: Vec<CastMemberDto>,
+    /// Only kinds this title actually has. A kind absent here does not exist
+    /// for this title, so the client draws the layout without it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artwork: Vec<ArtworkDto>,
+    /// Series this episode belongs to (ADR-0039 item 2), for the link back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_title: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingDto {
+    pub source: String,
+    pub value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CastMemberDto {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtworkDto {
+    /// poster | backdrop | logo.
+    pub kind: &'static str,
+    pub url: String,
 }
 
 #[derive(Serialize)]
@@ -125,7 +193,7 @@ pub struct PlaybackInfoDto {
 pub async fn get(
     State(state): State<AppState>,
     Path(item_id): Path<i64>,
-) -> ApiResult<Json<MediaItemDto>> {
+) -> ApiResult<Json<MediaItemDetailDto>> {
     blocking(move || {
         let row = state
             .db
@@ -133,9 +201,69 @@ pub async fn get(
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
         let root = library_root(&state, row.library_id)?;
-        Ok(Json(to_dto(row, &root)))
+        let library_id = row.library_id;
+        let relpath = row.path.clone();
+        let meta = state
+            .db
+            .with_conn(|c| item_metadata(c, item_id, library_id, &relpath))
+            .map_err(ApiError::internal)?;
+        Ok(Json(to_detail_dto(row, &root, meta)))
     })
     .await
+}
+
+fn to_detail_dto(row: MediaItemRow, library_root: &str, meta: ItemMetadata) -> MediaItemDetailDto {
+    MediaItemDetailDto {
+        item: to_dto(row, library_root),
+        item_key: meta.item_key,
+        canonical_title: meta.title,
+        plot: meta.plot,
+        runtime_minutes: meta.runtime_minutes,
+        air_date: meta.air_date,
+        genres: meta.genres,
+        ratings: meta
+            .ratings
+            .into_iter()
+            .map(|r| RatingDto {
+                source: r.source,
+                value: r.value,
+                votes: r.votes,
+            })
+            .collect(),
+        cast: meta
+            .cast
+            .into_iter()
+            .map(|c| CastMemberDto {
+                name: c.name,
+                role: c.role,
+                order: c.order,
+            })
+            .collect(),
+        artwork: meta
+            .artwork
+            .into_iter()
+            .filter_map(|a| {
+                let kind = artwork_kind_name(a.kind)?;
+                Some(ArtworkDto {
+                    kind,
+                    url: format!("/api/v0/artwork/{}/{kind}", a.item_key),
+                })
+            })
+            .collect(),
+        series_key: meta.series_key,
+        show_title: meta.show_title,
+    }
+}
+
+/// Wire name for the kinds an item page renders. Kinds with no surface yet
+/// return `None` rather than being advertised with a URL nothing asks for.
+fn artwork_kind_name(kind: ArtworkKind) -> Option<&'static str> {
+    match kind {
+        ArtworkKind::Poster => Some("poster"),
+        ArtworkKind::Backdrop => Some("backdrop"),
+        ArtworkKind::Logo => Some("logo"),
+        ArtworkKind::Banner | ArtworkKind::Other => None,
+    }
 }
 
 pub(crate) fn library_root(state: &AppState, library_id: i64) -> ApiResult<String> {

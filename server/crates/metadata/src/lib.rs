@@ -7,6 +7,7 @@ mod artwork;
 mod canonical;
 mod clean;
 mod fix;
+mod item_detail;
 mod item_links;
 mod match_score;
 mod measure_exclude;
@@ -21,8 +22,8 @@ mod resolve;
 mod tmdb;
 
 pub use artwork::{
-    ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, poster_path_for_item_key,
-    resolve_artwork_key,
+    ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, artwork_path_for_item_key,
+    artwork_refs_for_item_key, resolve_artwork_key,
 };
 pub use canonical::{
     canonical_from_search_hit, get_canonical, merge_prefer_left, persist_mapped_hit,
@@ -37,6 +38,7 @@ pub use fix::{
     ArtworkInvalidate, AssignRequest, AssignResult, ClearResult, FixCandidate, FixItemView,
     NoopArtwork, assign, clear_match, get_fix_item, retry_unmatched, search_candidates,
 };
+pub use item_detail::{ItemArtwork, ItemMetadata, item_metadata};
 pub use item_links::{
     clear_all_links_for_media_item, effective_item_key, link_keys_for_item, path_item_key,
     replace_auto_link, replace_auto_links, set_manually_matched, upsert_link,

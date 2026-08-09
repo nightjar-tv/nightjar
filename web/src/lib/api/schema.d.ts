@@ -118,7 +118,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get one media item */
+        /**
+         * Get one media item with its canonical metadata (ADR-0029 §1.2)
+         * @description File facts and canonical metadata in one response rather than two endpoints: the detail surface renders both on one screen, and the ADR-0029 link table makes it one join. A client must not call this per tile while browsing; the units listing already carries what a grid needs.
+         */
         get: operations["getItem"];
         put?: never;
         post?: never;
@@ -650,6 +653,53 @@ export interface components {
             playbackMethod: components["schemas"]["PlaybackMethod"];
         };
         /**
+         * @description Kinds an item surface renders (ADR-0027 §1). poster is the grid tile, backdrop the detail background, logo the title treatment over it. The store also holds banner and still; those have no surface yet and are not advertised here.
+         * @enum {string}
+         */
+        ArtworkKind: "poster" | "backdrop" | "logo";
+        ItemArtwork: {
+            kind: components["schemas"]["ArtworkKind"];
+            /** @description GET path for the image. Present means this title has artwork of this kind; the bytes are fetched on demand at first request (ADR-0027 §5), so the first GET may be slow but will not 404 for want of a source. A kind missing from the array does not exist for this title, and the client draws the layout without it rather than requesting an image that cannot arrive. */
+            url: string;
+        };
+        Rating: {
+            /** @description Provider name as recorded, e.g. imdb, themoviedb, tomatometerallcritics, default. Not an enum: the set is whatever the NFO or provider carried. */
+            source: string;
+            /** Format: double */
+            value: number;
+            /** Format: int64 */
+            votes?: number | null;
+        };
+        CastMember: {
+            name: string;
+            role?: string | null;
+            /** @description Billing order as recorded; 0 is top billing. */
+            order?: number | null;
+        };
+        /** @description A MediaItem plus the canonical metadata for the entity it is bound to. Canonical fields are absent, never empty-but-present, when the item has no canonical row (ADR-0029 §1.3); the client falls back to the scan fields already in the MediaItem half. */
+        MediaItemDetail: components["schemas"]["MediaItem"] & {
+            /** @description Opaque item_key (ADR-0035 item 11). Pass it back exactly as received; the grammar is not a parse contract. */
+            itemKey: string;
+            /** @description Title from the canonical row. `title` stays the scan-derived one, so a disagreement between the two is visible rather than hidden by overwriting. */
+            canonicalTitle?: string | null;
+            /** @description Episode overview for an episode, not the show's. */
+            plot?: string | null;
+            runtimeMinutes?: number | null;
+            /** @description ISO date; episodes only (ADR-0029 §1.2). */
+            airDate?: string | null;
+            /** @description Read from the show for an episode. Episode rows deliberately do not carry genres, so this is inherited rather than absent (ADR-0029 §1.2). */
+            genres?: string[];
+            /** @description Every source the record carried. An episode's own vote only; a show's score is not inherited down to its episodes. */
+            ratings?: components["schemas"]["Rating"][];
+            /** @description Read from the show for an episode, like genres. */
+            cast?: components["schemas"]["CastMember"][];
+            /** @description Only the kinds this title has. For an episode these come from the show entity, which is where poster, backdrop and logo live (ADR-0029 §1.2 gives episode rows a still and nothing else). */
+            artwork?: components["schemas"]["ItemArtwork"][];
+            /** @description Opaque series_key of the show an episode belongs to, for the link back to GET /api/v0/series. Absent for a movie. */
+            seriesKey?: string | null;
+            showTitle?: string | null;
+        };
+        /**
          * @description Metadata pipeline state (ADR-0026). `pending` = search tier queued; `matched` = identity found, detail enrichment pending; `ready` = full metadata bound; `unmatched` = search terminal no-match.
          * @enum {string}
          */
@@ -1092,7 +1142,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MediaItem"];
+                    "application/json": components["schemas"]["MediaItemDetail"];
                 };
             };
             /** @description Not found */

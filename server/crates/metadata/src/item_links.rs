@@ -2,6 +2,16 @@
 
 use rusqlite::{Connection, Transaction, params};
 
+/// The `item_key` / `series_key` prefixes (ADR-0025 §1, ADR-0039 item 2).
+///
+/// Declared here because this module owns the key grammar. Readers elsewhere
+/// import them rather than spelling the literals again, so there is one place
+/// the grammar is written down (Rule 4.11). The grammar stays opaque on the
+/// wire either way: these are for the server's own use, not a parse contract.
+pub const EPISODE_KEY_PREFIX: &str = "tmdb:episode:";
+pub const MOVIE_KEY_PREFIX: &str = "tmdb:movie:";
+pub const SHOW_KEY_PREFIX: &str = "tmdb:show:";
+
 /// Upsert one provider binding. Does not store path keys.
 pub fn upsert_link(
     tx: &Transaction<'_>,

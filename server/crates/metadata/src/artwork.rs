@@ -138,12 +138,16 @@ impl ArtworkStore {
         }
     }
 
-    /// Ensure original is on disk. `tmdb_path` is a `/abc.jpg` relative path.
+    /// Ensure original is on disk. `source` is an `ArtworkRef.path`, which the
+    /// model documents as "local path or remote URL as written in the NFO /
+    /// provider payload" and which is therefore either form: TMDB detail
+    /// projects `/abc.jpg`, NFO `<thumb>` carries a whole URL. Reading it as
+    /// TMDB-relative only is what left every NFO-sourced image unfetchable.
     pub fn ensure_tmdb_original(
         &self,
         item_key: &str,
         kind: ArtworkKind,
-        tmdb_path: &str,
+        source: &str,
     ) -> Result<PathBuf, String> {
         let dest = self.original_path(item_key, kind);
         if dest.is_file() {
@@ -157,11 +161,7 @@ impl ArtworkStore {
             return Ok(dest);
         }
         fs::create_dir_all(dest.parent().unwrap()).map_err(|e| format!("mkdir art: {e}"))?;
-        let path = tmdb_path.trim();
-        if path.is_empty() {
-            return Err("empty tmdb artwork path".into());
-        }
-        let url = format!("{TMDB_IMAGE_BASE}{path}");
+        let url = artwork_source_url(source)?;
         let _permit = self.slots.acquire()?;
         let resp = ureq::get(&url)
             .call()
@@ -181,12 +181,12 @@ impl ArtworkStore {
         item_key: &str,
         kind: ArtworkKind,
         width: Option<u32>,
-        tmdb_path: Option<&str>,
+        source: Option<&str>,
     ) -> Result<PathBuf, String> {
         let orig = self.original_path(item_key, kind);
         if !orig.is_file() {
-            let Some(tp) = tmdb_path.filter(|p| !p.is_empty()) else {
-                return Err("artwork not cached and no tmdb path".into());
+            let Some(tp) = source.filter(|p| !p.is_empty()) else {
+                return Err("artwork not cached and no source path".into());
             };
             self.ensure_tmdb_original(item_key, kind, tp)?;
         }
@@ -231,28 +231,64 @@ fn try_ffmpeg_scale(src: &Path, dest: &Path, width: u32) -> Result<(), String> {
     }
 }
 
-/// Look up first poster path from canonical JSON for an item_key.
-pub fn poster_path_for_item_key(conn: &rusqlite::Connection, item_key: &str) -> Option<String> {
-    let (kind, id) = parse_provider_key(item_key)?;
-    let artwork_json: Option<String> = conn
+/// Absolute URL to download an `ArtworkRef.path` from.
+///
+/// The two shapes in the store are a TMDB relative path (`/abc.jpg`, written by
+/// the detail projection) and a whole URL (written by the NFO `<thumb>` /
+/// `<fanart>` projection). On the dogfood library 44,540 of 69,656 refs are the
+/// second shape, so treating every ref as TMDB-relative is not an edge case.
+fn artwork_source_url(source: &str) -> Result<String, String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err("empty artwork source path".into());
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Ok(source.to_string());
+    }
+    if source.starts_with('/') {
+        // A local filesystem path is not a fetch source, and joining one to the
+        // CDN base would produce a nonsense URL that 404s slowly.
+        if std::path::Path::new(source).is_file() {
+            return Err(format!("artwork source is a local file: {source}"));
+        }
+        return Ok(format!("{TMDB_IMAGE_BASE}{source}"));
+    }
+    Err(format!("unrecognised artwork source: {source}"))
+}
+
+/// First artwork path of `kind` from canonical JSON for an item_key.
+pub fn artwork_path_for_item_key(
+    conn: &rusqlite::Connection,
+    item_key: &str,
+    kind: ArtworkKind,
+) -> Option<String> {
+    for reference in artwork_refs_for_item_key(conn, item_key) {
+        if reference.kind == kind {
+            return Some(reference.path);
+        }
+    }
+    None
+}
+
+/// Every artwork ref on the canonical row an item_key names.
+pub fn artwork_refs_for_item_key(
+    conn: &rusqlite::Connection,
+    item_key: &str,
+) -> Vec<crate::model::ArtworkRef> {
+    let Some((entity_kind, id)) = parse_provider_key(item_key) else {
+        return Vec::new();
+    };
+    let raw: Option<String> = conn
         .query_row(
             "SELECT artwork_json FROM metadata_canonical
              WHERE provider = 'tmdb' AND entity_kind = ?1 AND provider_id = ?2",
-            rusqlite::params![kind, id],
+            rusqlite::params![entity_kind, id],
             |r| r.get(0),
         )
-        .ok()?;
-    let raw = artwork_json?;
-    let arr: Vec<crate::model::ArtworkRef> = serde_json::from_str(&raw).ok()?;
-    arr.into_iter()
-        .find(|a| a.kind == ArtworkKind::Poster && a.path.starts_with('/'))
-        .map(|a| a.path)
-        .or_else(|| {
-            let arr: Vec<crate::model::ArtworkRef> = serde_json::from_str(&raw).ok()?;
-            arr.into_iter()
-                .find(|a| a.path.starts_with('/'))
-                .map(|a| a.path)
-        })
+        .ok()
+        .flatten();
+    raw.and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 fn parse_provider_key(item_key: &str) -> Option<(&'static str, String)> {
@@ -277,19 +313,24 @@ fn parse_provider_key(item_key: &str) -> Option<(&'static str, String)> {
 /// back to the media item's `tmdb:movie:` / `tmdb:show:` link, the same keys
 /// the drain warms under, so a poster warmed under the provisional show key
 /// serves when the grid requests the effective key. Returns the serve key and
-/// the canonical poster path, if any.
+/// the source path for the requested kind, if any.
+///
+/// The kind is a parameter rather than assumed: the caller used to hand the
+/// canonical path only for posters, so a backdrop or logo request could never
+/// find a source and every one of them missed as "not cached".
 pub fn resolve_artwork_key(
     conn: &rusqlite::Connection,
     item_key: &str,
+    kind: ArtworkKind,
 ) -> Result<(String, Option<String>), String> {
-    if let Some(path) = poster_path_for_item_key(conn, item_key) {
+    if let Some(path) = artwork_path_for_item_key(conn, item_key, kind) {
         return Ok((item_key.to_string(), Some(path)));
     }
     if let Some((library_id, relpath)) = parse_path_key(item_key) {
         for media_item_id in media_item_ids_for_path(conn, library_id, relpath)? {
             for link in crate::item_links::link_keys_for_item(conn, media_item_id)? {
                 if (link.starts_with("tmdb:movie:") || link.starts_with("tmdb:show:"))
-                    && let Some(path) = poster_path_for_item_key(conn, &link)
+                    && let Some(path) = artwork_path_for_item_key(conn, &link, kind)
                 {
                     return Ok((link, Some(path)));
                 }
@@ -367,9 +408,71 @@ mod tests {
     fn poster_path_resolves_show_key() {
         let c = mem_with_show();
         assert_eq!(
-            poster_path_for_item_key(&c, "tmdb:show:1396").as_deref(),
+            artwork_path_for_item_key(&c, "tmdb:show:1396", ArtworkKind::Poster).as_deref(),
             Some("/abc.jpg")
         );
+    }
+
+    /// Each kind finds its own source. Before this, only posters did, so a
+    /// backdrop or logo request could never fetch and always read as uncached.
+    #[test]
+    fn each_kind_finds_its_own_source() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO metadata_canonical
+               (provider, entity_kind, provider_id, title, artwork_json, ids_json, projected_at)
+             VALUES ('tmdb', 'movie', '550', 'Fight Club',
+               '[{\"kind\":\"poster\",\"path\":\"/p.jpg\"},
+                 {\"kind\":\"backdrop\",\"path\":\"/b.jpg\"}]',
+               '{}', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        let key = "tmdb:movie:550";
+        assert_eq!(
+            artwork_path_for_item_key(&c, key, ArtworkKind::Poster).as_deref(),
+            Some("/p.jpg")
+        );
+        assert_eq!(
+            artwork_path_for_item_key(&c, key, ArtworkKind::Backdrop).as_deref(),
+            Some("/b.jpg")
+        );
+        // Absent for this title is None, not the poster standing in for it.
+        assert_eq!(artwork_path_for_item_key(&c, key, ArtworkKind::Logo), None);
+        assert_eq!(
+            resolve_artwork_key(&c, key, ArtworkKind::Backdrop).unwrap(),
+            (key.to_string(), Some("/b.jpg".to_string()))
+        );
+        assert_eq!(
+            resolve_artwork_key(&c, key, ArtworkKind::Logo).unwrap(),
+            (key.to_string(), None)
+        );
+    }
+
+    /// `ArtworkRef.path` is documented as a local path or a whole URL, and the
+    /// dogfood library holds far more of the second shape than the first.
+    #[test]
+    fn source_url_accepts_both_shapes() {
+        assert_eq!(
+            artwork_source_url("/abc.jpg").unwrap(),
+            "https://image.tmdb.org/t/p/original/abc.jpg"
+        );
+        assert_eq!(
+            artwork_source_url("https://image.tmdb.org/t/p/original/abc.jpg").unwrap(),
+            "https://image.tmdb.org/t/p/original/abc.jpg",
+            "an NFO URL is not re-prefixed onto the CDN base"
+        );
+        assert!(artwork_source_url("").is_err());
+        assert!(artwork_source_url("abc.jpg").is_err());
+    }
+
+    #[test]
+    fn source_url_refuses_a_local_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("poster.jpg");
+        fs::write(&local, b"jpeg").unwrap();
+        let err = artwork_source_url(local.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("local file"), "{err}");
     }
 
     #[test]
@@ -378,7 +481,8 @@ mod tests {
         let tx = c.unchecked_transaction().unwrap();
         crate::item_links::upsert_link(&tx, 1, "tmdb:show:1396", false).unwrap();
         tx.commit().unwrap();
-        let (key, path) = resolve_artwork_key(&c, "path:1:Show/S01E01.mkv").unwrap();
+        let (key, path) =
+            resolve_artwork_key(&c, "path:1:Show/S01E01.mkv", ArtworkKind::Poster).unwrap();
         assert_eq!(key, "tmdb:show:1396");
         assert_eq!(path.as_deref(), Some("/abc.jpg"));
     }
@@ -386,7 +490,8 @@ mod tests {
     #[test]
     fn resolve_artwork_key_keeps_unlinked_path_key() {
         let c = mem_with_show();
-        let (key, path) = resolve_artwork_key(&c, "path:1:Show/S01E01.mkv").unwrap();
+        let (key, path) =
+            resolve_artwork_key(&c, "path:1:Show/S01E01.mkv", ArtworkKind::Poster).unwrap();
         assert_eq!(key, "path:1:Show/S01E01.mkv");
         assert!(path.is_none());
     }
@@ -394,7 +499,7 @@ mod tests {
     #[test]
     fn resolve_artwork_key_keeps_provider_key() {
         let c = mem_with_show();
-        let (key, path) = resolve_artwork_key(&c, "tmdb:show:1396").unwrap();
+        let (key, path) = resolve_artwork_key(&c, "tmdb:show:1396", ArtworkKind::Poster).unwrap();
         assert_eq!(key, "tmdb:show:1396");
         assert_eq!(path.as_deref(), Some("/abc.jpg"));
     }
