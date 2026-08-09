@@ -44,7 +44,7 @@ not here — this page is the reference, not the tour.
 | [0024](0024-ranked-track-selection.md) | Ranked track selection | Accepted | — | — |
 | [0025](0025-item-identity.md) | Item identity | Accepted | — | — |
 | [0026](0026-metadata-pipeline.md) | Metadata pipeline | Partially superseded (amended 11×) | — | §8.4 item 3 by [0037](0037-kids-scoping-and-overrides.md) (in place) |
-| [0027](0027-artwork-pipeline.md) | Artwork pipeline | Accepted (amended) | — | — |
+| [0027](0027-artwork-pipeline.md) | Artwork pipeline | Accepted (amended 2026-08-04, 2026-08-10) | — | — |
 | [0028](0028-manual-metadata-fix.md) | Manual metadata fix | Accepted | — | — |
 | [0029](0029-canonical-metadata-and-item-links.md) | Canonical metadata store and file↔item links | Accepted (amended) | — | — |
 | [0030](0030-library-relative-paths.md) | Library-relative media paths and library repoint | Accepted (amended 2026-08-04) | — | — |
