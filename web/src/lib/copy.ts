@@ -29,8 +29,28 @@ export const copy = {
 		'This browser cannot switch audio tracks on a file it plays directly.',
 	titleDamagedUsable: (usableSec: number, claimedSec: number) =>
 		`This file looks damaged. Playback works through about ${formatClock(usableSec)} of the claimed ${formatClock(claimedSec)}.`,
+	/** Walk still running: a count, never a percentage, because the total is
+	 * still growing and a percentage built on it would move backwards. */
+	scanFound: (found: number) => `Scanning. ${found.toLocaleString()} found.`,
+	probing: (done: number, queued: number) =>
+		`Probing. ${done.toLocaleString()} done, ${queued.toLocaleString()} waiting.`,
+	probingOf: (done: number, total: number) =>
+		`Probing ${done.toLocaleString()} of ${total.toLocaleString()}.`,
+	probeErrors: (errors: number) => `${errors.toLocaleString()} probe errors.`,
+	/** Its own line: metadata finishes on its own schedule, not the probe's. */
+	metadataDraining: (pending: number) =>
+		`Matching metadata. ${pending.toLocaleString()} left.`,
+	episodeCount: (n: number) => (n === 1 ? '1 episode' : `${n.toLocaleString()} episodes`),
 	/** Two rips of one film are one unit (ADR-0025 §2), so say how many files. */
 	versionCount: (n: number) => `${n.toLocaleString()} versions`,
+	/** The folder has no binding, but its episodes name a show (ADR-0039 item 6). */
+	identityEntityOnly: 'show known, folder not bound',
+	identityUnidentified: 'no match',
+	unitsSummary: (units: number, items: number) =>
+		`${units.toLocaleString()} units over ${items.toLocaleString()} items.`,
+	showsWithoutBinding: (n: number) =>
+		`${n.toLocaleString()} shows have metadata but no folder bound to them anywhere.`,
+	seriesUnnumbered: 'No canonical episode numbers, so these are listed rather than ordered.',
 	movieVersions: 'Files bound to this film. Which one plays is not decided yet.',
 	/** Accessible name for the title-time scrub control (ADR-0020). */
 	scrubPosition: 'Position',

@@ -212,6 +212,20 @@ pub struct ScanJobRow {
     pub deferred_remove: i64,
 }
 
+/// Live item-state counts behind a library's scan progress display.
+///
+/// `probe_queued` is a queue depth and the job row's `probed` is a cumulative
+/// total; they are never added together as if they were the same measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgressCounts {
+    pub found: i64,
+    pub probe_queued: i64,
+    pub probe_errors: i64,
+    pub metadata_pending: i64,
+    pub metadata_ready: i64,
+    pub metadata_unmatched: i64,
+}
+
 /// One row for fold-aware index matching (ADR-0030 §2).
 #[derive(Debug, Clone)]
 pub struct ItemPathRow {
@@ -1280,6 +1294,91 @@ impl Db {
         .map_err(|e| format!("get scan job {job_id}: {e}"))
     }
 
+    /// Most recent scan job for a library, whatever its state.
+    pub fn latest_scan_job(&self, library_id: i64) -> Result<Option<ScanJobRow>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, library_id, state, added, updated, removed, unchanged,
+                    probed, errors, index_duration_ms, probe_duration_ms,
+                    error_message, started_at, finished_at, kind, candidate_path,
+                    skipped_outside_root, deferred_remove
+             FROM scan_jobs WHERE library_id = ?1 ORDER BY id DESC LIMIT 1",
+            [library_id],
+            map_scan_job,
+        )
+        .optional()
+        .map_err(|e| format!("latest scan job for library {library_id}: {e}"))
+    }
+
+    /// Live counts behind a library's progress display.
+    ///
+    /// `probe_status` and `metadata_status` are read as named counts rather
+    /// than returned as histograms, because `indexed` is a queue depth and
+    /// `probed` on the job row is a cumulative total, and a caller handed both
+    /// in one shape has to know which is which to avoid dividing one by the
+    /// other.
+    pub fn scan_progress_counts(&self, library_id: i64) -> Result<ScanProgressCounts, String> {
+        let conn = self.lock()?;
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items WHERE library_id = ?1",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("progress found count: {e}"))?;
+        let probe_queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE library_id = ?1 AND probe_status = 'indexed'",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("progress probe queue depth: {e}"))?;
+        let probe_errors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE library_id = ?1 AND probe_status = 'error'",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("progress probe errors: {e}"))?;
+        // 'matched' is identity-found-detail-pending (ADR-0026 §8.1), which is
+        // still draining, so it counts as pending here for the same reason the
+        // drain's own remaining query counts it.
+        let metadata_pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE library_id = ?1 AND metadata_status IN ('pending', 'matched')",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("progress metadata pending: {e}"))?;
+        let metadata_ready: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE library_id = ?1 AND metadata_status = 'ready'",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("progress metadata ready: {e}"))?;
+        let metadata_unmatched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE library_id = ?1 AND metadata_status = 'unmatched'",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("progress metadata unmatched: {e}"))?;
+        Ok(ScanProgressCounts {
+            found,
+            probe_queued,
+            probe_errors,
+            metadata_pending,
+            metadata_ready,
+            metadata_unmatched,
+        })
+    }
+
     pub fn set_scan_job_skipped_outside_root(
         &self,
         job_id: i64,
@@ -2039,5 +2138,78 @@ mod tests {
         let (attempts_a3, retry_a3) = retry_state(a);
         assert_eq!(attempts_a3, 0);
         assert_eq!(retry_a3, None);
+    }
+
+    /// Progress reads name their measures rather than handing back a
+    /// histogram: `probe_queued` is a live queue depth over `probe_status`,
+    /// while the job row's `probed` is a cumulative count for that job. Seeded
+    /// rather than observed from a scan, so it is reproducible.
+    #[test]
+    fn scan_progress_counts_are_named_not_a_histogram() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "tv".into(),
+                path: "/tv".into(),
+                kind: "shows".into(),
+            })
+            .unwrap();
+        let other = db
+            .create_library(&NewLibrary {
+                name: "films".into(),
+                path: "/films".into(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO media_items
+                    (library_id, path, mtime_ms, size_bytes, title, kind,
+                     probe_status, metadata_status)
+                 VALUES (?1, 'a.mkv', 1, 1, 'a', 'episode', 'indexed', 'pending'),
+                        (?1, 'b.mkv', 1, 1, 'b', 'episode', 'indexed', 'matched'),
+                        (?1, 'c.mkv', 1, 1, 'c', 'episode', 'probed', 'ready'),
+                        (?1, 'd.mkv', 1, 1, 'd', 'episode', 'error', 'unmatched'),
+                        (?2, 'e.mkv', 1, 1, 'e', 'movie', 'indexed', 'pending')",
+                params![lib.id, other.id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let counts = db.scan_progress_counts(lib.id).unwrap();
+        assert_eq!(counts.found, 4, "the other library's row is not counted");
+        assert_eq!(counts.probe_queued, 2);
+        assert_eq!(counts.probe_errors, 1);
+        // ADR-0026 §8.1: `matched` is identity found and detail still pending,
+        // which is work in flight, so it counts as pending here.
+        assert_eq!(counts.metadata_pending, 2);
+        assert_eq!(counts.metadata_ready, 1);
+        assert_eq!(counts.metadata_unmatched, 1);
+    }
+
+    #[test]
+    fn latest_scan_job_is_the_newest_for_that_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "tv".into(),
+                path: "/tv".into(),
+                kind: "shows".into(),
+            })
+            .unwrap();
+        assert!(db.latest_scan_job(lib.id).unwrap().is_none());
+
+        let first = db.create_scan_job(lib.id).unwrap();
+        db.complete_scan_job(first, 10).unwrap();
+        let second = db.create_scan_job(lib.id).unwrap();
+        db.set_scan_job_state(second, "indexing").unwrap();
+
+        let job = db.latest_scan_job(lib.id).unwrap().unwrap();
+        assert_eq!(job.id, second);
+        assert_eq!(job.state, "indexing");
     }
 }

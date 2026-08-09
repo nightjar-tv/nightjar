@@ -3,6 +3,7 @@
 mod filename;
 mod models;
 mod playback;
+mod scan_progress;
 mod track_select;
 
 pub use filename::{MAX_EPISODE_RANGE, ParsedName, parse_filename};
@@ -12,6 +13,10 @@ pub use playback::{
     PlaybackDecision, PlaybackMethod, VideoEncodePlan, decide_playback, is_dolby_vision_profile5,
     known_profile, method_from_manifest_expect, mime_for_path, needs_standalone_subtitle_extract,
     resolve_profile, resolve_profile_bag, video_encode_plan,
+};
+pub use scan_progress::{
+    IndexPass, PROBE_BAR_MIN_QUEUE_DEPTH, ProgressDisplay, metadata_display, probe_display,
+    probe_total,
 };
 pub use track_select::{
     DEFAULT_PREFERENCE_LANGUAGE, TrackCandidate, TrackSelection, select_audio_track,

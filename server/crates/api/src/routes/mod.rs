@@ -1,4 +1,5 @@
 mod artwork;
+mod browse;
 pub mod items;
 mod libraries;
 mod metadata_fix;
@@ -34,6 +35,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/libraries/{library_id}/items",
             get(libraries::list_items),
         )
+        .route(
+            "/api/v0/libraries/{library_id}/units",
+            get(browse::list_units),
+        )
+        .route(
+            "/api/v0/libraries/{library_id}/scan-progress",
+            get(libraries::scan_progress),
+        )
+        .route("/api/v0/series", get(browse::get))
         .route("/api/v0/items/{item_id}", get(items::get))
         .route(
             "/api/v0/artwork/{item_key}/{kind}",

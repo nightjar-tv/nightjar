@@ -111,6 +111,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/libraries/{libraryId}/units": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the browse units of a library (ADR-0039 item 4)
+         * @description A browse unit is one series for a shows library and one item for a movies library, keyed by `series_key` in both cases (ADR-0039 item 2). The response says which kind of unit it carries, so a client does not have to know what it asked for. Units cover every media row in the library: `counts.items` equals the library's `itemCount`.
+         */
+        get: operations["listLibraryUnits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/libraries/{libraryId}/scan-progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Progress of the library's most recent scan job (ADR-0004)
+         * @description Named progress fields rather than a status histogram. Probe and metadata are reported separately because they finish at different times; nothing here combines them into one figure.
+         */
+        get: operations["getScanProgress"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/series": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One unit with its media rows in canonical order (ADR-0035 item 8)
+         * @description A show returns its episodes grouped by canonical season. A movie key resolves too, because a movie is a series of one (ADR-0039 item 2) and its files are otherwise unreachable past the listing's single merged unit; `kind` says which was returned.
+         *
+         *     `seriesKey` is a query parameter, not a path segment, for the reason ADR-0035 item 6 gives for `itemKey`: an unbound folder's key is `folder:{libraryId}:{relpath}` and contains slashes and spaces, which a path segment cannot carry through a proxy intact.
+         */
+        get: operations["getSeries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/items/{itemId}": {
         parameters: {
             query?: never;
@@ -704,6 +766,108 @@ export interface components {
          * @enum {string}
          */
         MetadataStatus: "pending" | "matched" | "ready" | "unmatched";
+        /**
+         * @description What one browse unit collects. `series` is a show and its episodes, across every folder bound to it (ADR-0039 item 8). `movie` is a film and its files, which ADR-0039 item 2 treats as a series of one keyed by its own item_key; two rips of one film are one unit, not two (ADR-0025 §2).
+         * @enum {string}
+         */
+        UnitKind: "series" | "movie";
+        /**
+         * @description Which of ADR-0039 item 6's two edges answers for this unit. `bound` = the folder is bound to a show entity (a `series` row), or the movie holds a provider link. `entityOnly` = the folder has no binding but its episodes name a show entity, so the show is known and the folder is not; these are visible with canonical metadata and this marker rather than hidden. `unidentified` = neither edge answers, which is the below-floor fraction ADR-0025 §4 prices.
+         * @enum {string}
+         */
+        UnitIdentity: "bound" | "entityOnly" | "unidentified";
+        LibraryUnit: {
+            /** @description Opaque series_key (ADR-0039 item 2). Pass it to GET /api/v0/series. */
+            seriesKey: string;
+            kind: components["schemas"]["UnitKind"];
+            identity: components["schemas"]["UnitIdentity"];
+            /** @description Canonical show or movie title when the unit has one, otherwise the show folder's name (or the file's title for a movie). */
+            title: string;
+            year?: number | null;
+            /**
+             * Format: int64
+             * @description Media rows this unit collects, scoped to the library that was asked. A show bound in two libraries counts separately in each, while GET /api/v0/series returns the union (ADR-0039 item 8).
+             */
+            itemCount: number;
+            /**
+             * Format: int64
+             * @description The media row to open, present only when the unit collects exactly one. A movie with two files (ADR-0025 §2) omits it rather than pointing at one version arbitrarily; open it through GET /api/v0/series instead.
+             */
+            itemId?: number | null;
+            /** @description Artwork path for this unit, present only when the unit has a provider key to serve art under (ADR-0027). The image itself may not be cached yet, in which case the GET returns 404. */
+            posterUrl?: string | null;
+        };
+        UnitCounts: {
+            /** Format: int64 */
+            units: number;
+            /** Format: int64 */
+            bound: number;
+            /** Format: int64 */
+            entityOnly: number;
+            /** Format: int64 */
+            unidentified: number;
+            /**
+             * Format: int64
+             * @description Media rows covered by the units. Equal to the library's itemCount: grouping never drops a row.
+             */
+            items: number;
+            /**
+             * Format: int64
+             * @description Shows libraries only. Show entities (`metadata_canonical` rows at `entity_kind='tv'`) that no `series` row binds anywhere on the server. Server-wide rather than per-library because a show entity is not library-scoped (ADR-0039 item 1). These produce no unit, because a unit is a folder of files; the count is here so they are not invisible.
+             */
+            showEntitiesWithoutBinding?: number | null;
+        };
+        LibraryUnits: {
+            /** Format: int64 */
+            libraryId: number;
+            libraryKind: components["schemas"]["LibraryKind"];
+            /** @description The kind every unit in this response carries. */
+            unitKind: components["schemas"]["UnitKind"];
+            units: components["schemas"]["LibraryUnit"][];
+            counts: components["schemas"]["UnitCounts"];
+        };
+        SeriesEpisode: {
+            /** Format: int64 */
+            itemId: number;
+            /** @description Opaque item_key (ADR-0035 item 11). */
+            itemKey: string;
+            /** @description Canonical episode title when bound, otherwise the file's. */
+            title: string;
+            /** @description Canonical season number; null when the episode is unbound. */
+            season?: number | null;
+            /** @description Canonical episode number; null when the episode is unbound. */
+            episode?: number | null;
+            /** @description Season parsed from the filename at scan. Present so a numbering disagreement is visible; ordering never uses it (ADR-0035 item 8). */
+            fileSeason?: number | null;
+            fileEpisode?: number | null;
+            airDate?: string | null;
+            /** @description Whether season and episode came from the canonical row. False means the episode is in the unnumbered list. */
+            canonicalNumbering: boolean;
+            /** @description Absolute path, reconstructed like MediaItem.path. */
+            path: string;
+            probeStatus: components["schemas"]["ProbeStatus"];
+            metadataStatus: components["schemas"]["MetadataStatus"];
+        };
+        SeriesSeason: {
+            /** @description Canonical season number. 0 is the specials season. */
+            season: number;
+            episodes: components["schemas"]["SeriesEpisode"][];
+        };
+        SeriesDetail: {
+            seriesKey: string;
+            kind: components["schemas"]["UnitKind"];
+            identity: components["schemas"]["UnitIdentity"];
+            title: string;
+            year?: number | null;
+            plot?: string | null;
+            posterUrl?: string | null;
+            /** Format: int64 */
+            itemCount: number;
+            /** @description Seasons in canonical order, episodes in canonical order within each. Filename order is never used (ADR-0035 item 8). */
+            seasons: components["schemas"]["SeriesSeason"][];
+            /** @description Media rows under this unit with no canonical numbering, ordered by path. ADR-0035 item 8: unmatched episodes group but do not order, so they are listed rather than folded into a season. A movie's files are always here, since a film has no episode numbering. */
+            unnumbered: components["schemas"]["SeriesEpisode"][];
+        };
         ScanJobAccepted: {
             /** Format: int64 */
             jobId: number;
@@ -752,6 +916,64 @@ export interface components {
              * @description On `kind=repoint` jobs: count of existing media rows that missed the new root keep-set and were left in place (delete_missing deferred to the next ordinary scan). Zero on ordinary scans (ADR-0030).
              */
             deferredRemove: number;
+        };
+        /**
+         * @description What the server says this line of progress supports. `count` = a running number with no denominator, because the walk is still discovering files and a percentage would move backwards. `bar` = the total is fixed and large enough that a percentage is worth drawing. `none` = nothing to show. Clients render what this says; they do not derive a percentage from any other field.
+         * @enum {string}
+         */
+        ProgressDisplay: "none" | "count" | "bar";
+        ProbeProgress: {
+            display: components["schemas"]["ProgressDisplay"];
+            /**
+             * Format: int64
+             * @description Probes finished by this job. Cumulative, never a queue depth.
+             */
+            done: number;
+            /**
+             * Format: int64
+             * @description Items waiting to be probed right now. A depth, not a total.
+             */
+            queued: number;
+            /** Format: int64 */
+            errors: number;
+            /**
+             * Format: int64
+             * @description done + queued, present only once the index pass has finished. Null while the walk runs, because the denominator is still growing and a percentage built on it would move backwards.
+             */
+            total?: number | null;
+        };
+        MetadataProgress: {
+            /** @description `count` while work remains, `none` otherwise. Never `bar`: metadata drains on its own schedule and folding it into the probe bar would report one number for two jobs that finish at different times. */
+            display: components["schemas"]["ProgressDisplay"];
+            /**
+             * Format: int64
+             * @description Items at metadata_status pending or matched (ADR-0026 §8.1).
+             */
+            pending: number;
+            /** Format: int64 */
+            ready: number;
+            /** Format: int64 */
+            unmatched: number;
+        };
+        ScanProgress: {
+            /** Format: int64 */
+            libraryId: number;
+            /**
+             * Format: int64
+             * @description Most recent scan job for this library; null if never scanned.
+             */
+            jobId?: number | null;
+            /** @description State of that job. Absent when the library has no job. */
+            state?: components["schemas"]["ScanJobState"];
+            /** @description Whether the walk has stopped adding to the probe queue. False while the job is queued or indexing. */
+            indexPassComplete: boolean;
+            /**
+             * Format: int64
+             * @description Media rows in the library right now. During the index pass this is the running discovery count; after it, the library total.
+             */
+            found: number;
+            probe: components["schemas"]["ProbeProgress"];
+            metadata: components["schemas"]["MetadataProgress"];
         };
         PlaybackInfo: {
             /** Format: int64 */
@@ -1115,6 +1337,109 @@ export interface operations {
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listLibraryUnits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                libraryId: components["parameters"]["LibraryId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Units */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryUnits"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getScanProgress: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                libraryId: components["parameters"]["LibraryId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Progress */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScanProgress"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSeries: {
+        parameters: {
+            query: {
+                /** @description Opaque series_key from a LibraryUnit (ADR-0039 item 2). Pass back the string exactly as received; the grammar is not a parse contract and the server may change it in any version. */
+                seriesKey: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Series */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeriesDetail"];
+                };
+            };
+            /** @description Missing or malformed seriesKey */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No series under that key */
             404: {
                 headers: {
                     [name: string]: unknown;
