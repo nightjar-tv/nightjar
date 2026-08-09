@@ -24,6 +24,12 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nightjar=info,tower_http=info".into()),
         )
+        // Colour only when a human is watching. Under `docker logs`, or any
+        // redirect to a file, stdout is a pipe and the escapes land in the log,
+        // where they wrap every `field=value` pair so that no grep for one can
+        // match. The server can see which case it is in, so it does not ask
+        // (Rule 4.12).
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let data_dir = data_dir();
