@@ -186,6 +186,20 @@ fn assign_match_blocking(
             ApiError::internal(e)
         }
     })?;
+    // Manual assign does the same provider work the drain does — season
+    // fetches, episode projection, link writes. The drain logs its counters
+    // per pass; this path discarded them, so that work appeared in no log
+    // anywhere. Same line shape as `metadata drain pass complete` so the two
+    // are greppable together.
+    tracing::info!(
+        media_item_id = item_id,
+        item_key = %result.item_key,
+        seasons_fetched = result.bind.seasons_fetched,
+        seasons_skipped = result.bind.seasons_skipped,
+        episodes_projected = result.bind.episodes_projected,
+        files_linked = result.bind.files_linked,
+        "manual assign complete"
+    );
     Ok(Json(AssignResponse {
         item_key: result.item_key,
         media_item_id: item_id,

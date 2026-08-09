@@ -463,6 +463,21 @@ pub struct DrainStats {
     pub gate_pass: bool,
     pub stopped_early: bool,
     /// Season detail fetches that returned a payload (live client or double).
+    ///
+    /// This is also the count of [`canonical::persist_season_projection`]
+    /// attempts — it increments immediately before each call — so it is the
+    /// denominator for [`Self::bind_errors`]. The 2026-08-07 overnight run read
+    /// 2,056 here against 1,915 distinct stored season payloads; the excess is
+    /// re-fetches collapsing onto the payload table's
+    /// `(provider, entity_kind, provider_id)` primary key, not double counting.
+    ///
+    /// **It undercounts attempts exactly when they fail.** A bind that errors
+    /// propagates out of [`bind_resolved_items`] with `?`, so the whole
+    /// [`BindStats`] for that call is discarded — including seasons it had
+    /// already fetched and projected before the failure. At `bind_errors == 0`
+    /// the undercount is nil; on a run that errors it is material, and it
+    /// biases the denominator downward precisely when you are trying to
+    /// measure a failure rate.
     pub seasons_fetched: usize,
     /// Episode canonical rows projected from season payloads this drain.
     pub episodes_projected: usize,
@@ -477,6 +492,9 @@ pub struct DrainStats {
 /// Counters from one [`bind_resolved_items`] call.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BindStats {
+    /// Season fetches that reached [`canonical::persist_season_projection`].
+    /// Discarded wholesale if this bind later returns `Err` — see
+    /// [`DrainStats::seasons_fetched`].
     pub seasons_fetched: usize,
     pub episodes_projected: usize,
     pub files_linked: usize,
