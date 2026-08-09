@@ -8,6 +8,10 @@ export const copy = {
 	folderUnreachable: (path: string) =>
 		`The folder ${path} isn't reachable. Check that the drive is mounted, then rescan.`,
 	rescan: 'Rescan',
+	play: 'Play',
+	/** A session is transient; the surface is not. Resuming is the ordinary
+	 *  case after an idle reap, not an error the viewer has to recover from. */
+	playResume: (fromSec: number) => `Resume from ${formatClock(fromSec)}`,
 	preparingSession: 'Starting playback session…',
 	sessionsBusy:
 		'All playback sessions are in use. Close another player tab and try again.',
@@ -25,6 +29,9 @@ export const copy = {
 		'This browser cannot switch audio tracks on a file it plays directly.',
 	titleDamagedUsable: (usableSec: number, claimedSec: number) =>
 		`This file looks damaged. Playback works through about ${formatClock(usableSec)} of the claimed ${formatClock(claimedSec)}.`,
+	/** Two rips of one film are one unit (ADR-0025 §2), so say how many files. */
+	versionCount: (n: number) => `${n.toLocaleString()} versions`,
+	movieVersions: 'Files bound to this film. Which one plays is not decided yet.',
 	/** Accessible name for the title-time scrub control (ADR-0020). */
 	scrubPosition: 'Position',
 	/** Fullscreen the player container (keeps our scrub bar). */
