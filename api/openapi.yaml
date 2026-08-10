@@ -11,9 +11,16 @@ info:
 servers:
   - url: http://localhost:8096
     description: Local default
+# ADR-0034 item 11. Every operation needs a bearer token unless it says
+# otherwise, and only four say otherwise. The default is stated here rather
+# than repeated 41 times, so a new operation is authenticated by inheriting it.
+security:
+  - bearerAuth: []
+
 paths:
   /api/health:
     get:
+      security: []
       operationId: getHealth
       summary: Liveness check
       responses:
@@ -431,6 +438,7 @@ paths:
 
   /api/v0/artwork/{itemKey}/{kind}:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getArtwork
       summary: Serve cached artwork for an item_key (ADR-0027)
       parameters:
@@ -494,6 +502,7 @@ paths:
 
   /api/v0/items/{itemId}/subtitles/{trackId}.vtt:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSubtitleVtt
       summary: WebVTT for one text subtitle track (ADR-0010)
       parameters:
@@ -523,6 +532,7 @@ paths:
 
   /api/v0/items/{itemId}/stream:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: streamItem
       summary: Byte stream for playback (supports HTTP Range)
       description: >
@@ -650,6 +660,7 @@ paths:
 
   /api/v0/sessions/{sessionId}/runs/{runId}/master.m3u8:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionMasterPlaylist
       summary: HLS master playlist for a producer run
       description: >
@@ -681,6 +692,7 @@ paths:
 
   /api/v0/sessions/{sessionId}/runs/{runId}/index.m3u8:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionPlaylist
       summary: HLS media playlist for a producer run
       description: >
@@ -713,6 +725,7 @@ paths:
 
   /api/v0/sessions/{sessionId}/runs/{runId}/init.mp4:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionRunInit
       summary: fMP4 init segment for a producer run
       parameters:
@@ -741,6 +754,7 @@ paths:
 
   /api/v0/sessions/{sessionId}/subs/{asset}:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionSubtitlePlaylist
       summary: Subtitle media playlist or WebVTT segment for a session track
       description: >
@@ -785,6 +799,7 @@ paths:
 
   /api/v0/sessions/{sessionId}/{asset}:
     get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionAsset
       summary: HLS init segment or media segment for a session
       parameters:
@@ -908,6 +923,7 @@ paths:
 
   /api/v0/system/setup:
     get:
+      security: []
       operationId: getSetupState
       summary: Whether an admin and a library exist (ADR-0034 item 11)
       description: >
@@ -932,6 +948,7 @@ paths:
 
   /api/v0/auth/bootstrap:
     post:
+      security: []
       operationId: bootstrapFirstAccount
       summary: Create the first account on a server that has none (ADR-0034 item 10)
       description: >
@@ -970,6 +987,7 @@ paths:
 
   /api/v0/auth/login:
     post:
+      security: []
       operationId: login
       summary: Exchange credentials for a session token (ADR-0034 item 5)
       description: >
@@ -1383,6 +1401,21 @@ paths:
                 $ref: "#/components/schemas/TranscodeCapabilities"
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        The session token returned once by login or bootstrap. Never stored
+        server-side in plaintext; only its SHA-256 is (ADR-0034 item 5).
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: nj_session
+      description: >-
+        Accepted on exactly the eight GET routes ADR-0034 item 9 enumerates,
+        because a media element cannot send an Authorization header. Every
+        operation that accepts it lists it explicitly; nothing inherits it.
   parameters:
     LibraryId:
       name: libraryId

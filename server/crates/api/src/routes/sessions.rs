@@ -1,3 +1,4 @@
+use crate::authority::WatchingCaller;
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::routes::items::{
     abs_path, decide, library_root, profile_from_query, subtitle_tracks_for,
@@ -107,6 +108,7 @@ fn dto_from_view(view: nightjar_transcode::SessionView) -> TranscodeSessionDto {
 
 pub async fn start(
     State(state): State<AppState>,
+    _watching: WatchingCaller,
     Path(item_id): Path<i64>,
     Query(query): Query<StartQuery>,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
