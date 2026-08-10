@@ -15,3 +15,42 @@ pub struct AppState {
     pub pool: Arc<LibraryPool>,
     pub artwork: Option<Arc<ArtworkStore>>,
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::state::AppState;
+    use nightjar_db::Db;
+    use std::sync::Arc;
+
+    /// The smallest `AppState` a handler test can run against.
+    ///
+    /// Achievable only because `TranscodeCapabilities::software_only` exists:
+    /// the real startup path probes ffmpeg encoders, which is far too slow to
+    /// pay per test. The pool still spawns its worker threads, which idle.
+    pub(crate) fn state(dir: &std::path::Path) -> AppState {
+        let db = Arc::new(Db::open(std::path::Path::new(":memory:")).unwrap());
+        let subs = Arc::new(nightjar_transcode::SubsStore::new(dir.join("subs")).unwrap());
+        let caps = Arc::new(nightjar_transcode::TranscodeCapabilities::software_only(
+            None,
+            "test state does not probe encoders",
+        ));
+        let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
+            dir.join("hls"),
+            1,
+            caps.preferred_encode_leg.clone(),
+            Some(Arc::clone(&subs)),
+            Some(Arc::clone(&db)),
+        )
+        .unwrap();
+        let pool = nightjar_scanner::LibraryPool::spawn(Arc::clone(&db), Arc::clone(&subs));
+        AppState {
+            db,
+            hls,
+            transcode_caps: caps,
+            tonemap_available: false,
+            subs,
+            pool,
+            artwork: None,
+        }
+    }
+}

@@ -7,7 +7,7 @@ mod scan_progress;
 mod track_select;
 
 pub use filename::{MAX_EPISODE_RANGE, ParsedName, parse_filename};
-pub use models::{LibraryKind, MediaKind};
+pub use models::{LibraryKind, MediaKind, Role};
 pub use playback::{
     AETHER_V0, BROWSER_V0, ClientCapabilityProfile, HdrCapability, MEDIA3_V0, MPV_V0,
     PlaybackDecision, PlaybackMethod, VideoEncodePlan, decide_playback, is_dolby_vision_profile5,

@@ -10,6 +10,7 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
@@ -19,6 +20,31 @@ impl ApiError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
+    }
+
+    /// No usable credential. Distinct from [`Self::forbidden`]: this says the
+    /// caller is nobody, that one says the caller is somebody without reach.
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
+
+    /// Authenticated and refused. Never a 404 for an authorisation failure: a
+    /// 404 leaks whether the thing exists (ADR-0035 item 7).
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: msg.into(),
+        }
+    }
+
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: msg.into(),
         }
     }

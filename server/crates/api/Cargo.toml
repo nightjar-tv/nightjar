@@ -21,8 +21,22 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
 nightjar-core = { path = "../core" }
+nightjar-auth = { path = "../auth" }
 nightjar-db = { path = "../db" }
 nightjar-metadata = { path = "../metadata" }
 nightjar-scanner = { path = "../scanner" }
 nightjar-transcode = { path = "../transcode" }
 rusqlite = { workspace = true }
+
+[dev-dependencies]
+# Both already in [workspace.dependencies]; this is wiring, not a new project
+# dependency. argon2 builds a deliberately-weak hash for the rehash test;
+# tempfile gives the subtitle and HLS stores a directory to exist in.
+argon2 = { workspace = true, features = ["std"] }
+tempfile = { workspace = true }
+# Dev-only, and already in the tree transitively via axum; this makes it
+# nameable rather than introducing code. It buys the one property that cannot
+# be had otherwise: `MatchedPath` has no public constructor and is populated
+# only during routing, so end-to-end cookie acceptance is untestable without a
+# real `Router`.
+tower = { version = "0.5", features = ["util"] }

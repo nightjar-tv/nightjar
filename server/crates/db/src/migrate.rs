@@ -53,6 +53,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         19,
         include_str!("../migrations/019_drop_subtitle_source_stamps.sql"),
     ),
+    (
+        20,
+        include_str!("../migrations/020_accounts_profiles_sessions.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -294,7 +298,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 19);
+        assert_eq!(v, 20);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -983,6 +987,233 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status_b, "ready");
+    }
+
+    /// ADR-0034 items 1, 5 and 6 plus ADR-0040 item 2. Guard shape follows
+    /// migrations 6 and 12: an existing populated DB migrates without moving
+    /// the row counts the rest of the system depends on.
+    #[test]
+    fn migration_20_adds_accounts_without_touching_media() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(19) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, '/tmp/t/a.mkv', 1, 2, 'A', 'episode'),
+                    (1, '/tmp/t/b.mkv', 1, 2, 'B', 'episode');
+             INSERT INTO media_item_links (media_item_id, item_key)
+             VALUES (1, 'tmdb:episode:1');",
+        )
+        .unwrap();
+        let items_before = count(&conn, "media_items");
+        let links_before = count(&conn, "media_item_links");
+
+        let migration_20 = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 20)
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        conn.execute_batch(migration_20).unwrap();
+
+        assert_eq!(count(&conn, "media_items"), items_before);
+        assert_eq!(count(&conn, "media_item_links"), links_before);
+        assert_eq!(count(&conn, "accounts"), 0);
+        assert_eq!(count(&conn, "profiles"), 0);
+        assert_eq!(count(&conn, "login_sessions"), 0);
+    }
+
+    /// ADR-0040 item 2: exactly one owner is a constraint, not a convention.
+    /// The guarantee is that the second write fails, not that a reviewer
+    /// notices, so the second write is what this asserts.
+    #[test]
+    fn migration_20_refuses_a_second_owner() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (username, password_hash, role)
+             VALUES ('a', 'x', 'owner');",
+        )
+        .unwrap();
+
+        let second = conn.execute_batch(
+            "INSERT INTO accounts (username, password_hash, role)
+             VALUES ('b', 'x', 'owner');",
+        );
+        assert!(second.is_err(), "a second owner must not be insertable");
+
+        // Managers and members are unconstrained in number, so the index is
+        // the owner singleton and not a general uniqueness rule on `role`.
+        conn.execute_batch(
+            "INSERT INTO accounts (username, password_hash, role)
+             VALUES ('c', 'x', 'manager'), ('d', 'x', 'manager'),
+                    ('e', 'x', 'member'), ('f', 'x', 'member');",
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "accounts"), 5);
+
+        // Promoting a second account to owner is the same violation by a
+        // different route, and the partial index catches it there too.
+        let promote =
+            conn.execute_batch("UPDATE accounts SET role = 'owner' WHERE username = 'c';");
+        assert!(promote.is_err(), "promotion cannot create a second owner");
+    }
+
+    /// The CHECK constraint is the closed set, so a value outside ADR-0040
+    /// item 1's three cannot reach disk however it is spelled.
+    #[test]
+    fn migration_20_role_is_a_closed_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for bad in ["admin", "Owner", "", "superuser"] {
+            let r = conn.execute(
+                "INSERT INTO accounts (username, password_hash, role) VALUES (?1, 'x', ?2)",
+                rusqlite::params![bad, bad],
+            );
+            assert!(r.is_err(), "role {bad:?} must be refused");
+        }
+        // The default is the least authority, so an insert that forgets the
+        // column cannot silently create an administrator.
+        conn.execute_batch("INSERT INTO accounts (username, password_hash) VALUES ('a', 'x');")
+            .unwrap();
+        let role: String = conn
+            .query_row("SELECT role FROM accounts WHERE username = 'a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(role, "member");
+    }
+
+    /// The `expires_at` length CHECK. Not a format validator: it catches the
+    /// class that breaks the lexicographic comparison session classification
+    /// depends on, which is a timestamp of the wrong shape reaching disk.
+    #[test]
+    fn migration_20_refuses_a_misshapen_expiry() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                  VALUES (1, 'a', 'x', 'owner');",
+        )
+        .unwrap();
+
+        for bad in [
+            "2026-08-10",                    // date only, sorts before every full stamp
+            "2026-08-10T00:00:00Z",          // no milliseconds, one char short
+            "2026-08-10T00:00:00.000+10:00", // offset rather than UTC
+            "",
+        ] {
+            let r = conn.execute(
+                "INSERT INTO login_sessions
+                     (account_id, token_sha256, client_label, expires_at)
+                 VALUES (1, ?1, 'tv', ?2)",
+                rusqlite::params![bad, bad],
+            );
+            assert!(r.is_err(), "expiry {bad:?} must be refused");
+        }
+
+        conn.execute(
+            "INSERT INTO login_sessions
+                 (account_id, token_sha256, client_label, expires_at)
+             VALUES (1, 'ok', 'tv', '2099-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// ADR-0034 item 5: deleting a profile must not leave a live session that
+    /// has silently widened to account scope. The migration's answer is
+    /// ON DELETE CASCADE, so the session is destroyed rather than widened.
+    #[test]
+    fn migration_20_profile_delete_takes_its_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO accounts (id, username, password_hash, role)
+                  VALUES (1, 'a', 'x', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+                  VALUES (1, 1, 'aa', 'kid'), (2, 1, 'bb', 'adult');
+             INSERT INTO login_sessions
+                  (account_id, active_profile_id, token_sha256, client_label, expires_at)
+             VALUES (1, 1, 'h1', 'tv', '2099-01-01T00:00:00.000Z'),
+                    (1, 2, 'h2', 'phone', '2099-01-01T00:00:00.000Z'),
+                    (1, NULL, 'h3', 'browser', '2099-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM profiles WHERE id = 1", [])
+            .unwrap();
+
+        let remaining: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT token_sha256 FROM login_sessions ORDER BY token_sha256")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            remaining,
+            vec!["h2".to_string(), "h3".to_string()],
+            "the capped session goes with its profile; the account-scope one stays"
+        );
+        // And nothing was widened: no surviving row points at the dead profile.
+        assert_eq!(
+            count_where(&conn, "login_sessions", "active_profile_id = 1"),
+            0
+        );
+    }
+
+    /// Deleting an account takes its profiles and its sessions (ADR-0034
+    /// item 7).
+    #[test]
+    fn migration_20_account_delete_cascades() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO accounts (id, username, password_hash, role)
+                  VALUES (1, 'a', 'x', 'owner'), (2, 'b', 'x', 'member');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+                  VALUES (1, 2, 'aa', 'p');
+             INSERT INTO login_sessions
+                  (account_id, active_profile_id, token_sha256, client_label, expires_at)
+             VALUES (2, 1, 'h1', 'tv', '2099-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM accounts WHERE id = 2", [])
+            .unwrap();
+        assert_eq!(count(&conn, "profiles"), 0);
+        assert_eq!(count(&conn, "login_sessions"), 0);
+        assert_eq!(count(&conn, "accounts"), 1);
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn count_where(conn: &Connection, table: &str, predicate: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     /// Copy a real dogfood DB, migrate through 012, print strip leftovers.
