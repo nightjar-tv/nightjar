@@ -1,0 +1,13 @@
+[package]
+name = "nightjar-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# `std` is required for `OsRng`: argon2's default features resolve rand_core
+# without `getrandom`, so `password_hash::rand_core::OsRng` does not exist
+# until `std` pulls `rand_core/std`. Verified by compiling both ways.
+argon2 = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }

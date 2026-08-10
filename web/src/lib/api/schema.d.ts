@@ -493,6 +493,255 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/system/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Whether an admin and a library exist (ADR-0034 item 11)
+         * @description Unauthenticated, the same class as /system/transcode.
+         *
+         *     **Two independent facts, never one flag.** A `setupComplete` boolean cannot express the third state, and the third state is the only install we actually have: the dogfood database holds libraries and roughly 24,800 items and no account. A wizard trusting one flag reads that as fresh and offers to add a library the server already holds. No derived `setupComplete`, `nextStep` or `state` field is added later either; they are the same collapse in different costumes, and the moment one exists clients reach for it instead of the two facts.
+         */
+        get: operations["getSetupState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/auth/bootstrap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create the first account on a server that has none (ADR-0034 item 10)
+         * @description The one unauthenticated write in the server, gated on exactly one condition: that no account exists. No token, no environment variable, no setup code printed to the log, because core behaviour works by default (Rule 4.12) and a printed code is unreadable in half the ways this server is deployed.
+         *
+         *     The account is created with role `owner`, and one uncapped profile with simple interface off is created in the same transaction, because an account with no profile has nowhere to write watch state.
+         */
+        post: operations["bootstrapFirstAccount"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange credentials for a session token (ADR-0034 item 5)
+         * @description Returns the token in the body **exactly once**; the server stores only its SHA-256 and cannot return it again. Also sets an `HttpOnly`, `SameSite=Lax` cookie holding the same token, scoped to `/api/v0` and marked `Secure` when the request arrived over TLS. One credential in two envelopes: expiry, revocation and sign-out-everywhere kill both at once.
+         *
+         *     A wrong password and an unknown username are the same response and take the same time. The server verifies against a dummy Argon2id hash when the account does not exist, so the memory-hard cost is paid either way and the route is not a user-enumeration oracle.
+         */
+        post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/auth/session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The current session's account, role and active profile
+         * @description Which profile this session is acting **as**. Not to be confused with `/api/v0/profiles/{profileRef}/...`, which is which profile a request acts **on** and is a different question with a near-identical shape.
+         */
+        get: operations["getSession"];
+        put?: never;
+        /**
+         * Narrow this session to a profile (ADR-0034 item 3)
+         * @description Narrowing is free and takes only a `profileRef`. **Widening back is not**, and the asymmetry is the security property rather than an inconsistency: without it a child on a narrowed session leaves the classification cap by tapping a menu, which defeats B2-D before it ships. See DELETE on this path.
+         *
+         *     This sets which profile the session acts **as**. A session in profile scope cannot administer the server, including the account holder's own profile and including an adult-flagged one.
+         */
+        post: operations["selectProfile"];
+        /**
+         * Widen this session back to account scope, with the password
+         * @description Takes the account password, deliberately. Narrowing is free because it only ever reduces reach; widening restores it, and a re-authentication is what stops a capped viewer escaping the cap by navigating. B2-7 is expected to add a PIN as an equal-strength shortcut here; this route does not bind that design.
+         */
+        delete: operations["widenToAccountScope"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke this session
+         * @description Sets `revoked_at` rather than deleting the row, so a later presentation of the token reads as revoked rather than unknown. Kills the cookie and the bearer token together; they are one credential.
+         */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/auth/logout-all": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revoke every session on this account */
+        post: operations["logoutEverywhere"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Accounts on this server (owner and manager only)
+         * @description A member reaches their own account and no others (ADR-0040 item 1), and gets the named forbidden error rather than a 404: a 404 would leak whether an account exists.
+         */
+        get: operations["listAccounts"];
+        put?: never;
+        /**
+         * Create an account (owner and manager)
+         * @description Creates one uncapped profile with simple interface off in the same transaction (ADR-0034 item 3): an account with no profile has nowhere to write watch state. Those two values are a creation default, not a semantics decision; what a cap means is B2-D's.
+         *
+         *     `role` may be `manager` or `member`. It may not be `owner`: there is exactly one owner and the only way to become it is transfer, which is an owner-only action.
+         */
+        post: operations["createAccount"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/accounts/{accountId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete an account
+         * @description Deletes its profiles and revokes its sessions (ADR-0034 item 7).
+         *
+         *     **Owner-only when the target is a `manager`** (ADR-0040 item 3), which is the eviction case the role model exists for: under a boolean, anyone who could administer the server could remove the person who installed it. The owner cannot be deleted at all; its role changes only through transfer.
+         */
+        delete: operations["deleteAccount"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/accounts/{accountId}/role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Change an account's role (owner only, ADR-0040 item 3)
+         * @description One of the three owner-only actions. Setting `owner` transfers ownership: the acting owner is demoted to `manager` and the target promoted **in one transaction**, so the partial unique index enforcing one owner is never transiently violated and the server is never ownerless. The target must be an existing account; there is no unowned state.
+         */
+        put: operations["setAccountRole"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Profiles this session may see
+         * @description A member sees the profiles under their own account. An owner or manager sees any account's when `accountId` is given, and their own otherwise (ADR-0040 item 1).
+         *
+         *     A member passing another account's `accountId` gets a named 403, **not an empty list**. An empty list is indistinguishable from "that account exists and has no profiles", which is an account-enumeration oracle of the same family as a login route that answers faster for an unknown username. For the same reason the refusal does not depend on whether the account exists: a member passing any id but their own is refused identically, so the response cannot be used to probe.
+         */
+        get: operations["listProfiles"];
+        put?: never;
+        /**
+         * Create a profile under an account
+         * @description A member may create profiles under their own account and no other. That is the point of the role: a member holding a child's profile is a parent, and a parent who cannot set their own child's cap has no reason to hold an account.
+         */
+        post: operations["createProfile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/profiles/{profileRef}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a profile
+         * @description `profileRef` here is which profile the request acts **on**, which is a different question from `/api/v0/auth/session`'s "acting as". The two route families look alike and a reader will conflate them if neither says so.
+         *
+         *     Destroys the profile's watch state and its name. Playback event rows stay, with a reference that no longer resolves (ADR-0034 item 7). Every session narrowed to this profile is destroyed with it, so a token for one reads as unknown rather than revoked.
+         */
+        delete: operations["deleteProfile"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/system/transcode": {
         parameters: {
             query?: never;
@@ -760,6 +1009,86 @@ export interface components {
             /** @description Opaque series_key of the show an episode belongs to, for the link back to GET /api/v0/series. Absent for a movie. */
             seriesKey?: string | null;
             showTitle?: string | null;
+        };
+        /**
+         * @description Account authority (ADR-0040 item 1). owner reaches everything and there is exactly one, enforced by a partial unique index rather than by convention. manager has full account powers except the three owner-only actions. member reaches themselves and the profiles under their own account.
+         *
+         *     **Not a ranking.** Authority is the action list in ADR-0040 item 3, not a scale, so no client should compare these values. A precedence field is what that record rejects.
+         * @enum {string}
+         */
+        Role: "owner" | "manager" | "member";
+        /** @description Two independent facts. Four reachable states, and the third is the only install we have: libraries present with no account, which is the dogfood database at roughly 24,800 items. */
+        SetupState: {
+            /** @description An account with role owner or manager exists. */
+            adminExists: boolean;
+            libraryExists: boolean;
+        };
+        BootstrapRequest: {
+            username: string;
+            password: string;
+            /** @description Names this device in the session list. Defaults to a generic label. */
+            clientLabel?: string;
+        };
+        LoginRequest: {
+            username: string;
+            password: string;
+            clientLabel?: string;
+        };
+        LoginResponse: {
+            /** @description Returned exactly once. The server stores only its SHA-256 and cannot reissue it. Send as `Authorization: Bearer`; the cookie set alongside carries the same value for media routes that cannot set a header. */
+            token: string;
+            /**
+             * Format: date-time
+             * @description Absolute, 90 days. No sliding renewal and no refresh token.
+             */
+            expiresAt: string;
+            account: components["schemas"]["Account"];
+        };
+        SessionView: {
+            account: components["schemas"]["Account"];
+            /**
+             * @description `profile` once narrowed. Profile scope cannot administer the server and cannot write outside its own profile.
+             * @enum {string}
+             */
+            scope: "account" | "profile";
+            activeProfile?: components["schemas"]["Profile"];
+            clientLabel?: string;
+            /** Format: date-time */
+            expiresAt?: string;
+        };
+        Account: {
+            /** Format: int64 */
+            id: number;
+            username: string;
+            role: components["schemas"]["Role"];
+            /** @description Concurrent playback across every profile on this account; null means no per-account limit, which is the shipped default. The shape is decided by ADR-0034 item 8 and **enforced in B2-9**, so nothing reads it yet. */
+            maxConcurrentSessions?: number | null;
+        };
+        Profile: {
+            /** @description Opaque and durable (ADR-0034 item 6). Never `profileId`, which ADR-0022 uses for the client capability profile. Clients treat it as opaque exactly as they treat `itemKey`. */
+            profileRef: string;
+            name: string;
+            /** @description Null is uncapped. What a cap means is B2-D's decision. */
+            classificationCap?: string | null;
+            simpleInterface: boolean;
+        };
+        CreateAccountRequest: {
+            username: string;
+            password: string;
+            role: components["schemas"]["Role"];
+            /** @description Name for the profile created alongside the account. */
+            profileName?: string;
+        };
+        CreateProfileRequest: {
+            name: string;
+            /**
+             * Format: int64
+             * @description Owner and manager only. Omitted means the session's own account, which is the only value a member may reach.
+             */
+            accountId?: number;
+            classificationCap?: string | null;
+            /** @default false */
+            simpleInterface: boolean;
         };
         /**
          * @description Metadata pipeline state (ADR-0026). `pending` = search tier queued; `matched` = identity found, detail enrichment pending; `ready` = full metadata bound; `unmatched` = search terminal no-match.
@@ -2164,6 +2493,453 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSetupState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Setup state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupState"];
+                };
+            };
+        };
+    };
+    bootstrapFirstAccount: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BootstrapRequest"];
+            };
+        };
+        responses: {
+            /** @description First account created; the token is returned once */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginResponse"];
+                };
+            };
+            /** @description An account already exists. Named `bootstrap_already_complete`, not a generic 403, so a client can tell "you are too late" from "you are not allowed". */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Session created */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginResponse"];
+                };
+            };
+            /** @description Credentials rejected. Indistinguishable for unknown user and wrong password. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionView"];
+                };
+            };
+            /** @description Unknown, expired or revoked. Three distinct named errors, not one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    selectProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Opaque durable reference (ADR-0034 item 6). Never `profileId`: that name is taken by ADR-0022's client capability profile. */
+                    profileRef: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Session narrowed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description That profile is not on this session's account */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    widenToAccountScope: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    password: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Session widened to account scope */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Password rejected; the session stays narrowed */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    logoutEverywhere: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All sessions on the account revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listAccounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accounts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        accounts: components["schemas"]["Account"][];
+                    };
+                };
+            };
+            /** @description Named forbidden error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createAccount: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAccountRequest"];
+            };
+        };
+        responses: {
+            /** @description Account created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            /** @description Named forbidden error, including an attempt to create a second owner */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deleteAccount: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                accountId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Account deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Named forbidden error: a manager deleting a manager, anyone deleting the owner, or a member deleting anyone. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    setAccountRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                accountId: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    role: components["schemas"]["Role"];
+                    /**
+                     * @description Required to be `true` when `role` is `owner`, and ignored otherwise. Transfer is the most consequential action on the server and it is otherwise indistinguishable from any other role change: one body value apart.
+                     *
+                     *     This is not a second writer to the column, which would be the fork Rule 4.11 refuses. It is the same writer declining an ambiguous request, and it makes the call legible in the schema: a reader meets the field name and understands what the request does. Same instinct as ADR-0034 item 10's named `bootstrap_already_complete` rather than a generic 403.
+                     */
+                    confirmDemotesCaller?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Role changed, or ownership transferred */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `role` is `owner` and `confirmDemotesCaller` was absent or false. Named, not generic: the caller is being told what the request would have done, not that it was malformed. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Named forbidden error; a manager cannot change any role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listProfiles: {
+        parameters: {
+            query?: {
+                accountId?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Profiles */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        profiles: components["schemas"]["Profile"][];
+                    };
+                };
+            };
+            /** @description A member asked about an account other than their own. Named, and returned whether or not that account exists. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Profile created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Profile"];
+                };
+            };
+        };
+    };
+    deleteProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                profileRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Profile deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Named forbidden error */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

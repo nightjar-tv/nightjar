@@ -1,4 +1,6 @@
+mod accounts;
 mod artwork;
+pub mod auth;
 mod browse;
 pub mod items;
 mod libraries;
@@ -10,7 +12,7 @@ mod track_ids;
 use crate::state::AppState;
 use axum::{
     Json, Router,
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde::Serialize;
 
@@ -44,6 +46,34 @@ pub fn router(state: AppState) -> Router {
             get(libraries::scan_progress),
         )
         .route("/api/v0/series", get(browse::get))
+        .route("/api/v0/system/setup", get(auth::setup_state))
+        .route("/api/v0/auth/bootstrap", post(auth::bootstrap))
+        .route("/api/v0/auth/login", post(auth::login))
+        .route("/api/v0/auth/logout", post(auth::logout))
+        .route("/api/v0/auth/logout-all", post(auth::logout_all))
+        .route(
+            "/api/v0/auth/session",
+            get(auth::get_session)
+                .post(auth::select_profile)
+                .delete(auth::widen_to_account),
+        )
+        .route(
+            "/api/v0/accounts",
+            get(accounts::list).post(accounts::create),
+        )
+        .route("/api/v0/accounts/{account_id}", delete(accounts::delete))
+        .route(
+            "/api/v0/accounts/{account_id}/role",
+            put(accounts::set_role),
+        )
+        .route(
+            "/api/v0/profiles",
+            get(accounts::list_profiles).post(accounts::create_profile),
+        )
+        .route(
+            "/api/v0/profiles/{profile_ref}",
+            delete(accounts::delete_profile),
+        )
         .route("/api/v0/items/{item_id}", get(items::get))
         .route(
             "/api/v0/artwork/{item_key}/{kind}",

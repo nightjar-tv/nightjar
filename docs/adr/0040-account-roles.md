@@ -1,6 +1,6 @@
 # ADR-0040: Account roles
 
-- Status: accepted
+- Status: accepted; amended 2026-08-10 (item 1 and item 3: the owner cannot demote themselves)
 - Date: 2026-08-06
 - Accepted: 2026-08-06, with all nine questions signed off in
   `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`.
@@ -64,7 +64,7 @@ field.**
 
 | Role | Reach |
 |---|---|
-| **owner** | Everything. Exactly one per server, cannot be removed, and is the only role that can perform the owner-only actions in item 3 |
+| **owner** | Everything. Exactly one per server, cannot be removed **or demoted, including by themselves**, and is the only role that can perform the owner-only actions in item 3 |
 | **manager** | Full account powers across the server, except the owner-only actions |
 | **member** | Themselves and the profiles under their own account, and nothing else |
 
@@ -117,7 +117,16 @@ reverse it.
 
 **Transfer ownership** demotes the acting owner to `manager` and promotes the
 target in one transaction, so the partial unique index is never violated and
-the server is never ownerless. The target must be an existing account. There is
+the server is never ownerless.
+
+**Amended 2026-08-10, one sentence, because the literal reading had a hole.**
+"Cannot be removed" was written against deletion and does not cover an owner
+setting their own role to `member`. The partial unique index does not catch it
+either: *zero* owners violates nothing, since the index forbids two and not
+none. So a literal reader could implement a self-demotion path that leaves the
+server ownerless and no constraint would object. The owner's role changes only
+through transfer, in either direction, and an attempt to change one's own role
+is refused before any other check. The target must be an existing account. There is
 no unowned state and no "no owner" migration path.
 
 **Recovery when the owner account is lost** is ADR-0034 item 12's
