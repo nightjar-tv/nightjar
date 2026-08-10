@@ -52,6 +52,14 @@ export const copy = {
 		`${n.toLocaleString()} shows have metadata but no folder bound to them anywhere.`,
 	seriesUnnumbered: 'No canonical episode numbers, so these are listed rather than ordered.',
 	movieVersions: 'Files bound to this film. Which one plays is not decided yet.',
+	/** The demo client's login, kept alive until Block 3 supplies the real
+	 *  one. Every route but four needs a session now (ADR-0034 item 11). */
+	checkingSession: 'Checking your session…',
+	loginHint: 'Sign in to browse this server.',
+	bootstrapHint: 'No account exists yet. The first one you make owns this server.',
+	signIn: 'Sign in',
+	createOwner: 'Create owner account',
+	signOut: 'Sign out',
 	/** Accessible name for the title-time scrub control (ADR-0020). */
 	scrubPosition: 'Position',
 	/** Fullscreen the player container (keeps our scrub bar). */
