@@ -3,6 +3,7 @@
 //! Pre-accounts: local-trust like the rest of `/api/v0`. Block 2 must make
 //! these admin-only first — assign rewrites watch state across profiles.
 
+use crate::authority::AdminCaller;
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
@@ -93,6 +94,7 @@ fn data_dir() -> std::path::PathBuf {
 
 pub async fn candidates(
     State(state): State<AppState>,
+    _admin: AdminCaller,
     Path(item_id): Path<i64>,
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<CandidatesResponse>> {
@@ -129,6 +131,7 @@ fn candidates_blocking(
 
 pub async fn assign_match(
     State(state): State<AppState>,
+    _admin: AdminCaller,
     Path(item_id): Path<i64>,
     Json(body): Json<AssignBody>,
 ) -> ApiResult<Json<AssignResponse>> {
@@ -208,6 +211,7 @@ fn assign_match_blocking(
 
 pub async fn clear(
     State(state): State<AppState>,
+    _admin: AdminCaller,
     Path(item_id): Path<i64>,
 ) -> ApiResult<Json<ClearResponse>> {
     blocking(move || clear_blocking(state, item_id)).await
@@ -235,6 +239,7 @@ fn clear_blocking(state: AppState, item_id: i64) -> ApiResult<Json<ClearResponse
 
 pub async fn retry(
     State(_state): State<AppState>,
+    _admin: AdminCaller,
     Path(item_id): Path<i64>,
 ) -> ApiResult<Json<RetryResponse>> {
     blocking(move || retry_blocking(item_id)).await

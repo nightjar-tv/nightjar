@@ -1,3 +1,5 @@
+use crate::authority::AdminCaller;
+use crate::error::ApiResult;
 use crate::state::AppState;
 use axum::{Json, extract::State};
 use serde::Serialize;
@@ -24,9 +26,10 @@ pub struct EncoderCandidateDto {
 
 pub async fn transcode_capabilities(
     State(state): State<AppState>,
-) -> Json<TranscodeCapabilitiesDto> {
+    _admin: AdminCaller,
+) -> ApiResult<Json<TranscodeCapabilitiesDto>> {
     let caps = &state.transcode_caps;
-    Json(TranscodeCapabilitiesDto {
+    Ok(Json(TranscodeCapabilitiesDto {
         ffmpeg_version: caps.ffmpeg_version.clone(),
         preferred_h264_encoder: caps.preferred_h264_encoder.clone(),
         preferred_device: caps.preferred_encode_leg.device.clone(),
@@ -40,5 +43,5 @@ pub async fn transcode_capabilities(
                 reason: e.reason.clone(),
             })
             .collect(),
-    })
+    }))
 }

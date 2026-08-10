@@ -6,11 +6,93 @@
 
 use crate::error::ApiError;
 use crate::state::AppState;
-use axum::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Request, State};
 use axum::http::{Method, request::Parts};
+use axum::middleware::Next;
+use axum::response::Response;
 use nightjar_auth::token_sha256_hex;
 use nightjar_core::Role;
 use nightjar_db::{SessionRejection, SessionRow};
+
+/// The whole unauthenticated surface of the API (ADR-0034 item 11).
+///
+/// **This is an exception list, not a gate list.** `require_session` wraps
+/// every route in one place, so a route added tomorrow is authenticated
+/// because nobody did anything, and making it anonymous means editing this
+/// array. That is the direction the default has to point: the failure mode
+/// worth designing against is the route nobody thought about, not the route
+/// somebody thought about wrongly.
+///
+/// Four entries, and each one has to be reachable before a credential can
+/// exist. Health is what a container orchestrator polls; setup state is read
+/// by a client deciding whether to show bootstrap or login; bootstrap creates
+/// the first account; login is how every other credential is obtained.
+pub const UNAUTHENTICATED_ROUTES: [(&str, &str); 4] = [
+    ("GET", "/api/health"),
+    ("GET", "/api/v0/system/setup"),
+    ("POST", "/api/v0/auth/bootstrap"),
+    ("POST", "/api/v0/auth/login"),
+];
+
+fn is_unauthenticated(method: &Method, matched: &str) -> bool {
+    UNAUTHENTICATED_ROUTES
+        .iter()
+        .any(|(m, path)| method == m && *path == matched)
+}
+
+/// Require a session on every route but the four, and resolve it once.
+///
+/// Applied with `route_layer`, so it runs only after routing has resolved a
+/// handler. Two things follow from that and both are wanted: `MatchedPath` is
+/// always populated, so the exception check compares route patterns rather
+/// than raw paths; and a request that matches nothing passes through to the
+/// SPA fallback untouched, which keeps the static assets public without
+/// naming them here.
+///
+/// A presented credential is resolved even on the four, so `Option<Caller>`
+/// means "is somebody logged in" rather than "was this route gated". The
+/// resolution happens once and travels in the request extensions, so a handler
+/// taking `Caller` costs no second lookup.
+pub async fn require_session(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let (mut parts, body) = request.into_parts();
+    let matched = parts
+        .extensions
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let exempt = matched
+        .as_deref()
+        .is_some_and(|matched| is_unauthenticated(&parts.method, matched));
+
+    match presented_token(&parts) {
+        Some(token) => match resolve_caller(&state, &token).await {
+            Ok(caller) => {
+                parts.extensions.insert(caller);
+            }
+            // A bad credential on an anonymous route is not an error: the
+            // client is simply not logged in, which is the state those four
+            // exist to serve.
+            Err(error) => {
+                if !exempt {
+                    return Err(error);
+                }
+            }
+        },
+        None => {
+            if !exempt {
+                return Err(ApiError::unauthorized(
+                    "no_credential: no session presented",
+                ));
+            }
+        }
+    }
+
+    request = Request::from_parts(parts, body);
+    Ok(next.run(request).await)
+}
 
 /// The routes that accept the login cookie, enumerated because ADR-0034 item 9
 /// enumerates them.
@@ -36,6 +118,15 @@ pub const COOKIE_ACCEPTED_ROUTES: [&str; 8] = [
     "/api/v0/sessions/{session_id}/{asset}",
 ];
 
+/// Refused for want of authority, as distinct from refused for want of a
+/// credential. A client that sees this must not retry by logging in again.
+/// Refused because the session has no profile, which is neither a missing
+/// credential nor a missing role. The client's move is to select a profile,
+/// and naming it separately is what tells them so.
+pub const ACCOUNT_SCOPE_CANNOT_PLAY: &str = "profile_required: select a profile before playing";
+
+pub const INSUFFICIENT_ROLE: &str = "insufficient_role: this account may not perform that action";
+
 /// An authenticated caller. Account scope until it narrows to a profile.
 #[derive(Debug, Clone)]
 pub struct Caller {
@@ -58,6 +149,31 @@ impl Caller {
 
     pub fn is_owner(&self) -> bool {
         self.is_account_scope() && self.role.is_owner()
+    }
+
+    /// The account-powers gate, named once and used by every route that
+    /// needs it (Rule 4.11). One string, so an operator greps one code and a
+    /// client matches one prefix; and one place to change if the boundary
+    /// ever moves.
+    pub fn require_account_powers(&self) -> Result<(), ApiError> {
+        if self.has_account_powers() {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden(INSUFFICIENT_ROLE))
+        }
+    }
+
+    /// ADR-0034 item 3, the other direction: the byte routes need to know
+    /// *who is watching*, and an account-scope session does not say. Refusing
+    /// is not a formality — B2-6's kids filter has nothing to filter against
+    /// without a profile, so a session that plays without one is a session
+    /// that plays around the filter.
+    pub fn require_profile_scope(&self) -> Result<(), ApiError> {
+        if self.is_account_scope() {
+            Err(ApiError::forbidden(ACCOUNT_SCOPE_CANNOT_PLAY))
+        } else {
+            Ok(())
+        }
     }
 
     /// Whether this caller may act on `account_id`. A member reaches their own
@@ -131,58 +247,113 @@ fn cookie_token(parts: &Parts) -> Option<String> {
 
 pub const SESSION_COOKIE: &str = "nj_session";
 
-impl FromRequestParts<AppState> for Caller {
+/// A caller with account powers, refused at extraction time.
+///
+/// Not a second mechanism: it reads exactly what `require_session` resolved,
+/// the same as `Caller`. What it changes is *when* the refusal happens. A gate
+/// written as the first line of a handler runs after every extractor, so a
+/// malformed body answers 422 and the authority check never runs — a member
+/// posting nonsense to an admin route learns the body was wrong before
+/// learning they were never allowed to ask. Extracting the requirement moves
+/// it in front of the body, and puts it in the signature where it is
+/// greppable and hard to drop by accident.
+///
+/// It carries nothing. A handler that also needs to know *who* the admin is
+/// takes `Caller` as well, which costs nothing — both read the same resolved
+/// value out of the request extensions. Giving this a payload no handler reads
+/// would be a field that exists to look thorough.
+pub struct AdminCaller;
+
+/// A caller who has selected a profile (ADR-0034 item 3), same reasoning.
+pub struct WatchingCaller;
+
+impl FromRequestParts<AppState> for AdminCaller {
     type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let Some(token) = presented_token(parts) else {
-            return Err(ApiError::unauthorized(
-                "no_credential: no session presented",
-            ));
-        };
-        let digest = token_sha256_hex(&token);
-        let db = std::sync::Arc::clone(&state.db);
-        let resolved = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let now = nightjar_db::now_iso(conn)?;
-                let found = nightjar_db::session_for_token(conn, &digest, &now)?;
-                if let Ok(row) = &found {
-                    nightjar_db::touch_last_seen(conn, row.id, &now)?;
-                }
-                Ok(found)
-            })
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("session lookup task: {e}")))?
-        .map_err(ApiError::internal)?;
-
-        let session = resolved.map_err(rejection_error)?;
-        let role = Role::parse(&session.role).ok_or_else(|| {
-            ApiError::internal(format!(
-                "account {} has role {}",
-                session.account_id, session.role
-            ))
-        })?;
-        Ok(Caller { session, role })
+        let caller =
+            <Caller as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
+        caller.require_account_powers()?;
+        Ok(Self)
     }
 }
 
-/// `Option<Caller>` for the one route that must work both ways: bootstrap is
-/// unauthenticated, and setup state is read before anyone can log in.
-impl OptionalFromRequestParts<AppState> for Caller {
+impl FromRequestParts<AppState> for WatchingCaller {
     type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let caller =
+            <Caller as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
+        caller.require_profile_scope()?;
+        Ok(Self)
+    }
+}
+
+/// Resolve a presented token to a caller, touching `last_seen_at` as it goes.
+async fn resolve_caller(state: &AppState, token: &str) -> Result<Caller, ApiError> {
+    let digest = token_sha256_hex(token);
+    let db = std::sync::Arc::clone(&state.db);
+    let resolved = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let now = nightjar_db::now_iso(conn)?;
+            let found = nightjar_db::session_for_token(conn, &digest, &now)?;
+            if let Ok(row) = &found {
+                nightjar_db::touch_last_seen(conn, row.id, &now)?;
+            }
+            Ok(found)
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("session lookup task: {e}")))?
+    .map_err(ApiError::internal)?;
+
+    let session = resolved.map_err(rejection_error)?;
+    let role = Role::parse(&session.role).ok_or_else(|| {
+        ApiError::internal(format!(
+            "account {} has role {}",
+            session.account_id, session.role
+        ))
+    })?;
+    Ok(Caller { session, role })
+}
+
+/// Reads what `require_session` resolved. The extractor does no lookup of its
+/// own, so a handler cannot be authenticated by taking `Caller` while the
+/// layer is missing — the only way to be authenticated is to be behind the
+/// layer, which is what makes the guarantee structural rather than habitual.
+impl FromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<Caller>().cloned().ok_or_else(|| {
+            // Unreachable behind the layer, and it fails closed rather than
+            // 500ing, because the one way to arrive here is a route that
+            // escaped `route_layer` and that must not be a route that works.
+            ApiError::unauthorized("no_credential: no session presented")
+        })
+    }
+}
+
+/// `Option<Caller>` for a route in the unauthenticated set that still wants to
+/// know whether somebody is logged in. `None` means no valid credential was
+/// presented, not that the route is anonymous.
+impl OptionalFromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
     ) -> Result<Option<Self>, Self::Rejection> {
-        match <Caller as FromRequestParts<AppState>>::from_request_parts(parts, state).await {
-            Ok(caller) => Ok(Some(caller)),
-            Err(_) => Ok(None),
-        }
+        Ok(parts.extensions.get::<Caller>().cloned())
     }
 }
 
@@ -306,6 +477,14 @@ mod routing_tests {
         router
             .route("/api/v0/items/{item_id}/metadata/assign", post(probe))
             .route("/api/v0/items/{item_id}/playback-info", get(probe))
+            // The same layer the real router applies. Without it every probe
+            // answers 401, because `Caller` reads what the layer resolved and
+            // does no lookup of its own — which is the property, not a
+            // nuisance: a handler cannot authenticate itself into existence.
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_session,
+            ))
             .with_state(state)
     }
 

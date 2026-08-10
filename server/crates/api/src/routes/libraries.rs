@@ -1,3 +1,4 @@
+use crate::authority::AdminCaller;
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
@@ -153,6 +154,7 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<Json<LibrariesResp
 
 pub async fn create(
     State(state): State<AppState>,
+    _admin: AdminCaller,
     Json(body): Json<CreateLibraryRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateLibraryResponse>)> {
     // `is_dir` and `canonicalize` stat a possibly-remote root, and
@@ -234,6 +236,7 @@ pub async fn get(
 /// ADR-0030 §3: name-only → 200; path change → 202 + async repoint job.
 pub async fn patch(
     State(state): State<AppState>,
+    _admin: AdminCaller,
     Path(library_id): Path<i64>,
     Json(body): Json<PatchLibraryRequest>,
 ) -> ApiResult<axum::response::Response> {
@@ -327,6 +330,7 @@ pub async fn patch(
 
 pub async fn scan(
     State(state): State<AppState>,
+    _admin: AdminCaller,
     Path(library_id): Path<i64>,
 ) -> ApiResult<(StatusCode, Json<ScanJobAcceptedDto>)> {
     let db = std::sync::Arc::clone(&state.db);

@@ -1,3 +1,4 @@
+use crate::authority::WatchingCaller;
 use crate::error::{ApiError, ApiResult};
 use crate::routes::items::{ProfileQuery, abs_path, decide, library_root, profile_from_query};
 use crate::state::AppState;
@@ -15,6 +16,7 @@ use tokio_util::io::ReaderStream;
 
 pub async fn stream_item(
     State(state): State<AppState>,
+    _watching: WatchingCaller,
     Path(item_id): Path<i64>,
     Query(query): Query<ProfileQuery>,
     headers: HeaderMap,

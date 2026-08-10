@@ -1,4 +1,5 @@
 import type { paths } from './schema';
+import { authHeaders } from '../session';
 
 type Resp<P extends keyof paths, M extends keyof paths[P]> = paths[P][M] extends {
 	responses: {
@@ -22,6 +23,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		headers: {
 			Accept: 'application/json',
 			...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+			// Every route but four needs this now (ADR-0034 item 11). Absent
+			// when nobody is logged in, which is what the layout gate reacts to.
+			...authHeaders(),
 			...init?.headers
 		}
 	});
@@ -120,5 +124,29 @@ export const api = {
 		});
 	},
 	getTranscodeCapabilities: () =>
-		request<Resp<'/api/v0/system/transcode', 'get'>>('/api/v0/system/transcode')
+		request<Resp<'/api/v0/system/transcode', 'get'>>('/api/v0/system/transcode'),
+
+	// Auth. Four of these five are the demo client's whole login; the fifth
+	// narrows to a profile, without which the byte routes refuse to play.
+	getSetupState: () =>
+		request<Resp<'/api/v0/system/setup', 'get'>>('/api/v0/system/setup'),
+	bootstrap: (body: { username: string; password: string; clientLabel: string }) =>
+		request<Resp<'/api/v0/auth/bootstrap', 'post'>>('/api/v0/auth/bootstrap', {
+			method: 'POST',
+			body: JSON.stringify(body)
+		}),
+	login: (body: { username: string; password: string; clientLabel: string }) =>
+		request<Resp<'/api/v0/auth/login', 'post'>>('/api/v0/auth/login', {
+			method: 'POST',
+			body: JSON.stringify(body)
+		}),
+	getSession: () =>
+		request<Resp<'/api/v0/auth/session', 'get'>>('/api/v0/auth/session'),
+	listProfiles: () => request<Resp<'/api/v0/profiles', 'get'>>('/api/v0/profiles'),
+	selectProfile: (profileRef: string) =>
+		request<undefined>('/api/v0/auth/session', {
+			method: 'POST',
+			body: JSON.stringify({ profileRef })
+		}),
+	logout: () => request<undefined>('/api/v0/auth/logout', { method: 'POST' })
 };

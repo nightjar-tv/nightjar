@@ -1,6 +1,6 @@
 //! Accounts, roles and profiles (ADR-0034 items 1, 3, 7; ADR-0040 items 1, 3).
 
-use crate::authority::Caller;
+use crate::authority::{Caller, INSUFFICIENT_ROLE};
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::routes::auth::{AccountDto, ProfileDto, account_dto, profile_dto};
 use crate::state::AppState;
@@ -103,9 +103,7 @@ pub(crate) fn authorize_role_change(
 
 /// Authority for deleting an account (ADR-0034 item 7, ADR-0040 item 3).
 pub(crate) fn authorize_account_delete(caller: &Caller, target_role: Role) -> ApiResult<()> {
-    if !caller.has_account_powers() {
-        return Err(ApiError::forbidden(FORBIDDEN));
-    }
+    caller.require_account_powers()?;
     if target_role.is_owner() {
         return Err(ApiError::forbidden(
             "owner_is_unremovable: transfer ownership first",
@@ -121,16 +119,12 @@ pub(crate) fn authorize_account_delete(caller: &Caller, target_role: Role) -> Ap
     Ok(())
 }
 
-const FORBIDDEN: &str = "insufficient_role: this account may not perform that action";
-
 pub async fn list(
     State(state): State<AppState>,
     caller: Caller,
 ) -> ApiResult<Json<AccountsResponse>> {
     blocking(move || {
-        if !caller.has_account_powers() {
-            return Err(ApiError::forbidden(FORBIDDEN));
-        }
+        caller.require_account_powers()?;
         let rows = state
             .db
             .with_conn(nightjar_db::list_accounts)
@@ -150,9 +144,7 @@ pub async fn create(
     Json(body): Json<CreateAccountRequest>,
 ) -> ApiResult<(StatusCode, Json<AccountDto>)> {
     blocking(move || {
-        if !caller.has_account_powers() {
-            return Err(ApiError::forbidden(FORBIDDEN));
-        }
+        caller.require_account_powers()?;
         let role = Role::parse(&body.role)
             .ok_or_else(|| ApiError::bad_request("role must be manager or member"))?;
         // There is exactly one owner and the only way to become it is
@@ -202,9 +194,7 @@ pub async fn delete(
     Path(account_id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     blocking(move || {
-        if !caller.has_account_powers() {
-            return Err(ApiError::forbidden(FORBIDDEN));
-        }
+        caller.require_account_powers()?;
         let target = state
             .db
             .with_conn(|conn| nightjar_db::account_by_id(conn, account_id))
@@ -267,7 +257,7 @@ pub async fn list_profiles(
         // be indistinguishable from "exists with no profiles", and a 404 would
         // separate the two; both are account-enumeration oracles.
         if !caller.may_act_on_account(account_id) {
-            return Err(ApiError::forbidden(FORBIDDEN));
+            return Err(ApiError::forbidden(INSUFFICIENT_ROLE));
         }
         let rows = state
             .db
@@ -288,7 +278,7 @@ pub async fn create_profile(
     blocking(move || {
         let account_id = body.account_id.unwrap_or(caller.session.account_id);
         if !caller.may_act_on_account(account_id) {
-            return Err(ApiError::forbidden(FORBIDDEN));
+            return Err(ApiError::forbidden(INSUFFICIENT_ROLE));
         }
         if body.name.trim().is_empty() {
             return Err(ApiError::bad_request("name is required"));
@@ -327,7 +317,7 @@ pub async fn delete_profile(
         // Refused identically for a profile that does not exist and one on
         // another account, so the response cannot be used to probe.
         let Some(profile) = profile.filter(|p| caller.may_act_on_account(p.account_id)) else {
-            return Err(ApiError::forbidden(FORBIDDEN));
+            return Err(ApiError::forbidden(INSUFFICIENT_ROLE));
         };
         state
             .db
