@@ -46,6 +46,37 @@ pub struct Rating {
     pub votes: Option<i64>,
 }
 
+/// The maximum `value` is expressed against, for a rating source we know the
+/// scale of. `None` means unknown, and a client must not assume one.
+///
+/// **A scale belongs to the source, not to the row, which is why this is a
+/// function and not a stored column.** Every projected rating already records
+/// where it came from, and `imdb` is out of ten wherever it appears; storing
+/// the same constant on 26,000 rows would add a field that can disagree with
+/// itself after a re-project. It also means the answer is available for rows
+/// already on disk, which a stored column would not be without re-projecting
+/// through writers that are frozen.
+///
+/// **Why it is needed at all:** the dogfood library carries
+/// `tomatometerallcritics` ranging 3.0 to 100.0 in the same array as `imdb`
+/// 7.6, and nothing on the wire said they were different scales, so no client
+/// could render them side by side honestly. That is a gap in what the API
+/// says, not a rendering bug for a client to solve by guessing.
+///
+/// `default` is the NFO's unnamed `<rating>` and deliberately returns `None`.
+/// It duplicates a named source on 1,743 of the 1,749 dogfood rows that carry
+/// one — and differs on the other six, which is why it is reported with an
+/// unknown scale rather than dropped as a duplicate.
+pub fn rating_max(source: &str) -> Option<f64> {
+    match source {
+        // TMDB user score, under two names: `tmdb` from the ADR-0026 §8.3
+        // search-hit projection, `themoviedb` from an NFO written by a scraper.
+        "tmdb" | "themoviedb" | "imdb" => Some(10.0),
+        "tomatometerallcritics" => Some(100.0),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ArtworkKind {

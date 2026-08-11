@@ -4,6 +4,8 @@
 - Date: 2026-08-03
 - Amended: 2026-08-04 — sparse canonical upsert from search hit (ADR-0026
   §8.3); detail overwrite; cert on enrich (ADR-0026 §8.4)
+- Amended: 2026-08-11 — §1.5 ratings carry a `max` on the wire, resolved from
+  the source rather than stored
 - Depends on: ADR-0025 (item identity grammar; file↔item cardinality);
   ADR-0026 (§4 raw payloads; §6 collections; §8 two-tier status / sparse
   write); season bind on enrich (ADR-0026 §8.4)
@@ -134,6 +136,28 @@ change, not by mutating a shared entity.
 One field on the canonical row among the others (structured / JSON column
 matching other multi-value projected fields). Not a separate ratings
 table. TV / episode mapper gaps wait on the re-project slice.
+
+**A rating carries the scale it is expressed against** (amended 2026-08-11).
+The stored shape is `source`, `value`, `votes`, and that is not enough to
+render: the dogfood library carries `tomatometerallcritics` ranging 3.0 to
+100.0 in the same array as `imdb` 7.6, so a client given two bare numbers can
+only guess or mislead. `Rating` on the wire gains `max`, the maximum `value` is
+expressed against — 10 for `imdb` / `themoviedb` / `tmdb`, 100 for
+`tomatometerallcritics`. **Absent `max` means the scale is unknown and a client
+must render the number without a denominator**, which is the honest answer for
+`default`, the NFO's unnamed `<rating>`.
+
+**The scale belongs to the source, not to the row, so it is resolved rather
+than stored.** `imdb` is out of ten wherever it appears; a column would repeat
+one constant across 26,000 rows and could then disagree with itself after a
+re-project. Resolving it also means rows already on disk answer correctly
+without a re-projection, which matters because the two writers that produce
+ratings are frozen while the Block 1 leave measures are unpublished.
+
+`default` is reported rather than suppressed as a duplicate. It equals a named
+source on 1,743 of the 1,749 dogfood rows that carry one — **and differs on the
+other six**, so dropping it would silently lose a distinct value to make a
+display tidier.
 
 #### 1.6 Re-project upsert and delete
 

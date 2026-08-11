@@ -8,7 +8,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::artwork::artwork_path_for_item_key;
+use crate::artwork::resolve_artwork_key;
 use crate::canonical::get_canonical;
 use crate::item_links::{
     EPISODE_KEY_PREFIX, MOVIE_KEY_PREFIX, SHOW_KEY_PREFIX, effective_item_key,
@@ -71,17 +71,13 @@ pub fn item_metadata(
     relpath: &str,
 ) -> Result<ItemMetadata, String> {
     let item_key = effective_item_key(conn, media_item_id, library_id, relpath)?;
-    let unmatched = || ItemMetadata {
-        item_key: item_key.clone(),
-        ..ItemMetadata::default()
-    };
     let Some((entity_kind, provider_id)) = provider_entity(&item_key) else {
         // ADR-0029 §1.3: no provider entity, no canonical row. The client falls
         // back to the scan fields already on the response.
-        return Ok(unmatched());
+        return unmatched(conn, item_key);
     };
     let Some(own) = get_canonical(conn, "tmdb", entity_kind, &provider_id)? else {
-        return Ok(unmatched());
+        return unmatched(conn, item_key);
     };
 
     let show = show_row_for_episode(conn, entity_kind, &provider_id)?;
@@ -92,14 +88,7 @@ pub fn item_metadata(
     // still and nothing else (ADR-0029 §1.2), so poster, backdrop and logo come
     // from the show, which is also where a viewer expects them from.
     let art_key = show_key.clone().unwrap_or_else(|| item_key.clone());
-    let artwork = RENDERED_ARTWORK
-        .into_iter()
-        .filter(|kind| artwork_path_for_item_key(conn, &art_key, *kind).is_some())
-        .map(|kind| ItemArtwork {
-            kind,
-            item_key: art_key.clone(),
-        })
-        .collect();
+    let artwork = advertised_artwork(conn, &art_key)?;
 
     let show_meta = show.as_ref().map(|(_, meta)| meta);
     Ok(ItemMetadata {
@@ -117,6 +106,55 @@ pub fn item_metadata(
         series_key: show_key,
         show_title: show_meta.map(|m| m.title.clone()),
     })
+}
+
+/// An item with no canonical row: a key, whatever art the serve path can find,
+/// and nothing else.
+///
+/// **The artwork is the part that is not obvious.** An unmatched key still
+/// reaches art through the ADR-0026 §8.4 provisional show link, which is what
+/// the grid already renders posters from, so returning an empty array here
+/// would advertise "this title has none" about images the very next request
+/// serves.
+fn unmatched(conn: &Connection, item_key: String) -> Result<ItemMetadata, String> {
+    let artwork = advertised_artwork(conn, &item_key)?;
+    Ok(ItemMetadata {
+        item_key,
+        artwork,
+        ..ItemMetadata::default()
+    })
+}
+
+/// The kinds this key can actually be served, resolved the way the serve route
+/// resolves them.
+///
+/// **One resolver, because two were answering the same question differently**
+/// (Rule 4.11). `GET /items/{id}` used to read the canonical row directly while
+/// `GET /artwork/{key}/{kind}` used [`resolve_artwork_key`], which also follows
+/// a path key to the item's `tmdb:show:` / `tmdb:movie:` link. On the dogfood
+/// library that gap covered 326 TV files: the detail response said `artwork:
+/// null` for titles whose poster and backdrop the artwork route served on
+/// request. ADR-0027 §6 makes absence from this array load-bearing — it is how
+/// a client tells "none exists" from "not cached yet" — so an advertisement
+/// narrower than the serve path is not a missing feature, it is a wrong answer
+/// in the direction that hides working images.
+///
+/// The entry carries the key the bytes are **served** under rather than the key
+/// asked about, so the URL a client follows is the one the store caches and the
+/// drain warms, and the fallback is walked once here instead of on every image
+/// GET.
+fn advertised_artwork(conn: &Connection, art_key: &str) -> Result<Vec<ItemArtwork>, String> {
+    let mut artwork = Vec::new();
+    for kind in RENDERED_ARTWORK {
+        let (serve_key, source) = resolve_artwork_key(conn, art_key, kind)?;
+        if source.is_some() {
+            artwork.push(ItemArtwork {
+                kind,
+                item_key: serve_key,
+            });
+        }
+    }
+    Ok(artwork)
 }
 
 /// The show entity behind an episode, with its canonical row. `None` for a
@@ -275,8 +313,11 @@ mod tests {
     /// ADR-0029 §1.3: no provider entity, no canonical row. The response still
     /// carries a key, and the client falls back to the scan fields it already
     /// has rather than showing an error.
+    ///
+    /// This item has no link at all, so it has no art either — which is the
+    /// case the next test exists to distinguish from.
     #[test]
-    fn unmatched_item_has_a_key_and_nothing_else() {
+    fn unmatched_item_with_no_link_has_a_key_and_nothing_else() {
         let c = fixture();
         let meta = item_metadata(&c, 9, 2, "Mystery Folder/e1.mkv").unwrap();
         assert_eq!(meta.item_key, "path:2:Mystery Folder/e1.mkv");
@@ -284,5 +325,54 @@ mod tests {
         assert!(meta.genres.is_empty());
         assert!(meta.artwork.is_empty());
         assert_eq!(meta.series_key, None);
+    }
+
+    /// An episode matched at show level but not yet season-bound: the effective
+    /// key is the path key (`tmdb:show:` is not watch-shaped, `item_links::
+    /// is_watch_item_key`), and the show link still carries art.
+    ///
+    /// **This is the regression.** The detail response advertised nothing while
+    /// `GET /artwork/{path key}/poster` served the show's poster through the
+    /// same link, so ADR-0027 §6's "absent means this title has none" was false
+    /// for 326 files on the dogfood library. The assertion that matters is not
+    /// that art appears, but that it appears **under the key the serve path
+    /// resolves to**, because that is what makes the advertised URL the one the
+    /// store already holds.
+    #[test]
+    fn a_show_linked_episode_advertises_the_art_the_serve_path_would_return() {
+        let c = fixture();
+        c.execute_batch(
+            "INSERT INTO media_items (id, library_id, path, mtime_ms, size_bytes, title, kind,
+                                      season, episode)
+                  VALUES (30, 2, 'Futurama/Season 9/S09E01.mkv', 1, 1, 'S09E01', 'episode', 9, 1);
+             INSERT INTO media_item_links (media_item_id, item_key)
+                  VALUES (30, 'tmdb:show:615');",
+        )
+        .unwrap();
+
+        let meta = item_metadata(&c, 30, 2, "Futurama/Season 9/S09E01.mkv").unwrap();
+        assert_eq!(
+            meta.item_key, "path:2:Futurama/Season 9/S09E01.mkv",
+            "a provisional show link is not a watch key (ADR-0026 §8.4)"
+        );
+        assert_eq!(
+            meta.title, None,
+            "still no canonical row, so still no facts"
+        );
+        assert_eq!(
+            meta.artwork,
+            vec![
+                ItemArtwork {
+                    kind: ArtworkKind::Poster,
+                    item_key: "tmdb:show:615".into()
+                },
+                ItemArtwork {
+                    kind: ArtworkKind::Backdrop,
+                    item_key: "tmdb:show:615".into()
+                },
+            ],
+            "advertised under the show key the artwork route serves from, not \
+             under the path key that was asked about"
+        );
     }
 }
