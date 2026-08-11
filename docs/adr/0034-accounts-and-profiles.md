@@ -8,6 +8,9 @@
   ADR-0040 was accepted on the same sheet and the same day, so this amendment
   landed **with** the record that defines the role model rather than ahead of it
   by forward reference, which was the condition the ADR-0035–0038 sheet set
+- Amended: 2026-08-11 — item 9's cookie list is eight entries and now nine, by
+  splitting a session's `init.mp4` out of the `{asset}` capture (issue #96).
+  The described surface is unchanged; the enumeration is one step less open
 - Depends on: ADR-0003 §3 (no auth in v0, ended by this ADR); ADR-0007
   (playback sessions, cap model); ADR-0011 (session sharing removed);
   ADR-0022 §5 (policy ceilings, no policy schema until accounts exist);
@@ -224,16 +227,35 @@ profile holds viewing identity and never holds authority.**
    `GET /api/v0/items/{itemId}/stream`,
    `GET /api/v0/items/{itemId}/subtitles/{trackId}.vtt`, and under
    `/api/v0/sessions/{sessionId}/`: `runs/{runId}/master.m3u8`,
-   `runs/{runId}/index.m3u8`, `runs/{runId}/init.mp4`, `subs/{asset}`, and
-   `{asset}`. Nothing else, and adding a route to that list is a decision, not a
-   consequence of where a path happens to sit.
+   `runs/{runId}/index.m3u8`, `runs/{runId}/init.mp4`, `subs/{asset}`,
+   `init.mp4`, and `{asset}`. Nothing else, and adding a route to that list is a
+   decision, not a consequence of where a path happens to sit.
 
    Prefix matching is how this control fails. `/api/v0/items/` as a prefix
    admits the whole item surface including the metadata fix endpoints B2-2 is
    about to make admin-only, and it would do it silently, on the day someone adds
    a route rather than on the day someone changes the rule. A test asserts the
-   accepted set is exactly these eight and that every other route rejects a
+   accepted set is exactly these nine and that every other route rejects a
    cookie-only request.
+
+   **Amended 2026-08-11 — eight became nine, and the added entry is a
+   narrowing.** Issue #96 observed that the enumeration is exact for *routes*
+   and not for the one entry that is a capture: a route added under
+   `/sessions/{sessionId}/` is default-denied and the exact-set test sees it,
+   but a shape grown inside the `{asset}` handler adds no route, keeps the same
+   `MatchedPath`, and inherits cookie acceptance with nothing route-level able
+   to see it. A session serves two names, `init.mp4` and `seg_<startMs>.m4s`.
+   The first is now a route of its own, so it is out of the capture and the
+   list is longer while the surface it describes is not. The second cannot be a
+   route: axum will not accept a path segment that mixes static text with a
+   parameter, so `seg_{startMs}.m4s` is unroutable. What bounds the remainder
+   is a test over the function that decides what a session will serve, so a
+   third shape fails a test rather than arriving unremarked. That is weaker
+   than the router carrying it, and moving the segment id into its own path
+   segment is the change that would close it — a wire change to the playlist,
+   deliberately not taken in the same pass that only rearranged routes, and not
+   verifiable end to end while no library is reachable. Issue #96 stays open
+   with that as its remaining scope.
 
    The cookie exists because an HTML element cannot set a request header. A
    `<video src>`, a native Safari HLS load, and an `<img>` poster all fetch

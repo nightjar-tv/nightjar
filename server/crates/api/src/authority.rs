@@ -104,10 +104,19 @@ pub async fn require_session(
 /// rule.
 ///
 /// Anything not in this list is refused a cookie by default, so a new route
-/// cannot gain cookie acceptance by being added. What this list cannot guard
-/// is the catch-all at the end growing new behaviour inside its handler, which
-/// is issue #96.
-pub const COOKIE_ACCEPTED_ROUTES: [&str; 8] = [
+/// cannot gain cookie acceptance by being added.
+///
+/// **Issue #96, narrowed on 2026-08-11 and not closed.** A session serves two
+/// asset shapes, `init.mp4` and `seg_<start_ms>.m4s`. The first is now its own
+/// static route, so it is out of the capture. The second cannot be a route:
+/// axum refuses a segment that mixes static text with a parameter, so
+/// `seg_{start_ms}.m4s` is not expressible and `{asset}` stays. What now
+/// guards the remainder is a test over `hls::is_safe_asset` — the function
+/// that decides what a session will serve — so a third shape fails a test
+/// rather than inheriting cookie acceptance quietly. That is a weaker
+/// guarantee than the router giving it, and it is the strongest one available
+/// without changing the segment URI on the wire.
+pub const COOKIE_ACCEPTED_ROUTES: [&str; 9] = [
     "/api/v0/artwork/{item_key}/{kind}",
     "/api/v0/items/{item_id}/stream",
     "/api/v0/items/{item_id}/subtitles/{asset}",
@@ -115,6 +124,7 @@ pub const COOKIE_ACCEPTED_ROUTES: [&str; 8] = [
     "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
     "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
     "/api/v0/sessions/{session_id}/subs/{*asset}",
+    "/api/v0/sessions/{session_id}/init.mp4",
     "/api/v0/sessions/{session_id}/{asset}",
 ];
 
@@ -370,7 +380,7 @@ mod tests {
     /// touching the router, so widening the cookie surface is always a
     /// deliberate edit in two places.
     #[test]
-    fn the_cookie_accepted_set_is_exactly_these_eight() {
+    fn the_cookie_accepted_set_is_exactly_these_nine() {
         let expected = [
             "/api/v0/artwork/{item_key}/{kind}",
             "/api/v0/items/{item_id}/stream",
@@ -379,14 +389,52 @@ mod tests {
             "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
             "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
             "/api/v0/sessions/{session_id}/subs/{*asset}",
+            "/api/v0/sessions/{session_id}/init.mp4",
             "/api/v0/sessions/{session_id}/{asset}",
         ];
         assert_eq!(
             COOKIE_ACCEPTED_ROUTES.len(),
-            8,
-            "item 9 names eight; changing the count is an ADR amendment"
+            9,
+            "item 9 names nine; changing the count is an ADR amendment"
         );
         assert_eq!(COOKIE_ACCEPTED_ROUTES, expected);
+    }
+
+    /// How much of the cookie surface is still an open set, pinned by name.
+    ///
+    /// An entry ending in a capture accepts whatever its handler chooses to
+    /// serve, so its cookie acceptance covers a set the router cannot see the
+    /// edges of (issue #96). Four such entries exist, each closed by a parser
+    /// in its own handler and none by the router, and this test exists so a
+    /// fifth is a deliberate edit rather than a side effect. Shortening this
+    /// list is progress; lengthening it needs a reason in the same commit.
+    #[test]
+    fn the_open_captures_are_these_four_and_no_others() {
+        let open: Vec<&str> = COOKIE_ACCEPTED_ROUTES
+            .iter()
+            .copied()
+            .filter(|route| {
+                let last = route.rsplit('/').next().unwrap_or_default();
+                last.starts_with('{') && last.ends_with('}')
+            })
+            .collect();
+        assert_eq!(
+            open,
+            [
+                // `{kind}`: `ArtworkStore::parse_kind`.
+                "/api/v0/artwork/{item_key}/{kind}",
+                // `{asset}`: `is_valid_track_id` plus a `.vtt` suffix.
+                "/api/v0/items/{item_id}/subtitles/{asset}",
+                // `{*asset}`: a sidecar tree the router would otherwise have
+                // to encode the layout of.
+                "/api/v0/sessions/{session_id}/subs/{*asset}",
+                // `{asset}`: `hls::is_safe_asset`, two names. Would be two
+                // static routes if axum could route `seg_{start_ms}.m4s`.
+                "/api/v0/sessions/{session_id}/{asset}",
+            ],
+            "the cookie surface gained or lost an open capture; say which in \
+             the commit that did it"
+        );
     }
 
     /// Every route that writes must be absent from the list. This is the

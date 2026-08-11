@@ -797,19 +797,58 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/sessions/{sessionId}/init.mp4:
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      operationId: getSessionInit
+      summary: fMP4 init segment for a session
+      description: >
+        The playlist points at the run-scoped `runs/{runId}/init.mp4`, so this
+        is the shape a client holding an older URI asks for. It is a path of
+        its own rather than one value of the asset capture below because that
+        capture is cookie-accepted and the router cannot otherwise say which
+        names it covers (issue #96).
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Init segment bytes
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Session or init segment not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Init not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/sessions/{sessionId}/{asset}:
     get:
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionAsset
-      summary: HLS init segment or media segment for a session
+      summary: HLS media segment for a session
       parameters:
         - $ref: "#/components/parameters/SessionId"
         - name: asset
           in: path
           required: true
+          description: >
+            A time-keyed media segment name (ADR-0020). The server serves this
+            and `init.mp4` above and nothing else; the pattern is the contract
+            the router cannot express, since axum will not route a segment that
+            mixes static text with a parameter.
           schema:
             type: string
-            pattern: '^(init\.mp4|seg_[0-9]{11}\.m4s)$'
+            pattern: '^seg_[0-9]{11}\.m4s$'
         - name: njFetcher
           in: query
           required: false

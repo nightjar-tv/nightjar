@@ -5599,14 +5599,39 @@ mod tests {
         reg.stop(&id);
     }
 
-    /// Segment count and boundaries mirror the video VOD playlist so a
-    /// player's segment index maps to the same subtitle window.
+    /// A session serves two asset names and this is where that is decided.
+    ///
+    /// It matters beyond path safety. The route the browser reaches these
+    /// through, `GET /api/v0/sessions/{session_id}/{asset}`, is one of the
+    /// cookie-accepted routes (ADR-0034 item 9), and it is a capture: the
+    /// router cannot say which names it covers, because axum will not route
+    /// `seg_{start_ms}.m4s`. So the size of that cookie-accepted set is
+    /// whatever this function returns true for, and issue #96 is the record of
+    /// that gap. A third shape arriving here widens a security surface, which
+    /// is why the rejections below are asserted as thoroughly as the two
+    /// acceptances: near-misses, wrong padding, suffixed names, the playlist
+    /// names that belong to their own routes, and traversal.
     #[test]
-    fn asset_name_allowlist() {
+    fn a_session_serves_exactly_two_asset_names() {
         assert!(is_safe_asset("init.mp4"));
         assert!(is_safe_asset("seg_00000008000.m4s"));
-        assert!(!is_safe_asset("seg000.m4s"));
-        assert!(!is_safe_asset("../etc/passwd"));
+        for name in [
+            "",
+            "seg000.m4s",
+            "seg_8000.m4s",
+            "seg_000000080000.m4s",
+            "seg_0000000800a.m4s",
+            "seg_00000008000.m4s.tmp",
+            "init.mp4.orig",
+            "INIT.MP4",
+            "master.m3u8",
+            "index.m3u8",
+            "../etc/passwd",
+            "../../init.mp4",
+            "subs/e0.vtt",
+        ] {
+            assert!(!is_safe_asset(name), "{name} must not be servable");
+        }
         assert_eq!(
             crate::hls_segment_map::parse_time_keyed_segment_name("seg_00000008000.m4s"),
             Some(8000)
