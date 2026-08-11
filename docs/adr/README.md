@@ -26,7 +26,7 @@ not here — this page is the reference, not the tour.
 | [0006](0006-phase2-remux-decision.md) | Phase 2 playback decision engine and remux delivery | Partially superseded | [0003](0003-phase1-schema-api.md) §5 | [0011](0011-remux-session-convergence.md) (delivery / remux job / cache / `remuxState`; decision-engine shape stands) |
 | [0007](0007-hls-transcode-sessions.md) | HLS software-transcode sessions | Accepted | — | — |
 | [0008](0008-abr-post-v1.md) | Adaptive bitrate is post-v1 | Accepted | — | — |
-| [0009](0009-hw-accel-detection.md) | Hardware encode detection by verification | Accepted (amended 2026-08-03) | — | — |
+| [0009](0009-hw-accel-detection.md) | Hardware encode detection by verification | Accepted (amended 2026-08-03, 2026-08-11) | — | — |
 | [0010](0010-text-subs-webvtt.md) | Text subtitle tracks as WebVTT sidecars | Partially superseded | — | §7 by [0013](0013-subtitle-extraction-at-scan.md) |
 | [0011](0011-remux-session-convergence.md) | Remux converges onto the session model | Accepted | [0006](0006-phase2-remux-decision.md) (delivery decisions) | — |
 | [0012](0012-audio-downmix-and-track-selection.md) | Audio downmix and multi-track selection | Accepted | — | — |

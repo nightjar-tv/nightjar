@@ -109,7 +109,10 @@ impl EncodeLeg {
         }
     }
 
-    /// Name-only HW leg (NVENC / V4L2 / MF) — system memory + yuv420p until measured.
+    /// Name-only HW leg (NVENC / V4L2 / MF / AMF / RKMPP) — system memory +
+    /// yuv420p until measured. A backend that needs more than this does not
+    /// verify, which is the probe reporting it rather than the leg guessing at
+    /// device args nobody has run (ADR-0009 §6 first implement field budget).
     pub fn generic_hw(encoder: &str, backend: &str) -> Self {
         Self {
             encoder: encoder.into(),
@@ -202,6 +205,12 @@ impl TranscodeCapabilities {
 
 /// Platform preference order for H.264 encode (ADR-0009 §3). First verified
 /// wins; `libx264` is always last.
+///
+/// Adding a candidate is cheap and that is why the list is generous rather
+/// than minimal: a name this FFmpeg build does not list is `unavailable`
+/// without any invocation at all, and a name it lists but cannot use costs one
+/// failed verify encode at startup. The cost of *omitting* one is a machine
+/// that transcodes in software for the life of the install and never says so.
 fn candidates_for_host() -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
     #[cfg(target_os = "macos")]
@@ -213,12 +222,22 @@ fn candidates_for_host() -> Vec<(&'static str, &'static str)> {
         out.push(("h264_nvenc", "nvenc"));
         out.push(("h264_qsv", "qsv"));
         out.push(("h264_vaapi", "vaapi"));
+        // Rockchip's own encoder, ahead of `v4l2m2m` because on a board that
+        // lists both, `v4l2m2m` is the generic kernel path and this is the
+        // vendor one. The generic entry stays last so it remains the catch-all.
+        out.push(("h264_rkmpp", "rkmpp"));
         out.push(("h264_v4l2m2m", "v4l2m2m"));
     }
     #[cfg(target_os = "windows")]
     {
         out.push(("h264_nvenc", "nvenc"));
         out.push(("h264_qsv", "qsv"));
+        // AMD's own encoder. `vaapi` above covers AMD on Linux only, so
+        // without this entry an AMD card on Windows falls through to `h264_mf`
+        // or to software. Ahead of `h264_mf` for the same reason `rkmpp` leads
+        // `v4l2m2m`: Media Foundation wraps whatever the OS exposes and is the
+        // generic path, so it stays the last hardware candidate.
+        out.push(("h264_amf", "amf"));
         out.push(("h264_mf", "mediafoundation"));
     }
     out.push(("libx264", "software"));
@@ -652,6 +671,35 @@ mod tests {
                 .as_deref(),
             Some("format=yuv420p")
         );
+    }
+
+    /// The host list is written per-OS behind `cfg`, so no single run sees all
+    /// three arms. What every run can check is the shape a new entry must keep:
+    /// software last, no name listed twice, and an encode leg that probes the
+    /// encoder it is named after. The last clause is the one that matters —
+    /// `encode_legs_for_candidate` falls through to a generic leg, so a typo in
+    /// a candidate name would otherwise probe happily under the wrong encoder
+    /// and report it as the verified one.
+    #[test]
+    fn host_candidates_end_in_software_and_probe_under_their_own_name() {
+        let list = candidates_for_host();
+        assert_eq!(
+            list.last().map(|(name, _)| *name),
+            Some("libx264"),
+            "software is always the last candidate: {list:?}"
+        );
+        let mut names: Vec<&str> = list.iter().map(|(name, _)| *name).collect();
+        let listed = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), listed, "duplicate candidate in {list:?}");
+        for (name, backend) in &list {
+            let legs = encode_legs_for_candidate(name, backend);
+            assert!(!legs.is_empty(), "{name} has no encode leg to verify");
+            for leg in legs {
+                assert_eq!(&leg.encoder, name, "{name} probes as {}", leg.encoder);
+            }
+        }
     }
 
     #[test]
