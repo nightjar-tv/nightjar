@@ -5,6 +5,7 @@
 - Amended: 2026-08-03 — session-shaped verify; one encode-leg builder; pix_fmt
   ownership; supersede “land backend flags later” (§6). Research pointer:
   `nightjar-meta/notes/hw/jellyfin-hw-encode-map-2026-08.md`.
+- Amended: 2026-08-11 — §3 gains `h264_amf` (Windows) and `h264_rkmpp` (Linux).
 
 ## Context
 
@@ -49,9 +50,28 @@ constitution rule until ENGINEERING_RULES is amended).
 3. **Preference policy (amendable).** Among verified candidates, pick the first
    in this order for the host OS:
    - macOS: `h264_videotoolbox`, then `libx264`
-   - Linux: `h264_nvenc`, `h264_qsv`, `h264_vaapi`, `h264_v4l2m2m`, then
-     `libx264`
-   - Windows: `h264_nvenc`, `h264_qsv`, `h264_mf`, then `libx264`
+   - Linux: `h264_nvenc`, `h264_qsv`, `h264_vaapi`, `h264_rkmpp`,
+     `h264_v4l2m2m`, then `libx264`
+   - Windows: `h264_nvenc`, `h264_qsv`, `h264_amf`, `h264_mf`, then `libx264`
+
+   **Amended 2026-08-11 — two vendor encoders added.** `h264_amf` is AMD's own
+   encoder and `vaapi` above covers AMD on Linux only, so without it an AMD card
+   on Windows fell through to `h264_mf` or to software. `h264_rkmpp` is
+   Rockchip's, for the cheap ARM boxes people repurpose as always-on servers.
+   Both sit ahead of the generic path for their platform — `h264_mf` wraps
+   whatever the OS exposes and `h264_v4l2m2m` is the generic kernel interface —
+   so the vendor entry is tried first and the generic one stays the last
+   hardware candidate before software. No ordering principle changed; two
+   vendors that had no entry now have one.
+
+   **Adding a candidate is close to free, which is why this list is generous
+   rather than minimal.** A name the FFmpeg build does not list is
+   `unavailable` under item 1 with no invocation at all; a name it lists but
+   cannot use costs one failed verify encode at startup. Omitting a name costs
+   an install that transcodes in software for its whole life without ever
+   saying so. The asymmetry is the reason to add a plausible encoder before
+   anyone has the hardware to confirm it, and item 1 is what keeps that honest:
+   an unverified backend is never preferred.
 
    Throughput preference is intentional for this slice: a verified hardware
    encoder always beats software when both work. That is wrong for quality in
