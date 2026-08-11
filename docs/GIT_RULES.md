@@ -45,6 +45,15 @@ Commit messages and PR bodies follow the plain-prose register in
   review returns as soon as there is a second owner.
 - No TODO/FIXME/HACK in the diff (Rule 4.1). CI greps for it.
 - Draft PRs are fine and encouraged for early feedback; never merge a draft.
+- **`--auto` is not "merge when green" here, and four occurrences say so.**
+  Branch protection requires `web` and `server`. `gate1` is **not required**, and
+  it is the slowest check by a wide margin — measured at 400 s and 340 s on
+  2026-08-11 with the required pair already green. `gh pr merge --auto` fires the
+  moment the *required* set passes, so it merges before `gate1` has said anything.
+  It has done so twice and been fine by luck. **Wait for `gate1` explicitly**
+  (`gh pr checks <pr>` until it reads `pass`), or make it required. Until it is
+  required, "CI is green" and "the required checks are green" are different
+  claims and only one of them is what `--auto` reads.
 
 ## 4. What never enters the repo
 - Secrets, API keys, tokens. CI runs a secret scanner; a leaked key means
