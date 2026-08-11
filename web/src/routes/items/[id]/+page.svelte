@@ -62,10 +62,16 @@
 		return bits.join(' · ');
 	}
 
+	// A bare number is not readable when one array carries a 0-100 score beside
+	// a 0-10 one, so the scale is shown when the server knows it and omitted
+	// when it does not (ADR-0029 §1.5). Absent max is never guessed at here:
+	// the source with no known scale is the NFO's unnamed `default`, and
+	// printing it as `/10` would be inventing a denominator.
 	function ratingLine(r: components['schemas']['Rating']): string {
+		const score = r.max != null ? `${r.value}/${r.max}` : `${r.value}`;
 		return r.votes != null
-			? `${r.source} ${r.value} (${r.votes.toLocaleString()} votes)`
-			: `${r.source} ${r.value}`;
+			? `${r.source} ${score} (${r.votes.toLocaleString()} votes)`
+			: `${r.source} ${score}`;
 	}
 
 	function castLine(c: components['schemas']['CastMember']): string {

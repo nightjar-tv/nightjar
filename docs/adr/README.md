@@ -46,7 +46,7 @@ not here — this page is the reference, not the tour.
 | [0026](0026-metadata-pipeline.md) | Metadata pipeline | Partially superseded (amended 11×) | — | §8.4 item 3 by [0037](0037-kids-scoping-and-overrides.md) (in place) |
 | [0027](0027-artwork-pipeline.md) | Artwork pipeline | Accepted (amended 2026-08-04, 2026-08-10) | — | — |
 | [0028](0028-manual-metadata-fix.md) | Manual metadata fix | Accepted | — | — |
-| [0029](0029-canonical-metadata-and-item-links.md) | Canonical metadata store and file↔item links | Accepted (amended) | — | — |
+| [0029](0029-canonical-metadata-and-item-links.md) | Canonical metadata store and file↔item links | Accepted (amended 2026-08-04, 2026-08-11) | — | — |
 | [0030](0030-library-relative-paths.md) | Library-relative media paths and library repoint | Accepted (amended 2026-08-04) | — | — |
 | [0031](0031-tmdb-api-key-and-attribution.md) | TMDB API key distribution and attribution | Accepted | — | — |
 | [0032](0032-multi-exact-collision-order.md) | Multi-exact collision resolution order | Accepted (amended 2×) | — | — |
