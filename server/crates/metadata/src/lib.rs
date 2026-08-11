@@ -61,7 +61,7 @@ pub use measure_exclude::{
 pub use migrator::{MigrateReport, migrate_item_keys};
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
-    ProviderIds, Rating, item_key_for_metadata,
+    ProviderIds, Rating, item_key_for_metadata, rating_max,
 };
 pub use negative_cache::{
     CLEANER_VERSION, CacheKind, NegativeEntry, NegativeReason, PROVIDER_TMDB, ReasonCounts,
