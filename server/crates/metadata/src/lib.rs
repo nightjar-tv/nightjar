@@ -44,6 +44,7 @@ pub use fix::{
     NoopArtwork, assign, clear_match, get_fix_item, retry_unmatched, search_candidates,
 };
 pub use item_detail::{ItemArtwork, ItemMetadata, item_metadata};
+pub use item_links::series_key_for_item;
 pub use item_links::{
     clear_all_links_for_media_item, effective_item_key, effective_item_keys_for_library,
     link_keys_for_item, path_item_key, replace_auto_link, replace_auto_links,
@@ -58,7 +59,7 @@ pub use measure_exclude::{
     MEASURE_EXCLUDE_LIBRARY_NAMES_DEFAULT, MEASURE_EXCLUDE_LIBRARY_NAMES_ENV,
     measure_exclude_libraries_sql_in, measure_exclude_library_names,
 };
-pub use migrator::{MigrateReport, migrate_item_keys};
+pub use migrator::{MigrateReport, SeriesMigrateReport, migrate_item_keys, migrate_series_keys};
 pub use model::{
     ArtworkKind, ArtworkRef, CanonicalMetadata, CastMember, CollectionRef, MetadataKind,
     ProviderIds, Rating, item_key_for_metadata,
