@@ -812,9 +812,39 @@ fn m3u8_ok(bytes: Vec<u8>) -> ApiResult<Response> {
     Ok(res)
 }
 
-pub async fn asset(
+/// The session-scoped `init.mp4`.
+///
+/// The playlist points at the run-scoped `runs/{run_id}/init.mp4` instead, so
+/// this is the shape a client that kept an older URI asks for. It stays served
+/// and it stays named, because the point of issue #96 is that the router says
+/// which shapes exist rather than a handler deciding after the fact.
+pub async fn session_init(
+    state: State<AppState>,
+    Path(session_id): Path<String>,
+    query: Query<AssetQuery>,
+) -> ApiResult<Response> {
+    asset(state, session_id, "init.mp4".to_string(), query).await
+}
+
+/// One media segment, `seg_<start_ms>.m4s` (ADR-0020 time-keyed names).
+///
+/// Still a capture rather than the shape it serves, because axum cannot route
+/// `seg_{start_ms}.m4s` — a path segment is static or a parameter, not both.
+/// `hls::is_safe_asset` is therefore the thing that closes the set, and it has
+/// a test pinning it to exactly these two names so a third cannot arrive
+/// unremarked (issue #96).
+pub async fn segment(
+    state: State<AppState>,
+    Path((session_id, asset_name)): Path<(String, String)>,
+    query: Query<AssetQuery>,
+) -> ApiResult<Response> {
+    asset(state, session_id, asset_name, query).await
+}
+
+async fn asset(
     State(state): State<AppState>,
-    Path((session_id, asset)): Path<(String, String)>,
+    session_id: String,
+    asset: String,
     Query(query): Query<AssetQuery>,
 ) -> ApiResult<Response> {
     let hls = Arc::clone(&state.hls);

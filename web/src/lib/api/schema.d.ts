@@ -435,6 +435,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/sessions/{sessionId}/init.mp4": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * fMP4 init segment for a session
+         * @description The playlist points at the run-scoped `runs/{runId}/init.mp4`, so this is the shape a client holding an older URI asks for. It is a path of its own rather than one value of the asset capture below because that capture is cookie-accepted and the router cannot otherwise say which names it covers (issue #96).
+         */
+        get: operations["getSessionInit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/sessions/{sessionId}/{asset}": {
         parameters: {
             query?: never;
@@ -442,7 +462,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** HLS init segment or media segment for a session */
+        /** HLS media segment for a session */
         get: operations["getSessionAsset"];
         put?: never;
         post?: never;
@@ -2362,6 +2382,46 @@ export interface operations {
             };
         };
     };
+    getSessionInit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Init segment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "video/mp4": string;
+                };
+            };
+            /** @description Session or init segment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Init not ready yet */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getSessionAsset: {
         parameters: {
             query?: {
@@ -2371,6 +2431,7 @@ export interface operations {
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];
+                /** @description A time-keyed media segment name (ADR-0020). The server serves this and `init.mp4` above and nothing else; the pattern is the contract the router cannot express, since axum will not route a segment that mixes static text with a parameter. */
                 asset: string;
             };
             cookie?: never;

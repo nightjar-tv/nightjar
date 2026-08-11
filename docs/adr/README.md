@@ -51,7 +51,7 @@ not here — this page is the reference, not the tour.
 | [0031](0031-tmdb-api-key-and-attribution.md) | TMDB API key distribution and attribution | Accepted | — | — |
 | [0032](0032-multi-exact-collision-order.md) | Multi-exact collision resolution order | Accepted (amended 2×) | — | — |
 | [0033](0033-series-identity.md) | Durable series identity | Accepted | — | — |
-| [0034](0034-accounts-and-profiles.md) | Accounts and profiles | Partially superseded | — | item 2 by [0040](0040-account-roles.md) |
+| [0034](0034-accounts-and-profiles.md) | Accounts and profiles | Partially superseded (amended 2026-08-11) | — | item 2 by [0040](0040-account-roles.md) |
 | [0035](0035-watch-state-and-continue-watching.md) | Watch state and continue-watching | Accepted | — | — |
 | [0036](0036-playback-events.md) | Playback events (writer only in v1) | Accepted, condition unverified — item 1 | — | — |
 | [0037](0037-kids-scoping-and-overrides.md) | Kids scoping and parent overrides | Accepted | [0026](0026-metadata-pipeline.md) §8.4 item 3 | — |

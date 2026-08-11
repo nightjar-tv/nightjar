@@ -129,9 +129,22 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/sessions/{session_id}",
             get(sessions::get).delete(sessions::delete),
         )
+        // Issue #96, as far as the router can take it. A session serves exactly
+        // two shapes — `init.mp4` and `seg_<start_ms>.m4s` — and the first is
+        // now a static route rather than one value of a capture. The second
+        // cannot be expressed: axum rejects a segment that mixes static text
+        // with a parameter ("Only one parameter is allowed per path segment"),
+        // so `seg_{start_ms}.m4s` is not a pattern this router can hold. What
+        // closes the remaining capture is a test over the served set
+        // (`hls::is_safe_asset`), which fails if that handler grows a third
+        // shape — see the issue for the wire-change option and why it waits.
+        .route(
+            "/api/v0/sessions/{session_id}/init.mp4",
+            get(sessions::session_init),
+        )
         .route(
             "/api/v0/sessions/{session_id}/{asset}",
-            get(sessions::asset),
+            get(sessions::segment),
         )
         // ADR-0034 item 11. `route_layer`, not `layer`: it runs only once
         // routing has resolved a handler, so every route above is behind it
@@ -334,6 +347,11 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
     (
         "DELETE",
         "/api/v0/sessions/{session_id}",
+        Authority::AnySession,
+    ),
+    (
+        "GET",
+        "/api/v0/sessions/{session_id}/init.mp4",
         Authority::AnySession,
     ),
     (
@@ -841,7 +859,7 @@ mod route_authority_tests {
     }
 }
 
-/// B2-2 step 4. The cookie reaches exactly eight routes on the real router.
+/// B2-2 step 4. The cookie reaches exactly nine routes on the real router.
 #[cfg(test)]
 mod cookie_surface_tests {
     use super::*;
@@ -858,7 +876,7 @@ mod cookie_surface_tests {
     /// fix routes, the specific case an `/api/v0/items/` prefix would have
     /// admitted silently.
     #[tokio::test]
-    async fn only_the_eight_accept_a_cookie() {
+    async fn only_the_nine_accept_a_cookie() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_support::state(dir.path());
 
@@ -1024,7 +1042,7 @@ mod openapi_security_tests {
         }
     }
 
-    /// And `cookieAuth` appears on exactly the eight the extractor accepts, so
+    /// And `cookieAuth` appears on exactly the nine the extractor accepts, so
     /// a client reading the spec cannot conclude the cookie works on a route
     /// where it will be refused.
     #[test]
