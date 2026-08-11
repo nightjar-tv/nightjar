@@ -13,7 +13,7 @@ use nightjar_core::{
     title_looks_sdh,
 };
 use nightjar_db::{MediaItemRow, SidecarRow, resolve_media_path};
-use nightjar_metadata::{ArtworkKind, ItemMetadata, item_metadata};
+use nightjar_metadata::{ArtworkKind, ItemMetadata, item_metadata, rating_max};
 use nightjar_transcode::{
     TrackReadiness, is_burn_in_sidecar_format, is_serveable_sidecar_format, list_audio_tracks,
     list_burn_in_subtitles, list_text_subtitles, stored_webvtt,
@@ -96,6 +96,14 @@ pub struct MediaItemDetailDto {
     pub show_title: Option<String>,
 }
 
+/// One rating, with the scale it is expressed against when that is known.
+///
+/// `max` is present because `value` alone is not renderable: the dogfood
+/// library returns `tomatometerallcritics` on 0–100 in the same array as `imdb`
+/// on 0–10, and a client given two bare numbers can only guess or mislead.
+/// Absent `max` means the scale is unknown for that source — `default`, the
+/// NFO's unnamed `<rating>`, is the one that reaches it — and a client must
+/// then show the number without implying a denominator.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RatingDto {
@@ -103,6 +111,8 @@ pub struct RatingDto {
     pub value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub votes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -225,6 +235,7 @@ fn to_detail_dto(row: MediaItemRow, library_root: &str, meta: ItemMetadata) -> M
             .ratings
             .into_iter()
             .map(|r| RatingDto {
+                max: rating_max(&r.source),
                 source: r.source,
                 value: r.value,
                 votes: r.votes,

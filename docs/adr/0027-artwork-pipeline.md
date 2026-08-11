@@ -208,6 +208,30 @@ worth seeing. A plausible mechanism was fitted to a number without checking
 that the number meant what it appeared to mean, and the mechanism fitted was
 the one this ADR itself describes, which is exactly what made it convincing.
 
+**§6's advertisement was narrower than the serve path, so "this title has none"
+was false for 325 files** (recorded 2026-08-11, fixed the same day).
+
+`GET /items/{id}` read the canonical row for the key it was asked about, while
+`GET /artwork/{itemKey}/{kind}` used a resolver that also follows a path key to
+the item's provisional `tmdb:show:` link (ADR-0026 §8.4). Both answer "what art
+does this item have", and they answered differently. On the dogfood library the
+gap was every TV file matched at show level but not season-bound: the detail
+response carried no `artwork` array while the artwork route returned a 580 KB
+poster and a 212 KB backdrop for the same item on request. Measured after the
+fix: of 325 TV files with no episode identity, 272 now advertise art that
+serves, and the 53 that still advertise none 404 on the serve path, so the two
+agree in both directions.
+
+The amendment above is what made this a defect rather than a gap. Once absence
+from the array means "none exists", an advertisement narrower than the serve
+path is not an incomplete feature — it is a wrong answer, and wrong in the
+direction that hides images the server is holding and would have served. Fixed
+by giving the detail projection the same resolver, which also means the
+advertised URL now names the key the bytes are cached under.
+
+Same shape as the `starts_with('/')` bug above: a reader narrower than the
+data, in a place where nothing compared the two readers against each other.
+
 ## Open, and deliberately not decided here
 
 **Sizing, format and quality are one decision.** Measured originals: movie

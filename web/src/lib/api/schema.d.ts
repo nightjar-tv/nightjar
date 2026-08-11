@@ -980,6 +980,11 @@ export interface components {
             value: number;
             /** Format: int64 */
             votes?: number | null;
+            /**
+             * Format: double
+             * @description The maximum `value` is expressed against, when the scale of that source is known: 10 for imdb / themoviedb / tmdb, 100 for tomatometerallcritics. **Absent means unknown, and a client must not assume a scale** — render the number without a denominator. `default`, the NFO's unnamed rating, is the source that reaches this. The field exists because one array can carry a 0-100 score beside a 0-10 one, which no client can render honestly from `value` alone.
+             */
+            max?: number | null;
         };
         CastMember: {
             name: string;
