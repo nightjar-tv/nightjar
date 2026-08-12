@@ -143,7 +143,14 @@ fn is_combining_mark(c: char) -> bool {
     matches!(c, '\u{0300}'..='\u{036F}')
 }
 
-/// Map common Latin diacritics to ASCII (dogfood set; no unicode-norm crate).
+/// Map common Latin diacritics to ASCII (no unicode-norm crate).
+///
+/// Covers Latin-1 Supplement and Latin Extended-A. The combining-mark path
+/// above already handles decomposed input, so the table's job is the
+/// *precomposed* form — which is the side a provider payload arrives in.
+/// `ō` is U+014D, so a Latin-1-only table folded a decomposed library title to
+/// `shogun` and left TMDB's precomposed name as `shōgun`: the two forms of one
+/// title produced two keys and never met.
 fn strip_diacritics(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -175,6 +182,46 @@ fn strip_diacritics(s: &str) -> String {
             '²' => "2",
             'Ð' => "D",
             'ð' => "d",
+            'Ā' | 'Ă' | 'Ą' => "A",
+            'ā' | 'ă' | 'ą' => "a",
+            'Ć' | 'Ĉ' | 'Ċ' | 'Č' => "C",
+            'ć' | 'ĉ' | 'ċ' | 'č' => "c",
+            'Ď' | 'Đ' => "D",
+            'ď' | 'đ' => "d",
+            'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' => "E",
+            'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+            'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' => "G",
+            'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+            'Ĥ' | 'Ħ' => "H",
+            'ĥ' | 'ħ' => "h",
+            'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' => "I",
+            'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+            'Ĳ' => "IJ",
+            'ĳ' => "ij",
+            'Ĵ' => "J",
+            'ĵ' => "j",
+            'Ķ' => "K",
+            'ķ' | 'ĸ' => "k",
+            'Ĺ' | 'Ļ' | 'Ľ' | 'Ŀ' | 'Ł' => "L",
+            'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+            'Ń' | 'Ņ' | 'Ň' | 'Ŋ' => "N",
+            'ń' | 'ņ' | 'ň' | 'ŉ' | 'ŋ' => "n",
+            'Ō' | 'Ŏ' | 'Ő' => "O",
+            'ō' | 'ŏ' | 'ő' => "o",
+            'Ŕ' | 'Ŗ' | 'Ř' => "R",
+            'ŕ' | 'ŗ' | 'ř' => "r",
+            'Ś' | 'Ŝ' | 'Ş' | 'Š' => "S",
+            'ś' | 'ŝ' | 'ş' | 'š' | 'ſ' => "s",
+            'Ţ' | 'Ť' | 'Ŧ' => "T",
+            'ţ' | 'ť' | 'ŧ' => "t",
+            'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' => "U",
+            'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+            'Ŵ' => "W",
+            'ŵ' => "w",
+            'Ŷ' | 'Ÿ' => "Y",
+            'ŷ' => "y",
+            'Ź' | 'Ż' | 'Ž' => "Z",
+            'ź' | 'ż' | 'ž' => "z",
             other => {
                 out.push(other);
                 continue;
@@ -630,6 +677,43 @@ mod tests {
             fold_title_orthography("Léon The Professional"),
             "Leon The Professional"
         );
+    }
+
+    #[test]
+    fn latin_extended_a_folds_to_the_same_key_in_both_forms() {
+        // The failure this closes: a provider name arrives precomposed and a
+        // macOS path arrives decomposed, so one title produced two keys.
+        let precomposed = "Sh\u{014d}gun";
+        let decomposed = "Sho\u{0304}gun";
+        assert_ne!(
+            precomposed, decomposed,
+            "the two forms must differ, or this test proves nothing"
+        );
+        assert_eq!(fold_title_orthography(precomposed), "Shogun");
+        assert_eq!(fold_title_orthography(decomposed), "Shogun");
+        assert_eq!(
+            crate::match_score::norm_key(precomposed),
+            crate::match_score::norm_key(decomposed)
+        );
+    }
+
+    #[test]
+    fn ascii_titles_are_untouched_by_the_extended_fold() {
+        // Expected values are written out rather than compared against another
+        // call of the same function: an ASCII control that asserts f(x) == f(x)
+        // cannot fail and would prove nothing about the table.
+        for (input, want) in [
+            ("Shogun", "Shogun"),
+            ("The Sopranos", "The Sopranos"),
+            ("Star Trek - Deep Space Nine", "Star Trek Deep Space Nine"),
+            ("Will & Grace", "Will and Grace"),
+        ] {
+            assert_eq!(
+                fold_title_orthography(input),
+                want,
+                "ASCII control {input:?}"
+            );
+        }
     }
 
     #[test]

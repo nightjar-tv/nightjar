@@ -1031,8 +1031,8 @@ mod tests {
                    (provider, kind, query_key, reason, confidence, attempt_count,
                     attempted_at, next_retry_at, cleaner_version)
                  VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 3,
-                         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
-                params![key],
+                         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', ?2)",
+                params![key, negative_cache::CLEANER_VERSION],
             )
             .unwrap();
         }
@@ -1169,8 +1169,8 @@ mod tests {
                    (provider, kind, query_key, reason, confidence, attempt_count,
                     attempted_at, next_retry_at, cleaner_version)
                  VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 3,
-                         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
-                params![key],
+                         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', ?2)",
+                params![key, negative_cache::CLEANER_VERSION],
             )
             .unwrap();
         }
@@ -1293,8 +1293,8 @@ mod tests {
                (provider, kind, query_key, reason, confidence, attempt_count,
                 attempted_at, next_retry_at, cleaner_version)
              VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 2,
-                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
-            params![qk],
+                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', ?2)",
+            params![qk, negative_cache::CLEANER_VERSION],
         )
         .unwrap();
         // A series-id miss (ADR-0033 Q4: identified folders cache under their
@@ -1304,8 +1304,11 @@ mod tests {
                (provider, kind, query_key, reason, confidence, attempt_count,
                 attempted_at, next_retry_at, cleaner_version)
              VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 2,
-                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
-            params![negative_cache::series_cache_key(55)],
+                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', ?2)",
+            params![
+                negative_cache::series_cache_key(55),
+                negative_cache::CLEANER_VERSION
+            ],
         )
         .unwrap();
 
@@ -1467,8 +1470,8 @@ mod tests {
                (provider, kind, query_key, reason, confidence, attempt_count,
                 attempted_at, next_retry_at, cleaner_version)
              VALUES ('tmdb', 'tv', ?1, 'below_threshold', 0.72, 2,
-                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', 1)",
-            params![sibling_qk],
+                     '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z', ?2)",
+            params![sibling_qk, negative_cache::CLEANER_VERSION],
         )
         .unwrap();
 
