@@ -1,9 +1,77 @@
-//! ADR-0025 §5 item_key migrator (watch state + playback events).
+//! Key migrators: ADR-0025 §5 for `item_key`, ADR-0039 item 7 for
+//! `series_key`.
 //!
-//! No-op when those tables do not exist yet (Block 2). Assign/clear always
-//! call this so the path is one (Rule 4.11) when watch state lands.
+//! Both no-op while their tables do not exist yet (Block 2). Every caller runs
+//! them anyway so the path is one (Rule 4.11) when those tables land. Two
+//! functions rather than one because they rewrite different tables — a movie
+//! assign runs both over the same value, which is exactly the case that would
+//! make merging them look reasonable and would then hide which table each rule
+//! applies to.
 
 use rusqlite::{Connection, OptionalExtension, params};
+
+/// Rewrite `series_key` on every table keyed by it (ADR-0039 item 7).
+///
+/// **The tables this rewrites do not exist yet, and the list is here rather
+/// than at each future call site so there is one place to add them.**
+/// `profile_track_choice` arrives with B2-8 and the kids override table with
+/// B2-6. Until then this is reached, finds nothing, and reports that it found
+/// nothing — which is different from not being called.
+///
+/// **Merge on collision, which is the common case rather than the exotic one.**
+/// Two folders can bind the same show (a split library, or extras in a sibling
+/// directory), so two keys arrive at one and collide on
+/// `(profile_id, series_key)`:
+///
+/// - `profile_track_choice`: newer `updated_at` wins. There is no ratio to
+///   compare the way ADR-0025 §5 compares position, and a preference has no
+///   partial state.
+/// - Kids overrides: the **more restrictive** entry survives. That is ADR-0037
+///   item 6's precedence — blocked, then allowed, then the ladder — applied to
+///   a merge rather than a second ordering invented here.
+///
+/// **Unbind does not call this.** ADR-0028 clear-match returns a folder to a
+/// `folder:` key and the rows stay on `tmdb:show:{id}`, because rewriting them
+/// would be wrong while a second folder is still bound to that show, and
+/// re-binding the same folder reattaches them for free.
+pub fn migrate_series_keys(
+    conn: &Connection,
+    old_key: &str,
+    new_key: &str,
+) -> Result<SeriesMigrateReport, String> {
+    if old_key == new_key {
+        return Ok(SeriesMigrateReport::default());
+    }
+    let present: Vec<&str> = SERIES_KEYED_TABLES
+        .iter()
+        .copied()
+        .filter(|t| table_exists(conn, t).unwrap_or(false))
+        .collect();
+    if let Some(table) = present.first() {
+        // Unreachable until B2-6 and B2-8 add the tables, and it fails loudly
+        // rather than silently doing nothing. The merge rules above are what a
+        // writer implements here; writing them now, against a schema that does
+        // not exist, would be inventing the schema (Rule 4.9).
+        return Err(format!(
+            "series_key migration for {table} is unimplemented: the table exists, \
+             so the merge rule in this function's documentation now has to be written"
+        ));
+    }
+    Ok(SeriesMigrateReport {
+        tables_present: present.len(),
+    })
+}
+
+/// Every table keyed on `series_key`. Add here, not at a call site.
+const SERIES_KEYED_TABLES: &[&str] = &["profile_track_choice", "kids_overrides"];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SeriesMigrateReport {
+    /// How many of [`SERIES_KEYED_TABLES`] were present. Zero is the expected
+    /// value today and is reported rather than assumed, so a caller can tell
+    /// "nothing to move" from "never ran".
+    pub tables_present: usize,
+}
 
 /// Rewrite `item_key` on watch/playback tables from `old_keys` → `new_key`.
 ///
@@ -205,6 +273,27 @@ fn migrate_events(conn: &Connection, old_key: &str, new_key: &str) -> Result<usi
 
 #[cfg(test)]
 mod tests {
+
+    /// ADR-0039 item 7. The tables land with B2-6 and B2-8, so today this
+    /// finds nothing — and reports that it found nothing, which is a different
+    /// fact from never having been called. Without the count, a future reader
+    /// cannot tell a working migrator from an unwired one.
+    #[test]
+    fn series_key_migration_reports_that_no_keyed_table_exists_yet() {
+        let c = Connection::open_in_memory().unwrap();
+        let r = migrate_series_keys(&c, "folder:1:Alpha", "tmdb:show:55").unwrap();
+        assert_eq!(r.tables_present, 0);
+    }
+
+    /// A bind that does not change the key is not a migration. This is the
+    /// common case on a re-match to the same show, and it must not be counted
+    /// or logged as a rewrite.
+    #[test]
+    fn series_key_migration_is_a_no_op_when_the_key_is_unchanged() {
+        let c = Connection::open_in_memory().unwrap();
+        let r = migrate_series_keys(&c, "tmdb:show:55", "tmdb:show:55").unwrap();
+        assert_eq!(r, SeriesMigrateReport::default());
+    }
     use super::*;
     use nightjar_db::migrate;
 

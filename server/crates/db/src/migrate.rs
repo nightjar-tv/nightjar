@@ -57,6 +57,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         20,
         include_str!("../migrations/020_accounts_profiles_sessions.sql"),
     ),
+    (
+        21,
+        include_str!("../migrations/021_series_binding_without_entity.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -87,6 +91,11 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         };
         let before_sidecars = if version == 6 || version == 12 {
             count_table(conn, "media_item_sidecars")?
+        } else {
+            0
+        };
+        let before_series = if version == 21 {
+            count_table(conn, "series")?
         } else {
             0
         };
@@ -130,6 +139,18 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
 
         if version == 16 {
             derive_series_rows(&tx)?;
+        }
+
+        // 021 rebuilds `series` to drop a NOT NULL. A rebuild is the one
+        // migration shape that can silently lose rows, so it is counted either
+        // side, the same guard 012 carries.
+        if version == 21 {
+            let after_series = count_table(&tx, "series")?;
+            if after_series != before_series {
+                return Err(format!(
+                    "migration 21 aborted: series count {before_series} -> {after_series}"
+                ));
+            }
         }
 
         tx.execute(
@@ -298,7 +319,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 20);
+        assert_eq!(v, 21);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -728,6 +749,106 @@ mod tests {
     /// 016 (RC8): one-shot series-row derive (ADR-0033 Q5). Ready episodes
     /// with episode links produce one row per show folder — `Season N/` and
     /// `Specials/` inherit the folder. Re-running the derive is a no-op.
+    /// Apply migrations up to and including `through`, so a rebuild can be
+    /// tested against a database that already holds rows.
+    fn migrate_through(conn: &Connection, through: i64) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS {
+            if version > through {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+    }
+
+    /// ADR-0039 item 3. The rebuild is the one migration shape that can lose
+    /// rows silently, so this is the dogfood-shaped case: rows already present,
+    /// bound, and they must all survive with their bindings intact.
+    #[test]
+    fn migration_21_keeps_every_series_row_and_allows_a_null_binding() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate_through(&c, 20);
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES
+               (1, 'Shameless (US) (2011)', 34343),
+               (1, 'Shameless (UK) (2004)', 20610),
+               (1, 'Alpha', 55);",
+        )
+        .unwrap();
+        let before = count_table(&c, "series").unwrap();
+
+        migrate(&c).unwrap();
+
+        assert_eq!(count_table(&c, "series").unwrap(), before, "no row lost");
+        let mut stmt = c
+            .prepare("SELECT relpath, tmdb_show_id FROM series ORDER BY relpath")
+            .unwrap();
+        let rows: Vec<(String, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Alpha".to_string(), Some(55)),
+                ("Shameless (UK) (2004)".to_string(), Some(20610)),
+                ("Shameless (US) (2011)".to_string(), Some(34343)),
+            ],
+            "every binding survives the rebuild"
+        );
+
+        // The point of the rebuild: a folder can now have a row and no entity.
+        c.execute(
+            "INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Unbound', NULL)",
+            [],
+        )
+        .unwrap();
+        let unbound: Option<i64> = c
+            .query_row(
+                "SELECT tmdb_show_id FROM series WHERE relpath = 'Unbound'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unbound, None);
+    }
+
+    /// The cascade and the primary key are carried over by the rebuild, not
+    /// re-stated by luck. Both would be easy to drop while copying the DDL.
+    #[test]
+    fn migration_21_keeps_the_primary_key_and_the_cascade() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO libraries (name, path, kind) VALUES ('S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 55);",
+        )
+        .unwrap();
+        let dup = c.execute(
+            "INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 99)",
+            [],
+        );
+        assert!(dup.is_err(), "(library_id, relpath) is still unique");
+
+        c.execute("DELETE FROM libraries WHERE id = 1", []).unwrap();
+        assert_eq!(
+            count_table(&c, "series").unwrap(),
+            0,
+            "the row cascades with its library"
+        );
+    }
+
     #[test]
     fn migration_16_derives_series_rows_and_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
