@@ -252,6 +252,7 @@ fn main() {
         };
         let n = ids.len();
         let library = LibrarySeriesShape {
+            folder_seasons: Vec::new(),
             year: key.library_year,
             episode_count: key.episode_count,
             season_count: key.season_count,

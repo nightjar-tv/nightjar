@@ -57,6 +57,12 @@ pub struct LibrarySeriesShape {
     pub episode_count: Option<u32>,
     /// Distinct season numbers present (excludes null).
     pub season_count: Option<u32>,
+    /// The season numbers the **folder** asserts, season 0 already excluded.
+    /// Not the same thing as `season_count`: the count is a pin signal that
+    /// must equal a candidate's, this is the set a candidate must be able to
+    /// hold. Empty means the folder asserts nothing and no coverage evidence
+    /// exists.
+    pub folder_seasons: Vec<i32>,
     /// ADR-0032 reference episode (usable after-token title only).
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
@@ -67,11 +73,79 @@ pub struct LibrarySeriesShape {
 pub const EPISODE_TITLE_TIE_CAP: usize = 5;
 
 /// Per-candidate extras (search year always; counts from `/tv/{id}` detail).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CandidateShape {
     pub year: Option<i32>,
     pub episode_count: Option<u32>,
     pub season_count: Option<u32>,
+    /// Season numbers from the `seasons[]` array of the `/tv/{id}` payload the
+    /// collision tier already fetches. `None` means not fetched, which is not
+    /// evidence about the candidate either way.
+    pub season_numbers: Option<Vec<i32>>,
+}
+
+/// Can this candidate hold every season the folder asserts?
+///
+/// `Some(true)` it can, `Some(false)` it demonstrably cannot, `None` there is
+/// no evidence — an unfetched season list must never read as either answer.
+/// One-directional by construction: at least, never exactly, so a library one
+/// season behind a running show still covers.
+pub fn candidate_covers_folder_seasons(
+    shape: &CandidateShape,
+    folder_seasons: &[i32],
+) -> Option<bool> {
+    if folder_seasons.is_empty() {
+        return None;
+    }
+    let have = shape.season_numbers.as_deref()?;
+    Some(folder_seasons.iter().all(|want| have.contains(want)))
+}
+
+/// Season coverage as **promotion evidence for the year pin, never a gate.**
+///
+/// The year selected a candidate that cannot hold the folder — the folder says
+/// `(2003)`, the two-episode 2003 miniseries aired 2003, both facts correct and
+/// the answer wrong. If exactly one other title-exact candidate demonstrably
+/// can hold it, that candidate wins.
+///
+/// Three rules keep this from becoming the gate that was measured destroying
+/// 338 correct bindings to catch 6:
+///
+/// - It only ever **moves** a pick between candidates. It cannot reject a
+///   candidate set, cannot lower a score below the floor, and cannot unmatch a
+///   folder — with no better candidate the year's pick stands.
+/// - Unknown coverage is **no evidence**. A candidate whose seasons were never
+///   fetched neither promotes nor demotes, and the year's pick is only
+///   displaced when its own list is present and short.
+/// - **Ambiguity keeps the year.** Two candidates that both cover mean the
+///   evidence does not discriminate, so nothing moves.
+fn coverage_beats_year<'a>(
+    chosen: &SearchHit,
+    exact: &[&'a SearchHit],
+    shapes: Option<&[CandidateShape]>,
+    folder_seasons: &[i32],
+) -> Option<&'a SearchHit> {
+    let shapes = shapes?;
+    if shapes.len() != exact.len() {
+        return None;
+    }
+    let chosen_i = exact.iter().position(|h| h.id == chosen.id)?;
+    if candidate_covers_folder_seasons(&shapes[chosen_i], folder_seasons) != Some(false) {
+        return None;
+    }
+    let mut winner: Option<&SearchHit> = None;
+    for (i, h) in exact.iter().enumerate() {
+        if i == chosen_i {
+            continue;
+        }
+        if candidate_covers_folder_seasons(&shapes[i], folder_seasons) == Some(true) {
+            if winner.is_some() {
+                return None;
+            }
+            winner = Some(h);
+        }
+    }
+    winner
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -354,7 +428,10 @@ pub fn score_search_with_shape(
     let (hit, conf, method) = if !exact_year.is_empty() {
         let hit = exact_year[0];
         let conf = if exact_year.len() == 1 { 0.98 } else { 0.80 };
-        (hit, conf, "exact_title_year")
+        match coverage_beats_year(hit, &exact, candidate_shapes, &library.folder_seasons) {
+            Some(better) => (better, 0.90, "exact_title_season_coverage"),
+            None => (hit, conf, "exact_title_year"),
+        }
     } else if !exact.is_empty() && year.is_some() {
         let y = year.unwrap();
         let hit = exact
@@ -369,8 +446,7 @@ pub fn score_search_with_shape(
             .iter()
             .map(|h| CandidateShape {
                 year: row_year(h, kind),
-                episode_count: None,
-                season_count: None,
+                ..Default::default()
             })
             .collect();
         let shapes = match candidate_shapes {
@@ -556,11 +632,13 @@ mod tests {
                 year: Some(2005),
                 episode_count: Some(327),
                 season_count: Some(15),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(2025),
                 episode_count: Some(8),
                 season_count: Some(1),
+                season_numbers: None,
             },
         ];
         let m = score_search_with_shape(
@@ -591,11 +669,13 @@ mod tests {
                 year: Some(2019),
                 episode_count: Some(40),
                 season_count: Some(5),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(1997),
                 episode_count: Some(40),
                 season_count: Some(1),
+                season_numbers: None,
             },
         ];
         let m = score_search_with_shape(
@@ -624,11 +704,13 @@ mod tests {
                 year: Some(2000),
                 episode_count: Some(40),
                 season_count: Some(1),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(2010),
                 episode_count: Some(40),
                 season_count: Some(1),
+                season_numbers: None,
             },
         ];
         let m = score_search_with_shape(
@@ -659,11 +741,13 @@ mod tests {
                 year: Some(2001),
                 episode_count: Some(181),
                 season_count: Some(9),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(2026),
                 episode_count: Some(12),
                 season_count: Some(2),
+                season_numbers: None,
             },
         ];
         let m = score_search_with_shape(
@@ -695,11 +779,13 @@ mod tests {
                 year: Some(2004),
                 episode_count: Some(73),
                 season_count: Some(4),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(2003),
                 episode_count: Some(2),
                 season_count: Some(1),
+                season_numbers: None,
             },
         ];
         let m = score_search_with_shape(
@@ -751,11 +837,13 @@ mod tests {
                 year: None,
                 episode_count: Some(0),
                 season_count: Some(0),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(2023),
                 episode_count: Some(3),
                 season_count: Some(1),
+                season_numbers: None,
             },
         ];
         let m = score_search_with_shape(
@@ -783,6 +871,7 @@ mod tests {
             year: Some(2000),
             episode_count: Some(0),
             season_count: Some(0),
+            season_numbers: None,
         }];
         let m = score_search_with_shape(
             &results,
@@ -860,16 +949,19 @@ mod tests {
                 year: Some(2004),
                 episode_count: Some(73),
                 season_count: Some(4),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(2003),
                 episode_count: Some(2),
                 season_count: Some(1),
+                season_numbers: None,
             },
             CandidateShape {
                 year: Some(1978),
                 episode_count: Some(24),
                 season_count: Some(1),
+                season_numbers: None,
             },
         ];
         let c = score_search_with_shape(
@@ -889,6 +981,182 @@ mod tests {
             "library-year pin still selects the 2003 entity"
         );
         assert_eq!(c.method, "exact_title_library_year");
+    }
+
+    fn shape(year: i32, seasons: &[i32]) -> CandidateShape {
+        CandidateShape {
+            year: Some(year),
+            episode_count: None,
+            season_count: Some(seasons.len() as u32),
+            season_numbers: Some(seasons.to_vec()),
+        }
+    }
+
+    /// The year is correct and decisive, and must stay decisive: the candidate
+    /// it picks also covers the folder, so coverage has nothing to say.
+    #[test]
+    fn coverage_leaves_a_correct_year_pin_alone() {
+        let hits = vec![tv(10, "Test Show", 1998), tv(11, "Test Show", 2017)];
+        let shapes = [shape(1998, &[1, 2, 3]), shape(2017, &[1, 2, 3])];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(1998),
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: Some(1998),
+                folder_seasons: vec![1, 2, 3],
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 10);
+        assert_eq!(c.method, "exact_title_year");
+        assert!((c.confidence - 0.98).abs() < f64::EPSILON);
+    }
+
+    /// The year is correct about the year and wrong about the scope: a
+    /// two-episode same-year entity against a folder asserting four seasons.
+    #[test]
+    fn coverage_beats_a_year_pin_that_cannot_hold_the_folder() {
+        let hits = vec![
+            tv(1, "Test Show", 2004),
+            tv(2, "Test Show", 2003),
+            tv(3, "Test Show", 1978),
+        ];
+        let shapes = [
+            shape(2004, &[1, 2, 3, 4]),
+            shape(2003, &[1]),
+            shape(1978, &[1]),
+        ];
+        let lib = LibrarySeriesShape {
+            year: Some(2003),
+            folder_seasons: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib.clone(),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1, "the entity that can hold four seasons wins");
+        assert_eq!(c.method, "exact_title_season_coverage");
+        assert!(
+            meets_auto_match_floor(c.confidence),
+            "promotion must stay above the floor, not merely change the pick"
+        );
+
+        // Same inputs with no shapes: the year pin stands. Without this the
+        // test above could pass for the wrong reason.
+        let c2 = score_search_with_shape(&hits, "Test Show", Some(2003), SearchKind::Tv, lib, None)
+            .expect("a candidate");
+        assert_eq!(c2.tmdb_id, 2);
+        assert_eq!(c2.method, "exact_title_year");
+    }
+
+    /// Absent data is not a verdict. A candidate with no season list must not
+    /// be promoted over the year's pick, and a year pick with no season list
+    /// must not be displaced — the failure mode is a check that passes because
+    /// it cannot fail.
+    #[test]
+    fn an_unfetched_season_list_is_no_evidence_in_either_direction() {
+        let unknown = CandidateShape {
+            year: Some(2004),
+            episode_count: None,
+            season_count: None,
+            season_numbers: None,
+        };
+        assert_eq!(
+            candidate_covers_folder_seasons(&unknown, &[1, 2, 3, 4]),
+            None
+        );
+        assert_eq!(
+            candidate_covers_folder_seasons(&shape(2003, &[1]), &[]),
+            None,
+            "a folder asserting nothing yields no coverage evidence"
+        );
+        assert_eq!(
+            candidate_covers_folder_seasons(&shape(2004, &[1, 2, 3, 4, 5]), &[1, 2, 3]),
+            Some(true),
+            "at least, never exactly: a candidate ahead of the library still covers"
+        );
+
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let lib = LibrarySeriesShape {
+            year: Some(2003),
+            folder_seasons: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+
+        // Alternative unknown, year pick short: nothing to promote to.
+        let shapes = [unknown.clone(), shape(2003, &[1])];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib.clone(),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2, "an unfetched alternative never promotes");
+        assert_eq!(c.method, "exact_title_year");
+
+        // Year pick unknown, alternative covers: the year pick is not displaced
+        // on evidence it does not have.
+        let shapes = [
+            shape(2004, &[1, 2, 3, 4]),
+            CandidateShape {
+                year: Some(2003),
+                ..Default::default()
+            },
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2, "an unfetched year pick is not demoted");
+        assert_eq!(c.method, "exact_title_year");
+    }
+
+    /// Two candidates that both cover mean the evidence does not discriminate.
+    #[test]
+    fn ambiguous_coverage_keeps_the_year_pin() {
+        let hits = vec![
+            tv(1, "Test Show", 2004),
+            tv(2, "Test Show", 2003),
+            tv(3, "Test Show", 2010),
+        ];
+        let shapes = [
+            shape(2004, &[1, 2, 3, 4]),
+            shape(2003, &[1]),
+            shape(2010, &[1, 2, 3, 4]),
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: Some(2003),
+                folder_seasons: vec![1, 2, 3, 4],
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2);
+        assert_eq!(c.method, "exact_title_year");
     }
 
     /// The counterexample case: does the year still earn its place once it is
