@@ -34,6 +34,20 @@ impl MetadataSource for TmdbStub {
     }
 }
 
+/// Season numbers from a `/tv/{id}` payload's `seasons[]` array. `None` when
+/// the array is absent, which must read as "not fetched", never as "no
+/// seasons".
+pub fn season_numbers_from_detail(data: &Value) -> Option<Vec<i32>> {
+    Some(
+        data.get("seasons")?
+            .as_array()?
+            .iter()
+            .filter_map(|s| s.get("season_number")?.as_i64())
+            .map(|n| n as i32)
+            .collect(),
+    )
+}
+
 const MOVIE_APPEND: &str = "images,credits,videos,release_dates,external_ids";
 const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggregate_credits";
 const SEASON_APPEND: &str = "images,credits,videos,external_ids";
@@ -311,6 +325,7 @@ impl TmdbClient {
                 .get("number_of_seasons")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
+            season_numbers: season_numbers_from_detail(&data),
         })
     }
 
@@ -536,6 +551,7 @@ impl MetadataSource for TmdbClient {
                 year: input.library_year,
                 episode_count: input.library_episode_count,
                 season_count: input.library_season_count,
+                folder_seasons: input.library_seasons.clone(),
                 ref_season: input.ref_season,
                 ref_episode: input.ref_episode,
                 ref_episode_title: input.ref_episode_title.clone(),

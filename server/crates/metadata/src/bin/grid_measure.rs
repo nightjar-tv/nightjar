@@ -235,6 +235,7 @@ fn phase_a_fast(client: &TmdbClient, groups: &[Group]) -> FastReport {
             Kind::Tv => SearchKind::Tv,
         };
         let library = LibrarySeriesShape {
+            folder_seasons: Vec::new(),
             year: g.library_year,
             episode_count: g.episode_count,
             season_count: g.season_count,
