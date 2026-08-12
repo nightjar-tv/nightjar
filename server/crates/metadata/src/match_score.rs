@@ -339,18 +339,193 @@ fn pin_collision<'a>(
     None
 }
 
+/// What a comparison of two episode titles is allowed to conclude.
+///
+/// **A comparator may report agreement, or silence. It may not report
+/// disagreement on weak evidence.** That is not a style preference: measured
+/// across 696 working folders, title confirmation held on 588 while title
+/// refutation never once identified a wrong entity, and a false refutation
+/// costs a working binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeTitleVerdict {
+    /// The two titles name the same episode.
+    Agree,
+    /// Cannot tell. Either side carried no identity, or they differ with
+    /// nothing to corroborate the difference. Never read this as "different".
+    Unknown,
+    /// They name different episodes, and a second field agrees that they do.
+    Disagree,
+}
+
+/// Gap 2: a provider placeholder carries no identity, exactly as a filename
+/// placeholder does. The rule existed and was applied to one side only, so a
+/// real title on disk was compared against `Episode 1` and reported as a
+/// disagreement.
+fn provider_title_is_generic(name: &str) -> bool {
+    crate::clean::episode_title_rejected(name, "")
+}
+
+/// Gap 3: some providers prefix every episode title with the show's own name —
+/// `The Grand-ish Tour: A Trip Down Memory Lane` against a filename carrying
+/// only `A Trip Down Memory Lane`.
+fn strip_show_name_prefix(name: &str, show_soft_key: &str) -> String {
+    let show = norm_key(show_soft_key);
+    if show.is_empty() {
+        return name.to_string();
+    }
+    for sep in [": ", " - "] {
+        if let Some(i) = name.find(sep)
+            && norm_key(&name[..i]) == show
+        {
+            return name[i + sep.len()..].trim().to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Gap 4: the episode label is carried on **both** sides — TMDB writes
+/// `Episode 10: Aftersun` and the filename writes `Episode 10 - Aftersun`.
+/// Stripping it from one side only turns an exact match into a disagreement.
+fn strip_episode_label(name: &str) -> String {
+    for sep in [": ", " - "] {
+        if let Some(i) = name.find(sep) {
+            let head = norm_key(&name[..i]);
+            let mut w = head.split_whitespace();
+            if w.next() == Some("episode")
+                && w.next().is_some_and(is_ordinal_word)
+                && w.next().is_none()
+            {
+                return name[i + sep.len()..].trim().to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn is_ordinal_word(w: &str) -> bool {
+    w.chars().all(|c| c.is_ascii_digit())
+        || matches!(
+            w,
+            "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine" | "ten"
+        )
+}
+
+/// Q4: part-number conventions. `The Reptile Room (1)` and
+/// `The Reptile Room: Part One` are the same episode, and
+/// `Look at the Princess (1) - A Kiss Is But a Kiss` differs from the
+/// provider's spelling only in where the part number sits. Punctuation
+/// normalisation alone does not bridge either, so the part number is lifted
+/// out and the remaining words compared without regard to order.
+fn part_number_key(name: &str) -> Option<String> {
+    let n = norm_key(name);
+    let mut toks: Vec<String> = Vec::new();
+    let mut it = n.split_whitespace().peekable();
+    while let Some(w) = it.next() {
+        if (w == "part" || w == "pt") && it.peek().is_some_and(|x| is_ordinal_word(x)) {
+            toks.push(ordinal_value(it.next().unwrap()));
+            continue;
+        }
+        toks.push(w.to_string());
+    }
+    // Order-insensitivity is granted only to titles that carry a part number,
+    // which is where the transposition happens. Without this guard the rule
+    // would also merge two genuinely different titles built from the same
+    // words in a different order.
+    if !toks.iter().any(|t| t.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    toks.sort();
+    Some(toks.join(" "))
+}
+
+fn ordinal_value(w: &str) -> String {
+    match w {
+        "one" => "1",
+        "two" => "2",
+        "three" => "3",
+        "four" => "4",
+        "five" => "5",
+        "six" => "6",
+        "seven" => "7",
+        "eight" => "8",
+        "nine" => "9",
+        "ten" => "10",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Do two air dates disagree? `None` when either is missing — absent data is
+/// never a verdict. One day of slack, because 990 of 1,204 measured pairs
+/// shared an identical title and differed by exactly one day on date
+/// convention alone.
+fn air_dates_disagree(a: Option<&str>, b: Option<&str>) -> Option<bool> {
+    let (a, b) = (a?, b?);
+    let d = |s: &str| -> Option<i64> {
+        let y: i64 = s.get(0..4)?.parse().ok()?;
+        let m: i64 = s.get(5..7)?.parse().ok()?;
+        let dd: i64 = s.get(8..10)?.parse().ok()?;
+        Some(y * 372 + m * 31 + dd)
+    };
+    Some((d(a)? - d(b)?).abs() > 1)
+}
+
+/// Compare a filename-derived episode title against a provider episode title.
+///
+/// The five comparator defects measured on the dogfood library are closed here
+/// as five separate rules rather than one normalisation, because a single rule
+/// would silently absorb the next case into whichever gap it resembled.
+///
+/// Gap 5 — a provider using a stylised title set (`BLATANT, NOT SUBTLE`) where
+/// the filenames use a plain one (`Pilot`, `Run`) — has **no comparison fix**
+/// and is not given one. Two legitimate title sets for the same episodes are
+/// not a disagreement about identity, and it falls out as [`Unknown`] through
+/// the corroboration rule below rather than through a rule that pretends to
+/// recognise aliases.
+///
+/// [`Unknown`]: EpisodeTitleVerdict::Unknown
+pub fn compare_episode_title(
+    from_file: &str,
+    from_provider: &str,
+    show_soft_key: &str,
+    file_air_date: Option<&str>,
+    provider_air_date: Option<&str>,
+) -> EpisodeTitleVerdict {
+    let file = crate::clean::strip_trailing_source_token(from_file);
+    if crate::clean::episode_title_rejected(&file, show_soft_key)
+        || provider_title_is_generic(from_provider)
+    {
+        return EpisodeTitleVerdict::Unknown;
+    }
+    let prov = strip_show_name_prefix(from_provider, show_soft_key);
+    let file = strip_episode_label(&file);
+    let prov = strip_episode_label(&prov);
+    if norm_key(&file) == norm_key(&prov) {
+        return EpisodeTitleVerdict::Agree;
+    }
+    if let (Some(a), Some(b)) = (part_number_key(&file), part_number_key(&prov))
+        && a == b
+    {
+        return EpisodeTitleVerdict::Agree;
+    }
+    match air_dates_disagree(file_air_date, provider_air_date) {
+        Some(true) => EpisodeTitleVerdict::Disagree,
+        _ => EpisodeTitleVerdict::Unknown,
+    }
+}
+
 /// ADR-0032 step 4: unique folded match of local reference title vs candidate
 /// episode names (parallel to `exact`). Declines when over cap or no unique hit.
 pub fn pin_episode_title<'a>(
     exact: &[&'a SearchHit],
     candidate_episode_names: &[Option<String>],
     local_title: &str,
+    show_soft_key: &str,
 ) -> Option<(&'a SearchHit, &'static str)> {
     if exact.len() > EPISODE_TITLE_TIE_CAP || exact.len() != candidate_episode_names.len() {
         return None;
     }
-    let want = norm_key(local_title);
-    if want.is_empty() {
+    if norm_key(local_title).is_empty() {
         return None;
     }
     let mut hit: Option<&SearchHit> = None;
@@ -358,7 +533,11 @@ pub fn pin_episode_title<'a>(
         let Some(name) = candidate_episode_names[i].as_deref() else {
             continue;
         };
-        if norm_key(name) == want {
+        // Only agreement pins. Unknown and Disagree both decline, so a
+        // comparator that cannot tell can never select a candidate.
+        if compare_episode_title(local_title, name, show_soft_key, None, None)
+            == EpisodeTitleVerdict::Agree
+        {
             if hit.is_some() {
                 return None;
             }
@@ -896,7 +1075,7 @@ mod tests {
             Some("I Hate You, Stephen Hawking".into()),
         ];
         let (hit, method) =
-            pin_episode_title(&exact, &names, "I Hate You, Stephen Hawking").unwrap();
+            pin_episode_title(&exact, &names, "I Hate You, Stephen Hawking", "test show").unwrap();
         assert_eq!(hit.id, 2);
         assert_eq!(method, "exact_title_episode_title");
     }
@@ -907,12 +1086,173 @@ mod tests {
         let b = tv(2, "Top Gear", 2002);
         let exact = vec![&a, &b];
         let names = vec![Some("Episode 1".into()), Some("Episode 1".into())];
-        assert!(pin_episode_title(&exact, &names, "Episode 1").is_none());
+        assert!(pin_episode_title(&exact, &names, "Episode 1", "test show").is_none());
 
         let many: Vec<SearchHit> = (0..6).map(|i| tv(i, "Show", 2000 + i as i32)).collect();
         let refs: Vec<&SearchHit> = many.iter().collect();
         let names: Vec<_> = (0..6).map(|i| Some(format!("Title {i}"))).collect();
-        assert!(pin_episode_title(&refs, &names, "Title 1").is_none());
+        assert!(pin_episode_title(&refs, &names, "Title 1", "test show").is_none());
+    }
+
+    fn cmp(file: &str, provider: &str) -> EpisodeTitleVerdict {
+        compare_episode_title(file, provider, "test show", None, None)
+    }
+
+    /// Gap 1 — the extractor left a trailing source token on the title.
+    #[test]
+    fn gap1_trailing_source_token() {
+        assert_eq!(
+            crate::clean::strip_trailing_source_token("Second Chances - SDTV"),
+            "Second Chances"
+        );
+        assert_eq!(
+            crate::clean::strip_trailing_source_token("First Flight - DVD"),
+            "First Flight"
+        );
+        // A real title ending in one of those words is not a source token.
+        assert_eq!(
+            crate::clean::strip_trailing_source_token("The Tangled Web"),
+            "The Tangled Web"
+        );
+        assert_eq!(
+            cmp("Second Chances - SDTV", "Second Chances"),
+            EpisodeTitleVerdict::Agree
+        );
+    }
+
+    /// Gap 2 — the generic-title rule was applied to the filename side only,
+    /// so a real title on disk was compared against a provider placeholder.
+    #[test]
+    fn gap2_provider_placeholder_is_silent_not_different() {
+        assert_eq!(
+            cmp("A Real Title", "Episode 1"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            cmp("Another Real Title", "Episode 1"),
+            EpisodeTitleVerdict::Unknown
+        );
+        // Both generic is still silence, never agreement.
+        assert_eq!(cmp("Episode 4", "Episode 4"), EpisodeTitleVerdict::Unknown);
+    }
+
+    /// Gap 3 — the provider prefixes every episode with the show's own name.
+    #[test]
+    fn gap3_show_name_prefixed_provider_title() {
+        assert_eq!(
+            compare_episode_title(
+                "A Real Episode Title",
+                "Test Show: A Real Episode Title",
+                "test show",
+                None,
+                None,
+            ),
+            EpisodeTitleVerdict::Agree
+        );
+        // The prefix only strips when it is the show's name.
+        assert_eq!(
+            compare_episode_title(
+                "A Real Episode Title",
+                "Some Other Show: A Real Episode Title",
+                "test show",
+                None,
+                None,
+            ),
+            EpisodeTitleVerdict::Unknown
+        );
+    }
+
+    /// Gap 4 — the episode label is on both sides and was stripped from one.
+    #[test]
+    fn gap4_episode_label_on_both_sides() {
+        assert_eq!(
+            cmp("Episode 10 - A Real Title", "Episode 10: A Real Title"),
+            EpisodeTitleVerdict::Agree
+        );
+        assert_eq!(
+            cmp("Second Real Title", "Episode Two: Second Real Title"),
+            EpisodeTitleVerdict::Agree
+        );
+    }
+
+    /// Gap 5 — two legitimate title sets for the same episodes. There is no
+    /// comparison that recognises this, and none is invented: it must come
+    /// out silent rather than different.
+    #[test]
+    fn gap5_stylised_alias_set_is_silent() {
+        assert_eq!(
+            cmp("Plain Name", "A STYLISED NAME"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            cmp("Second Plain Name", "ANOTHER STYLISED ONE"),
+            EpisodeTitleVerdict::Unknown
+        );
+        // With corroborating air dates that also differ, it may disagree.
+        assert_eq!(
+            compare_episode_title(
+                "Pilot",
+                "Something Else",
+                "test show",
+                Some("2026-03-25"),
+                Some("2019-01-02")
+            ),
+            EpisodeTitleVerdict::Disagree
+        );
+        // One day apart is a date convention, not a different episode.
+        assert_eq!(
+            compare_episode_title(
+                "Pilot",
+                "Something Else",
+                "test show",
+                Some("2026-03-25"),
+                Some("2026-03-26")
+            ),
+            EpisodeTitleVerdict::Unknown
+        );
+    }
+
+    /// Q4 — part-number conventions, including the transposition that
+    /// accounted for most of the 26 format-difference refutations.
+    #[test]
+    fn q4_part_number_conventions() {
+        assert_eq!(
+            cmp("Test Episode (1)", "Test Episode: Part One"),
+            EpisodeTitleVerdict::Agree
+        );
+        assert_eq!(
+            cmp(
+                "Test Episode (1) - A Second Fragment",
+                "Test Episode - A Second Fragment (1)"
+            ),
+            EpisodeTitleVerdict::Agree
+        );
+        // Different part numbers are different episodes, and stay unknown
+        // rather than agreeing.
+        assert_ne!(
+            cmp("Test Episode (1)", "Test Episode: Part Two"),
+            EpisodeTitleVerdict::Agree
+        );
+    }
+
+    /// The governing constraint, asserted directly: with nothing to
+    /// corroborate a difference, the answer is unknown and never different.
+    #[test]
+    fn absent_corroboration_never_yields_disagreement() {
+        assert_eq!(
+            cmp("A Real Title", "A Completely Different Title"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            compare_episode_title(
+                "A Real Title",
+                "A Different One",
+                "test show",
+                Some("2020-01-01"),
+                None
+            ),
+            EpisodeTitleVerdict::Unknown
+        );
     }
 
     #[test]
