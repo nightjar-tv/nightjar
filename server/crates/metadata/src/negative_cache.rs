@@ -15,7 +15,10 @@ pub const PROVIDER_TMDB: &str = "tmdb";
 
 /// Bump when `norm_key` / title-fold rules change (ADR-0026 §3).
 /// Mismatched rows are ignored (treated as cache miss) so old keys re-search.
-pub const CLEANER_VERSION: i32 = 1;
+///
+/// 2: `strip_diacritics` extended to Latin Extended-A, so any cached key
+/// containing one of those code points folded differently when it was written.
+pub const CLEANER_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
