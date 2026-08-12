@@ -376,6 +376,30 @@ const RELEASE_JUNK: &[&str] = &[
     "dual", "internal",
 ];
 
+/// Source tokens that appear as a trailing ` - TOKEN` on an episode title and
+/// are not release junk anywhere else in the string. Kept separate from
+/// [`RELEASE_JUNK`] and matched only at the end, because these are ordinary
+/// words: a bare `web` or `dvd` scan would cut `Charlotte's Web` in half.
+const TRAILING_SOURCE_TOKENS: &[&str] = &["sdtv", "dvd", "web", "bdrip", "hdrip", "tvrip"];
+
+/// Strip a trailing ` - SDTV` / ` - DVD` source suffix, repeatedly.
+///
+/// Measured on the dogfood library: the extractor left these on 226 JAG files,
+/// 180 Golden Girls, 94 Sex and the City, 84 Felicity, 56 Queer as Folk and 25
+/// Rugrats, every one of which then read as a title disagreement against a
+/// provider title that was in fact identical.
+pub fn strip_trailing_source_token(title: &str) -> String {
+    let mut s = title.trim();
+    while let Some(i) = s.rfind(" - ") {
+        let tail = s[i + 3..].trim().to_ascii_lowercase();
+        if !TRAILING_SOURCE_TOKENS.contains(&tail.as_str()) {
+            break;
+        }
+        s = s[..i].trim_end();
+    }
+    s.to_string()
+}
+
 fn strip_release_junk_fragment(s: &str) -> String {
     let lower = s.to_ascii_lowercase();
     let mut cut = lower.len();
@@ -411,7 +435,9 @@ pub fn after_token_episode_title(basename: &str, season: i32, episode: i32) -> O
     let rest = stem[end..]
         .trim_start_matches([' ', '-', '_', '.', '–', '—'])
         .trim();
-    Some(strip_release_junk_fragment(rest))
+    Some(strip_trailing_source_token(&strip_release_junk_fragment(
+        rest,
+    )))
 }
 
 fn find_episode_token_end(lower: &str, season: i32, episode: i32) -> Option<usize> {

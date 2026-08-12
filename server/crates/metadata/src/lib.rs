@@ -36,8 +36,8 @@ pub use canonical::{
 };
 pub use clean::{
     after_token_episode_title, clean_movie_title, clean_show_title, episode_title_rejected,
-    fold_title_orthography, pick_reference_episode, series_library_year, year_from_path,
-    year_from_show_folder,
+    fold_title_orthography, pick_reference_episode, series_library_year,
+    strip_trailing_source_token, year_from_path, year_from_show_folder,
 };
 pub use fix::{
     ArtworkInvalidate, AssignRequest, AssignResult, ClearResult, FixCandidate, FixItemView,
@@ -50,9 +50,10 @@ pub use item_links::{
     series_key_for_show_folder, set_manually_matched, upsert_link,
 };
 pub use match_score::{
-    AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, LibrarySeriesShape, MatchCandidate,
-    SearchHit, SearchKind, meets_auto_match_floor, needs_collision_detail, norm_key,
-    pin_episode_title, score_search, score_search_with_library_year, score_search_with_shape,
+    AUTO_MATCH_FLOOR, CandidateShape, EPISODE_TITLE_TIE_CAP, EpisodeTitleVerdict,
+    LibrarySeriesShape, MatchCandidate, SearchHit, SearchKind, compare_episode_title,
+    meets_auto_match_floor, needs_collision_detail, norm_key, pin_episode_title, score_search,
+    score_search_with_library_year, score_search_with_shape,
 };
 pub use measure_exclude::{
     MEASURE_EXCLUDE_LIBRARY_NAMES_DEFAULT, MEASURE_EXCLUDE_LIBRARY_NAMES_ENV,

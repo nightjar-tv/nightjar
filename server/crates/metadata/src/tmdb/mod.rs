@@ -293,7 +293,7 @@ impl TmdbClient {
         for hit in &exact_refs {
             names.push(self.tv_episode_name(hit.id, ref_season, ref_episode)?);
         }
-        if let Some((hit, method)) = pin_episode_title(&exact_refs, &names, ref_title) {
+        if let Some((hit, method)) = pin_episode_title(&exact_refs, &names, ref_title, title) {
             return Ok(Some(MatchCandidate {
                 tmdb_id: hit.id,
                 confidence: 0.90,
