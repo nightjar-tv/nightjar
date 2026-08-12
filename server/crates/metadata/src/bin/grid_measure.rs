@@ -242,7 +242,7 @@ fn phase_a_fast(client: &TmdbClient, groups: &[Group]) -> FastReport {
             ref_episode: g.ref_episode,
             ref_episode_title: g.ref_episode_title.clone(),
         };
-        let hits = match client.search(kind, &g.title, g.year) {
+        let hits = match client.search(kind, &g.title) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("  search error {:?} {}: {e}", g.kind, g.title);

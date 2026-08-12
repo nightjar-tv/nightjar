@@ -88,11 +88,17 @@ fn load_item(conn: &Connection, id: i64) -> Result<FixItemView, String> {
 }
 
 /// Search TMDB for assign candidates (floor does not apply).
+///
+/// `_year` is still accepted so the endpoint's query contract is unchanged
+/// (Rule 2.3), and it is no longer used: search stopped narrowing on year at
+/// the provider. Note that this year is **human-supplied**, unlike the drain's
+/// folder-derived one, so whether the fix flow should narrow on it is a
+/// separate decision from the one that removed the drain's filter.
 pub fn search_candidates(
     client: &TmdbClient,
     item: &FixItemView,
     q: Option<&str>,
-    year: Option<i32>,
+    _year: Option<i32>,
 ) -> Result<Vec<FixCandidate>, String> {
     let title = q
         .map(str::trim)
@@ -105,20 +111,13 @@ pub fn search_candidates(
                 clean_movie_title(&item.title, year_from_path(&item.path).or(item.year)).0
             }
         });
-    let yr = year.or_else(|| {
-        if item.kind == "movie" {
-            year_from_path(&item.path).or(item.year)
-        } else {
-            None
-        }
-    });
     let search_kind = if item.kind == "episode" {
         SearchKind::Tv
     } else {
         SearchKind::Movie
     };
     let hits = client
-        .search(search_kind, &title, yr)
+        .search(search_kind, &title)
         .map_err(|e| e.to_string())?;
     Ok(hits
         .into_iter()

@@ -831,6 +831,103 @@ mod tests {
         assert!((AUTO_MATCH_FLOOR - 0.80).abs() < f64::EPSILON);
     }
 
+    /// The class the API-side year filter costs: a folder whose year names a
+    /// short same-year entity while the folder itself is a multi-season run.
+    /// Narrowing the search on that year returned only the short entity, so no
+    /// scoring rule could reach the right one. Unfiltered, it is at least a
+    /// candidate. Anonymous titles per the matcher-fixture convention.
+    #[test]
+    fn unfiltered_search_keeps_the_candidate_a_year_filter_would_remove() {
+        let narrowed = [tv(1, "Test Show", 2003)];
+        let unfiltered = vec![
+            tv(2, "Test Show", 2004),
+            tv(1, "Test Show", 2003),
+            tv(3, "Test Show", 1978),
+        ];
+
+        assert!(
+            !narrowed.iter().any(|h| h.id == 2),
+            "the year-narrowed set is exactly the problem: the multi-season \
+             entity is absent, so nothing downstream can select it"
+        );
+        assert!(unfiltered.iter().any(|h| h.id == 2));
+
+        // Necessary and not sufficient: unfiltered, the library-year pin still
+        // selects the same-year short entity. Beating that is a later change,
+        // and this asserts the state as it is rather than as it should end up.
+        let shapes = [
+            CandidateShape {
+                year: Some(2004),
+                episode_count: Some(73),
+                season_count: Some(4),
+            },
+            CandidateShape {
+                year: Some(2003),
+                episode_count: Some(2),
+                season_count: Some(1),
+            },
+            CandidateShape {
+                year: Some(1978),
+                episode_count: Some(24),
+                season_count: Some(1),
+            },
+        ];
+        let c = score_search_with_shape(
+            &unfiltered,
+            "Test Show",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                year: Some(2003),
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(
+            c.tmdb_id, 1,
+            "library-year pin still selects the 2003 entity"
+        );
+        assert_eq!(c.method, "exact_title_library_year");
+    }
+
+    /// The counterexample case: does the year still earn its place once it is
+    /// no longer a provider filter? It does, as a scoring signal — a genuinely
+    /// ambiguous same-name set is still pinned by the folder's year.
+    #[test]
+    fn year_still_discriminates_as_a_scoring_signal() {
+        let hits = vec![tv(10, "Test Show", 1998), tv(11, "Test Show", 2017)];
+        let shapes = [
+            CandidateShape {
+                year: Some(1998),
+                ..Default::default()
+            },
+            CandidateShape {
+                year: Some(2017),
+                ..Default::default()
+            },
+        ];
+        for (library_year, want) in [(1998, 10), (2017, 11)] {
+            let c = score_search_with_shape(
+                &hits,
+                "Test Show",
+                None,
+                SearchKind::Tv,
+                LibrarySeriesShape {
+                    year: Some(library_year),
+                    ..Default::default()
+                },
+                Some(&shapes),
+            )
+            .expect("a candidate");
+            assert_eq!(
+                c.tmdb_id, want,
+                "folder year {library_year} must still pin its entity"
+            );
+            assert!(meets_auto_match_floor(c.confidence));
+        }
+    }
+
     fn show_meta(title: &str, year: Option<i32>) -> CanonicalMetadata {
         CanonicalMetadata {
             kind: crate::model::MetadataKind::Show,
