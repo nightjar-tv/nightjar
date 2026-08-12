@@ -257,7 +257,7 @@ impl TmdbClient {
             .collect();
         let mut shapes = Vec::with_capacity(exact.len());
         for hit in &exact {
-            shapes.push(self.tv_candidate_shape(hit)?);
+            shapes.push(self.tv_candidate_shape(hit, library.ref_season)?);
         }
         let shaped_results: Vec<SearchHit> = exact.iter().map(|h| (*h).clone()).collect();
         let scored = score_search_with_shape(
@@ -277,7 +277,7 @@ impl TmdbClient {
         let Some(ref_title) = library.ref_episode_title.as_deref() else {
             return Ok(scored);
         };
-        let (Some(ref_season), Some(ref_episode)) = (library.ref_season, library.ref_episode)
+        let (Some(_ref_season), Some(ref_episode)) = (library.ref_season, library.ref_episode)
         else {
             return Ok(scored);
         };
@@ -289,10 +289,18 @@ impl TmdbClient {
         if exact_refs.len() > crate::match_score::EPISODE_TITLE_TIE_CAP {
             return Ok(scored);
         }
-        let mut names: Vec<Option<String>> = Vec::with_capacity(exact_refs.len());
-        for hit in &exact_refs {
-            names.push(self.tv_episode_name(hit.id, ref_season, ref_episode)?);
-        }
+        // The reference season rode along on the `/tv/{id}` call above, so the
+        // names are already here: no call per candidate.
+        let names: Vec<Option<String>> = shapes
+            .iter()
+            .map(|sh| {
+                sh.reference_season_episodes.as_deref().and_then(|eps| {
+                    eps.iter()
+                        .find(|(n, _)| *n == ref_episode)
+                        .map(|(_, nm)| nm.clone())
+                })
+            })
+            .collect();
         if let Some((hit, method)) = pin_episode_title(&exact_refs, &names, ref_title, title) {
             return Ok(Some(MatchCandidate {
                 tmdb_id: hit.id,
@@ -309,12 +317,24 @@ impl TmdbClient {
         Ok(scored)
     }
 
-    fn tv_candidate_shape(&self, hit: &SearchHit) -> Result<CandidateShape, ResolveError> {
+    /// `/tv/{id}` for a collision candidate, with the folder's reference season
+    /// appended to the **same** request (`append_to_response=season/{n}`), so
+    /// episode-title evidence costs no additional call.
+    fn tv_candidate_shape(
+        &self,
+        hit: &SearchHit,
+        ref_season: Option<i32>,
+    ) -> Result<CandidateShape, ResolveError> {
         let year = hit
             .first_air_date
             .as_deref()
             .and_then(|d| d.get(..4)?.parse().ok());
-        let data = self.get_json(&format!("/tv/{}", hit.id), &[("language", "en-US")])?;
+        let append = ref_season.map(|n| format!("season/{n}"));
+        let mut q: Vec<(&str, &str)> = vec![("language", "en-US")];
+        if let Some(ref a) = append {
+            q.push(("append_to_response", a.as_str()));
+        }
+        let data = self.get_json(&format!("/tv/{}", hit.id), &q)?;
         Ok(CandidateShape {
             year,
             episode_count: data
@@ -326,28 +346,21 @@ impl TmdbClient {
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
             season_numbers: season_numbers_from_detail(&data),
+            reference_season_episodes: ref_season
+                .and_then(|n| data.get(format!("season/{n}")))
+                .and_then(|v| v.get("episodes"))
+                .and_then(|e| e.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            Some((
+                                e.get("episode_number")?.as_i64()? as i32,
+                                e.get("name")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                }),
         })
-    }
-
-    fn tv_episode_name(
-        &self,
-        show_id: i64,
-        season: i32,
-        episode: i32,
-    ) -> Result<Option<String>, ResolveError> {
-        // Missing episode on a tied candidate is a decline signal for that
-        // row (ADR-0032), not a resolve failure for the show group.
-        let Some(data) = self.get_json_optional(
-            &format!("/tv/{show_id}/season/{season}/episode/{episode}"),
-            &[("language", "en-US")],
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(data
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()))
     }
 
     pub fn movie_detail(

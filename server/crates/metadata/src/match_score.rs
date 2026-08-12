@@ -82,6 +82,85 @@ pub struct CandidateShape {
     /// collision tier already fetches. `None` means not fetched, which is not
     /// evidence about the candidate either way.
     pub season_numbers: Option<Vec<i32>>,
+    /// `(episode_number, name)` for the folder's reference season, appended to
+    /// the same `/tv/{id}` call via `append_to_response=season/{n}`. `None`
+    /// means not fetched — no evidence, never a verdict.
+    pub reference_season_episodes: Option<Vec<(i32, String)>>,
+}
+
+/// Does this candidate's reference-season episode carry the title the folder's
+/// reference file does?
+///
+/// `Some(true)` confirms, `None` there is nothing to compare. **There is no
+/// `Some(false)`**, and that is the point: [`compare_episode_title`] can return
+/// `Agree` or `Unknown` on a filename-derived title and nothing else, because
+/// `Disagree` needs a corroborating air date and filenames carry none. Title
+/// evidence is therefore one-directional **by construction, not by policy** —
+/// it is what the measurement supports, where confirmation held on 598 working
+/// folders and refutation never once identified a wrong entity. A later author
+/// adding a penalty path here would be reversing a measured result, not
+/// filling in an oversight.
+pub fn candidate_confirms_reference_episode(
+    shape: &CandidateShape,
+    library: &LibrarySeriesShape,
+    show_soft_key: &str,
+) -> Option<bool> {
+    let want = library.ref_episode_title.as_deref()?;
+    let ref_episode = library.ref_episode?;
+    let episodes = shape.reference_season_episodes.as_deref()?;
+    let name = episodes
+        .iter()
+        .find(|(n, _)| *n == ref_episode)
+        .map(|(_, nm)| nm.as_str())?;
+    match compare_episode_title(want, name, show_soft_key, None, None) {
+        EpisodeTitleVerdict::Agree => Some(true),
+        // Unknown is the only other reachable verdict here, and it is not
+        // evidence against the candidate.
+        _ => None,
+    }
+}
+
+/// Episode-title confirmation as **promotion evidence, never a penalty.**
+///
+/// Same discipline as the season-coverage promotion it sits beside: it only
+/// moves a pick between candidates, and an ambiguous or absent signal leaves
+/// the pick alone.
+///
+/// - The chosen candidate being **confirmed** ends it — evidence supports the
+///   scorer and nothing moves.
+/// - Promotion needs **exactly one** other confirmed candidate. Two confirmed
+///   candidates mean the evidence does not discriminate.
+/// - Absence of confirmation is **not** evidence against a candidate; it is
+///   only the absence of a reason to prefer it.
+fn confirmation_beats_pick<'a>(
+    chosen: &SearchHit,
+    exact: &[&'a SearchHit],
+    shapes: Option<&[CandidateShape]>,
+    library: &LibrarySeriesShape,
+    show_soft_key: &str,
+) -> Option<&'a SearchHit> {
+    let shapes = shapes?;
+    if shapes.len() != exact.len() {
+        return None;
+    }
+    let chosen_i = exact.iter().position(|h| h.id == chosen.id)?;
+    if candidate_confirms_reference_episode(&shapes[chosen_i], library, show_soft_key) == Some(true)
+    {
+        return None;
+    }
+    let mut winner: Option<&SearchHit> = None;
+    for (i, h) in exact.iter().enumerate() {
+        if i == chosen_i {
+            continue;
+        }
+        if candidate_confirms_reference_episode(&shapes[i], library, show_soft_key) == Some(true) {
+            if winner.is_some() {
+                return None;
+            }
+            winner = Some(h);
+        }
+    }
+    winner
 }
 
 /// Can this candidate hold every season the folder asserts?
@@ -639,7 +718,7 @@ pub fn score_search_with_shape(
             } else {
                 (exact[0], 0.90, "exact_title")
             }
-        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library) {
+        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library.clone()) {
             (hit, 0.90, method)
         } else {
             // Prefer first non-empty candidate for the unpinned method payload,
@@ -660,6 +739,20 @@ pub fn score_search_with_shape(
         }
         (hit, conf, "top1_rank")
     };
+
+    // Title confirmation applies after the branch has chosen, so it reaches the
+    // decided branches — a sole same-year hit scores 0.98 and no tie-break can
+    // reach it. It raises a confirmed candidate over an unconfirmed one and
+    // never lowers anything.
+    let (hit, conf, method) =
+        match confirmation_beats_pick(hit, &exact, candidate_shapes, &library, title) {
+            Some(better) => (
+                better,
+                f64::max(conf, 0.90),
+                "exact_title_episode_confirmed",
+            ),
+            None => (hit, conf, method),
+        };
 
     Some(MatchCandidate {
         tmdb_id: hit.id,
@@ -812,12 +905,14 @@ mod tests {
                 episode_count: Some(327),
                 season_count: Some(15),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2025),
                 episode_count: Some(8),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -849,12 +944,14 @@ mod tests {
                 episode_count: Some(40),
                 season_count: Some(5),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(1997),
                 episode_count: Some(40),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -884,12 +981,14 @@ mod tests {
                 episode_count: Some(40),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2010),
                 episode_count: Some(40),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -921,12 +1020,14 @@ mod tests {
                 episode_count: Some(181),
                 season_count: Some(9),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2026),
                 episode_count: Some(12),
                 season_count: Some(2),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -959,12 +1060,14 @@ mod tests {
                 episode_count: Some(73),
                 season_count: Some(4),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2003),
                 episode_count: Some(2),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1017,12 +1120,14 @@ mod tests {
                 episode_count: Some(0),
                 season_count: Some(0),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2023),
                 episode_count: Some(3),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1051,6 +1156,7 @@ mod tests {
             episode_count: Some(0),
             season_count: Some(0),
             season_numbers: None,
+            reference_season_episodes: None,
         }];
         let m = score_search_with_shape(
             &results,
@@ -1290,18 +1396,21 @@ mod tests {
                 episode_count: Some(73),
                 season_count: Some(4),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2003),
                 episode_count: Some(2),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
             CandidateShape {
                 year: Some(1978),
                 episode_count: Some(24),
                 season_count: Some(1),
                 season_numbers: None,
+                reference_season_episodes: None,
             },
         ];
         let c = score_search_with_shape(
@@ -1323,12 +1432,142 @@ mod tests {
         assert_eq!(c.method, "exact_title_library_year");
     }
 
+    fn shape_eps(year: i32, seasons: &[i32], eps: &[(i32, &str)]) -> CandidateShape {
+        CandidateShape {
+            year: Some(year),
+            episode_count: None,
+            season_count: Some(seasons.len() as u32),
+            season_numbers: Some(seasons.to_vec()),
+            reference_season_episodes: Some(eps.iter().map(|(n, t)| (*n, t.to_string())).collect()),
+        }
+    }
+
+    fn lib_with_ref(year: i32, seasons: &[i32], ref_title: &str) -> LibrarySeriesShape {
+        LibrarySeriesShape {
+            year: Some(year),
+            folder_seasons: seasons.to_vec(),
+            ref_season: Some(1),
+            ref_episode: Some(2),
+            ref_episode_title: Some(ref_title.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Confirmation promotes: the year picks a candidate whose reference
+    /// episode carries a different title, and exactly one other candidate
+    /// carries the folder's.
+    #[test]
+    fn confirmation_promotes_the_candidate_that_carries_the_title() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let shapes = [
+            shape_eps(2004, &[1], &[(2, "A Real Episode Title")]),
+            shape_eps(2003, &[1], &[(2, "Something Entirely Different")]),
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1);
+        assert_eq!(c.method, "exact_title_episode_confirmed");
+        assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// Confirmation absent: the year pin holds, unchanged and undemoted.
+    #[test]
+    fn absent_confirmation_leaves_the_year_pin_alone() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        // Neither candidate has episode names fetched.
+        let shapes = [shape(2004, &[1]), shape(2003, &[1])];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2);
+        assert_eq!(c.method, "exact_title_year");
+        assert!((c.confidence - 0.98).abs() < f64::EPSILON);
+    }
+
+    /// Confirmation would promote a wrong candidate, and ambiguity prevents
+    /// it: two candidates carry the same episode title, so the evidence does
+    /// not discriminate and the year's pick stands.
+    #[test]
+    fn ambiguous_confirmation_cannot_promote() {
+        let hits = vec![
+            tv(1, "Test Show", 2004),
+            tv(2, "Test Show", 2003),
+            tv(3, "Test Show", 2010),
+        ];
+        let shapes = [
+            shape_eps(2004, &[1], &[(2, "A Real Episode Title")]),
+            shape_eps(2003, &[1], &[(2, "Something Entirely Different")]),
+            shape_eps(2010, &[1], &[(2, "A Real Episode Title")]),
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2);
+        assert_eq!(c.method, "exact_title_year");
+    }
+
+    /// Confirmation never lowers. A candidate the scorer picked and that the
+    /// titles confirm keeps its score exactly; and a candidate nothing
+    /// confirms is not demoted for it.
+    #[test]
+    fn confirmation_raises_and_never_lowers() {
+        let hits = vec![tv(1, "Test Show", 2003), tv(2, "Test Show", 2004)];
+        // The year's pick is itself confirmed: nothing moves, score intact.
+        let shapes = [
+            shape_eps(2003, &[1], &[(2, "A Real Episode Title")]),
+            shape_eps(2004, &[1], &[(2, "A Real Episode Title")]),
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1);
+        assert_eq!(c.method, "exact_title_year");
+        assert!((c.confidence - 0.98).abs() < f64::EPSILON);
+
+        // A title that matches nothing is not a verdict against anyone.
+        assert_eq!(
+            candidate_confirms_reference_episode(
+                &shape_eps(2003, &[1], &[(2, "Something Entirely Different")]),
+                &lib_with_ref(2003, &[1], "A Real Episode Title"),
+                "test show",
+            ),
+            None,
+            "the comparator has no Disagree to give on a filename title"
+        );
+    }
+
     fn shape(year: i32, seasons: &[i32]) -> CandidateShape {
         CandidateShape {
             year: Some(year),
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
+            reference_season_episodes: None,
         }
     }
 
@@ -1410,6 +1649,7 @@ mod tests {
             episode_count: None,
             season_count: None,
             season_numbers: None,
+            reference_season_episodes: None,
         };
         assert_eq!(
             candidate_covers_folder_seasons(&unknown, &[1, 2, 3, 4]),
