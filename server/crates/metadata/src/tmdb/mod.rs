@@ -138,24 +138,22 @@ impl TmdbClient {
             .map_err(|e| ResolveError::Provider(e.to_string()))
     }
 
-    pub fn search(
-        &self,
-        kind: SearchKind,
-        title: &str,
-        year: Option<i32>,
-    ) -> Result<Vec<SearchHit>, ResolveError> {
+    /// Title search, deliberately **not** narrowed by the folder's year.
+    ///
+    /// The year is still evidence — it pins through `library.year` and
+    /// `exact_title_year` in the scorer — but it is applied here, where a
+    /// stronger signal can outweigh it, rather than at the provider, where
+    /// nothing can. Narrowing on `first_air_date_year` removes candidates
+    /// before any Nightjar rule sees them: `Battlestar Galactica (2003)`
+    /// returned one hit, the two-episode miniseries, with the four-season
+    /// series absent from the result set entirely. A folder cannot be matched
+    /// to a candidate that was never returned.
+    pub fn search(&self, kind: SearchKind, title: &str) -> Result<Vec<SearchHit>, ResolveError> {
         let path = match kind {
             SearchKind::Movie => "/search/movie",
             SearchKind::Tv => "/search/tv",
         };
-        let year_s = year.map(|y| y.to_string());
-        let mut q: Vec<(&str, &str)> = vec![("query", title)];
-        if let Some(ref y) = year_s {
-            match kind {
-                SearchKind::Movie => q.push(("year", y.as_str())),
-                SearchKind::Tv => q.push(("first_air_date_year", y.as_str())),
-            }
-        }
+        let q: Vec<(&str, &str)> = vec![("query", title)];
         let data = self.get_json(path, &q)?;
         let results = data
             .get("results")
@@ -231,7 +229,7 @@ impl TmdbClient {
         year: Option<i32>,
         library: LibrarySeriesShape,
     ) -> Result<Option<MatchCandidate>, ResolveError> {
-        let results = self.search(kind, title, year)?;
+        let results = self.search(kind, title)?;
         if !needs_collision_detail(&results, title, year, kind, library.clone()) {
             return Ok(score_search_with_shape(
                 &results, title, year, kind, library, None,
