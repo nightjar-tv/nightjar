@@ -39,6 +39,9 @@ pub struct ResolveInput {
     /// Distinct episode files / seasons under the show (TV collision pin).
     pub library_episode_count: Option<u32>,
     pub library_season_count: Option<u32>,
+    /// The season numbers the folder asserts, season 0 excluded. Coverage
+    /// evidence for the year pin; the count above stays the pin signal.
+    pub library_seasons: Vec<i32>,
     /// ADR-0032 reference episode for title pin (usable after-token only).
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
