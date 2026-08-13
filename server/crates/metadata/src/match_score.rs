@@ -363,6 +363,14 @@ fn is_empty_shell(shape: &CandidateShape) -> bool {
         || (matches!(shape.episode_count, Some(0)) && shape.season_count.is_none())
 }
 
+/// The candidate-set exclusion: a provider entity with zero episodes is not a
+/// candidate (ADR-0026, amended) — a folder with files cannot bind to an
+/// entity with nothing to bind to. Unknown (`None`) never excludes, the same
+/// absence-is-not-evidence discipline as season coverage.
+pub(crate) fn has_no_episodes(shape: &CandidateShape) -> bool {
+    shape.episode_count == Some(0)
+}
+
 /// First discriminator that selects exactly one of `exact` wins.
 /// Order: episode count → season count → premiere year.
 /// Counts first so folder year cannot pin a miniseries when the library is a
@@ -677,16 +685,45 @@ pub fn score_search_with_shape(
         return None;
     }
     let nk = norm_key(title);
-    let exact_year: Vec<&SearchHit> = results
+    let exact_all: Vec<&SearchHit> = results.iter().filter(|r| title_hit(r, &nk, kind)).collect();
+    let had_title_hits = !exact_all.is_empty();
+
+    // A provider entity with zero episodes is not a candidate (ADR-0026,
+    // amended): a folder with files cannot bind to it, so drop such
+    // title-hits before any year/pin/coverage/confirmation branch, keeping
+    // shapes parallel to the survivors. Only aligned detail shapes carry an
+    // episode count; the year-only synthetic shapes have `episode_count:
+    // None` and never exclude (unknown is not evidence).
+    let (exact, shapes): (Vec<&SearchHit>, Option<Vec<CandidateShape>>) = match candidate_shapes {
+        Some(s) if s.len() == exact_all.len() => {
+            let mut kept_hits = Vec::with_capacity(exact_all.len());
+            let mut kept_shapes = Vec::with_capacity(exact_all.len());
+            for (h, sh) in exact_all.iter().zip(s.iter()) {
+                if !has_no_episodes(sh) {
+                    kept_hits.push(*h);
+                    kept_shapes.push((*sh).clone());
+                }
+            }
+            (kept_hits, Some(kept_shapes))
+        }
+        _ => (exact_all, candidate_shapes.map(|s| s.to_vec())),
+    };
+    let shapes = shapes.as_deref();
+    if exact.is_empty() && had_title_hits {
+        // Every title-hit was an empty shell: none is a candidate. Do not
+        // fall through to `top1_rank` over the leftover search hits.
+        return None;
+    }
+    let exact_year: Vec<&SearchHit> = exact
         .iter()
-        .filter(|r| title_hit(r, &nk, kind) && year.is_some() && row_year(r, kind) == year)
+        .copied()
+        .filter(|r| year.is_some() && row_year(r, kind) == year)
         .collect();
-    let exact: Vec<&SearchHit> = results.iter().filter(|r| title_hit(r, &nk, kind)).collect();
 
     let (hit, conf, method) = if !exact_year.is_empty() {
         let hit = exact_year[0];
         let conf = if exact_year.len() == 1 { 0.98 } else { 0.80 };
-        match coverage_beats_year(hit, &exact, candidate_shapes, &library.folder_seasons) {
+        match coverage_beats_year(hit, &exact, shapes, &library.folder_seasons) {
             Some(better) => (better, 0.90, "exact_title_season_coverage"),
             None => (hit, conf, "exact_title_year"),
         }
@@ -707,7 +744,7 @@ pub fn score_search_with_shape(
                 ..Default::default()
             })
             .collect();
-        let shapes = match candidate_shapes {
+        let shapes = match shapes {
             Some(s) if s.len() == exact.len() => s,
             _ => owned.as_slice(),
         };
@@ -744,15 +781,14 @@ pub fn score_search_with_shape(
     // decided branches — a sole same-year hit scores 0.98 and no tie-break can
     // reach it. It raises a confirmed candidate over an unconfirmed one and
     // never lowers anything.
-    let (hit, conf, method) =
-        match confirmation_beats_pick(hit, &exact, candidate_shapes, &library, title) {
-            Some(better) => (
-                better,
-                f64::max(conf, 0.90),
-                "exact_title_episode_confirmed",
-            ),
-            None => (hit, conf, method),
-        };
+    let (hit, conf, method) = match confirmation_beats_pick(hit, &exact, shapes, &library, title) {
+        Some(better) => (
+            better,
+            f64::max(conf, 0.90),
+            "exact_title_episode_confirmed",
+        ),
+        None => (hit, conf, method),
+    };
 
     Some(MatchCandidate {
         tmdb_id: hit.id,
@@ -1148,8 +1184,10 @@ mod tests {
         assert!(meets_auto_match_floor(m.confidence));
     }
 
+    /// A sole candidate that is an empty shell is not a candidate at all:
+    /// the scorer returns `None` (unmatched), not a below-floor score.
     #[test]
-    fn empty_shell_sole_exact_stays_below_floor() {
+    fn empty_shell_sole_exact_is_not_a_candidate() {
         let results = vec![tv(1, "Delta", 2000)];
         let shapes = [CandidateShape {
             year: Some(2000),
@@ -1158,17 +1196,76 @@ mod tests {
             season_numbers: None,
             reference_season_episodes: None,
         }];
+        assert!(
+            score_search_with_shape(
+                &results,
+                "Delta",
+                None,
+                SearchKind::Tv,
+                LibrarySeriesShape::default(),
+                Some(&shapes),
+            )
+            .is_none(),
+            "a sole entity with zero episodes is not a candidate"
+        );
+    }
+
+    /// A shell sharing the title with a real entity is dropped; the real
+    /// entity wins (ADR-0026, amended).
+    #[test]
+    fn empty_shell_loses_to_a_real_entity() {
+        let results = vec![tv(1, "Test Show", 2000), tv(2, "Test Show", 2020)];
+        let shapes = [
+            CandidateShape {
+                year: Some(2000),
+                episode_count: Some(0),
+                season_count: Some(0),
+                season_numbers: None,
+                reference_season_episodes: None,
+            },
+            CandidateShape {
+                year: Some(2020),
+                episode_count: Some(20),
+                season_count: Some(2),
+                season_numbers: None,
+                reference_season_episodes: None,
+            },
+        ];
         let m = score_search_with_shape(
             &results,
-            "Delta",
+            "Test Show",
             None,
             SearchKind::Tv,
             LibrarySeriesShape::default(),
             Some(&shapes),
         )
         .unwrap();
-        assert_eq!(m.method, "exact_title_empty_shell");
-        assert!(!meets_auto_match_floor(m.confidence));
+        assert_eq!(m.tmdb_id, 2);
+        assert!(meets_auto_match_floor(m.confidence));
+    }
+
+    /// Empty is the rule, not small: a one-episode entity stays a candidate.
+    #[test]
+    fn one_episode_entity_is_still_a_candidate() {
+        let results = vec![tv(1, "Test Show", 2000)];
+        let shapes = [CandidateShape {
+            year: Some(2000),
+            episode_count: Some(1),
+            season_count: Some(1),
+            season_numbers: None,
+            reference_season_episodes: None,
+        }];
+        let m = score_search_with_shape(
+            &results,
+            "Test Show",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape::default(),
+            Some(&shapes),
+        )
+        .unwrap();
+        assert_eq!(m.tmdb_id, 1);
+        assert!(meets_auto_match_floor(m.confidence));
     }
 
     #[test]

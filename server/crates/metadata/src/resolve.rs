@@ -73,6 +73,10 @@ pub enum UnresolvedReason {
     /// Best search hit scored below the auto-match floor (ADR-0026 §2).
     /// Path `item_key` / fragile watch state until manual fix or better input.
     BelowThreshold { confidence: f64, method: String },
+    /// The provider entity the match picked has zero episodes. A folder with
+    /// files cannot bind to an entity with nothing to bind to; the entity is
+    /// not a candidate (ADR-0026, amended).
+    NoEpisodes,
 }
 
 impl std::fmt::Display for UnresolvedReason {
@@ -83,6 +87,7 @@ impl std::fmt::Display for UnresolvedReason {
             Self::BelowThreshold { confidence, method } => {
                 write!(f, "below threshold: {confidence:.2} [{method}]")
             }
+            Self::NoEpisodes => write!(f, "picked entity has no episodes"),
         }
     }
 }
@@ -134,6 +139,10 @@ pub enum ProviderResult {
         /// Entity-keyed raw body for ADR-0026 §4 persistence (`None` for stubs).
         raw: Option<RawProviderPayload>,
     },
+    /// The picked provider entity has zero episodes; it is not a candidate
+    /// (ADR-0026, amended). Terminal `unmatched` with a recorded reason —
+    /// not a find miss, not a provider error.
+    EmptyShell,
     BelowThreshold {
         confidence: f64,
         method: &'static str,
@@ -342,6 +351,19 @@ impl<T: MetadataSource> Resolver<T> {
                 canonical::get_canonical(conn, PROVIDER_TMDB, "tv", &series_show_id.to_string())
                     .map_err(ResolveError::Provider)?
         {
+            // ADR-0026 (amended): a stored detail reporting zero episodes is
+            // not a candidate, so the stored id is discarded exactly like a
+            // name/year disagreement. A missing payload or a missing field is
+            // unknown and never rejects.
+            let stored_has_no_episodes = crate::raw_payload::get_raw_payload(
+                conn,
+                PROVIDER_TMDB,
+                "tv",
+                &series_show_id.to_string(),
+            )
+            .map_err(ResolveError::Provider)?
+            .as_deref()
+            .is_some_and(|p| crate::tmdb::tv_payload_episode_count(p) == Some(0));
             if let Some(reason) = crate::match_score::find_hit_reject_reason(
                 &meta,
                 crate::match_score::SearchKind::Tv,
@@ -350,6 +372,10 @@ impl<T: MetadataSource> Resolver<T> {
             ) {
                 eprintln!(
                     "  discard stored series id {series_show_id} — {reason}; falling through to search"
+                );
+            } else if stored_has_no_episodes {
+                eprintln!(
+                    "  discard stored series id {series_show_id} — stored detail has 0 episodes; falling through to search"
                 );
             } else {
                 // One hit path (Rule 4.11): the same persist and
@@ -432,6 +458,11 @@ impl<T: MetadataSource> Resolver<T> {
                     method,
                     raw,
                 } => (metadata, method, raw),
+                ProviderResult::EmptyShell => {
+                    return Ok(ResolveOutcome::Unresolved {
+                        reason: UnresolvedReason::NoEpisodes,
+                    });
+                }
                 ProviderResult::BelowThreshold { confidence, method } => {
                     if let (Some(conn), Some(qk)) = (conn, cache_key) {
                         let _ = negative_cache::record_miss(
@@ -1576,5 +1607,169 @@ mod tests {
             1,
             "the second resolve consults the series-id row"
         );
+    }
+
+    /// ADR-0026 (amended): a pick with zero episodes is terminal `unmatched`
+    /// with the recorded reason, never a `Resolved` bind to the empty entity.
+    struct EmptyShellSource;
+    impl MetadataSource for EmptyShellSource {
+        fn resolve(&self, _input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+            Ok(ProviderResult::EmptyShell)
+        }
+    }
+
+    #[test]
+    fn empty_shell_winner_is_unresolved_with_recorded_reason() {
+        let outcome = Resolver {
+            tmdb: EmptyShellSource,
+        }
+        .resolve(&ResolveInput {
+            title: Some("Test Show".into()),
+            year: None,
+            kind: Some(MetadataKind::Episode),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ResolveOutcome::Unresolved {
+                reason: UnresolvedReason::NoEpisodes
+            },
+            "an entity with zero episodes must not be bound"
+        );
+    }
+
+    /// ADR-0033 §8 + ADR-0026 (amended): a stored series id whose persisted
+    /// detail reports zero episodes is not a candidate, so the id is
+    /// discarded and the resolve falls through to search, exactly like a
+    /// name/year disagreement. The stored shell id is never bound.
+    #[test]
+    fn stored_series_id_with_zero_episodes_falls_through_to_search() {
+        struct EmptyStoredThenSearch {
+            calls: Cell<usize>,
+        }
+        impl MetadataSource for EmptyStoredThenSearch {
+            fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+                self.calls.set(self.calls.get() + 1);
+                assert!(
+                    input.series_show_id.is_none(),
+                    "the stored shell id must be cleared before the fall-through search"
+                );
+                Ok(show_hit(20610, "Test Show", Some(2004), "exact_title"))
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Test Show (2004)', 55);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '55', 'Test Show', 2004, '{\"tmdb\":55,\"tmdb_show\":55}', 55,
+                '2026-01-01T00:00:00Z');
+             INSERT INTO metadata_raw_payloads (provider, entity_kind, provider_id, fetched_at, payload)
+             VALUES ('tmdb', 'tv', '55', '2026-01-01T00:00:00Z',
+                     '{\"id\":55,\"name\":\"Test Show\",\"number_of_episodes\":0}');",
+        )
+        .unwrap();
+
+        let src = EmptyStoredThenSearch {
+            calls: Cell::new(0),
+        };
+        let resolver = Resolver { tmdb: src };
+        let outcome = resolver
+            .resolve_with_store(
+                &ResolveInput {
+                    series_show_id: Some(55),
+                    title: Some("Test Show".into()),
+                    year: Some(2004),
+                    kind: Some(MetadataKind::Episode),
+                    ..Default::default()
+                },
+                &conn,
+            )
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            } => {
+                assert_eq!(
+                    metadata.ids.tmdb,
+                    Some(20610),
+                    "the fall-through search hit wins, never the stored shell id"
+                );
+                assert_eq!(match_method.as_deref(), Some("exact_title"));
+            }
+            other => panic!("expected search resolve, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "exactly one search after the stored shell id was discarded"
+        );
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links WHERE item_key LIKE 'tmdb:show:55%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "the empty stored id is never written as a link");
+    }
+
+    /// Empty is the rule, not small: a stored payload with episodes still
+    /// binds locally, and a missing payload stays unknown (never a reject).
+    #[test]
+    fn stored_series_id_with_episodes_still_binds() {
+        struct PanicProvider;
+        impl MetadataSource for PanicProvider {
+            fn resolve(&self, _input: &ResolveInput) -> Result<ProviderResult, ResolveError> {
+                panic!("a folder with stored identity must not reach the provider");
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha (2002)', 55);
+             INSERT INTO metadata_canonical (
+               provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at
+             ) VALUES
+               ('tmdb', 'tv', '55', 'Alpha', 2002, '{\"tmdb\":55,\"tmdb_show\":55}', 55,
+                '2026-01-01T00:00:00Z');
+             INSERT INTO metadata_raw_payloads (provider, entity_kind, provider_id, fetched_at, payload)
+             VALUES ('tmdb', 'tv', '55', '2026-01-01T00:00:00Z',
+                     '{\"id\":55,\"name\":\"Alpha\",\"number_of_episodes\":4}');",
+        )
+        .unwrap();
+        let outcome = Resolver {
+            tmdb: PanicProvider,
+        }
+        .resolve_with_store(
+            &ResolveInput {
+                series_show_id: Some(55),
+                title: Some("Alpha".into()),
+                year: Some(2002),
+                kind: Some(MetadataKind::Episode),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved {
+                metadata,
+                match_method,
+                ..
+            } => {
+                assert_eq!(metadata.ids.tmdb, Some(55));
+                assert_eq!(match_method.as_deref(), Some("series_row"));
+            }
+            other => panic!("stored identity with episodes must resolve locally, got {other:?}"),
+        }
     }
 }
