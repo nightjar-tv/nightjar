@@ -470,19 +470,54 @@ fn strip_show_name_prefix(name: &str, show_soft_key: &str) -> String {
     name.to_string()
 }
 
-/// Gap 4: the episode label is carried on **both** sides — TMDB writes
-/// `Episode 10: Aftersun` and the filename writes `Episode 10 - Aftersun`.
-/// Stripping it from one side only turns an exact match into a disagreement.
-fn strip_episode_label(name: &str) -> String {
+/// Labels that **number** an episode instead of naming it.
+///
+/// One set in one place, because the shape arrived twice more after gap 4
+/// under two different words. Writing each as its own rule is what produces
+/// the next one; adding a word here is the whole change instead.
+///
+/// | | provider | filename | bridged |
+/// |---|---|---|---|
+/// | gap 4 | `Episode 10: Aftersun` | `Episode 10 - Aftersun` | yes |
+/// | gap 7 | `Theatre of Pain` | `Night 3 - Theater of Pain` | yes |
+/// | gap 6 | `Part (1)` | `The Peacekeeper Wars (1)` | **no** |
+///
+/// **Gap 6 is deliberately not bridged**, and it is listed so the next reader
+/// does not try. `Part (1)` is a label with nothing after it, so there is no
+/// title on the provider side to compare — the only thing the two sides share
+/// is the number 1. Bridging it would mean agreeing on a bare part number,
+/// which matches any file whose title reduces to one. It is a placeholder
+/// case, not a labelling case, and it belongs to whatever handles placeholders.
+///
+/// On the dogfood library `part` and `night` fire; `episode` shipped with gap
+/// 4; `chapter`, `day` and `week` are in the set on the same argument and are
+/// exercised only by the unit tests.
+const ORDINAL_LABELS: &[&str] = &["episode", "part", "chapter", "night", "day", "week"];
+
+/// Gap 4, generalised to [`ORDINAL_LABELS`]: the label is carried on **both**
+/// sides — TMDB writes `Episode 10: Aftersun` and the filename writes
+/// `Episode 10 - Aftersun`. Stripping it from one side only turns an exact
+/// match into a disagreement, so this is applied to both sides by the caller.
+fn strip_ordinal_label(name: &str) -> String {
     for sep in [": ", " - "] {
         if let Some(i) = name.find(sep) {
             let head = norm_key(&name[..i]);
             let mut w = head.split_whitespace();
-            if w.next() == Some("episode")
+            if w.next().is_some_and(|l| ORDINAL_LABELS.contains(&l))
                 && w.next().is_some_and(is_ordinal_word)
                 && w.next().is_none()
             {
-                return name[i + sep.len()..].trim().to_string();
+                let rest = name[i + sep.len()..].trim();
+                // A label with nothing after it is a placeholder, not a title
+                // (`Episode 3`, `Part (1)`). Stripping it to the empty string
+                // would turn two placeholders on unrelated shows into an exact
+                // match, which is the opposite of what identity evidence is
+                // for. Leave it whole and let the generic-title rejection in
+                // `episode_title_rejected` / `provider_title_is_generic` judge
+                // it.
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
             }
         }
     }
@@ -495,6 +530,44 @@ fn is_ordinal_word(w: &str) -> bool {
             w,
             "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine" | "ten"
         )
+}
+
+/// One measured spelling variant, folded for the comparison only.
+///
+/// `The Continental` is spelled `Theatre of Pain` by the provider and
+/// `Theater of Pain` on disk, and nothing else separates the two titles.
+///
+/// **Deliberately one pair, and deliberately not in [`norm_key`].**
+///
+/// Not in `norm_key` because that is the persisted negative-cache key through
+/// `cleaner_version` (ADR-0026 §5): folding there invalidates the cache
+/// library-wide and is a different change with a different cost. This fold is
+/// local to the episode-title comparison and persists nothing.
+///
+/// One pair because the wider scopes were measured on the dogfood library and
+/// both failed. Over 41,876 distinct `norm_key` values:
+///
+/// | scope | titles rewritten | previously-distinct titles merged |
+/// |---|---:|---:|
+/// | this pair | 10 | **0** |
+/// | eight common pairs | 48 | 4 |
+/// | general `-re`/`-er` + `-our`/`-or` | 924 | 4 |
+///
+/// The merge counts are what rejected the other two, not the rewrite counts:
+/// **every merge either produced was between two different shows** —
+/// `Shades of Gray` on 655/211288 against `Shades of Grey` on 121/4629,
+/// `Honor Thy Father` on 39269 against `Honour Thy Father` on 121040, and so
+/// on. Not one was two spellings of a single episode. A wider fold here buys
+/// no correct match and hands the confirmation path new ways to confirm a
+/// wrong candidate.
+fn fold_spelling_variant(norm: &str) -> String {
+    if !norm.contains("theatre") {
+        return norm.to_string();
+    }
+    norm.split(' ')
+        .map(|w| if w == "theatre" { "theater" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Q4: part-number conventions. `The Reptile Room (1)` and
@@ -585,9 +658,13 @@ pub fn compare_episode_title(
         return EpisodeTitleVerdict::Unknown;
     }
     let prov = strip_show_name_prefix(from_provider, show_soft_key);
-    let file = strip_episode_label(&file);
-    let prov = strip_episode_label(&prov);
-    if norm_key(&file) == norm_key(&prov) {
+    let file = strip_ordinal_label(&file);
+    let prov = strip_ordinal_label(&prov);
+    let (file_key, prov_key) = (norm_key(&file), norm_key(&prov));
+    if file_key == prov_key {
+        return EpisodeTitleVerdict::Agree;
+    }
+    if fold_spelling_variant(&file_key) == fold_spelling_variant(&prov_key) {
         return EpisodeTitleVerdict::Agree;
     }
     if let (Some(a), Some(b)) = (part_number_key(&file), part_number_key(&prov))
@@ -1375,6 +1452,97 @@ mod tests {
         assert_eq!(
             cmp("Second Real Title", "Episode Two: Second Real Title"),
             EpisodeTitleVerdict::Agree
+        );
+    }
+
+    /// Rule 1 — every label in [`ORDINAL_LABELS`], stripped from **both**
+    /// sides. Titles are invented; the rule is what is under test, not any
+    /// particular show.
+    #[test]
+    fn ordinal_label_is_stripped_for_every_label_and_on_both_sides() {
+        for label in ORDINAL_LABELS {
+            // provider carries the label, filename does not
+            assert_eq!(
+                cmp("A Real Title", &format!("{label} 3: A Real Title")),
+                EpisodeTitleVerdict::Agree,
+                "provider-side `{label}` was not stripped"
+            );
+            // filename carries the label, provider does not
+            assert_eq!(
+                cmp(&format!("{label} 3 - A Real Title"), "A Real Title"),
+                EpisodeTitleVerdict::Agree,
+                "file-side `{label}` was not stripped"
+            );
+            // both sides carry it, in the two separator styles
+            assert_eq!(
+                cmp(
+                    &format!("{label} 3 - A Real Title"),
+                    &format!("{label} 3: A Real Title")
+                ),
+                EpisodeTitleVerdict::Agree,
+                "`{label}` on both sides did not compare equal"
+            );
+        }
+        // Word ordinals too, since gap 4 shipped with them.
+        assert_eq!(
+            cmp("Chapter Two - A Real Title", "A Real Title"),
+            EpisodeTitleVerdict::Agree
+        );
+    }
+
+    /// Rule 1, the guard — a label with nothing after it is a placeholder, not
+    /// a title, and must not be stripped to the empty string. Two placeholders
+    /// on unrelated shows would then compare equal and confirm each other.
+    #[test]
+    fn an_ordinal_label_with_nothing_after_it_is_not_stripped_to_empty() {
+        assert_eq!(
+            cmp("Chapter 9 - ", "Week 4 - "),
+            EpisodeTitleVerdict::Unknown
+        );
+        // The shipped generic rejection still owns the bare-placeholder case.
+        assert_eq!(cmp("Episode 3", "A Real Title"), EpisodeTitleVerdict::Unknown);
+        assert_eq!(cmp("A Real Title", "Episode 3"), EpisodeTitleVerdict::Unknown);
+    }
+
+    /// Rule 2 — the one measured spelling variant, and only it. The three
+    /// negative cases are the wider scopes this deliberately did not ship;
+    /// each was measured to merge titles belonging to different shows.
+    #[test]
+    fn only_the_measured_spelling_variant_folds() {
+        assert_eq!(
+            cmp("A Theater Piece", "A Theatre Piece"),
+            EpisodeTitleVerdict::Agree
+        );
+        assert_eq!(
+            cmp("A Centre Piece", "A Center Piece"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            cmp("A Colour Piece", "A Color Piece"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            cmp("A Grey Piece", "A Gray Piece"),
+            EpisodeTitleVerdict::Unknown
+        );
+    }
+
+    /// The two rules compose, and the control does not merge. The control is
+    /// the point of this test: two genuinely different titles must stay
+    /// different after both rules have run.
+    #[test]
+    fn the_two_rules_compose_and_different_titles_still_differ() {
+        assert_eq!(
+            cmp("Night 3 - The Theater Piece", "The Theatre Piece"),
+            EpisodeTitleVerdict::Agree
+        );
+        assert_eq!(
+            cmp("Night 3 - A Real Title", "Night 4 - A Wholly Other Title"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            cmp("A Real Title", "A Wholly Other Title"),
+            EpisodeTitleVerdict::Unknown
         );
     }
 
