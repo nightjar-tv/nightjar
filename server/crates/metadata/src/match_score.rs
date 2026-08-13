@@ -1500,8 +1500,14 @@ mod tests {
             EpisodeTitleVerdict::Unknown
         );
         // The shipped generic rejection still owns the bare-placeholder case.
-        assert_eq!(cmp("Episode 3", "A Real Title"), EpisodeTitleVerdict::Unknown);
-        assert_eq!(cmp("A Real Title", "Episode 3"), EpisodeTitleVerdict::Unknown);
+        assert_eq!(
+            cmp("Episode 3", "A Real Title"),
+            EpisodeTitleVerdict::Unknown
+        );
+        assert_eq!(
+            cmp("A Real Title", "Episode 3"),
+            EpisodeTitleVerdict::Unknown
+        );
     }
 
     /// Rule 2 — the one measured spelling variant, and only it. The three
