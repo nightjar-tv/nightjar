@@ -60,6 +60,23 @@ not here — this page is the reference, not the tour.
 | [0040](0040-account-roles.md) | Account roles | Accepted | — | — |
 | [0041](0041-subtitle-classification-and-client-gated-extraction.md) | Subtitle classification and client-gated extraction | Accepted | [0013](0013-subtitle-extraction-at-scan.md) §1–§2 | — |
 | [0042](0042-derived-artifact-versioning-and-reconciliation.md) | Derived artifact versioning and library reconciliation | **Proposed** | — | — |
+| [0046](0046-multi-entity-binding-one-unit-per-folder.md) | Multi-entity binding, one browse unit per folder | **Proposed** | — | — |
+
+## Why the numbers jump from 0042 to 0046
+
+0043, 0044 and 0045 are taken and have no row here, which is the one case where
+a gap in this table is not a mistake:
+
+- **0043** (season fit / unmatched reason) is **written but uncommitted** — the
+  file exists in a working tree and not on `main`. The number is spent.
+- **0044** and **0045** are **reserved by decision sheets** in
+  `nightjar-meta/notes/design/`, not by ADR files. 0044's sheet still carries
+  eight blank `Decision:` lines; 0045's was written against a design that has
+  since been measured and refuted (see 0046).
+
+Recorded because this table is what a later author reads to pick the next free
+number, and reading it alone would have said 0043 was free. It is not. **Check
+the directory and the reservations, not only this register.**
 
 ## Reading this table
 
