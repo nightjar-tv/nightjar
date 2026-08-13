@@ -48,6 +48,16 @@ pub fn season_numbers_from_detail(data: &Value) -> Option<Vec<i32>> {
     )
 }
 
+/// `number_of_episodes` from a `/tv/{id}` payload (fresh or stored raw).
+/// `None` when the field is absent or the payload does not parse, which must
+/// read as unknown, never as zero (ADR-0026, amended: unknown never excludes).
+pub(crate) fn tv_payload_episode_count(payload: &str) -> Option<u32> {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|v| v.get("number_of_episodes")?.as_u64())
+        .map(|n| n as u32)
+}
+
 const MOVIE_APPEND: &str = "images,credits,videos,release_dates,external_ids";
 const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggregate_credits";
 const SEASON_APPEND: &str = "images,credits,videos,external_ids";
@@ -268,6 +278,12 @@ impl TmdbClient {
             library.clone(),
             Some(&shapes),
         );
+        if scored.is_none() {
+            // Every title-hit was an empty shell: none is a candidate, and
+            // the episode-title pin must not resurrect one (ADR-0026,
+            // amended).
+            return Ok(scored);
+        }
         if let Some(ref c) = scored
             && meets_auto_match_floor(c.confidence)
         {
@@ -472,7 +488,18 @@ impl TmdbClient {
         }
         let (metadata, raw) = match search_kind {
             SearchKind::Movie => self.movie_detail(candidate.tmdb_id)?,
-            SearchKind::Tv => self.tv_detail(candidate.tmdb_id)?,
+            SearchKind::Tv => {
+                let (metadata, raw) = self.tv_detail(candidate.tmdb_id)?;
+                if tv_payload_episode_count(&raw.payload) == Some(0) {
+                    // A winner with zero episodes is not a candidate
+                    // (ADR-0026, amended): refuse the bind. A sole title-hit
+                    // never fetches shapes at score time, so the winner
+                    // detail is where the shell is first seen; this is the
+                    // zero-extra-request bind-time check.
+                    return Ok(TmdbResolve::EmptyShell);
+                }
+                (metadata, raw)
+            }
         };
         Ok(TmdbResolve::Matched {
             metadata: Box::new(metadata),
@@ -489,6 +516,10 @@ pub enum TmdbResolve {
         raw: RawProviderPayload,
         candidate: MatchCandidate,
     },
+    /// The picked entity has zero episodes, so it is not a candidate
+    /// (ADR-0026, amended). Not a provider error and not a find miss: the
+    /// resolver records it as terminal `unmatched` with a reason.
+    EmptyShell,
     BelowThreshold {
         candidate: MatchCandidate,
     },
@@ -579,6 +610,7 @@ impl MetadataSource for TmdbClient {
                 method: candidate.method,
                 raw: Some(raw),
             }),
+            TmdbResolve::EmptyShell => Ok(ProviderResult::EmptyShell),
             TmdbResolve::BelowThreshold { candidate } => Ok(ProviderResult::BelowThreshold {
                 confidence: candidate.confidence,
                 method: candidate.method,
@@ -679,6 +711,28 @@ mod tests {
         assert_eq!(
             TmdbStub.resolve(&ResolveInput::default()).unwrap(),
             ProviderResult::Miss
+        );
+    }
+
+    #[test]
+    fn tv_payload_episode_count_is_unknown_when_absent() {
+        assert_eq!(
+            tv_payload_episode_count(r#"{"id":1,"name":"Test Show"}"#),
+            None,
+            "a missing field is unknown, never zero"
+        );
+        assert_eq!(
+            tv_payload_episode_count(r#"{"id":1,"number_of_episodes":0}"#),
+            Some(0)
+        );
+        assert_eq!(
+            tv_payload_episode_count(r#"{"id":1,"number_of_episodes":5}"#),
+            Some(5)
+        );
+        assert_eq!(
+            tv_payload_episode_count("not json"),
+            None,
+            "an unparseable payload is unknown, never a reject"
         );
     }
 

@@ -30,6 +30,8 @@
 - Amended: 2026-08-06 — §8.4 item 3's certification projection superseded
   in place by ADR-0037 item 8; the projection it froze was never
   implemented and the storage it named cannot hold a board label
+- Amended: 2026-08-13 — entities with zero episodes are not candidates;
+  the prefix rule is unchanged because it was not the failure (§2)
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -92,7 +94,7 @@ the discrete method classes from the spike matcher:
 |---|---:|---|
 | `exact_title_year` (unique) | 0.98 | Normalised title hit and year match; one candidate |
 | `exact_title` (unique) | 0.90 | Title hit; no year on the file, one candidate |
-| `exact_title_empty_shell` | 0.72 | Sole title hit is a TMDB shell (`number_of_seasons`/`episodes` 0) — never auto-match |
+| `exact_title_empty_shell` | 0.72 | Sole title hit is a TMDB shell (`number_of_seasons` 0, episode count unknown) — never auto-match; a shell with `number_of_episodes` 0 is not a candidate at all (2026-08-13 amend, below) |
 | `exact_title_year` (multi) | 0.80 | Title+year hit; more than one candidate |
 | `exact_title` (multi) | 0.72 | Title hit; more than one candidate; **superseded for TV** by the collision pin below when a discriminator fires |
 | `exact_title_collision_unpinned` | 0.72 | Multi exact-title; no discriminator selected exactly one candidate |
@@ -132,6 +134,32 @@ fetches `/tv/{id}` detail before scoring so count pins have data.
 TV title hit: exact fold **or** candidate name is the query as a prefix
 followed by more words (e.g. cleaned folder "The Continental" vs TMDB
 "The Continental: From the World of John Wick").
+
+**Empty entities are not candidates (2026-08-13).** A folder that has files
+cannot bind to a provider entity with no episodes; there is nothing for the
+files to bind to. The predicate is `number_of_episodes == 0`, applied at
+every site that already holds the number: in the scorer when detail shapes
+are aligned (a dropped shell does not fall through to search ranking), in
+the stored `series_row` detail (the id is discarded and search runs,
+ADR-0033 §8), and after the winner's `tv_detail` (a sole title-hit never
+fetches shapes at score time, so the bind-time detail is where the shell is
+first seen; the pick is refused as `unmatched` with a recorded reason). An
+unknown episode count never excludes, the same absence-is-not-evidence
+discipline as season coverage.
+
+The Continental prefix over-match is closed by excluding the shell, not by
+narrowing the prefix rule, because the prefix was never the problem. On the
+measured library the collision pin already picked the long official title
+over the empty shell in both trees. The wrong binding survived entirely on
+the stored-id (`series_row`) path: the name/year cross-check compared a
+missing `first_air_date` to the folder year and treated silence as
+agreement (a vacuous year half). Narrowing the prefix rule aimed at the
+scorer and could not have fixed a bind that never scored. Three premises
+stand as recorded: the prefix match is one-directional (the candidate name
+extends the query, never the reverse); punctuation does not separate
+same-show from different-show (the colon folds to a space); and the
+head-before-colon branch of the matcher is dead after `norm_key` removes
+colons, so it remains untouched.
 
 Step 4 is **TV multi-exact only**, capped at 5 tied candidates, and
 declines when the local reference title is on the ADR-0032 rejection list.
