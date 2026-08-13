@@ -31,3 +31,7 @@ path = "src/bin/queue_measure.rs"
 [[bin]]
 name = "metadata-grid-measure"
 path = "src/bin/grid_measure.rs"
+
+[[bin]]
+name = "metadata-title-match-measure"
+path = "src/bin/title_match_measure.rs"
