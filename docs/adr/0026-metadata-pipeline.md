@@ -32,6 +32,8 @@
   implemented and the storage it named cannot hold a board label
 - Amended: 2026-08-13 — entities with zero episodes are not candidates;
   the prefix rule is unchanged because it was not the failure (§2)
+- Amended: 2026-08-13 — an entity with episodes but **no episode identity**
+  is a distinct provider state from an entity with no episodes (§2)
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -160,6 +162,31 @@ extends the query, never the reverse); punctuation does not separate
 same-show from different-show (the colon folds to a space); and the
 head-before-colon branch of the matcher is dead after `norm_key` removes
 colons, so it remains untouched.
+
+**An entity can have episodes and still carry no episode identity, and that
+is a third state, not a variant of the first two.** TMDB 270857
+(`Vanished Name`) has 31 stored episodes whose titles are `Episode 1`,
+`Episode 2`, `Episode 3` and so on to the end. TMDB 224784
+(`Farscape: The Peacekeeper Wars`) has two, named `Part (1)` and `Part (2)`.
+Neither is an empty shell — `number_of_episodes` is non-zero, so the 2026-08-13
+exclusion above does not reach them — and neither supplies a single comparable
+title.
+
+The consequence is that **every episode-title mechanism is silent on such an
+entity, and silence is the correct output**, not a defect to be engineered
+around. `provider_title_is_generic` already rejects the `Episode N` form. The
+`Part (1)` form is the same class with a different surface: a label with
+nothing after it. Bridging it would mean agreeing on a bare part number, which
+matches any file whose title reduces to one, so the episode-title comparator
+refuses it by construction and records the refusal in place (see the
+`ORDINAL_LABELS` doc comment, which lists it as deliberately not bridged).
+
+This matters beyond the comparator because it is a **provider state a folder
+can be correctly bound to**. A folder whose bound entity carries no episode
+identity produces no title evidence for or against itself, so it is
+indistinguishable by titles from a folder bound to the wrong entity entirely.
+Any future rule that reads "the titles do not match, therefore the binding is
+wrong" is wrong on exactly this state.
 
 Step 4 is **TV multi-exact only**, capped at 5 tied candidates, and
 declines when the local reference title is on the ADR-0032 rejection list.

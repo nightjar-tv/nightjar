@@ -2,6 +2,8 @@
 
 - Status: accepted
 - Date: 2026-08-02
+- Amended: 2026-08-13 — §7, the wrong-bind class this flow owns, and why it
+  has no automatic fix
 - Depends on: ADR-0025 (§5 migrator); ADR-0026 (confidence floor, negative-
   result cache, payloads, collections storage §6)
 - Gate: Gate 3 — every mismatch fixable in-UI in under 30 seconds
@@ -85,6 +87,62 @@ Pre-accounts: same local-trust as the rest of `/api/v0`. When accounts and
 profiles land (Block 2), these operations are admin-only. Do not invent a
 second permission model here.
 
+### 7. The wrong-bind class this flow owns
+
+A folder can be bound to the wrong provider entity with high confidence and
+stay that way through every improvement to candidate selection. **Measured on
+the dogfood library, three folders are in this state**, and the fix flow owns
+them because no automatic correction exists:
+
+| folder | bound | correct entity | files |
+|---|---|---|---:|
+| Battlestar Galactica (2003) | 71365 (the 2003 miniseries) | 1972 (the 2004 series) | 72 |
+| What If…! | 66565 | 91363 `What If...?` | 26 |
+| The Haunting | 231907 | 72844 `The Haunting of Hill House` | 10 |
+
+A fourth, `The Continental (2023)`, was in the class and is **already fixed**:
+its stored entity reports zero episodes, which ADR-0026's 2026-08-13 exclusion
+discards, so it re-binds on the next rescan with no operator action.
+
+**Why there is no automatic fix, and both halves are structural.**
+
+*The evidence is not available where the decision is made.* The stored-id bind
+path may read persisted payloads only (ADR-0033 §8). An episode list is
+persisted **only when a folder binds to that entity** — so a wrong bind means
+the correct entity was never bound and its list was never stored. Measured
+across 723 bound folders: of 942 non-bound title-hit candidates, 48 have a
+persisted episode list, and every one of those 48 is an entity some *other*
+folder is bound to. For all four folders above, the correct entity has nothing
+stored at all. The evidence a rebind would need is unavailable by construction,
+not by oversight.
+
+*And the locally available half cannot tell a wrong id from a stale filename.*
+Both produce identical evidence: a stored episode list that none of the
+folder's titles matches. `Vanished (2026)` is the proof — its stored id 270857
+is **correct**, its filenames were stale, and a predicate built on the local
+half fires on it and would move it to 287231, breaking a correct binding. A
+stale-filename detector was measured as the prerequisite that would separate
+the two and does not: it sees a *renumbered* filename (the title still exists
+on the show at another number) and cannot see a *renamed* one (the title exists
+nowhere on the show), and the renamed kind is exactly the failing case.
+
+**So the class is surfaced as low confidence and corrected by an operator
+through the four operations above.** That is what this flow is for.
+
+Two facts recorded with it, because they bound what any future automatic
+attempt could achieve:
+
+- **Two of the three would not auto-bind even with the evidence.** On the
+  fall-through search their correct entities score 0.72
+  (`exact_title_collision_unpinned`) — below the 0.80 floor. Only Battlestar
+  clears it.
+- **`series_key` cannot survive a rebind.** It is `tmdb:show:{id}`, derived
+  from the show id (`item_links::series_key_for_show_folder`), so any rebind
+  restates the folder's identity to every consumer keyed on it, including
+  existing `media_item_links` rows and any bookmarked browse-unit URL. An
+  earlier plan asserted the key should not change because one folder is one
+  show to the user; that is right about the user and wrong about the key.
+
 ## Alternatives considered
 
 **Assign without running the migrator.** Rejected: orphans watch state onto
@@ -115,6 +173,12 @@ linkage after reassignment is a data bug, not a presentation bug.
   that leaves the open surface. Admin-only is not optional polish.
 - Kids allowlisting a mismatched title is the wrong repair; the fix flow
   is preferred (Phase 3 kids prose).
+- **§7's class is a standing operator obligation, not a backlog item.** It does
+  not shrink as matching improves, because the failure is in what the bind site
+  can see rather than in how well it chooses. Any future proposal to automate
+  it must first answer the `Vanished (2026)` case, and a fetch at the bind site
+  does not: it buys the missing claimant evidence and leaves the wrong-id /
+  stale-filename ambiguity exactly where it was.
 - ADR-0027 (artwork) consumes the invalidate/enqueue obligation; it does
   not redefine artwork identity. Number 0027 is reserved for that ADR;
   write it immediately before the artwork slice once real payloads exist to
