@@ -2,6 +2,8 @@
 
 - Status: accepted
 - Date: 2026-08-05
+- Amended: 2026-08-13 — item 8: what the zero-request property costs, and why
+  the cross-check refutes rather than corrects
 - Depends on: ADR-0025 (item identity / path keys §4); ADR-0026 (§3
   negative cache, §8.1/§8.4 two-tier, §8.6 Visible proxy, §8.10 cascade);
   ADR-0028 (manual fix); ADR-0029 (detail payloads); ADR-0030 (library-
@@ -75,6 +77,31 @@ folder-keyed series row; two folders never merge by fold collision.**
    exactly the `Shameless (UK)/(US)` case. "Cross-check" here means "compare
    against the stored payload," never "re-fetch."
 
+   **What the zero-request property costs, recorded 2026-08-13.** The
+   cross-check can only ever ask questions about the *stored* entity, and that
+   bounds it to refuting a binding, never to correcting one. An episode list is
+   persisted only when a folder binds to that entity, so the entity a wrong
+   binding should have chosen has nothing stored — measured across 723 folders,
+   of 942 non-bound title-hit candidates only 48 have a persisted episode list
+   and **every one of the 48 is an entity some other folder is bound to**. A
+   correction therefore cannot be computed here without fetching, and fetching
+   is what this item exists to avoid.
+
+   Worse, the half that *is* computable does not carry the meaning it appears
+   to. "The stored episode list matches none of the folder's titles" is
+   produced identically by a wrong stored id and by filenames that went stale
+   after the provider corrected its metadata — and by an entity that carries no
+   episode identity at all (ADR-0026 §2). Acting on it would break correct
+   bindings; the measured instance is `Vanished (2026)`, whose stored id is
+   right and whose filenames were stale.
+
+   **So this item's zero-request property is not a limitation to be engineered
+   around; it is the reason the wrong-bind class belongs to the operator fix
+   flow (ADR-0028 §7) rather than to the resolver.** The 2026-08-13
+   zero-episode discard is the shape of correction that *is* available here: a
+   property of the stored payload alone, needing no comparison with any other
+   entity.
+
 ## Consequences
 
 - A folder rename re-derives the series row and drops folder-level state
@@ -86,6 +113,10 @@ folder-keyed series row; two folders never merge by fold collision.**
 - Search suppression for identified folders is bounded by the cross-check: a
   folder whose stored detail disagrees falls through to search rather than
   binding a wrong id (plan Decision 3).
+- **The cross-check refutes; it does not correct.** Everything it can read is a
+  property of the stored entity, so it can discard an id and fall through to
+  search, and it can never establish that a *different* entity is the right one.
+  Item 8's 2026-08-13 note records why, and ADR-0028 §7 owns what is left over.
 - Group formation moved from the folded title to the folder scope, and the
   Visible proxy (§8.6) and the negative cache re-keyed with it in RC8.
 - Accepted 2026-08-05 with the human sign-off on all eight questions
