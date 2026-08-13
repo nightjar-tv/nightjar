@@ -27,14 +27,96 @@ impl ParsedName {
     }
 }
 
+/// Release-junk tokens that end a title. Quality, source and codec, matched as
+/// whole words so an ordinary word is never cut: `Ac3` the band is not `AC3`
+/// the codec only because the boundary check requires a separator on both
+/// sides, and `Web` is deliberately absent for the same reason `Charlotte's
+/// Web` exists.
+///
+/// The episode *title* extractor in `nightjar-metadata` has had this list since
+/// the dogfood measurement; `parse_filename` has never had one on either
+/// branch. The movie branch appeared to, because cutting at the year removes
+/// whatever follows it — which works only when a year is found, and 62 of the
+/// 63 measured failures are names with no year at all.
+const TITLE_JUNK: &[&str] = &[
+    "bluray", "blu-ray", "webdl", "web-dl", "webrip", "hdtv", "pdtv", "dvdrip", "bdrip", "hdrip",
+    "tvrip", "sdtv", "remux", "2160p", "1080p", "1080i", "720p", "480p", "x264", "x265", "h264",
+    "h265", "hevc", "xvid", "divx", "aac", "ac3", "dts", "truehd", "atmos", "flac", "10bit",
+    "8bit", "hdr10", "proper", "repack",
+];
+
+/// Cut a title at the first whole-word release-junk token.
+///
+/// Whole-word only: the token must start at a word boundary, so `x264` in
+/// `Matrix264` is not a token and `1080p` glued to a word is not either. When
+/// the cut would leave nothing, the title is returned whole — a name that is
+/// *only* junk carries no identity, and an empty title is worse than a junk one
+/// because the caller substitutes the entire stem for it.
+fn cut_at_title_junk(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut cut = None;
+    for tok in TITLE_JUNK {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(tok) {
+            let i = from + rel;
+            let end = i + tok.len();
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let right_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                cut = Some(cut.map_or(i, |c: usize| c.min(i)));
+                break;
+            }
+            from = end;
+        }
+    }
+    let Some(i) = cut else {
+        return s.to_string();
+    };
+    let head = s[..i]
+        .trim()
+        .trim_matches([' ', '-', '_', '.', '(', '['])
+        .trim();
+    if head.is_empty() {
+        s.to_string()
+    } else {
+        head.to_string()
+    }
+}
+
+/// Strip a leading `[group]` release tag.
+///
+/// **Guarded on what is left, not on what is stripped.** `[REC] (2007)` is a
+/// real film and its whole title is the bracket, so the rule only fires when
+/// the remainder still carries a letter — `[Commie] Show - 07` keeps `Show`,
+/// `[REC] (2007)` keeps everything. Without that guard the rule destroys a
+/// title to clean one, which is the trade the orthography measurement rejected.
+fn strip_leading_group(stem: &str) -> &str {
+    let t = stem.trim_start();
+    if !t.starts_with('[') {
+        return stem;
+    }
+    let Some(close) = t.find(']') else {
+        return stem;
+    };
+    let rest = t[close + 1..]
+        .trim_start_matches([' ', '_', '.', '-'])
+        .trim();
+    if rest.chars().any(|c| c.is_alphabetic()) {
+        rest
+    } else {
+        stem
+    }
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
-    let stem = strip_extension(file_name);
+    let stem = strip_leading_group(strip_extension(file_name));
     let normalized = stem.replace(['_', '.'], " ");
     let compact = stem.to_ascii_lowercase();
 
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
-        let title = clean_title(&stem[..before.min(stem.len())]);
+        let title = cut_at_title_junk(&clean_title(&stem[..before.min(stem.len())]));
         let end = if episode_end > episode {
             Some(episode_end)
         } else {
@@ -63,10 +145,10 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
                 .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
             match cut {
                 Some(i) if i > 0 => clean_title(&stem[..i]),
-                _ => clean_title(stem),
+                _ => cut_at_title_junk(&clean_title(stem)),
             }
         }
-        None => clean_title(stem),
+        None => cut_at_title_junk(&clean_title(stem)),
     };
 
     ParsedName {
@@ -238,6 +320,87 @@ fn find_year(s: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule 1 — a leading release-group bracket is not part of the title.
+    #[test]
+    fn a_leading_group_bracket_is_stripped() {
+        let a = parse_filename("[AnonGroup] Anon Show - 1x02 - A Title.mkv");
+        assert_eq!(a.title, "Anon Show");
+        assert_eq!(a.season, Some(1));
+        assert_eq!(a.episode, Some(2));
+
+        let b = parse_filename("[AnonGroup]Anon Film (2019).mkv");
+        assert_eq!(b.title, "Anon Film");
+        assert_eq!(b.year, Some(2019));
+    }
+
+    /// Rule 1, the guard — the rule fires on what is **left**, not on what is
+    /// stripped. A film whose whole title is a bracket keeps it; stripping to
+    /// clean would destroy the title to tidy it.
+    #[test]
+    fn a_bracket_that_is_the_title_is_kept() {
+        let a = parse_filename("[REC] (2007).mkv");
+        assert!(a.title.contains("[REC]"), "got {:?}", a.title);
+        assert_eq!(a.year, Some(2007));
+
+        // A bracket that is not leading is not a group tag either.
+        let b = parse_filename("Anon Show - 1x02 - A Title [AnonGroup].mkv");
+        assert_eq!(b.title, "Anon Show");
+        let c = parse_filename("Anon [Bracketed] Film (2011).mkv");
+        assert_eq!(c.title, "Anon [Bracketed] Film");
+    }
+
+    /// Rule 2 — one case per junk class, on the episode branch's title and on
+    /// the movie branch's, since neither had a strip before.
+    #[test]
+    fn release_junk_is_cut_from_the_title_on_both_branches() {
+        for junk in [
+            "Bluray-1080p",
+            "WEBRip-720p",
+            "HDTV",
+            "x264",
+            "HEVC",
+            "AAC",
+            "DTS",
+            "REPACK",
+        ] {
+            let e = parse_filename(&format!("Anon Show {junk} - 1x02 - A Title.mkv"));
+            assert_eq!(e.title, "Anon Show", "episode branch kept {junk}");
+            let m = parse_filename(&format!("Anon Film {junk}.mkv"));
+            assert_eq!(m.title, "Anon Film", "movie branch kept {junk}");
+        }
+    }
+
+    /// Rule 2, the guards — whole words only, and never cut to nothing.
+    #[test]
+    fn junk_words_glued_into_a_title_are_not_cut() {
+        assert_eq!(
+            parse_filename("Anon Matrix264 Film (2011).mkv").title,
+            "Anon Matrix264 Film"
+        );
+        assert_eq!(
+            parse_filename("Anon Aacorn Film (2011).mkv").title,
+            "Anon Aacorn Film"
+        );
+        // A name that is only junk carries no identity; cutting to empty makes
+        // the caller substitute the whole stem, which is worse than the junk.
+        let only = parse_filename("1080p.x264.mkv");
+        assert!(!only.title.is_empty());
+    }
+
+    /// The control: the form 93% of the measured library is written in parses
+    /// identically before and after both rules.
+    #[test]
+    fn the_common_form_is_unchanged_by_the_title_rules() {
+        let p = parse_filename("Anon Show - 4x11 - An Episode Title - Bluray-1080p.mkv");
+        assert_eq!(p.title, "Anon Show");
+        assert_eq!(p.kind, MediaKind::Episode);
+        assert_eq!(p.season, Some(4));
+        assert_eq!(p.episode, Some(11));
+        let m = parse_filename("Anon Film (2019) Bluray-1080p.mkv");
+        assert_eq!(m.title, "Anon Film");
+        assert_eq!(m.year, Some(2019));
+    }
 
     /// Defect 1 — a resolution token is not an episode. Titles are invented;
     /// the token shapes are what is under test.
