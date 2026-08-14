@@ -57,6 +57,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         20,
         include_str!("../migrations/020_accounts_profiles_sessions.sql"),
     ),
+    (
+        21,
+        include_str!("../migrations/021_series_entity_bindings.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -298,7 +302,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 20);
+        assert_eq!(v, 21);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -307,6 +311,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_series, 1);
+        let has_series_bindings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'series_entity_bindings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_series_bindings, 1);
         let has_subtitle_tracks: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_item_subtitle_tracks'",
@@ -1552,5 +1565,257 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    /// Bring an in-memory DB up through every migration, with `foreign_keys`
+    /// ON the way `Db::open` sets it, so cascade behaviour is the real one.
+    fn migrated_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
+    /// One row of `series_entity_bindings`, named rather than an 8-tuple so
+    /// the assertions below read as the schema they are checking.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BindingRow {
+        library_id: i64,
+        relpath: String,
+        tmdb_show_id: i64,
+        is_primary: i64,
+        folder_seasons: (Option<i64>, Option<i64>),
+        entity_seasons: (Option<i64>, Option<i64>),
+    }
+
+    fn binding_rows(conn: &Connection) -> Vec<BindingRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT library_id, relpath, tmdb_show_id, is_primary,
+                        folder_season_start, folder_season_end,
+                        entity_season_start, entity_season_end
+                 FROM series_entity_bindings
+                 ORDER BY relpath, tmdb_show_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok(BindingRow {
+                library_id: r.get(0)?,
+                relpath: r.get(1)?,
+                tmdb_show_id: r.get(2)?,
+                is_primary: r.get(3)?,
+                folder_seasons: (r.get(4)?, r.get(5)?),
+                entity_seasons: (r.get(6)?, r.get(7)?),
+            })
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// 021 (ADR-0046 item 2): every existing `series` row becomes exactly one
+    /// primary binding, unbounded on both sides. Unbounded is the point — a
+    /// backfilled row reads as "covers every folder season, numbering
+    /// unchanged", which is what the folder does today, so a folder that never
+    /// spans keeps behaving exactly as it does now.
+    #[test]
+    fn migration_21_backfills_one_unbounded_primary_per_series_row() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES
+                (1, 'Will & Grace', 4454),
+                (1, 'Beta', 66);",
+        )
+        .unwrap();
+
+        // The backfill ran before these rows existed, so re-run its statement
+        // the way a fresh migration on a populated DB would see them.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             SELECT library_id, relpath, tmdb_show_id, 1, NULL, NULL, NULL, NULL
+             FROM series;",
+        )
+        .unwrap();
+
+        let series_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM series", [], |r| r.get(0))
+            .unwrap();
+        let rows = binding_rows(&conn);
+        assert_eq!(
+            rows.len() as i64,
+            series_count,
+            "exactly one binding row per series row"
+        );
+        assert!(
+            rows.iter().all(|r| r.is_primary == 1),
+            "every backfilled row is the primary binding"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.folder_seasons == (None, None) && r.entity_seasons == (None, None)),
+            "backfilled ranges are unbounded, not computed from the library"
+        );
+    }
+
+    /// The backfill is a copy, so running it twice changes nothing. The
+    /// migration framework already guarantees one run; this guards the
+    /// statement itself, because a backfill that is not idempotent is a
+    /// re-run away from duplicating every folder.
+    #[test]
+    fn migration_21_backfill_is_idempotent() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 55);",
+        )
+        .unwrap();
+        let backfill = "INSERT OR IGNORE INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             SELECT library_id, relpath, tmdb_show_id, 1, NULL, NULL, NULL, NULL
+             FROM series;";
+        conn.execute_batch(backfill).unwrap();
+        let first = binding_rows(&conn);
+        conn.execute_batch(backfill).unwrap();
+        let second = binding_rows(&conn);
+        assert_eq!(first, second, "a second backfill changes nothing");
+        assert_eq!(first.len(), 1);
+    }
+
+    /// A second entity is representable: the folder's seasons and the entity's
+    /// differ, and the row round-trips unchanged. Nothing writes a row like
+    /// this in production yet — slice B does — so this is where the shape is
+    /// proved able to hold Will & Grace before any code depends on it.
+    #[test]
+    fn migration_21_holds_a_renumbered_second_entity() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Will & Grace', 4454);
+             INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             VALUES
+                (1, 'Will & Grace', 4454, 1, NULL, NULL, NULL, NULL),
+                (1, 'Will & Grace', 74321, 0, 9, 11, 1, 3);",
+        )
+        .unwrap();
+        let rows = binding_rows(&conn);
+        assert_eq!(
+            rows,
+            vec![
+                BindingRow {
+                    library_id: 1,
+                    relpath: "Will & Grace".to_string(),
+                    tmdb_show_id: 4454,
+                    is_primary: 1,
+                    folder_seasons: (None, None),
+                    entity_seasons: (None, None),
+                },
+                BindingRow {
+                    library_id: 1,
+                    relpath: "Will & Grace".to_string(),
+                    tmdb_show_id: 74321,
+                    is_primary: 0,
+                    folder_seasons: (Some(9), Some(11)),
+                    entity_seasons: (Some(1), Some(3)),
+                },
+            ],
+            "folder seasons 9-11 map to entity seasons 1-3, stored as a range \
+             and not as an offset"
+        );
+    }
+
+    /// One primary per folder, enforced by the partial index rather than by
+    /// convention. Two primaries would make "which entity names the unit"
+    /// ambiguous at the storage layer, which is the question ADR-0046 item 5
+    /// leaves open — open at the product level, not undecidable at the schema.
+    #[test]
+    fn migration_21_rejects_a_second_primary_for_one_folder() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 55);
+             INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary)
+             VALUES (1, 'Alpha', 55, 1);",
+        )
+        .unwrap();
+        let err = conn
+            .execute_batch(
+                "INSERT INTO series_entity_bindings
+                    (library_id, relpath, tmdb_show_id, is_primary)
+                 VALUES (1, 'Alpha', 999, 1);",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unique"),
+            "second primary must be rejected, got: {err}"
+        );
+
+        // A second *non*-primary binding for the same folder is the whole
+        // point of the table and must still be allowed.
+        conn.execute_batch(
+            "INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             VALUES (1, 'Alpha', 999, 0, 9, 11, 1, 3);",
+        )
+        .unwrap();
+        assert_eq!(binding_rows(&conn).len(), 2);
+    }
+
+    /// Deleting a library cascades through `series` into its bindings. Without
+    /// this the table accumulates rows pointing at folders that no longer
+    /// exist, and a later folder at the same relpath inherits them.
+    #[test]
+    fn migration_21_bindings_cascade_when_the_library_goes() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 55);
+             INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary)
+             VALUES (1, 'Alpha', 55, 1);",
+        )
+        .unwrap();
+        assert_eq!(binding_rows(&conn).len(), 1);
+        conn.execute_batch("DELETE FROM libraries WHERE id = 1;")
+            .unwrap();
+        assert_eq!(
+            binding_rows(&conn).len(),
+            0,
+            "bindings go with the series rows they belong to"
+        );
+    }
+
+    /// A binding must belong to a `series` row. The composite foreign key is
+    /// what makes `(library_id, relpath)` mean the same thing in both tables.
+    #[test]
+    fn migration_21_rejects_a_binding_with_no_series_row() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/media/S', 'shows');",
+        )
+        .unwrap();
+        let err = conn
+            .execute_batch(
+                "INSERT INTO series_entity_bindings
+                    (library_id, relpath, tmdb_show_id, is_primary)
+                 VALUES (1, 'Nonexistent', 55, 1);",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "expected a foreign key violation, got: {err}"
+        );
     }
 }
