@@ -17,6 +17,7 @@ use crate::clean::{
     year_from_path,
 };
 use crate::item_links;
+use crate::match_score::{SeasonRangeMapping, UnplacedFile, map_unplaced_to_candidate_seasons};
 use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind, item_key_for_metadata};
 use crate::negative_cache::{PROVIDER_TMDB, query_key};
 use crate::resolve::MetadataSource;
@@ -946,6 +947,174 @@ pub fn bind_resolved_items<T: MetadataSource>(
     }
 }
 
+/// Counters from one [`bind_second_entities`] call.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SecondEntityStats {
+    pub entities_bound: usize,
+    pub files_linked: usize,
+    /// Files still unplaced after every candidate was tested. Reported rather
+    /// than swallowed: a folder needing three entities where the search finds
+    /// two is a real outcome, and Monster is that folder.
+    pub still_unplaced: usize,
+}
+
+/// The folder a second-entity search runs for.
+#[derive(Debug, Clone, Copy)]
+struct SecondEntityScope<'a> {
+    library_id: i64,
+    show_folder: &'a str,
+    title: &'a str,
+    soft_key: &'a str,
+}
+
+/// ADR-0046 item 4: after a bind leaves folder seasons unplaced, look for a
+/// second entity that explains them.
+///
+/// Runs only when `seasons_skipped > 0` and only when the folder has no
+/// secondary binding yet, so a rescan of a resolved folder issues **zero**
+/// search requests — the property ADR-0033 item 1 protects and Gate 3
+/// depends on.
+///
+/// **The primary binding is never touched.** A primary that moves is a
+/// `series_key` change, restating the folder's identity to every consumer
+/// keyed on it. Battlestar Galactica is the folder that tempts it — bound to
+/// the two-episode miniseries while 70 files belong to the series — and it is
+/// blocked on ADR-0046 item 5 rather than fixed here.
+fn bind_second_entities<T: MetadataSource>(
+    conn: &Connection,
+    resolver: &Resolver<T>,
+    folder: SecondEntityScope<'_>,
+    item_ids: &[i64],
+    primary_show_id: i64,
+) -> Result<SecondEntityStats, String> {
+    let SecondEntityScope {
+        library_id,
+        show_folder,
+        title,
+        soft_key,
+    } = folder;
+    let mut stats = SecondEntityStats::default();
+    if crate::series_bindings::has_secondary(conn, library_id, show_folder)? {
+        return Ok(stats);
+    }
+    let mut unplaced: Vec<(i64, UnplacedFile)> = Vec::new();
+    for slot in episode_slots(conn, item_ids)? {
+        let linked: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM media_item_links
+                 WHERE media_item_id = ?1 AND item_key LIKE 'tmdb:episode:%' LIMIT 1",
+                params![slot.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("check episode link: {e}"))?;
+        if linked.is_some() {
+            continue;
+        }
+        let (Some(season), Some(episode)) = (slot.season, slot.episode) else {
+            continue;
+        };
+        let base = std::path::Path::new(&slot.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(slot.path.as_str());
+        let Some(t) = crate::clean::after_token_episode_title(base, season, episode) else {
+            continue;
+        };
+        unplaced.push((
+            slot.id,
+            UnplacedFile {
+                folder_season: season,
+                episode,
+                title: t,
+            },
+        ));
+    }
+    if unplaced.is_empty() {
+        return Ok(stats);
+    }
+    stats.still_unplaced = unplaced.len();
+
+    let candidates = resolver
+        .tmdb
+        .second_entity_candidates(title, primary_show_id)
+        .map_err(|e| e.to_string())?;
+    let files: Vec<UnplacedFile> = unplaced.iter().map(|(_, f)| f.clone()).collect();
+    for cand in candidates {
+        let Some(mapping) = map_unplaced_to_candidate_seasons(&cand.shape, &files, soft_key) else {
+            // No title agreed. No binding — the files stay unmatched, which is
+            // the bucket with three built consumers. Binding the best of a bad
+            // set is the failure this refuses.
+            continue;
+        };
+        crate::series_bindings::record_secondary(
+            conn,
+            library_id,
+            show_folder,
+            cand.tmdb_show_id,
+            mapping.folder_seasons,
+            mapping.entity_seasons,
+        )?;
+        stats.entities_bound += 1;
+        let linked = link_files_to_entity(conn, resolver, cand.tmdb_show_id, &mapping, &unplaced)?;
+        stats.files_linked += linked;
+        stats.still_unplaced = stats.still_unplaced.saturating_sub(linked);
+    }
+    Ok(stats)
+}
+
+/// Project the entity's seasons and link the folder files that map onto them.
+fn link_files_to_entity<T: MetadataSource>(
+    conn: &Connection,
+    resolver: &Resolver<T>,
+    entity_id: i64,
+    mapping: &SeasonRangeMapping,
+    unplaced: &[(i64, UnplacedFile)],
+) -> Result<usize, String> {
+    let (flo, fhi) = mapping.folder_seasons;
+    let (elo, ehi) = mapping.entity_seasons;
+    let mut linked = 0usize;
+    for entity_season in elo..=ehi {
+        let Some(raw) = resolver
+            .tmdb
+            .fetch_season(entity_id, entity_season)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let eps = canonical::persist_season_projection(conn, PROVIDER_TMDB, entity_id, &raw)?;
+        // The folder's number for this entity season, derived from the two
+        // stored ranges rather than from an offset.
+        let folder_season = flo + (entity_season - elo);
+        if folder_season > fhi {
+            continue;
+        }
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin second-entity bind tx: {e}"))?;
+        for ep in &eps {
+            let (Some(es), Some(en)) = (ep.season, ep.episode) else {
+                continue;
+            };
+            if es != entity_season {
+                continue;
+            }
+            let Some(key) = item_key_for_metadata(ep) else {
+                continue;
+            };
+            for (media_id, file) in unplaced {
+                if file.folder_season == folder_season && file.episode == en {
+                    item_links::replace_auto_links(&tx, *media_id, std::slice::from_ref(&key))?;
+                    linked += 1;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit second-entity bind: {e}"))?;
+    }
+    Ok(linked)
+}
+
 struct EpisodeSlot {
     id: i64,
     season: Option<i32>,
@@ -1504,6 +1673,37 @@ fn enrich_one_group<T: MetadataSource>(
                             "  bind {} seasons_fetched={} skipped={} linked={}",
                             g.title, b.seasons_fetched, b.seasons_skipped, b.files_linked
                         );
+                        // ADR-0046 item 4: seasons the bound entity has no
+                        // season for are the unplaced set, and they are the
+                        // input to the second-entity search. The count is
+                        // already computed from a call the drain just made.
+                        if let Some(primary) = final_meta.ids.tmdb.or(final_meta.ids.tmdb_show) {
+                            match bind_second_entities(
+                                conn,
+                                resolver,
+                                SecondEntityScope {
+                                    library_id: g.library_id,
+                                    show_folder: &g.show_folder,
+                                    title: &g.title,
+                                    soft_key: &g.title,
+                                },
+                                &g.item_ids,
+                                primary,
+                            ) {
+                                Ok(se) if se.entities_bound > 0 => {
+                                    eprintln!(
+                                        "  second entity {} bound={} linked={} still_unplaced={}",
+                                        g.title,
+                                        se.entities_bound,
+                                        se.files_linked,
+                                        se.still_unplaced
+                                    );
+                                    stats.files_linked += se.files_linked;
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("  second entity ({}): {e}", g.title),
+                            }
+                        }
                     }
                     true
                 }
@@ -4335,5 +4535,253 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(links, vec!["tmdb:episode:1001", "tmdb:episode:1002"]);
+    }
+
+    /// A source that offers one second entity numbering its seasons from 1,
+    /// and counts how many times it was asked. The count is the test for the
+    /// zero-request rescan property.
+    struct SecondEntitySource {
+        searches: std::cell::Cell<usize>,
+    }
+
+    impl SecondEntitySource {
+        fn new() -> Self {
+            Self {
+                searches: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl MetadataSource for SecondEntitySource {
+        fn resolve(
+            &self,
+            _input: &crate::resolve::ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+            Ok(crate::resolve::ProviderResult::Miss)
+        }
+
+        fn second_entity_candidates(
+            &self,
+            _title: &str,
+            exclude: i64,
+        ) -> Result<Vec<crate::resolve::SecondEntityCandidate>, crate::resolve::ResolveError>
+        {
+            self.searches.set(self.searches.get() + 1);
+            assert_ne!(exclude, 74321, "the bound primary is never a candidate");
+            Ok(vec![crate::resolve::SecondEntityCandidate {
+                tmdb_show_id: 74321,
+                shape: crate::match_score::CandidateShape {
+                    candidate_season_episodes: Some(vec![
+                        (1, 1, "Eleven Years Later".to_string()),
+                        (1, 2, "Rocket Man".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            }])
+        }
+
+        fn fetch_season(
+            &self,
+            show_id: i64,
+            season_number: i32,
+        ) -> Result<Option<crate::tmdb::RawProviderPayload>, crate::resolve::ResolveError> {
+            assert_eq!(show_id, 74321);
+            let payload = format!(
+                r#"{{"season_number": {season_number}, "episodes": [
+                     {{"id": 9001, "name": "Eleven Years Later", "season_number": {season_number}, "episode_number": 1}},
+                     {{"id": 9002, "name": "Rocket Man", "season_number": {season_number}, "episode_number": 2}}
+                   ]}}"#
+            );
+            Ok(Some(crate::tmdb::RawProviderPayload {
+                entity_kind: "season".into(),
+                provider_id: format!("{show_id}:{season_number}"),
+                payload,
+            }))
+        }
+    }
+
+    /// Folder numbered S9, entity numbering the same episodes S1.
+    fn unplaced_folder(c: &Connection) {
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind)
+                  VALUES (1, 'Shows', '/Shows', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'Will & Grace', 4454);
+             INSERT INTO series_entity_bindings
+                  (library_id, relpath, tmdb_show_id, is_primary)
+                  VALUES (1, 'Will & Grace', 4454, 1);
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+                (1, 1, 'Will & Grace/Season 9/Will & Grace - S09E01 - Eleven Years Later.mkv',
+                    1, 1, 'Will & Grace', 'episode', 9, 1),
+                (2, 1, 'Will & Grace/Season 9/Will & Grace - S09E02 - Rocket Man.mkv',
+                    1, 1, 'Will & Grace', 'episode', 9, 2);",
+        )
+        .unwrap();
+    }
+
+    fn scope() -> SecondEntityScope<'static> {
+        SecondEntityScope {
+            library_id: 1,
+            show_folder: "Will & Grace",
+            title: "Will & Grace",
+            soft_key: "Will & Grace",
+        }
+    }
+
+    #[test]
+    fn agreeing_titles_write_a_secondary_binding_and_link_the_files() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        unplaced_folder(&c);
+        let resolver = Resolver {
+            tmdb: SecondEntitySource::new(),
+        };
+
+        let stats = bind_second_entities(&c, &resolver, scope(), &[1, 2], 4454).unwrap();
+        assert_eq!(stats.entities_bound, 1);
+        assert_eq!(stats.files_linked, 2);
+        assert_eq!(stats.still_unplaced, 0);
+
+        let row: (i64, i64, i32, i32, i32, i32) = c
+            .query_row(
+                "SELECT tmdb_show_id, is_primary, folder_season_start, folder_season_end,
+                        entity_season_start, entity_season_end
+                 FROM series_entity_bindings WHERE is_primary = 0",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (74321, 0, 9, 9, 1, 1), "folder S9 maps to entity S1");
+
+        let links: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links WHERE item_key LIKE 'tmdb:episode:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(links, 2);
+    }
+
+    /// The primary is never rewritten, whatever is found. A primary that moves
+    /// is a `series_key` change, restating the folder's identity to every
+    /// consumer keyed on it.
+    #[test]
+    fn the_primary_binding_is_never_touched() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        unplaced_folder(&c);
+        let resolver = Resolver {
+            tmdb: SecondEntitySource::new(),
+        };
+        bind_second_entities(&c, &resolver, scope(), &[1, 2], 4454).unwrap();
+
+        let primary: i64 = c
+            .query_row(
+                "SELECT tmdb_show_id FROM series_entity_bindings WHERE is_primary = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(primary, 4454);
+        let series: i64 = c
+            .query_row("SELECT tmdb_show_id FROM series", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(series, 4454, "the series row is untouched");
+    }
+
+    /// **Zero search requests on a rescan of a resolved folder** — the
+    /// property ADR-0033 item 1 protects and Gate 3 depends on. The stored
+    /// record exists to suppress the re-search; without it identity would be
+    /// re-derived from search on every drain.
+    #[test]
+    fn a_resolved_folder_issues_no_search_on_rescan() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        unplaced_folder(&c);
+        let resolver = Resolver {
+            tmdb: SecondEntitySource::new(),
+        };
+
+        bind_second_entities(&c, &resolver, scope(), &[1, 2], 4454).unwrap();
+        assert_eq!(resolver.tmdb.searches.get(), 1, "first pass searches once");
+
+        bind_second_entities(&c, &resolver, scope(), &[1, 2], 4454).unwrap();
+        assert_eq!(
+            resolver.tmdb.searches.get(),
+            1,
+            "a rescan issues no further search"
+        );
+    }
+
+    /// A source that finds a candidate whose titles do not agree.
+    struct DisagreeingSource;
+
+    impl MetadataSource for DisagreeingSource {
+        fn resolve(
+            &self,
+            _input: &crate::resolve::ResolveInput,
+        ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+            Ok(crate::resolve::ProviderResult::Miss)
+        }
+
+        fn second_entity_candidates(
+            &self,
+            _title: &str,
+            _exclude: i64,
+        ) -> Result<Vec<crate::resolve::SecondEntityCandidate>, crate::resolve::ResolveError>
+        {
+            Ok(vec![crate::resolve::SecondEntityCandidate {
+                tmdb_show_id: 55555,
+                shape: crate::match_score::CandidateShape {
+                    candidate_season_episodes: Some(vec![(
+                        1,
+                        1,
+                        "Something Else Entirely".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            }])
+        }
+    }
+
+    /// No agreement, no binding. The files stay unmatched — the bucket with
+    /// three built consumers — rather than binding the best of a bad set.
+    #[test]
+    fn no_title_agreement_writes_no_binding() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        unplaced_folder(&c);
+        let resolver = Resolver {
+            tmdb: DisagreeingSource,
+        };
+
+        let stats = bind_second_entities(&c, &resolver, scope(), &[1, 2], 4454).unwrap();
+        assert_eq!(stats.entities_bound, 0);
+        assert_eq!(stats.files_linked, 0);
+        assert_eq!(
+            stats.still_unplaced, 2,
+            "both files stay unplaced, and are reported"
+        );
+
+        let secondaries: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM series_entity_bindings WHERE is_primary = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(secondaries, 0);
     }
 }
