@@ -3,7 +3,7 @@
 - Status: accepted; amended 2026-08-10 (item 1 and item 3: the owner cannot demote themselves)
 - Date: 2026-08-06
 - Accepted: 2026-08-06, with all nine questions signed off in
-  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`.
+  the ADR-0039/0040 decision sheet, 2026-08-06.
   **B2-1 must not dispatch until its step table takes the `role` column** — its
   migration writes the account table and this record changes what column it
   takes (sheet Q17)
@@ -17,9 +17,8 @@
 - Gate: Gate 3 — kids scoping and parent overrides are unreachable from a
   profile session including an adult-flagged one; full v1 API frozen
 - Related: ADR-0035 item 7 and ADR-0037 items 9, 11 and 12, which read this
-  record; Block 2 plan B2-G, B2-1 and B2-2
-  (`nightjar-meta/docs/BLOCK_2_PLAN.md`); decision sheet
-  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`;
+  record; Block 2 plan B2-G, B2-1 and B2-2; decision sheet
+  the ADR-0039/0040 decision sheet, 2026-08-06;
   ADR-0035 to ADR-0038 sign-off sheet Q22, which raised this
 
 ## Context

@@ -3382,7 +3382,7 @@ mod tests {
     }
 
     /// Proves tonemap changed pixels vs retag — not beauty.
-    /// Floor from `nightjar-meta/notes/hdr-tonemap-delta-2026-08-01.md` (measured MAD ≈ 11.08).
+    /// Floor from the HDR tonemap-delta measurement, 2026-08-01 (MAD ≈ 11.08).
     #[test]
     fn tonemap_frame_differs_from_retag() {
         if !ffmpeg_available() || !ffmpeg_has_zscale() {
@@ -3431,7 +3431,7 @@ mod tests {
             .map(|(x, y)| u64::from((*x as i16 - *y as i16).unsigned_abs()))
             .sum();
         let mad = sum as f64 / a.len() as f64;
-        // Half of measured ~11.08 — nightjar-meta/notes/hdr-tonemap-delta-2026-08-01.md
+        // Half of measured ~11.08 — HDR tonemap-delta measurement, 2026-08-01
         assert!(
             mad >= 5.0,
             "expected tonemap≠retag (MAD≥5.0), got MAD={mad}"

@@ -139,7 +139,7 @@ waste:
    leaving it open is what stops a toggle from getting built by default when
    someone eventually wires the trigger up; it is not a claim that the
    trigger exists. Tracked as a residual in
-   `nightjar-meta/notes/plan-derived-artifacts-slice-2026-08-06.md`, not
+   the plan derived artifacts slice note, 2026-08-06, not
    only here — an ADR noting its own gap and a plan not tracking it is how a
    residual gets forgotten (ADR-0026 §8.4's fate: frozen in an ADR, never
    implemented, untracked until it surfaced months later during ADR-0037).
@@ -313,14 +313,14 @@ Session slot scheduling. Burn-in selection and encode graphs (ADR-0018).
 `.ass` store shape (ADR-0019, inherited unchanged). `trackId`, store path,
 ADR-0025 keys (unchanged from ADR-0013). Subtitle download providers.
 Widening `BROWSER_V0` (recorded, not acted on, in the source measurement
-brief — see `nightjar-meta/docs/derived-artifacts-slice-brief.md` §5).
+brief — see the derived-artifacts slice brief §5).
 QSV / hardware transcode fallback (same brief, same section — unrelated
 finding, ops not code).
 
 ## Acceptance
 
 Corpus fixtures (Rule 4.3), all small and synthetic — see
-`nightjar-meta/docs/derived-artifacts-slice-brief.md` Acceptance for the
+the derived-artifacts slice brief Acceptance for the
 authoritative list this ADR's implementation is checked against:
 
 - no subtitle streams → `none`, asserting ffmpeg is never spawned
@@ -346,7 +346,7 @@ Behavioural tests:
 
 ## References (notes)
 
-- `nightjar-meta/docs/derived-artifacts-slice-brief.md` — source brief,
+- the derived-artifacts slice brief — source brief,
   2026-08-06, all measured figures in this ADR (n and transport as stated
   there; WiFi over a degraded array, upper bounds, re-measure once the
   array rebuild finishes and the `--sample` flag is dropped from

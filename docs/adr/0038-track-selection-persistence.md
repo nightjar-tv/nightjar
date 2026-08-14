@@ -5,14 +5,14 @@
 - Accepted: 2026-08-06, once ADR-0039 was accepted. It supplies the `series_key`
   item 4 stores against, including for unmatched show folders, and the migrator
   that rewrites it — in both directions, since a movie's series key is its own
-  `item_key` (sheet Q7). Sign-off: `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`
+  `item_key` (sheet Q7). Sign-off: the ADR-0039/0040 decision sheet, 2026-08-06
 - Depends on: ADR-0024 (the ranked selection rule and its reason strings, which
   this extends and does not restate); ADR-0012 (audio inventory, `trackId`);
   ADR-0010 (subtitle inventory); ADR-0034 (profiles); ADR-0039 (`series_key`,
   its grammar, its opacity, and the migrator that rewrites it), extending
   ADR-0033
 - Gate: Gate 3 — full v1 API frozen
-- Related: Block 2 plan B2-E and B2-8 (`nightjar-meta/docs/BLOCK_2_PLAN.md`);
+- Related: Block 2 plan B2-E and B2-8;
   ADR-0024 §3, which named this slice as the Block 2 half of that decision
 
 ## Context

@@ -8,8 +8,8 @@
   (season detail payloads); ADR-0033 (durable series identity)
 - Gate: Gate 3 — metadata auto-match ≥95% correct, every mismatch fixable
   in-UI in under 30 seconds
-- Related: `nightjar-meta/docs/BLOCK1_LEAVE_BAR.md` (unmatched is an output,
-  never a target); `nightjar-meta/notes/tvdb-vs-tmdb-library-spike-2026-08-12.md`
+- Related: the Block 1 leave bar (unmatched is an output,
+  never a target); the TVDB vs TMDB library spike note, 2026-08-12
 
 ## Context
 

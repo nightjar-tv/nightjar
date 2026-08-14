@@ -47,7 +47,7 @@ impl ProgressDisplay {
 /// Probe queue depth at or above which a bar is worth drawing.
 ///
 /// Chosen from two measured regimes rather than by taste. On 2026-08-09
-/// (`nightjar-meta/notes/m1-cross-queue-preempt-2026-08-09.md`) probe kept pace
+/// (cross-queue preempt probe, 2026-08-09) kept pace
 /// with the walk and the backlog oscillated between 0 and 175, draining in
 /// seconds. On 2026-08-07, before probes were enqueued as the walk discovered
 /// them, the same library built a backlog of 23,244 and a priority item waited

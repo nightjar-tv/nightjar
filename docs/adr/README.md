@@ -67,7 +67,7 @@ not here — this page is the reference, not the tour.
 
 0044 and 0045 are taken and have no row here, which is the one case where a gap
 in this table is not a mistake. They are **reserved by decision sheets** in
-`nightjar-meta/notes/design/`, not by ADR files. 0044's sheet still carries
+the private design sheets, not by ADR files. 0044's sheet still carries
 eight blank `Decision:` lines; 0045's was written against a design that has
 since been measured and refuted (see 0046).
 
@@ -100,7 +100,7 @@ number, and reading it alone would say 0044 and 0045 are free. They are not.
 
 ## ADR-0001 and ADR-0002
 
-Both were flagged in `nightjar-meta/docs/SLICE_CLOSEOUT.md`'s "ADR
+Both were flagged in the slice close-out checklist's "ADR
 hygiene" checklist as an illustration: *"Leaving 0001/0002 as `proposed`
 while later ADRs assume them is how sign-off debt hides."* As of this
 index:
@@ -108,7 +108,7 @@ index:
 - **ADR-0001 already carries its correct status** — `superseded by
   ADR-0021`, dated 2026-07-31. It is not `proposed`. The
   `SLICE_CLOSEOUT.md` illustration was stale on this half by about a
-  week; corrected there in the companion `nightjar-meta` commit rather
+  week; corrected there in the companion private-repository commit rather
   than left to keep citing a status that changed.
 - **ADR-0002 is genuinely `proposed` and correctly so.** Its own
   Decision section says "Pending sign-off. Decide before Phase 3 HTTPS

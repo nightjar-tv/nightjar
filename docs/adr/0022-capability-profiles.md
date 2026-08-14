@@ -35,7 +35,7 @@ Dart player interface rule in ADR-0021 and applies to the web client too.
 | `BROWSER_V0` | Web (and today's anonymous default) | Already shipped. Codecs + containers + `maxAudioChannels: 2`. |
 | `MEDIA3_V0` | Android / Android TV Flutter | Scored in bake-off (~96.5% DP on dogfood). |
 | `MPV_V0` | Windows / Linux media_kit; bake-off libmpv floor | Scored (~100% DP on dogfood). |
-| `AETHER_V0` | Apple if ADR-0021 option (a) wins | **Modelled, not measured:** `decide_playback` rates on dogfood DB (~24 940 items, 2026-08-02): ~100% directPlay. Same modelled run: `APPLE_AVPLAYER_V0` ~**13.1%** directPlay (no Matroska; restricted codecs) — that gap is the argument for the Aether path. Matroska + wide codecs; client bridges audio AVPlayer rejects. Counts: `nightjar-meta/notes/t1-profile-counts-2026-08-02.txt`. |
+| `AETHER_V0` | Apple if ADR-0021 option (a) wins | **Modelled, not measured:** `decide_playback` rates on dogfood DB (~24 940 items, 2026-08-02): ~100% directPlay. Same modelled run: `APPLE_AVPLAYER_V0` ~**13.1%** directPlay (no Matroska; restricted codecs) — that gap is the argument for the Aether path. Matroska + wide codecs; client bridges audio AVPlayer rejects. Counts: the T1 profile counts note, 2026-08-02. |
 | Tizen / webOS model-year ids | Vendor Flutter shells | Capability varies by TV year; client must report what that stick can decode. |
 
 Ids are additive. Unknown id + full field bag still decides; unknown id with
@@ -93,13 +93,13 @@ runtime.
 Regression coverage for the graph: committed synthetic PQ (`hevc_hdr10_mp4`)
 and HLG (`hevc_hlg_mp4`) assert encode labels are BT.709; a measured
 retag-vs-tonemap MAD floor proves **not-retag only** (not beauty) —
-`nightjar-meta/notes/hdr-tonemap-delta-2026-08-01.md`.
+the HDR tonemap delta note, 2026-08-01.
 
 **Beauty / product inspection (Proven by inspection, not measured).** Kit
-titles: `nightjar-meta/notes/hdr-tonemap-beauty-2026-08-01.md` (2026-08-01). Product HLS
+titles: the HDR tonemap beauty note, 2026-08-01. Product HLS
 web-player inspection 2026-08-02 (Garrett): HDR10, P8.1, P7 MEL, P7 FEL
 correct; P8.4 visual unknown; P5 failed session via named refuse —
-`nightjar-meta/notes/hw/libplacebo-dv-spike-2026-08-02.md`.
+the libplacebo DV spike note, 2026-08-02.
 
 ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
@@ -190,7 +190,7 @@ a single ceiling for Auto is enough for Gate 2 remote watchability.
   (modelled decide rates; not a measured client bake-off), host `zscale`
   probe with decide reason + **415 refuse-before-spawn** when tonemap is
   required and unavailable. Profile 5: named refuse, no tonemap attempt.
-  MAD regression is not-retag only (`nightjar-meta/notes/hdr-tonemap-delta-2026-08-01.md`).
+  MAD regression is not-retag only (the HDR tonemap delta note, 2026-08-01).
   Kit / product picture claims are **Proven by inspection** where dated —
   not measured Gate metrics.
 - Amendment (2026-08-02): §5 splits capability from policy so Phase 3 does not

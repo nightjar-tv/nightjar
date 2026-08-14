@@ -40,11 +40,11 @@
   rescan
 - Related: Continuity settled set (direct-to-TMDB, FTS rejected, application
   key); strategy note
-  (`nightjar-meta/notes/design/metadata-artwork-strategy.md`); two-tier
-  design (`nightjar-meta/notes/design/metadata-two-tier-grid-strategy.md`);
-  grid measure (`nightjar-meta/notes/grid-fast-vs-full-metadata-2026-08-04.md`); match
-  spike (`nightjar-meta/notes/fts-vs-search-match-quality-2026-08-02.md`);
-  Phase 3 Block 1 (`nightjar-meta/docs/PHASE_3_REVISED.md`)
+  (the metadata artwork strategy decision sheet); two-tier
+  design (the metadata two tier grid strategy decision sheet);
+  grid measure (the grid fast vs full metadata note, 2026-08-04); match
+  spike (the FTS vs search match quality note, 2026-08-02);
+  Phase 3 Block 1
 
 ## Context
 
@@ -627,7 +627,7 @@ owns the evaluator.
 
 **Prediction (search tier):** dogfood Visible ~80 units; measured
 search-only + CDN model ≈ **~28 s** path-known
-(`nightjar-meta/notes/grid-fast-vs-full-metadata-2026-08-04.md`). Full enrich
+(the grid fast vs full metadata note, 2026-08-04). Full enrich
 (detail + seasons) is ~5–14× slower depending on TV share and is **not**
 on the adult first-screen critical path once two-tier is live.
 

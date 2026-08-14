@@ -249,7 +249,7 @@ runs `delete_missing` — that scan is the only clear.
 repoint index records `deferred_remove > 0`, the process arms an in-memory
 holdoff (default **1 hour**): **poll** skips starting a full walk for that
 library so automatic discovery cannot apply the deferred deletes before
-review. **Manual `POST .../scan` is still allowed** (operator explicit).
+review. **Manual `POST.../scan` is still allowed** (operator explicit).
 Holdoff clears when a successful ordinary scan completes, or when the
 duration expires (process restart also drops the holdoff — one delete scan
 may run; acceptable for v1). A second repoint before that scan defers
@@ -392,7 +392,7 @@ if documented as unstable across repoint.
   unmatched count is `deferred_remove` until the next ordinary scan.
 - ADR-0025 §4 storage and grammar finally agree; derived path keys use
   the stored (sticky) relpath column.
-- Migration dry-run numbers: `nightjar-meta/notes/migration-012-dogfood-2026-08-03.md`
+- Migration dry-run numbers: the migration 012 dogfood note, 2026-08-03
   (24940/8583, zero leftovers). Gate 3 remount / Docker path-move
   verification against the live dogfood library remains outstanding.
 - v1 has no force-repoint: operators whose tree genuinely changed by more

@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-08-06
 - Accepted: 2026-08-06, with all fourteen questions signed off in
-  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`.
+  the ADR-0039/0040 decision sheet, 2026-08-06.
   Q10 and Q4 change shipped pipeline behaviour and were put explicitly; Q2
   corrected the brief's `entity_kind` to the shipped `tv`. ADR-0035, ADR-0037
   and ADR-0038 were accepted in the same action
@@ -17,8 +17,7 @@
 - Gate: Gate 3 — rescan of an unchanged library generates no search requests;
   watch history survives rename, re-encode, and library remove-and-re-add;
   full v1 API frozen
-- Related: Block 2 plan B2-F (`nightjar-meta/docs/BLOCK_2_PLAN.md`); decision
-  sheet `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`;
+- Related: Block 2 plan B2-F; the ADR-0039/0040 decision sheet, 2026-08-06;
   ADR-0035 (rollup), ADR-0037 (certification inheritance), ADR-0038
   (`series_key`), all three of which were blocked on this record
 

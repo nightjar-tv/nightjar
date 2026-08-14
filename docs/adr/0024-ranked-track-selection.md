@@ -15,7 +15,7 @@ the same first-stream failure mode. That is the Emby bug: a file with no
 subtitle index, and English preference never gets a vote.
 
 Evidence and proposed shape live in
-`nightjar-meta/notes/design/track-selection-rules.md`. Two synthetic corpus
+the track selection rules decision sheet. Two synthetic corpus
 fixtures make the ambiguities concrete (Rule 4.3 — generated, not commercial):
 
 | Fixture | What it holds |

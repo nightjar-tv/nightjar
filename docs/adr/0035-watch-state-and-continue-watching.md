@@ -5,7 +5,7 @@
 - Accepted: 2026-08-06, once ADR-0039 and ADR-0040 were accepted. ADR-0039
   supplies the series entity and the `series_key` item 8 rolls up over; ADR-0040
   supplies the role model item 7's ownership rule reads. Sign-off for both:
-  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`
+  the ADR-0039/0040 decision sheet, 2026-08-06
 - Depends on: ADR-0034 (profiles, `profileRef`, deletion cascade), as amended by
   ADR-0040; ADR-0025 §1 (`item_key`), §3 (lifecycle), §4 (path keys), §5
   (key-change merge rule); ADR-0039 (`series_key` and the show entity),
@@ -14,8 +14,7 @@
 - Gate: Gate 3 — resume works across devices and survives server restarts;
   watch history survives rename, re-encode, and library remove-and-re-add;
   full v1 API frozen
-- Related: Block 2 plan B2-B and B2-3 / B2-4
-  (`nightjar-meta/docs/BLOCK_2_PLAN.md`); ADR-0036 playback events, which is a
+- Related: Block 2 plan B2-B and B2-3 / B2-4; ADR-0036 playback events, which is a
   different table for a different question
 
 ## Context

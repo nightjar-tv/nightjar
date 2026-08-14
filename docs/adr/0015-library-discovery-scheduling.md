@@ -15,7 +15,7 @@ after `POST /libraries` for the next 60 s poll tick, and perpetual 60 s polls
 even after notify had armed.
 
 Notify over SMB can arm successfully and never deliver creates
-(`nightjar-meta/docs/library-change-detection.md`, moved from this repo's
+(the library change-detection note, moved from this repo's
 `docs/` in the 2026-08-07 product/meta split — pre-decision research, not a
 binding contributor doc). Gating poll on "notify armed" would disable the
 only mechanism that works on those shares.
@@ -37,7 +37,7 @@ local disks (the common non-SMB install), never a gate.
 
 ## Decision
 
-1. **Full-walk entry points.** Library create, manual `POST .../scan`,
+1. **Full-walk entry points.** Library create, manual `POST.../scan`,
    periodic poll, and internal manual follow-up call `request_scan` (with a
    `ScanTrigger`). That is the only code that **starts a full-library scan
    job**. Notify media creates use `hint_ingest` and do **not** call
@@ -135,7 +135,7 @@ local disks (the common non-SMB install), never a gate.
   where notify is the right accelerator.
 - **Mount-type classification** (fstype / “network vs local”) as a poll
   gate. iSCSI, mergerfs/Unraid user shares, and Docker Desktop look wrong;
-  the table rots (see `nightjar-meta/docs/library-change-detection.md`).
+  the table rots (see the library change-detection note).
 
 Path-hinted **single-file** ingest on notify is decision 5 above. Jellyfin-style
 **subtree** refresh (whole season/dir, still without `delete_missing`) remains

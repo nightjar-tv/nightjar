@@ -11,7 +11,7 @@
 - Gate: Gate 3 — full v1 API frozen. This ADR is one of the pre-freeze decisions
   Gate 3 requires be recorded, and the recorded decision is that there is no read
   endpoint in v1
-- Related: Block 2 plan B2-C and B2-5 (`nightjar-meta/docs/BLOCK_2_PLAN.md`);
+- Related: Block 2 plan B2-C and B2-5;
   ADR-0035 watch state, which answers a different question with a different table
 
 ## Context

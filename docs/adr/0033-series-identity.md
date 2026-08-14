@@ -11,7 +11,7 @@
 - Gate: Gate 3 — rescan of an unchanged library generates no search
   requests; every mismatch fixable in-UI in under 30 seconds
 - Related: Block 1 recovery slice RC7; decision sheet
-  `nightjar-meta/notes/design/adr-0033-questions-2026-08-05.md`
+  the ADR-0033 decision sheet, 2026-08-05
 
 ## Context
 
@@ -120,7 +120,7 @@ folder-keyed series row; two folders never merge by fold collision.**
 - Group formation moved from the folded title to the folder scope, and the
   Visible proxy (§8.6) and the negative cache re-keyed with it in RC8.
 - Accepted 2026-08-05 with the human sign-off on all eight questions
-  recorded in `nightjar-meta/notes/design/adr-0033-questions-2026-08-05.md`
+  recorded in the ADR-0033 decision sheet, 2026-08-05
   before RC8 started; every answer was option A. RC8 implemented this shape
   (migration 016 + folder-scoped group formation + one hit path) and deleted
   anything resembling the branch's `series_cache`; the identifier `series_cache`
