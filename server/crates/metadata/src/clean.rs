@@ -527,10 +527,23 @@ fn skip_contiguous_dash_episodes(bytes: &[u8], mut j: usize, start: i32) -> usiz
 }
 
 /// ADR-0032 reference pick: usable mid-season preferred; S01E01 only if usable.
-pub fn pick_reference_episode(
+/// Every `(season, episode, title)` in the folder whose filename carries a
+/// usable after-token episode title.
+///
+/// [`pick_reference_episode`] narrows this to one for the ADR-0032 collision
+/// pin, which is right for that job — one file is enough to break a tie between
+/// same-numbering candidates. It is **not** enough to confirm a binding on a
+/// folder holding several installments: the reference is chosen by the
+/// *folder's* numbering, so it can land on a season the candidate entity does
+/// not have, and the comparison then returns nothing at all. Silent, not wrong
+/// — the same shape as appending the folder's season number to another
+/// entity's id.
+///
+/// One filter, two consumers (Rule 4.11).
+pub fn usable_episode_titles(
     episodes: &[(i32, i32, &str)],
     show_soft_key: &str,
-) -> Option<(i32, i32, String)> {
+) -> Vec<(i32, i32, String)> {
     let mut usable: Vec<(i32, i32, String)> = Vec::new();
     for &(season, episode, basename) in episodes {
         let Some(title) = after_token_episode_title(basename, season, episode) else {
@@ -541,6 +554,14 @@ pub fn pick_reference_episode(
         }
         usable.push((season, episode, title));
     }
+    usable
+}
+
+pub fn pick_reference_episode(
+    episodes: &[(i32, i32, &str)],
+    show_soft_key: &str,
+) -> Option<(i32, i32, String)> {
+    let usable = usable_episode_titles(episodes, show_soft_key);
     if usable.is_empty() {
         return None;
     }

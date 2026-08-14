@@ -1,6 +1,6 @@
 //! Resolve NFO first, then TMDB (ADR-0026 resolution path).
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::canonical;
 use crate::model::{CanonicalMetadata, MetadataKind};
@@ -46,6 +46,16 @@ pub struct ResolveInput {
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
     pub ref_episode_title: Option<String>,
+    /// Every `(season, episode, title)` the folder's filenames supply, not just
+    /// the ADR-0032 reference above.
+    ///
+    /// The reference episode is chosen by the **folder's** numbering, so on a
+    /// folder holding several installments it can name a season the stored
+    /// entity does not have — and a confirmation keyed on it then returns
+    /// nothing rather than disagreeing. Measured: `Monster (2022)` agrees with
+    /// its stored entity on **9 of 10** testable files, and on none of them if
+    /// only the reference is consulted.
+    pub folder_episode_titles: Vec<(i32, i32, String)>,
     /// Enrich by provider id (ADR-0026 §8.3): detail-only, never searches.
     /// When set, the negative cache is skipped and the provider fetches the
     /// detail payload for this id directly (no query key, no floor gate).
@@ -156,6 +166,60 @@ pub enum ProviderResult {
 }
 
 /// One metadata backend (TMDB today; keep the trait thin — Rule 4.7).
+/// Do the folder's filenames agree with the stored entity's episode titles?
+///
+/// **Agreement only, and no refutation path.** [`compare_episode_title`] cannot
+/// return `Disagree` on a filename-derived title — a disagreement needs a
+/// corroborating air date and filenames carry none — so absence of agreement is
+/// never evidence against the id. A folder whose titles are generic, or whose
+/// seasons were never fetched, yields nothing and the discard stands. That is
+/// the intended outcome, not a gap: `Love on the Spectrum U.S` agrees on 0 of
+/// 27 files and is the one stored id the name check is right to discard.
+///
+/// **Local reads only.** The entity's episode rows were persisted when the
+/// folder bound, so this adds no provider request and a rescan issues the same
+/// count as before (ADR-0033 item 1, Gate 3).
+fn stored_id_confirmed_by_episode_titles(
+    conn: &Connection,
+    show_id: i64,
+    folder_episodes: &[(i32, i32, String)],
+    show_soft_key: &str,
+) -> bool {
+    if folder_episodes.is_empty() {
+        return false;
+    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT title FROM metadata_canonical
+         WHERE provider = ?1 AND entity_kind = 'episode'
+           AND tmdb_show = ?2 AND season = ?3 AND episode = ?4",
+    ) else {
+        return false;
+    };
+    for (season, episode, file_title) in folder_episodes {
+        let provider_title: Option<String> = stmt
+            .query_row(params![PROVIDER_TMDB, show_id, season, episode], |r| {
+                r.get(0)
+            })
+            .optional()
+            .ok()
+            .flatten();
+        let Some(provider_title) = provider_title else {
+            continue;
+        };
+        if crate::match_score::compare_episode_title(
+            file_title.as_str(),
+            &provider_title,
+            show_soft_key,
+            None,
+            None,
+        ) == crate::match_score::EpisodeTitleVerdict::Agree
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub trait MetadataSource {
     fn resolve(&self, input: &ResolveInput) -> Result<ProviderResult, ResolveError>;
 
@@ -393,12 +457,32 @@ impl<T: MetadataSource> Resolver<T> {
             .map_err(ResolveError::Provider)?
             .as_deref()
             .is_some_and(|p| crate::tmdb::tv_payload_episode_count(p) == Some(0));
-            if let Some(reason) = crate::match_score::find_hit_reject_reason(
+            let name_reject = crate::match_score::find_hit_reject_reason(
                 &meta,
                 crate::match_score::SearchKind::Tv,
                 input.title.as_deref().unwrap_or_default(),
                 input.year,
-            ) {
+            );
+            // Issue 121. The cross-check's name predicate is right about one
+            // binding in eleven on the measured library, and the ten it is
+            // wrong about include `Monster (2022)`, whose stored entity agrees
+            // on 9 of 10 episode titles. Discarding a confirmed id is what
+            // sends the folder into a re-search it does not need, and the
+            // re-search is where it acquires a wrong entity.
+            //
+            // Episode titles are per-file evidence and cost nothing here: the
+            // stored entity's episodes were persisted when the folder bound,
+            // so this is a local read. That asymmetry is why this works where
+            // rebinding a *claimant* did not — the claimant's episode list is
+            // never stored, the incumbent's always is.
+            let confirmed = name_reject.is_some()
+                && stored_id_confirmed_by_episode_titles(
+                    conn,
+                    series_show_id,
+                    &input.folder_episode_titles,
+                    input.title.as_deref().unwrap_or_default(),
+                );
+            if let Some(reason) = name_reject.filter(|_| !confirmed) {
                 eprintln!(
                     "  discard stored series id {series_show_id} — {reason}; falling through to search"
                 );
@@ -1800,5 +1884,154 @@ mod tests {
             }
             other => panic!("stored identity with episodes must resolve locally, got {other:?}"),
         }
+    }
+
+    /// Fixture for issue 121: a folder whose title the name gate rejects,
+    /// bound to an entity whose episode titles the filenames carry.
+    /// `Monster` against `DAHMER - Monster: The Jeffrey Dahmer Story`.
+    fn name_mismatch_folder(conn: &Connection, provider_ep_title: &str) {
+        conn.execute_batch(&format!(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'Monster (2022)', 113988);
+             INSERT INTO metadata_canonical
+               (provider, entity_kind, provider_id, title, year, ids_json, tmdb_show, projected_at)
+             VALUES
+               ('tmdb', 'tv', '113988', 'DAHMER - Monster: The Jeffrey Dahmer Story', 2022,
+                '{{\"tmdb\":113988,\"tmdb_show\":113988}}', 113988, '2026-01-01T00:00:00Z'),
+               ('tmdb', 'episode', '9001', '{provider_ep_title}', NULL, '{{}}', 113988,
+                '2026-01-01T00:00:00Z');
+             UPDATE metadata_canonical SET season = 1, episode = 3
+               WHERE provider_id = '9001';"
+        ))
+        .unwrap();
+    }
+
+    fn resolve_mismatch(
+        conn: &Connection,
+        resolver: &Resolver<CountingMiss>,
+        folder_titles: Vec<(i32, i32, String)>,
+    ) -> ResolveOutcome {
+        resolver
+            .resolve_with_store(
+                &ResolveInput {
+                    series_show_id: Some(113988),
+                    title: Some("Monster".into()),
+                    year: None,
+                    kind: Some(MetadataKind::Show),
+                    folder_episode_titles: folder_titles,
+                    ..Default::default()
+                },
+                conn,
+            )
+            .unwrap()
+    }
+
+    /// **Issue 121's root.** The name gate rejects `DAHMER - Monster: …` for
+    /// the folder `Monster`, and that binding is correct — the filenames carry
+    /// its episode titles. The stored id is kept and no search is issued, so
+    /// the folder never reaches the re-search where it acquired `Monster High`.
+    #[test]
+    fn a_confirmed_stored_id_survives_a_name_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        name_mismatch_folder(&conn, "Blame it on the Rain");
+        let resolver = Resolver {
+            tmdb: CountingMiss {
+                calls: std::cell::Cell::new(0),
+            },
+        };
+
+        let outcome = resolve_mismatch(
+            &conn,
+            &resolver,
+            vec![(1, 3, "Blame it on the Rain".to_string())],
+        );
+
+        assert!(
+            matches!(outcome, ResolveOutcome::Resolved { .. }),
+            "a confirmed stored id resolves rather than falling through"
+        );
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            0,
+            "no search is issued — this is the request the rescue exists to avoid"
+        );
+    }
+
+    /// The rescue must not save the one binding the gate is right about.
+    /// `Love on the Spectrum U.S` agrees on 0 of 27 files; with no agreement
+    /// the discard stands and the search runs exactly as before.
+    #[test]
+    fn an_unconfirmed_stored_id_is_still_discarded() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        name_mismatch_folder(&conn, "Something Else Entirely");
+        let resolver = Resolver {
+            tmdb: CountingMiss {
+                calls: std::cell::Cell::new(0),
+            },
+        };
+
+        resolve_mismatch(
+            &conn,
+            &resolver,
+            vec![(1, 3, "Blame it on the Rain".to_string())],
+        );
+
+        assert_eq!(
+            resolver.tmdb.calls.get(),
+            1,
+            "no agreement means the discard stands and the search runs"
+        );
+    }
+
+    /// **Decision 2.** The agreement is on season 1 episode 3; a confirmation
+    /// keyed on the ADR-0032 reference episode alone would consult whichever
+    /// single file was picked and could miss it entirely. Every testable file
+    /// is compared, so a folder holding several installments still confirms.
+    #[test]
+    fn confirmation_reads_every_file_not_the_reference_episode() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        name_mismatch_folder(&conn, "Blame it on the Rain");
+        let resolver = Resolver {
+            tmdb: CountingMiss {
+                calls: std::cell::Cell::new(0),
+            },
+        };
+
+        // The first two files are on seasons the stored entity does not have —
+        // the shape a multi-installment folder produces. Only the third agrees.
+        let outcome = resolve_mismatch(
+            &conn,
+            &resolver,
+            vec![
+                (2, 1, "Spree".to_string()),
+                (3, 1, "The Gein Family".to_string()),
+                (1, 3, "Blame it on the Rain".to_string()),
+            ],
+        );
+
+        assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
+        assert_eq!(resolver.tmdb.calls.get(), 0, "the third file confirms");
+    }
+
+    /// A folder with no usable episode titles yields no verdict, and absence
+    /// of evidence is not evidence for the id.
+    #[test]
+    fn no_episode_titles_means_no_rescue() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        name_mismatch_folder(&conn, "Blame it on the Rain");
+        let resolver = Resolver {
+            tmdb: CountingMiss {
+                calls: std::cell::Cell::new(0),
+            },
+        };
+
+        resolve_mismatch(&conn, &resolver, Vec::new());
+
+        assert_eq!(resolver.tmdb.calls.get(), 1, "no titles, no rescue");
     }
 }

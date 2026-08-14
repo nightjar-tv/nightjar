@@ -14,7 +14,7 @@ use nightjar_db::{resolve_media_path, show_folder_relpath};
 use crate::canonical;
 use crate::clean::{
     clean_movie_title, clean_show_title, pick_reference_episode, series_library_year,
-    year_from_path,
+    usable_episode_titles, year_from_path,
 };
 use crate::item_links;
 use crate::match_score::{SeasonRangeMapping, UnplacedFile, map_unplaced_to_candidate_seasons};
@@ -433,6 +433,10 @@ struct QueryGroup {
     ref_season: Option<i32>,
     ref_episode: Option<i32>,
     ref_episode_title: Option<String>,
+    /// Every usable `(season, episode, title)` the folder supplies. The
+    /// reference above is one of these; the stored-id confirmation needs all
+    /// of them (issue 121).
+    folder_episode_titles: Vec<(i32, i32, String)>,
     item_ids: Vec<i64>,
     max_id: i64,
     band: QueueBand,
@@ -647,6 +651,7 @@ fn status_query_groups(
                         ref_season: None,
                         ref_episode: None,
                         ref_episode_title: None,
+                        folder_episode_titles: Vec::new(),
                         item_ids: Vec::new(),
                         max_id: it.id,
                         band,
@@ -701,7 +706,7 @@ fn status_query_groups(
                     path: path0.to_string(),
                     library_path: library_path0.to_string(),
                     library_id: it.library_id,
-                    show_folder,
+                    show_folder: show_folder.clone(),
                     title: ct.clone(),
                     year: None,
                     library_year,
@@ -718,6 +723,13 @@ fn status_query_groups(
                     ref_season: pref.as_ref().map(|p| p.0),
                     ref_episode: pref.as_ref().map(|p| p.1),
                     ref_episode_title: pref.map(|p| p.2),
+                    folder_episode_titles: folder_titles_from_db(
+                        conn,
+                        it.library_id,
+                        &show_folder,
+                        &ct,
+                    )
+                    .unwrap_or_default(),
                     item_ids: Vec::new(),
                     max_id: it.id,
                     band,
@@ -945,6 +957,125 @@ pub fn bind_resolved_items<T: MetadataSource>(
             Ok(stats)
         }
     }
+}
+
+/// Every usable `(season, episode, title)` in a show folder, read from the
+/// database rather than from the pending group.
+///
+/// **The group is not the folder.** `ep_by_show` collects only items awaiting
+/// resolution, so a folder whose earlier seasons are already `ready` presents
+/// the resolver with just the seasons being retried. `Monster (2022)` retried
+/// its unmatched S2 and S3 and offered no S1 file at all — while the stored
+/// entity, DAHMER, holds only S1. The confirmation then had nothing to compare
+/// and the correct id was discarded anyway, which is the exact defect this is
+/// meant to stop.
+///
+/// A local read. No provider request.
+fn folder_titles_from_db(
+    conn: &Connection,
+    library_id: i64,
+    show_folder: &str,
+    show_soft_key: &str,
+) -> Result<Vec<(i32, i32, String)>, String> {
+    let like = if show_folder.is_empty() {
+        "%".to_string()
+    } else {
+        format!("{show_folder}/%")
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, season, episode FROM media_items
+             WHERE library_id = ?1 AND kind = 'episode'
+               AND season IS NOT NULL AND episode IS NOT NULL
+               AND path LIKE ?2",
+        )
+        .map_err(|e| format!("prepare folder titles: {e}"))?;
+    let rows: Vec<(String, i32, i32)> = stmt
+        .query_map(params![library_id, like], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| format!("query folder titles: {e}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("folder title row: {e}"))?;
+    let basenames: Vec<(i32, i32, &str)> = rows
+        .iter()
+        .map(|(p, s, e)| {
+            let base = std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p.as_str());
+            (*s, *e, base)
+        })
+        .collect();
+    Ok(usable_episode_titles(&basenames, show_soft_key))
+}
+
+/// Unlink files bound to an entity this folder does not bind (issue 121).
+///
+/// A file whose canonical episode belongs to an entity absent from the
+/// folder's bindings is mis-linked — it says the folder holds an episode of a
+/// show the folder is not bound to. `Monster (2022)` acquired 17 such links to
+/// `Monster High` before the stored-id rescue existed.
+///
+/// **Unlinked, not rebound.** The item returns to `unmatched`, which is the
+/// honest state and the bucket with three built consumers; choosing a
+/// replacement is a matching decision this repair does not make.
+///
+/// **Every binding counts, not just the primary.** A folder that binds a
+/// second entity under ADR-0046 holds that entity's episodes legitimately —
+/// Will & Grace's 52 revival files are linked to 74321 and must survive.
+fn unlink_foreign_entity_links(
+    conn: &Connection,
+    library_id: i64,
+    show_folder: &str,
+    item_ids: &[i64],
+) -> Result<usize, String> {
+    let bound: Vec<i64> = crate::series_bindings::for_folder(conn, library_id, show_folder)?
+        .into_iter()
+        .map(|b| b.tmdb_show_id)
+        .collect();
+    if bound.is_empty() {
+        // No record of what this folder binds. Unlinking on that basis would
+        // be destroying links on absence of evidence, which is the failure
+        // this codebase keeps refusing.
+        return Ok(0);
+    }
+    let mut stale = Vec::new();
+    for id in item_ids {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.tmdb_show FROM media_item_links l
+                 JOIN metadata_canonical c
+                   ON c.provider = ?1 AND c.entity_kind = 'episode'
+                  AND l.item_key = 'tmdb:episode:' || c.provider_id
+                 WHERE l.media_item_id = ?2 AND l.manually_matched = 0",
+            )
+            .map_err(|e| format!("prepare foreign link scan: {e}"))?;
+        let shows: Vec<Option<i64>> = stmt
+            .query_map(params![PROVIDER_TMDB, id], |r| r.get(0))
+            .map_err(|e| format!("scan links: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("scan link row: {e}"))?;
+        if !shows.is_empty() && shows.iter().all(|s| s.is_some_and(|s| !bound.contains(&s))) {
+            stale.push(*id);
+        }
+    }
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin unlink tx: {e}"))?;
+    for id in &stale {
+        item_links::clear_all_links_for_media_item(&tx, *id)?;
+        tx.execute(
+            "UPDATE media_items SET metadata_status = 'unmatched' WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("reset status: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("commit unlink: {e}"))?;
+    Ok(stale.len())
 }
 
 /// Counters from one [`bind_second_entities`] call.
@@ -1458,6 +1589,7 @@ fn search_one_group<T: MetadataSource>(
         ref_season: g.ref_season,
         ref_episode: g.ref_episode,
         ref_episode_title: g.ref_episode_title.clone(),
+        folder_episode_titles: g.folder_episode_titles.clone(),
         // ADR-0033: the folder's stored series identity, when it has one.
         // The resolver cross-checks it against the persisted detail and binds
         // with zero provider calls; disagreement falls through to search.
@@ -1673,6 +1805,23 @@ fn enrich_one_group<T: MetadataSource>(
                             "  bind {} seasons_fetched={} skipped={} linked={}",
                             g.title, b.seasons_fetched, b.seasons_skipped, b.files_linked
                         );
+                        // Issue 121: a file linked to an entity this folder
+                        // does not bind is mis-linked. Clear it before looking
+                        // for a second entity, so the unplaced set is the
+                        // truth rather than yesterday's wrong answer.
+                        match unlink_foreign_entity_links(
+                            conn,
+                            g.library_id,
+                            &g.show_folder,
+                            &g.item_ids,
+                        ) {
+                            Ok(n) if n > 0 => eprintln!(
+                                "  unlink {} — {n} file(s) linked to an entity this folder does not bind",
+                                g.title
+                            ),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("  unlink ({}): {e}", g.title),
+                        }
                         // ADR-0046 item 4: seasons the bound entity has no
                         // season for are the unplaced set, and they are the
                         // input to the second-entity search. The count is
@@ -4783,5 +4932,204 @@ mod tests {
             )
             .unwrap();
         assert_eq!(secondaries, 0);
+    }
+
+    /// Issue 121 cleanup. A file linked to an episode of an entity the folder
+    /// does not bind is mis-linked and returns to `unmatched`.
+    #[test]
+    fn a_file_bound_to_an_unbound_entity_is_unlinked() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'Monster (2022)', 113988);
+             INSERT INTO series_entity_bindings
+                  (library_id, relpath, tmdb_show_id, is_primary)
+                  VALUES (1, 'Monster (2022)', 113988, 1);
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode,
+                   metadata_status)
+             VALUES (1, 1, 'Monster (2022)/Season 2/m.2x01.mkv', 1, 1, 'M', 'episode', 2, 1,
+                     'ready');
+             INSERT INTO metadata_canonical
+                  (provider, entity_kind, provider_id, title, ids_json, tmdb_show,
+                   season, episode, projected_at)
+             VALUES ('tmdb', 'episode', '7001', 'Scream Building', '{}', 41974, 1, 1, 'now');
+             INSERT INTO media_item_links (media_item_id, item_key)
+                  VALUES (1, 'tmdb:episode:7001');",
+        )
+        .unwrap();
+
+        let n = unlink_foreign_entity_links(&c, 1, "Monster (2022)", &[1]).unwrap();
+        assert_eq!(n, 1);
+        let links: i64 = c
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 0, "the mis-link is gone");
+        let status: String = c
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "unmatched", "unlinked, not rebound");
+    }
+
+    /// **Will & Grace's 52 must survive.** A folder that binds a second entity
+    /// under ADR-0046 holds that entity's episodes legitimately, and a repair
+    /// reading only the primary would delete them.
+    #[test]
+    fn a_file_bound_to_a_secondary_entity_is_untouched() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'Will & Grace', 4454);
+             INSERT INTO series_entity_bindings
+                  (library_id, relpath, tmdb_show_id, is_primary,
+                   folder_season_start, folder_season_end,
+                   entity_season_start, entity_season_end)
+             VALUES (1, 'Will & Grace', 4454, 1, NULL, NULL, NULL, NULL),
+                    (1, 'Will & Grace', 74321, 0, 9, 11, 1, 3);
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode,
+                   metadata_status)
+             VALUES (1, 1, 'Will & Grace/Season 9/w.s09e01.mkv', 1, 1, 'W', 'episode', 9, 1,
+                     'ready');
+             INSERT INTO metadata_canonical
+                  (provider, entity_kind, provider_id, title, ids_json, tmdb_show,
+                   season, episode, projected_at)
+             VALUES ('tmdb', 'episode', '9001', 'Eleven Years Later', '{}', 74321, 1, 1, 'now');
+             INSERT INTO media_item_links (media_item_id, item_key)
+                  VALUES (1, 'tmdb:episode:9001');",
+        )
+        .unwrap();
+
+        let n = unlink_foreign_entity_links(&c, 1, "Will & Grace", &[1]).unwrap();
+        assert_eq!(n, 0, "a secondary binding is a binding");
+        let links: i64 = c
+            .query_row("SELECT COUNT(*) FROM media_item_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 1);
+    }
+
+    /// No binding record means no evidence about what the folder holds, and
+    /// deleting links on absence of evidence is the failure this refuses.
+    #[test]
+    fn no_binding_record_means_no_unlinking() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 1, 'Orphan/Season 1/o.s01e01.mkv', 1, 1, 'O', 'episode', 1, 1);
+             INSERT INTO metadata_canonical
+                  (provider, entity_kind, provider_id, title, ids_json, tmdb_show,
+                   season, episode, projected_at)
+             VALUES ('tmdb', 'episode', '5001', 'Whatever', '{}', 999, 1, 1, 'now');
+             INSERT INTO media_item_links (media_item_id, item_key)
+                  VALUES (1, 'tmdb:episode:5001');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            unlink_foreign_entity_links(&c, 1, "Orphan", &[1]).unwrap(),
+            0
+        );
+    }
+
+    /// A manual match is the operator's decision and outranks this repair
+    /// (ADR-0028).
+    #[test]
+    fn a_manual_link_is_never_unlinked() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Monster (2022)', 113988);
+             INSERT INTO series_entity_bindings (library_id, relpath, tmdb_show_id, is_primary)
+                  VALUES (1, 'Monster (2022)', 113988, 1);
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES (1, 1, 'Monster (2022)/Season 2/m.2x01.mkv', 1, 1, 'M', 'episode', 2, 1);
+             INSERT INTO metadata_canonical
+                  (provider, entity_kind, provider_id, title, ids_json, tmdb_show,
+                   season, episode, projected_at)
+             VALUES ('tmdb', 'episode', '7001', 'Scream Building', '{}', 41974, 1, 1, 'now');
+             INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+                  VALUES (1, 'tmdb:episode:7001', 1);",
+        )
+        .unwrap();
+
+        assert_eq!(
+            unlink_foreign_entity_links(&c, 1, "Monster (2022)", &[1]).unwrap(),
+            0
+        );
+    }
+
+    /// **The defect this slice shipped green once.** `ep_by_show` collects
+    /// only items awaiting resolution, so a folder whose earlier seasons are
+    /// already `ready` presents the resolver with just the seasons being
+    /// retried. `Monster (2022)` retried its unmatched S2 and S3 while its
+    /// stored entity holds only S1, so a confirmation built from the group saw
+    /// nothing to compare and the correct id was discarded anyway.
+    ///
+    /// Every unit test for the confirmation passed against that, because each
+    /// constructed the title list directly and none exercised what feeds it.
+    /// This asserts the feed.
+    #[test]
+    fn folder_titles_include_files_that_are_not_pending() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode,
+                   metadata_status)
+             VALUES
+                (1, 1, 'Monster (2022)/Season 1/Monster - S01E03 - Blame it on the Rain.mkv',
+                     1, 1, 'Monster', 'episode', 1, 3, 'ready'),
+                (2, 1, 'Monster (2022)/Season 2/Monster - S02E01 - Spree.mkv',
+                     1, 1, 'Monster', 'episode', 2, 1, 'pending');",
+        )
+        .unwrap();
+
+        let titles = folder_titles_from_db(&c, 1, "Monster (2022)", "monster").unwrap();
+        assert!(
+            titles.iter().any(|(s, e, _)| *s == 1 && *e == 3),
+            "the already-ready S1 file must be present — it is the only one the \
+             stored entity can confirm against, and reading the pending group \
+             alone is what let the wrong entity through"
+        );
+        assert_eq!(titles.len(), 2, "both files, whatever their status");
+    }
+
+    /// A folder read must not collect a neighbouring folder's files.
+    #[test]
+    fn folder_titles_do_not_leak_across_folders() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+                (1, 1, 'Monster (2022)/Season 1/Monster - S01E03 - Blame it on the Rain.mkv',
+                     1, 1, 'Monster', 'episode', 1, 3),
+                (2, 1, 'Monster High/Season 1/Monster High - S01E01 - Scream Building.mkv',
+                     1, 1, 'Monster High', 'episode', 1, 1);",
+        )
+        .unwrap();
+
+        let titles = folder_titles_from_db(&c, 1, "Monster (2022)", "monster").unwrap();
+        assert_eq!(
+            titles.len(),
+            1,
+            "a prefix-sharing sibling folder is not this folder"
+        );
     }
 }
