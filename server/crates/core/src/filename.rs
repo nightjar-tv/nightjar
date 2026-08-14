@@ -217,7 +217,8 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
                     edigits += 1;
                 }
                 if edigits > 0 && episode > 0 {
-                    return Some((i, season, episode, episode));
+                    let end = extend_episode_span(bytes, j, season, episode);
+                    return Some((i, season, episode, end));
                 }
             }
         }
@@ -251,7 +252,7 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
                     edigits += 1;
                 }
                 if edigits > 0 && episode > 0 {
-                    let end = extend_contiguous_dash_episodes(bytes, j, episode);
+                    let end = extend_episode_span(bytes, j, season, episode);
                     return Some((i, season, episode, end));
                 }
             }
@@ -261,34 +262,110 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
     None
 }
 
-/// After `NxMM`, consume immediate `-NN` / `-NN-NN` when each NN is the next
-/// contiguous episode and the span stays within [`MAX_EPISODE_RANGE`].
-/// Does not consume spaced title numerals (` - 100 -`).
-fn extend_contiguous_dash_episodes(bytes: &[u8], mut j: usize, start: i32) -> i32 {
+/// Consume the episode tokens that follow `S<season>E<start>` or `N x <start>`
+/// and return the last episode the file covers.
+///
+/// **One rule over a separator and repetition set**, because the forms are not
+/// four additions to a fifth. The set is `E01E02`, `E01-E02`, `x01x02`,
+/// `01-x03`, `E1-S6E2` and the bare `-02` — and the grammar behind all of them
+/// is the same: an optional separator, an optional repeat of the season, an
+/// optional episode marker, then a number.
+///
+/// **A separator means a range end; a repetition means the next episode.**
+/// `S15E06-08` is one file holding episodes 6, 7 and 8, so it emits the
+/// inclusive run — ADR-0025's amendment requires the item list to show one
+/// entry spanning the range rather than a gap that reads as missing media, and
+/// emitting `[6]` would leave 7 and 8 looking absent. Without a separator the
+/// tokens are an explicit list and each must be the next number.
+///
+/// **A repeated season must agree.** `S6E1-S6E2` is a range; `S6E1-S7E2` is not
+/// one, and stops here rather than falling out somewhere later.
+///
+/// [`MAX_EPISODE_RANGE`] bounds the result either way, which is what stops a
+/// malformed or adversarial name generating an arbitrary run.
+fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i32 {
     let mut end = start;
-    while end - start + 1 < MAX_EPISODE_RANGE {
-        if j >= bytes.len() || bytes[j] != b'-' {
+    loop {
+        let mut k = j;
+        let separated = k < bytes.len() && bytes[k] == b'-';
+        if separated {
+            k += 1;
+        }
+        // An optional repeat of the season, in either spelling it appears in:
+        // `s06` before an `e`, or `6x` before the number.
+        if let Some((repeated, after)) = read_repeated_season(bytes, k) {
+            if repeated != season {
+                break;
+            }
+            k = after;
+        }
+        if k < bytes.len() && (bytes[k] == b'e' || bytes[k] == b'x') {
+            k += 1;
+        }
+        // Something must separate this token from the last, or a stray trailing
+        // number would read as an episode.
+        if k == j {
             break;
         }
-        let after_dash = j + 1;
-        if after_dash >= bytes.len() || !bytes[after_dash].is_ascii_digit() {
-            break;
-        }
-        let mut k = after_dash;
         let mut next = 0i32;
-        let mut nd = 0;
-        while k < bytes.len() && bytes[k].is_ascii_digit() && nd < 3 {
+        let mut digits = 0;
+        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 3 {
             next = next * 10 + (bytes[k] - b'0') as i32;
             k += 1;
-            nd += 1;
+            digits += 1;
         }
-        if nd == 0 || next != end + 1 {
+        if digits == 0 {
+            break;
+        }
+        let ok = if separated {
+            next > end
+        } else {
+            next == end + 1
+        };
+        if !ok || next - start + 1 > MAX_EPISODE_RANGE {
             break;
         }
         end = next;
         j = k;
     }
     end
+}
+
+/// `s06` or `6x` immediately at `i`, returning the season and the offset after
+/// it. Only the spellings a season is actually repeated in.
+fn read_repeated_season(bytes: &[u8], i: usize) -> Option<(i32, usize)> {
+    if i >= bytes.len() {
+        return None;
+    }
+    if bytes[i] == b's' {
+        let mut k = i + 1;
+        let mut n = 0i32;
+        let mut digits = 0;
+        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 3 {
+            n = n * 10 + (bytes[k] - b'0') as i32;
+            k += 1;
+            digits += 1;
+        }
+        // Must be followed by an episode marker, else `s` is part of a word.
+        if digits > 0 && k < bytes.len() && bytes[k] == b'e' {
+            return Some((n, k));
+        }
+        return None;
+    }
+    if bytes[i].is_ascii_digit() {
+        let mut k = i;
+        let mut n = 0i32;
+        let mut digits = 0;
+        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 2 {
+            n = n * 10 + (bytes[k] - b'0') as i32;
+            k += 1;
+            digits += 1;
+        }
+        if digits > 0 && k < bytes.len() && bytes[k] == b'x' {
+            return Some((n, k));
+        }
+    }
+    None
 }
 
 fn find_year(s: &str) -> Option<i32> {
@@ -533,11 +610,24 @@ mod tests {
         assert_eq!(p.episode_numbers(), vec![20, 21]);
     }
 
+    /// **Superseded 2026-08-14 and kept as the record of what changed.** This
+    /// asserted `1x01-03 -> [1]`, on the reading that a dash repeats an episode
+    /// and so must land on the next number. A dash is a **range end**: the file
+    /// holds episodes 1, 2 and 3, and emitting `[1]` leaves two of them looking
+    /// absent — the gap ADR-0025's amendment exists to prevent.
+    ///
+    /// What survives is the part that was really being tested: a dash followed
+    /// by something that is not a larger episode number is not a range.
     #[test]
-    fn non_contiguous_dash_is_not_a_range() {
+    fn a_dash_span_covers_the_run_and_a_backwards_one_is_not_a_range() {
         let p = parse_filename("Show - 1x01-03 - Title.mkv");
         assert_eq!(p.episode, Some(1));
-        assert_eq!(p.episode_end, None);
+        assert_eq!(p.episode_end, Some(3));
+        assert_eq!(p.episode_numbers(), vec![1, 2, 3]);
+
+        let back = parse_filename("Show - 1x05-03 - Title.mkv");
+        assert_eq!(back.episode, Some(5));
+        assert_eq!(back.episode_end, None);
     }
 
     #[test]
@@ -554,5 +644,97 @@ mod tests {
         assert_eq!(p.kind, MediaKind::Movie);
         assert_eq!(p.year, Some(2021));
         assert!(p.title.starts_with("Another Movie"));
+    }
+}
+
+#[cfg(test)]
+mod multi_episode_spellings {
+    use crate::parse_filename;
+
+    /// Measured on `origin/main` at `3d776ec` before the rule was written.
+    /// Five spellings return the first episode and report success, which is
+    /// worse than returning nothing: a caller cannot tell a single-episode
+    /// file from a range whose tail was dropped.
+    ///
+    /// **Three of the five are on the `SxxExx` branch, which never calls
+    /// `extend_contiguous_dash_episodes` at all.** A change confined to that
+    /// function fixes the `NxNN` two and moves the corpus enough to look done.
+    #[test]
+    fn every_multi_episode_spelling_yields_the_whole_span() {
+        for (name, want) in [
+            ("Show.S01E01E02.mkv", vec![1, 2]),
+            ("Show.S01E01-E02.mkv", vec![1, 2]),
+            ("Show.S6E1-S6E2.mkv", vec![1, 2]),
+            ("Show.[02x01x02].mkv", vec![1, 2]),
+            ("Show.1x01-x03.mkv", vec![1, 2, 3]),
+            ("Show.S01E01-02-03.mkv", vec![1, 2, 3]),
+            // The two that already worked, unchanged.
+            ("Show.1x01-02.mkv", vec![1, 2]),
+            ("Show.5x20-21.mkv", vec![20, 21]),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.episode_numbers(), want, "{name}");
+        }
+    }
+
+    /// A repeated season token must agree. `S6E1-S6E2` is a range; `S6E1-S7E2`
+    /// crosses seasons and is not one, and returning the first episode alone is
+    /// the correct outcome there rather than something to fall out by accident.
+    #[test]
+    fn a_cross_season_span_is_not_a_range() {
+        let p = parse_filename("Show.S6E1-S7E2.mkv");
+        assert_eq!(p.season, Some(6));
+        assert_eq!(p.episode_numbers(), vec![1]);
+    }
+
+    /// A separator introduces a **range end**, so `A-B` emits the inclusive
+    /// run. Written first against the superseded reading of decision 2, which
+    /// asserted `1x01-05 -> [1]`; that reading is amended 2026-08-14 because it
+    /// contradicts this slice's own ADR-0025 amendment — one file holding five
+    /// episodes must not leave four of them looking absent.
+    #[test]
+    fn a_separator_emits_the_inclusive_run() {
+        assert_eq!(
+            parse_filename("Show.1x01-05.mkv").episode_numbers(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            parse_filename("Show.S15E06-08.mkv").episode_numbers(),
+            vec![6, 7, 8]
+        );
+    }
+
+    /// The cap is what keeps a range from being arbitrary, and it is unchanged.
+    /// `S01E91-E100` is 10 wide against a cap of 8 — refused before and after.
+    #[test]
+    fn the_cap_still_bounds_the_span() {
+        assert_eq!(
+            parse_filename("Show.S01E01-E20.mkv").episode_numbers(),
+            vec![1]
+        );
+        assert_eq!(
+            parse_filename("Series.S01E91-E100.mkv").episode_numbers(),
+            vec![91]
+        );
+    }
+
+    /// A descending or equal second number is not a range.
+    #[test]
+    fn a_backwards_span_is_not_a_range() {
+        assert_eq!(
+            parse_filename("Show.S01E05-E02.mkv").episode_numbers(),
+            vec![5]
+        );
+        assert_eq!(
+            parse_filename("Show.S01E05-E05.mkv").episode_numbers(),
+            vec![5]
+        );
+    }
+
+    /// Season 0 is a season and episode 0 stays refused — both load-bearing.
+    #[test]
+    fn season_zero_and_episode_zero_are_unchanged() {
+        assert_eq!(parse_filename("Show.S00E01-E02.mkv").season, Some(0));
+        assert_eq!(parse_filename("Show.S01E00-E01.mkv").episode, None);
     }
 }
