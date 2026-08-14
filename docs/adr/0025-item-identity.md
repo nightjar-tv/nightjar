@@ -214,3 +214,59 @@ key (§4); no third shape.
   Gate 3 full-library measure at threshold 0.80 owns the real fraction;
   raising coverage (cleaner, year extraction) shrinks it without changing
   this identity rule.
+
+---
+
+## Amendment 2026-08-14 — a file spanning a range is one item, several keys
+
+Landed with the multi-episode spellings slice, which is the change that makes
+the question concrete: `Series (S15E06-08).mkv` is **one file holding three
+episodes**.
+
+### 1. One media item, several item keys
+
+**A file spanning an episode range is one `media_items` row linked to one
+`item_key` per episode it covers.** It is not one key naming a range, and not
+several rows.
+
+**§2's many-to-many already permits this and the shape needs no change.**
+`media_item_links` is `(media_item_id, item_key)` with no unique constraint on
+the item side, and `EpisodeSlot::season_episodes` (`queue.rs`) already re-parses
+the basename for ranges and inserts one `by_se` entry per episode. **This
+amendment records shipped behaviour rather than proposing a model** — measured
+on the dogfood library, 33 range files carry 62 links between them, and
+`30 Rock - 5x20-21` links `tmdb:episode:334173` and `tmdb:episode:334174`
+today.
+
+**No `episode_end` column.** The range is derived by re-parsing the basename,
+which is why `season_episodes` exists, and a column would be a second place for
+the same fact to disagree from (Rule 4.11).
+
+### 2. The item list shows one entry spanning the range
+
+**A file covering 6–8 appears once, as one entry covering 6–8. It does not
+appear three times, and it does not leave 7 and 8 absent.**
+
+This is the half that decides parser behaviour, and it decided it: a span
+emitting only its first episode links one key and **leaves the rest looking
+like missing media**. That is the failure this item names — the confusion
+Olaris' issue describes and that Jellyfin's documentation promises to avoid
+while only partly delivering.
+
+The multi-episode plan's first draft said a separator must land on the next
+episode number, which yields `[6]` for `S15E06-08`. **That contradicted this
+item**, and was amended before implementation rather than discovered after.
+
+### 3. Watch state marking every key is deferred by construction
+
+**Not built here, and not because it was overlooked.**
+
+There is **no `CREATE TABLE watch_state` in any migration**. B2-3 is unbuilt and
+blocked on B2-0's merge behind gate 1, and `migrator.rs` already guards the
+absence — `if !table_exists(conn, "watch_state")` returns `tables_present:
+false`, so §5's key-rewrite path survives it today.
+
+**What follows from item 1, when the table exists:** marking a file watched
+marks every episode key it covers, because those keys are what the file is. No
+new decision is needed then; recording it now stops the absence reading as an
+open question.
