@@ -387,6 +387,9 @@ fn show_detail(
     let mut episodes = Vec::new();
     let mut entity = bound_entity;
     let mut fallback_title = String::new();
+    // One read per folder, not per episode.
+    let mut binding_cache: BTreeMap<(i64, String), Vec<crate::series_bindings::SeriesBinding>> =
+        BTreeMap::new();
     for (library_id, folders) in &by_library {
         let Some(library) = library(conn, *library_id)? else {
             continue;
@@ -403,7 +406,29 @@ fn show_detail(
             if entity.is_none() {
                 entity = item.tmdb_show;
             }
-            episodes.push(episode_from(&library, item, &keys)?);
+            // ADR-0046 item 3(a): the reader sees the **folder's** numbering.
+            // A file bound to a second entity carries that entity's canonical
+            // season — Will & Grace's revival is season 1 on TMDB 74321 and
+            // season 9 on disk — and grouping on the canonical number would
+            // put two runs of "season 1" in one unit. Nothing errors; it is
+            // simply wrong on screen.
+            //
+            // The translation is driven by the stored range, so a folder with
+            // one binding takes `folder_season_for`'s unbounded path and its
+            // response does not move (Rule 2.3).
+            let item_entity = item.tmdb_show;
+            let mut ep = episode_from(&library, item, &keys)?;
+            if let (Some(entity_id), Some(canonical_season)) = (item_entity, ep.season) {
+                let bindings = bindings_for(conn, *library_id, &folder, &mut binding_cache)?;
+                if let Some(b) = bindings
+                    .iter()
+                    .find(|b| b.tmdb_show_id == entity_id && !b.is_primary)
+                    && let Some(folder_season) = b.folder_season_for(canonical_season)
+                {
+                    ep.season = Some(folder_season);
+                }
+            }
+            episodes.push(ep);
         }
     }
 
@@ -487,6 +512,21 @@ fn movie_detail(
         seasons: Vec::new(),
         unnumbered: files,
     }))
+}
+
+/// Bindings for one folder, read once and cached for the request.
+fn bindings_for<'a>(
+    conn: &Connection,
+    library_id: i64,
+    folder: &str,
+    cache: &'a mut BTreeMap<(i64, String), Vec<crate::series_bindings::SeriesBinding>>,
+) -> Result<&'a Vec<crate::series_bindings::SeriesBinding>, String> {
+    let key = (library_id, folder.to_string());
+    if !cache.contains_key(&key) {
+        let rows = crate::series_bindings::for_folder(conn, library_id, folder)?;
+        cache.insert(key.clone(), rows);
+    }
+    Ok(cache.get(&key).expect("just inserted"))
 }
 
 fn episode_from(
@@ -1287,5 +1327,140 @@ mod tests {
         assert_eq!(listed.units[0].series_key, "folder:3:");
         assert_eq!(listed.units[0].title, "One Show");
         assert_eq!(listed.units[0].item_count, 2);
+    }
+
+    /// Fixture: a folder holding S1-S2 bound to 4454, and S9-S10 whose
+    /// canonical rows belong to 74321 numbering them S1-S2.
+    fn will_and_grace(c: &Connection) {
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind)
+                  VALUES (1, 'Shows', '/Shows', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'Will & Grace', 4454);
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+                (1, 1, 'Will & Grace/Season 1/w.s01e01.mkv', 1, 1, 'W', 'episode', 1, 1),
+                (2, 1, 'Will & Grace/Season 2/w.s02e01.mkv', 1, 1, 'W', 'episode', 2, 1),
+                (3, 1, 'Will & Grace/Season 9/w.s09e01.mkv', 1, 1, 'W', 'episode', 9, 1),
+                (4, 1, 'Will & Grace/Season 10/w.s10e01.mkv', 1, 1, 'W', 'episode', 10, 1);
+             INSERT INTO metadata_canonical
+                  (provider, entity_kind, provider_id, title, ids_json, tmdb_show,
+                   season, episode, projected_at)
+             VALUES
+                ('tmdb', 'episode', '101', 'Pilot',      '{}', 4454,  1, 1, 'now'),
+                ('tmdb', 'episode', '201', 'Guess Who',  '{}', 4454,  2, 1, 'now'),
+                ('tmdb', 'episode', '901', 'Eleven Years Later', '{}', 74321, 1, 1, 'now'),
+                ('tmdb', 'episode', '1001','The Curmudgeon',     '{}', 74321, 2, 1, 'now');
+             INSERT INTO media_item_links (media_item_id, item_key) VALUES
+                (1, 'tmdb:episode:101'), (2, 'tmdb:episode:201'),
+                (3, 'tmdb:episode:901'), (4, 'tmdb:episode:1001');",
+        )
+        .unwrap();
+    }
+
+    /// **The defect the whole numbering design exists to prevent.** 74321
+    /// numbers the revival S1-S2 and the folder numbers it S9-S10. Without the
+    /// stored range the reader gets two season 1 buckets and two season 2
+    /// buckets in one unit — nothing errors, it is simply wrong on screen.
+    #[test]
+    fn multi_entity_folder_reads_in_the_folders_numbering() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        will_and_grace(&c);
+        c.execute_batch(
+            "INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             VALUES (1, 'Will & Grace', 74321, 0, 9, 10, 1, 2);",
+        )
+        .unwrap();
+
+        let detail = get_series(&c, "tmdb:show:4454").unwrap().unwrap();
+        let seasons: Vec<i32> = detail.seasons.iter().map(|s| s.season).collect();
+        assert_eq!(
+            seasons,
+            vec![1, 2, 9, 10],
+            "the folder's numbering, with no duplicate bucket"
+        );
+        let mut sorted = seasons.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seasons.len(), "no season appears twice");
+        assert!(
+            detail.seasons.iter().all(|s| s.episodes.len() == 1),
+            "one episode per season bucket; nothing was merged"
+        );
+    }
+
+    /// Without the binding row the same data interleaves — the state this
+    /// slice exists to prevent, asserted so the fix is demonstrated rather
+    /// than assumed.
+    #[test]
+    fn without_the_binding_row_the_seasons_collide() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        will_and_grace(&c);
+
+        let detail = get_series(&c, "tmdb:show:4454").unwrap().unwrap();
+        let seasons: Vec<i32> = detail.seasons.iter().map(|s| s.season).collect();
+        assert_eq!(
+            seasons,
+            vec![1, 2],
+            "two buckets, each holding two shows' episodes"
+        );
+        assert!(
+            detail.seasons.iter().all(|s| s.episodes.len() == 2),
+            "this is the interleave: 1998's S1 and 2017's S1 in one bucket"
+        );
+    }
+
+    /// Rule 2.3: a folder that binds one entity must not move. Its backfilled
+    /// primary is unbounded, so the translation returns the season unchanged.
+    #[test]
+    fn single_entity_folder_is_unchanged_by_the_translation() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        will_and_grace(&c);
+        c.execute_batch(
+            "DELETE FROM media_items WHERE id IN (3, 4);
+             INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             VALUES (1, 'Will & Grace', 4454, 1, NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+
+        let detail = get_series(&c, "tmdb:show:4454").unwrap().unwrap();
+        assert_eq!(
+            detail.seasons.iter().map(|s| s.season).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(detail.item_count, 2);
+    }
+
+    /// One folder stays one browse unit however many entities it binds
+    /// (ADR-0046 item 1). The corollary that does the work: several folders
+    /// give several units, and that is the user's decision.
+    #[test]
+    fn a_multi_entity_folder_is_still_one_unit() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        will_and_grace(&c);
+        c.execute_batch(
+            "INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             VALUES (1, 'Will & Grace', 74321, 0, 9, 10, 1, 2);",
+        )
+        .unwrap();
+
+        let listed = list_library_units(&c, 1).unwrap();
+        assert_unit_keys_unique(&listed);
+        assert_eq!(listed.units.len(), 1, "one folder, one unit");
+        assert_eq!(listed.units[0].series_key, "tmdb:show:4454");
+        assert_eq!(listed.units[0].item_count, 4);
     }
 }

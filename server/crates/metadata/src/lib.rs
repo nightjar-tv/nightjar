@@ -20,6 +20,7 @@ mod queue;
 mod rate_limit;
 mod raw_payload;
 mod resolve;
+mod series_bindings;
 mod tmdb;
 
 pub use artwork::{

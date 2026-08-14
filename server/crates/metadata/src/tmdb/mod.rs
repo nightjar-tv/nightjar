@@ -16,7 +16,9 @@ use crate::match_score::{
 };
 use crate::model::{CanonicalMetadata, MetadataKind};
 use crate::rate_limit::ApiRateLimiter;
-use crate::resolve::{MetadataSource, ProviderResult, ResolveError, ResolveInput};
+use crate::resolve::{
+    MetadataSource, ProviderResult, ResolveError, ResolveInput, SecondEntityCandidate,
+};
 
 pub use credentials::{
     CredError, TmdbCredentials, TmdbKeySource, embedded_application_key, resolve_credentials,
@@ -37,6 +39,17 @@ impl MetadataSource for TmdbStub {
 /// Season numbers from a `/tv/{id}` payload's `seasons[]` array. `None` when
 /// the array is absent, which must read as "not fetched", never as "no
 /// seasons".
+/// Cap on seasons appended to one `/tv/{id}` call. TMDB documents a limit of
+/// 20 `append_to_response` items; this stays under it and bounds the response
+/// for a long-running show rather than trusting the provider's ceiling.
+const MAX_APPENDED_SEASONS: usize = 20;
+
+/// Cap on search hits examined for a second entity. Each costs two requests,
+/// and this path runs only when a bind left seasons unplaced. Popular
+/// franchises return long prefix tails — Grand Designs 17, Doctor Who 18 — and
+/// walking all of them would turn one fix into thirty-odd calls.
+const MAX_SECOND_ENTITY_CANDIDATES: usize = 5;
+
 pub fn season_numbers_from_detail(data: &Value) -> Option<Vec<i32>> {
     Some(
         data.get("seasons")?
@@ -376,7 +389,79 @@ impl TmdbClient {
                         })
                         .collect()
                 }),
+            candidate_season_episodes: None,
         })
+    }
+
+    /// `/tv/{id}` with the candidate's **own** seasons appended, for the
+    /// unplaced-file search (ADR-0046 item 4).
+    ///
+    /// [`Self::tv_candidate_shape`] appends the season number the *folder*
+    /// uses, which is right for the collision tier — same show, same
+    /// numbering — and **silent** on a renumbered split. Will & Grace's
+    /// unplaced files are folder seasons 9-11 and TMDB 74321 has seasons 1-3,
+    /// so `season/9` is simply absent from the response and the shipped
+    /// confirmation returns `None`. Not wrong; silent. That is the one shape
+    /// the second-entity search is about, so it needs the candidate's own
+    /// numbering instead.
+    ///
+    /// **Costs two requests**, because the season numbers are not knowable
+    /// until the detail arrives. That is affordable precisely because this
+    /// runs only when a bind left seasons unplaced — never on a rescan of a
+    /// folder that already has its bindings, which is what the stored
+    /// folder->entity record exists to guarantee (ADR-0033 item 1).
+    fn tv_candidate_own_seasons(
+        &self,
+        id: i64,
+    ) -> Result<Option<Vec<crate::match_score::CandidateEpisode>>, ResolveError> {
+        let detail = self.get_json(&format!("/tv/{id}"), &[("language", "en-US")])?;
+        let Some(seasons) = season_numbers_from_detail(&detail) else {
+            return Ok(None);
+        };
+        // Season 0 is excluded for the same reason the coverage predicate
+        // excludes it: a `Specials` folder exists independently of whether a
+        // provider models season 0, so it is not evidence about identity.
+        let wanted: Vec<i32> = seasons
+            .into_iter()
+            .filter(|n| *n > 0)
+            .take(MAX_APPENDED_SEASONS)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let append = wanted
+            .iter()
+            .map(|n| format!("season/{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let data = self.get_json(
+            &format!("/tv/{id}"),
+            &[("language", "en-US"), ("append_to_response", &append)],
+        )?;
+        let mut out = Vec::new();
+        for n in wanted {
+            let Some(eps) = data
+                .get(format!("season/{n}"))
+                .and_then(|v| v.get("episodes"))
+                .and_then(|e| e.as_array())
+            else {
+                continue;
+            };
+            for e in eps {
+                let (Some(num), Some(name)) = (
+                    e.get("episode_number").and_then(|v| v.as_i64()),
+                    e.get("name").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                out.push((n, num as i32, name.to_string()));
+            }
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out))
+        }
     }
 
     pub fn movie_detail(
@@ -626,6 +711,34 @@ impl MetadataSource for TmdbClient {
     ) -> Result<Option<RawProviderPayload>, ResolveError> {
         self.season_detail(show_id, season_number)
     }
+
+    fn second_entity_candidates(
+        &self,
+        title: &str,
+        exclude_show_id: i64,
+    ) -> Result<Vec<SecondEntityCandidate>, ResolveError> {
+        let hits = self.search(SearchKind::Tv, title)?;
+        let mut out = Vec::new();
+        for hit in hits.iter().take(MAX_SECOND_ENTITY_CANDIDATES) {
+            if hit.id == exclude_show_id {
+                continue;
+            }
+            let Some(episodes) = self.tv_candidate_own_seasons(hit.id)? else {
+                // No episodes reachable. The empty-shell exclusion (#111)
+                // already says an entity with no episodes is never a
+                // candidate; there is nothing here for a file to bind to.
+                continue;
+            };
+            out.push(SecondEntityCandidate {
+                tmdb_show_id: hit.id,
+                shape: CandidateShape {
+                    candidate_season_episodes: Some(episodes),
+                    ..Default::default()
+                },
+            });
+        }
+        Ok(out)
+    }
 }
 
 impl MetadataSource for &TmdbClient {
@@ -639,6 +752,14 @@ impl MetadataSource for &TmdbClient {
         season_number: i32,
     ) -> Result<Option<RawProviderPayload>, ResolveError> {
         (*self).fetch_season(show_id, season_number)
+    }
+
+    fn second_entity_candidates(
+        &self,
+        title: &str,
+        exclude_show_id: i64,
+    ) -> Result<Vec<SecondEntityCandidate>, ResolveError> {
+        (*self).second_entity_candidates(title, exclude_show_id)
     }
 }
 

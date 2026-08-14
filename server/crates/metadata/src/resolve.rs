@@ -168,6 +168,35 @@ pub trait MetadataSource {
     ) -> Result<Option<RawProviderPayload>, ResolveError> {
         Ok(None)
     }
+
+    /// Entities other than `exclude_show_id` that might hold a folder's
+    /// unplaced files, each with its **own** seasons already fetched
+    /// (ADR-0046 item 4).
+    ///
+    /// Default: unsupported, matching [`Self::fetch_season`], so every stub
+    /// and measure keeps compiling and a source that cannot search simply
+    /// finds no second entity rather than failing the bind.
+    ///
+    /// **This is a title search and not a provider-graph walk.** There is no
+    /// related-series edge to follow: `belongs_to_collection` is null on 697
+    /// of 697 TV entities — it is movie-only — and recommendations are
+    /// asymmetric and partial. Given 4454, nothing in its payload points at
+    /// 74321.
+    fn second_entity_candidates(
+        &self,
+        _title: &str,
+        _exclude_show_id: i64,
+    ) -> Result<Vec<SecondEntityCandidate>, ResolveError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A provider entity a folder might additionally bind, with the shape needed
+/// to test it against the folder's unplaced files.
+#[derive(Debug, Clone)]
+pub struct SecondEntityCandidate {
+    pub tmdb_show_id: i64,
+    pub shape: crate::match_score::CandidateShape,
 }
 
 /// Parses `input.nfo_xml` when present. Not a [`MetadataSource`]: corrupt NFO
