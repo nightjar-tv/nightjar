@@ -72,6 +72,9 @@ pub struct LibrarySeriesShape {
 /// Max multi-exact candidates for the episode-title pin (ADR-0032).
 pub const EPISODE_TITLE_TIE_CAP: usize = 5;
 
+/// `(season_number, episode_number, name)` on a candidate's own season.
+pub type CandidateEpisode = (i32, i32, String);
+
 /// Per-candidate extras (search year always; counts from `/tv/{id}` detail).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CandidateShape {
@@ -86,6 +89,18 @@ pub struct CandidateShape {
     /// the same `/tv/{id}` call via `append_to_response=season/{n}`. `None`
     /// means not fetched — no evidence, never a verdict.
     pub reference_season_episodes: Option<Vec<(i32, String)>>,
+    /// `(season_number, episode_number, name)` across the candidate's **own**
+    /// seasons, for the unplaced-file search (ADR-0046 item 4). `None` means
+    /// not fetched.
+    ///
+    /// Separate from [`Self::reference_season_episodes`] rather than merged
+    /// into it, and the reason is not tidiness. That field is keyed on episode
+    /// number alone because it holds exactly one season; merging several
+    /// seasons in would put three episode 1s in it and the collision tier's
+    /// `find(|(n, _)| *n == ref_episode)` would silently take whichever came
+    /// first. A one-directional signal that can pick the wrong season is worse
+    /// than no signal, so the two live side by side.
+    pub candidate_season_episodes: Option<Vec<CandidateEpisode>>,
 }
 
 /// Does this candidate's reference-season episode carry the title the folder's
@@ -118,6 +133,94 @@ pub fn candidate_confirms_reference_episode(
         // evidence against the candidate.
         _ => None,
     }
+}
+
+/// One unplaced file: the season the **folder** puts it in, its episode
+/// number, and the episode title its filename carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnplacedFile {
+    pub folder_season: i32,
+    pub episode: i32,
+    pub title: String,
+}
+
+/// Which of the candidate's seasons the folder's unplaced seasons correspond
+/// to, established by episode-title agreement (ADR-0046 item 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeasonRangeMapping {
+    /// Inclusive folder-season range this binding covers.
+    pub folder_seasons: (i32, i32),
+    /// Inclusive entity-season range it maps to.
+    pub entity_seasons: (i32, i32),
+    /// How many files agreed. Reported so a one-file mapping is visible as
+    /// one file rather than reading like the same evidence as fifty.
+    pub confirmations: usize,
+}
+
+/// Map the folder's unplaced seasons onto a candidate's own seasons, using the
+/// shipped comparator over episode titles.
+///
+/// **Agreement only, and no `Disagree` path — deliberately.** Same discipline
+/// as [`candidate_confirms_reference_episode`]: a filename-derived title
+/// carries no air date, so [`compare_episode_title`] cannot return `Disagree`
+/// on one, and refutation never once identified a wrong entity across the 598
+/// folders the comparator was measured on. A file that fails to agree
+/// contributes nothing; it does not count against the candidate.
+///
+/// The mapping is a **range, not an offset** (ADR-0046 item 3b). Nothing here
+/// computes `folder_season - entity_season`, because an anthology has no
+/// offset: its installments both start at season 1 and the folder's number is
+/// an ordinal over them.
+///
+/// Returns `None` when no file agrees anywhere, which is the honest outcome —
+/// the caller writes no binding and the files stay unmatched.
+pub fn map_unplaced_to_candidate_seasons(
+    shape: &CandidateShape,
+    unplaced: &[UnplacedFile],
+    show_soft_key: &str,
+) -> Option<SeasonRangeMapping> {
+    let episodes = shape.candidate_season_episodes.as_deref()?;
+    // folder season -> (entity season -> agreeing files)
+    let mut votes: std::collections::BTreeMap<i32, std::collections::BTreeMap<i32, usize>> =
+        std::collections::BTreeMap::new();
+    for file in unplaced {
+        for (cand_season, cand_episode, name) in episodes {
+            if *cand_episode != file.episode {
+                continue;
+            }
+            if compare_episode_title(&file.title, name, show_soft_key, None, None)
+                == EpisodeTitleVerdict::Agree
+            {
+                *votes
+                    .entry(file.folder_season)
+                    .or_default()
+                    .entry(*cand_season)
+                    .or_default() += 1;
+            }
+        }
+    }
+    if votes.is_empty() {
+        return None;
+    }
+    // One entity season per folder season: the best supported, ties broken by
+    // the lower season number so the result does not depend on map order.
+    let mut pairs: Vec<(i32, i32, usize)> = Vec::new();
+    for (folder_season, by_entity) in votes {
+        let best = by_entity
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
+        pairs.push((folder_season, best.0, best.1));
+    }
+    let confirmations = pairs.iter().map(|p| p.2).sum();
+    let folder_lo = pairs.iter().map(|p| p.0).min()?;
+    let folder_hi = pairs.iter().map(|p| p.0).max()?;
+    let entity_lo = pairs.iter().map(|p| p.1).min()?;
+    let entity_hi = pairs.iter().map(|p| p.1).max()?;
+    Some(SeasonRangeMapping {
+        folder_seasons: (folder_lo, folder_hi),
+        entity_seasons: (entity_lo, entity_hi),
+        confirmations,
+    })
 }
 
 /// Episode-title confirmation as **promotion evidence, never a penalty.**
@@ -1019,6 +1122,7 @@ mod tests {
                 season_count: Some(15),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2025),
@@ -1026,6 +1130,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1058,6 +1163,7 @@ mod tests {
                 season_count: Some(5),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(1997),
@@ -1065,6 +1171,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1095,6 +1202,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2010),
@@ -1102,6 +1210,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1134,6 +1243,7 @@ mod tests {
                 season_count: Some(9),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2026),
@@ -1141,6 +1251,7 @@ mod tests {
                 season_count: Some(2),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1174,6 +1285,7 @@ mod tests {
                 season_count: Some(4),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2003),
@@ -1181,6 +1293,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1234,6 +1347,7 @@ mod tests {
                 season_count: Some(0),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2023),
@@ -1241,6 +1355,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1272,6 +1387,7 @@ mod tests {
             season_count: Some(0),
             season_numbers: None,
             reference_season_episodes: None,
+            candidate_season_episodes: None,
         }];
         assert!(
             score_search_with_shape(
@@ -1299,6 +1415,7 @@ mod tests {
                 season_count: Some(0),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2020),
@@ -1306,6 +1423,7 @@ mod tests {
                 season_count: Some(2),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let m = score_search_with_shape(
@@ -1331,6 +1449,7 @@ mod tests {
             season_count: Some(1),
             season_numbers: None,
             reference_season_episodes: None,
+            candidate_season_episodes: None,
         }];
         let m = score_search_with_shape(
             &results,
@@ -1668,6 +1787,7 @@ mod tests {
                 season_count: Some(4),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(2003),
@@ -1675,6 +1795,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
             CandidateShape {
                 year: Some(1978),
@@ -1682,6 +1803,7 @@ mod tests {
                 season_count: Some(1),
                 season_numbers: None,
                 reference_season_episodes: None,
+                candidate_season_episodes: None,
             },
         ];
         let c = score_search_with_shape(
@@ -1710,6 +1832,7 @@ mod tests {
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
             reference_season_episodes: Some(eps.iter().map(|(n, t)| (*n, t.to_string())).collect()),
+            candidate_season_episodes: None,
         }
     }
 
@@ -1839,6 +1962,7 @@ mod tests {
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
             reference_season_episodes: None,
+            candidate_season_episodes: None,
         }
     }
 
@@ -1921,6 +2045,7 @@ mod tests {
             season_count: None,
             season_numbers: None,
             reference_season_episodes: None,
+            candidate_season_episodes: None,
         };
         assert_eq!(
             candidate_covers_folder_seasons(&unknown, &[1, 2, 3, 4]),
@@ -2136,5 +2261,107 @@ mod tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_entity_tests {
+    use super::*;
+
+    fn shape_with_own_seasons(eps: Vec<(i32, i32, &str)>) -> CandidateShape {
+        CandidateShape {
+            candidate_season_episodes: Some(
+                eps.into_iter()
+                    .map(|(s, e, n)| (s, e, n.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn unplaced(items: &[(i32, i32, &str)]) -> Vec<UnplacedFile> {
+        items
+            .iter()
+            .map(|(s, e, t)| UnplacedFile {
+                folder_season: *s,
+                episode: *e,
+                title: (*t).to_string(),
+            })
+            .collect()
+    }
+
+    /// The Will & Grace shape: the folder numbers its revival S9-S11 and the
+    /// entity numbers the same episodes S1-S3. This is the case the shipped
+    /// confirmation is silent on, because it appends the *folder's* season
+    /// number to the *candidate's* id and `season/9` does not exist on 74321.
+    #[test]
+    fn renumbered_split_maps_folder_seasons_onto_the_entitys_own() {
+        let shape = shape_with_own_seasons(vec![
+            (1, 1, "Eleven Years Later"),
+            (1, 2, "Rocket Man"),
+            (2, 1, "The West Side Curmudgeon"),
+            (3, 1, "We Love Lucy"),
+        ]);
+        let files = unplaced(&[
+            (9, 1, "Eleven Years Later"),
+            (9, 2, "Rocket Man"),
+            (10, 1, "The West Side Curmudgeon"),
+            (11, 1, "We Love Lucy"),
+        ]);
+        let got = map_unplaced_to_candidate_seasons(&shape, &files, "willandgrace").unwrap();
+        assert_eq!(got.folder_seasons, (9, 11));
+        assert_eq!(got.entity_seasons, (1, 3));
+        assert_eq!(got.confirmations, 4);
+    }
+
+    /// Without the candidate's own seasons there is no evidence, and the
+    /// absence of evidence is not a verdict. This is the state every candidate
+    /// is in on `main`.
+    #[test]
+    fn no_candidate_seasons_fetched_yields_no_mapping() {
+        let shape = CandidateShape::default();
+        let files = unplaced(&[(9, 1, "Eleven Years Later")]);
+        assert!(map_unplaced_to_candidate_seasons(&shape, &files, "willandgrace").is_none());
+    }
+
+    /// No agreement means no binding. The files stay unmatched, which is the
+    /// bucket with three built consumers, rather than being bound to the best
+    /// of a bad set.
+    #[test]
+    fn no_title_agreement_writes_no_mapping() {
+        let shape = shape_with_own_seasons(vec![(1, 1, "Something Else Entirely")]);
+        let files = unplaced(&[(9, 1, "Eleven Years Later")]);
+        assert!(map_unplaced_to_candidate_seasons(&shape, &files, "willandgrace").is_none());
+    }
+
+    /// An anthology has no offset: both installments start at season 1 and the
+    /// folder's number is an ordinal over them. A range expresses it; a
+    /// subtraction does not.
+    #[test]
+    fn anthology_maps_without_an_offset() {
+        let shape = shape_with_own_seasons(vec![(1, 1, "The Gein Family"), (1, 2, "Frozen")]);
+        let files = unplaced(&[(3, 1, "The Gein Family"), (3, 2, "Frozen")]);
+        let got = map_unplaced_to_candidate_seasons(&shape, &files, "monster").unwrap();
+        assert_eq!(got.folder_seasons, (3, 3));
+        assert_eq!(got.entity_seasons, (1, 1));
+    }
+
+    /// A generic provider title carries no identity and must not confirm.
+    /// Same rule ADR-0032 already applies to the collision pin.
+    #[test]
+    fn generic_titles_do_not_confirm() {
+        let shape = shape_with_own_seasons(vec![(1, 7, "Episode 7")]);
+        let files = unplaced(&[(9, 7, "Episode 7")]);
+        assert!(map_unplaced_to_candidate_seasons(&shape, &files, "someshow").is_none());
+    }
+
+    /// Ties break on the lower entity season, so the mapping does not depend
+    /// on iteration order.
+    #[test]
+    fn tied_support_breaks_deterministically() {
+        let shape = shape_with_own_seasons(vec![(1, 1, "Twice Told"), (2, 1, "Twice Told")]);
+        let files = unplaced(&[(9, 1, "Twice Told")]);
+        let got = map_unplaced_to_candidate_seasons(&shape, &files, "someshow").unwrap();
+        assert_eq!(got.entity_seasons, (1, 1), "lower season wins a tie");
     }
 }
