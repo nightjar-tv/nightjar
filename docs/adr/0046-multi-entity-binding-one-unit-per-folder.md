@@ -250,3 +250,73 @@ a relationship graph.
   record exists to prevent.
 - The primary-metadata question (item 5) has to be answered before a
   multi-entity folder can render, but not before the schema lands.
+
+---
+
+## Amendment 2026-08-14 — item 5 is a binding-anchor question, and file counts cannot answer it
+
+Item 5 deferred "which entity supplies the unit's primary metadata" as a
+poster, overview and tile-name question, and said it blocked no part of items
+1–4. **Two measurements since say otherwise**, and this amendment states what
+they establish without closing the question.
+
+### It blocks a real folder, and not on rendering
+
+`Battlestar Galactica (2003)` is bound to **71365, the two-episode
+miniseries**, while **70 of its 72 files belong to 1972**, the series. The
+folder's primary is its minor entity.
+
+Adding 1972 as a secondary binding does not fix this: under item 1 the tile
+takes its identity from the primary, so the unit would be named after a
+two-episode miniseries while holding four seasons. The fix is to decide which
+entity is primary — **so for this folder item 5 decides the binding anchor,
+not the poster.** It is blocking, and the multi-entity binding slice left the
+folder unfixed for exactly this reason.
+
+### "The primary is the entity holding the most files" does not work
+
+It is the obvious rule and it fails on measurement, for a structural reason
+rather than a tuning one.
+
+**File counts are downstream of bindings, so a rule keyed on them ratifies
+whatever the matcher already got wrong.** Measured on the dogfood library:
+`Monster (2022)`'s most-files entity is **`Monster High` (2010)** with 17,
+against `DAHMER - Monster: The Jeffrey Dahmer Story` with 10 — and the 17 are
+a wrong match (`notes/monster-wrong-match-2026-08-14.md`). The rule would
+select the error that produced its own input.
+
+**Battlestar shows the same circularity from the other side.** By files
+*currently linked*, 71365 wins **2–0** and the wrong anchor is
+self-confirming. By files the folder *holds and the entity could explain*,
+1972 wins **70–2**. Those are different rules wearing one name, and only the
+second is usable — which means the tiebreak needs **candidate evaluation, not
+a `COUNT(*)`**.
+
+### The folder title is evidence already computed, and used only to reject
+
+ADR-0033 item 8's cross-check compares the folder's title against a stored
+entity's name and **discards on mismatch**. Nothing then carries that title
+into the choice of replacement: the re-search selects blind. The Monster
+defect is what that costs — a candidate rejected for a name mismatch, replaced
+by a worse one.
+
+**The folder title is the one signal here that is not downstream of a provider
+decision.** It is the user's own statement of what the folder is.
+
+### What this amendment settles, and what it does not
+
+**Settled:** item 5 is a binding-anchor question and is blocking for
+Battlestar; a bare file count cannot answer it; and any count used as a
+tiebreak must be over files an entity can *explain*, never over files already
+bound to it.
+
+**Not settled, and deliberately:** the rule itself. The shape the measurements
+point at is **title-match first, file count as tiebreak only where titles are
+indistinguishable** — which would resolve Monster by the first half and
+Battlestar by the second, since Battlestar's two entities are both named
+`Battlestar Galactica` and Will & Grace's are both named `Will & Grace`. That
+is a hypothesis supported by three folders and it is **not** adopted here. It
+needs the same treatment the tiling sketch got: measured across the 697-show
+set before it is written, because a rule derived from the folders that
+motivated it is how the refuted sketch was produced.
+
