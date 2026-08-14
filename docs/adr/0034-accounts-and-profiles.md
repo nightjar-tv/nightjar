@@ -18,8 +18,8 @@
 - Gate: Gate 3 — resume works across devices and survives server restarts;
   kids scoping and parent overrides are unreachable from a profile session
   including an adult-flagged one; full v1 API frozen
-- Related: Block 2 plan B2-A (`nightjar-meta/docs/BLOCK_2_PLAN.md` §2); decision
-  sheet `nightjar-meta/notes/design/adr-0034-questions-2026-08-06.md` (twelve
+- Related: Block 2 plan B2-A (the Block 2 plan §2); decision
+  the ADR-0034 decision sheet, 2026-08-06 (twelve
   questions signed off 2026-08-06 before B2-1 dispatch); B2-B watch state;
   B2-D kids scoping; B2-9 policy ceilings
 

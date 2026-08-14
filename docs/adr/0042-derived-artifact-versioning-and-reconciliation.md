@@ -201,6 +201,6 @@ support burden, and most of them do not have the problem.
   are decided with them.
 - What the first reconciliation run costs on a real library. The tier table
   above uses measured per-item figures (217 ms, 130 ms, 5 s) from
-  `nightjar-meta/notes/measurement-provenance-2026-08-06.md`, but the sweep
+  the measurement provenance note, 2026-08-06, but the sweep
   itself is unmeasured. It must be measured before the cheap tier is enabled by
   default, not assumed from the per-item numbers.

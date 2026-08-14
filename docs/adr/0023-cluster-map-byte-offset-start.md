@@ -28,7 +28,7 @@ Cluster, no `-ss`) lands cold under 3 s on the purge matrix, with exact
 `-output_ts_offset` rather than the scrub request; that closed far copy from
 **+1.42 s** to **+0.083 s**. The residual matches the ~83 ms edit-list /
 priming offset already characterised in the cut-rule gating work
-(`nightjar-meta/notes/cut-rule-gating-2026-07-31.md`); cite it, do not leave
+(the cut rule gating note, 2026-07-31); cite it, do not leave
 it unexplained.
 
 That elevates the keyframe map from a Phase 4 nicety to the named fix for a
@@ -346,7 +346,7 @@ fallback flags. Confirmed 2026-08-01 on a local disposable copy (not the
 live library tree): mapped session → scrub → atomic replace under the path
 (new inode + mutated last 64 KiB window) → scrub again. Observed identity
 stale → `-ss` fallback + map rebuild enqueue
-(`nightjar-meta/notes/gate2-live-replace-dogfood.md`). Unraid SMB open-FD
+(the Gate 2 live replace dogfood note). Unraid SMB open-FD
 quirks remain optional share dogfood; the dangerous next-bind case is
 covered. The old inode under an open FD may keep the in-flight producer
 honest until it exits; the next bind is the check.
@@ -427,10 +427,10 @@ scan-time sweep.
 ## Consequences
 
 - Gate 2 under-3s seek: Matroska and MP4 cold mid/far claimable on the
-  2026-08-01 purge matrix (`nightjar-meta/notes/gate2-cold-purge-matrix-2026-08-01.md`);
+  2026-08-01 purge matrix (the Gate 2 cold purge matrix note, 2026-08-01);
   every land_ms &lt; 3000 including MP4 far TC (max 2123 ms). Live replace under
   an open session dogfooded locally (§8;
-  `nightjar-meta/notes/gate2-live-replace-dogfood.md`).
+  the Gate 2 live replace dogfood note).
 - Two start paths, one map schema, one virtual-file binding model.
 - Identity fingerprint is the common invalidation key. MP4 `moov'` is
   per-session, not a derived artifact.
@@ -456,15 +456,15 @@ scan-time sweep.
 
 ## References (notes)
 
-- `nightjar-meta/notes/far-seek-baseline-2026-08-01.md`
-- `nightjar-meta/notes/far-seek-http-shim-2026-08-01.md`
-- `nightjar-meta/notes/far-seek-cluster-spawn-2026-08-01.md`
-- `nightjar-meta/notes/mp4-faststart-2026-08-01.md`
-- `nightjar-meta/notes/mp4-virtual-faststart-spawn-2026-08-01.md`
-- `nightjar-meta/notes/gate2-cold-purge-matrix-2026-08-01.md`
-- `nightjar-meta/notes/gate2-live-replace-dogfood.md`
-- `nightjar-meta/docs/derived-artifacts-slice-brief.md` (2026-08-06 amendment
+- the far seek baseline note, 2026-08-01
+- the far seek HTTP shim note, 2026-08-01
+- the far seek cluster spawn note, 2026-08-01
+- the MP4 faststart note, 2026-08-01
+- the MP4 virtual faststart spawn note, 2026-08-01
+- the Gate 2 cold purge matrix note, 2026-08-01
+- the Gate 2 live replace dogfood note
+- the derived-artifacts slice brief (2026-08-06 amendment
   source; `keyframe_index_probe.py` runs, n=300/n=20, WiFi over a degraded
   array — figures are upper bounds, re-run without `--sample` once the array
   rebuild finishes)
-- `nightjar-meta/notes/cut-rule-gating-2026-07-31.md` (elst / priming ~83 ms)
+- the cut rule gating note, 2026-07-31 (elst / priming ~83 ms)

@@ -66,7 +66,7 @@ This aligns the gate with the copy deck promise.
    the walk, and the job waits on it once the pass is done.
 
    *Amended 2026-08-08 (Rule 6.4).* This previously read "fast index pass,
-   **then** a worker pool ... draining a queue", and the code matched: probes
+   **then** a worker pool... draining a queue", and the code matched: probes
    accumulated in a `Vec` through the whole pass and were handed over exactly
    once at the end. Nothing was queued to probe until the walk finished, so on
    the 2026-08-07 dogfood run not one of 23,283 TV items carried a `probed_at`
@@ -178,4 +178,4 @@ after the walk ends. An aggregate cannot answer it, because averaging the
 0.45/s window with the 3.41/s window returns 2.14/s, which describes neither.
 `probed_at` supports this directly and §2.4's `walk_ms` / `upsert_ms` give the
 phase boundaries. Evidence:
-`nightjar-meta/notes/probe-rate-matched-2026-08-09.md`.
+the probe rate matched note, 2026-08-09.

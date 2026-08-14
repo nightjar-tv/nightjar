@@ -14,8 +14,8 @@
 - Gate: Gate 3 — metadata auto-match ≥95% correct; every mismatch fixable
   in-UI in under 30 seconds; rescan of an unchanged library issues no search
   requests
-- Related: `nightjar-meta/notes/tmdb-entity-splits-2026-08-13.md` (the
-  measurement this record rests on); `nightjar-meta/notes/design/adr-0045-multi-entity-questions-2026-08-12.md`
+- Related: the TMDB entity splits note, 2026-08-13 (the
+  measurement this record rests on); the ADR-0045 multi-entity decision sheet, 2026-08-12
   (question sheet, written against the refuted design, superseded in framing)
 
 ## Context

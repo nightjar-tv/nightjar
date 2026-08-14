@@ -21,7 +21,7 @@ subtitle-warm triggers) were not earning their keep (Rule 4.11).
 
 2. **API removals (v0 unfrozen).** `POST /api/v0/items/{itemId}/remux`,
    `PlaybackInfo.remuxState` / `remuxError`, and the remux arm of
-   `GET .../stream` are deleted. Remux items expose `sessionsUrl` like
+   `GET.../stream` are deleted. Remux items expose `sessionsUrl` like
    transcode. Clients start a session; there is nothing to poll for remux
    readiness.
 
@@ -58,7 +58,7 @@ holds one film rather than two, so that win was largely theoretical at real
 library sizes: eviction often lands before a second viewer arrives. Subtitle
 warm did not complete inside the remux window on either finished title.
 
-Post-convergence numbers above are from `POST .../sessions` to the first
+Post-convergence numbers above are from `POST.../sessions` to the first
 servable `seg000.m4s` on the same NAS and titles, with
 `videoEncoder`/`encoderKind` = `copy`.
 
@@ -137,7 +137,7 @@ path iOS/tvOS need).
    **fresh playlist URI per run** replace the synthetic full-title grid.
    Scrubber range comes from item / usable duration; far seek is
    `?startMs=` + new playlist URI (probe:
-   `nightjar-meta/scripts/playlist_shape_probe/RESULTS.md`). Transcode still force-IDRs
+   the playlist-shape probe results). Transcode still force-IDRs
    on `SEGMENT_MS` (ADR-0008 §3); its time-keys fall on that grid.
 
 7. **Out-of-window segment requests are load-bearing 503s, not 404s.**

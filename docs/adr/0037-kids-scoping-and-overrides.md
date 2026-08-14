@@ -6,7 +6,7 @@
   item 6 owns the episode-to-series edge item 5's certification inheritance
   reads — without it a capped profile sees no television at all; ADR-0040
   supplies the role model items 9, 11 and 12 qualify against. Sign-off for both:
-  `nightjar-meta/notes/design/adr-0039-0040-questions-2026-08-06.md`
+  the ADR-0039/0040 decision sheet, 2026-08-06
 - Supersedes: ADR-0026 §8.4 item 3 (certification projection; see item 8)
 - Depends on: ADR-0034 (account and profile scope, the cap and simple-interface
   columns, PIN deferred to B2-7), as amended by ADR-0040; ADR-0026 status
@@ -18,7 +18,7 @@
 - Gate: Gate 3 — kids scoping and parent overrides are unreachable from a profile
   session including an adult-flagged one; kids denial verified on every
   item-returning endpoint
-- Related: Block 2 plan B2-D, B2-6, B2-7 (`nightjar-meta/docs/BLOCK_2_PLAN.md`);
+- Related: Block 2 plan B2-D, B2-6, B2-7;
   ADR-0035 watch state (the rail is an item-returning surface and is not exempt)
 
 ## Context

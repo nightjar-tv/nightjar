@@ -65,12 +65,11 @@ Commit messages and PR bodies follow the plain-prose register in
   the web build needs the client at build time, API changes stay reviewable in
   PRs, and the drift check keeps it honest. Other generated artifacts (token
   CSS, etc.) remain build outputs.
-- Editor/OS junk (.DS_Store, .idea). Covered by .gitignore; don't add
+- Editor/OS junk (.DS_Store,.idea). Covered by.gitignore; don't add
   exceptions.
 - Vendored dependencies. Cargo/npm lockfiles yes; copied source trees no.
 - Working docs that do not bind contributors (plan, brand strategy, copy deck,
-  writing checklist). Those live in the private `nightjar-tv/nightjar-meta`
-  repo.
+  writing checklist). Those live in a private maintainer repository.
 
 ## 5. Tags & releases
 - Semantic versioning: `v1.2.3`. Tags are annotated and signed, created only
@@ -95,7 +94,7 @@ Commit messages and PR bodies follow the plain-prose register in
   anything that leaves the machine.
 - **Session-scoped publish carve-out.** A human may authorize an LLM to branch,
   commit, push, and open pull requests for one session. This reuses the
-  mechanism `nightjar-meta/AGENTS.md` already has — publish is allowed only when
+  mechanism the private maintainer tooling already has — publish is allowed only when
   the human authorized it that turn — so both repos share one shape instead of
   growing a second. Rule 4.11 applies to process, not only to code.
 

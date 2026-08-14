@@ -7,7 +7,7 @@
 - Depends on: ADR-0025 (§5 migrator); ADR-0026 (confidence floor, negative-
   result cache, payloads, collections storage §6)
 - Gate: Gate 3 — every mismatch fixable in-UI in under 30 seconds
-- Related: Phase 3 Block 1 (`nightjar-meta/docs/PHASE_3_REVISED.md`); kids
+- Related: Phase 3 Block 1; kids
   scoping prefers fix over allowlist for wrong matches
 
 ## Context

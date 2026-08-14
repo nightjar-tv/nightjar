@@ -8,8 +8,8 @@
   remove-and-re-add
 - Related: ADR-0022 §5 (version selection under effective ceiling, follow-up);
   watch-history design note
-  (`nightjar-meta/notes/design/NIGHTJAR_WATCH_HISTORY_SPEC.md`); Phase 3
-  Block 1 (`nightjar-meta/docs/PHASE_3_REVISED.md`)
+  (the watch-history spec); Phase 3
+  Block 1 (the Phase 3 plan)
 
 ## Context
 

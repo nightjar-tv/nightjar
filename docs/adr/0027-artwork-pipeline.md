@@ -12,7 +12,7 @@
 - Gate: Gate 3 — artwork served from Nightjar cache; disk measure for ~24.8k
   items at the chosen thumbnail set
 - Related: strategy note
-  (`nightjar-meta/notes/design/metadata-artwork-strategy.md`); Phase 3 Block 1
+  (the metadata artwork strategy decision sheet); Phase 3 Block 1
 
 ## Context
 

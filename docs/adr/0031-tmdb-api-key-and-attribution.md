@@ -9,7 +9,7 @@
   real matcher traffic
 - Related: ADR-0027 (artwork — reserved, unwritten; artwork is still
   TMDB-derived under §1's 6-month ceiling — the separate ADR decides
-  image pipeline shape, not ToU scope); `nightjar-meta/docs/COPY_DECK.md`
+  image pipeline shape, not ToU scope); the copy deck
   (needs a matching attribution entry — not written yet)
 - Numbering: next free after 0030. **0027 remains artwork.** Do not reuse.
 
@@ -196,7 +196,7 @@ mark; must not imply endorsement.
 **Implementation:** vendor the approved SVG into the repo; do not hotlink
 TMDB's CDN asset. The About page must render identically offline.
 
-`nightjar-meta/docs/COPY_DECK.md` needs a matching entry for that string,
+the copy deck needs a matching entry for that string,
 naming rule, link target, and logo placement. **Not written yet — flag
 for copy, not invented here.**
 
