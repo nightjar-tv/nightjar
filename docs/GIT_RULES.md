@@ -107,6 +107,8 @@ Commit messages and PR bodies follow the plain-prose register in
   > and asserting they do is how this section came to be read as governing a
   > repository it cannot name. The carve-out stands on its own terms.
 
+  Rule 4.11 applies to process, not only to code.
+
   Authorization is never standing. It does not survive the session that granted
   it, and a later session needs its own.
 
