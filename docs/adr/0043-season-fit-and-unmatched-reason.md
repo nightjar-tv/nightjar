@@ -92,7 +92,7 @@ never two causes collapsed into one label:
 | reason | meaning |
 |---|---|
 | `no_show_candidate` | nothing survived candidate selection |
-| `no_season_fit` | candidates existed; none covered the folder's seasons |
+| ~~`no_season_fit`~~ | **struck 2026-08-15 — nothing can produce it. See the reconciliation below.** |
 | `season_out_of_range` | the scanned season does not exist on the bound show |
 | `episode_out_of_range` | the season exists; the scanned episode is beyond its episode count |
 | `episode_not_projected` | the season exists and holds the number, but no episode row was projected for it |
@@ -215,3 +215,67 @@ whose season was never fetched, and whether the comparator tolerates the
 part-number transposition that accounts for most of the 26. §2 and the
 `no_season_fit` reason code are unaffected and stand — the reason a candidate
 was refused is worth recording whatever refuses it.
+
+---
+
+## Amendment 2026-08-15 — reconciling §2's token list with what the tree emits
+
+Written while enumerating the resolver's outcomes for the slice that finally
+builds §2. Two corrections, one in each direction.
+
+### `no_season_fit` is struck, and it was not an oversight
+
+The 2026-08-12 amendment looked directly at this token and **kept it**, saying
+*"§2 and the `no_season_fit` reason code are unaffected and stand — the reason a
+candidate was refused is worth recording whatever refuses it."*
+
+That reasoning is sound on its face and it did not hold. It is a prediction:
+that *something* would go on refusing candidates on season grounds once §1's
+gate was gone. **Coverage promotion, which replaced §1, promotes rather than
+refuses.** It raises a better-covered candidate over a worse one and rejects
+nothing, so there is no season-based rejection anywhere in the shipped tree and
+**no code path can produce this token.**
+
+**Struck rather than deleted**, because a reader comparing the shipped column to
+this table would otherwise find nine tokens, find the 2026-08-12 amendment
+explicitly preserving the tenth, and be unable to reconcile the two.
+
+**And the general lesson is not "check the list".** Someone did check it, in the
+same amendment that retired the mechanism, and gave a reason. Checking a token
+list means predicting which causes the *next* mechanism will have — and here the
+author was adopting that mechanism in the same breath and still predicted wrong.
+**A specified-and-unbuilt design decays even when it is checked**, because the
+check is a forecast.
+
+### `NoEpisodes` is added, and §2 never named it
+
+`UnresolvedReason::NoEpisodes` has existed since the empty-shell exclusion
+shipped: a folder with files cannot bind to a provider entity with zero
+episodes, so the entity is not a candidate. It is produced today, it is logged
+today, and **§2's list has no token for it.**
+
+| reason | meaning |
+|---|---|
+| `no_episodes` | the picked entity has no episodes, so nothing can bind to it |
+
+### What the tree actually emits, which is the input to the build
+
+Enumerated from the code rather than from this table:
+
+- **Resolve-time causes exist as values and are discarded.**
+  `UnresolvedReason` carries `NoMatch`, `NfoInvalid`, `BelowThreshold` and
+  `NoEpisodes`; the queue matches on it, formats it into a log line and drops
+  it. §2's premise — *"the drain already knows which cause fired at the point it
+  fails; it discards that knowledge"* — is still exactly true.
+- **Bind-time causes do not exist as values at all.** After a bind, status comes
+  from a set difference: linked → `ready`, unlinked → `unmatched`. Nothing
+  computes *why* an item went unlinked, so `season_out_of_range`,
+  `episode_out_of_range`, `episode_not_projected`, `duplicate_slot` and
+  `no_scanned_number` have **no producer** — they name causes this record
+  assumed rather than causes the code distinguishes.
+
+**Those are different pieces of work.** Persisting the resolve-time reason is
+plumbing a value that already exists. Producing the bind-time reasons is
+deciding what the causes are and computing them, which is closer to designing a
+taxonomy than to adding a column. The build treats them as two steps and this
+record stops claiming they are one.
