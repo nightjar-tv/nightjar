@@ -89,6 +89,25 @@ pub enum UnresolvedReason {
     NoEpisodes,
 }
 
+impl UnresolvedReason {
+    /// The token persisted in `media_items.metadata_unmatched_reason`.
+    ///
+    /// Named from the variant that produces it rather than from ADR-0043 §2's
+    /// list, which was written before any writer existed: of its ten tokens
+    /// three had producers, five named bind-time causes nothing computes, one
+    /// was struck for naming a retired mechanism, and this set's `no_episodes`
+    /// was missing from it entirely. §2's `no_show_candidate` is `no_match`
+    /// here, after the variant.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::NoMatch => "no_match",
+            Self::NfoInvalid { .. } => "nfo_invalid",
+            Self::BelowThreshold { .. } => "below_threshold",
+            Self::NoEpisodes => "no_episodes",
+        }
+    }
+}
+
 impl std::fmt::Display for UnresolvedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -521,7 +540,22 @@ impl<T: MetadataSource> Resolver<T> {
                 return Ok(ResolveOutcome::Resolved {
                     metadata: Box::new(meta),
                     source: MetadataOrigin::Tmdb,
-                    match_method: Some("series_row".to_string()),
+                    // Two routes reach this return and they are not the same
+                    // event. One is the cross-check passing. The other is the
+                    // cross-check *rejecting* on the folder name and episode
+                    // titles rescuing the id — which is precisely the "how
+                    // often does the name gate reject something that should
+                    // have been kept" question the diagnostic column exists to
+                    // answer. A shared token would make the column blind to the
+                    // thing it is for.
+                    match_method: Some(
+                        if confirmed {
+                            "series_row_title_confirmed"
+                        } else {
+                            "series_row"
+                        }
+                        .to_string(),
+                    ),
                 });
             }
         }

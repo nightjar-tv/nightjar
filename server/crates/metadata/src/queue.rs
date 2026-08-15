@@ -1305,18 +1305,49 @@ pub fn set_metadata_status(
     ids: &[i64],
     status: MetadataStatus,
 ) -> Result<(), String> {
+    set_metadata_status_recording(conn, ids, status, None)
+}
+
+/// Set the status and record **why**, in the same statement (ADR-0043 §2).
+///
+/// The token goes to the column the status calls for and the other is cleared,
+/// so an item never carries both a failure reason and a success route. A
+/// `None` token clears both — that is the honest state for a decision nothing
+/// computes a cause for, which is every bind-time exit today.
+///
+/// **Diagnostic, never control flow.** Nothing reads either column to decide
+/// what happens next.
+pub fn set_metadata_status_recording(
+    conn: &Connection,
+    ids: &[i64],
+    status: MetadataStatus,
+    token: Option<&str>,
+) -> Result<(), String> {
     if ids.is_empty() {
         return Ok(());
     }
+    let sql = if status == MetadataStatus::Unmatched {
+        "UPDATE media_items
+            SET metadata_status = ?1,
+                metadata_unmatched_reason = ?2,
+                metadata_match_method = NULL
+          WHERE id = ?3"
+    } else {
+        "UPDATE media_items
+            SET metadata_status = ?1,
+                metadata_match_method = ?2,
+                metadata_unmatched_reason = NULL
+          WHERE id = ?3"
+    };
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| format!("begin status tx: {e}"))?;
     {
         let mut stmt = tx
-            .prepare("UPDATE media_items SET metadata_status = ?1 WHERE id = ?2")
+            .prepare(sql)
             .map_err(|e| format!("prepare status update: {e}"))?;
         for id in ids {
-            stmt.execute(params![status.as_str(), id])
+            stmt.execute(params![status.as_str(), token, id])
                 .map_err(|e| format!("update status {id}: {e}"))?;
         }
     }
@@ -1657,7 +1688,12 @@ fn search_one_group<T: MetadataSource>(
                             "  unmatched {} — resolved without usable tmdb id (no stored key)",
                             g.title
                         );
-                        set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+                        set_metadata_status_recording(
+                            conn,
+                            &g.item_ids,
+                            MetadataStatus::Unmatched,
+                            Some("no_usable_provider_id"),
+                        )?;
                         stats.items_unmatched += g.item_ids.len();
                     }
                     Err(e) => return Err(e),
@@ -1666,7 +1702,12 @@ fn search_one_group<T: MetadataSource>(
         }
         Ok(ResolveOutcome::Unresolved { reason, .. }) => {
             eprintln!("  unmatched {} reason={reason:?}", g.title);
-            set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+            set_metadata_status_recording(
+                conn,
+                &g.item_ids,
+                MetadataStatus::Unmatched,
+                Some(reason.token()),
+            )?;
             stats.items_unmatched += g.item_ids.len();
         }
         Err(e) => {
@@ -1770,7 +1811,11 @@ fn enrich_one_group<T: MetadataSource>(
     };
     stats.provider_resolves += 1;
     match resolver.resolve_with_store(&input, conn) {
-        Ok(ResolveOutcome::Resolved { metadata, .. }) => {
+        Ok(ResolveOutcome::Resolved {
+            metadata,
+            match_method: enrich_method,
+            ..
+        }) => {
             // If NFO is present but incomplete, merge NFO data over TMDB
             // (only when kinds match — episode NFOs do not merge into show
             // detail, ADR-0026 §8.2).
@@ -1870,13 +1915,23 @@ fn enrich_one_group<T: MetadataSource>(
             // an item `matched`, and that is a retry, never a resting state.
             match g.resolve_kind {
                 MetadataKind::Movie => {
-                    set_metadata_status(conn, &g.item_ids, MetadataStatus::Ready)?;
+                    set_metadata_status_recording(
+                        conn,
+                        &g.item_ids,
+                        MetadataStatus::Ready,
+                        enrich_method.as_deref(),
+                    )?;
                     stats.items_ready += g.item_ids.len();
                 }
                 MetadataKind::Episode | MetadataKind::Show => {
                     let bound = episode_bound_ids(conn, &g.item_ids)?;
                     if !bound.is_empty() {
-                        set_metadata_status(conn, &bound, MetadataStatus::Ready)?;
+                        set_metadata_status_recording(
+                            conn,
+                            &bound,
+                            MetadataStatus::Ready,
+                            enrich_method.as_deref(),
+                        )?;
                         stats.items_ready += bound.len();
                     }
                     let unbound: Vec<i64> = g
@@ -1891,7 +1946,17 @@ fn enrich_one_group<T: MetadataSource>(
                             g.title,
                             unbound.len()
                         );
-                        set_metadata_status(conn, &unbound, MetadataStatus::Unmatched)?;
+                        // Layer 2 (ADR-0043, 2026-08-15 amendment): nothing
+                        // computes *why* this item went unlinked — the status
+                        // is a set difference. `None` records that honestly
+                        // rather than inventing a cause the code does not
+                        // distinguish.
+                        set_metadata_status_recording(
+                            conn,
+                            &unbound,
+                            MetadataStatus::Unmatched,
+                            None,
+                        )?;
                         stats.items_unmatched += unbound.len();
                     }
                     // bind_complete == false: the bind provider error is a
@@ -1916,7 +1981,12 @@ fn enrich_one_group<T: MetadataSource>(
             // transient failure: terminal `unmatched`, never a bare next-pass
             // repeat of the same call (ADR-0026 §8.4). The link survives.
             eprintln!("  enrich unmatched {} — stored id 404: {e}", g.title);
-            set_metadata_status(conn, &g.item_ids, MetadataStatus::Unmatched)?;
+            set_metadata_status_recording(
+                conn,
+                &g.item_ids,
+                MetadataStatus::Unmatched,
+                Some("stored_id_404"),
+            )?;
             stats.items_unmatched += g.item_ids.len();
         }
         Err(ResolveError::Provider(e)) => {
@@ -5131,5 +5201,92 @@ mod tests {
             1,
             "a prefix-sharing sibling folder is not this folder"
         );
+    }
+
+    fn reasons(c: &Connection) -> Vec<(i64, Option<String>, Option<String>)> {
+        let mut st = c
+            .prepare(
+                "SELECT id, metadata_unmatched_reason, metadata_match_method
+                 FROM media_items ORDER BY id",
+            )
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn one_item(c: &Connection) {
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO media_items (id, library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 1, 'A/a.mkv', 1, 1, 'A', 'episode');",
+        )
+        .unwrap();
+    }
+
+    /// A failure writes the reason column and leaves the route column NULL.
+    #[test]
+    fn an_unmatched_exit_records_its_reason_and_no_route() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("no_episodes"))
+            .unwrap();
+        assert_eq!(reasons(&c), vec![(1, Some("no_episodes".into()), None)]);
+    }
+
+    /// A success writes the route column and leaves the reason column NULL.
+    #[test]
+    fn a_ready_exit_records_its_route_and_no_reason() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Ready, Some("series_row")).unwrap();
+        assert_eq!(reasons(&c), vec![(1, None, Some("series_row".into()))]);
+    }
+
+    /// **Neither column ever carries a stale value from the other state.** An
+    /// item that failed and then succeeded must not keep its failure reason —
+    /// that is the "cleared when the status leaves the state the token
+    /// describes" rule, and it is the one a reader would otherwise trust.
+    #[test]
+    fn a_later_decision_clears_the_earlier_one() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("no_match"))
+            .unwrap();
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Ready, Some("exact_title"))
+            .unwrap();
+        assert_eq!(reasons(&c), vec![(1, None, Some("exact_title".into()))]);
+
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("stored_id_404"))
+            .unwrap();
+        assert_eq!(reasons(&c), vec![(1, Some("stored_id_404".into()), None)]);
+    }
+
+    /// `None` is the honest record for a decision nothing computes a cause
+    /// for — every bind-time exit today. It must not leave a stale token
+    /// behind either.
+    #[test]
+    fn no_token_records_nothing_and_clears_what_was_there() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("no_match"))
+            .unwrap();
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, None).unwrap();
+        assert_eq!(reasons(&c), vec![(1, None, None)]);
+    }
+
+    /// The plain wrapper keeps its old behaviour and records nothing.
+    #[test]
+    fn set_metadata_status_records_nothing() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        set_metadata_status(&c, &[1], MetadataStatus::Ready).unwrap();
+        assert_eq!(reasons(&c), vec![(1, None, None)]);
     }
 }

@@ -61,6 +61,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         21,
         include_str!("../migrations/021_series_entity_bindings.sql"),
     ),
+    (
+        22,
+        include_str!("../migrations/022_metadata_decision_reasons.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -302,7 +306,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 21);
+        assert_eq!(v, 22);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -320,6 +324,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_series_bindings, 1);
+        // 022: both decision columns exist and are nullable, so an existing
+        // row reads NULL — "decided before this migration", distinguishable
+        // from every real token.
+        for col in ["metadata_unmatched_reason", "metadata_match_method"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{col}");
+        }
         let has_subtitle_tracks: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_item_subtitle_tracks'",
