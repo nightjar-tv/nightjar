@@ -931,7 +931,14 @@ pub fn score_search_with_shape(
         if exact.len() == 1 {
             // Sole exact hit that is an empty TMDB shell stays below floor.
             if is_empty_shell(&shapes[0]) {
-                (exact[0], 0.72, "exact_title_empty_shell")
+                // Named for what it still catches. #111's candidate exclusion
+                // (`has_no_episodes`, `episode_count == Some(0)`) runs before
+                // this and takes almost everything `is_empty_shell` used to
+                // mean; what survives here is the narrower shape it does not
+                // cover — zero seasons, with an episode count that is non-zero
+                // or unknown. The old name promised the whole class and would
+                // have made the diagnostic column overstate its reach.
+                (exact[0], 0.72, "exact_title_zero_seasons")
             } else {
                 (exact[0], 0.90, "exact_title")
             }
@@ -1012,7 +1019,7 @@ pub fn needs_collision_detail(
     // Still below floor after year-only pin → fetch detail counts / title tier.
     // Empty-shell sole hit also needs detail (or stays unmatched).
     c.confidence < AUTO_MATCH_FLOOR
-        && (c.method == "exact_title_collision_unpinned" || c.method == "exact_title_empty_shell")
+        && (c.method == "exact_title_collision_unpinned" || c.method == "exact_title_zero_seasons")
 }
 
 pub fn meets_auto_match_floor(confidence: f64) -> bool {
