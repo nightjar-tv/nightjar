@@ -378,7 +378,12 @@ impl<T: MetadataSource> Resolver<T> {
                     return Ok(ResolveOutcome::Resolved {
                         metadata,
                         source: MetadataOrigin::Nfo,
-                        match_method: None,
+                        // This *is* a route — the entity was chosen by the id
+                        // the NFO carries — and it is the dominant one in a
+                        // library written by a tool that emits TMDB ids. It
+                        // reported `None` until 2026-08-15, which left the
+                        // diagnostic column blank for most of the library.
+                        match_method: Some("nfo_tvshow_tmdb_id".to_string()),
                     });
                 }
                 // Show identified but no TMDB id: carry imdb/tvdb for `/find`.
@@ -404,7 +409,11 @@ impl<T: MetadataSource> Resolver<T> {
                     return Ok(ResolveOutcome::Resolved {
                         metadata,
                         source: MetadataOrigin::Nfo,
-                        match_method: None,
+                        // The item's own sidecar, distinct from the show root's
+                        // `tvshow.nfo` above. Two tokens rather than one,
+                        // because a single `nfo` token would merge two routes
+                        // and no query could separate them afterwards.
+                        match_method: Some("nfo_item_tmdb_id".to_string()),
                     });
                 }
                 // Episode NFO external ids are episode-level (strategy note
@@ -728,7 +737,7 @@ mod tests {
             } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
                 assert_eq!(metadata.title, "Fight Club");
-                assert_eq!(match_method, None);
+                assert_eq!(match_method.as_deref(), Some("nfo_item_tmdb_id"));
             }
             ResolveOutcome::Unresolved { .. } => panic!("expected NFO resolve"),
         }
@@ -1024,7 +1033,12 @@ mod tests {
             } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
                 assert_eq!(metadata.ids.tmdb, Some(550));
-                assert_eq!(match_method, None);
+                // Was `None` until 2026-08-15. The NFO's own id *is* how the
+                // entity was chosen, and reporting nothing left the diagnostic
+                // column blank for most of a Sonarr-managed library — 22,096 of
+                // 25,212 ready items on the measured run. The assertion moves
+                // with the decision rather than pinning the gap in place.
+                assert_eq!(match_method.as_deref(), Some("nfo_item_tmdb_id"));
             }
             other => panic!("expected NFO resolve, got {other:?}"),
         }

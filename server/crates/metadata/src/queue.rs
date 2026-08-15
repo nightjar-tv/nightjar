@@ -823,6 +823,7 @@ fn apply_search_hit(
     conn: &Connection,
     item_ids: &[i64],
     metadata: &CanonicalMetadata,
+    match_method: Option<&str>,
 ) -> Result<bool, String> {
     let tx = conn
         .unchecked_transaction()
@@ -866,7 +867,17 @@ fn apply_search_hit(
     };
     tx.commit().map_err(|e| format!("commit search-hit: {e}"))?;
     if wrote {
-        set_metadata_status(conn, item_ids, MetadataStatus::Matched)?;
+        // The search tier is where the entity is *chosen*, so this is the
+        // route worth recording. Enrich resolves by the stored id afterwards
+        // and always reports `tmdb_id`; without this write the column answers
+        // "how did enrich resolve" rather than "how was this entity chosen",
+        // and the twelve scorer tokens have no producer at all.
+        set_metadata_status_recording(
+            conn,
+            item_ids,
+            MetadataStatus::Matched,
+            match_method.map_or(Decision::Uncomputed, Decision::Token),
+        )?;
     }
     Ok(wrote)
 }
@@ -1305,15 +1316,57 @@ pub fn set_metadata_status(
     ids: &[i64],
     status: MetadataStatus,
 ) -> Result<(), String> {
-    set_metadata_status_recording(conn, ids, status, None)
+    set_metadata_status_only(conn, ids, status)
+}
+
+/// Status only, both decision columns untouched.
+fn set_metadata_status_only(
+    conn: &Connection,
+    ids: &[i64],
+    status: MetadataStatus,
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin status tx: {e}"))?;
+    {
+        let mut stmt = tx
+            .prepare("UPDATE media_items SET metadata_status = ?1 WHERE id = ?2")
+            .map_err(|e| format!("prepare status update: {e}"))?;
+        for id in ids {
+            stmt.execute(params![status.as_str(), id])
+                .map_err(|e| format!("update status {id}: {e}"))?;
+        }
+    }
+    tx.commit().map_err(|e| format!("commit status: {e}"))?;
+    Ok(())
+}
+
+/// What to record about a status change (ADR-0043 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision<'a> {
+    /// This decision has a known cause or route. It goes to the column the
+    /// status calls for; the other is cleared.
+    Token(&'a str),
+    /// Nothing computes a cause for this decision — the honest state for every
+    /// bind-time exit today. Clears both.
+    Uncomputed,
+    /// The status moved but **the entity was not re-chosen**, so whatever route
+    /// is already recorded still describes how it was chosen. Leaves both
+    /// columns alone.
+    ///
+    /// This is what enrich-by-stored-id is: it resolves details for an id the
+    /// search tier already picked. Overwriting with `tmdb_id` there is what
+    /// made the column answer "how did enrich resolve" instead of "how was this
+    /// entity chosen".
+    KeepRoute,
 }
 
 /// Set the status and record **why**, in the same statement (ADR-0043 §2).
 ///
-/// The token goes to the column the status calls for and the other is cleared,
-/// so an item never carries both a failure reason and a success route. A
-/// `None` token clears both — that is the honest state for a decision nothing
-/// computes a cause for, which is every bind-time exit today.
+/// An item never carries both a failure reason and a success route.
 ///
 /// **Diagnostic, never control flow.** Nothing reads either column to decide
 /// what happens next.
@@ -1321,11 +1374,18 @@ pub fn set_metadata_status_recording(
     conn: &Connection,
     ids: &[i64],
     status: MetadataStatus,
-    token: Option<&str>,
+    decision: Decision<'_>,
 ) -> Result<(), String> {
     if ids.is_empty() {
         return Ok(());
     }
+    if decision == Decision::KeepRoute {
+        return set_metadata_status_only(conn, ids, status);
+    }
+    let token = match decision {
+        Decision::Token(t) => Some(t),
+        _ => None,
+    };
     let sql = if status == MetadataStatus::Unmatched {
         "UPDATE media_items
             SET metadata_status = ?1,
@@ -1659,7 +1719,7 @@ fn search_one_group<T: MetadataSource>(
                     .and_modify(|p| *p = *p || poster)
                     .or_insert(poster);
             } else {
-                match apply_search_hit(conn, &g.item_ids, &metadata) {
+                match apply_search_hit(conn, &g.item_ids, &metadata, match_method.as_deref()) {
                     Ok(true) => {
                         // ADR-0033: a fresh TV match writes the folder-keyed
                         // series row, so a later group under this folder binds
@@ -1692,7 +1752,7 @@ fn search_one_group<T: MetadataSource>(
                             conn,
                             &g.item_ids,
                             MetadataStatus::Unmatched,
-                            Some("no_usable_provider_id"),
+                            Decision::Token("no_usable_provider_id"),
                         )?;
                         stats.items_unmatched += g.item_ids.len();
                     }
@@ -1706,7 +1766,7 @@ fn search_one_group<T: MetadataSource>(
                 conn,
                 &g.item_ids,
                 MetadataStatus::Unmatched,
-                Some(reason.token()),
+                Decision::Token(reason.token()),
             )?;
             stats.items_unmatched += g.item_ids.len();
         }
@@ -1737,8 +1797,18 @@ fn persist_nfo_ready_and_link(
         }
     }
     {
+        // A third status-write site, and it records its route like the other
+        // two. It is inline rather than calling the shared writer because it
+        // shares this function's transaction — the whole point of the path is
+        // that identity, links and status land together.
         let mut stmt = tx
-            .prepare("UPDATE media_items SET metadata_status = ?1 WHERE id = ?2")
+            .prepare(
+                "UPDATE media_items
+                    SET metadata_status = ?1,
+                        metadata_match_method = 'nfo_complete',
+                        metadata_unmatched_reason = NULL
+                  WHERE id = ?2",
+            )
             .map_err(|e| format!("prepare status update: {e}"))?;
         for id in item_ids {
             stmt.execute(params![MetadataStatus::Ready.as_str(), id])
@@ -1811,11 +1881,10 @@ fn enrich_one_group<T: MetadataSource>(
     };
     stats.provider_resolves += 1;
     match resolver.resolve_with_store(&input, conn) {
-        Ok(ResolveOutcome::Resolved {
-            metadata,
-            match_method: enrich_method,
-            ..
-        }) => {
+        // The enrich tier's own `match_method` is deliberately not bound: it
+        // resolves details for an id the search tier already chose, and
+        // recording it would overwrite the route that did the choosing.
+        Ok(ResolveOutcome::Resolved { metadata, .. }) => {
             // If NFO is present but incomplete, merge NFO data over TMDB
             // (only when kinds match — episode NFOs do not merge into show
             // detail, ADR-0026 §8.2).
@@ -1919,7 +1988,7 @@ fn enrich_one_group<T: MetadataSource>(
                         conn,
                         &g.item_ids,
                         MetadataStatus::Ready,
-                        enrich_method.as_deref(),
+                        Decision::KeepRoute,
                     )?;
                     stats.items_ready += g.item_ids.len();
                 }
@@ -1930,7 +1999,7 @@ fn enrich_one_group<T: MetadataSource>(
                             conn,
                             &bound,
                             MetadataStatus::Ready,
-                            enrich_method.as_deref(),
+                            Decision::KeepRoute,
                         )?;
                         stats.items_ready += bound.len();
                     }
@@ -1955,7 +2024,7 @@ fn enrich_one_group<T: MetadataSource>(
                             conn,
                             &unbound,
                             MetadataStatus::Unmatched,
-                            None,
+                            Decision::Uncomputed,
                         )?;
                         stats.items_unmatched += unbound.len();
                     }
@@ -1985,7 +2054,7 @@ fn enrich_one_group<T: MetadataSource>(
                 conn,
                 &g.item_ids,
                 MetadataStatus::Unmatched,
-                Some("stored_id_404"),
+                Decision::Token("stored_id_404"),
             )?;
             stats.items_unmatched += g.item_ids.len();
         }
@@ -3918,7 +3987,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
         };
-        let wrote = apply_search_hit(&c, &[1], &meta).unwrap();
+        let wrote = apply_search_hit(&c, &[1], &meta, None).unwrap();
         assert!(
             !wrote,
             "episode-only id must not be accepted as an enrichable hit"
@@ -5231,8 +5300,13 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         one_item(&c);
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("no_episodes"))
-            .unwrap();
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Unmatched,
+            Decision::Token("no_episodes"),
+        )
+        .unwrap();
         assert_eq!(reasons(&c), vec![(1, Some("no_episodes".into()), None)]);
     }
 
@@ -5242,7 +5316,13 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         one_item(&c);
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Ready, Some("series_row")).unwrap();
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Ready,
+            Decision::Token("series_row"),
+        )
+        .unwrap();
         assert_eq!(reasons(&c), vec![(1, None, Some("series_row".into()))]);
     }
 
@@ -5255,14 +5335,29 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         one_item(&c);
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("no_match"))
-            .unwrap();
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Ready, Some("exact_title"))
-            .unwrap();
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Unmatched,
+            Decision::Token("no_match"),
+        )
+        .unwrap();
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Ready,
+            Decision::Token("exact_title"),
+        )
+        .unwrap();
         assert_eq!(reasons(&c), vec![(1, None, Some("exact_title".into()))]);
 
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("stored_id_404"))
-            .unwrap();
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Unmatched,
+            Decision::Token("stored_id_404"),
+        )
+        .unwrap();
         assert_eq!(reasons(&c), vec![(1, Some("stored_id_404".into()), None)]);
     }
 
@@ -5274,9 +5369,15 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         one_item(&c);
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Some("no_match"))
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Unmatched,
+            Decision::Token("no_match"),
+        )
+        .unwrap();
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, Decision::Uncomputed)
             .unwrap();
-        set_metadata_status_recording(&c, &[1], MetadataStatus::Unmatched, None).unwrap();
         assert_eq!(reasons(&c), vec![(1, None, None)]);
     }
 
@@ -5288,5 +5389,81 @@ mod tests {
         one_item(&c);
         set_metadata_status(&c, &[1], MetadataStatus::Ready).unwrap();
         assert_eq!(reasons(&c), vec![(1, None, None)]);
+    }
+
+    /// **The gap the shipped column had, asserted at the call site.**
+    ///
+    /// `apply_search_hit` is where the search tier commits the entity the
+    /// scorer chose. It previously set `Matched` through the plain writer, so
+    /// the route was computed, logged and dropped — and the twelve scorer
+    /// tokens had no producer at all. Every writer test passed, because the
+    /// writer was correct; what was missing was a caller.
+    #[test]
+    fn the_search_tier_records_the_route_that_chose_the_entity() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        let meta = CanonicalMetadata {
+            kind: MetadataKind::Movie,
+            title: "A".into(),
+            original_title: None,
+            year: Some(1999),
+            air_date: None,
+            plot: None,
+            genres: Vec::new(),
+            runtime_minutes: None,
+            cast: Vec::new(),
+            ratings: Vec::new(),
+            ids: crate::model::ProviderIds {
+                tmdb: Some(550),
+                tmdb_show: None,
+                imdb: None,
+                tvdb: None,
+            },
+            artwork: Vec::new(),
+            collection: None,
+            season: None,
+            episode: None,
+        };
+        let wrote = apply_search_hit(&c, &[1], &meta, Some("exact_title_year")).unwrap();
+        assert!(wrote);
+        assert_eq!(
+            reasons(&c),
+            vec![(1, None, Some("exact_title_year".into()))],
+            "the scorer's route reaches the column"
+        );
+    }
+
+    /// **Enrich must not overwrite it.** Resolving details for an id the search
+    /// tier already picked is not a second choice of entity, and reporting
+    /// `tmdb_id` there is what made the column answer "how did enrich resolve".
+    #[test]
+    fn enrich_by_stored_id_keeps_the_route_that_chose_the_entity() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        set_metadata_status_recording(
+            &c,
+            &[1],
+            MetadataStatus::Matched,
+            Decision::Token("exact_title_season_coverage"),
+        )
+        .unwrap();
+        set_metadata_status_recording(&c, &[1], MetadataStatus::Ready, Decision::KeepRoute)
+            .unwrap();
+        let got = reasons(&c);
+        assert_eq!(
+            got,
+            vec![(1, None, Some("exact_title_season_coverage".into()))],
+            "the chosen route survives enrich"
+        );
+        let status: String = c
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "ready", "and the status still moved");
     }
 }
