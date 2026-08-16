@@ -364,6 +364,34 @@ would have got there. **The prediction was not careless; it was
 unmeasurable** — which is the argument for deriving a token set from a bounded
 population rather than reasoning one out in advance.
 
+### Measured against a control, 2026-08-16
+
+Two byte-identical database copies, drained with a `main` binary and a branch
+binary on the same host in sequence.
+
+**Zero behaviour change.** Item statuses, item links, entity bindings, series
+rows, canonical rows and the negative cache are byte-identical across the two
+runs — 25,367 items, 27,088 canonical rows, every hash matching. Requests were
+10,485 against the control's 10,486: one fewer, so *no request was added*,
+though the counts are not identical and the difference is a non-deterministic
+provider interaction rather than a decision.
+
+**The classification agrees with an independent one, item by item.** A post-hoc
+classifier reconstructing the same questions from stored state — written
+separately, seeing links and canonical rows rather than the bind — agrees on
+**99 of 99** items and on the same set of item ids, not merely in aggregate.
+
+**The taxonomy held on a population it was not derived from.** The three tokens
+came from 117 cases. This run classified a different and larger population — 99
+uncaused items among 1,054 unmatched, with `below_threshold` at 944 rather than
+17 — and every item fell into one of the three. **Residue: 0.** That is stronger
+evidence of completeness than re-measuring the original population would have
+been, because the tokens had no opportunity to be fitted to it.
+
+Proportions move with the population, as they should: 40/34/26 on the original
+117, 38/31/30 on these 99. The counts in the table above describe the population
+they were measured on and are not constants.
+
 ### Unchanged
 
 Still diagnostic, never control flow. Nothing reads these tokens to decide what
