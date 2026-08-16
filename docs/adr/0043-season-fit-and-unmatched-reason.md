@@ -1,7 +1,8 @@
 # ADR-0043: Season fit as a candidate constraint, and a recorded unmatched reason
 
 - Status: **§1 (season fit) superseded before shipping — see Amendment
-  2026-08-12. §2 (unmatched reason) accepted and stands.**
+  2026-08-12. §2 (unmatched reason) accepted and stands; its bind-time token
+  list is amended by measurement 2026-08-16 — three of the five ship.**
 - Date: 2026-08-12
 - Depends on: ADR-0025 (item identity / path keys); ADR-0026 (§2 scoring
   floor, §8.4 terminal statuses); ADR-0028 (manual fix flow); ADR-0029
@@ -95,9 +96,9 @@ never two causes collapsed into one label:
 | ~~`no_season_fit`~~ | **struck 2026-08-15 — nothing can produce it. See the reconciliation below.** |
 | `season_out_of_range` | the scanned season does not exist on the bound show |
 | `episode_out_of_range` | the season exists; the scanned episode is beyond its episode count |
-| `episode_not_projected` | the season exists and holds the number, but no episode row was projected for it |
+| `episode_not_projected` | **not shipped — 0 instances in the measured population; kept as the residue bucket. See Amendment 2026-08-16.** the season exists and holds the number, but no episode row was projected for it |
 | `duplicate_slot` | another file in the folder already holds this season/episode |
-| `no_scanned_number` | the file has no parsed season/episode to resolve |
+| `no_scanned_number` | **not shipped — unreachable: a file with no parsed season never enters the bind. See Amendment 2026-08-16.** the file has no parsed season/episode to resolve |
 | `nfo_invalid` | NFO bytes present but unparseable |
 | `below_threshold` | best hit scored under the ADR-0026 floor |
 | `stored_id_404` | the stored provider id no longer resolves |
@@ -279,3 +280,120 @@ plumbing a value that already exists. Producing the bind-time reasons is
 deciding what the causes are and computing them, which is closer to designing a
 taxonomy than to adding a column. The build treats them as two steps and this
 record stops claiming they are one.
+
+## Amendment 2026-08-16 — the bind-time tokens, measured rather than predicted
+
+The step above called the bind-time reasons "closer to designing a taxonomy
+than to adding a column." That step is now built, and the taxonomy it produced
+is **not** the one §2 predicted. §2's list stays visible above; this is what
+ships.
+
+### Three tokens, and two that do not ship
+
+Every item that reaches `unmatched` with no computed cause was classified —
+**117 of them, the whole population rather than a sample**, since every other
+terminal state already records something and a fourth cause cannot be hiding
+elsewhere:
+
+| token | files | share of the uncaused population |
+|---|---:|---:|
+| `episode_out_of_range` | 47 | 40% |
+| `season_out_of_range` | 40 | 34% |
+| `duplicate_slot` | 30 | 26% |
+| `no_scanned_number` | **0** | — |
+| `episode_not_projected` | **0** | — |
+
+The three with instances are built. **The two without are not**, and their rows
+in §2's table stay as a record of what was assumed. A token with no instance is
+a guess about the shape of the failure, and §2's guesses were already wrong
+twice: `no_season_fit` had to be struck because nothing could produce it, and
+`no_episodes` had to be added because §2 never named it.
+
+`no_scanned_number` is not merely rare — it is *unreachable as written*. A file
+with no parsed season never enters the bind, so the code path that would emit
+it does not exist. It is not waiting for an instance; it was a cause of the
+wrong kind.
+
+### The order the questions are asked in is the taxonomy
+
+Season present on the entity → episode number present in that season → slot
+free. A file covering an episode range can fail differently on each number it
+covers; the classification takes the furthest-along answer, because that is the
+most specific true thing about the file.
+
+**A file that reaches the end records nothing.** That residue is
+`episode_not_projected`'s slot, kept reachable at zero on purpose. Before this
+slice a null meant *nothing computes this*; after it, a null means *a cause
+these three do not name* — a different claim, and the signal that a fourth
+cause has appeared. Adding the token then is cheap. Shipping it now, empty,
+would make the eventual instance indistinguishable from the 117 nulls it would
+have been sitting among.
+
+### `duplicate_slot` records the cause and decides nothing
+
+30 files — a quarter of the population — lose a slot another file already
+holds. Whether both should link (ADR-0025 §2 already permits several files per
+item) or one should win is a **product decision, and not this record's.** The
+bind keeps the last file per slot exactly as it did before; the loser now says
+why it lost. Recording a cause is not the same as endorsing the behaviour that
+produced it.
+
+### `season_out_of_range` is a second reader, not a second detection
+
+`BindStats::seasons_skipped` already counted exactly this fact — a folder
+season the bound entity has no season for. The token reads the same signal per
+file instead of computing it again. **This is the cheapest of the three for
+that reason, not because the cause is simpler.**
+
+### Why the taxonomy is derived and not predicted
+
+It took four attempts to settle, each more careful than the last:
+
+1. **§2's prediction**, written before any writer existed — five bind-time
+   tokens, two of which have no instances and one (`no_season_fit`) that
+   nothing could ever emit.
+2. **An enumeration from the code**, in the amendment above — correct that the
+   producers were missing, still silent on which causes were real.
+3. **An 80-case run**, which found two causes covering "99%" of the population.
+   The retry population was biased against `duplicate_slot`: 1 instance, where
+   the full population holds 30.
+4. **All 117 classified.** 47 / 40 / 30 — three real causes, no dominant pair.
+
+Only the fourth is right, and nothing short of measuring the whole population
+would have got there. **The prediction was not careless; it was
+unmeasurable** — which is the argument for deriving a token set from a bounded
+population rather than reasoning one out in advance.
+
+### Measured against a control, 2026-08-16
+
+Two byte-identical database copies, drained with a `main` binary and a branch
+binary on the same host in sequence.
+
+**Zero behaviour change.** Item statuses, item links, entity bindings, series
+rows, canonical rows and the negative cache are byte-identical across the two
+runs — 25,367 items, 27,088 canonical rows, every hash matching. Requests were
+10,485 against the control's 10,486: one fewer, so *no request was added*,
+though the counts are not identical and the difference is a non-deterministic
+provider interaction rather than a decision.
+
+**The classification agrees with an independent one, item by item.** A post-hoc
+classifier reconstructing the same questions from stored state — written
+separately, seeing links and canonical rows rather than the bind — agrees on
+**99 of 99** items and on the same set of item ids, not merely in aggregate.
+
+**The taxonomy held on a population it was not derived from.** The three tokens
+came from 117 cases. This run classified a different and larger population — 99
+uncaused items among 1,054 unmatched, with `below_threshold` at 944 rather than
+17 — and every item fell into one of the three. **Residue: 0.** That is stronger
+evidence of completeness than re-measuring the original population would have
+been, because the tokens had no opportunity to be fitted to it.
+
+Proportions move with the population, as they should: 40/34/26 on the original
+117, 38/31/30 on these 99. The counts in the table above describe the population
+they were measured on and are not constants.
+
+### Unchanged
+
+Still diagnostic, never control flow. Nothing reads these tokens to decide what
+happens next; no binding, status or provider request changes because of this
+amendment.

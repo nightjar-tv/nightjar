@@ -495,6 +495,51 @@ pub struct DrainStats {
     pub bind_errors: usize,
 }
 
+/// Why a file in a folder whose entity resolved received no episode link.
+///
+/// **Three tokens, each with a measured instance behind it.** ADR-0043 §2
+/// predicted five bind-time reasons before any writer existed; classifying all
+/// 117 items that reach `unmatched` with no computed cause found instances of
+/// three and none of the other two. `no_scanned_number` and
+/// `episode_not_projected` are deliberately absent rather than shipped empty —
+/// a token with no instance is a guess, and §2's guesses were wrong twice.
+///
+/// **The variant order is load-bearing.** It is the order the bind asks the
+/// questions in — season present? episode present? slot free? — and a file
+/// covering an episode range can fail differently on each number it covers.
+/// The derived `Ord` picks the furthest-along answer, which is the most
+/// specific true thing about the file.
+///
+/// A file that reaches the end of the ordering records **nothing**. That
+/// residue is the empty bucket that keeps the taxonomy honest: a null after
+/// this means *a cause these three do not name*, which is a different claim
+/// from today's null and is the signal a fourth cause has appeared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UnplacedCause {
+    /// The folder's season is absent from the bound entity entirely — the
+    /// season fetch returned nothing. Same fact `BindStats::seasons_skipped`
+    /// counts; this is a second reader of it, not a second detection.
+    SeasonOutOfRange,
+    /// The season exists and was projected; this episode number is beyond
+    /// what it holds.
+    EpisodeOutOfRange,
+    /// The slot exists and another file in the same folder already holds it.
+    /// Records the cause and decides nothing — which file wins is ADR-0025's
+    /// question, and `by_se` keeps the last as it always has.
+    DuplicateSlot,
+}
+
+impl UnplacedCause {
+    /// The stored token. Closed set, like `metadata_negative_cache.reason`.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::SeasonOutOfRange => "season_out_of_range",
+            Self::EpisodeOutOfRange => "episode_out_of_range",
+            Self::DuplicateSlot => "duplicate_slot",
+        }
+    }
+}
+
 /// Counters from one [`bind_resolved_items`] call.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BindStats {
@@ -894,11 +939,31 @@ pub fn bind_resolved_items<T: MetadataSource>(
     item_ids: &[i64],
     metadata: &CanonicalMetadata,
 ) -> Result<BindStats, String> {
+    bind_resolved_items_classified(conn, resolver, item_ids, metadata).map(|(stats, _)| stats)
+}
+
+/// [`bind_resolved_items`], and why each file that received no link went
+/// unplaced (ADR-0043 §2 as amended 2026-08-16).
+///
+/// **The classification runs where the bind already knows.** Every fact it
+/// needs — which seasons the entity returned, which episode numbers it
+/// projected, which file holds which slot — is already in hand here. Deriving
+/// the same answers from stored state afterwards would be a second
+/// implementation of the bind, free to disagree with it.
+///
+/// Diagnostic only: this changes no binding, no status and no request.
+pub fn bind_resolved_items_classified<T: MetadataSource>(
+    conn: &Connection,
+    resolver: &Resolver<T>,
+    item_ids: &[i64],
+    metadata: &CanonicalMetadata,
+) -> Result<(BindStats, HashMap<i64, UnplacedCause>), String> {
     let mut stats = BindStats::default();
+    let mut unplaced: HashMap<i64, UnplacedCause> = HashMap::new();
     match metadata.kind {
         MetadataKind::Movie => {
             let Some(key) = item_key_for_metadata(metadata) else {
-                return Ok(stats);
+                return Ok((stats, unplaced));
             };
             let tx = conn
                 .unchecked_transaction()
@@ -908,17 +973,20 @@ pub fn bind_resolved_items<T: MetadataSource>(
                 stats.files_linked += 1;
             }
             tx.commit().map_err(|e| format!("commit movie bind: {e}"))?;
-            Ok(stats)
+            Ok((stats, unplaced))
         }
         MetadataKind::Show | MetadataKind::Episode => {
             let Some(show_id) = metadata.ids.tmdb.or(metadata.ids.tmdb_show) else {
-                return Ok(stats);
+                return Ok((stats, unplaced));
             };
             let rows = episode_slots(conn, item_ids)?;
             let seasons: std::collections::HashSet<i32> =
                 rows.iter().filter_map(|r| r.season).collect();
             if seasons.is_empty() {
-                return Ok(stats);
+                // Every file parsed no season number. That is §2's
+                // `no_scanned_number`, which measured zero instances — so it
+                // is residue and records nothing, not a token shipped empty.
+                return Ok((stats, unplaced));
             }
             // One file may cover several episode numbers (ADR-0025 §2 range).
             let mut by_se: std::collections::HashMap<(i32, i32), i64> =
@@ -928,6 +996,13 @@ pub fn bind_resolved_items<T: MetadataSource>(
                     by_se.insert((s, e), row.id);
                 }
             }
+            // What the bind learns as it goes, kept for the classification
+            // below. Not a second lookup — the same values, retained.
+            let mut seasons_absent: std::collections::HashSet<i32> =
+                std::collections::HashSet::new();
+            let mut projected: std::collections::HashSet<(i32, i32)> =
+                std::collections::HashSet::new();
+            let mut linked: std::collections::HashSet<i64> = std::collections::HashSet::new();
             for sn in seasons {
                 let Some(raw) = resolver
                     .tmdb
@@ -936,6 +1011,7 @@ pub fn bind_resolved_items<T: MetadataSource>(
                 else {
                     // Stub, or TMDB 404 for this season number — skip and try others.
                     stats.seasons_skipped += 1;
+                    seasons_absent.insert(sn);
                     continue;
                 };
                 stats.seasons_fetched += 1;
@@ -947,6 +1023,7 @@ pub fn bind_resolved_items<T: MetadataSource>(
                     let (Some(s), Some(e)) = (ep.season, ep.episode) else {
                         continue;
                     };
+                    projected.insert((s, e));
                     let Some(media_id) = by_se.get(&(s, e)) else {
                         continue;
                     };
@@ -961,11 +1038,36 @@ pub fn bind_resolved_items<T: MetadataSource>(
                 for (media_id, keys) in &keys_by_media {
                     item_links::replace_auto_links(&tx, *media_id, keys)?;
                     stats.files_linked += 1;
+                    linked.insert(*media_id);
                 }
                 tx.commit()
                     .map_err(|e| format!("commit episode bind: {e}"))?;
             }
-            Ok(stats)
+            for row in &rows {
+                if linked.contains(&row.id) {
+                    continue;
+                }
+                let mut cause: Option<UnplacedCause> = None;
+                for (s, e) in row.season_episodes() {
+                    let this = if seasons_absent.contains(&s) {
+                        UnplacedCause::SeasonOutOfRange
+                    } else if !projected.contains(&(s, e)) {
+                        UnplacedCause::EpisodeOutOfRange
+                    } else if by_se.get(&(s, e)) != Some(&row.id) {
+                        UnplacedCause::DuplicateSlot
+                    } else {
+                        // The slot projected, this file holds it, and still no
+                        // link was written. None of the three names that, so
+                        // record nothing — the residue is the signal.
+                        continue;
+                    };
+                    cause = Some(cause.map_or(this, |prev| prev.max(this)));
+                }
+                if let Some(cause) = cause {
+                    unplaced.insert(row.id, cause);
+                }
+            }
+            Ok((stats, unplaced))
         }
     }
 }
@@ -1907,9 +2009,15 @@ fn enrich_one_group<T: MetadataSource>(
             };
 
             eprintln!("  enrich {} → tmdb:{tmdb_id} (detail+bind)", g.title);
-            let bind_complete = match bind_resolved_items(conn, resolver, &g.item_ids, &final_meta)
-            {
-                Ok(b) => {
+            let mut unplaced: HashMap<i64, UnplacedCause> = HashMap::new();
+            let bind_complete = match bind_resolved_items_classified(
+                conn,
+                resolver,
+                &g.item_ids,
+                &final_meta,
+            ) {
+                Ok((b, why)) => {
+                    unplaced = why;
                     stats.seasons_fetched += b.seasons_fetched;
                     stats.episodes_projected += b.episodes_projected;
                     stats.files_linked += b.files_linked;
@@ -2015,17 +2123,41 @@ fn enrich_one_group<T: MetadataSource>(
                             g.title,
                             unbound.len()
                         );
-                        // Layer 2 (ADR-0043, 2026-08-15 amendment): nothing
-                        // computes *why* this item went unlinked — the status
-                        // is a set difference. `None` records that honestly
-                        // rather than inventing a cause the code does not
-                        // distinguish.
-                        set_metadata_status_recording(
-                            conn,
-                            &unbound,
-                            MetadataStatus::Unmatched,
-                            Decision::Uncomputed,
-                        )?;
+                        // Layer 2 (ADR-0043 §2, as amended 2026-08-15): the
+                        // status is still a set difference, but the bind now
+                        // says why each file fell out of it. Items the bind
+                        // did not classify keep `Uncomputed` — after this
+                        // slice that null means *a cause the three tokens do
+                        // not name*, not "nothing computes this".
+                        let mut residue: Vec<i64> = Vec::new();
+                        let mut by_cause: HashMap<UnplacedCause, Vec<i64>> = HashMap::new();
+                        for id in &unbound {
+                            match unplaced.get(id) {
+                                Some(cause) => by_cause.entry(*cause).or_default().push(*id),
+                                None => residue.push(*id),
+                            }
+                        }
+                        for (cause, ids) in &by_cause {
+                            eprintln!("    {} — {} file(s)", cause.token(), ids.len());
+                            set_metadata_status_recording(
+                                conn,
+                                ids,
+                                MetadataStatus::Unmatched,
+                                Decision::Token(cause.token()),
+                            )?;
+                        }
+                        if !residue.is_empty() {
+                            eprintln!(
+                                "    unclassified — {} file(s) unplaced for a cause the bind-time tokens do not name",
+                                residue.len()
+                            );
+                            set_metadata_status_recording(
+                                conn,
+                                &residue,
+                                MetadataStatus::Unmatched,
+                                Decision::Uncomputed,
+                            )?;
+                        }
                         stats.items_unmatched += unbound.len();
                     }
                     // bind_complete == false: the bind provider error is a
@@ -2655,6 +2787,165 @@ mod tests {
             )
             .unwrap();
         assert_eq!(s5_link, "tmdb:show:77");
+        // ADR-0043 §2 as amended: the same fact `seasons_skipped` counted, now
+        // readable per file. One signal, two consumers.
+        let s5_reason: Option<String> = c
+            .query_row(
+                "SELECT metadata_unmatched_reason FROM media_items WHERE season = 5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s5_reason.as_deref(), Some("season_out_of_range"));
+    }
+
+    /// The season exists and was projected; this number is past its end.
+    /// Distinct from `season_out_of_range` — the entity is right, the season
+    /// is right, and only the episode number is not there.
+    #[test]
+    fn unplaced_records_episode_out_of_range_when_the_season_projected() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Beta/Season 01/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1),
+               (1, 'Beta/Season 01/Beta.S01E09.mkv', 1, 1, 'Beta', 'episode', 1, 9);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: PartialSeasonSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 1);
+        assert_eq!(s.items_unmatched, 1);
+        assert_eq!(
+            s.seasons_skipped, 0,
+            "the season was fetched — this is not the season-absent case"
+        );
+        let reason: Option<String> = c
+            .query_row(
+                "SELECT metadata_unmatched_reason FROM media_items WHERE episode = 9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("episode_out_of_range"));
+    }
+
+    /// Two files, one slot. The loser records the cause; **which file wins is
+    /// not this slice's decision** (ADR-0025 §2) and the winner is untouched.
+    #[test]
+    fn unplaced_records_duplicate_slot_and_leaves_the_winner_alone() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Beta/Season 01/Beta.S01E01.1080p.mkv', 1, 1, 'Beta', 'episode', 1, 1),
+               (1, 'Beta/Season 01/Beta.S01E01.720p.mkv', 1, 1, 'Beta', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: PartialSeasonSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 1);
+        assert_eq!(s.items_unmatched, 1);
+
+        let winner: (String, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT metadata_status, metadata_unmatched_reason, metadata_match_method
+                 FROM media_items WHERE metadata_status = 'ready'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(winner.0, "ready");
+        assert_eq!(winner.1, None, "the winner carries no failure reason");
+        let loser: Option<String> = c
+            .query_row(
+                "SELECT metadata_unmatched_reason FROM media_items
+                 WHERE metadata_status = 'unmatched'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loser.as_deref(), Some("duplicate_slot"));
+        // The loser keeps its show link and loses only the episode slot.
+        let loser_ep: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links l
+                 JOIN media_items m ON m.id = l.media_item_id
+                 WHERE m.metadata_status = 'unmatched'
+                   AND l.item_key LIKE 'tmdb:episode:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loser_ep, 0);
+    }
+
+    /// The residue. A file the bind cannot place for any of the three reasons
+    /// records **nothing** rather than a fallback label — §2's
+    /// `no_scanned_number` measured zero instances and is not a shipped token.
+    ///
+    /// This is the check that keeps the taxonomy honest: a null here means *a
+    /// cause the three do not name*, which is what makes a future non-zero
+    /// count a signal instead of noise.
+    #[test]
+    fn unplaced_records_nothing_when_no_token_names_the_cause() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Beta/Season 01/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1),
+               (1, 'Beta/Season 01/Beta.extras.mkv', 1, 1, 'Beta', 'episode', 1, NULL);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: PartialSeasonSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 1);
+        assert_eq!(s.items_unmatched, 1);
+        // Status and reason read together: a null reason on a row that was
+        // never written would pass this test for the wrong reason.
+        let (status, reason): (String, Option<String>) = c
+            .query_row(
+                "SELECT metadata_status, metadata_unmatched_reason FROM media_items
+                 WHERE episode IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "unmatched");
+        assert_eq!(
+            reason, None,
+            "no token names this, so none is invented — the null is the record"
+        );
     }
 
     #[test]
