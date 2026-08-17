@@ -268,8 +268,37 @@ impl TmdbClient {
     ) -> Result<Option<MatchCandidate>, ResolveError> {
         let results = self.search(kind, title)?;
         if !needs_collision_detail(&results, title, year, kind, library.clone()) {
-            return Ok(score_search_with_shape(
-                &results, title, year, kind, library, None,
+            // A search that returned **no** title-exact hit has nothing for the
+            // ladder to choose among, and `needs_collision_detail` — a test
+            // about collisions — declines to fetch, so there is no evidence
+            // either. That is the one case where the absence is the problem
+            // rather than an economy: measured library-wide, 428 of the 432
+            // folders that get no detail are sole *exact* hits already clearing
+            // the floor, and only **4** have no exact hit at all.
+            //
+            // One detail call for those four. The seasons ride along on it as
+            // everywhere else.
+            let nk_probe = norm_key(title);
+            let has_exact = results
+                .iter()
+                .any(|r| crate::match_score::title_hit(r, &nk_probe, kind));
+            let sole = if kind == SearchKind::Tv
+                && !has_exact
+                && library.ref_episode_title.is_some()
+                && let Some(top1) = results.first()
+            {
+                self.tv_candidate_shape(top1, library.ref_season).ok()
+            } else {
+                None
+            };
+            return Ok(crate::match_score::score_search_with_shape_and_sole(
+                &results,
+                title,
+                year,
+                kind,
+                library,
+                None,
+                sole.as_ref(),
             ));
         }
         let nk = norm_key(title);
