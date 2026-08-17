@@ -493,6 +493,18 @@ pub struct DrainStats {
     pub seasons_skipped: usize,
     /// Bind failures (logged; items may still be marked ready).
     pub bind_errors: usize,
+    /// Libraries skipped because their root is not reachable (ADR-0014).
+    ///
+    /// **A drain over missing media is indistinguishable from a drain over a
+    /// library with no NFOs** — both report `errors = 0` and a plausible
+    /// status distribution. Measured 2026-08-17: the same database drained with
+    /// its media absent gave 1,054 unmatched against 155, with every NFO route
+    /// silently replaced by title search. These two counters are what make that
+    /// run identifiable after the fact instead of looking like a bad matching
+    /// day.
+    pub libraries_unreachable: usize,
+    /// Items left `pending` because their library was skipped.
+    pub items_in_unreachable: usize,
 }
 
 /// Why a file in a folder whose entity resolved received no episode link.
@@ -619,11 +631,14 @@ fn status_query_groups(
 
     let mut stmt = conn
         .prepare(
+            // `l.reachable = 1` is the whole of the reachability gate: a
+            // library whose root is gone contributes no groups, so nothing in
+            // it is resolved from evidence that is not there (ADR-0014).
             "SELECT m.id, m.kind, m.title, m.year, m.path, m.season, m.episode,
                     l.id as library_id, l.path
              FROM media_items m
              JOIN libraries l ON l.id = m.library_id
-             WHERE m.metadata_status = ?1
+             WHERE m.metadata_status = ?1 AND l.reachable = 1
              ORDER BY m.id DESC",
         )
         .map_err(|e| format!("prepare status groups: {e}"))?;
@@ -1596,6 +1611,55 @@ pub fn drain_pending<T: MetadataSource>(
         predicted_secs: T_FIRST_SCREEN_PREDICTED_SECS * (proxy.units.len() as f64 / 80.0),
         ..DrainStats::default()
     };
+
+    // ADR-0014: a library whose root is unreachable is skipped, not resolved
+    // from whatever evidence survives. `request_scan` already refuses with
+    // "library path is not reachable"; the drain had no equivalent and would
+    // read no NFO, resolve by title search instead, and report `errors = 0`.
+    //
+    // **Refuse rather than degrade.** Items stay `pending`, which is the
+    // honest state for "not attempted" and is what the next drain retries;
+    // resolving them against a library that is not there produces terminal
+    // statuses derived from absent evidence.
+    //
+    // This reads `libraries.reachable`, the record the scanner already
+    // maintains, rather than probing the path here — Rule 4.11, and a probe in
+    // this path would need its own timeout for a hung network mount.
+    let unreachable: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM libraries WHERE reachable = 0")
+            .map_err(|e| format!("prepare reachability: {e}"))?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| format!("query reachability: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("reachability row: {e}"))?;
+        ids
+    };
+    if !unreachable.is_empty() {
+        stats.libraries_unreachable = unreachable.len();
+        for id in &unreachable {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM media_items
+                      WHERE library_id = ?1 AND metadata_status = 'pending'",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            stats.items_in_unreachable += n as usize;
+            let path: String = conn
+                .query_row(
+                    "SELECT path FROM libraries WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            eprintln!(
+                "  skipping library {id} — path is not reachable: {path} ({n} item(s) left pending)"
+            );
+        }
+    }
 
     let mut unit_has_poster: HashMap<String, bool> = HashMap::new();
     for u in &proxy.units {
@@ -2717,6 +2781,77 @@ mod tests {
                 payload: payload.into(),
             }))
         }
+    }
+
+    /// A library whose root is unreachable contributes no groups, and its
+    /// items stay `pending` rather than acquiring a terminal status derived
+    /// from evidence that is not there.
+    ///
+    /// Measured motivation: the same database drained with its media absent
+    /// reported 1,054 unmatched against 155, `errors = 0` either way, because
+    /// no NFO could be read and every folder fell through to title search.
+    #[test]
+    fn drain_skips_unreachable_libraries_and_leaves_them_pending() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO libraries (name, path, kind) VALUES ('Gone', '/tmp/Gone', 'shows');
+             UPDATE libraries SET reachable = 0 WHERE name = 'Gone';
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Beta/Season 01/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1),
+               (2, 'Beta/Season 01/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: PartialSeasonSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.libraries_unreachable, 1);
+        assert_eq!(s.items_in_unreachable, 1);
+
+        let reachable_status: String = c
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE library_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            reachable_status, "pending",
+            "the reachable library is drained as usual"
+        );
+        let gone_status: String = c
+            .query_row(
+                "SELECT metadata_status FROM media_items WHERE library_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gone_status, "pending",
+            "not attempted is the honest state; the next drain retries it"
+        );
+        let gone_links: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM media_item_links l
+                 JOIN media_items m ON m.id = l.media_item_id
+                 WHERE m.library_id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gone_links, 0,
+            "nothing is bound from a library that is not there"
+        );
     }
 
     #[test]
