@@ -238,6 +238,20 @@ a relationship graph.
 - ADR-0035 item 8's canonical ordering gains an exception for multi-entity
   folders, stated in item 3(a). It is the one place a shipped rule forks, and
   it forks on a folder property rather than per request.
+- **The bindings are coupled to `series` by `ON DELETE CASCADE`, so deleting a
+  `series` row discards every binding for that folder — the primary included.**
+  Recorded here as a consequence rather than only in migration 021, because the
+  obvious implementation of a future "re-match this library" or "reset provider
+  identity" feature is `DELETE FROM series`, and that would silently undo this
+  ADR's whole effect for every folder it touches. No shipped code does this
+  today. Whoever adds a delete path owns the decision about these rows; the
+  cascade is not a default anyone should inherit unexamined.
+
+  Observed 2026-08-16 in an ops harness that clears `series` to force a
+  re-match: all five of the dogfood library's bindings were destroyed before the
+  run measured a library that then had none, so the run could not have shown
+  multi-entity binding working and would have reported its absence as a matching
+  failure (issue #132).
 - ADR-0037's certification stays per item along the entity edge; no
   folder-level tie-break is introduced, because the unit does not need one.
 - The empty-shell exclusion (ADR-0026, amended 2026-08-13) already prevents a

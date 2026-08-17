@@ -13,6 +13,24 @@
 -- The primary binding is a row here too, so there is one shape rather than a
 -- special case for the first entity.
 --
+-- **Deleting a `series` row discards every binding for that folder, including
+-- the primary.** That follows from the cascade below and is stated here because
+-- it is not obvious from either table on its own, and because the obvious
+-- implementation of any future "re-match this library" or "reset provider
+-- identity" feature is `DELETE FROM series`, which would take the bindings with
+-- it silently and with nothing in the log.
+--
+-- Observed 2026-08-16: an ops drain harness that clears `series` to force a
+-- re-match destroyed all five of the dogfood library's bindings — Will & Grace,
+-- What If…!, The Continental, Monster, Battlestar Galactica — before measuring
+-- a library that then had none. A run of that shape cannot show multi-entity
+-- binding working and reports its absence as a matching failure.
+--
+-- The cascade itself is deliberately left as it is: no shipped code deletes
+-- `series`, and changing a foreign key in SQLite is a table rebuild, which is
+-- disproportionate to a hazard with no live trigger. If a delete path is ever
+-- added, it owns the decision about what happens to these rows.
+--
 -- **Season ranges: NULL means unbounded, not unknown.** A primary row backfilled
 -- from an existing `series` row is NULL on all four columns, which reads as
 -- "covers every folder season, numbering unchanged" — precisely today's
