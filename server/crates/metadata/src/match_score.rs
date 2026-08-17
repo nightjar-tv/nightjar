@@ -223,6 +223,35 @@ pub fn map_unplaced_to_candidate_seasons(
     })
 }
 
+/// Whether episode titles endorse the sole candidate the search returned, when
+/// **no** candidate matched by title.
+///
+/// Separate from [`confirmation_beats_pick`] and deliberately so. That function
+/// chooses *among* exact candidates and indexes `shapes` by position in the
+/// exact set; there is no position for a candidate that is not in it. Widening
+/// `shapes` to sometimes mean something else would make one parameter carry two
+/// meanings, which is the defect this codebase keeps finding.
+///
+/// **This can only vouch, never select.** With one candidate there is nothing
+/// to disambiguate, so `Agree` says the lone option is consistent with the
+/// folder — not that it was chosen over alternatives. The failure mode is
+/// endorsing the only candidate when the right answer was never returned, which
+/// is `Monster (2022)`'s shape.
+///
+/// Measured 2026-08-18 across 430 folders that already resolve: **no** folder
+/// with a non-exact top-1 has episode titles agreeing with it, so this cannot
+/// move a correct binding on that evidence. Where the top-1 *is* exact, titles
+/// endorse the ladder's own answer 369 times.
+fn sole_candidate_confirmed(
+    top1_shape: Option<&CandidateShape>,
+    library: &LibrarySeriesShape,
+    show_soft_key: &str,
+) -> bool {
+    top1_shape
+        .map(|sh| candidate_confirms_reference_episode(sh, library, show_soft_key) == Some(true))
+        .unwrap_or(false)
+}
+
 /// Episode-title confirmation as **promotion evidence, never a penalty.**
 ///
 /// Same discipline as the season-coverage promotion it sits beside: it only
@@ -902,6 +931,27 @@ pub fn score_search_with_shape(
     // year pin still works from search first_air_date.
     candidate_shapes: Option<&[CandidateShape]>,
 ) -> Option<MatchCandidate> {
+    score_search_with_shape_and_sole(results, title, year, kind, library, candidate_shapes, None)
+}
+
+/// [`score_search_with_shape`], plus the detail of the **top-1 result** when the
+/// search returned no title-exact hit at all.
+///
+/// A separate parameter rather than an extra entry in `candidate_shapes`:
+/// that slice is positional over the exact set and every consumer indexes it
+/// that way, so a candidate outside the set has no position in it. One
+/// parameter carrying two meanings depending on whether another is empty is
+/// exactly the collapse this codebase keeps finding — `series_row` merging two
+/// routes, a token absorbing five, truncation indistinguishable from absence.
+pub fn score_search_with_shape_and_sole(
+    results: &[SearchHit],
+    title: &str,
+    year: Option<i32>,
+    kind: SearchKind,
+    library: LibrarySeriesShape,
+    candidate_shapes: Option<&[CandidateShape]>,
+    sole_shape: Option<&CandidateShape>,
+) -> Option<MatchCandidate> {
     if results.is_empty() {
         return None;
     }
@@ -1020,6 +1070,13 @@ pub fn score_search_with_shape(
             f64::max(conf, 0.90),
             "exact_title_episode_confirmed",
         ),
+        // No candidate matched by title, so there was nothing for the ladder to
+        // choose among and nothing for confirmation to redirect to. Episode
+        // titles can still say whether the sole candidate is consistent with
+        // the folder. It vouches; it does not select.
+        None if exact.is_empty() && sole_candidate_confirmed(sole_shape, &library, title) => {
+            (hit, f64::max(conf, 0.90), "exact_title_episode_confirmed")
+        }
         None => (hit, conf, method),
     };
 
@@ -1922,6 +1979,73 @@ mod tests {
         assert_eq!(c.tmdb_id, 1);
         assert_eq!(c.method, "exact_title_episode_confirmed");
         assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// **The sole-candidate path.** No title-exact hit at all, so the ladder
+    /// falls to `top1_rank` below the floor and confirmation has nothing to
+    /// redirect to. Episode titles vouch for the one candidate there is.
+    #[test]
+    fn sole_non_exact_candidate_confirmed_by_episode_title() {
+        // Genuinely non-matching name: `norm_key` folds punctuation, so a
+        // near-spelling of the query would be an *exact* hit and take the other
+        // path. This is the real shape — the search returned something adjacent.
+        let hits = vec![tv(1, "Adventures of the Mutant Team", 1992)];
+        let sole = shape_eps(1992, &[1], &[(2, "A Real Episode Title")]);
+        let c = score_search_with_shape_and_sole(
+            &hits,
+            "x men the animated series",
+            None,
+            SearchKind::Tv,
+            lib_with_ref(1992, &[1], "A Real Episode Title"),
+            None,
+            Some(&sole),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1);
+        assert_eq!(c.method, "exact_title_episode_confirmed");
+        assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// It vouches; it never selects. With the titles disagreeing, the sole
+    /// candidate stays exactly where the ladder left it — below the floor.
+    #[test]
+    fn sole_candidate_without_title_agreement_is_left_below_the_floor() {
+        let hits = vec![tv(1, "Adventures of the Mutant Team", 1992)];
+        let sole = shape_eps(1992, &[1], &[(2, "Something Entirely Different")]);
+        let c = score_search_with_shape_and_sole(
+            &hits,
+            "x men the animated series",
+            None,
+            SearchKind::Tv,
+            lib_with_ref(1992, &[1], "A Real Episode Title"),
+            None,
+            Some(&sole),
+        )
+        .expect("a candidate");
+        assert_eq!(c.method, "top1_rank");
+        assert!(!meets_auto_match_floor(c.confidence));
+    }
+
+    /// And it must not reach a folder that *did* have exact hits — that path
+    /// is `confirmation_beats_pick`'s, and letting both fire would give one
+    /// token two routes.
+    #[test]
+    fn sole_candidate_path_does_not_fire_when_exact_hits_exist() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let shapes = [shape(2004, &[1]), shape(2003, &[1])];
+        let sole = shape_eps(2004, &[1], &[(2, "A Real Episode Title")]);
+        let c = score_search_with_shape_and_sole(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            Some(&shapes),
+            Some(&sole),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2, "the year pin stands");
+        assert_eq!(c.method, "exact_title_year");
     }
 
     /// Grand Designs in miniature: a yearless folder, several exact hits, and
