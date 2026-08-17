@@ -283,6 +283,47 @@ pub fn candidate_covers_folder_seasons(
     Some(folder_seasons.iter().all(|want| have.contains(want)))
 }
 
+/// The one exact candidate that can hold every season the folder asserts, if
+/// there is exactly one.
+///
+/// [`coverage_beats_year`] asks the same question but only ever runs inside the
+/// year-matched branch, so a folder carrying no year never reaches it.
+/// `Grand Designs` is the case: eight exact hits, `folder_seasons`
+/// `[8,10,24,25,26,27]`, and only `1831` holds season 27 — every regional
+/// variant stops at 12, 10, 3, 2 or 1. It landed unpinned at 0.72 with the
+/// discriminator computed and unconsulted.
+///
+/// **Exactly one, or nothing.** Two coverers mean the evidence does not
+/// discriminate: `star trek`, `doctor who` and `pride and prejudice` each have
+/// eight, and pinning those would be worse than pinning none. A non-coverer is
+/// never evidence *against* a candidate, only the absence of a reason to prefer
+/// it — the same one-directional contract the predicate already carries.
+///
+/// Measured 2026-08-18 over the snapshot, no provider calls: 8 folders below
+/// the floor gain a sole coverer, 120 folders that already resolve have one and
+/// **none of them differs from the binding they already have**, and 145 have
+/// several and stay unpinned.
+fn sole_season_coverer<'a>(
+    exact: &[&'a SearchHit],
+    shapes: &[CandidateShape],
+    folder_seasons: &[i32],
+) -> Option<&'a SearchHit> {
+    if folder_seasons.is_empty() || shapes.len() != exact.len() {
+        return None;
+    }
+    let mut winner: Option<&SearchHit> = None;
+    for (i, h) in exact.iter().enumerate() {
+        // `None` is an unfetched season list: no evidence, never a verdict.
+        if candidate_covers_folder_seasons(&shapes[i], folder_seasons) == Some(true) {
+            if winner.is_some() {
+                return None;
+            }
+            winner = Some(h);
+        }
+    }
+    winner
+}
+
 /// Season coverage as **promotion evidence for the year pin, never a gate.**
 ///
 /// The year selected a candidate that cannot hold the folder — the folder says
@@ -944,6 +985,11 @@ pub fn score_search_with_shape(
             }
         } else if let Some((hit, method)) = pin_collision(&exact, shapes, library.clone()) {
             (hit, 0.90, method)
+        } else if let Some(hit) = sole_season_coverer(&exact, shapes, &library.folder_seasons) {
+            // Only after `pin_collision` declines, so no folder that pins today
+            // is re-attributed. This reaches exactly the folders that were
+            // landing at 0.72 with the answer already computed.
+            (hit, 0.90, "exact_title_season_coverage")
         } else {
             // Prefer first non-empty candidate for the unpinned method payload,
             // but stay below floor.
@@ -1876,6 +1922,104 @@ mod tests {
         assert_eq!(c.tmdb_id, 1);
         assert_eq!(c.method, "exact_title_episode_confirmed");
         assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// Grand Designs in miniature: a yearless folder, several exact hits, and
+    /// only one candidate able to hold the seasons the folder asserts.
+    #[test]
+    fn sole_season_coverer_pins_a_yearless_collision() {
+        let hits = vec![tv(1, "Grand Designs", 1999), tv(2, "Grand Designs", 2015)];
+        // Mirrors the real Grand Designs: no count matches on either side, so
+        // both count pins decline and coverage is the only discriminator left.
+        // 47 files across 2 distinct seasons; candidates hold 259 episodes over
+        // 27 seasons and 74 over 10.
+        let mut a = shape(1999, &[1, 2, 3, 24]);
+        let mut b = shape(2015, &[1, 2, 3]);
+        a.episode_count = Some(259);
+        a.season_count = Some(27);
+        b.episode_count = Some(74);
+        b.season_count = Some(10);
+        let shapes = [a, b];
+        let library = LibrarySeriesShape {
+            year: None,
+            folder_seasons: vec![1, 24],
+            episode_count: Some(47),
+            season_count: Some(2),
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Grand Designs",
+            None,
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1, "only candidate 1 holds season 24");
+        assert_eq!(c.method, "exact_title_season_coverage");
+        assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// Two coverers decline. `star trek`, `doctor who` and `pride and prejudice`
+    /// each have eight in the measured library, and pinning those would be
+    /// worse than pinning none.
+    #[test]
+    fn two_season_coverers_leave_the_collision_unpinned() {
+        let hits = vec![tv(1, "Test Show", 1999), tv(2, "Test Show", 2015)];
+        let shapes = [shape(1999, &[1, 2, 3]), shape(2015, &[1, 2, 3])];
+        let library = LibrarySeriesShape {
+            year: None,
+            folder_seasons: vec![1, 2],
+            episode_count: Some(47),
+            season_count: Some(2),
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            None,
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.method, "exact_title_collision_unpinned");
+        assert!(!meets_auto_match_floor(c.confidence));
+    }
+
+    /// A folder that already pins by count keeps that route — coverage is
+    /// consulted only where `pin_collision` declines, so nothing is
+    /// re-attributed.
+    #[test]
+    fn coverage_does_not_reattribute_a_count_pin() {
+        let hits = vec![tv(1, "Test Show", 1999), tv(2, "Test Show", 2015)];
+        let mut a = shape(1999, &[1, 2, 3]);
+        let mut b = shape(2015, &[1, 2, 3, 4]);
+        a.episode_count = Some(47);
+        b.episode_count = Some(200);
+        let shapes = [a, b];
+        let library = LibrarySeriesShape {
+            year: None,
+            folder_seasons: vec![1, 2],
+            episode_count: Some(47),
+            season_count: Some(2),
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            None,
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1);
+        assert_eq!(
+            c.method, "exact_title_episode_count",
+            "the count pin still owns it"
+        );
     }
 
     /// Confirmation absent: the year pin holds, unchanged and undemoted.
