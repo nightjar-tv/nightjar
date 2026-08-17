@@ -2227,6 +2227,14 @@ fn episode_bound_ids(conn: &Connection, item_ids: &[i64]) -> Result<Vec<i64>, St
 /// through to a different file, which is the existing contract (autopsy D5) and
 /// the reason this is not "first that parses".
 ///
+/// **That contract is about this candidate list, not about resolution.** A
+/// corrupt NFO ends the *cascade over NFO files*; it does not end the resolve.
+/// Search still runs — the same search a folder with no NFO would get — and the
+/// parse failure is reported only if that search also fails. The distinction
+/// was worth writing down because this comment was read as authorising the
+/// stronger behaviour, and 890 files in one measured run were terminal
+/// `unmatched` on filenames that would have matched.
+///
 /// - **Movie:** `<stem>.nfo`, then `<dir>/movie.nfo`, then
 ///   `<dir>/<foldername>.nfo`.
 /// - **Episode:** `<stem>.nfo`, then `<dir>/episodedetails.nfo`.

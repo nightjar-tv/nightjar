@@ -318,6 +318,28 @@ impl NfoSource {
 /// `uniqueid` is an *episode* id (never a `tmdb:show:`), and TVDB/IMDB alone
 /// has no TMDB API path — both must fall through to TMDB search instead of
 /// landing a terminal `matched` with nothing enrichable.
+/// Report a search failure, unless a malformed NFO already explained it.
+///
+/// A corrupt sidecar is carried past the NFO stage rather than ending
+/// resolution, so an item whose NFO failed to parse still gets the search every
+/// NFO-less folder gets. If that search also fails, the parse failure is the
+/// reason worth surfacing: **it names something the user can fix**, and it is
+/// the cause that came first. `below_threshold` on a folder whose NFO is
+/// corrupt describes the symptom.
+fn unresolved_or_nfo_invalid(
+    nfo_invalid_detail: &Option<String>,
+    reason: UnresolvedReason,
+) -> ResolveOutcome {
+    match nfo_invalid_detail {
+        Some(detail) => ResolveOutcome::Unresolved {
+            reason: UnresolvedReason::NfoInvalid {
+                detail: detail.clone(),
+            },
+        },
+        None => ResolveOutcome::Unresolved { reason },
+    }
+}
+
 fn nfo_has_usable_id(meta: &CanonicalMetadata) -> bool {
     match meta.kind {
         MetadataKind::Movie => meta.ids.tmdb.is_some(),
@@ -366,6 +388,13 @@ impl<T: MetadataSource> Resolver<T> {
         // read separately so tvshow.nfo never masks it (autopsy D5).
         let mut nfo_imdb_id: Option<String> = None;
         let mut nfo_tvdb_id: Option<i64> = None;
+        // A parse failure is carried rather than returned. If search later
+        // resolves the item, the malformed sidecar cost nothing and this is
+        // dropped; if search also fails, it becomes the reported reason,
+        // because "your NFO is corrupt" is more actionable to a user than
+        // "nothing scored above the floor" and it is the cause that came
+        // first.
+        let mut nfo_invalid_detail: Option<String> = None;
         let tvshow_nfo = match input.kind {
             Some(MetadataKind::Episode) | Some(MetadataKind::Show) => {
                 NfoSource.attempt_xml(input.tvshow_nfo_xml.as_deref())
@@ -391,11 +420,18 @@ impl<T: MetadataSource> Resolver<T> {
                 nfo_tvdb_id = metadata.ids.tvdb;
             }
             NfoAttempt::Invalid(err) => {
-                return Ok(ResolveOutcome::Unresolved {
-                    reason: UnresolvedReason::NfoInvalid {
-                        detail: err.to_string(),
-                    },
-                });
+                // A malformed NFO ends the *NFO candidate cascade* — it never
+                // falls through to a different NFO file, which is the autopsy
+                // D5 contract documented at `nfo_sidecar_xml`. It does not end
+                // *resolution*. Search is still available and is exactly what a
+                // folder with no NFO at all would get, so a corrupt sidecar
+                // leaves the item no worse off than an absent one.
+                //
+                // Measured 2026-08-17: 890 of 1,146 unmatched files in a
+                // library whose `tvshow.nfo` carried no TMDB id were this, 465
+                // of them in one folder, because a template artifact repeats
+                // across every episode. All had matchable filenames.
+                nfo_invalid_detail.get_or_insert_with(|| err.to_string());
             }
             NfoAttempt::Absent => {}
         }
@@ -420,11 +456,7 @@ impl<T: MetadataSource> Resolver<T> {
                 // §2 A4 is separate work); never a show lookup.
             }
             NfoAttempt::Invalid(err) => {
-                return Ok(ResolveOutcome::Unresolved {
-                    reason: UnresolvedReason::NfoInvalid {
-                        detail: err.to_string(),
-                    },
-                });
+                nfo_invalid_detail.get_or_insert_with(|| err.to_string());
             }
             NfoAttempt::Absent => {}
         }
@@ -593,19 +625,18 @@ impl<T: MetadataSource> Resolver<T> {
                 && let Ok(Some(entry)) =
                     negative_cache::should_skip(conn, PROVIDER_TMDB, cache_kind, qk, &now)
             {
-                return Ok(match entry.reason {
-                    NegativeReason::BelowThreshold => ResolveOutcome::Unresolved {
-                        reason: UnresolvedReason::BelowThreshold {
+                return Ok(unresolved_or_nfo_invalid(
+                    &nfo_invalid_detail,
+                    match entry.reason {
+                        NegativeReason::BelowThreshold => UnresolvedReason::BelowThreshold {
                             confidence: entry.confidence.unwrap_or(0.0),
                             method: "negative_cache".into(),
                         },
-                    },
-                    NegativeReason::NoResults | NegativeReason::ApiError => {
-                        ResolveOutcome::Unresolved {
-                            reason: UnresolvedReason::NoMatch,
+                        NegativeReason::NoResults | NegativeReason::ApiError => {
+                            UnresolvedReason::NoMatch
                         }
-                    }
-                });
+                    },
+                ));
             }
             let result = self.tmdb.resolve(&attempt)?;
             let (metadata, method, raw) = match result {
@@ -615,9 +646,10 @@ impl<T: MetadataSource> Resolver<T> {
                     raw,
                 } => (metadata, method, raw),
                 ProviderResult::EmptyShell => {
-                    return Ok(ResolveOutcome::Unresolved {
-                        reason: UnresolvedReason::NoEpisodes,
-                    });
+                    return Ok(unresolved_or_nfo_invalid(
+                        &nfo_invalid_detail,
+                        UnresolvedReason::NoEpisodes,
+                    ));
                 }
                 ProviderResult::BelowThreshold { confidence, method } => {
                     if let (Some(conn), Some(qk)) = (conn, cache_key) {
@@ -631,12 +663,13 @@ impl<T: MetadataSource> Resolver<T> {
                             &now_rfc3339(),
                         );
                     }
-                    return Ok(ResolveOutcome::Unresolved {
-                        reason: UnresolvedReason::BelowThreshold {
+                    return Ok(unresolved_or_nfo_invalid(
+                        &nfo_invalid_detail,
+                        UnresolvedReason::BelowThreshold {
                             confidence,
                             method: method.to_string(),
                         },
-                    });
+                    ));
                 }
                 ProviderResult::Miss => {
                     if let (Some(conn), Some(qk)) = (conn, cache_key) {
@@ -650,9 +683,10 @@ impl<T: MetadataSource> Resolver<T> {
                             &now_rfc3339(),
                         );
                     }
-                    return Ok(ResolveOutcome::Unresolved {
-                        reason: UnresolvedReason::NoMatch,
-                    });
+                    return Ok(unresolved_or_nfo_invalid(
+                        &nfo_invalid_detail,
+                        UnresolvedReason::NoMatch,
+                    ));
                 }
                 ProviderResult::FindMiss => {
                     // The `/find` id lookup produced no accepted hit (find
@@ -759,8 +793,39 @@ mod tests {
         );
     }
 
+    /// A corrupt sidecar must not cost the item its search.
+    ///
+    /// Replaces `malformed_nfo_is_unresolved_reason_not_tmdb_fallback`, which
+    /// asserted the opposite contract. That test kept passing after the change
+    /// **for the wrong reason**: `TmdbStub` always misses, so the search it
+    /// was asserting could not happen produced nothing either way. A provider
+    /// that can actually hit is what makes the difference observable.
     #[test]
-    fn malformed_nfo_is_unresolved_reason_not_tmdb_fallback() {
+    fn malformed_nfo_falls_through_to_search_and_can_still_resolve() {
+        let src = CountingHit {
+            search_calls: Cell::new(0),
+        };
+        let outcome = Resolver { tmdb: src }
+            .resolve(&ResolveInput {
+                nfo_xml: Some(fixture("malformed.nfo")),
+                title: Some("Fight Club".into()),
+                year: Some(1999),
+                kind: Some(MetadataKind::Movie),
+                ..Default::default()
+            })
+            .unwrap();
+        match outcome {
+            ResolveOutcome::Resolved { source, .. } => {
+                assert_eq!(source, MetadataOrigin::Tmdb, "search must have run");
+            }
+            other => panic!("expected the search result, got {other:?}"),
+        }
+    }
+
+    /// And when search fails too, the parse failure is the reason reported —
+    /// not `no_match`. It names something the user can fix, and it came first.
+    #[test]
+    fn malformed_nfo_is_the_reported_reason_when_search_also_fails() {
         let outcome = resolve(&ResolveInput {
             nfo_xml: Some(fixture("malformed.nfo")),
             title: Some("Fight Club".into()),
