@@ -684,6 +684,7 @@ impl MetadataSource for TmdbClient {
                 ref_season: input.ref_season,
                 ref_episode: input.ref_episode,
                 ref_episode_title: input.ref_episode_title.clone(),
+                folder_episode_titles: input.folder_episode_titles.clone(),
             },
         )? {
             TmdbResolve::Matched {

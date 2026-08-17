@@ -67,6 +67,18 @@ pub struct LibrarySeriesShape {
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
     pub ref_episode_title: Option<String>,
+    /// **Every** usable `(season, episode, title)` the folder's filenames
+    /// carry, not just the reference one.
+    ///
+    /// The reference episode alone is one title at one number. Measured
+    /// 2026-08-17 over the 20 show folders that failed below threshold,
+    /// comparing every folder title against every candidate episode
+    /// distinguished exactly one candidate in 17 of them — a folder is close to
+    /// fingerprinted by its episode titles, and one of them is not.
+    ///
+    /// Already computed for every TV group (`folder_titles_from_db`), so this
+    /// costs no query and no provider request.
+    pub folder_episode_titles: Vec<(i32, i32, String)>,
 }
 
 /// Max multi-exact candidates for the episode-title pin (ADR-0032).
@@ -103,8 +115,12 @@ pub struct CandidateShape {
     pub candidate_season_episodes: Option<Vec<CandidateEpisode>>,
 }
 
-/// Does this candidate's reference-season episode carry the title the folder's
-/// reference file does?
+/// Does this candidate carry **any** episode title the folder's filenames do?
+///
+/// Widened 2026-08-17 from one reference episode to title-anywhere on both
+/// sides. The narrow form compared one folder title, at one episode number,
+/// against the candidate's reference season — and was silent on 17 of the 20
+/// show folders that a title-anywhere comparison distinguished.
 ///
 /// `Some(true)` confirms, `None` there is nothing to compare. **There is no
 /// `Some(false)`**, and that is the point: [`compare_episode_title`] can return
@@ -115,24 +131,58 @@ pub struct CandidateShape {
 /// folders and refutation never once identified a wrong entity. A later author
 /// adding a penalty path here would be reversing a measured result, not
 /// filling in an oversight.
-pub fn candidate_confirms_reference_episode(
+pub fn candidate_confirms_any_episode_title(
     shape: &CandidateShape,
     library: &LibrarySeriesShape,
     show_soft_key: &str,
 ) -> Option<bool> {
-    let want = library.ref_episode_title.as_deref()?;
-    let ref_episode = library.ref_episode?;
-    let episodes = shape.reference_season_episodes.as_deref()?;
-    let name = episodes
-        .iter()
-        .find(|(n, _)| *n == ref_episode)
-        .map(|(_, nm)| nm.as_str())?;
-    match compare_episode_title(want, name, show_soft_key, None, None) {
-        EpisodeTitleVerdict::Agree => Some(true),
-        // Unknown is the only other reachable verdict here, and it is not
-        // evidence against the candidate.
-        _ => None,
+    // Every episode this candidate is known to hold. `reference_season_episodes`
+    // is the folder's reference season, keyed on episode number alone;
+    // `candidate_season_episodes` carries `(season, episode, name)` when the
+    // unplaced-file search fetched it. **Only what is already fetched** — this
+    // adds no provider request, and an unfetched season is not evidence either
+    // way.
+    let mut provider: Vec<&str> = Vec::new();
+    if let Some(eps) = shape.reference_season_episodes.as_deref() {
+        provider.extend(eps.iter().map(|(_, name)| name.as_str()));
     }
+    if let Some(eps) = shape.candidate_season_episodes.as_deref() {
+        provider.extend(eps.iter().map(|(_, _, name)| name.as_str()));
+    }
+    if provider.is_empty() {
+        return None;
+    }
+
+    // Title-anywhere, on both sides. A folder title may sit at a different
+    // number on the candidate than in the folder — renumbered splits, absorbed
+    // specials, an offset revival — so matching on the slot throws away the
+    // agreements that identify the entity. The reference title is included in
+    // this set, so nothing the narrower check found is lost.
+    let mut folder: Vec<&str> = library
+        .folder_episode_titles
+        .iter()
+        .map(|(_, _, t)| t.as_str())
+        .collect();
+    if let Some(t) = library.ref_episode_title.as_deref() {
+        folder.push(t);
+    }
+    if folder.is_empty() {
+        return None;
+    }
+
+    for want in &folder {
+        for name in &provider {
+            if compare_episode_title(want, name, show_soft_key, None, None)
+                == EpisodeTitleVerdict::Agree
+            {
+                return Some(true);
+            }
+        }
+    }
+    // Unknown is the only other reachable verdict, and it is not evidence
+    // against the candidate — however many titles were compared. **Silence at
+    // any width stays silence.**
+    None
 }
 
 /// One unplaced file: the season the **folder** puts it in, its episode
@@ -161,7 +211,7 @@ pub struct SeasonRangeMapping {
 /// shipped comparator over episode titles.
 ///
 /// **Agreement only, and no `Disagree` path — deliberately.** Same discipline
-/// as [`candidate_confirms_reference_episode`]: a filename-derived title
+/// as [`candidate_confirms_any_episode_title`]: a filename-derived title
 /// carries no air date, so [`compare_episode_title`] cannot return `Disagree`
 /// on one, and refutation never once identified a wrong entity across the 598
 /// folders the comparator was measured on. A file that fails to agree
@@ -247,7 +297,7 @@ fn confirmation_beats_pick<'a>(
         return None;
     }
     let chosen_i = exact.iter().position(|h| h.id == chosen.id)?;
-    if candidate_confirms_reference_episode(&shapes[chosen_i], library, show_soft_key) == Some(true)
+    if candidate_confirms_any_episode_title(&shapes[chosen_i], library, show_soft_key) == Some(true)
     {
         return None;
     }
@@ -256,7 +306,7 @@ fn confirmation_beats_pick<'a>(
         if i == chosen_i {
             continue;
         }
-        if candidate_confirms_reference_episode(&shapes[i], library, show_soft_key) == Some(true) {
+        if candidate_confirms_any_episode_title(&shapes[i], library, show_soft_key) == Some(true) {
             if winner.is_some() {
                 return None;
             }
@@ -1878,6 +1928,121 @@ mod tests {
         assert!(meets_auto_match_floor(c.confidence));
     }
 
+    /// **The widening, isolated.** The folder's *reference* episode title
+    /// matches nothing, and a *different* folder title matches the candidate at
+    /// a *different* episode number. The one-episode form was silent here; that
+    /// silence is what left 17 of 20 collision folders unresolved.
+    #[test]
+    fn a_non_reference_folder_title_confirms_at_a_different_number() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let shapes = [
+            // Candidate 1 holds the folder's S1E05 title, at episode 9.
+            shape_eps(
+                2004,
+                &[1],
+                &[(2, "Nothing Alike"), (9, "The Wrong Trousers")],
+            ),
+            shape_eps(2003, &[1], &[(2, "Also Nothing Alike")]),
+        ];
+        let mut library = lib_with_ref(2003, &[1], "A Title Nobody Has");
+        library.folder_episode_titles = vec![(1, 5, "The Wrong Trousers".to_string())];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1, "the candidate carrying a folder title wins");
+        assert_eq!(c.method, "exact_title_episode_confirmed");
+        assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// Ambiguity still declines at the wider width: two candidates each carry
+    /// one of the folder's titles, so nothing discriminates and the ladder
+    /// stands. Will & Grace is this shape — two entities really are present.
+    #[test]
+    fn widened_confirmation_still_declines_when_two_candidates_agree() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let shapes = [
+            shape_eps(2004, &[1], &[(9, "The Wrong Trousers")]),
+            shape_eps(2003, &[1], &[(4, "A Grand Day Out")]),
+        ];
+        let mut library = lib_with_ref(2003, &[1], "A Title Nobody Has");
+        library.folder_episode_titles = vec![
+            (1, 5, "The Wrong Trousers".to_string()),
+            (1, 6, "A Grand Day Out".to_string()),
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2, "the year pin stands");
+        assert_eq!(c.method, "exact_title_year");
+    }
+
+    /// Generic provider titles yield nothing at any width — the comparator
+    /// refuses them, and widening must not turn that refusal into agreement.
+    /// Three of the four folders measured "silent" on 2026-08-17 were this.
+    #[test]
+    fn widened_confirmation_is_silent_on_generic_provider_titles() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let shapes = [
+            shape_eps(2004, &[1], &[(1, "Episode 1"), (2, "Episode 2")]),
+            shape_eps(2003, &[1], &[(1, "Episode 1")]),
+        ];
+        let mut library = lib_with_ref(2003, &[1], "Episode 2");
+        library.folder_episode_titles = vec![(1, 1, "Episode 1".to_string())];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(
+            c.tmdb_id, 2,
+            "the year pin stands; no promotion on generics"
+        );
+        assert_eq!(c.method, "exact_title_year");
+    }
+
+    /// No folder titles at all: unchanged ladder, comparator never reached.
+    /// 88 of 687 resolving folders are this population.
+    #[test]
+    fn widened_confirmation_is_inert_without_folder_titles() {
+        let hits = vec![tv(1, "Test Show", 2004), tv(2, "Test Show", 2003)];
+        let shapes = [
+            shape_eps(2004, &[1], &[(9, "The Wrong Trousers")]),
+            shape_eps(2003, &[1], &[(4, "A Grand Day Out")]),
+        ];
+        let library = LibrarySeriesShape {
+            year: Some(2003),
+            folder_seasons: vec![1],
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 2);
+        assert_eq!(c.method, "exact_title_year");
+    }
+
     /// Confirmation absent: the year pin holds, unchanged and undemoted.
     #[test]
     fn absent_confirmation_leaves_the_year_pin_alone() {
@@ -1952,7 +2117,7 @@ mod tests {
 
         // A title that matches nothing is not a verdict against anyone.
         assert_eq!(
-            candidate_confirms_reference_episode(
+            candidate_confirms_any_episode_title(
                 &shape_eps(2003, &[1], &[(2, "Something Entirely Different")]),
                 &lib_with_ref(2003, &[1], "A Real Episode Title"),
                 "test show",

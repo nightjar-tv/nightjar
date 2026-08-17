@@ -242,6 +242,9 @@ fn phase_a_fast(client: &TmdbClient, groups: &[Group]) -> FastReport {
             ref_season: g.ref_season,
             ref_episode: g.ref_episode,
             ref_episode_title: g.ref_episode_title.clone(),
+            // Measurement bin: folder-title breadth is not plumbed here.
+            // Empty is "no evidence", never "no agreement".
+            folder_episode_titles: Vec::new(),
         };
         let hits = match client.search(kind, &g.title) {
             Ok(h) => h,

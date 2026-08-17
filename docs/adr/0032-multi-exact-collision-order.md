@@ -152,3 +152,58 @@ series match is worse than unmatched (ADR-0026).
 - Top Gear-class residue after a declined or non-unique title attempt is
   expected when every candidate shares a placeholder episode name;
   year/ID/manual own it.
+
+## Amendment 2026-08-17 — episode-title confirmation widens to title-anywhere
+
+**The order in this ADR is unchanged.** The tie-breakers still run episode
+count, then season count, then library year, and title confirmation still runs
+after the branch has chosen. What changes is **how much evidence confirmation
+accepts.**
+
+Before: one folder title — the reference episode's — compared against the
+candidate's episode at that same number.
+
+After: **every** usable episode title the folder's filenames carry, against
+**every** episode the candidate is known to hold, agreement wherever it lands.
+
+### Why
+
+Measured 2026-08-17 on a cold title-only run of the dogfood library. Of the 20
+show folders that failed below the floor, **title-anywhere distinguished exactly
+one candidate in 17**. The one-episode form was silent on all of them.
+
+A folder title often sits at a different number on the candidate — renumbered
+splits, absorbed specials, an offset revival — so matching on the slot discards
+the agreements that identify the entity.
+
+### Cost, measured before the change
+
+Over all 687 folders that resolved in that run: **595 agree with the binding
+they already have, 4 silent, 0 disagree.** The four silent were read by hand:
+three are correct bindings whose *provider* titles are generic (`Episode 1`), and
+the fourth is a wrong binding that titles correctly declined to endorse.
+
+**No provider request is added.** The widening reads only episodes already
+fetched — `reference_season_episodes`, which the collision tier appends to
+`/tv/{id}`, plus `candidate_season_episodes` where ADR-0046's unplaced search
+already fetched it. An unfetched season remains no evidence either way.
+
+### What does not change
+
+- **One-directional still.** `Some(true)` or `None`, never `Some(false)`.
+  Silence at any width stays silence, and a wider comparison finding nothing is
+  still not evidence against a candidate.
+- **Ambiguity still declines.** Two candidates carrying folder titles leaves the
+  ladder's pick alone. A folder genuinely holding two entities — Will & Grace —
+  is that shape, and a rule returning one answer there would be wrong.
+- **No new `match_method` token.** This widens an existing route rather than
+  adding one; a new token would split `exact_title_episode_confirmed` in the
+  column rather than name anything new. The cost is accepted: a later wrong rate
+  on that token cannot separate one-episode from title-anywhere confirmations,
+  because the widening replaces the old behaviour rather than sitting beside it.
+- **Candidate admission is untouched.** `name_matches_query` and the prefix rule
+  are not changed here. A folder whose correct entity never enters the exact set
+  — `Monster (2022)`, where the rule admits `Monster High` and rejects
+  `DAHMER - Monster: …` — is **not fixed by this**, and is expected to become
+  `unmatched` rather than correctly bound. Unmatched has three built consumers;
+  a wrong match has none.
