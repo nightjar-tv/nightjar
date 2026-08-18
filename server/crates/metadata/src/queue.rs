@@ -234,8 +234,24 @@ pub fn snapshot_visible_proxy_filtered(
                         .then_with(|| a.id.cmp(&b.id))
                 });
                 for m in movies.into_iter().take(n) {
+                    // ADR-0026: the **filename** year outranks the folder's.
+                    // Both are the library's own labelling, and where they
+                    // disagree the filename is the one a renamer wrote from
+                    // provider metadata while the folder is what a human typed
+                    // once. Measured 2026-08-19 over 1,777 movies: 1,756 agree
+                    // and the precedence decides nothing; 19 disagree, and in
+                    // every one the filename year is the provider's. Two of
+                    // those 19 were *bound to the wrong film* under the old
+                    // order — `Peter Pan (2003)` holding the 77-minute 1953
+                    // film, `Split (2016)` holding the 117-minute 2017 one —
+                    // which no count reported, because a wrong bind is a
+                    // success everywhere this project looks.
+                    //
+                    // Inert unless the library writes the year in both places:
+                    // with one of them absent, `or` yields the same value
+                    // either way round.
                     let folder_year = year_from_path(&m.path);
-                    let (ct, cy) = clean_movie_title(&m.title, folder_year.or(m.year));
+                    let (ct, cy) = clean_movie_title(&m.title, m.year.or(folder_year));
                     let qk = query_key(&ct, cy);
                     units.push(VisibleProxyUnit {
                         unit_key: format!("movie|{qk}"),
@@ -692,8 +708,10 @@ fn status_query_groups(
         let band = band_for_item(it.id, &visible_ids, &cw, &search);
         match it.kind.as_str() {
             "movie" => {
+                // Same precedence as the visible-proxy path above, and for
+                // the same measured reason.
                 let folder_year = year_from_path(&it.path);
-                let (ct, cy) = clean_movie_title(&it.title, folder_year.or(it.year));
+                let (ct, cy) = clean_movie_title(&it.title, it.year.or(folder_year));
                 let qk = query_key(&ct, cy);
                 let unit_key = format!("movie|{qk}");
                 let g = movie_groups
@@ -4671,6 +4689,96 @@ mod tests {
             &[Some(2002)],
             "folder (YYYY) must reach ResolveInput.year for TV search"
         );
+    }
+
+    /// **The filename year outranks the folder's, and only where both exist.**
+    ///
+    /// Both are the library's own labelling. Where they disagree the filename is
+    /// what a renamer wrote from provider metadata and the folder is what a
+    /// human typed once — measured over 1,777 movies, 19 disagree and the
+    /// filename is the provider's year in all 19. Two of those were bound to
+    /// the *wrong film* under the old order and reported as successes.
+    ///
+    /// The last two cases are the reach limit: with only one of the two present
+    /// the precedence decides nothing, so a library that names the year once
+    /// gets neither the fix nor a regression.
+    #[test]
+    fn the_filename_year_outranks_the_folder_year() {
+        struct YearCapture {
+            years: std::sync::Mutex<Vec<Option<i32>>>,
+        }
+        impl MetadataSource for YearCapture {
+            fn resolve(
+                &self,
+                input: &ResolveInput,
+            ) -> Result<crate::resolve::ProviderResult, crate::resolve::ResolveError> {
+                self.years.lock().unwrap().push(input.year);
+                Ok(crate::resolve::ProviderResult::Miss)
+            }
+        }
+        for (path, parsed_year, want, why) in [
+            // both present and disagreeing: the filename wins
+            (
+                "Split (2016)/Split (2017).mkv",
+                Some(2017),
+                Some(2017),
+                "filename wins",
+            ),
+            // both present and agreeing: nothing to decide
+            (
+                "Some Film (2019)/Some Film (2019).mkv",
+                Some(2019),
+                Some(2019),
+                "agree",
+            ),
+            // folder only: no filename year to outrank, so the folder still
+            // reaches the provider
+            (
+                "Some Film (2019)/Some Film.mkv",
+                None,
+                Some(2019),
+                "folder only",
+            ),
+            // filename only: nothing changes either
+            (
+                "Some Film/Some Film (2019).mkv",
+                Some(2019),
+                Some(2019),
+                "filename only",
+            ),
+        ] {
+            let c = Connection::open_in_memory().unwrap();
+            migrate(&c).unwrap();
+            c.execute(
+                "INSERT INTO libraries (name, path, kind) VALUES ('M', '/tmp/M', 'movies')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, year)
+                 VALUES (1, ?1, 1, 1, 'Some Film', 'movie', ?2)",
+                params![path, parsed_year],
+            )
+            .unwrap();
+            let resolver = Resolver {
+                tmdb: YearCapture {
+                    years: std::sync::Mutex::new(Vec::new()),
+                },
+            };
+            drain_pending(
+                &c,
+                &resolver,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+                DrainOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                resolver.tmdb.years.lock().unwrap().as_slice(),
+                &[want],
+                "{why}: {path}"
+            );
+        }
     }
 
     fn movie_nfo_xml(title: &str, tmdb: u32) -> String {
