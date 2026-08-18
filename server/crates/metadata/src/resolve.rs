@@ -131,6 +131,9 @@ pub enum ResolveOutcome {
         source: MetadataOrigin,
         /// Scorer method / discriminator name (TMDB path). `None` for NFO.
         match_method: Option<String>,
+        /// Whether episode titles agreed with the chosen candidate. `None`
+        /// when nothing was compared — an NFO or id route never compares.
+        confirmed: Option<bool>,
     },
     Unresolved {
         reason: UnresolvedReason,
@@ -168,6 +171,11 @@ pub enum ProviderResult {
         metadata: Box<CanonicalMetadata>,
         /// Scorer method string (which table row / discriminator fired).
         method: &'static str,
+        /// Whether episode titles agreed with the candidate that was chosen.
+        /// `None` when nothing was compared. Separate from `method`, which
+        /// answers *how was this entity chosen* — confirmation sometimes
+        /// chooses and sometimes only agrees, and one field cannot say both.
+        confirmed: Option<bool>,
         /// Entity-keyed raw body for ADR-0026 §4 persistence (`None` for stubs).
         raw: Option<RawProviderPayload>,
     },
@@ -416,6 +424,7 @@ impl<T: MetadataSource> Resolver<T> {
                         // reported `None` until 2026-08-15, which left the
                         // diagnostic column blank for most of the library.
                         match_method: Some("nfo_tvshow_tmdb_id".to_string()),
+                        confirmed: None,
                     });
                 }
                 // Show identified but no TMDB id: carry imdb/tvdb for `/find`.
@@ -453,6 +462,7 @@ impl<T: MetadataSource> Resolver<T> {
                         // because a single `nfo` token would merge two routes
                         // and no query could separate them afterwards.
                         match_method: Some("nfo_item_tmdb_id".to_string()),
+                        confirmed: None,
                     });
                 }
                 // Episode NFO external ids are episode-level (strategy note
@@ -584,6 +594,10 @@ impl<T: MetadataSource> Resolver<T> {
                 return Ok(ResolveOutcome::Resolved {
                     metadata: Box::new(meta),
                     source: MetadataOrigin::Tmdb,
+                    // This route reaches here either by the name cross-check
+                    // passing or by episode titles rescuing an id it rejected.
+                    // Only the second compared titles.
+                    confirmed: confirmed.then_some(true),
                     // Two routes reach this return and they are not the same
                     // event. One is the cross-check passing. The other is the
                     // cross-check *rejecting* on the folder name and episode
@@ -642,12 +656,13 @@ impl<T: MetadataSource> Resolver<T> {
                 ));
             }
             let result = self.tmdb.resolve(&attempt)?;
-            let (metadata, method, raw) = match result {
+            let (metadata, method, confirmed, raw) = match result {
                 ProviderResult::Hit {
                     metadata,
                     method,
+                    confirmed,
                     raw,
-                } => (metadata, method, raw),
+                } => (metadata, method, confirmed, raw),
                 ProviderResult::EmptyShell => {
                     return Ok(unresolved_or_nfo_invalid(
                         &nfo_invalid_detail,
@@ -735,6 +750,7 @@ impl<T: MetadataSource> Resolver<T> {
                 metadata,
                 source: MetadataOrigin::Tmdb,
                 match_method: Some(method.to_string()),
+                confirmed,
             });
         }
         unreachable!("a /find outcome (discard or miss) is followed by at most one search attempt")
@@ -771,6 +787,7 @@ mod tests {
                 source,
                 metadata,
                 match_method,
+                confirmed: _,
             } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
                 assert_eq!(metadata.title, "Fight Club");
@@ -956,6 +973,7 @@ mod tests {
                     episode: None,
                 }),
                 method: "tmdb_id",
+                confirmed: None,
                 raw: None,
             })
         }
@@ -1005,6 +1023,7 @@ mod tests {
             Ok(ProviderResult::Hit {
                 metadata: Box::new(Self::hit_meta(id)),
                 method: "test",
+                confirmed: None,
                 raw: None,
             })
         }
@@ -1035,6 +1054,7 @@ mod tests {
                 metadata,
                 source,
                 match_method,
+                confirmed: _,
             } => {
                 assert_eq!(source, MetadataOrigin::Tmdb);
                 assert_eq!(metadata.ids.tmdb, Some(42));
@@ -1098,6 +1118,7 @@ mod tests {
                 metadata,
                 source,
                 match_method,
+                confirmed: _,
             } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
                 assert_eq!(metadata.ids.tmdb, Some(550));
@@ -1139,6 +1160,7 @@ mod tests {
                 metadata,
                 source,
                 match_method,
+                confirmed: _,
             } => {
                 assert_eq!(metadata.ids.tmdb, Some(550));
                 assert_eq!(metadata.title, "Fight Club");
@@ -1186,6 +1208,7 @@ mod tests {
                 episode: None,
             }),
             method,
+            confirmed: None,
             raw: Some(crate::tmdb::RawProviderPayload {
                 entity_kind: "tv".into(),
                 provider_id: id.to_string(),
@@ -1232,6 +1255,7 @@ mod tests {
                 metadata,
                 source,
                 match_method,
+                confirmed: _,
             } => {
                 assert_eq!(source, MetadataOrigin::Tmdb);
                 assert_eq!(metadata.ids.tmdb, Some(55), "search result wins");

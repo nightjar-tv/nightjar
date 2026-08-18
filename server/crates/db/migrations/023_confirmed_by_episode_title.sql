@@ -1,0 +1,24 @@
+-- ADR-0032 as amended 2026-08-18: `match_method` records **what selected** the
+-- candidate; this records **whether episode titles agreed** with that choice.
+--
+-- Two fields because one column cannot hold two facts, and the measurement
+-- showed it rather than the argument. Letting confirmation claim `match_method`
+-- moved ~10,570 items off `exact_title_year`, `_episode_count`,
+-- `_episode_title` and `_season_count` — the last two to zero, so the column
+-- could no longer say those routes fired at all. One token absorbing five is
+-- `series_row`'s collapse at scale. Keeping the route and dropping the
+-- agreement loses the other half: 770 successful bindings would report
+-- `exact_title_collision_unpinned`, a token meaning *nothing pinned this*.
+--
+-- **Nullable on purpose, and the three states are the point.**
+--   NULL = not evaluated — no candidate episodes were fetched, so nothing was
+--          compared
+--   0    = evaluated, and no folder title agreed
+--   1    = evaluated, and one did
+--
+-- A `NOT NULL DEFAULT 0` would collapse "no evidence" into "no agreement",
+-- which is the distinction `compare_episode_title`'s one-directional contract
+-- exists to protect and the fifth place this project has had to insist on it.
+--
+-- Diagnostic, never control flow. Nothing reads it to decide what happens next.
+ALTER TABLE media_items ADD COLUMN metadata_confirmed_by_episode_title INTEGER;

@@ -70,6 +70,18 @@ pub struct LibrarySeriesShape {
     /// and compare by equality; this is the per-season shape, and it is what
     /// lets a candidate be asked *how much of this folder could you explain*.
     pub folder_season_counts: Vec<(i32, u32)>,
+    /// **Every** usable `(season, episode, title)` the folder's filenames
+    /// carry, not just the reference one.
+    ///
+    /// The reference episode alone is one title at one number. Measured
+    /// 2026-08-17 over the 20 show folders that failed below threshold,
+    /// comparing every folder title against every candidate episode
+    /// distinguished exactly one candidate in 17 of them — a folder is close to
+    /// fingerprinted by its episode titles, and one of them is not.
+    ///
+    /// Already computed for every TV group (`folder_titles_from_db`), so this
+    /// costs no query and no provider request.
+    pub folder_episode_titles: Vec<(i32, i32, String)>,
     /// ADR-0032 reference episode (usable after-token title only).
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
@@ -118,8 +130,12 @@ pub struct CandidateShape {
     pub candidate_season_episodes: Option<Vec<CandidateEpisode>>,
 }
 
-/// Does this candidate's reference-season episode carry the title the folder's
-/// reference file does?
+/// Does this candidate carry **any** episode title the folder's filenames do?
+///
+/// Widened 2026-08-17 from one reference episode to title-anywhere on both
+/// sides. The narrow form compared one folder title, at one episode number,
+/// against the candidate's reference season — and was silent on 17 of the 20
+/// show folders that a title-anywhere comparison distinguished.
 ///
 /// `Some(true)` confirms, `None` there is nothing to compare. **There is no
 /// `Some(false)`**, and that is the point: [`compare_episode_title`] can return
@@ -130,24 +146,58 @@ pub struct CandidateShape {
 /// folders and refutation never once identified a wrong entity. A later author
 /// adding a penalty path here would be reversing a measured result, not
 /// filling in an oversight.
-pub fn candidate_confirms_reference_episode(
+pub fn candidate_confirms_any_episode_title(
     shape: &CandidateShape,
     library: &LibrarySeriesShape,
     show_soft_key: &str,
 ) -> Option<bool> {
-    let want = library.ref_episode_title.as_deref()?;
-    let ref_episode = library.ref_episode?;
-    let episodes = shape.reference_season_episodes.as_deref()?;
-    let name = episodes
-        .iter()
-        .find(|(n, _)| *n == ref_episode)
-        .map(|(_, nm)| nm.as_str())?;
-    match compare_episode_title(want, name, show_soft_key, None, None) {
-        EpisodeTitleVerdict::Agree => Some(true),
-        // Unknown is the only other reachable verdict here, and it is not
-        // evidence against the candidate.
-        _ => None,
+    // Every episode this candidate is known to hold. `reference_season_episodes`
+    // is the folder's reference season, keyed on episode number alone;
+    // `candidate_season_episodes` carries `(season, episode, name)` when the
+    // unplaced-file search fetched it. **Only what is already fetched** — this
+    // adds no provider request, and an unfetched season is not evidence either
+    // way.
+    let mut provider: Vec<&str> = Vec::new();
+    if let Some(eps) = shape.reference_season_episodes.as_deref() {
+        provider.extend(eps.iter().map(|(_, name)| name.as_str()));
     }
+    if let Some(eps) = shape.candidate_season_episodes.as_deref() {
+        provider.extend(eps.iter().map(|(_, _, name)| name.as_str()));
+    }
+    if provider.is_empty() {
+        return None;
+    }
+
+    // Title-anywhere, on both sides. A folder title may sit at a different
+    // number on the candidate than in the folder — renumbered splits, absorbed
+    // specials, an offset revival — so matching on the slot throws away the
+    // agreements that identify the entity. The reference title is included in
+    // this set, so nothing the narrower check found is lost.
+    let mut folder: Vec<&str> = library
+        .folder_episode_titles
+        .iter()
+        .map(|(_, _, t)| t.as_str())
+        .collect();
+    if let Some(t) = library.ref_episode_title.as_deref() {
+        folder.push(t);
+    }
+    if folder.is_empty() {
+        return None;
+    }
+
+    for want in &folder {
+        for name in &provider {
+            if compare_episode_title(want, name, show_soft_key, None, None)
+                == EpisodeTitleVerdict::Agree
+            {
+                return Some(true);
+            }
+        }
+    }
+    // Unknown is the only other reachable verdict, and it is not evidence
+    // against the candidate — however many titles were compared. **Silence at
+    // any width stays silence.**
+    None
 }
 
 /// One unplaced file: the season the **folder** puts it in, its episode
@@ -176,7 +226,7 @@ pub struct SeasonRangeMapping {
 /// shipped comparator over episode titles.
 ///
 /// **Agreement only, and no `Disagree` path — deliberately.** Same discipline
-/// as [`candidate_confirms_reference_episode`]: a filename-derived title
+/// as [`candidate_confirms_any_episode_title`]: a filename-derived title
 /// carries no air date, so [`compare_episode_title`] cannot return `Disagree`
 /// on one, and refutation never once identified a wrong entity across the 598
 /// folders the comparator was measured on. A file that fails to agree
@@ -263,7 +313,7 @@ fn sole_candidate_confirmed(
     show_soft_key: &str,
 ) -> bool {
     top1_shape
-        .map(|sh| candidate_confirms_reference_episode(sh, library, show_soft_key) == Some(true))
+        .map(|sh| candidate_confirms_any_episode_title(sh, library, show_soft_key) == Some(true))
         .unwrap_or(false)
 }
 
@@ -285,29 +335,62 @@ fn confirmation_beats_pick<'a>(
     shapes: Option<&[CandidateShape]>,
     library: &LibrarySeriesShape,
     show_soft_key: &str,
-) -> Option<&'a SearchHit> {
-    let shapes = shapes?;
+) -> Confirmation<'a> {
+    let Some(shapes) = shapes else {
+        return Confirmation::NoEvidence;
+    };
     if shapes.len() != exact.len() {
-        return None;
+        return Confirmation::NoEvidence;
     }
-    let chosen_i = exact.iter().position(|h| h.id == chosen.id)?;
-    if candidate_confirms_reference_episode(&shapes[chosen_i], library, show_soft_key) == Some(true)
+    let Some(chosen_i) = exact.iter().position(|h| h.id == chosen.id) else {
+        return Confirmation::NoEvidence;
+    };
+    if candidate_confirms_any_episode_title(&shapes[chosen_i], library, show_soft_key) == Some(true)
     {
-        return None;
+        // The ladder's pick is the one titles agree with. Shipped behaviour
+        // discarded that because it was not a *change*, so a collision resolved
+        // to the **right** entity kept 0.72 and died below the floor with its
+        // evidence in hand. It is an endorsement, not a redirect: the route
+        // stays whatever selected the candidate.
+        return Confirmation::Endorses(exact[chosen_i]);
     }
     let mut winner: Option<&SearchHit> = None;
     for (i, h) in exact.iter().enumerate() {
         if i == chosen_i {
             continue;
         }
-        if candidate_confirms_reference_episode(&shapes[i], library, show_soft_key) == Some(true) {
+        if candidate_confirms_any_episode_title(&shapes[i], library, show_soft_key) == Some(true) {
             if winner.is_some() {
-                return None;
+                return Confirmation::NoEvidence;
             }
             winner = Some(h);
         }
     }
-    winner
+    match winner {
+        Some(h) => Confirmation::Redirects(h),
+        None => Confirmation::NoEvidence,
+    }
+}
+
+/// What episode-title confirmation did, which is **two facts, not one**.
+///
+/// `match_method` answers *how was this entity chosen*. Confirmation sometimes
+/// chooses — it redirects to a candidate the ladder did not pick — and
+/// sometimes only agrees with a choice already made. Recording both as
+/// `exact_title_episode_confirmed` overstates the second: measured, it moved
+/// ~10,570 items off the routes that actually selected them and drove
+/// `_episode_title` and `_season_count` to zero.
+#[derive(Debug, Clone, Copy)]
+pub enum Confirmation<'a> {
+    /// A candidate the ladder did **not** pick carries the folder's titles.
+    /// Confirmation selected it, so it owns `match_method`.
+    Redirects(&'a SearchHit),
+    /// The ladder's own pick carries them. Confirmation agreed; it did not
+    /// choose. The route is unchanged and only the flag records this.
+    Endorses(&'a SearchHit),
+    /// Nothing to compare, or two candidates agree and the evidence does not
+    /// discriminate.
+    NoEvidence,
 }
 
 /// Can this candidate hold every season the folder asserts?
@@ -497,6 +580,14 @@ pub struct MatchCandidate {
     pub result_title: Option<String>,
     pub result_year: Option<i32>,
     pub n_results: usize,
+    /// Whether episode titles agreed with the candidate that was chosen —
+    /// `None` when nothing was compared.
+    ///
+    /// Separate from `method`, which answers *how was this entity chosen*.
+    /// Confirmation sometimes chooses and sometimes only agrees, and one column
+    /// cannot hold both: letting it claim the route moved ~10,570 items off the
+    /// routes that selected them.
+    pub confirmed_by_episode_title: Option<bool>,
 }
 
 /// Normalise a title for exact comparison (spike `norm_key` + orthography fold).
@@ -1158,24 +1249,47 @@ pub fn score_search_with_shape_and_sole(
     // decided branches — a sole same-year hit scores 0.98 and no tie-break can
     // reach it. It raises a confirmed candidate over an unconfirmed one and
     // never lowers anything.
-    let (hit, conf, method) = match confirmation_beats_pick(hit, &exact, shapes, &library, title) {
-        Some(better) => (
+    let confirmation = confirmation_beats_pick(hit, &exact, shapes, &library, title);
+    // The fourth element is the second field (ADR-0032 as amended): whether
+    // episode titles agreed, recorded beside — not instead of — the route.
+    // It is read off the arm that fired, so a route named `_episode_confirmed`
+    // can never be stored next to a `false`.
+    let (hit, conf, method, confirmed) = match confirmation {
+        // Confirmation *chose* this candidate, so it owns the route.
+        Confirmation::Redirects(better) => (
             better,
             f64::max(conf, 0.90),
             "exact_title_episode_confirmed",
+            Some(true),
         ),
+        // Confirmation *agreed with* the ladder's choice. Raise the confidence
+        // — that is the defect, a right answer dying at 0.72 with its evidence
+        // in hand — and **keep the route**, because the count or the year is
+        // what selected it.
+        Confirmation::Endorses(same) => (same, f64::max(conf, 0.90), method, Some(true)),
         // No candidate matched by title, so there was nothing for the ladder to
         // choose among and nothing for confirmation to redirect to. Episode
         // titles can still say whether the sole candidate is consistent with
         // the folder. It vouches; it does not select.
-        None if exact.is_empty() && sole_candidate_confirmed(sole_shape, &library, title) => {
-            (hit, f64::max(conf, 0.90), "exact_title_episode_confirmed")
+        Confirmation::NoEvidence
+            if exact.is_empty() && sole_candidate_confirmed(sole_shape, &library, title) =>
+        {
+            (
+                hit,
+                f64::max(conf, 0.90),
+                "exact_title_episode_confirmed",
+                Some(true),
+            )
         }
-        None => (hit, conf, method),
+        // Shapes were present and nothing agreed: evaluated, no agreement. No
+        // shapes at all: nothing was compared, and `None` says so rather than
+        // letting a default speak for it.
+        Confirmation::NoEvidence => (hit, conf, method, shapes.map(|_| false)),
     };
 
     Some(MatchCandidate {
         tmdb_id: hit.id,
+        confirmed_by_episode_title: confirmed,
         confidence: conf,
         method,
         result_title: display_title(hit, kind),
@@ -2462,16 +2576,89 @@ mod tests {
         assert_eq!(c.tmdb_id, 1);
         assert_eq!(c.method, "exact_title_year");
         assert!((c.confidence - 0.98).abs() < f64::EPSILON);
+        assert_eq!(
+            c.confirmed_by_episode_title,
+            Some(true),
+            "the agreement is recorded even where it changed nothing"
+        );
 
         // A title that matches nothing is not a verdict against anyone.
         assert_eq!(
-            candidate_confirms_reference_episode(
+            candidate_confirms_any_episode_title(
                 &shape_eps(2003, &[1], &[(2, "Something Entirely Different")]),
                 &lib_with_ref(2003, &[1], "A Real Episode Title"),
                 "test show",
             ),
             None,
             "the comparator has no Disagree to give on a filename title"
+        );
+    }
+
+    /// **Endorsement raises without renaming.** The collision branch picked
+    /// this candidate arbitrarily and scored it below floor; confirmation
+    /// agrees with that pick. Before the amendment this returned
+    /// `exact_title_episode_confirmed` and the route that actually selected the
+    /// candidate was gone. Now the route stays, the confidence rises, and the
+    /// agreement lives in its own field — which is the whole argument for two.
+    #[test]
+    fn endorsement_raises_the_score_and_leaves_the_route_alone() {
+        let hits = vec![tv(1, "Test Show", 2003), tv(2, "Test Show", 2004)];
+        // Only the candidate the branch already picked carries the title.
+        let shapes = [
+            shape_eps(2003, &[1], &[(2, "A Real Episode Title")]),
+            shape_eps(2004, &[1], &[(2, "Some Other Title")]),
+        ];
+        // A library year that matches neither, so no year pin fires and the
+        // collision branch is what picks — the 770's shape.
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            None,
+            SearchKind::Tv,
+            lib_with_ref(1999, &[1], "A Real Episode Title"),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 1);
+        assert_eq!(c.method, "exact_title_collision_unpinned");
+        assert!((c.confidence - 0.90).abs() < f64::EPSILON);
+        assert_eq!(c.confirmed_by_episode_title, Some(true));
+    }
+
+    /// Shapes were fetched and no folder title agreed with any of them. That is
+    /// a measured `false`, and it must not read the same as the runs where no
+    /// episodes were ever fetched.
+    #[test]
+    fn evaluated_disagreement_is_not_the_same_as_no_evidence() {
+        let hits = vec![tv(1, "Test Show", 2003), tv(2, "Test Show", 2004)];
+        let shapes = [
+            shape_eps(2003, &[1], &[(2, "Some Other Title")]),
+            shape_eps(2004, &[1], &[(2, "A Third Title")]),
+        ];
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.confirmed_by_episode_title, Some(false));
+
+        // Same library, no shapes fetched at all: nothing was compared.
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            Some(2003),
+            SearchKind::Tv,
+            lib_with_ref(2003, &[1], "A Real Episode Title"),
+            None,
+        )
+        .expect("a candidate");
+        assert_eq!(
+            c.confirmed_by_episode_title, None,
+            "not evaluated is its own state"
         );
     }
 
