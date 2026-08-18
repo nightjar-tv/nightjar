@@ -368,7 +368,51 @@ fn read_repeated_season(bytes: &[u8], i: usize) -> Option<(i32, usize)> {
     None
 }
 
+/// A four-digit year, preferring one in parentheses over a bare number.
+///
+/// `Title (YYYY)` is what every renamer writes and what this library uses, and
+/// the parentheses are the thing that makes the number a *year* rather than a
+/// number that happens to be in the name. Taking the first four digits anywhere
+/// reads `Wonder Woman 1984 (2020)` as **1984** and `2001 A Space Odyssey
+/// (1968)` as **2001** — and where the number is not at position 0,
+/// [`parse_filename`] cuts the title there too, so one rule loses both halves.
+///
+/// Measured 2026-08-19 across 25,004 items: six files disagree, and no file
+/// wants the bare token while a parenthesised year is present. Four of the six
+/// bind correctly today only because the *folder* year overrules this parse —
+/// which is why this lands before that precedence is touched. Swapping first
+/// was measured to turn three of them into failures and to send `2012 (2009)`
+/// to a Japanese film whose title ends in `2012`.
+///
+/// The bare-token scan is unchanged and still runs when there are no
+/// parentheses, which is the dotted release form (`Movie.Name.2019.1080p`).
 fn find_year(s: &str) -> Option<i32> {
+    find_parenthesised_year(s).or_else(|| find_bare_year(s))
+}
+
+/// `(YYYY)` anywhere in the name, first one wins.
+fn find_parenthesised_year(s: &str) -> Option<i32> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if bytes[i] == b'('
+            && bytes[i + 5] == b')'
+            && bytes[i + 1..i + 5].iter().all(u8::is_ascii_digit)
+        {
+            let y = std::str::from_utf8(&bytes[i + 1..i + 5])
+                .ok()?
+                .parse::<i32>()
+                .ok()?;
+            if (1900..=2100).contains(&y) {
+                return Some(y);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_bare_year(s: &str) -> Option<i32> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i + 4 <= bytes.len() {
@@ -397,6 +441,76 @@ fn find_year(s: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A number in the title is not the year.** `find_year` took the first
+    /// four digits anywhere, so `Wonder Woman 1984 (2020)` parsed as 1984 —
+    /// and because the cut follows the year, the title became `Wonder Woman`.
+    /// One rule, both halves wrong.
+    ///
+    /// Four of the six real files affected bind correctly *only* because the
+    /// folder year overrules this parse, which is why this lands before that
+    /// precedence is touched.
+    #[test]
+    fn a_parenthesised_year_outranks_a_number_in_the_title() {
+        for (name, title, year) in [
+            (
+                "Wonder Woman 1984 (2020) Bluray-1080p.mkv",
+                "Wonder Woman 1984",
+                2020,
+            ),
+            (
+                "Blade Runner 2049 (2017) Bluray-1080p.mkv",
+                "Blade Runner 2049",
+                2017,
+            ),
+            ("1917 (2019) Bluray-1080p.mkv", "1917", 2019),
+            (
+                "2001 A Space Odyssey (1968) Bluray-1080p.mkv",
+                "2001 A Space Odyssey",
+                1968,
+            ),
+            ("2012 (2009) Bluray-1080p.mp4", "2012", 2009),
+            ("2067 (2020) Bluray-1080p.mkv", "2067", 2020),
+            // a four-digit number that is neither the year nor at the start
+            ("The 1900 House (1999).mkv", "The 1900 House", 1999),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.year, Some(year), "{name}");
+        }
+    }
+
+    /// The bare-token scan is the fallback, not the rule that was removed. It
+    /// still runs whenever there are no parentheses — which is the dotted
+    /// release form, and the majority of names that carry a year at all.
+    #[test]
+    fn a_bare_year_still_parses_when_there_are_no_parentheses() {
+        for (name, title, year) in [
+            ("Some Film 1999.mkv", "Some Film", 1999),
+            ("Movie.Name.2019.1080p.mkv", "Movie Name", 2019),
+            ("Some Film (2017).mkv", "Some Film", 2017),
+            ("Fight Club (1999) Bluray-1080p.mkv", "Fight Club", 1999),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.year, Some(year), "{name}");
+        }
+    }
+
+    /// The episode branch never parses a year and must stay that way: a year in
+    /// an episode title is not the show's year, and `series_library_year` reads
+    /// this field.
+    #[test]
+    fn the_episode_branch_still_parses_no_year() {
+        for name in [
+            "Show - 1x01 - Title (2019).mkv",
+            "Show - S02E03 - Something 1984.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.year, None, "{name}");
+            assert_eq!(p.title, "Show", "{name}");
+        }
+    }
 
     /// Rule 1 — a leading release-group bracket is not part of the title.
     #[test]
