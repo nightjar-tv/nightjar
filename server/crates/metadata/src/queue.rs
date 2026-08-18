@@ -899,11 +899,46 @@ fn tmdb_id_from_links(
 /// TMDB id at all must not land `matched` (no stored id → enrich dead-end).
 /// Returns `false` when nothing enrichable was stored; callers keep the item
 /// un-matched instead of parking it in a terminal `matched` without a key.
+/// Record whether folder episode titles agreed with the chosen candidate.
+///
+/// Diagnostic only — nothing reads this to decide what happens next. It exists
+/// so a measurement can ask "how often did confirmation agree with the route
+/// that won" without the route token having to encode both facts at once.
+fn record_episode_title_confirmation(
+    conn: &Connection,
+    item_ids: &[i64],
+    confirmed: bool,
+) -> Result<(), String> {
+    if item_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin confirmation tx: {e}"))?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "UPDATE media_items
+                    SET metadata_confirmed_by_episode_title = ?1
+                  WHERE id = ?2",
+            )
+            .map_err(|e| format!("prepare confirmation update: {e}"))?;
+        for id in item_ids {
+            stmt.execute(params![i64::from(confirmed), id])
+                .map_err(|e| format!("update confirmation {id}: {e}"))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| format!("commit confirmation: {e}"))?;
+    Ok(())
+}
+
 fn apply_search_hit(
     conn: &Connection,
     item_ids: &[i64],
     metadata: &CanonicalMetadata,
     match_method: Option<&str>,
+    confirmed: Option<bool>,
 ) -> Result<bool, String> {
     let tx = conn
         .unchecked_transaction()
@@ -958,6 +993,14 @@ fn apply_search_hit(
             MetadataStatus::Matched,
             match_method.map_or(Decision::Uncomputed, Decision::Token),
         )?;
+        // ADR-0032 as amended: the second field. `match_method` says what
+        // selected the candidate; this says whether episode titles agreed with
+        // that choice, and the two answer different questions. Only written
+        // when there is an answer — a `None` leaves the column NULL, which is
+        // "not evaluated", not "did not agree".
+        if let Some(confirmed) = confirmed {
+            record_episode_title_confirmation(conn, item_ids, confirmed)?;
+        }
     }
     Ok(wrote)
 }
@@ -1949,6 +1992,7 @@ fn search_one_group<T: MetadataSource>(
             metadata,
             source,
             match_method,
+            confirmed,
             ..
         }) => {
             let tmdb_id = metadata.ids.tmdb.or(metadata.ids.tmdb_show);
@@ -1969,7 +2013,13 @@ fn search_one_group<T: MetadataSource>(
                     .and_modify(|p| *p = *p || poster)
                     .or_insert(poster);
             } else {
-                match apply_search_hit(conn, &g.item_ids, &metadata, match_method.as_deref()) {
+                match apply_search_hit(
+                    conn,
+                    &g.item_ids,
+                    &metadata,
+                    match_method.as_deref(),
+                    confirmed,
+                ) {
                     Ok(true) => {
                         // ADR-0033: a fresh TV match writes the folder-keyed
                         // series row, so a later group under this folder binds
@@ -2780,6 +2830,7 @@ mod tests {
             Ok(crate::resolve::ProviderResult::Hit {
                 metadata: Box::new(meta),
                 method: "exact_title_year",
+                confirmed: None,
                 raw: Some(raw),
             })
         }
@@ -2840,6 +2891,7 @@ mod tests {
             Ok(crate::resolve::ProviderResult::Hit {
                 metadata: Box::new(meta),
                 method: "exact_title",
+                confirmed: None,
                 raw: Some(crate::tmdb::RawProviderPayload {
                     entity_kind: "tv".into(),
                     provider_id: "77".into(),
@@ -3342,6 +3394,7 @@ mod tests {
                 Ok(crate::resolve::ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "tv".into(),
                         provider_id: "1".into(),
@@ -3423,6 +3476,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "movie".into(),
                         provider_id: "42".into(),
@@ -3499,6 +3553,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "movie".into(),
                         provider_id: "42".into(),
@@ -3592,6 +3647,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "movie".into(),
                         provider_id: "42".into(),
@@ -3688,6 +3744,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "tv".into(),
                         provider_id: "77".into(),
@@ -3903,6 +3960,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "movie".into(),
                         provider_id: "99".into(),
@@ -4010,6 +4068,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "movie".into(),
                         provider_id: "42".into(),
@@ -4081,6 +4140,7 @@ mod tests {
                 Ok(ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "movie".into(),
                         provider_id: id.to_string(),
@@ -4208,6 +4268,7 @@ mod tests {
             Ok(crate::resolve::ProviderResult::Hit {
                 metadata: Box::new(meta),
                 method: "exact_title",
+                confirmed: None,
                 raw: Some(crate::tmdb::RawProviderPayload {
                     entity_kind: "tv".into(),
                     provider_id: id.to_string(),
@@ -4402,6 +4463,7 @@ mod tests {
                 Ok(crate::resolve::ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "tv".into(),
                         provider_id: id.to_string(),
@@ -4551,7 +4613,7 @@ mod tests {
             season: Some(1),
             episode: Some(1),
         };
-        let wrote = apply_search_hit(&c, &[1], &meta, None).unwrap();
+        let wrote = apply_search_hit(&c, &[1], &meta, None, None).unwrap();
         assert!(
             !wrote,
             "episode-only id must not be accepted as an enrichable hit"
@@ -4856,6 +4918,7 @@ mod tests {
                     } else {
                         "nfo_show"
                     },
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "tv".into(),
                         provider_id: id.to_string(),
@@ -5031,6 +5094,7 @@ mod tests {
                 Ok(crate::resolve::ProviderResult::Hit {
                     metadata: Box::new(meta),
                     method: "exact_title",
+                    confirmed: None,
                     raw: Some(crate::tmdb::RawProviderPayload {
                         entity_kind: "tv".into(),
                         provider_id: id.to_string(),
@@ -5181,6 +5245,7 @@ mod tests {
                 } else {
                     "exact_title"
                 },
+                confirmed: None,
                 raw: Some(crate::tmdb::RawProviderPayload {
                     entity_kind: "tv".into(),
                     provider_id: id.to_string(),
@@ -5955,6 +6020,31 @@ mod tests {
         assert_eq!(reasons(&c), vec![(1, None, None)]);
     }
 
+    fn movie_meta() -> CanonicalMetadata {
+        CanonicalMetadata {
+            kind: MetadataKind::Movie,
+            title: "A".into(),
+            original_title: None,
+            year: Some(1999),
+            air_date: None,
+            plot: None,
+            genres: Vec::new(),
+            runtime_minutes: None,
+            cast: Vec::new(),
+            ratings: Vec::new(),
+            ids: crate::model::ProviderIds {
+                tmdb: Some(550),
+                tmdb_show: None,
+                imdb: None,
+                tvdb: None,
+            },
+            artwork: Vec::new(),
+            collection: None,
+            season: None,
+            episode: None,
+        }
+    }
+
     /// **The gap the shipped column had, asserted at the call site.**
     ///
     /// `apply_search_hit` is where the search tier commits the entity the
@@ -5989,12 +6079,57 @@ mod tests {
             season: None,
             episode: None,
         };
-        let wrote = apply_search_hit(&c, &[1], &meta, Some("exact_title_year")).unwrap();
+        let wrote = apply_search_hit(&c, &[1], &meta, Some("exact_title_year"), None).unwrap();
         assert!(wrote);
         assert_eq!(
             reasons(&c),
             vec![(1, None, Some("exact_title_year".into()))],
             "the scorer's route reaches the column"
+        );
+    }
+
+    /// **The second field has a producer.** The first version of the route
+    /// column shipped with a writer and no caller; this asserts the caller for
+    /// the confirmation column before it is measured, so a run reporting all
+    /// NULLs means "confirmation never fired", not "nothing writes it".
+    #[test]
+    fn the_search_tier_records_whether_episode_titles_agreed() {
+        fn confirmed_col(c: &Connection) -> Option<i64> {
+            c.query_row(
+                "SELECT metadata_confirmed_by_episode_title FROM media_items WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+        let meta = movie_meta();
+
+        // Not evaluated stays NULL — the state a `NOT NULL DEFAULT 0` would
+        // have destroyed.
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        apply_search_hit(&c, &[1], &meta, Some("exact_title_year"), None).unwrap();
+        assert_eq!(confirmed_col(&c), None, "no evidence is not disagreement");
+
+        // Evaluated and disagreed.
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        apply_search_hit(&c, &[1], &meta, Some("exact_title_year"), Some(false)).unwrap();
+        assert_eq!(confirmed_col(&c), Some(0));
+
+        // Evaluated and agreed — and the route it agreed *with* survives, which
+        // is the whole reason there are two fields.
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        one_item(&c);
+        apply_search_hit(&c, &[1], &meta, Some("exact_title_year"), Some(true)).unwrap();
+        assert_eq!(confirmed_col(&c), Some(1));
+        assert_eq!(
+            reasons(&c),
+            vec![(1, None, Some("exact_title_year".into()))],
+            "confirmation records itself without taking the route's column"
         );
     }
 

@@ -7,6 +7,8 @@
   preference
 - Amended: 2026-08-03 — full ladder table (year → counts → episode
   title); method `exact_title_episode_title` at 0.90; TV-only; accepted
+- Amended: 2026-08-18 — confirmation endorses without renaming the route;
+  agreement moves to its own three-state column
 - Depends on: ADR-0026 §2 (floor + existing TV collision pin); ADR-0028
   (manual fix); ADR-0031 §7 coverage sample (soft-key re-run)
 - Related: the TMDB show-coverage soft-key sample, 2026-08-03;
@@ -152,3 +154,79 @@ series match is worse than unmatched (ADR-0026).
 - Top Gear-class residue after a declined or non-unique title attempt is
   expected when every candidate shares a placeholder episode name;
   year/ID/manual own it.
+
+---
+
+## Amendment 2026-08-18 — one column cannot hold two facts
+
+The ladder's original shape has confirmation *replacing* the route: whenever
+episode titles agreed, `match_method` became `exact_title_episode_confirmed`
+and the candidate rose to 0.90. That reads naturally — confirmation is the
+last rung, so the last rung names the row — and it is wrong in a way only a
+measurement shows.
+
+`match_method` answers **what selected this candidate**. Confirmation
+sometimes selects (it redirects the pick to a different candidate) and
+sometimes only agrees (the year or a count pin already chose, and the titles
+concur). Those are different events and the column was recording them the
+same way.
+
+**What the single column did, measured on the replay harness:**
+
+| | items |
+|---|---:|
+| moved off `exact_title_year`, `_episode_count`, `_episode_title`, `_season_count` | ~10,570 |
+| `exact_title_episode_title` after | 0 |
+| `exact_title_season_count` after | 0 |
+
+Two tokens went to zero. The column could no longer say those routes had
+fired at all — the same collapse `series_row` produces at scale, arrived at
+from the other direction. A diagnostic that reports one cause for five is not
+a coarser diagnostic; it is a wrong one.
+
+The obvious correction — keep the route, drop the agreement — loses the other
+half. 770 bindings that confirmation successfully pinned would report
+`exact_title_collision_unpinned`, a token whose meaning is *nothing pinned
+this*. Both single-column arrangements are false, in opposite directions.
+
+### The decision
+
+**Confirmation redirects → it owns `match_method`.** It chose the candidate,
+so `exact_title_episode_confirmed` is the honest answer, and 0.90 stands.
+
+**Confirmation endorses → the route stays and the confidence still rises.**
+The defect being fixed is a correct answer dying at 0.72 with its evidence in
+hand; raising it does not require renaming what selected it.
+
+**Agreement is recorded in its own column,
+`media_items.metadata_confirmed_by_episode_title`** (migration 023),
+nullable, three-state:
+
+| value | meaning |
+|---|---|
+| `NULL` | not evaluated — no candidate episodes fetched, nothing compared |
+| `0` | evaluated, no folder title agreed |
+| `1` | evaluated, one did |
+
+`NOT NULL DEFAULT 0` was rejected: it collapses *no evidence* into *no
+agreement*, which is precisely the distinction `compare_episode_title`'s
+one-directional contract exists to protect. This is the fifth place in this
+project where that collapse had to be refused explicitly.
+
+The column is **diagnostic and never control flow**. Nothing reads it to
+decide what happens next; it exists so a measurement can ask how often
+confirmation agreed with the route that won, without the route token having
+to carry both facts.
+
+### Consequences
+
+- `MatchCandidate` gains `confirmed_by_episode_title: Option<bool>`, read off
+  the branch that fired rather than recomputed — a row can never carry
+  `exact_title_episode_confirmed` next to a `0`.
+- The value is threaded through `ProviderResult::Hit` and
+  `ResolveOutcome::Resolved` as `confirmed: Option<bool>` and written by
+  `apply_search_hit`, the same call site that records the route. A writer
+  without a caller is how the route column shipped inert the first time; the
+  producer is asserted by test before this is measured.
+- The method table in ADR-0026 §2 is unchanged. `exact_title_episode_confirmed`
+  keeps its 0.90; the endorsement case now reaches 0.90 under its own token.

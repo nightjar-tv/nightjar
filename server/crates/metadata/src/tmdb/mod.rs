@@ -385,6 +385,10 @@ impl TmdbClient {
         if let Some((hit, method)) = pin_episode_title(&exact_refs, &names, ref_title, title) {
             return Ok(Some(MatchCandidate {
                 tmdb_id: hit.id,
+                // ADR-0032's episode-title pin **selects** — the route is
+                // `exact_title_episode_title` — and the titles agreed by
+                // construction, so the flag is true rather than unknown.
+                confirmed_by_episode_title: Some(true),
                 confidence: 0.90,
                 method,
                 result_title: hit.name.clone().or_else(|| hit.original_name.clone()),
@@ -677,6 +681,9 @@ impl MetadataSource for TmdbClient {
             return Ok(ProviderResult::Hit {
                 metadata: Box::new(metadata),
                 method: "tmdb_id",
+                // A stored id resolves without comparing titles.
+                confirmed: None,
+                // Resolving a stored id compares no titles.
                 raw: Some(raw),
             });
         }
@@ -709,6 +716,9 @@ impl MetadataSource for TmdbClient {
                         return Ok(ProviderResult::Hit {
                             metadata: Box::new(metadata),
                             method,
+                            // `/find` resolves by external id, not by title.
+                            confirmed: None,
+                            // `/find` resolves by external id, not by title.
                             raw: Some(raw),
                         });
                     }
@@ -734,6 +744,7 @@ impl MetadataSource for TmdbClient {
                 episode_count: input.library_episode_count,
                 season_count: input.library_season_count,
                 folder_season_counts: input.folder_season_counts.clone(),
+                folder_episode_titles: input.folder_episode_titles.clone(),
                 folder_seasons: input.library_seasons.clone(),
                 ref_season: input.ref_season,
                 ref_episode: input.ref_episode,
@@ -747,6 +758,7 @@ impl MetadataSource for TmdbClient {
             } => Ok(ProviderResult::Hit {
                 metadata,
                 method: candidate.method,
+                confirmed: candidate.confirmed_by_episode_title,
                 raw: Some(raw),
             }),
             TmdbResolve::EmptyShell => Ok(ProviderResult::EmptyShell),

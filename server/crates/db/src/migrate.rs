@@ -65,6 +65,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         22,
         include_str!("../migrations/022_metadata_decision_reasons.sql"),
     ),
+    (
+        23,
+        include_str!("../migrations/023_confirmed_by_episode_title.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -306,7 +310,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 22);
+        assert_eq!(v, 23);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",

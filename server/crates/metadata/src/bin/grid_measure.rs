@@ -245,6 +245,7 @@ fn phase_a_fast(client: &TmdbClient, groups: &[Group]) -> FastReport {
             // Measurement bin: the folder's per-season shape is not plumbed
             // here. Empty is "no evidence", never "no seasons".
             folder_season_counts: Vec::new(),
+            folder_episode_titles: Vec::new(),
         };
         let hits = match client.search(kind, &g.title) {
             Ok(h) => h,
