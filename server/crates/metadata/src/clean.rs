@@ -117,22 +117,67 @@ const JUNK_TOKENS: &[&str] = &[
     "dual", "internal",
 ];
 
-fn strip_junk(s: &str) -> String {
+/// Separators either side of a release-junk token.
+const JUNK_SEPARATORS: [char; 6] = [' ', '.', '_', '-', '[', '('];
+
+/// Byte index where release junk begins, or `None` if the string is all title.
+///
+/// Three conditions, and the second is why this function exists.
+///
+/// 1. **The token starts at a word boundary.** Already true before: `Aardvark`
+///    does not contain the token `dv` as far as this is concerned.
+/// 2. **The token also *ends* at one.** A trailing ASCII letter means the token
+///    is merely the start of a longer word — `Multiverse` is not `multi`,
+///    `Atmosphere` is not `atmos`, `Dvorak` is not `dv`. Without this the rule
+///    discarded the matched word *and the rest of the title*, so `Atmosphere`
+///    cleaned to the empty string. Digits stay legal: `AAC2.0` and `DTS5.1` are
+///    junk and must still cut.
+/// 3. **Something has to survive.** A name consisting only of junk is not a
+///    title, and an empty query cannot match anything, so a cut that would
+///    leave nothing is skipped in favour of the next one along. This is what
+///    saves `Extended Family` and `Proper Binge`, where the token really is the
+///    whole first word and no boundary check can tell.
+///
+/// Every occurrence is considered, not just the first: with (2) in place the
+/// earliest match may be rejected while a later, genuine one stands — as in
+/// `Multiverse of Madness MULTi 1080p`.
+///
+/// The same reasoning is already recorded one list along, on
+/// [`TRAILING_SOURCE_TOKENS`]: *"these are ordinary words: a bare `web` or
+/// `dvd` scan would cut `Charlotte's Web` in half."*
+fn release_junk_cut(s: &str, tokens: &[&str]) -> Option<usize> {
+    // ASCII-only lowercasing preserves byte length, so indices into `lower`
+    // are valid indices into `s`.
     let lower = s.to_ascii_lowercase();
-    let mut cut = lower.len();
-    for tok in JUNK_TOKENS {
-        if let Some(idx) = lower.find(tok) {
-            let ok_boundary = idx == 0
-                || matches!(
-                    lower.as_bytes()[idx - 1],
-                    b'.' | b' ' | b'_' | b'-' | b'[' | b'('
-                );
-            if ok_boundary && idx < cut {
-                cut = idx;
+    let bytes = lower.as_bytes();
+    let mut cut: Option<usize> = None;
+    for tok in tokens {
+        for (idx, _) in lower.match_indices(tok) {
+            if idx > 0 && !JUNK_SEPARATORS.contains(&(bytes[idx - 1] as char)) {
+                continue;
+            }
+            if bytes
+                .get(idx + tok.len())
+                .is_some_and(u8::is_ascii_alphabetic)
+            {
+                continue;
+            }
+            if s[..idx].trim_matches(JUNK_SEPARATORS).is_empty() {
+                continue;
+            }
+            if cut.is_none_or(|c| idx < c) {
+                cut = Some(idx);
             }
         }
     }
-    s[..cut.min(s.len())].to_string()
+    cut
+}
+
+fn strip_junk(s: &str) -> String {
+    match release_junk_cut(s, JUNK_TOKENS) {
+        Some(cut) => s[..cut].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -401,21 +446,10 @@ pub fn strip_trailing_source_token(title: &str) -> String {
 }
 
 fn strip_release_junk_fragment(s: &str) -> String {
-    let lower = s.to_ascii_lowercase();
-    let mut cut = lower.len();
-    for tok in RELEASE_JUNK {
-        if let Some(idx) = lower.find(tok) {
-            let ok_boundary = idx == 0
-                || matches!(
-                    lower.as_bytes()[idx - 1],
-                    b'.' | b' ' | b'_' | b'-' | b'[' | b'('
-                );
-            if ok_boundary && idx < cut {
-                cut = idx;
-            }
-        }
-    }
-    s[..cut.min(s.len())]
+    // Same rule as `strip_junk`, different list. The lists differ deliberately
+    // (`dv` is movies-only); the boundary rule must not.
+    let cut = release_junk_cut(s, RELEASE_JUNK).unwrap_or(s.len());
+    s[..cut]
         .trim()
         .trim_matches([' ', '-', '_', '.', '–', '—'])
         .to_string()
@@ -585,6 +619,115 @@ mod tests {
         let (t, y) = clean_movie_title("Fight Club (1999) Bluray-1080p", Some(1999));
         assert_eq!(t, "Fight Club");
         assert_eq!(y, Some(1999));
+    }
+
+    /// **A junk token is a word, not a prefix.** Every input below is
+    /// synthetic — it shares nothing with any real library but its shape, which
+    /// is the point: the rule discarded the matched word *and the rest of the
+    /// title*, so `Atmosphere` cleaned to the empty string and reached the
+    /// provider as a query that cannot match anything. `dv` is two letters.
+    #[test]
+    fn a_word_that_merely_begins_with_a_junk_token_is_not_junk() {
+        for raw in [
+            "Atmosphere",
+            "Atmospheric Pressure",
+            "Multiverse of Madness",
+            "The Multiverse Chronicles",
+            "Dvorak",
+            "Dvorak in Prague",
+            "Repackaged Lives",
+            "Internationally Yours",
+            // the token is the whole first word, so no boundary check can tell
+            // it from junk — what saves these is that a cut leaving nothing is
+            // not a cut
+            "Extended Family",
+            "Proper Binge",
+            "Unrated Ambitions",
+            "Subbed Rosa",
+            // these already passed on the left-boundary check alone and must
+            // keep passing: the match is anchored at word start, not a
+            // substring test
+            "Aardvark",
+            "Cardvark Chronicles",
+            "Semimulti Show",
+            "A Quiet Place",
+        ] {
+            let (t, _) = clean_movie_title(raw, Some(2020));
+            assert_eq!(t, raw, "{raw:?} is a title, not release junk");
+        }
+    }
+
+    /// The stripping the rule exists for, which was never broken and must stay
+    /// that way. The digit cases are why the right-hand boundary rejects
+    /// *letters* rather than requiring a separator.
+    #[test]
+    fn genuine_release_junk_is_still_cut() {
+        for (raw, want) in [
+            ("Some Film Extended", "Some Film"),
+            ("Some Film MULTi", "Some Film"),
+            ("Some Film Bluray-1080p", "Some Film"),
+            ("Some Film AAC2.0", "Some Film"),
+            ("Some Film DTS5.1", "Some Film"),
+            ("Fight Club Bluray-1080p", "Fight Club"),
+            // the earliest match is rejected as a word, and the later, genuine
+            // one still cuts — so every occurrence has to be considered, not
+            // just the first
+            ("Multiverse of Madness MULTi 1080p", "Multiverse of Madness"),
+            // a cut at 0 is skipped in favour of the next valid one rather
+            // than abandoning the strip altogether
+            ("Extended.Cut.1080p.BluRay", "Extended Cut"),
+        ] {
+            let (t, _) = clean_movie_title(raw, Some(2020));
+            assert_eq!(t, want, "{raw:?}");
+        }
+    }
+
+    /// **The same defect, the other list.** `strip_release_junk_fragment` feeds
+    /// `after_token_episode_title`, so a truncated episode title becomes the
+    /// evidence confirmation compares — and `Some("")` is worse than `None`,
+    /// because it reads as a title that agreed with nothing.
+    #[test]
+    fn episode_titles_survive_a_junk_prefixed_word() {
+        for (base, ep, want) in [
+            ("Some Show - 1x03 - Atmosphere.mkv", 3, "Atmosphere"),
+            (
+                "Some Show - 1x04 - Road to the Multiverse.mkv",
+                4,
+                "Road to the Multiverse",
+            ),
+            (
+                "Some Show - 1x05 - Extended Family.mkv",
+                5,
+                "Extended Family",
+            ),
+            (
+                "Some Show - 1x06 - Intellectual Property.mkv",
+                6,
+                "Intellectual Property",
+            ),
+            (
+                "Some Show - 1x07 - The Jerusalem Duality.mkv",
+                7,
+                "The Jerusalem Duality",
+            ),
+            // still stripped
+            (
+                "Some Show - 1x10 - A Real Title - Bluray-1080p.mkv",
+                10,
+                "A Real Title",
+            ),
+            (
+                "Some Show - 1x11 - A Real Title - WEBDL-1080p.mkv",
+                11,
+                "A Real Title",
+            ),
+        ] {
+            assert_eq!(
+                after_token_episode_title(base, 1, ep).as_deref(),
+                Some(want),
+                "{base:?}"
+            );
+        }
     }
 
     #[test]
