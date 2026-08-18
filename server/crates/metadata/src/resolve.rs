@@ -39,6 +39,9 @@ pub struct ResolveInput {
     /// Distinct episode files / seasons under the show (TV collision pin).
     pub library_episode_count: Option<u32>,
     pub library_season_count: Option<u32>,
+    /// `(season_number, file_count)` the folder holds — the per-season shape,
+    /// distinct from the two counts above.
+    pub folder_season_counts: Vec<(i32, u32)>,
     /// The season numbers the folder asserts, season 0 excluded. Coverage
     /// evidence for the year pin; the count above stays the pin signal.
     pub library_seasons: Vec<i32>,
