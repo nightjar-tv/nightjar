@@ -50,6 +50,29 @@ const MAX_APPENDED_SEASONS: usize = 20;
 /// walking all of them would turn one fix into thirty-odd calls.
 const MAX_SECOND_ENTITY_CANDIDATES: usize = 5;
 
+/// `(season_number, episode_count)` from a `/tv/{id}` payload's `seasons[]`.
+///
+/// The array is already in every collision-tier response and
+/// [`season_numbers_from_detail`] parses the numbers and **drops the counts**.
+/// This reads what is already there: no request, no append.
+///
+/// Season 0 is excluded — a `Specials` season exists independently of whether
+/// the folder files one, and counting it would let a folder with no specials
+/// look short against every candidate that has them.
+pub fn season_episode_counts_from_detail(data: &Value) -> Option<Vec<(i32, u32)>> {
+    Some(
+        data.get("seasons")?
+            .as_array()?
+            .iter()
+            .filter_map(|s| {
+                let n = s.get("season_number")?.as_i64()? as i32;
+                let c = s.get("episode_count")?.as_u64()? as u32;
+                (n > 0).then_some((n, c))
+            })
+            .collect(),
+    )
+}
+
 pub fn season_numbers_from_detail(data: &Value) -> Option<Vec<i32>> {
     Some(
         data.get("seasons")?
@@ -404,6 +427,7 @@ impl TmdbClient {
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
             season_numbers: season_numbers_from_detail(&data),
+            season_episode_counts: season_episode_counts_from_detail(&data),
             reference_season_episodes: ref_season
                 .and_then(|n| data.get(format!("season/{n}")))
                 .and_then(|v| v.get("episodes"))
@@ -709,6 +733,7 @@ impl MetadataSource for TmdbClient {
                 year: input.library_year,
                 episode_count: input.library_episode_count,
                 season_count: input.library_season_count,
+                folder_season_counts: input.folder_season_counts.clone(),
                 folder_seasons: input.library_seasons.clone(),
                 ref_season: input.ref_season,
                 ref_episode: input.ref_episode,

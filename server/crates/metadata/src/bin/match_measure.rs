@@ -259,6 +259,9 @@ fn main() {
             ref_season: key.ref_season,
             ref_episode: key.ref_episode,
             ref_episode_title: key.ref_episode_title.clone(),
+            // Measurement bin: the folder's per-season shape is not plumbed
+            // here. Empty is "no evidence", never "no seasons".
+            folder_season_counts: Vec::new(),
         };
         match client.match_search_with_series_shape(kind, &key.title, key.year, library) {
             Ok(Some(c)) if meets_auto_match_floor(c.confidence) => *matched += n,

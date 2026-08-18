@@ -429,6 +429,8 @@ struct QueryGroup {
     library_year: Option<i32>,
     library_episode_count: Option<u32>,
     library_season_count: Option<u32>,
+    /// `(season_number, file_count)` the folder holds, season 0 excluded.
+    folder_season_counts: Vec<(i32, u32)>,
     library_seasons: Vec<i32>,
     ref_season: Option<i32>,
     ref_episode: Option<i32>,
@@ -707,6 +709,7 @@ fn status_query_groups(
                         library_year: None,
                         library_episode_count: None,
                         library_season_count: None,
+                        folder_season_counts: Vec::new(),
                         library_seasons: Vec::new(),
                         ref_season: None,
                         ref_episode: None,
@@ -772,6 +775,23 @@ fn status_query_groups(
                     library_year,
                     library_episode_count: Some(siblings.len() as u32),
                     library_season_count: (!seasons.is_empty()).then_some(seasons.len() as u32),
+                    folder_season_counts: {
+                        // Season 0 excluded, matching the candidate side: a
+                        // `Specials` folder exists independently of whether a
+                        // provider models one.
+                        let mut per: std::collections::HashMap<i32, u32> =
+                            std::collections::HashMap::new();
+                        for sib in siblings {
+                            if let Some(sn) = sib.season
+                                && sn > 0
+                            {
+                                *per.entry(sn).or_insert(0) += 1;
+                            }
+                        }
+                        let mut v: Vec<(i32, u32)> = per.into_iter().collect();
+                        v.sort_by_key(|(s, _)| *s);
+                        v
+                    },
                     library_seasons: {
                         // Season 0 is excluded: a `Specials` folder exists
                         // independently of whether a provider models season 0,
@@ -1905,6 +1925,7 @@ fn search_one_group<T: MetadataSource>(
         library_year: g.library_year,
         library_episode_count: g.library_episode_count,
         library_season_count: g.library_season_count,
+        folder_season_counts: g.folder_season_counts.clone(),
         library_seasons: g.library_seasons.clone(),
         ref_season: g.ref_season,
         ref_episode: g.ref_episode,
@@ -2102,6 +2123,7 @@ fn enrich_one_group<T: MetadataSource>(
         library_year: g.library_year,
         library_episode_count: g.library_episode_count,
         library_season_count: g.library_season_count,
+        folder_season_counts: g.folder_season_counts.clone(),
         library_seasons: g.library_seasons.clone(),
         ref_season: g.ref_season,
         ref_episode: g.ref_episode,

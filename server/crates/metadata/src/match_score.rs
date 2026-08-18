@@ -63,6 +63,13 @@ pub struct LibrarySeriesShape {
     /// hold. Empty means the folder asserts nothing and no coverage evidence
     /// exists.
     pub folder_seasons: Vec<i32>,
+    /// `(season_number, file_count)` the folder holds, season 0 excluded.
+    ///
+    /// Not the same as `season_count` (how many distinct seasons) nor
+    /// `episode_count` (how many files in total). Both of those are magnitudes
+    /// and compare by equality; this is the per-season shape, and it is what
+    /// lets a candidate be asked *how much of this folder could you explain*.
+    pub folder_season_counts: Vec<(i32, u32)>,
     /// ADR-0032 reference episode (usable after-token title only).
     pub ref_season: Option<i32>,
     pub ref_episode: Option<i32>,
@@ -85,6 +92,14 @@ pub struct CandidateShape {
     /// collision tier already fetches. `None` means not fetched, which is not
     /// evidence about the candidate either way.
     pub season_numbers: Option<Vec<i32>>,
+    /// `(season_number, episode_count)` from the same `seasons[]` array
+    /// `season_numbers` is read from — season 0 excluded. `None` means not
+    /// fetched, which is not evidence about the candidate either way.
+    ///
+    /// Carried because a *count of seasons* cannot say whether a candidate could
+    /// hold the folder's files, and a *total episode count* inverts on a folder
+    /// holding more episodes than the entity has. Per-season counts answer both.
+    pub season_episode_counts: Option<Vec<(i32, u32)>>,
     /// `(episode_number, name)` for the folder's reference season, appended to
     /// the same `/tv/{id}` call via `append_to_response=season/{n}`. `None`
     /// means not fetched — no evidence, never a verdict.
@@ -353,7 +368,81 @@ fn sole_season_coverer<'a>(
     winner
 }
 
-/// Season coverage as **promotion evidence for the year pin, never a gate.**
+/// How much of the folder this candidate could explain, counted **per season**.
+///
+/// For each season the folder holds, the number of files the candidate has an
+/// episode for: `min(folder files in that season, candidate episodes in that
+/// season)`. Seasons the candidate does not have contribute nothing.
+///
+/// **This is not the containment test refuted on 2026-08-18**, and the
+/// difference is the whole reason it is safe. That test compared *totals* —
+/// `candidate_eps >= folder_eps` — and inverted on a folder holding more
+/// episodes than the entity has: `Firefly`'s 14 files against an 11-episode
+/// entity failed it, and `Firefly Lane` passed. Counting per season cannot
+/// invert, because a folder season with more files than the entity's season
+/// contributes the entity's count and never disqualifies it.
+///
+/// It is also not `episode_count` or `season_count`, which are magnitudes
+/// compared by **equality** and which a partial library can never satisfy —
+/// `Grand Designs` is 47 against 259, `Will & Grace` 246 against 194.
+fn slots_explained(shape: &CandidateShape, library: &LibrarySeriesShape) -> Option<u32> {
+    let have = shape.season_episode_counts.as_deref()?;
+    if library.folder_season_counts.is_empty() {
+        return None;
+    }
+    let mut n = 0u32;
+    for (fs, files) in &library.folder_season_counts {
+        if let Some((_, eps)) = have.iter().find(|(s, _)| s == fs) {
+            n += (*files).min(*eps);
+        }
+    }
+    Some(n)
+}
+
+/// The primary entity for a folder no single candidate can hold.
+///
+/// **A pin was never the answer for this shape.** `Will & Grace` is 246 files
+/// across two entities of 194 and 52; every pin declined and each was right to.
+/// The folder needs *two* bindings, and ADR-0046 already decided how the first
+/// is chosen:
+///
+/// > "The primary is the entity holding the most files" does not work. File
+/// > counts are downstream of bindings, so a rule keyed on them ratifies
+/// > whatever the matcher already got wrong. … the tiebreak needs **candidate
+/// > evaluation, not a `COUNT(*)`**.
+///
+/// So this counts what each candidate *could explain* about the files the
+/// folder holds, which no existing binding can bias. Measured: `4454` explains
+/// **194**, `74321` explains **52**.
+///
+/// **A clear winner, or nothing.** The leader must explain at least twice the
+/// runner-up — 194 against 52 is 3.7×. Anything closer means the evidence does
+/// not discriminate and the folder stays unpinned, the same one-directional
+/// discipline as every other signal here.
+fn primary_by_slots_explained<'a>(
+    exact: &[&'a SearchHit],
+    shapes: &[CandidateShape],
+    library: &LibrarySeriesShape,
+) -> Option<&'a SearchHit> {
+    const CLEAR_WINNER: u32 = 2;
+    if shapes.len() != exact.len() {
+        return None;
+    }
+    let mut scored: Vec<(u32, &SearchHit)> = exact
+        .iter()
+        .enumerate()
+        .filter_map(|(i, h)| slots_explained(&shapes[i], library).map(|n| (n, *h)))
+        .filter(|(n, _)| *n > 0)
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    let runner_up = scored.get(1).map(|(n, _)| *n).unwrap_or(0);
+    (scored[0].0 >= runner_up.saturating_mul(CLEAR_WINNER).max(1)).then_some(scored[0].1)
+}
+
+// Season coverage as **promotion evidence for the year pin, never a gate.**
 ///
 /// The year selected a candidate that cannot hold the folder — the folder says
 /// `(2003)`, the two-episode 2003 miniseries aired 2003, both facts correct and
@@ -1040,6 +1129,11 @@ pub fn score_search_with_shape_and_sole(
             // is re-attributed. This reaches exactly the folders that were
             // landing at 0.72 with the answer already computed.
             (hit, 0.90, "exact_title_season_coverage")
+        } else if let Some(hit) = primary_by_slots_explained(&exact, shapes, &library) {
+            // No candidate can hold the whole folder — ADR-0046's spanning
+            // case. The primary is the one that explains most of it; the rest
+            // is `bind_second_entities`' job and already ships.
+            (hit, 0.90, "exact_title_slots_explained")
         } else {
             // Prefer first non-empty candidate for the unpinned method payload,
             // but stay below floor.
@@ -1231,6 +1325,7 @@ mod tests {
                 episode_count: Some(327),
                 season_count: Some(15),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1239,6 +1334,7 @@ mod tests {
                 episode_count: Some(8),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1272,6 +1368,7 @@ mod tests {
                 episode_count: Some(40),
                 season_count: Some(5),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1280,6 +1377,7 @@ mod tests {
                 episode_count: Some(40),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1311,6 +1409,7 @@ mod tests {
                 episode_count: Some(40),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1319,6 +1418,7 @@ mod tests {
                 episode_count: Some(40),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1352,6 +1452,7 @@ mod tests {
                 episode_count: Some(181),
                 season_count: Some(9),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1360,6 +1461,7 @@ mod tests {
                 episode_count: Some(12),
                 season_count: Some(2),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1394,6 +1496,7 @@ mod tests {
                 episode_count: Some(73),
                 season_count: Some(4),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1402,6 +1505,7 @@ mod tests {
                 episode_count: Some(2),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1456,6 +1560,7 @@ mod tests {
                 episode_count: Some(0),
                 season_count: Some(0),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1464,6 +1569,7 @@ mod tests {
                 episode_count: Some(3),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1496,6 +1602,7 @@ mod tests {
             episode_count: Some(0),
             season_count: Some(0),
             season_numbers: None,
+            season_episode_counts: None,
             reference_season_episodes: None,
             candidate_season_episodes: None,
         }];
@@ -1524,6 +1631,7 @@ mod tests {
                 episode_count: Some(0),
                 season_count: Some(0),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1532,6 +1640,7 @@ mod tests {
                 episode_count: Some(20),
                 season_count: Some(2),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1558,6 +1667,7 @@ mod tests {
             episode_count: Some(1),
             season_count: Some(1),
             season_numbers: None,
+            season_episode_counts: None,
             reference_season_episodes: None,
             candidate_season_episodes: None,
         }];
@@ -1896,6 +2006,7 @@ mod tests {
                 episode_count: Some(73),
                 season_count: Some(4),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1904,6 +2015,7 @@ mod tests {
                 episode_count: Some(2),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1912,6 +2024,7 @@ mod tests {
                 episode_count: Some(24),
                 season_count: Some(1),
                 season_numbers: None,
+                season_episode_counts: None,
                 reference_season_episodes: None,
                 candidate_season_episodes: None,
             },
@@ -1941,6 +2054,7 @@ mod tests {
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
+            season_episode_counts: None,
             reference_season_episodes: Some(eps.iter().map(|(n, t)| (*n, t.to_string())).collect()),
             candidate_season_episodes: None,
         }
@@ -2146,6 +2260,137 @@ mod tests {
         );
     }
 
+    /// Will & Grace: 246 files across two entities of 194 and 52. Every pin
+    /// declines and each is right to — the folder needs two bindings. The
+    /// primary is the entity that explains most of what the folder holds.
+    #[test]
+    fn a_spanning_folder_takes_the_entity_that_explains_most_of_it() {
+        let hits = vec![
+            tv(4454, "Will & Grace", 1998),
+            tv(74321, "Will & Grace", 2017),
+        ];
+        let mut orig = shape(1998, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        orig.episode_count = Some(194);
+        orig.season_count = Some(8);
+        orig.season_episode_counts = Some(vec![
+            (1, 22),
+            (2, 24),
+            (3, 25),
+            (4, 27),
+            (5, 24),
+            (6, 24),
+            (7, 24),
+            (8, 24),
+        ]);
+        let mut rev = shape(2017, &[1, 2, 3]);
+        rev.episode_count = Some(52);
+        rev.season_count = Some(3);
+        rev.season_episode_counts = Some(vec![(1, 16), (2, 18), (3, 18)]);
+        let shapes = [orig, rev];
+        let library = LibrarySeriesShape {
+            year: None,
+            episode_count: Some(246),
+            season_count: Some(11),
+            folder_seasons: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            folder_season_counts: vec![
+                (1, 22),
+                (2, 24),
+                (3, 25),
+                (4, 27),
+                (5, 24),
+                (6, 24),
+                (7, 24),
+                (8, 24),
+                (9, 16),
+                (10, 18),
+                (11, 18),
+            ],
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Will & Grace",
+            None,
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.tmdb_id, 4454, "194 explained against 52");
+        assert_eq!(c.method, "exact_title_slots_explained");
+        assert!(meets_auto_match_floor(c.confidence));
+    }
+
+    /// Two candidates that explain comparably leave the folder unpinned. The
+    /// margin must be a factor of two; 100 against 90 is not evidence.
+    #[test]
+    fn a_close_slots_race_does_not_pick_a_primary() {
+        let hits = vec![tv(1, "Test Show", 1998), tv(2, "Test Show", 2017)];
+        let mut a = shape(1998, &[1, 2]);
+        a.season_episode_counts = Some(vec![(1, 10), (2, 10)]);
+        let mut b = shape(2017, &[1, 2]);
+        b.season_episode_counts = Some(vec![(1, 9), (2, 9)]);
+        let shapes = [a, b];
+        let library = LibrarySeriesShape {
+            year: None,
+            episode_count: Some(20),
+            season_count: Some(2),
+            folder_seasons: vec![1, 2],
+            folder_season_counts: vec![(1, 10), (2, 10)],
+            ..Default::default()
+        };
+        let c = score_search_with_shape(
+            &hits,
+            "Test Show",
+            None,
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(c.method, "exact_title_collision_unpinned");
+        assert!(!meets_auto_match_floor(c.confidence));
+    }
+
+    /// **Not containment.** A folder holding more files in a season than the
+    /// entity has episodes must not disqualify that entity — that inversion is
+    /// what moved Firefly to `Firefly Lane` under the refuted total-comparison
+    /// test. Per-season counting takes the entity's count and carries on.
+    #[test]
+    fn a_folder_season_larger_than_the_entitys_does_not_disqualify_it() {
+        let hits = vec![tv(1437, "Firefly", 2002), tv(87049, "Firefly Lane", 2021)];
+        let mut real = shape(2002, &[1]);
+        real.season_episode_counts = Some(vec![(1, 11)]);
+        let mut other = shape(2021, &[1, 2]);
+        other.season_episode_counts = Some(vec![(1, 10), (2, 16)]);
+        let shapes = [real, other];
+        let library = LibrarySeriesShape {
+            year: None,
+            episode_count: Some(14),
+            season_count: Some(1),
+            folder_seasons: vec![1],
+            // 14 files in season 1; the entity has 11. Containment said no.
+            folder_season_counts: vec![(1, 14)],
+            ..Default::default()
+        };
+        assert_eq!(
+            slots_explained(&shapes[0], &library),
+            Some(11),
+            "the entity explains its 11, and the folder's extras do not veto it"
+        );
+        assert_eq!(slots_explained(&shapes[1], &library), Some(10));
+        let c = score_search_with_shape(
+            &hits,
+            "Firefly",
+            None,
+            SearchKind::Tv,
+            library,
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_ne!(c.tmdb_id, 87049, "never Firefly Lane");
+    }
+
     /// Confirmation absent: the year pin holds, unchanged and undemoted.
     #[test]
     fn absent_confirmation_leaves_the_year_pin_alone() {
@@ -2236,6 +2481,7 @@ mod tests {
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
+            season_episode_counts: None,
             reference_season_episodes: None,
             candidate_season_episodes: None,
         }
@@ -2319,6 +2565,7 @@ mod tests {
             episode_count: None,
             season_count: None,
             season_numbers: None,
+            season_episode_counts: None,
             reference_season_episodes: None,
             candidate_season_episodes: None,
         };
