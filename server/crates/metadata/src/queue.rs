@@ -1003,14 +1003,23 @@ pub fn bind_resolved_items_classified<T: MetadataSource>(
                 // is residue and records nothing, not a token shipped empty.
                 return Ok((stats, unplaced));
             }
-            // One file may cover several episode numbers (ADR-0025 §2 range).
-            let mut by_se: std::collections::HashMap<(i32, i32), i64> =
+            // One file may cover several episode numbers (ADR-0025 §2 range),
+            // and one slot may hold several files — the Bluray and the WEBRip
+            // of the same episode are two files of one item, which §2 decided
+            // and this used to discard by keeping whichever came last.
+            let mut slot_members: std::collections::HashMap<(i32, i32), Vec<&EpisodeSlot>> =
                 std::collections::HashMap::new();
             for row in &rows {
                 for (s, e) in row.season_episodes() {
-                    by_se.insert((s, e), row.id);
+                    slot_members.entry((s, e)).or_default().push(row);
                 }
             }
+            // Extras are excluded here, once, so both the link site and the
+            // classification below read the same answer.
+            let by_se: std::collections::HashMap<(i32, i32), Vec<i64>> = slot_members
+                .iter()
+                .map(|(k, members)| (*k, slot_members_that_link(members)))
+                .collect();
             // What the bind learns as it goes, kept for the classification
             // below. Not a second lookup — the same values, retained.
             let mut seasons_absent: std::collections::HashSet<i32> =
@@ -1039,13 +1048,18 @@ pub fn bind_resolved_items_classified<T: MetadataSource>(
                         continue;
                     };
                     projected.insert((s, e));
-                    let Some(media_id) = by_se.get(&(s, e)) else {
+                    let Some(media_ids) = by_se.get(&(s, e)) else {
                         continue;
                     };
                     let Some(key) = item_key_for_metadata(ep) else {
                         continue;
                     };
-                    keys_by_media.entry(*media_id).or_default().push(key);
+                    for media_id in media_ids {
+                        keys_by_media
+                            .entry(*media_id)
+                            .or_default()
+                            .push(key.clone());
+                    }
                 }
                 let tx = conn
                     .unchecked_transaction()
@@ -1068,7 +1082,7 @@ pub fn bind_resolved_items_classified<T: MetadataSource>(
                         UnplacedCause::SeasonOutOfRange
                     } else if !projected.contains(&(s, e)) {
                         UnplacedCause::EpisodeOutOfRange
-                    } else if by_se.get(&(s, e)) != Some(&row.id) {
+                    } else if !by_se.get(&(s, e)).is_some_and(|ids| ids.contains(&row.id)) {
                         UnplacedCause::DuplicateSlot
                     } else {
                         // The slot projected, this file holds it, and still no
@@ -1379,6 +1393,9 @@ struct EpisodeSlot {
     season: Option<i32>,
     episode: Option<i32>,
     path: String,
+    /// Probed runtime. `None` is **no evidence** and never excludes a file —
+    /// see [`slot_members_that_link`].
+    duration_ms: Option<i64>,
 }
 
 impl EpisodeSlot {
@@ -1407,10 +1424,55 @@ impl EpisodeSlot {
     }
 }
 
+/// Which files in one season/episode slot are versions of that episode.
+///
+/// ADR-0025 §2 already decided this: *"Multiple versions of one film (4K remux +
+/// 1080p, or Bluray + WEBDL) — one `item_key`, several media files."* The bind
+/// did not implement it, keeping whichever file came last and leaving the rest
+/// `unmatched`.
+///
+/// **The exception is extras.** A folder holds
+/// `American Gigg-Olo - Cat Scene (Uncensored)` beside the episode: 48 seconds
+/// against 22.9 minutes. Linking it as a version puts a clip in the episode's
+/// `item_key`, and ADR-0022 §5's version selection is then free to play the clip
+/// when someone asked for the episode. **That is playing the wrong thing** —
+/// worse than the arbitrary-but-whole-episode file the bind kept before.
+///
+/// **Duration, not filename tokens.** Measured over the 30 files in this state:
+/// versions sit at **0.98–1.02** of the longest file in their slot and the two
+/// real extras at **0.50** and **0.03**, so any threshold in 0.55–0.95
+/// separates them. Tokens would have been *less* accurate, not merely less
+/// robust — `Family Guy - S20E17 - All About Alana.mkv` carries no scene marker
+/// and is a genuine version.
+///
+/// **A file with no probed duration links.** `None` is no evidence, never a
+/// verdict — the same one-directional rule as `compare_episode_title` and
+/// `candidate_covers_folder_seasons`. A filter written the obvious way would
+/// exclude it.
+fn slot_members_that_link(members: &[&EpisodeSlot]) -> Vec<i64> {
+    const MIN_RATIO: f64 = 0.75;
+    // The reference is the longest file present, not the one the old code
+    // happened to keep and not the provider's runtime: the former was
+    // arbitrary, the latter is absent for some episodes and would cost a call.
+    let longest = members
+        .iter()
+        .filter_map(|m| m.duration_ms)
+        .filter(|d| *d > 0)
+        .max();
+    members
+        .iter()
+        .filter(|m| match (longest, m.duration_ms) {
+            (Some(long), Some(d)) if d > 0 => (d as f64) / (long as f64) >= MIN_RATIO,
+            _ => true,
+        })
+        .map(|m| m.id)
+        .collect()
+}
+
 fn episode_slots(conn: &Connection, ids: &[i64]) -> Result<Vec<EpisodeSlot>, String> {
     let mut out = Vec::with_capacity(ids.len());
     let mut stmt = conn
-        .prepare("SELECT id, season, episode, path FROM media_items WHERE id = ?1")
+        .prepare("SELECT id, season, episode, path, duration_ms FROM media_items WHERE id = ?1")
         .map_err(|e| format!("prepare episode slots: {e}"))?;
     for id in ids {
         let row = stmt
@@ -1420,6 +1482,7 @@ fn episode_slots(conn: &Connection, ids: &[i64]) -> Result<Vec<EpisodeSlot>, Str
                     season: r.get(1)?,
                     episode: r.get(2)?,
                     path: r.get(3)?,
+                    duration_ms: r.get(4)?,
                 })
             })
             .map_err(|e| format!("episode slot {id}: {e}"))?;
@@ -2983,10 +3046,15 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("episode_out_of_range"));
     }
 
-    /// Two files, one slot. The loser records the cause; **which file wins is
-    /// not this slice's decision** (ADR-0025 §2) and the winner is untouched.
+    /// Two files, one slot, **both link** — ADR-0025 §2's "Bluray + WEBDL:
+    /// one `item_key`, several media files", which the bind used to discard by
+    /// keeping whichever came last.
+    ///
+    /// Replaces `unplaced_records_duplicate_slot_and_leaves_the_winner_alone`,
+    /// which asserted the discarding behaviour. Neither file here has a probed
+    /// duration, so this also pins decision 4: **absent duration links**.
     #[test]
-    fn unplaced_records_duplicate_slot_and_leaves_the_winner_alone() {
+    fn two_versions_of_one_episode_both_link() {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         c.execute_batch(
@@ -3007,40 +3075,80 @@ mod tests {
             DrainOptions::default(),
         )
         .unwrap();
-        assert_eq!(s.items_ready, 1);
-        assert_eq!(s.items_unmatched, 1);
+        assert_eq!(s.items_ready, 2, "both versions are the episode");
+        assert_eq!(s.items_unmatched, 0);
 
-        let winner: (String, Option<String>, Option<String>) = c
+        let with_key: i64 = c
             .query_row(
-                "SELECT metadata_status, metadata_unmatched_reason, metadata_match_method
-                 FROM media_items WHERE metadata_status = 'ready'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(winner.0, "ready");
-        assert_eq!(winner.1, None, "the winner carries no failure reason");
-        let loser: Option<String> = c
-            .query_row(
-                "SELECT metadata_unmatched_reason FROM media_items
-                 WHERE metadata_status = 'unmatched'",
+                "SELECT COUNT(*) FROM media_item_links WHERE item_key LIKE 'tmdb:episode:%'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(loser.as_deref(), Some("duplicate_slot"));
-        // The loser keeps its show link and loses only the episode slot.
-        let loser_ep: i64 = c
+        assert_eq!(with_key, 2, "both files carry the episode key");
+        let distinct_keys: i64 = c
+            .query_row(
+                "SELECT COUNT(DISTINCT item_key) FROM media_item_links
+                 WHERE item_key LIKE 'tmdb:episode:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct_keys, 1, "one item, several files");
+    }
+
+    /// An extra is not a version. 48 seconds against a 22-minute episode is the
+    /// measured shape (`American Gigg-Olo - Cat Scene (Uncensored)`), and
+    /// linking it would let ADR-0022 §5 play the clip when someone asked for
+    /// the episode.
+    #[test]
+    fn a_much_shorter_file_in_the_slot_does_not_link() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode, duration_ms)
+             VALUES
+               (1, 'Beta/Season 01/Beta.S01E01.mkv', 1, 1, 'Beta', 'episode', 1, 1, 1374000),
+               (1, 'Beta/Season 01/Beta.S01E01 - Cat Scene.mkv', 1, 1, 'Beta', 'episode', 1, 1, 48000);",
+        )
+        .unwrap();
+        let s = drain_pending(
+            &c,
+            &Resolver {
+                tmdb: PartialSeasonSource,
+            },
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            DrainOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.items_ready, 1, "the episode links");
+        assert_eq!(s.items_unmatched, 1, "the clip does not");
+
+        let clip_reason: Option<String> = c
+            .query_row(
+                "SELECT metadata_unmatched_reason FROM media_items
+                 WHERE path LIKE '%Cat Scene%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            clip_reason.as_deref(),
+            Some("duplicate_slot"),
+            "another file holds the slot, which is still what happened"
+        );
+        let clip_keys: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM media_item_links l
                  JOIN media_items m ON m.id = l.media_item_id
-                 WHERE m.metadata_status = 'unmatched'
-                   AND l.item_key LIKE 'tmdb:episode:%'",
+                 WHERE m.path LIKE '%Cat Scene%' AND l.item_key LIKE 'tmdb:episode:%'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(loser_ep, 0);
+        assert_eq!(clip_keys, 0, "the clip never enters the episode's item");
     }
 
     /// The residue. A file the bind cannot place for any of the three reasons
