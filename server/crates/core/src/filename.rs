@@ -629,6 +629,38 @@ fn strip_site_prefix(stem: &str) -> &str {
     }
 }
 
+/// Cut a title at a closing bracket it never opened.
+///
+/// **The mirror of [`back_up_to_open_bracket`].** That handles a bracket the
+/// title opened and did not close; this handles one the title closes without
+/// having opened — `Anime Series Title][12END][720p]`, where everything from
+/// the stray `]` on belongs to a group the title is not part of.
+///
+/// **Square brackets only.** `(` and `)` appear inside real titles; an Arabic
+/// corpus case that passes today carries a stray `)` and cutting there breaks
+/// it. `[` and `]` are release-group syntax and nothing else.
+fn cut_at_unmatched_close(s: &str) -> String {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '【' => depth += 1,
+            ']' | '】' => {
+                if depth == 0 {
+                    let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
+                    return if head.is_empty() {
+                        s.to_string()
+                    } else {
+                        head.to_string()
+                    };
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    s.to_string()
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let whole = strip_extension(file_name);
@@ -642,9 +674,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
 
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_episode_marker(&cut_at_absolute_episode(&cut_at_title_junk(&cut_stem_at(
-                stem, before,
-            ))))
+            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
+                &cut_at_title_junk(&cut_stem_at(stem, before)),
+            )))
         });
         let end = if episode_end > episode {
             Some(episode_end)
@@ -670,7 +702,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // the year branch, which would otherwise call a pack a movie.
     if let Some((before, season)) = find_bare_season(&normalized) {
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_episode_marker(&cut_at_title_junk(&cut_stem_at(stem, before)))
+            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_title_junk(&cut_stem_at(
+                stem, before,
+            ))))
         });
         return ParsedName {
             title: if title.is_empty() {
@@ -704,8 +738,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         }
         None => cut_at_title_junk(&clean_title(stem)),
     };
-    let title =
-        run_title.unwrap_or_else(|| cut_at_episode_marker(&cut_at_absolute_episode(&title)));
+    let title = run_title.unwrap_or_else(|| {
+        cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(&title)))
+    });
 
     ParsedName {
         title: if title.is_empty() {
@@ -2087,6 +2122,35 @@ mod tests {
         assert_eq!(p.season, Some(4));
         assert_eq!(p.episode, Some(11));
         assert_eq!(p.title, "Anon Show");
+    }
+
+    /// The mirror of `a_cut_inside_a_bracket_backs_out_to_the_bracket`: a
+    /// title cannot contain a bracket it never opened. Everything from the
+    /// stray `]` on belongs to a group the title is not part of.
+    #[test]
+    fn a_title_ends_at_a_bracket_it_never_opened() {
+        assert_eq!(
+            parse_filename("Anon Series Title][12END][720p][繁体]").title,
+            "Anon Series Title"
+        );
+        assert_eq!(
+            parse_filename("Anon Series Title!][04][1080P][繁體][MP4]").title,
+            "Anon Series Title!"
+        );
+        // A bracket the title does open and close is still its own.
+        assert_eq!(
+            parse_filename("Anon [Bracketed] Film (2011).mkv").title,
+            "Anon [Bracketed] Film"
+        );
+    }
+
+    /// **Square brackets only.** `(` and `)` appear inside real titles — an
+    /// Arabic corpus case that passes today carries a stray `)` — while `[`
+    /// and `]` are release-group syntax and nothing else.
+    #[test]
+    fn a_stray_parenthesis_does_not_end_a_title() {
+        let p = parse_filename("Anon nf) Anon Anon 2024 3 3");
+        assert!(p.title.starts_with("Anon nf)"), "got {:?}", p.title);
     }
 
     #[test]
