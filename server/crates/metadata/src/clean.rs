@@ -1,5 +1,6 @@
 //! Filename / folder title cleaning for search inputs.
 
+use nightjar_db::show_folder_relpath;
 use std::path::Path;
 
 /// Prefer folder `Title (Year)` over probe year (movies: parent of the file).
@@ -8,19 +9,42 @@ pub fn year_from_path(path: &str) -> Option<i32> {
     year_in_parens(parent)
 }
 
-/// Show-root folder year for `…/Show Name (2001)/Season 1/…`.
+/// Show-folder year for `…/Show Name (2001)/…`, by the shipped show-folder rule.
 ///
-/// Walks exactly two parents above the file. That is path-form sensitive when
-/// the **library root is the show folder**: absolute
-/// `…/Show (2001)/Season 1/ep.mkv` still yields `(2001)`, but the same file
-/// stored as relpath `Season 1/ep.mkv` has no show-folder component left.
-/// Normal `library/Show (YYYY)/Season N/…` keeps the same answer under both
-/// absolute and relative storage. Pin path form when reproing
-/// `series_library_year` / collision-pin year misses — do not conflate with
-/// a media_items.path → relpath migration (ADR-0030).
+/// **Which directory is the show folder is [`show_folder_relpath`]'s question,
+/// not this function's.** ADR-0033 Q2 defines it as the first directory
+/// component from the file up that is not season-named, and says the rule exists
+/// so that every consumer agrees on the folder key. This reads the year off
+/// whatever that rule returns.
+///
+/// It used to walk exactly two parents instead, which agrees with the rule for
+/// `Show (2001)/Season 01/ep.mkv` and disagrees for a **flat** layout —
+/// `Show (2001)/ep.mkv`, where two parents up is the library root and the year
+/// in the folder name was never read. The matcher oracle measures the
+/// difference on a controlled pair: `tv.sonarr.plain` and `tv.flat.titled`
+/// render the same filename for the same entities and differ only in layout,
+/// and all 137 rows the flat shape left unmatched are correct in the other. With
+/// no year, an exact-title collision has nothing to pin it and the group goes
+/// below threshold.
+///
+/// `library_root` is what tells "the last component is the show folder" from
+/// "the last component is the library root" — pass the library's own root.
+/// `""` degrades to reading the deepest non-season component, which is right for
+/// a relpath and can pick a year off an unrelated ancestor of an absolute path.
+/// It exists for the measurement binaries, which have no library root to pass.
+///
+/// Still parenthesised-year only (`year_in_parens`): `Show 2001` yields nothing,
+/// before and after. And a show folder *below* the season directory —
+/// `Show (2001)/Season 01/Disc 1/ep.mkv` — is outside the ADR-0033 rule itself,
+/// so both helpers agree and both return nothing.
+pub fn year_from_show_folder_at(path: &str, library_root: &str) -> Option<i32> {
+    let folder = show_folder_relpath(path, library_root);
+    year_in_parens(folder.rsplit('/').next().unwrap_or(""))
+}
+
+/// [`year_from_show_folder_at`] with no library root. See its note on `""`.
 pub fn year_from_show_folder(path: &str) -> Option<i32> {
-    let show = Path::new(path).parent()?.parent()?.file_name()?.to_str()?;
-    year_in_parens(show)
+    year_from_show_folder_at(path, "")
 }
 
 /// Series premiere year from library: earliest non-null episode `year`, else
@@ -28,6 +52,7 @@ pub fn year_from_show_folder(path: &str) -> Option<i32> {
 pub fn series_library_year(
     episode_years: impl IntoIterator<Item = Option<i32>>,
     episode_path: &str,
+    library_root: &str,
 ) -> Option<i32> {
     let mut min_y: Option<i32> = None;
     for y in episode_years.into_iter().flatten() {
@@ -38,7 +63,7 @@ pub fn series_library_year(
             });
         }
     }
-    min_y.or_else(|| year_from_show_folder(episode_path))
+    min_y.or_else(|| year_from_show_folder_at(episode_path, library_root))
 }
 
 fn year_in_parens(s: &str) -> Option<i32> {
@@ -822,14 +847,17 @@ mod tests {
 
     #[test]
     fn series_library_year_prefers_episode_then_show_folder() {
+        // The library root these absolute paths sit under. It is what tells the
+        // show folder from the root, so it is passed rather than guessed.
+        let root = "/Volumes/media/TV Shows";
         let path = "/Volumes/media/TV Shows/Scrubs (2001)/Season 1/Scrubs - 1x01.mkv";
-        assert_eq!(series_library_year([None, None], path), Some(2001));
+        assert_eq!(series_library_year([None, None], path, root), Some(2001));
         assert_eq!(
-            series_library_year([Some(2005), Some(2001), None], path),
+            series_library_year([Some(2005), Some(2001), None], path, root),
             Some(2001)
         );
         assert_eq!(
-            series_library_year([None], "/Volumes/media/TV Shows/Bones/Season 1/x.mkv"),
+            series_library_year([None], "/Volumes/media/TV Shows/Bones/Season 1/x.mkv", root),
             None
         );
         // Normal layout: absolute and library-relative agree.
@@ -845,6 +873,49 @@ mod tests {
             Some(2001)
         );
         assert_eq!(year_from_show_folder("Season 1/x.mkv"), None);
+    }
+
+    /// A flat layout keeps its show-folder year. The two-parent walk this
+    /// replaced returned `None` here, because two parents above the file is the
+    /// library root when there is no season directory in between — and
+    /// `show_folder_relpath` calls the same folder the show folder. The oracle
+    /// scores 137 rows on the difference.
+    #[test]
+    fn series_library_year_reads_a_flat_show_folder() {
+        let root = "/Volumes/media/TV Shows";
+        for path in [
+            "/Volumes/media/TV Shows/Scrubs (2001)/Scrubs - S01E01 - My Old Lady.mkv",
+            "Scrubs (2001)/Scrubs - S01E01 - My Old Lady.mkv",
+        ] {
+            assert_eq!(
+                year_from_show_folder_at(path, root),
+                Some(2001),
+                "flat layout should read its show-folder year: {path}"
+            );
+            assert_eq!(series_library_year([None], path, root), Some(2001));
+        }
+        // An episode year still wins over the folder.
+        assert_eq!(
+            series_library_year(
+                [Some(1999)],
+                "Scrubs (2001)/Scrubs - S01E01.mkv",
+                root
+            ),
+            Some(1999)
+        );
+        // Season and Specials directories still inherit the show folder.
+        assert_eq!(
+            year_from_show_folder_at("Scrubs (2001)/Specials/Scrubs - S00E01.mkv", root),
+            Some(2001)
+        );
+        // The library root is not a show folder, so its own year is not one
+        // either: the root *is* the show folder here and nothing remains above.
+        assert_eq!(
+            year_from_show_folder_at("Season 1/x.mkv", "/Volumes/media/Scrubs (2001)"),
+            None
+        );
+        // Unparenthesised years are still not years.
+        assert_eq!(year_from_show_folder_at("Scrubs 2001/x.mkv", root), None);
     }
 
     #[test]

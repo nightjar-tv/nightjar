@@ -794,7 +794,7 @@ fn status_query_groups(
                     .first()
                     .map(|s| s.library_path.as_str())
                     .unwrap_or(it.library_path.as_str());
-                let library_year = series_library_year(years, path0);
+                let library_year = series_library_year(years, path0, library_path0);
                 let seasons: std::collections::HashSet<i32> =
                     siblings.iter().filter_map(|s| s.season).collect();
                 let ref_eps: Vec<(i32, i32, &str)> = siblings

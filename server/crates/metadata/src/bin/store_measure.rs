@@ -208,7 +208,7 @@ fn main() {
     for (ct, rows) in ep_raw {
         let years = rows.iter().map(|r| r.year);
         let path0 = rows[0].path.clone();
-        let library_year = series_library_year(years, &path0);
+        let library_year = series_library_year(years, &path0, "");
         let seasons: HashSet<i32> = rows.iter().filter_map(|r| r.season).collect();
         let q = ShowQuery {
             title: ct,

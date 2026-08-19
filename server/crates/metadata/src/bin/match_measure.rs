@@ -188,7 +188,7 @@ fn main() {
         episode_total += rows.len();
         let years = rows.iter().map(|r| r.year);
         let path0 = rows[0].path.clone();
-        let library_year = series_library_year(years, &path0);
+        let library_year = series_library_year(years, &path0, "");
         let episode_count = Some(rows.len() as u32);
         let seasons: HashSet<i32> = rows.iter().filter_map(|r| r.season).collect();
         let season_count = (!seasons.is_empty()).then_some(seasons.len() as u32);
