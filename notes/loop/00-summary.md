@@ -120,6 +120,88 @@ A zero can mean "nothing is there" or "the code never ran", and they are the sam
 number. Check which before believing either — including when the instrument is
 your own shell command.
 
+### The cache was copied from the N150 — the harness is now complete on the Mac
+
+Done 2026-08-19, **zero provider requests**: a file copy, not a warm run.
+
+The N150 is `nightjar@192.168.1.183`, reachable from the Mac over Tailscale as
+`nightjar-dev.lonk-halfbeak.ts.net`. Its layout is the one
+`nightjar-meta/scripts/rc9_deploy_dogfood.sh` documents: everything lives in
+`~/gate2/`.
+
+Copied to `~/nightjar-wt-loop-scratch/replay/`:
+
+| artefact | size | check |
+|---|---:|---|
+| `tmdb-cache/` | 383 MB, **8,182 entries** | file-list md5 `c5515e99…` matches the N150 exactly; `__404__` sentinels survived |
+| `capture-media.jsonl` | 9.7 MB | 25,004 items |
+| `capture-media-v2.jsonl` | 10 MB | same plus a `year` column |
+| `capture-nfo.jsonl` | 145 MB | see the gap below |
+
+**The cache is complete for a full-library run.** The N150's logs hold several
+strict runs against it:
+
+    DONE groups=4958 ready=24923 unmatched=81 pending=0 errors=0 requests=0 secs=55.9
+    DONE groups=4977 ready=24942 unmatched=62 pending=0 errors=0 requests=0 secs=54.7
+
+`requests=0` on the full 25,004-item library in under a minute. That is the
+instrument working offline, and it is the cache that was copied.
+
+Nothing on the N150 was modified — the session read and streamed a tar to
+stdout, nothing else.
+
+### Two gaps to close before a strict pair runs on the Mac
+
+**1. The capture carries the N150's paths.** Every row says
+`library_path: /mnt/media/Movies`. The Mac mounts the same media over SMB at
+`/Volumes/media/Movies`. The drain reads NFOs from the real path at resolve
+time, so on the Mac every NFO route would miss silently and the run would
+measure a different library while reporting success — the exact failure
+`nightjar-meta/notes/replay-harness-2026-08-18.md` warns about. Either rewrite
+`library_path` in the capture, or set `NIGHTJAR_MEASURE_NO_NFO=1` on **both**
+arms.
+
+**2. `capture-nfo.jsonl` exists and nothing consumes it.** All ten `replay.rs`
+copies on the N150 were checked: none mentions NFOs at all. On the N150 that
+never mattered, because the media is local and the real paths resolve. So the
+"three parts" in the harness note are really two parts plus a capture that was
+made and never wired in. Wiring it in is the clean fix for any host without the
+media at the captured path.
+
+### Recipe on the Mac
+
+    J=~/.claude/jobs/13c074c6/tmp          # replay.rs, apply_harness.py, reference tree
+    R=~/nightjar-wt-loop-scratch/replay    # cache + captures, copied from the N150
+
+    cp -R server /tmp/tree/server
+    python3 $J/apply_harness.py $J/conf/server /tmp/tree/server   # TMDB cache + strict + NFO switch
+    cp $J/conf/server/crates/api/src/bin/replay.rs /tmp/tree/server/crates/api/src/bin/
+    python3 ~/Documents/GitHub/nightjar-meta/notes/scripts/replay_add_reparse.py /tmp/tree
+    cargo build --release --bin replay -p nightjar-api
+
+    NIGHTJAR_DATA_DIR=/tmp/data-ctl \
+    NIGHTJAR_CAPTURE=$R/capture-media-v2.jsonl \
+    NIGHTJAR_TMDB_CACHE=$R/tmdb-cache \
+    NIGHTJAR_TMDB_CACHE_STRICT=1 \
+    NIGHTJAR_REPARSE=1 \
+    ./target/release/replay
+
+**`NIGHTJAR_REPARSE=1` is not optional for a parser change.** Without it the
+replay inserts the *captured* parse and the change under test never runs. Both
+arms must set it, because re-parsing with today's parser does not reproduce the
+scanner that made the capture — the baseline moves, and that is only sound if
+both arms move together.
+
+### Where to measure
+
+**The N150 is still the cheapest place**: its paths already match the capture,
+its strict runs take ~55 seconds, and the media is local so the NFO route is
+real without any rewrite.
+
+The Mac is now viable for **writing and unit-testing** the three-part slice, and
+for a strict pair once gap 1 is closed. It was never blocked on the harness —
+only on one directory, and that directory is here now.
+
 ### What the corpus still cannot say
 
 The corpus is **parse-level**. No provider, no search, no candidates. It says
