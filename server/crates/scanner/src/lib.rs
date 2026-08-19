@@ -17,7 +17,7 @@ pub use walk::{
 };
 pub use watch::spawn_library_watcher;
 
-use nightjar_core::{MediaKind, parse_filename};
+use nightjar_core::parse_filename;
 use nightjar_db::{
     Db, ItemPathRow, UpsertItem, fold_path, resolve_media_path, show_folder_relpath, to_relpath,
 };
@@ -26,28 +26,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The title an item takes when its filename carries none.
+/// The title an episode takes when its filename carries none.
 ///
 /// `parse_filename` returns an empty title when the name has no series title
 /// in it at all — `S03E09 WS PDTV XviD FUtV`, `1x04`. The folder carries the
 /// title in that layout, and **the scanner is the layer that has the folder**;
 /// the parser only ever sees a basename.
 ///
-/// For an episode this is the show folder, so `Season 1/` and `Specials/` walk
-/// up to it — the same [`show_folder_relpath`] the queue groups by, so the two
-/// cannot disagree. For a movie it is the containing folder. A file sitting
-/// directly in the library root has no folder to borrow from and keeps the
-/// empty title, which `drain_pending` then refuses to search on.
-fn title_from_folder(stored: &str, library_root: &str, kind: MediaKind) -> String {
-    let folder = match kind {
-        MediaKind::Episode => show_folder_relpath(stored, library_root),
-        _ => {
-            let mut parts: Vec<&str> = stored.split('/').collect();
-            parts.pop();
-            parts.join("/")
-        }
-    };
-    folder
+/// The folder is the show folder, so `Season 1/` and `Specials/` walk up to it
+/// — the same [`show_folder_relpath`] the queue groups by, so the two cannot
+/// disagree. A file sitting directly in the library root has no folder to
+/// borrow from and keeps the empty title, which `drain_pending` then refuses to
+/// search on.
+///
+/// **Only an episode reaches this.** The parser's movie and season-pack arms
+/// substitute the stem rather than return an empty title, so a movie whose name
+/// is only release junk keeps `1080p x264` as its title. Giving it a folder
+/// instead means changing the rule in `cut_at_title_junk` that a name of only
+/// junk keeps its junk, and that is a change with its own blast radius and its
+/// own measurement, not a branch to leave here untaken.
+fn title_from_folder(stored: &str, library_root: &str) -> String {
+    show_folder_relpath(stored, library_root)
         .rsplit('/')
         .next()
         .unwrap_or_default()
@@ -278,7 +277,7 @@ pub fn hint_ingest(
         mtime_ms,
         size_bytes,
         title: if parsed.title.is_empty() {
-            title_from_folder(&store_path, &library_root, parsed.kind)
+            title_from_folder(&store_path, &library_root)
         } else {
             parsed.title
         },
@@ -737,7 +736,7 @@ fn run_index_pass(
                         mtime_ms: file.mtime_ms,
                         size_bytes: file.size_bytes,
                         title: if parsed.title.is_empty() {
-                            title_from_folder(&store_path, &library_root, parsed.kind)
+                            title_from_folder(&store_path, &library_root)
                         } else {
                             parsed.title
                         },
@@ -3662,7 +3661,7 @@ mod tests {
 #[cfg(test)]
 mod folder_title_tests {
     use super::title_from_folder;
-    use nightjar_core::MediaKind;
+    use nightjar_core::parse_filename;
 
     /// The scanner is the layer that has the folder. `parse_filename` only
     /// ever sees a basename, so a name carrying no title at all — `S01E04.mkv`
@@ -3678,26 +3677,8 @@ mod folder_title_tests {
             // No season directory at all.
             ("Anon Show/1x04.mkv", "Anon Show"),
         ] {
-            assert_eq!(
-                title_from_folder(rel, "/media/TV", MediaKind::Episode),
-                want,
-                "{rel}"
-            );
+            assert_eq!(title_from_folder(rel, "/media/TV"), want, "{rel}");
         }
-    }
-
-    /// A movie takes its containing folder, which is where the year lives too
-    /// — `clean_movie_title` reads it downstream.
-    #[test]
-    fn a_movie_borrows_its_containing_folder() {
-        assert_eq!(
-            title_from_folder(
-                "Anon Film (2019)/1080p.x264.mkv",
-                "/media/movies",
-                MediaKind::Movie
-            ),
-            "Anon Film (2019)"
-        );
     }
 
     /// **A file directly in the library root has no folder to borrow from**,
@@ -3706,13 +3687,28 @@ mod folder_title_tests {
     /// then refuses to search on it.
     #[test]
     fn a_file_in_the_library_root_borrows_nothing() {
-        assert_eq!(
-            title_from_folder("S01E04.mkv", "/media/TV", MediaKind::Episode),
-            ""
-        );
-        assert_eq!(
-            title_from_folder("1080p.x264.mkv", "/media/movies", MediaKind::Movie),
-            ""
-        );
+        assert_eq!(title_from_folder("S01E04.mkv", "/media/TV"), "");
+    }
+
+    /// **Only an episode can reach the fallback**, which is why there is no
+    /// movie path to borrow a containing folder. The parser's movie and
+    /// season-pack arms substitute the stem, so their titles are never empty
+    /// and the caller never asks.
+    #[test]
+    fn only_an_episode_can_reach_the_fallback() {
+        for name in [
+            "1080p.x264.mkv",
+            "Anon Film (2019) Bluray-1080p.mkv",
+            "Anon Show S01 1080p WEB-DL.mkv",
+            "1x04.mkv",
+            "S03E09 WS PDTV XviD FUtV.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert!(
+                !p.title.is_empty() || p.episode.is_some(),
+                "{name} reached the fallback as {:?}",
+                p.kind
+            );
+        }
     }
 }
