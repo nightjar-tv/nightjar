@@ -715,7 +715,18 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
             None
         };
         return ParsedName {
-            title: if title.is_empty() {
+            // **An absent title is absent.** When the season/episode token
+            // starts the name there is no series title in the filename at all
+            // — `S03E09 WS PDTV XviD FUtV`, `1x04` — and the folder carries
+            // it. Substituting the stem produced a "title" of pure release
+            // junk that the matcher then searched for.
+            //
+            // Empty is only honest if the caller handles it, and two do:
+            // `nightjar-scanner` falls back to the folder name before storing,
+            // and `drain_pending` refuses to search on an empty title. Neither
+            // existed when the substitution was written, which is why it was
+            // written.
+            title: if title.is_empty() && before > 0 {
                 stem.to_string()
             } else {
                 title
@@ -2233,6 +2244,49 @@ mod tests {
             parse_filename("Anon 12Blmx Film (2011) Bluray-1080p.mkv").title,
             "Anon 12Blmx Film"
         );
+    }
+
+    /// **An absent title is absent.** When the season/episode token starts the
+    /// name there is no series title in the filename at all, and substituting
+    /// the stem produced a "title" of pure release junk.
+    ///
+    /// Empty is only honest because two callers now handle it:
+    /// `nightjar-scanner` borrows the folder's name before storing, and the
+    /// TMDB source filters an empty title to a miss before any request.
+    #[test]
+    fn a_name_that_starts_with_the_token_has_no_title() {
+        for name in [
+            "S03E09 WS PDTV XviD FUtV",
+            "5x10 WS PDTV XviD FUtV",
+            "S01E04",
+            "1x04",
+            "01x04 - Halloween, Part 1 - 720p WEB-DL",
+            "S08E20 50-50 Carla [DVD]",
+            "S02E03-04-05.720p.BluRay-FUTV",
+            "1x03 - The 112th Congress [1080p BluRay].mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, "", "{name}");
+            assert!(p.season.is_some(), "{name} lost its season");
+            assert!(p.episode.is_some(), "{name} lost its episode");
+        }
+    }
+
+    /// The substitution is kept everywhere else. A name that *has* a title
+    /// before the token keeps it, and a name that is only junk still gets the
+    /// stem rather than nothing — cutting to empty there would throw away the
+    /// only identity the file has.
+    #[test]
+    fn a_title_before_the_token_is_still_substituted_when_it_cuts_to_nothing() {
+        assert_eq!(
+            parse_filename("Anon Show - 4x11 - An Episode - Bluray-1080p.mkv").title,
+            "Anon Show"
+        );
+        // Movie branch: only junk, so the stem stands in as before.
+        assert!(!parse_filename("1080p.x264.mkv").title.is_empty());
+        // A leading group tag is stripped first, so the token still starts the
+        // stem and the title is still absent.
+        assert_eq!(parse_filename("[Anon] S01E04.mkv").title, "");
     }
 
     #[test]
