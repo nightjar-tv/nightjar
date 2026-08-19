@@ -319,6 +319,13 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
         let Ok(season) = lower[start..j].parse::<i32>() else {
             return;
         };
+        // **A four-digit season must be a plausible year**, the same guard the
+        // marked `SxxxxEyy` spelling carries. `S2014` is a real year-season and
+        // the corpus asserts it; `S1080` and `S2160` are resolutions with an
+        // `s` in front, and width alone does not tell them apart.
+        if j - start == 4 && !(1900..=2100).contains(&season) {
+            return;
+        }
         if best.is_none_or(|(b, _)| i < b) {
             best = Some((i, season));
         }
@@ -418,17 +425,25 @@ fn cut_at_episode_marker(s: &str) -> String {
             while j < bytes.len() && bytes[j].is_ascii_digit() && j - i < 4 {
                 j += 1;
             }
+            // **A four-digit run in the year range is a year**, the same guard
+            // `cut_at_absolute_episode` puts on its own. Without it
+            // `Anon 2020 BLM Documentary` cuts at the year and the title is
+            // `Anon`.
+            let is_year =
+                j - i == 4 && (1900..=2100).contains(&lower[i..j].parse::<i32>().unwrap_or(0));
             let mut k = j;
             while k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_') {
                 k += 1;
             }
-            for w in ["bölüm", "bolum", "blm"] {
-                if lower[k..].starts_with(w) {
-                    let end = k + w.len();
-                    if end >= bytes.len() || !bytes[end].is_ascii_alphanumeric() {
-                        let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
-                        if head.chars().any(char::is_alphabetic) {
-                            return head.to_string();
+            if !is_year {
+                for w in ["bölüm", "bolum", "blm"] {
+                    if lower[k..].starts_with(w) {
+                        let end = k + w.len();
+                        if end >= bytes.len() || !bytes[end].is_ascii_alphanumeric() {
+                            let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
+                            if head.chars().any(char::is_alphabetic) {
+                                return head.to_string();
+                            }
                         }
                     }
                 }
@@ -629,14 +644,28 @@ fn trim_to_latin_title(body: &str) -> String {
 /// prefix must end in a dash with whitespace after it, and the remainder must
 /// still carry a letter. A bare domain with no dash is not stripped, because a
 /// film could be called one.
+///
+/// **And the head must carry `www.`, because a dotted release title otherwise
+/// has the shape of a domain.** `The.Office.US` and `Dr.No` are dot-separated
+/// labels with no whitespace ending in a short label, which is every test the
+/// domain shape can apply. A TLD list does not separate them either: `us`,
+/// `uk`, `no` and `to` are real country domains and ordinary English words.
+/// Every prefix measured here carries the subdomain, so that is what the
+/// evidence pays for; one without it may not cut a title until it has its own.
 fn strip_site_prefix(stem: &str) -> &str {
     let t = stem.trim_start();
     let Some(dash) = t.find(" - ").or_else(|| t.find("- ")) else {
         return stem;
     };
     let head = &t[..dash];
+    if !head
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("www."))
+    {
+        return stem;
+    }
     // A domain and nothing else: dot-separated labels, no whitespace.
-    if head.is_empty() || head.contains(char::is_whitespace) || !head.contains('.') {
+    if head.contains(char::is_whitespace) {
         return stem;
     }
     if !head
@@ -870,16 +899,19 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
             // digits made the whole file report no episode at all. One
             // separator before the `e`, an optional `p` for the `Ep`
             // spelling, and one separator before the digits.
-            if season_ok && digits > 0 && j < bytes.len() && is_token_gap(bytes[j]) {
-                j += 1;
+            if season_ok
+                && digits > 0
+                && let Some(end) = token_gap_end(bytes, j)
+            {
+                j = end;
             }
             if season_ok && digits > 0 && j < bytes.len() && bytes[j] == b'e' {
                 j += 1;
                 if j < bytes.len() && bytes[j] == b'p' {
                     j += 1;
                 }
-                if j < bytes.len() && is_token_gap(bytes[j]) {
-                    j += 1;
+                if let Some(end) = token_gap_end(bytes, j) {
+                    j = end;
                 }
                 let mut episode = 0i32;
                 let mut edigits = 0;
@@ -1026,6 +1058,32 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
 /// `S1-E1`, `S01_E01`.
 fn is_token_gap(b: u8) -> bool {
     matches!(b, b' ' | b'.' | b'_' | b'-')
+}
+
+/// The end of the separator between the two halves of a split season/episode
+/// token, or `None` when nothing separates them.
+///
+/// **One separator, not one byte.** ` - ` is a single separator spelled in
+/// three characters. Reading one byte parsed `S6-E1` and let `S6 - E1` fall
+/// through to the bare-season rule, which claimed the file as a season pack —
+/// a wrong claim where the glued spelling gives a right one, on a difference
+/// the name does not carry.
+///
+/// Spaces around at most one dot, dash or underscore, so the scan cannot run
+/// past a separator into whatever follows it.
+fn token_gap_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut j = from;
+    let mut punctuation = 0;
+    while j < bytes.len() && is_token_gap(bytes[j]) {
+        if bytes[j] != b' ' {
+            punctuation += 1;
+            if punctuation > 1 {
+                return None;
+            }
+        }
+        j += 1;
+    }
+    (j > from).then_some(j)
 }
 
 /// `s06` or `6x` immediately at `i`, returning the season and the offset after
@@ -1901,11 +1959,28 @@ mod tests {
 
     /// A four-digit number that is not a plausible year is not a season
     /// either, in any spelling.
+    ///
+    /// **The bare spelling was missing this guard**, so `S1080` and `S2160` —
+    /// a resolution with an `s` in front — became season packs while the
+    /// marked `S1080E01` was correctly refused. Width alone does not tell a
+    /// year-season from a resolution; the range does.
     #[test]
     fn a_four_digit_season_must_be_a_plausible_year() {
-        let p = parse_filename("Anon Show S1080E01 - An Episode.mkv");
-        assert_eq!(p.season, None);
-        assert_eq!(p.episode, None);
+        for name in [
+            "Anon Show S1080E01 - An Episode.mkv",
+            "Anon Show S1080 x264.mkv",
+            "Anon Show S2160 DTS.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, None, "{name} invented a season");
+            assert_eq!(p.episode, None, "{name} invented an episode");
+        }
+        // A plausible year still is one, in the bare spelling the corpus asserts.
+        let p = parse_filename("My.Series.S2014.720p.HDTV.x264-ME");
+        assert_eq!(
+            (p.season, p.episode, p.title.as_str()),
+            (Some(2014), None, "My Series")
+        );
     }
 
     /// **The terminator runs on the year arm too.** Cutting at the year takes
@@ -2090,6 +2165,21 @@ mod tests {
             parse_filename("Anon Doc - Anon Film (2011).mkv").title,
             "Anon Doc - Anon Film"
         );
+        // **A dotted release title has the domain shape and must survive it.**
+        // Every negative case above declines for a reason a dotted title does
+        // not supply — whitespace in the head, or no dash at all — so none of
+        // them tested the way this rule can wrongly fire. These do.
+        for (name, title) in [
+            ("Anon.Show.US - 1x01 - A Pilot.mkv", "Anon Show US"),
+            ("Anon.Doc.The.End - 1x01 - A Title.mkv", "Anon Doc The End"),
+            ("Dr.No - 1x01 - An Episode.mkv", "Dr No"),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+        // A real film title whose last word is also a country domain.
+        let p = parse_filename("Anon.Film.2019.HD - GRP.mkv");
+        assert_eq!(p.title, "Anon Film");
+        assert_eq!(p.year, Some(2019));
     }
 
     /// **The season and the episode marker may be separated.** Requiring the
@@ -2143,27 +2233,53 @@ mod tests {
         }
     }
 
-    /// The gap is one separator, not a run, and the season/episode scan still
-    /// refuses everything it refused before.
+    /// The gap is one separator, however it is spelled, and the season/episode
+    /// scan still refuses everything it refused before.
+    ///
+    /// **Changed, and the old assertion is worth recording.** It read
+    /// `assert_eq!(parse_filename("Anon Title S6 - E1 - Something.mkv").episode,
+    /// None)` under the comment "two separators is not a token", and it passed
+    /// while the file became a **season pack** — season 6, no episode. Asserting
+    /// one field let a rule trade a right answer for a wrong claim without the
+    /// test noticing, so every case here now asserts the whole parse.
     #[test]
     fn the_token_gap_does_not_widen_the_scan() {
-        // Two separators is not a token.
-        assert_eq!(
-            parse_filename("Anon Title S6 - E1 - Something.mkv").episode,
-            None
-        );
+        // A spaced dash is one separator spelled in three characters, and the
+        // glued spelling has always parsed.
+        for name in [
+            "Anon Title S6 - E1 - Something.mkv",
+            "Anon Title S6-E1 - Something.mkv",
+            "Anon Title S6 . E1 - Something.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(
+                (p.season, p.episode, p.kind, p.title.as_str()),
+                (Some(6), Some(1), MediaKind::Episode, "Anon Title"),
+                "{name}"
+            );
+        }
+        // Two punctuation marks is not one separator. The scan declines, and
+        // the bare-season rule then claims the `S6` — the same season pack it
+        // makes of any name whose episode spelling this does not recognise.
+        for name in [
+            "Anon Title S6 -- E1 - Something.mkv",
+            "Anon Title S6.-.E1.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!((p.season, p.episode), (Some(6), None), "{name}");
+        }
         // A resolution is still not an episode.
-        assert_eq!(parse_filename("A Anon Name (1920x1080).mkv").episode, None);
-        // Episode 0 is still refused.
-        assert_eq!(
-            parse_filename("Anon Show S01 E00 - A Pilot.mkv").episode,
-            None
-        );
+        let p = parse_filename("A Anon Name (1920x1080).mkv");
+        assert_eq!((p.season, p.episode), (None, None));
+        // Episode 0 is still refused, and the season it carries is still a pack.
+        let p = parse_filename("Anon Show S01 E00 - A Pilot.mkv");
+        assert_eq!((p.season, p.episode), (Some(1), None));
         // The common form is unchanged.
         let p = parse_filename("Anon Show - 4x11 - An Episode - Bluray-1080p.mkv");
-        assert_eq!(p.season, Some(4));
-        assert_eq!(p.episode, Some(11));
-        assert_eq!(p.title, "Anon Show");
+        assert_eq!(
+            (p.season, p.episode, p.title.as_str()),
+            (Some(4), Some(11), "Anon Show")
+        );
     }
 
     /// The mirror of `a_cut_inside_a_bracket_backs_out_to_the_bracket`: a
@@ -2223,6 +2339,35 @@ mod tests {
         ] {
             assert_eq!(parse_filename(name).title, title, "{name}");
         }
+    }
+
+    /// **A four-digit run in the year range is a year**, the guard
+    /// `cut_at_absolute_episode` already put on its own four-digit run. The
+    /// marker read up to four digits without it, so a year standing in front
+    /// of one of these words cut the title at the year.
+    #[test]
+    fn a_year_before_the_episode_word_is_not_an_episode_number() {
+        for (name, title, year) in [
+            (
+                "Anon 2020 BLM Documentary (2021).mkv",
+                "Anon 2020 BLM Documentary",
+                2021,
+            ),
+            (
+                "Anon 1999 Bolum Belgesel (2021).mkv",
+                "Anon 1999 Bolum Belgesel",
+                2021,
+            ),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.year, Some(year), "{name}");
+        }
+        // Three digits is still an episode number, and four outside the range.
+        assert_eq!(
+            parse_filename("Anon show 205. Blm (29.10.2023) 1080p WebDL").title,
+            "Anon show"
+        );
     }
 
     /// **The digit run in front is what makes these words safe to name.** The
