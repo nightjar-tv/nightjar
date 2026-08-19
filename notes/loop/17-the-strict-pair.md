@@ -1,4 +1,4 @@
-# 17 — the strict pair on the N150
+# 17 — the strict pair on the N150 (cold run; see 18 for the warm one)
 
 Run 2026-08-19 on `nightjar-dev`. **Both arms `requests=0`** — genuinely
 offline. Binaries verified distinct before running:
