@@ -337,6 +337,52 @@ fn has_spaced_dash_number(s: &str) -> bool {
     false
 }
 
+/// Cut a title at a bare episode marker — `Anon Show Ep01`, `Anon Show E1135`.
+///
+/// A release that numbers episodes absolutely often marks the number with `E`
+/// or `Ep` and no season at all, so [`find_season_episode`] declines and the
+/// title runs on through the marker and the episode title behind it.
+///
+/// **The number is not parsed.** It is an absolute episode number and
+/// [`ParsedName`] has nowhere to put one. The title is the half that is
+/// scorable and the half the matcher searches on.
+///
+/// **Two digits minimum.** `E06` is a marker; `E3` is as likely to be a title
+/// word, and taking one digit earns nothing measurable. The marker must also
+/// start at a separator, so `HEVC` and `EAC3` are untouched — the `e` in
+/// `HEVC` follows a letter, and the `a` after `EAC3`'s `E` is not a digit.
+fn cut_at_episode_marker(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'e' && (i == 0 || is_token_boundary(bytes[i - 1])) {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'p' {
+                j += 1;
+            }
+            if j < bytes.len() && matches!(bytes[j], b' ' | b'.' | b'_') {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 4 {
+                j += 1;
+            }
+            let digits = j - start;
+            let bounded =
+                j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j].is_ascii_alphabetic());
+            if (2..=4).contains(&digits) && !bounded {
+                let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
+                if head.chars().any(char::is_alphabetic) {
+                    return head.to_string();
+                }
+            }
+        }
+        i += 1;
+    }
+    s.to_string()
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let stem = strip_leading_group(strip_extension(file_name));
@@ -344,7 +390,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     let compact = stem.to_ascii_lowercase();
 
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
-        let title = cut_at_absolute_episode(&cut_at_title_junk(&cut_stem_at(stem, before)));
+        let title = cut_at_episode_marker(&cut_at_absolute_episode(&cut_at_title_junk(
+            &cut_stem_at(stem, before),
+        )));
         let end = if episode_end > episode {
             Some(episode_end)
         } else {
@@ -368,7 +416,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // season/episode scan, which owns every name that carries both, and before
     // the year branch, which would otherwise call a pack a movie.
     if let Some((before, season)) = find_bare_season(&normalized) {
-        let title = cut_at_title_junk(&cut_stem_at(stem, before));
+        let title = cut_at_episode_marker(&cut_at_title_junk(&cut_stem_at(stem, before)));
         return ParsedName {
             title: if title.is_empty() {
                 stem.to_string()
@@ -397,7 +445,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         }
         None => cut_at_title_junk(&clean_title(stem)),
     };
-    let title = cut_at_absolute_episode(&title);
+    let title = cut_at_episode_marker(&cut_at_absolute_episode(&title));
 
     ParsedName {
         title: if title.is_empty() {
@@ -1249,6 +1297,69 @@ mod tests {
         assert_eq!(
             parse_filename("Anon Show [2022] [S25E13] [PL] [720p].mkv").title,
             "Anon Show [2022]"
+        );
+    }
+
+    /// A bare episode marker ends the title. These names carry no season, so
+    /// the season/episode scan declines and the title used to run on through
+    /// the marker and the episode title behind it.
+    ///
+    /// The number itself is not parsed — it is an absolute episode number and
+    /// `ParsedName` has nowhere to put one.
+    #[test]
+    fn a_bare_episode_marker_ends_the_title() {
+        for (name, title) in [
+            ("[Anon] Anon Show Ep01 (D2201EC5).mkv", "Anon Show"),
+            ("Anon Show EP06 720p x265 GROUP.mp4", "Anon Show"),
+            (
+                "AnonShow.E1135.Ein.Titel.GERMAN.1080p.WEBRip.x264-Group",
+                "AnonShow",
+            ),
+            ("Anon_Show_e66_time_is_money_part_one", "Anon Show"),
+            (
+                "Anon.Show.Ep01-12.Complete.English.AC3.DL.1080p.BluRay.x264",
+                "Anon Show",
+            ),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.episode, None, "{name}");
+        }
+    }
+
+    /// The guards. Two digits minimum, a separator on the left, and no letter
+    /// or digit on the right — which is what keeps every codec token that
+    /// starts with `E` out of it.
+    #[test]
+    fn the_episode_marker_does_not_eat_codec_tokens_or_words() {
+        assert_eq!(
+            parse_filename("Anon Film (2011) HEVC EAC3 E-AC3 EXTENDED.mkv").title,
+            "Anon Film"
+        );
+        // One digit is not a marker: `E3` is as likely a title word.
+        assert_eq!(
+            parse_filename("Anon E3 Film (2011).mkv").title,
+            "Anon E3 Film"
+        );
+        // Glued to a letter or another digit it is not a marker either.
+        assert_eq!(
+            parse_filename("Anon Show E06x Film (2011).mkv").title,
+            "Anon Show E06x Film"
+        );
+        // Nothing before it carries a letter, so there is no title to end.
+        assert_eq!(
+            parse_filename("Ep01 (D2201EC5).mkv").title,
+            "Ep01 (D2201EC5)"
+        );
+
+        // A year inside the show title is still lost, and this rule does not
+        // reach it: the year branch cuts at `2018` long before the marker is
+        // looked at, so `Anon Show 2018 EP06` yields `Anon Show`. That is the
+        // `Wonder Woman 1984` shape on the TV side; it needs the year branch,
+        // not this one.
+        assert_eq!(
+            parse_filename("Anon Show 2018 EP06 720p x265 GROUP.mp4").title,
+            "Anon Show"
         );
     }
 
