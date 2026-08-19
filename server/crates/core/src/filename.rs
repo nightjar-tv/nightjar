@@ -588,6 +588,47 @@ fn trim_to_latin_title(body: &str) -> String {
         .to_string()
 }
 
+/// Strip a leading `www.site.tld - ` tracker prefix.
+///
+/// `www.Torrenting.com - Movie.2008.720p.X264-DIMENSION` parsed as
+/// `www Torrenting com - Movie`: the prefix survives every terminator because
+/// it sits before the title, and nothing cuts from the left.
+///
+/// **Guarded the same way [`strip_leading_group`] is — on what is left.** The
+/// prefix must end in a dash with whitespace after it, and the remainder must
+/// still carry a letter. A bare domain with no dash is not stripped, because a
+/// film could be called one.
+fn strip_site_prefix(stem: &str) -> &str {
+    let t = stem.trim_start();
+    let Some(dash) = t.find(" - ").or_else(|| t.find("- ")) else {
+        return stem;
+    };
+    let head = &t[..dash];
+    // A domain and nothing else: dot-separated labels, no whitespace.
+    if head.is_empty() || head.contains(char::is_whitespace) || !head.contains('.') {
+        return stem;
+    }
+    if !head
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return stem;
+    }
+    // The last label is a TLD only if it is short and all letters.
+    let Some(tld) = head.rsplit('.').next() else {
+        return stem;
+    };
+    if !(2..=4).contains(&tld.len()) || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return stem;
+    }
+    let rest = t[dash..].trim_start_matches([' ', '-']).trim();
+    if rest.chars().any(char::is_alphabetic) {
+        rest
+    } else {
+        stem
+    }
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let whole = strip_extension(file_name);
@@ -595,7 +636,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // terminator to cut at, so its title is selected from the groups rather
     // than derived by cutting.
     let run_title = bracket_run_title(whole);
-    let stem = strip_leading_group(whole);
+    let stem = strip_site_prefix(strip_leading_group(whole));
     let normalized = stem.replace(['_', '.'], " ");
     let compact = stem.to_ascii_lowercase();
 
@@ -1887,6 +1928,50 @@ mod tests {
         assert_eq!(
             parse_filename("Anon Batch Title (2011) Bluray-1080p.mkv").title,
             "Anon Batch Title"
+        );
+    }
+
+    /// A leading `www.site.tld - ` is a tracker prefix. It survived every
+    /// terminator because it sits *before* the title and nothing cuts from the
+    /// left.
+    #[test]
+    fn a_leading_site_prefix_is_not_the_title() {
+        assert_eq!(
+            parse_filename("www.Anon.com - Anon.2008.720p.X264-GROUP").title,
+            "Anon"
+        );
+        let p = parse_filename("www.Anon.org - Anon.S03E14.720p.HDTV.X264-GROUP");
+        assert_eq!(p.title, "Anon");
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(14));
+        assert_eq!(
+            parse_filename("www.5AnonRulz.tc - Anon (2000) Malayalam HQ HDRip - x264.mkv").title,
+            "Anon"
+        );
+    }
+
+    /// The guards. A bare domain with no dash stays, because a film could be
+    /// called one; what is left must still carry a letter; and a dashed title
+    /// that is not a domain is untouched.
+    #[test]
+    fn only_a_domain_before_a_dash_is_stripped() {
+        assert_eq!(
+            parse_filename("Anon Show - 1x02 - An Episode.mkv").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("Anon.com Anon Film (2011).mkv").title,
+            "Anon com Anon Film"
+        );
+        // The head is a domain but nothing with a letter follows the dash, so
+        // the prefix stays — stripping to nothing is worse than keeping junk,
+        // the same trade `cut_at_title_junk` makes.
+        let p = parse_filename("www.anon.com - 2019.mkv");
+        assert!(p.title.contains("anon com"), "got {:?}", p.title);
+        // Not a domain: the head has whitespace.
+        assert_eq!(
+            parse_filename("Anon Doc - Anon Film (2011).mkv").title,
+            "Anon Doc - Anon Film"
         );
     }
 
