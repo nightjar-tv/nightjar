@@ -274,8 +274,7 @@ const SEASON_WORDS: &[&str] = &["season", "saison", "stagione", "temporada"];
 /// replacement is byte-for-byte, so the index returned is an index into the
 /// original stem as well.
 ///
-/// Three guards, each one paid for by a passing corpus case it would otherwise
-/// break:
+/// Four guards, each one paid for by a passing case it would otherwise break:
 ///
 /// 1. **A spaced dash-number anywhere means the token belongs to the title.**
 ///    `Some Anime Show S3 - 12` is the anime absolute form and Sonarr keeps the
@@ -287,6 +286,9 @@ const SEASON_WORDS: &[&str] = &["season", "saison", "stagione", "temporada"];
 ///    by release metadata, not by the work's year.
 /// 3. **The head must carry a letter**, so a name that is only a token has no
 ///    title to end.
+/// 4. **Only a glued `s` may carry four digits** — see [`four_digit_season_ok`].
+///    Guard 2 looks *past* the digits, so it cannot see a title whose own last
+///    word is the marker and whose release year is the number.
 fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
     if has_spaced_dash_number(normalized) {
         return None;
@@ -295,10 +297,11 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
     let bytes = lower.as_bytes();
 
     let mut best: Option<(usize, i32)> = None;
-    let mut consider = |i: usize, marker_len: usize| {
+    let mut consider = |i: usize, marker_len: usize, spelled: bool| {
         // One optional separator between the marker and the digits.
         let mut j = i + marker_len;
-        if j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'.' || bytes[j] == b'_') {
+        let separated = j < bytes.len() && matches!(bytes[j], b' ' | b'.' | b'_');
+        if separated {
             j += 1;
         }
         let start = j;
@@ -319,11 +322,7 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
         let Ok(season) = lower[start..j].parse::<i32>() else {
             return;
         };
-        // **A four-digit season must be a plausible year**, the same guard the
-        // marked `SxxxxEyy` spelling carries. `S2014` is a real year-season and
-        // the corpus asserts it; `S1080` and `S2160` are resolutions with an
-        // `s` in front, and width alone does not tell them apart.
-        if j - start == 4 && !(1900..=2100).contains(&season) {
+        if j - start == 4 && !four_digit_season_ok(season, spelled, separated) {
             return;
         }
         if best.is_none_or(|(b, _)| i < b) {
@@ -335,17 +334,54 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
     while i < bytes.len() {
         if i == 0 || is_token_boundary(bytes[i - 1]) {
             if bytes[i] == b's' {
-                consider(i, 1);
+                consider(i, 1, false);
             }
             for w in SEASON_WORDS {
                 if lower[i..].starts_with(w) {
-                    consider(i, w.len());
+                    consider(i, w.len(), true);
                 }
             }
         }
         i += 1;
     }
     best
+}
+
+/// May a bare season token four digits wide claim them?
+///
+/// **Only the glued letter marker may, and only in the year range.** Three
+/// tests, and each one is a different spelling costing a different thing:
+///
+/// 1. **Not the spelled-out word.** `Open.Season.2006.720p.BluRay` is the film
+///    *Open Season*, and the four digits are its release year, not a season.
+///    The rule fired because the head of the range check — *a four-digit season
+///    must be a plausible year* — is exactly what a release year looks like,
+///    and [`year_follows`] looks *past* the digits, so it never sees that the
+///    digits **are** the year. Every form where the year follows the title
+///    directly breaks: dotted, spaced and underscore. `Wedding Season`,
+///    `Hunting Season`, `Mating Season`, `The Rainy Season`, and the same in
+///    the three non-English spellings — `La.Temporada.2019`, `La.Saison.1999`,
+///    `La.Stagione.2001`.
+///
+///    **This costs nothing measured.** Zero corpus cases have a spelled-out
+///    season word followed by a four-digit number. Every year-season the corpus
+///    asserts is the letter marker.
+///
+/// 2. **Not a separated letter marker.** Every one of those corpus cases is
+///    *glued* — `S2014`, `S1936E18`, `S2009E09`, `S2016E231` — so nothing
+///    measured buys `S 2014`, and accepting it keeps test 1's defect in a
+///    rarer spelling: `The Anon S 2019 Show` and `Anon.Film.S.2019.1080p` both
+///    became season 2019. Also free: zero corpus cases separate a four-digit
+///    season from its marker.
+///
+///    Narrower than the two-digit rule deliberately. `Anon Show S 01` is a
+///    season pack and stays one; width is what makes the separated spelling
+///    ambiguous, not the separator.
+///
+/// 3. **In the year range.** `S1080` and `S2160` are a resolution with an `s`
+///    in front, and width alone does not tell them from `S2014`.
+fn four_digit_season_ok(season: i32, spelled: bool, separated: bool) -> bool {
+    !spelled && !separated && (1900..=2100).contains(&season)
 }
 
 /// A separator a season marker may start after. An apostrophe is not one:
@@ -1981,6 +2017,88 @@ mod tests {
             (p.season, p.episode, p.title.as_str()),
             (Some(2014), None, "My Series")
         );
+    }
+
+    /// **A title ending in a season word is a title, not a season pack.**
+    ///
+    /// The four-digit guard required the number to be a plausible year, which
+    /// is exactly what a release year is, and `year_follows` looks *past* the
+    /// digits so it never saw that the digits were the year. Every release form
+    /// that puts the year straight after the title broke: `Open Season` became
+    /// season 2006 of a series called `Open`, and lost its year as well.
+    ///
+    /// Found by the differential sweep once it scored every field and sampled
+    /// every title rather than 900 of 2,332. Zero corpus cases spell a season
+    /// word before four digits, so declining costs nothing measured.
+    #[test]
+    fn a_title_ending_in_a_season_word_is_not_a_season_pack() {
+        for (name, title, year) in [
+            (
+                "Open.Season.2006.720p.BluRay.x264-GROUP",
+                "Open Season",
+                2006,
+            ),
+            ("Open Season 2006 1080p BluRay", "Open Season", 2006),
+            ("Open_Season_2006_1080p_BluRay", "Open Season", 2006),
+            (
+                "Wedding.Season.2022.1080p.NF.WEB-DL",
+                "Wedding Season",
+                2022,
+            ),
+            (
+                "The.Rainy.Season.1999.DVDRip.XviD",
+                "The Rainy Season",
+                1999,
+            ),
+            // The three non-English season words carry the same defect.
+            ("La.Temporada.2019.1080p", "La Temporada", 2019),
+            ("La.Saison.1999.DVDRip", "La Saison", 1999),
+            ("La.Stagione.2001.720p", "La Stagione", 2001),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, None, "{name} invented a season");
+            assert_eq!(p.kind, MediaKind::Movie, "{name}");
+            assert_eq!(p.year, Some(year), "{name}");
+            assert_eq!(p.title, title, "{name}");
+        }
+        // The sequel spelling already declined, because there the year really
+        // does follow the number and guard 2 sees it. It still does.
+        let p = parse_filename("Open.Season.3.2010.1080p.BluRay");
+        assert_eq!(
+            (p.season, p.year, p.title.as_str()),
+            (None, Some(2010), "Open Season 3")
+        );
+        // A season word before a *short* number is still a season pack.
+        let q = parse_filename("Anon.Show.Season.04.1080p.WEB-DL");
+        assert_eq!((q.season, q.title.as_str()), (Some(4), "Anon Show"));
+    }
+
+    /// **A four-digit season must be glued to its marker.**
+    ///
+    /// Fixing the spelled-out word alone would leave the same defect in a rarer
+    /// spelling. Every year-season the corpus asserts is glued — `S2014`,
+    /// `S1936E18`, `S2009E09`, `S2016E231` — so nothing measured buys the
+    /// separated form, and accepting it made `Anon Film S 2019` season 2019.
+    ///
+    /// Narrower than the two-digit rule on purpose: width is what makes the
+    /// separated spelling ambiguous, not the separator.
+    #[test]
+    fn a_separated_four_digit_season_is_not_a_season() {
+        for name in [
+            "The Anon S 2019 Show",
+            "Anon.Film.S.2019.1080p.BluRay",
+            "Anon_Film_S_2019_1080p",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, None, "{name} invented a season");
+            assert_eq!(p.kind, MediaKind::Movie, "{name}");
+        }
+        // Glued still parses, and a separated *two*-digit season still does
+        // too — the corpus asserts both.
+        let p = parse_filename("My.Series.S2014.720p.HDTV.x264-ME");
+        assert_eq!((p.season, p.title.as_str()), (Some(2014), "My Series"));
+        let q = parse_filename("Anon Show S 01 720p WEB DL DD 5 1 h264 GROUP");
+        assert_eq!((q.season, q.title.as_str()), (Some(1), "Anon Show"));
     }
 
     /// **The terminator runs on the year arm too.** Cutting at the year takes
