@@ -72,3 +72,17 @@ roots repointed at `/Volumes/media` and **verified against the filesystem**: 40
 sampled rows, every media file resolves. The rewriting script refuses to write
 an output whose paths do not resolve, because the failure it exists to prevent
 is silent.
+
+## The residual case, measured
+
+Part C exists for an item whose stored title is empty after Part B — a file
+with no title in its name **and** no folder to borrow one from.
+
+**Zero of the 25,043 dogfood items sit directly in a library root.** The path
+depth histogram is `{1: 1756, 2: 23285, 4: 2}` — every item is at least one
+folder deep. So in this library Part B always has a folder, and Part C's case
+never arises at all.
+
+Which is the same point again: the guard chain is complete here and none of it
+can be justified here. A library that is one folder flat is the shape Part C is
+for, and this is not that library.

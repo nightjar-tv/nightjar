@@ -92,7 +92,7 @@ mode has now happened at least twice here.
 | capture | on the Mac? | note |
 |---|---|---|
 | media (JSONL) | **regenerable, verified** | ran `capture_media.py` against a read-only copy of the dogfood db: **25,043 items, 9.8 MB, in seconds** |
-| NFO | **regenerable** | `/Volumes/media` is mounted over SMB and the NFOs are there — 1,784 movie NFOs, 847 show NFOs, episode NFOs per season folder. The script hardcodes `/mnt/media/...`, a Linux path, which is direct evidence it was written on the N150; it needs `/Volumes/media/{Movies,TV Shows}` |
+| NFO | **regenerable** | `/Volumes/media` is mounted over SMB and the NFOs are all there — **28,132** of them, counted properly (see the correction below). The script hardcodes `/mnt/media/...`, a Linux path, which is direct evidence it was written on the N150; it needs `/Volumes/media/{Movies,TV Shows}` |
 | TMDB response cache | **not here** | searched at unbounded depth with a verified-working tool: the only flat JSON cache directory over 1,000 entries anywhere under `~` is the 2,975-entry **TVDB** spike cache. There is no 7,967-entry TMDB cache on this machine |
 
 ### So the blocker is narrower than stated
@@ -149,6 +149,51 @@ instrument working offline, and it is the cache that was copied.
 
 Nothing on the N150 was modified — the session read and streamed a tar to
 stdout, nothing else.
+
+### The NFO figures I first published were wrong — corrected
+
+I reported "1,784 movie NFOs, 847 show NFOs". Those were **depth-one globs**
+presented as if they characterised the library. The movie figure was roughly
+right by accident, because a movie sits one folder deep. The TV figure counted
+only show-level `tvshow.nfo` files and missed every episode NFO — a 30×
+undercount.
+
+Counted properly, with `find` and no `timeout` prefix:
+
+| root | Mac (SMB) | N150 (local) |
+|---|---:|---:|
+| Movies | 1,783 | 1,783 |
+| TV Shows | *(walk in progress)* | 26,349 |
+| **total** | | **28,132** |
+
+That matches the 28,115 in `nightjar-meta/notes/replay-harness-2026-08-18.md`
+to within the files added since the capture. **The Movies count is identical on
+both hosts**, which is independent confirmation that the Mac's SMB mount and the
+N150's `/mnt/media` are the same library.
+
+### Four false negatives in one session, all the same shape
+
+Worth recording as a pattern rather than four separate corrections. Each was a
+bounded or broken probe reported as a property of the world:
+
+1. **"The replay harness is not on this machine."** I searched the repository
+   tree and its git history, then concluded about the machine. It was in
+   `~/.claude/jobs/13c074c6/tmp/`.
+2. **"0 NFOs."** `timeout 540 find ... | wc -l`, three times. **`timeout` is not
+   a command on macOS**; the pipeline never ran and `wc -l` counted an empty
+   stream. `find` works fine on the SMB mount without it — 82 NFOs under Red
+   Dwarf alone.
+3. **"`TmdbClient::search` has no empty-title check."** I read the low-level
+   method and concluded about the path. The guard is one level up at
+   `MetadataSource::resolve`, and the drain has never been able to issue an
+   empty query. Same shape as (1), one layer down instead of one machine over.
+4. **"TV depth2: 0."** A multi-level glob that failed to expand across ~847
+   shows. A single-directory glob on the same path returns 7.
+
+The brief's rule covers all four: *a zero can mean "nothing is there" or "the
+code never ran", and they are the same number.* The addition this session
+supplies is that **the instrument is often your own shell command**, and that a
+probe's scope is a claim about the probe, not about the world.
 
 ### Two gaps to close before a strict pair runs on the Mac
 
