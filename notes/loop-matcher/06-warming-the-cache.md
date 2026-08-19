@@ -236,3 +236,58 @@ ways forward, neither of which the loop can take on its own:
 Until one of those happens, **every rate in this loop remains over a
 collision-poor sample**: 34.0% of rows stalled, `tv.handmade` 5,644 rows never
 measured, and M2 still a stall wearing a wrong-bind's clothes.
+
+---
+
+## Attempt 2 — the sandbox was not the blocker. I was wrong about that.
+
+I reported the sandbox as the cause and asked for it to be disabled. **That was a
+misdiagnosis, and disabling it was unnecessary.** The real cause:
+
+- TMDB publishes **AAAA records**, and `getaddrinfo` on this machine returns the
+  **IPv6 addresses first**.
+- **This machine's IPv6 is broken.** `curl -6` to TMDB returns `http=000`, rc=28.
+- **`ureq` connects to the first address from `to_socket_addrs()` and does not
+  fall back.** So every request opened a black-holed IPv6 connection and waited
+  out the 30-second read deadline.
+- `curl` and Python succeeded because both do Happy Eyeballs across the whole
+  address list. That difference is exactly what made it look like a
+  per-binary network restriction.
+
+It reproduced **unsandboxed and in the foreground**, which is what falsified the
+sandbox theory. Confirmed the other way afterwards: with the resolver fixed, a
+warm batch runs **with the sandbox back on** — 939 requests, 0 timeouts, rc=0.
+
+The tell I had and misread: a raw IPv4 socket worked while the binary did not. I
+took "curl works, binary doesn't" as evidence about the *binary's permissions*
+when it was evidence about *address selection*. Two clients differing is not
+proof of a policy boundary between them.
+
+### The fix, in the harness only
+
+An IPv4-only resolver on the `AgentBuilder`, in the **harness overlay** —
+`~/nightjar-wt-matcher-scratch/harness-title.patch`, never committed to the
+product:
+
+    .resolver(|netloc: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        Ok(netloc.to_socket_addrs()?.filter(|a| a.is_ipv4()).collect())
+    })
+
+It affects only which address a warm connects to. **Strict runs issue no requests
+at all**, so nothing that gets measured passes through it.
+
+**There is a real product question here that this does not answer**, and it should
+not be settled by a loop: shipped Nightjar uses the same `ureq` agent with no
+resolver, so on any user's machine with broken IPv6 *every provider call takes 30
+seconds and then fails*. That is a plausible field defect, it is not what this
+loop was asked to do, and the oracle cannot see it — the replay never makes a
+request. Recorded here as a finding for someone to take on deliberately.
+
+### First verified warm
+
+    tv.flat.titled-b0   600 requests, 0 timeouts, 0 errors, cache 8185 -> 8785
+    tv.single-b0        939 requests, 0 timeouts, 0 errors  (sandboxed)
+
+Cache growth equals request count exactly, which is the check the earlier version
+of this script could not make.
