@@ -155,3 +155,84 @@ attribution between the two measurements clean.
 
 The key must be a shell substitution, not a literal — the text of a `!` command
 lands in the transcript.
+
+---
+
+## Attempt 1 — the key works, the sandbox does not
+
+The key was found at `~/nightjar-data-v9/secrets` (32 characters, TMDB v3 shape,
+not the replay placeholder) and the script accepted it. **The warm still could not
+run, for an unrelated reason.**
+
+Every request failed:
+
+    provider error: https://api.themoviedb.org/3/tv/9877?…&api_key=REDACTED:
+      Network Error: timed out reading response
+
+`api_key=REDACTED` confirms `scrub_tmdb_url_secret` keeps the key out of logs.
+
+### Triage — the binary is the only thing that cannot reach TMDB
+
+| client | result |
+|---|---|
+| DNS | resolves, 4 addresses |
+| `curl` → api.themoviedb.org | **http 401 in 0.45s** (correct without a key) |
+| `python3 urllib` | **HTTP 401** (correct) |
+| **raw TLS socket, port 443** | **hangs — no response, killed at 120s** |
+| the replay binary (`ureq`) | connect succeeds, **read times out at 30s** |
+
+No proxy variables are set. So the sandbox lets recognised HTTP clients through
+and blackholes a raw TLS connection opened by an arbitrary binary: TCP is
+accepted, nothing ever answers. `ureq` opens its own socket, so the replay
+connects and then waits out its 30-second read deadline on every call.
+
+**Nothing was written.** The cache copy is still 8,185 entries and the shared
+cache was never a target. The run was stopped rather than left to grind through
+8 rounds at 30 seconds per call.
+
+## What this nearly hid — `requests=N` counts attempts, not successes
+
+`tmdb/mod.rs`:
+
+    let _permit = self.limiter.acquire();
+    self.http_requests.fetch_add(1, Ordering::Relaxed);   // before the call
+    let mut url = format!("https://api.themoviedb.org/3{path}");
+
+The counter increments **before** `agent.get(..).call()`. So a request that times
+out still counts. Had the run completed, `warm_cache.sh` would have printed a
+large `TOTAL LIVE REQUESTS` while the cache grew by **zero** — and I had told the
+user to read that total as the number to report.
+
+That is the loop's oldest trap in a new place: a number that means "the code ran"
+being read as "the work happened". **The cache count is the ground truth; the
+request count is an intention.**
+
+`warm_cache.sh` now compares them per round and **aborts when requests are
+attempted and nothing is written**, naming the timeout signature and pointing at
+`run.err`. It also reports entries written alongside requests attempted, so the
+two can never be conflated again.
+
+This also means `requests=0` elsewhere in the loop is still sound as a proof of
+offline-ness — zero attempts is zero calls. The asymmetry only bites in the other
+direction, where a non-zero count is taken as evidence of success.
+
+## Where it stands
+
+Warming needs a network path this sandbox does not give the replay binary. Two
+ways forward, neither of which the loop can take on its own:
+
+1. **Run it outside the sandbox** — a plain terminal. The command needs no key on
+   it, only a path:
+
+       SHAPES="…16 shapes…" TMDB_SECRETS_FILE=~/nightjar-data-v9/secrets \
+         ~/Documents/GitHub/nightjar-wt-matcher/notes/loop-matcher/scripts/warm_cache.sh \
+         ~/Documents/GitHub/nightjar-wt-matcher-oracle \
+         ~/nightjar-wt-matcher-scratch/tmdb-cache-warm
+
+2. **Re-run with the sandbox disabled**, which turns off a safety boundary
+   wholesale and is the user's call to make explicitly, not something to assume
+   from "warm the cache".
+
+Until one of those happens, **every rate in this loop remains over a
+collision-poor sample**: 34.0% of rows stalled, `tv.handmade` 5,644 rows never
+measured, and M2 still a stall wearing a wrong-bind's clothes.

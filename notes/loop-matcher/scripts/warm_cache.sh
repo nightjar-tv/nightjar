@@ -30,12 +30,32 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SPIKE=${SPIKE:-$HOME/nightjar-spikes/matcher-oracle-2026-08-19}
 WORK=${WORK:-$HOME/nightjar-wt-matcher-scratch/warm}
 
+# Prefer a *path* to the key over the key itself. A credential passed on a
+# command line is visible in `ps` for the life of the process and lands in shell
+# history; a path is neither. `TMDB_SECRETS_FILE` points at a `key=value` file
+# holding a `tmdb_api_key=` line — the same format the resolver reads — and the
+# value is read here, never echoed and never passed as an argument.
+if [ -z "${TMDB_API_KEY:-}" ] && [ -n "${TMDB_SECRETS_FILE:-}" ]; then
+  [ -r "$TMDB_SECRETS_FILE" ] || { echo "cannot read $TMDB_SECRETS_FILE" >&2; exit 1; }
+  TMDB_API_KEY=$(grep -m1 -E '^[[:space:]]*tmdb_api_key[[:space:]]*=' "$TMDB_SECRETS_FILE"                  | cut -d= -f2- | tr -d '[:space:]')
+  case "$TMDB_API_KEY" in
+    "")            echo "no tmdb_api_key= line in $TMDB_SECRETS_FILE" >&2; exit 1;;
+    *not-a-key*)   echo "$TMDB_SECRETS_FILE holds the replay placeholder, not a real key" >&2; exit 1;;
+  esac
+  echo "key: read from $TMDB_SECRETS_FILE (${#TMDB_API_KEY} chars, value not printed)"
+fi
+
 if [ -z "${TMDB_API_KEY:-}" ]; then
   cat >&2 <<'MSG'
 TMDB_API_KEY is not set, and nothing here can run without it.
 
 Provide it for this command only, so it is never written to a file that
 outlives the run and never echoed:
+
+    TMDB_SECRETS_FILE=/path/to/secrets \
+      notes/loop-matcher/scripts/warm_cache.sh <worktree> <cache-dir>
+
+or, less safely, the key inline (visible in `ps` and in shell history):
 
     TMDB_API_KEY=xxxx notes/loop-matcher/scripts/warm_cache.sh <worktree> <cache-dir>
 
@@ -65,6 +85,7 @@ echo
 FILTER=${SHAPES:-}
 
 total=0
+prev=$start
 for round in $(seq 1 "$ROUNDS"); do
   echo "=== round $round ==="
   rq=0
@@ -96,7 +117,26 @@ for round in $(seq 1 "$ROUNDS"); do
   done
   now=$(count)
   total=$((total + rq))
-  echo "  round $round: $rq requests, cache now $now entries (+$((now - start)) overall)"
+  grew=$((now - prev))
+  echo "  round $round: $rq requests attempted, $grew entries written, cache now $now (+$((now - start)) overall)"
+  # **`requests=N` counts attempts, not successes.** `http_requests.fetch_add(1)`
+  # runs before `agent.get(..).call()`, so a request that times out or is refused
+  # still increments it. A round can therefore report thousands of requests and
+  # write nothing, which reads as "warming happened" if only the request total is
+  # believed. **The cache count is the ground truth.**
+  #
+  # This fired for real: every request timed out at the 30s read deadline while
+  # the counter climbed and the cache stayed at 8,185.
+  if [ "$rq" -gt 0 ] && [ "$grew" -eq 0 ]; then
+    echo
+    echo "ABORT: $rq requests attempted and 0 entries written. The requests are"
+    echo "       failing, not succeeding. Check a batch's run.err:"
+    echo "         grep -m3 'provider error' $WORK/*/run.err"
+    echo "       A 'timed out reading response' with curl working means the"
+    echo "       sandbox blackholes this binary's TLS — warm outside it."
+    exit 1
+  fi
+  prev=$now
   if [ "$rq" -eq 0 ]; then
     echo
     echo "converged: a whole round made no request."
