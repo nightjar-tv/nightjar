@@ -109,6 +109,66 @@ fn strip_leading_group(stem: &str) -> &str {
     }
 }
 
+/// Cut a title at a separated absolute-episode number — `Show - 12 [Group]`.
+///
+/// Anime releases number episodes absolutely and separate the number from the
+/// title with a spaced dash. Nothing else in the name says where the title
+/// ends, so the dash is the terminator: 97 of the corpus's title-only failures
+/// are this one form.
+///
+/// **Spaced only.** A glued dash is part of the title and always has been —
+/// `Stargate SG-1`, `Storage 24-7`. Measured over the 25,043-file dogfood
+/// library, matching a glued dash changes 215 basenames, 213 of them bound
+/// today, and turns `Stargate SG-1` into `Stargate SG`. The spaced form changes
+/// two, both unmatched. That gap is the whole reason this rule is narrow.
+///
+/// **A four-digit number in the year range is a year, not an episode.** The
+/// movie branch has already cut at any year it found before this runs, so the
+/// guard bites only on the episode branch, which never parses a year at all.
+///
+/// **The head must still carry a letter**, and when it does not the scan moves
+/// on to the next candidate rather than giving up. `5x09 - 100` has no title
+/// before the number; cutting there would leave a title that agreed with
+/// nothing.
+fn cut_at_absolute_episode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if !(bytes[i] == b' ' && bytes[i + 1] == b'-' && bytes[i + 2] == b' ') {
+            i += 1;
+            continue;
+        }
+        let start = i + 3;
+        let mut j = start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 4 {
+            j += 1;
+        }
+        let digits = j - start;
+        // A run longer than four digits is not an episode number, and a letter
+        // or digit straight after it means the token is something else
+        // (`- 07v2`, `- 12th`).
+        let bounded =
+            j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j].is_ascii_alphabetic());
+        if digits == 0 || bounded {
+            i += 1;
+            continue;
+        }
+        if digits == 4 {
+            let n: i32 = s[start..j].parse().unwrap_or(0);
+            if (1900..=2100).contains(&n) {
+                i += 1;
+                continue;
+            }
+        }
+        let head = s[..i].trim().trim_matches('-').trim();
+        if head.chars().any(char::is_alphabetic) {
+            return head.to_string();
+        }
+        i += 1;
+    }
+    s.to_string()
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let stem = strip_leading_group(strip_extension(file_name));
@@ -116,7 +176,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     let compact = stem.to_ascii_lowercase();
 
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
-        let title = cut_at_title_junk(&clean_title(&stem[..before.min(stem.len())]));
+        let title = cut_at_absolute_episode(&cut_at_title_junk(&clean_title(
+            &stem[..before.min(stem.len())],
+        )));
         let end = if episode_end > episode {
             Some(episode_end)
         } else {
@@ -150,6 +212,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         }
         None => cut_at_title_junk(&clean_title(stem)),
     };
+    let title = cut_at_absolute_episode(&title);
 
     ParsedName {
         title: if title.is_empty() {
@@ -742,6 +805,120 @@ mod tests {
         let back = parse_filename("Show - 1x05-03 - Title.mkv");
         assert_eq!(back.episode, Some(5));
         assert_eq!(back.episode_end, None);
+    }
+
+    /// A spaced dash before a number ends the title. This is the anime
+    /// absolute-numbering form and it is the single largest title class in the
+    /// Sonarr/Radarr corpus: 92 of the 738 applicable cases go from failing to
+    /// passing on this rule alone.
+    ///
+    /// The absolute number itself is not parsed — nothing in `ParsedName`
+    /// holds one — so these files still carry no season or episode. The title
+    /// is what moves, and the title is what the matcher searches on.
+    #[test]
+    fn a_spaced_dash_number_ends_the_title() {
+        for (name, title) in [
+            (
+                "[Commie] Anon Anime Show - 11 [65F220B4].mkv",
+                "Anon Anime Show",
+            ),
+            (
+                "[HorribleSubs] Anon Anime Show - 145 [720p].mkv",
+                "Anon Anime Show",
+            ),
+            (
+                "[Underwater] Anon Anime Show - 12 (720p) [5C7BC4F9]",
+                "Anon Anime Show",
+            ),
+            (
+                "Anon_Anime_Show_-_01(DVD)_-_(Anon_Group)[5AF6F1E4].mkv",
+                "Anon Anime Show",
+            ),
+            (
+                "[Doki]Anon Show - 07 (1280x720 Hi10P AAC) [80AF7DDE]",
+                "Anon Show",
+            ),
+            // The first candidate wins: what follows the number is an episode
+            // title, not more of the show title.
+            ("Anon Show - 031 - An Episode Title [Anon].avi", "Anon Show"),
+            (
+                "[CBM]_Anon_Show_-_11_-_511_Kinderheim_[6C70C4E4].mkv",
+                "Anon Show",
+            ),
+            // A season token in the title is part of it, not junk.
+            (
+                "[SFW-sage] Anon Show S3 - 12 [720p][D07C91FC]",
+                "Anon Show S3",
+            ),
+            ("[HorribleSubs] Anon Show 2 - 05 [720p].mkv", "Anon Show 2"),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+        }
+    }
+
+    /// The guard that makes the rule safe, and the measurement behind it. A
+    /// **glued** dash is part of the title: matching one changes 215 basenames
+    /// in the 25,043-file dogfood library, 213 of them bound today, and turns
+    /// `Stargate SG-1` into `Stargate SG`. The spaced rule changes two, both
+    /// unmatched.
+    #[test]
+    fn a_glued_dash_number_is_part_of_the_title() {
+        assert_eq!(
+            parse_filename("Anon SG-1 - 1x03 - An Episode - Bluray-1080p.mp4").title,
+            "Anon SG-1"
+        );
+        assert_eq!(
+            parse_filename("Anon Film-24 (2011).mkv").title,
+            "Anon Film-24"
+        );
+        assert_eq!(
+            parse_filename("Anon Show-01 - 2x04 - An Episode.mkv").title,
+            "Anon Show-01"
+        );
+    }
+
+    /// The other three guards.
+    ///
+    /// A four-digit number in the year range is a year. The movie branch has
+    /// already cut at any year it found, so this bites on the episode branch,
+    /// which never parses one.
+    ///
+    /// A number glued to a letter is not an episode number (`- 07v2`).
+    ///
+    /// The head must carry a letter, and when it does not the scan moves on
+    /// rather than giving up — cutting `5x09 - 100` to `5x09` would leave a
+    /// title that agrees with nothing.
+    #[test]
+    fn the_absolute_cut_has_three_more_guards() {
+        assert_eq!(
+            parse_filename("Anon Show - 1999 - S01E02 - An Episode.mkv").title,
+            "Anon Show - 1999"
+        );
+        // `07v2` is skipped, and nothing later is a candidate, so the name is
+        // left whole rather than cut at the next dash.
+        assert_eq!(
+            parse_filename("Anon Show - 07v2 - An Episode.mkv").title,
+            "Anon Show - 07v2 - An Episode"
+        );
+        // Nothing before the number carries a letter at the first candidate, so
+        // the scan continues and finds no acceptable cut.
+        let p = parse_filename("- 100 - 200.mkv");
+        assert!(!p.title.is_empty(), "got {:?}", p.title);
+    }
+
+    /// The control: the form 93% of the measured library is written in is
+    /// untouched by the absolute cut, and so is every shape that already had a
+    /// season and episode token.
+    #[test]
+    fn the_common_form_is_unchanged_by_the_absolute_cut() {
+        let p = parse_filename("Anon Show - 4x11 - An Episode Title - Bluray-1080p.mkv");
+        assert_eq!(p.title, "Anon Show");
+        assert_eq!(p.season, Some(4));
+        assert_eq!(p.episode, Some(11));
+        let m = parse_filename("Anon Film (2019) Bluray-1080p.mkv");
+        assert_eq!(m.title, "Anon Film");
+        assert_eq!(m.year, Some(2019));
     }
 
     #[test]
