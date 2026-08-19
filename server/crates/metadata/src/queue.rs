@@ -328,6 +328,29 @@ pub(crate) fn series_show_id_for_folder(
     library_id: i64,
     show_folder: &str,
 ) -> Result<Option<i64>, String> {
+    // **A folder that does not exist has no identity.** `show_folder_relpath`
+    // returns `""` for a file directly in the library root, and `series` rows
+    // are keyed `(library_id, relpath)` — so a `''` row is not one folder's
+    // identity, it is every root-level file's, shared.
+    //
+    // Two things then go wrong at once. Each file inherits a stored id
+    // belonging to some other show, which the ADR-0033 §8 name cross-check
+    // discards; and ADR-0033 Q4 keys the negative cache on
+    // `series:{that id}`, so the first miss suppresses every sibling's
+    // fall-through search. The comment beside `series_key` in `resolve.rs`
+    // names that hazard exactly — *one folder's miss must never suppress the
+    // other's fall-through search* — and an empty relpath inverts it.
+    //
+    // The oracle's `tv.root` shape measures it: 271 groups unmatched with
+    // `method: "negative_cache"`, carrying 1,834 files.
+    //
+    // Declining here rather than at the call sites keeps the drain, the browse
+    // proxy and the manual retry on one answer (Rule 4.11). A `''` row already
+    // in a database stops being consulted; [`upsert_series_row`] stops writing
+    // new ones.
+    if show_folder.is_empty() {
+        return Ok(None);
+    }
     conn.query_row(
         "SELECT tmdb_show_id FROM series WHERE library_id = ?1 AND relpath = ?2",
         params![library_id, show_folder],
@@ -341,6 +364,12 @@ pub(crate) fn series_show_id_for_folder(
 /// re-match updates the row (the folder's identity follows its last accepted
 /// match); nothing here runs inside a repair path.
 fn upsert_series_row(conn: &Connection, g: &QueryGroup, show_id: i64) -> Result<(), String> {
+    // No folder, no folder identity — the read side declines these, so writing
+    // one would only leave a row nothing consults. See
+    // [`series_show_id_for_folder`].
+    if g.show_folder.is_empty() {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO series (library_id, relpath, tmdb_show_id)
          VALUES (?1, ?2, ?3)
@@ -910,6 +939,13 @@ fn load_series_rows(conn: &Connection) -> Result<HashMap<(i64, String), i64>, St
     let mut out = HashMap::new();
     for row in rows {
         let (library_id, relpath, tmdb_show_id) = row.map_err(|e| format!("series row: {e}"))?;
+        // Skipped for the same reason [`series_show_id_for_folder`] declines
+        // it: a `''` relpath is the absence of a folder, not a folder every
+        // root-level file shares. Filtering on load means the group unit key
+        // cannot resurrect a legacy row this build would no longer write.
+        if relpath.is_empty() {
+            continue;
+        }
         out.insert((library_id, relpath), tmdb_show_id);
     }
     Ok(out)
