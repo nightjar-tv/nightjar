@@ -39,10 +39,57 @@ impl ParsedName {
 /// whatever follows it — which works only when a year is found, and 62 of the
 /// 63 measured failures are names with no year at all.
 const TITLE_JUNK: &[&str] = &[
-    "bluray", "blu-ray", "webdl", "web-dl", "webrip", "hdtv", "pdtv", "dvdrip", "bdrip", "hdrip",
-    "tvrip", "sdtv", "remux", "2160p", "1080p", "1080i", "720p", "480p", "x264", "x265", "h264",
-    "h265", "hevc", "xvid", "divx", "aac", "ac3", "dts", "truehd", "atmos", "flac", "10bit",
-    "8bit", "hdr10", "proper", "repack",
+    "bluray",
+    "blu-ray",
+    "webdl",
+    "web-dl",
+    "webrip",
+    "hdtv",
+    "pdtv",
+    "dvdrip",
+    "bdrip",
+    "hdrip",
+    "tvrip",
+    "sdtv",
+    "remux",
+    "2160p",
+    "1080p",
+    "1080i",
+    "720p",
+    "480p",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "hevc",
+    "xvid",
+    "divx",
+    "aac",
+    "ac3",
+    "dts",
+    "truehd",
+    "atmos",
+    "flac",
+    "10bit",
+    "8bit",
+    "hdr10",
+    "proper",
+    "repack",
+    // Edition and language tokens, each one measured on its own before it was
+    // added. `extended` earns 7 corpus cases, `truefrench` and `imax` one
+    // each, and none of the three cuts a single title in the 25,043-file
+    // dogfood library.
+    //
+    // **`german` is deliberately absent although it earns 7.** The corpus holds
+    // the counterexample itself — `The.Good.German.2006.720p.BluRay` is a real
+    // film — and the terminator now runs on the year arm, which is what used
+    // to protect it. `complete`, `uncut` and `unrated` are absent for the same
+    // reason and the library supplies theirs: `A Complete Unknown` becomes
+    // `A`, and `South Park Bigger Longer and Uncut` and `The Toxic Avenger
+    // Unrated` lose their last word. All three are bound today.
+    "extended",
+    "truefrench",
+    "imax",
 ];
 
 /// Cut a title at the first whole-word release-junk token.
@@ -451,7 +498,11 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
                 .find(&token)
                 .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
             match cut {
-                Some(i) if i > 0 => cut_stem_at(stem, i),
+                // **The terminator runs here too.** Cutting at the year
+                // removes what follows it and nothing else, so junk sitting
+                // *before* the year survived — `World.Movie.Z.EXTENDED.2013`
+                // kept `EXTENDED`. Only the fallback arms ever called this.
+                Some(i) if i > 0 => cut_at_title_junk(&cut_stem_at(stem, i)),
                 _ => cut_at_title_junk(&clean_title(stem)),
             }
         }
@@ -1531,6 +1582,70 @@ mod tests {
         let p = parse_filename("Anon Show S1080E01 - An Episode.mkv");
         assert_eq!(p.season, None);
         assert_eq!(p.episode, None);
+    }
+
+    /// **The terminator runs on the year arm too.** Cutting at the year takes
+    /// away what follows it and nothing else, so junk sitting *before* the
+    /// year survived. Only the fallback arms ever ran the junk cut.
+    #[test]
+    fn junk_before_the_year_is_cut_too() {
+        for (name, title, year) in [
+            (
+                "World.Anon.Z.EXTENDED.2013.German.DL.1080p.BluRay.AVC-XANOR",
+                "World Anon Z",
+                2013,
+            ),
+            (
+                "Anon.Aufbruch.nach.Pandora.Extended.2009.German.DTS.720p.BluRay.x264-SoW",
+                "Anon Aufbruch nach Pandora",
+                2009,
+            ),
+            ("Anon Film 1080p 2016 group", "Anon Film", 2016),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.year, Some(year), "{name}");
+        }
+    }
+
+    /// The edition and language tokens, each measured on its own before it was
+    /// added: `extended` earns seven corpus cases, `truefrench` and `imax` one
+    /// each, and none of the three cuts a title anywhere in the 25,043-file
+    /// dogfood library.
+    #[test]
+    fn edition_tokens_end_the_title() {
+        assert_eq!(
+            parse_filename("Valana la Anon TRUEFRENCH BluRay 720p 2016 group").title,
+            "Valana la Anon"
+        );
+        assert_eq!(
+            parse_filename("Anon.Title.Imax.2018.1080p.AMZN.WEB-DL.DD5.1.H.264-NTG").title,
+            "Anon Title"
+        );
+    }
+
+    /// **The words that were measured and left out**, and why each one stays
+    /// out. `german` earns seven and the corpus holds the film that refutes
+    /// it. The other three are refuted by the library, and all three of those
+    /// items are bound today.
+    #[test]
+    fn the_rejected_edition_words_do_not_cut() {
+        assert_eq!(
+            parse_filename("The.Good.German.2006.720p.BluRay.x264-RlsGrp").title,
+            "The Good German"
+        );
+        assert_eq!(
+            parse_filename("A Complete Unknown (2024) Bluray-1080p.mkv").title,
+            "A Complete Unknown"
+        );
+        assert_eq!(
+            parse_filename("South Park Bigger Longer and Uncut (1999) Bluray-1080p.mkv").title,
+            "South Park Bigger Longer and Uncut"
+        );
+        assert_eq!(
+            parse_filename("The Toxic Avenger Unrated (2025) Bluray-1080p.mkv").title,
+            "The Toxic Avenger Unrated"
+        );
     }
 
     #[test]
