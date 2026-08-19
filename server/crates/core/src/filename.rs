@@ -526,12 +526,20 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
             let mut j = i + 1;
             let mut season = 0i32;
             let mut digits = 0;
-            while j < bytes.len() && bytes[j].is_ascii_digit() && digits < 3 {
+            while j < bytes.len() && bytes[j].is_ascii_digit() && digits < 4 {
                 season = season * 10 + (bytes[j] - b'0') as i32;
                 j += 1;
                 digits += 1;
             }
-            if digits > 0 && j < bytes.len() && bytes[j] == b'e' {
+            // **A four-digit season is a year-season, and only the marked
+            // spelling may carry one.** `S2016E231` and `S1936E18` are real
+            // Sonarr forms. The bare `2016x231` is not allowed the same width
+            // because it is the shape of a resolution: `1920x804` puts a
+            // plausible year on the left and a whole three-digit run on the
+            // right, so no range guard and no whole-run guard separates them.
+            // The `S` and the `E` do — a resolution has neither.
+            let season_ok = digits < 4 || (1900..=2100).contains(&season);
+            if season_ok && digits > 0 && j < bytes.len() && bytes[j] == b'e' {
                 j += 1;
                 let mut episode = 0i32;
                 let mut edigits = 0;
@@ -1472,6 +1480,57 @@ mod tests {
         let p = parse_filename("Anon Show - 1x01 - Episode 1 - WEBRip-1080p.mkv");
         assert_eq!(p.title, "Anon Show");
         assert_eq!(p.episode, Some(1));
+    }
+
+    /// A four-digit season is a year-season, and Sonarr writes them.
+    /// `find_season_episode` read at most three season digits, so `S2016E231`
+    /// produced nothing at all — no season, no episode, and a title running to
+    /// the end of the name.
+    #[test]
+    fn a_four_digit_season_parses_in_the_marked_spelling() {
+        for (name, title, season, episode) in [
+            ("Anon Title - S1936E18 - An Episode", "Anon Title", 1936, 18),
+            ("Anon Week S2009E09 [SDTV].avi", "Anon Week", 2009, 9),
+            ("Anon!.S2016E14.2016-01-20.avi", "Anon!", 2016, 14),
+            ("Anon - S2016E231", "Anon", 2016, 231),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, Some(season), "{name}");
+            assert_eq!(p.episode, Some(episode), "{name}");
+            assert_eq!(p.title, title, "{name}");
+        }
+    }
+
+    /// **The marked spelling only, and that is the whole guard.** The bare
+    /// `2016x231` is not allowed four digits because it is the shape of a
+    /// resolution — `1920x804` puts a plausible year on the left and a whole
+    /// three-digit run on the right, so no range check and no whole-run check
+    /// separates the two. The `S` and the `E` do.
+    ///
+    /// Three corpus cases are given up for this and it is the right trade: a
+    /// resolution read as a season turns a film into an episode of season
+    /// 1920.
+    #[test]
+    fn the_bare_spelling_keeps_its_two_digit_season() {
+        for name in [
+            "[Anon] A Film Name [Dual-Audio][BDRip 1920x804 HEVC FLACx2] [91FC62A8].mkv",
+            "A Movie Name.1080x1920.mkv",
+            "A Movie Name (1920x1080).mkv",
+            "Anon Release - 07 (1280x720 x264-AAC) [ABCD1234].mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, None, "{name} invented a season");
+            assert_eq!(p.episode, None, "{name} invented an episode");
+        }
+    }
+
+    /// A four-digit number that is not a plausible year is not a season
+    /// either, in any spelling.
+    #[test]
+    fn a_four_digit_season_must_be_a_plausible_year() {
+        let p = parse_filename("Anon Show S1080E01 - An Episode.mkv");
+        assert_eq!(p.season, None);
+        assert_eq!(p.episode, None);
     }
 
     #[test]
