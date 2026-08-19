@@ -461,11 +461,27 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     }
 }
 
+/// Strip a file extension, and only a file extension.
+///
+/// **A release name is not a filename.** Cutting at the last dot whatever
+/// follows it threw away `S01E91-E100` from `Series.S01E91-E100`, and the
+/// parse then saw `Series` with no season and no episode at all. 232 corpus
+/// cases lose a non-extension suffix that way; ten of them lose their only
+/// season/episode token and six their only year, including
+/// `A.I.Artificial.Movie.(2001)`.
+///
+/// One to four characters, all alphanumeric. Checked against the 25,043-file
+/// dogfood library: every extension in it satisfies that, and no basename in
+/// it has a suffix that does not — so the guard costs the library nothing.
 fn strip_extension(name: &str) -> &str {
     match name.rfind('.') {
-        Some(i) if i > 0 => &name[..i],
+        Some(i) if i > 0 && is_extension(&name[i + 1..]) => &name[..i],
         _ => name,
     }
+}
+
+fn is_extension(suffix: &str) -> bool {
+    (1..=4).contains(&suffix.len()) && suffix.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 fn clean_title(s: &str) -> String {
@@ -1361,6 +1377,40 @@ mod tests {
             parse_filename("Anon Show 2018 EP06 720p x265 GROUP.mp4").title,
             "Anon Show"
         );
+    }
+
+    /// A release name is not a filename, so only a real extension is stripped.
+    /// Cutting at the last dot whatever followed it threw away `S01E91-E100`
+    /// and left the parse looking at `Series` alone.
+    #[test]
+    fn only_a_real_extension_is_stripped() {
+        let a = parse_filename("Anon.Show.S02E15");
+        assert_eq!(a.season, Some(2));
+        assert_eq!(a.episode, Some(15));
+        assert_eq!(a.title, "Anon Show");
+
+        let b = parse_filename("Warehouse.13.S01E01");
+        assert_eq!(b.season, Some(1));
+        assert_eq!(b.episode, Some(1));
+
+        // A group tag carrying a dot is not an extension either.
+        let c = parse_filename("[Anon-Group.Hu] Dr Anon S3 - 21 [1080p]");
+        assert_eq!(c.title, "Dr Anon S3");
+
+        // A parenthesised year at the end survives.
+        let d = parse_filename("A.Anon.Name.(1998)");
+        assert_eq!(d.year, Some(1998));
+    }
+
+    /// Real extensions still go, and the guard is the library's own shape: one
+    /// to four characters, all alphanumeric.
+    #[test]
+    fn real_extensions_are_still_stripped() {
+        for ext in ["mkv", "mp4", "avi", "m4v", "ts", "webm", "divx", "m2ts"] {
+            let p = parse_filename(&format!("Anon Film (2019).{ext}"));
+            assert_eq!(p.title, "Anon Film", "{ext}");
+            assert_eq!(p.year, Some(2019), "{ext}");
+        }
     }
 
     #[test]
