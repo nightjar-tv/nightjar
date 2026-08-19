@@ -97,3 +97,61 @@ get verdicts instead of stalls, which is where `movie.noyear`'s 58.8% and
 the rows they were hiding get scored. A rate that drops after warming is the
 instrument improving, not the product regressing — the same shape as note 05 in
 reverse, and it should be reported in those words.
+
+---
+
+## The trap in measuring afterwards
+
+**Do not re-measure with `./run.sh`.** `run.sh all` re-runs `inventory.py` and
+`pick_entities.py`, and those pick entities *from the cache* — an entity is kept
+only when the cache can serve it offline. A warmed cache serves more, so a full
+`run.sh` after warming **silently enlarges the entity set**, and every before/after
+in notes 00–05 is then computed over a different population. The rows would not
+join, and the difference would read as a result.
+
+`measure_warmed.sh` re-drains the libraries already in `out/lib` — which encode
+the 2,410-entity population — against the warmed cache, and scores those. It
+**aborts unless the population is still 2,410 entities and 67,982 rows**, and
+aborts if the cache count changes during the run, because that arm would not have
+been offline.
+
+Verified: the guard reads 2,410 and 67,982 off the current tree.
+
+## The tranche split is exactly one shape
+
+Checked against `warm-list.tsv` rather than assumed:
+
+| tranche | calls | shapes asking them |
+|---|---:|---|
+| **1 — candidate details and seasons** | **457** | the other 16 shapes |
+| **2 — titleless searches** | **4,876** | **`tv.handmade`, alone** |
+
+`tv.numbered` no longer contributes titleless searches: after the harness fix it
+asks the same real-title queries as `tv.sonarr.plain`, and those are already
+cached. So tranche 1 is `SHAPES` set to the 16 non-`tv.handmade` shapes, and
+tranche 2 is `SHAPES="tv.handmade"`. One shape, cleanly separable, which keeps the
+attribution between the two measurements clean.
+
+## The four commands, in order
+
+    W=~/Documents/GitHub/nightjar-wt-matcher
+    OR=~/Documents/GitHub/nightjar-wt-matcher-oracle
+    C=~/nightjar-wt-matcher-scratch/tmdb-cache-warm
+
+    # 1. tranche 1 — 457 calls, 3,862 groups
+    SHAPES="movie.noyear movie.scene movie.sonarr movie.yearfile movie.yearfolder \
+    tv.flat tv.flat.titled tv.noyear tv.numbered tv.partial tv.root tv.scene \
+    tv.single tv.sonarr tv.sonarr.plain tv.twoseason" \
+    TMDB_API_KEY=… $W/notes/loop-matcher/scripts/warm_cache.sh $OR $C
+
+    # 2. measure
+    $W/notes/loop-matcher/scripts/measure_warmed.sh $OR $C warm1
+
+    # 3. tranche 2 — the 4,876 searches that make M2 measurable
+    SHAPES="tv.handmade" TMDB_API_KEY=… $W/notes/loop-matcher/scripts/warm_cache.sh $OR $C
+
+    # 4. measure
+    $W/notes/loop-matcher/scripts/measure_warmed.sh $OR $C warm2
+
+The key must be a shell substitution, not a literal — the text of a `!` command
+lands in the transcript.
