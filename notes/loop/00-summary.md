@@ -247,6 +247,29 @@ arms must set it, because re-parsing with today's parser does not reproduce the
 scanner that made the capture — the baseline moves, and that is only sound if
 both arms move together.
 
+### Warm the new keys before a pair means anything
+
+**A change that makes a folder assert a new season or episode will miss the
+cache, and strict mode will refuse it.** That is not a defect in the change and
+not a defect in the harness — it is the harness doing its job. The drain goes
+to fetch something it has never needed before, and there is nothing recorded
+for it.
+
+It is predictable, so it should be planned for rather than discovered:
+
+1. Run the pair strict. Read the `cache miss in strict mode` lines.
+2. Run the **treatment arm alone with strict off** to warm the new path.
+   Record the cache entry count before and after, so the cost is measured
+   rather than claimed.
+3. Re-run the pair strict. Now `requests=0` on both arms means something.
+
+**Strict mode under-reports the warm cost.** It aborts a path at its first
+miss, so it can only report the misses it *reaches*. Measured here: the strict
+run showed **2** distinct missing keys; warming actually cost **3** requests and
+added **3** entries (8,182 -> 8,185), because fetching the first key let the
+drain reach a second one behind it. Budget for a cascade, and count the cache
+directory rather than trusting the miss lines.
+
 ### Where to measure
 
 **The N150 is still the cheapest place**: its paths already match the capture,
