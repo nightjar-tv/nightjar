@@ -460,3 +460,110 @@ instrument needs after this.
 If instead a large share binds *wrong*, my model of the query is wrong and the
 leading number folds away somewhere I have not looked — which would be the more
 interesting result.
+
+---
+
+## Tranche 2 — measured. The prediction held, including the part I revised.
+
+**4,876 live requests, 4,876 entries written, cache 10,196 → 15,072.** Converged
+in one round. Exactly the planned figure this time — no lower-bound effect,
+because a search that returns nothing raises no follow-on call.
+
+**Across both tranches: 6,887 live requests. Cache 8,185 → 15,072, delta exactly
+6,887.** The shared 8,185-entry cache is untouched.
+
+### The oracle is now fully measured for the first time
+
+    runs 34   provider errors 0   http requests 0
+    items 67982   stalled by a cache miss 0 (0.0%)
+
+**Zero stalls. Zero provider errors. Zero requests. Noise floor 0.** Every one of
+the 67,982 rows has a verdict. That has never been true before — the instrument
+began this session blind to 39.3% of itself.
+
+### tv.handmade
+
+| | value |
+|---|---|
+| measured | 5,644 (was 0) |
+| correct | **0 — 0.0%** |
+| wrong | **0** |
+| absent | **5,644** |
+
+One shape moved, one transition type: `stalled → absent`, 5,644 rows. Not one
+wrong binding. `correct` did not change by a single row.
+
+**The revised prediction was right on every line** — ~0% correct, failures
+overwhelmingly `absent` rather than `wrong`, wrong binds few. The actual figure is
+better than "few": **zero.**
+
+### Why, checked rather than assumed
+
+    4686 groups  reason=NoMatch          the search returned nothing
+     190 groups  reason=BelowThreshold   it returned something that did not score
+       1 group   exact_title_year_nearest, below threshold
+
+And from the cached responses themselves — 400 sampled `01 Closure`-style
+queries: **33 returned results, 367 returned none.**
+
+So the leading episode number is *not* the only guard, which is what the oracle's
+README and my own prediction both assumed. **About 8% of these nonsense queries
+do get candidates back from a live provider, and the matcher declined every one of
+them.** 190 groups had something to bind and correctly refused.
+
+That is worth saying plainly after a session spent cataloguing failures: **here
+the threshold did exactly its job.** `absent` is the right answer for a query that
+means nothing, and the matcher gave it 5,644 times out of 5,644.
+
+### What is still not measured
+
+M2's severity. `tv.handmade` asks *"what happens to `01 - Closure.mkv`"* and the
+answer is a clean 5,644 absents. It cannot ask *"what happens to `Closure.mkv`"* —
+the wrong-bind form, where the query folds equal to a real film. Nothing generates
+that shape, and generating it means changing the oracle's entity set, which the
+hard limits forbid.
+
+So: **M2 is confirmed to cost 5,644 unmatched files and is not shown to cost a
+single wrong binding.** The latent risk is still latent, and still unmeasured.
+
+## Final state — fully warmed, fully measured
+
+| shape | correct% | correct | wrong | absent |
+|---|---:|---:|---:|---:|
+| movie.sonarr | **100.0%** | 1,712 | 0 | 0 |
+| tv.flat.titled | **100.0%** | 5,644 | 0 | 0 |
+| tv.sonarr | **100.0%** | 5,644 | 0 | 0 |
+| tv.twoseason | **100.0%** | 6,278 | 0 | 0 |
+| tv.flat | 99.9% | 5,640 | 0 | 0 |
+| tv.numbered | 99.9% | 5,640 | 0 | 0 |
+| tv.sonarr.plain | 99.9% | 5,640 | 0 | 0 |
+| tv.partial | 99.9% | 1,649 | 0 | 0 |
+| tv.single | 99.9% | 697 | 0 | 0 |
+| movie.scene / yearfile / yearfolder | 99.9% | 1,710 each | 1 each | 1 each |
+| **tv.root** | **63.9%** | 3,609 | 41 | 1,401 |
+| **tv.noyear** | **63.9%** | 3,609 | 41 | 1,391 |
+| **tv.scene** | **61.6%** | 3,479 | 14 | 1,624 |
+| **movie.noyear** | **58.8%** | 1,006 | 1 | 705 |
+| **tv.handmade** | **0.0%** | 0 | 0 | 5,644 |
+
+Totals: **correct 55,377 (81.5%)**, `wrong.entity` 100,
+`wrong.unknownepisode` 1,737 (1,607 confirmed a different entity),
+absent 10,768, **stalled 0**.
+
+Wrong bindings by pair — 8 distinct causes, 59 items outside shared-root plus 41
+inside:
+
+     16  Queer as Folk              -> Queer as Folk (2022)
+     10  Suits                      -> Suits LA (2025)
+      8  Gilmore Girls              -> Gilmore Girls: A Year in the Life (2016)
+      8  Stranger Things            -> Stranger Things: Tales from '85 (2026)
+      8  Avatar: The Last Airbender -> Avatar: The Last Airbender (2024)
+      4  Blade Runner 2049          -> Blade Runner (1982)
+      3  Sherlock                   -> Sherlock & Daughter (2025)
+      2  Battlestar Galactica       -> Battlestar Galactica (2003)
+
+Five of those eight are a **title-prefix relationship, not a title collision** —
+the stored title is a strict prefix of the bound entity's, and the bound entity is
+the franchise's spin-off or sequel series. That is a distinct family from M5's
+same-title case and it wants its own name and its own fix. It is invisible without
+a warm cache, because every one of these was a stall.
