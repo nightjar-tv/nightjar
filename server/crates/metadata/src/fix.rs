@@ -116,6 +116,20 @@ pub fn search_candidates(
     } else {
         SearchKind::Movie
     };
+    // **An absent title is not a query.** `parse_filename` returns an empty
+    // title when the filename carries none (`S03E09 WS PDTV XviD FUtV`), and
+    // the scanner borrows the folder's name — but a file sitting directly in
+    // the library root has no folder to borrow from, so the stored title can
+    // still be empty. Searching on it asks the provider for everything and
+    // means nothing.
+    //
+    // The drain's own path already refuses this: `MetadataSource::resolve`
+    // filters an empty title to `Miss` before any request. This is the one
+    // route that did not, because it substitutes the stored title when the
+    // caller supplies no query of its own.
+    if title.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let hits = client
         .search(search_kind, &title)
         .map_err(|e| e.to_string())?;
@@ -334,6 +348,41 @@ mod tests {
         ) -> Result<crate::resolve::ProviderResult, ResolveError> {
             self.calls.set(self.calls.get() + 1);
             Ok(crate::resolve::ProviderResult::Miss)
+        }
+    }
+
+    /// **An absent title is not a query.** The drain's own path filters an
+    /// empty title to a miss before any request; this route did not, because
+    /// it substitutes the *stored* title when the caller supplies no query.
+    ///
+    /// A file directly in the library root is where that bites: the parser
+    /// finds no title in `S01E04.mkv` and the scanner has no folder to borrow
+    /// one from, so the stored title is empty.
+    ///
+    /// The client here carries a bogus key and is never reached — a real
+    /// search would error, so `Ok([])` is what proves the guard fired.
+    #[test]
+    fn a_fix_search_on_an_absent_title_asks_the_provider_nothing() {
+        let client = TmdbClient::new(crate::tmdb::TmdbCredentials {
+            api_key: "not-a-key".into(),
+            source: crate::tmdb::TmdbKeySource::Env,
+        });
+        for kind in ["episode", "movie"] {
+            let item = FixItemView {
+                id: 1,
+                library_id: 1,
+                path: "S01E04.mkv".into(),
+                title: String::new(),
+                kind: kind.into(),
+                year: None,
+                season: Some(1),
+                episode: Some(4),
+            };
+            let out = search_candidates(&client, &item, None, None).expect("no request, no error");
+            assert!(out.is_empty(), "{kind} searched on an empty title");
+            // An empty query string from the caller is the same absence.
+            let out = search_candidates(&client, &item, Some("   "), None).expect("no request");
+            assert!(out.is_empty(), "{kind} searched on a blank query");
         }
     }
 
