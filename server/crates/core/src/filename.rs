@@ -868,19 +868,36 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
     loop {
         let mut k = j;
         let separated = k < bytes.len() && bytes[k] == b'-';
-        if separated {
+        // **A dash is not the only separator**, and the other three cost
+        // nothing only because a marker has to follow them. `S02E09 E10`,
+        // `Series.S03E01.S03E02` and `2x04.2x05` are all one file holding two
+        // episodes; a dash-only rule reported the first and claimed success,
+        // which is worse than reporting nothing.
+        let soft_separated =
+            !separated && k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_');
+        if separated || soft_separated {
             k += 1;
         }
         // An optional repeat of the season, in either spelling it appears in:
         // `s06` before an `e`, or `6x` before the number.
+        let mut marked = false;
         if let Some((repeated, after)) = read_repeated_season(bytes, k) {
             if repeated != season {
                 break;
             }
             k = after;
+            marked = true;
         }
         if k < bytes.len() && (bytes[k] == b'e' || bytes[k] == b'x') {
             k += 1;
+            marked = true;
+        }
+        // **A soft separator needs a marker behind it.** Without one the
+        // corpus is full of names where the next token is an episode-title
+        // numeral: `S01E06 3 Beers For Batali`, `S01E04.2-45.PM`,
+        // `S02E21 18 5 4`. All three parse correctly today.
+        if soft_separated && !marked {
+            break;
         }
         // Something must separate this token from the last, or a stray trailing
         // number would read as an episode.
@@ -897,6 +914,8 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
         if digits == 0 {
             break;
         }
+        // A dash introduces a range end; anything else is a repetition and
+        // must land on the next episode exactly.
         let ok = if separated {
             next > end
         } else {
@@ -2020,6 +2039,64 @@ mod multi_episode_spellings {
             let p = parse_filename(name);
             assert_eq!(p.episode_numbers(), want, "{name}");
         }
+    }
+
+    /// **A dash is not the only separator.** `S02E09 E10` and
+    /// `Series.S03E01.S03E02` are one file holding two episodes; the dash-only
+    /// rule returned the first and reported success, which is worse than
+    /// returning nothing — a caller cannot tell a single-episode file from a
+    /// range whose tail was dropped.
+    #[test]
+    fn a_space_or_dot_separates_repeated_episode_tokens() {
+        for (name, want) in [
+            ("Anon.S03E01.S03E02.720p.HDTV.X264-GROUP", vec![1, 2]),
+            (
+                "The Anon S01e01 e02 ShoHD On Demand 1080i DD5 1 GROUP",
+                vec![1, 2],
+            ),
+            ("Anon.Title.2x04.2x05.720p.BluRay-FUTV", vec![4, 5]),
+            ("Hell on Anon S02E09 E10 HDTV x264 GROUP", vec![9, 10]),
+        ] {
+            assert_eq!(parse_filename(name).episode_numbers(), want, "{name}");
+        }
+    }
+
+    /// **The marker is the whole guard.** A space, dot or underscore is
+    /// accepted only when a repeated season or an `e`/`x` follows it. Without
+    /// that, every one of these — which parse correctly today — becomes a
+    /// two-episode file, because the token after the separator is a numeral in
+    /// the episode title.
+    #[test]
+    fn a_soft_separator_without_a_marker_is_not_an_episode() {
+        for (name, want) in [
+            (
+                "Anon Title S01E06 3 Beers For Batali DVDRip XviD GROUP",
+                vec![6],
+            ),
+            ("Anon.S01E04.2-45.PM.[HDTV-720p].mkv", vec![4]),
+            (
+                "Anon Title S02E21 18 5 4 720p WEB DL DD5 1 h 264 GROUP",
+                vec![21],
+            ),
+            ("Anon Show - 1x01 - An Episode - Bluray-1080p.mkv", vec![1]),
+            ("Anon.Show.S01E01.720p.mkv", vec![1]),
+        ] {
+            assert_eq!(parse_filename(name).episode_numbers(), want, "{name}");
+        }
+    }
+
+    /// A soft separator means repetition, not a range: the next number must be
+    /// exactly the next episode. Only the dash carries a range.
+    #[test]
+    fn a_soft_separator_does_not_open_a_range() {
+        assert_eq!(
+            parse_filename("Anon.S01E01.E05.720p.mkv").episode_numbers(),
+            vec![1]
+        );
+        assert_eq!(
+            parse_filename("Anon.S01E01-E05.720p.mkv").episode_numbers(),
+            vec![1, 2, 3, 4, 5]
+        );
     }
 
     /// A repeated season token must agree. `S6E1-S6E2` is a range; `S6E1-S7E2`
