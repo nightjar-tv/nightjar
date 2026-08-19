@@ -442,16 +442,169 @@ fn cut_at_episode_marker(s: &str) -> String {
     s.to_string()
 }
 
+/// Tokens that make a **bracket group** release metadata rather than a title.
+///
+/// **This list never cuts a title.** It can only make [`bracket_run_title`]
+/// skip a group and look at the next one, which is why it can hold `mp4`, `gb`
+/// and `batch` — words that would be reckless in [`TITLE_JUNK`], where a match
+/// truncates. The worst it can do is pass over a group whose every word is one
+/// of these, and a title made only of container tags is not a title.
+const GROUP_METADATA: &[&str] = &[
+    "mp4", "mkv", "avi", "avc", "gb", "gbk", "big5", "cht", "chs", "jap", "jp", "cn", "srt", "ass",
+    "sub", "subs", "batch", "end", "fin", "dvd", "bd", "opus", "eac3", "ddp", "dd", "hi10p",
+    "hi10", "multi", "dual", "audio", "web", "360p", "540p", "1080p10", "10bits",
+];
+
+/// The title of a name that is nothing but a run of bracket groups.
+///
+/// `[GM-Team][国漫][Anime Title][2019][215][AVC][GB][1080P]` carries no text
+/// outside the brackets at all, so there is nothing for a terminator to cut at
+/// and the title ran to the end of the name. Twenty corpus cases are this form
+/// and it is the bracket-delimited CJK release convention.
+///
+/// **The first group is the release tag** — the same assumption
+/// [`strip_leading_group`] already makes — so selection starts at the second.
+/// The title is the first group after it that carries a Latin letter run of two
+/// or more and is not release metadata.
+///
+/// Returns `None` unless the name really is a run: at least three groups, and
+/// nothing alphanumeric outside them. The 25,043-file dogfood library holds no
+/// name of this shape, so the rule is measured on the corpus alone.
+fn bracket_run_title(stem: &str) -> Option<String> {
+    let groups = bracket_groups(stem);
+    if groups.len() < 3 {
+        return None;
+    }
+    // Nothing outside the brackets may carry information, or this is an
+    // ordinary name that happens to end in tags.
+    let mut outside = String::new();
+    let mut last = 0;
+    for (start, end, _) in &groups {
+        outside.push_str(&stem[last..*start]);
+        last = *end;
+    }
+    outside.push_str(&stem[last..]);
+    if outside.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    for (_, _, body) in groups.iter().skip(1) {
+        if !has_latin_run(body) || is_group_metadata(body) {
+            continue;
+        }
+        // Through `clean_title` like every other title path: the group body is
+        // raw, and `Anime_Series_Title` has to become `Anime Series Title`
+        // before the soft key the matcher uses will agree with it.
+        let picked = clean_title(&trim_to_latin_title(body));
+        if !picked.is_empty() {
+            return Some(picked);
+        }
+    }
+    None
+}
+
+/// `(start, end, body)` for every `[...]` or `【...】`, in order.
+fn bracket_groups(s: &str) -> Vec<(usize, usize, &str)> {
+    let mut out = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '【' => open = Some((i, i + c.len_utf8())),
+            ']' | '】' => {
+                if let Some((start, body_start)) = open.take() {
+                    out.push((start, i + c.len_utf8(), &s[body_start..i]));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn has_latin_run(s: &str) -> bool {
+    let mut run = 0;
+    for c in s.chars() {
+        if c.is_ascii_alphabetic() {
+            run += 1;
+            if run >= 2 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// Every alphanumeric word in the group is metadata or a bare number.
+fn is_group_metadata(s: &str) -> bool {
+    for word in s.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        let known = GROUP_METADATA.contains(&lower.as_str())
+            || TITLE_JUNK.contains(&lower.as_str())
+            || word.chars().all(|c| c.is_ascii_digit());
+        if !known {
+            return false;
+        }
+    }
+    true
+}
+
+/// The Latin title inside a group that may also carry a CJK one.
+///
+/// Two steps. The longest run between non-ASCII characters is the Latin side,
+/// so `ANIME SERIES 海賊王` gives `ANIME SERIES`. Then, if a **spaced** `_`,
+/// `/` or `|` remains, the part after the last one wins — those separate two
+/// titles. An unspaced `_` is a filename space and must not split, or
+/// `Anime_Series_Title` becomes `Title`.
+fn trim_to_latin_title(body: &str) -> String {
+    let latin = body
+        .split(|c: char| !c.is_ascii())
+        .filter(|part| has_latin_run(part))
+        .max_by_key(|part| part.len())
+        .unwrap_or(body);
+
+    let bytes = latin.as_bytes();
+    let mut cut = None;
+    for i in 0..bytes.len() {
+        if matches!(bytes[i], b'_' | b'/' | b'|') {
+            let left_space = i > 0 && bytes[i - 1] == b' ';
+            let right_space = i + 1 < bytes.len() && bytes[i + 1] == b' ';
+            if left_space || right_space {
+                cut = Some(i + 1);
+            }
+        }
+    }
+    let tail = match cut {
+        Some(c) if has_latin_run(&latin[c..]) => &latin[c..],
+        _ => latin,
+    };
+    tail.trim()
+        .trim_matches([' ', '_', '.', '-', '/', '|', '~', '!'])
+        .trim()
+        .to_string()
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
-    let stem = strip_leading_group(strip_extension(file_name));
+    let whole = strip_extension(file_name);
+    // A name that is nothing but bracket groups has no text outside them for a
+    // terminator to cut at, so its title is selected from the groups rather
+    // than derived by cutting.
+    let run_title = bracket_run_title(whole);
+    let stem = strip_leading_group(whole);
     let normalized = stem.replace(['_', '.'], " ");
     let compact = stem.to_ascii_lowercase();
 
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
-        let title = cut_at_episode_marker(&cut_at_absolute_episode(&cut_at_title_junk(
-            &cut_stem_at(stem, before),
-        )));
+        let title = run_title.clone().unwrap_or_else(|| {
+            cut_at_episode_marker(&cut_at_absolute_episode(&cut_at_title_junk(&cut_stem_at(
+                stem, before,
+            ))))
+        });
         let end = if episode_end > episode {
             Some(episode_end)
         } else {
@@ -475,7 +628,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // season/episode scan, which owns every name that carries both, and before
     // the year branch, which would otherwise call a pack a movie.
     if let Some((before, season)) = find_bare_season(&normalized) {
-        let title = cut_at_episode_marker(&cut_at_title_junk(&cut_stem_at(stem, before)));
+        let title = run_title.clone().unwrap_or_else(|| {
+            cut_at_episode_marker(&cut_at_title_junk(&cut_stem_at(stem, before)))
+        });
         return ParsedName {
             title: if title.is_empty() {
                 stem.to_string()
@@ -508,7 +663,8 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         }
         None => cut_at_title_junk(&clean_title(stem)),
     };
-    let title = cut_at_episode_marker(&cut_at_absolute_episode(&title));
+    let title =
+        run_title.unwrap_or_else(|| cut_at_episode_marker(&cut_at_absolute_episode(&title)));
 
     ParsedName {
         title: if title.is_empty() {
@@ -1362,10 +1518,20 @@ mod tests {
             parse_filename("The Anon Show (2010) - [S01E01-02-03] - An Episode").title,
             "The Anon Show (2010)"
         );
-        // the year cut
+        // The year cut.
+        //
+        // **Changed 2026-08-19, and the old assertion is worth recording.** It
+        // used `[Anon][Anon Title][2019][234][AVC][GB][1080P]` and expected
+        // `[Anon Title]` — brackets and all, because backing the year cut out
+        // to the bracket was the best that could be done for a name with no
+        // text outside its groups. `bracket_run_title` now selects the title
+        // group for that shape and returns `Anon Title`, which is the answer
+        // the corpus wants. The example moved to a name that is *not* a
+        // bracket run, so this test still covers the year-cut route it was
+        // written for.
         assert_eq!(
-            parse_filename("[Anon][Anon Title][2019][234][AVC][GB][1080P]").title,
-            "[Anon Title]"
+            parse_filename("Anon Title [2019] Bluray-1080p.mkv").title,
+            "Anon Title"
         );
     }
 
@@ -1645,6 +1811,82 @@ mod tests {
         assert_eq!(
             parse_filename("The Toxic Avenger Unrated (2025) Bluray-1080p.mkv").title,
             "The Toxic Avenger Unrated"
+        );
+    }
+
+    /// A name that is nothing but bracket groups has no text outside them for
+    /// a terminator to cut at, so the title is *selected* from the groups
+    /// rather than derived by cutting. The first group is the release tag, so
+    /// selection starts at the second.
+    #[test]
+    fn a_bracket_run_selects_its_title_group() {
+        for (name, title) in [
+            (
+                "[Anon-Team][国漫][Anon Title][2019][215][AVC][GB][1080P]",
+                "Anon Title",
+            ),
+            (
+                "[Anon-Team][国漫][斗罗大陆][Anon Title][Douro Mainland][2019][215 END][AVC][GB][1080P]",
+                "Anon Title",
+            ),
+            (
+                "[Anon][Anon_Series_Title][01][GB][1080P][x264_AAC]",
+                "Anon Series Title",
+            ),
+            // a group carrying both scripts keeps its Latin side
+            (
+                "[AnonRaws][Anon Series 海賊王][1008][ViuTV][CHT][MKV]",
+                "Anon Series",
+            ),
+            (
+                "[Anon组][名侦探柯南·Anon Title][871][繁日][HDrip][X264-AAC]",
+                "Anon Title",
+            ),
+            // the full-width bracket is a bracket too
+            (
+                "【Anon字幕组】【天使降临_Anon Series Title】[第05话][1080p_HEVC][简繁外挂]",
+                "Anon Series Title",
+            ),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+    }
+
+    /// The two guards that keep this away from ordinary names.
+    ///
+    /// A name with text outside the brackets is not a run — a terminator has
+    /// something to cut at there and does a better job. And three groups
+    /// minimum, so a title with one or two trailing tags is untouched.
+    #[test]
+    fn an_ordinary_name_is_not_a_bracket_run() {
+        assert_eq!(
+            parse_filename("[Anon] Anon Show - 1x02 - An Episode [720p][ABCD1234].mkv").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("Anon Show - 4x11 - An Episode - Bluray-1080p.mkv").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("[Anon][Anon Title][1080p]").title,
+            "Anon Title"
+        );
+        assert_eq!(parse_filename("[REC] (2007).mkv").year, Some(2007));
+    }
+
+    /// **The group-rejection list never cuts a title.** It only makes the
+    /// selector skip a group, which is why it may hold `mp4`, `gb` and `batch`
+    /// — words that would be reckless in `TITLE_JUNK`, where a match
+    /// truncates. `Anon GB Title` keeps its middle word.
+    #[test]
+    fn the_group_metadata_list_does_not_truncate() {
+        assert_eq!(
+            parse_filename("Anon GB Title (2011) Bluray-1080p.mkv").title,
+            "Anon GB Title"
+        );
+        assert_eq!(
+            parse_filename("Anon Batch Title (2011) Bluray-1080p.mkv").title,
+            "Anon Batch Title"
         );
     }
 
