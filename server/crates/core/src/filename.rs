@@ -73,7 +73,7 @@ fn cut_at_title_junk(s: &str) -> String {
     let Some(i) = cut else {
         return s.to_string();
     };
-    let head = s[..i]
+    let head = s[..back_up_to_open_bracket(s, i)]
         .trim()
         .trim_matches([' ', '-', '_', '.', '(', '['])
         .trim();
@@ -82,6 +82,43 @@ fn cut_at_title_junk(s: &str) -> String {
     } else {
         head.to_string()
     }
+}
+
+/// Move a cut at `i` back to the opening bracket of the group it fell inside.
+///
+/// **A bracket group is atomic.** `[BD 1080p FLAC]` holds one junk token, so
+/// the whole group is release metadata and the title ends before it — cutting
+/// at `1080p` leaves `Goblin Slayer - Goblin's Crown [BD`, a title with half a
+/// bracket on the end. 18 corpus cases end this way.
+///
+/// Only a group left **open** at `i` counts. A bracket the title closes before
+/// the cut is part of the title, so `Anon [Bracketed] Film 1080p` still cuts at
+/// the junk token and keeps the bracket.
+fn back_up_to_open_bracket(s: &str, i: usize) -> usize {
+    let mut open: Vec<usize> = Vec::new();
+    for (at, c) in s[..i].char_indices() {
+        match c {
+            '[' | '(' | '{' => open.push(at),
+            ']' | ')' | '}' => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    open.first().copied().unwrap_or(i)
+}
+
+/// Cut the stem at `i` and clean it, backing the cut out of any bracket group
+/// it landed inside.
+///
+/// Every cut site goes through here. Bracket atomicity was first written into
+/// `cut_at_title_junk` alone and moved exactly **one** corpus case: 17 of the
+/// 18 titles ending in a half-open bracket come from the episode-token cut
+/// (`Series Title [1x05] Episode Title`) or the year cut
+/// (`[GM-Team][国漫][Anime Title][2019]`), neither of which is the junk cut.
+/// A fix that removes one route is not a fix for the mechanism.
+fn cut_stem_at(stem: &str, i: usize) -> String {
+    clean_title(&stem[..back_up_to_open_bracket(stem, i.min(stem.len()))])
 }
 
 /// Strip a leading `[group]` release tag.
@@ -307,9 +344,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     let compact = stem.to_ascii_lowercase();
 
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
-        let title = cut_at_absolute_episode(&cut_at_title_junk(&clean_title(
-            &stem[..before.min(stem.len())],
-        )));
+        let title = cut_at_absolute_episode(&cut_at_title_junk(&cut_stem_at(stem, before)));
         let end = if episode_end > episode {
             Some(episode_end)
         } else {
@@ -333,7 +368,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // season/episode scan, which owns every name that carries both, and before
     // the year branch, which would otherwise call a pack a movie.
     if let Some((before, season)) = find_bare_season(&normalized) {
-        let title = cut_at_title_junk(&clean_title(&stem[..before.min(stem.len())]));
+        let title = cut_at_title_junk(&cut_stem_at(stem, before));
         return ParsedName {
             title: if title.is_empty() {
                 stem.to_string()
@@ -356,7 +391,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
                 .find(&token)
                 .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
             match cut {
-                Some(i) if i > 0 => clean_title(&stem[..i]),
+                Some(i) if i > 0 => cut_stem_at(stem, i),
                 _ => cut_at_title_junk(&clean_title(stem)),
             }
         }
@@ -1158,6 +1193,63 @@ mod tests {
         let q = parse_filename("Anon.Show.S01E01.720p.mkv");
         assert_eq!(q.season, Some(1));
         assert_eq!(q.episode, Some(1));
+    }
+
+    /// A bracket group is atomic: a cut that lands inside one backs out to the
+    /// opening bracket. `[BD 1080p FLAC]` is release metadata, so a title
+    /// ending `... [BD` has half a bracket on it.
+    ///
+    /// **The mechanism has three routes and all three go through the same
+    /// helper.** Written into the junk cut alone it moved one corpus case;
+    /// seventeen of the eighteen come from the episode-token cut and the year
+    /// cut instead.
+    #[test]
+    fn a_cut_inside_a_bracket_backs_out_to_the_bracket() {
+        // the junk cut
+        assert_eq!(
+            parse_filename("[anon] Anon Show - Anon Crown [BD 1080p FLAC] [CD298D48].mkv").title,
+            "Anon Show - Anon Crown"
+        );
+        // the episode-token cut
+        assert_eq!(
+            parse_filename("Anon Show [1x05] An Episode").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("Anon Show [S01E05] An Episode").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("Anon Show - [02x01] - An Episode").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("The Anon Show (2010) - [S01E01-02-03] - An Episode").title,
+            "The Anon Show (2010)"
+        );
+        // the year cut
+        assert_eq!(
+            parse_filename("[Anon][Anon Title][2019][234][AVC][GB][1080P]").title,
+            "[Anon Title]"
+        );
+    }
+
+    /// The guard: only a group left **open** at the cut counts. A bracket the
+    /// title closes before the cut is part of the title.
+    #[test]
+    fn a_closed_bracket_before_the_cut_stays_in_the_title() {
+        assert_eq!(
+            parse_filename("Anon [Bracketed] Film (2011).mkv").title,
+            "Anon [Bracketed] Film"
+        );
+        assert_eq!(
+            parse_filename("Anon [Bracketed] Show - 1x02 - An Episode.mkv").title,
+            "Anon [Bracketed] Show"
+        );
+        assert_eq!(
+            parse_filename("Anon Show [2022] [S25E13] [PL] [720p].mkv").title,
+            "Anon Show [2022]"
+        );
     }
 
     #[test]
