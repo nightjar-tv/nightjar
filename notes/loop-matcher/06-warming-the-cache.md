@@ -291,3 +291,131 @@ request. Recorded here as a finding for someone to take on deliberately.
 
 Cache growth equals request count exactly, which is the check the earlier version
 of this script could not make.
+
+---
+
+## Tranche 1 — measured
+
+**2,011 live requests. Cache 8,185 → 10,196, a delta of exactly 2,011.** Request
+count and entries written agree 1:1, which is the check that matters given the
+counter counts attempts. The shared 8,185-entry cache is untouched.
+
+    tv.flat.titled-b0  600 requests   (verification batch)
+    tv.single-b0       939 requests   (verification batch, sandboxed)
+    round 1            472 requests, 472 entries written
+    round 2              0 requests  -> converged
+
+The scripted run converged in one effective round. The plan said 457 and the true
+cost was 2,011 — the lower-bound effect, 4.4×, exactly as `warm_list.py` warned.
+It converged immediately because the replay's own drain already makes several
+passes inside one batch, so it follows the raised calls without needing another
+round.
+
+Re-measured strict, `requests=0` on all 34 runs, population pinned at 2,410
+entities / 67,982 rows, noise floor **0**.
+
+### Stalls are gone everywhere except `tv.handmade`
+
+| shape | pre-warm | warmed | measured rows |
+|---|---:|---:|---:|
+| tv.sonarr | 100.0% | **100.0%** | 4,311 → **5,644** |
+| tv.flat.titled | 100.0% | **100.0%** | 4,311 → **5,644** |
+| tv.twoseason | 100.0% | **100.0%** | 3,562 → **6,278** |
+| tv.flat | 100.0% | 99.9% | 4,083 → 5,644 |
+| tv.numbered | 100.0% | 99.9% | 3,594 → 5,644 |
+| tv.sonarr.plain | 100.0% | 99.9% | 3,594 → 5,644 |
+| **tv.root** | 88.4% | **63.9%** | 4,012 → 5,644 |
+| **tv.noyear** | 95.9% | **63.9%** | 3,526 → 5,644 |
+| **tv.scene** | 89.5% | **61.6%** | 3,832 → 5,644 |
+| movie.noyear | 58.8% | 58.8% | unchanged |
+| tv.handmade | — | — | **still 0 of 5,644** |
+
+Overall stalled **23,086 → 5,644**; measured **44,896 → 62,338**; correct% **96.2%
+→ 88.8%**.
+
+**Every transition is `stalled → something`. Nothing already measured moved:**
+
+    stalled -> correct                12204
+    stalled -> absent                  3421
+    stalled -> wrong.unknownepisode    1737
+    stalled -> wrong.entity              80
+
+They sum to 17,442, exactly the fall in `stalled`. That is what warming should
+look like: information added, nothing perturbed.
+
+**This is note 05 in reverse, as written in advance.** The rate fell 7.33 points
+and no binding got worse. `tv.noyear` at 95.9% was 95.9% *of the 62% of its rows
+the cache could serve*; at 63.9% it is over all of them. The lower number is the
+truer one.
+
+## The result that matters: 1,707 confident wrong bindings, previously invisible
+
+Warming did not just move rows into `absent`. It moved **1,817** into wrong
+classes, and the bulk arrived under a label the loop had never seen —
+`wrong.unknownepisode`, which `compare.py` **aborted on** rather than counting as
+zero. That guard was added after the `wrong.entity` mistake in note 00, and this
+is the second time it has earned its place.
+
+The label is ambiguous by construction: the scorer rebuilds id → (season, episode)
+from cached season payloads, so an episode id from an uncached season cannot be
+placed, and **a correct bind into an uncached season looks identical to a wrong
+one.** So it was resolved from the other side — the resolver logs the entity it
+bound (`notes/loop-matcher/scripts/unknown_episode.py`):
+
+| | rows |
+|---|---:|
+| bound a **different** entity — a real wrong bind | **1,607** |
+| bound the same entity — scorer blind spot | **0** |
+| could not join to a resolver line | 130 |
+
+Not one was a scorer artefact. So the honest wrong total after tranche 1 is
+**1,707 confirmed** (100 `wrong.entity` + 1,607) with 130 unresolved — against
+**20** before warming.
+
+### And the mechanism is named
+
+| method that chose the wrong candidate | rows |
+|---|---:|
+| `exact_title_episode_count` | 989 |
+| `exact_title_season_count` | 604 |
+| `exact_title_year` | 14 |
+
+These are the **0.90-confidence collision pins** — the tie-breakers that fire
+after `pin_collision` and bind without hesitation. Examples: `Cross` bound 225001
+instead of 213306; `Lucifer` bound 156218 instead of 63174; `Archer` bound 26529
+instead of 10283.
+
+So the collision tier does not merely fail to pin (M5, `absent`). **When it does
+pin, it is often confidently wrong**, and no instrument on this project could see
+that until the cache was warm. Wrong beats absent in severity, and this is 1,707
+of the former.
+
+A new wrong-bind family also surfaced in the entity table — a show binding to its
+own spin-off or sequel series:
+
+     16  Queer as Folk              -> Queer as Folk (2022)
+     10  Suits                      -> Suits LA (2025)
+      8  Gilmore Girls              -> Gilmore Girls: A Year in the Life (2016)
+      8  Stranger Things            -> Stranger Things: Tales from '85 (2026)
+      8  Avatar: The Last Airbender -> Avatar: The Last Airbender (2024)
+      3  Sherlock                   -> Sherlock & Daughter (2025)
+      2  Battlestar Galactica       -> Battlestar Galactica (2003)
+
+## A quiet join defect in my own analysis, found and fixed
+
+`(shape, path)` is **not a unique row key.** Two entities with the same title and
+no year render the same relpath — two films called `Aladdin` both become
+`Aladdin/Aladdin.1080p.BluRay.mkv` — and `gen_library.py` puts them in different
+batches precisely so they cannot share a database. 120 of 67,982 rows collide.
+
+`compare.py` keyed on `(shape, path)`, so **every transition table in notes 01–05
+silently dropped up to 120 rows** while the verdict totals stayed correct. The tell
+was arithmetic: transitions summed to 17,359 where `stalled` fell by 17,442.
+
+Fixed to `(shape, batch, path)` — 67,982 unique — with an assertion that the key
+is unique, so a future collision fails loudly instead of quietly. Transitions now
+reconcile exactly.
+
+**The claim that depended on it was re-checked and survives**: zero rows that were
+`correct` on `origin/main` stopped being correct across iterations 1–3, under the
+corrected key.

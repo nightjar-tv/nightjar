@@ -26,8 +26,19 @@ SCORED = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
 # once made this script report wrong=0 for a shape the scorer said had 2,553 —
 # the verdict is `wrong.entity`, and a label that does not exist counts zero
 # exactly like a mechanism that is not there.
-VERDICTS = ["correct", "wrong.entity", "wrong.ep", "partial", "absent", "stalled"]
-WRONG = ("wrong.entity", "wrong.ep")
+# The scorer's own label set, transcribed from `score_binding.py`'s ORDER
+# rather than guessed. Guessing it has now cost twice: once reporting wrong=0 for
+# a shape with 2,553 wrong, and once aborting on `wrong.unknownepisode`, a label
+# that only appears after warming.
+#
+# `wrong.unknownepisode` is NOT known to be a wrong binding. It means the file
+# carries an episode link whose id the scorer cannot place, because it rebuilds
+# id -> (season, episode) from cached season payloads and that season is not
+# cached. A correct bind into an uncached season looks identical. It is counted
+# apart from `wrong.entity` for exactly that reason.
+VERDICTS = ["correct", "wrong.entity", "wrong.episode", "wrong.unknownepisode",
+            "partial", "absent", "stalled"]
+WRONG = ("wrong.entity", "wrong.episode")   # unknownepisode excluded: unproven
 
 
 def check_labels(rows):

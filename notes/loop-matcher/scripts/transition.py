@@ -14,10 +14,11 @@ after = json.load(open(sys.argv[2]))["rows"]
 FROM, TO = sys.argv[3], sys.argv[4]
 LIMIT = int(sys.argv[5]) if len(sys.argv) > 5 else 40
 
-ka = {(r["shape"], r["path"]): r for r in after}
+ka = {(r["shape"], r["batch"], r["path"]): r for r in after}
+assert len(ka) == len(after), "row key is not unique"
 hits = []
 for rb in before:
-    ra = ka.get((rb["shape"], rb["path"]))
+    ra = ka.get((rb["shape"], rb["batch"], rb["path"]))
     if ra and rb["verdict"] == FROM and ra["verdict"] == TO:
         hits.append((rb, ra))
 

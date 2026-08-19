@@ -15,8 +15,30 @@ Usage: compare.py <before-scored.json> <after-scored.json>
 """
 import collections, json, sys
 
-VERDICTS = ["correct", "wrong.entity", "wrong.ep", "partial", "absent", "stalled"]
-WRONG = ("wrong.entity", "wrong.ep")
+# The scorer's own label set, transcribed from `score_binding.py`'s ORDER
+# rather than guessed. Guessing it has now cost twice: once reporting wrong=0 for
+# a shape with 2,553 wrong, and once aborting on `wrong.unknownepisode`, a label
+# that only appears after warming.
+#
+# `wrong.unknownepisode` is NOT known to be a wrong binding. It means the file
+# carries an episode link whose id the scorer cannot place, because it rebuilds
+# id -> (season, episode) from cached season payloads and that season is not
+# cached. A correct bind into an uncached season looks identical. It is counted
+# apart from `wrong.entity` for exactly that reason.
+VERDICTS = ["correct", "wrong.entity", "wrong.episode", "wrong.unknownepisode",
+            "partial", "absent", "stalled"]
+WRONG = ("wrong.entity", "wrong.episode")   # unknownepisode excluded: unproven
+
+
+# **The row key must include the batch.** `(shape, path)` is not unique: two
+# entities with the same title and no year render the same relpath — two films
+# called `Aladdin` both become `Aladdin/Aladdin.1080p.BluRay.mkv` — and
+# `gen_library.py` puts them in different batches precisely so they cannot share
+# a database. Keying on `(shape, path)` silently dropped 120 of 67,982 rows from
+# every transition table, while the verdict totals stayed right. A join that
+# loses rows quietly is worse than one that fails.
+def rowkey(r):
+    return (r["shape"], r["batch"], r["path"])
 
 
 def load(p):
@@ -85,8 +107,9 @@ print("%-14s %8.1f%% %8.1f%%  %+8.2f pt"
 # Per-row transitions, so "wrong became correct" is told apart from
 # "wrong became absent". A count of bound items cannot tell them apart.
 print()
-kb = {(r["shape"], r["path"]): r for r in before}
-ka = {(r["shape"], r["path"]): r for r in after}
+kb = {rowkey(r): r for r in before}
+ka = {rowkey(r): r for r in after}
+assert len(kb) == len(before) and len(ka) == len(after), "row key is not unique"
 trans = collections.Counter()
 for k, rb_ in kb.items():
     ra_ = ka.get(k)
