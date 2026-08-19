@@ -6,6 +6,9 @@ reduced Sonarr/Radarr corpus. Fourteen kept, one reverted.
 Branch `loop/parser-corpus` in the worktree `~/Documents/GitHub/nightjar-wt-loop`.
 **Nothing is pushed.** The branch does not exist on the remote.
 
+**Correction 2026-08-19:** the "no replay harness on this machine" conclusion in
+the first version of this note was wrong. See the corrected section below.
+
 ## The number
 
 | | before | after |
@@ -59,30 +62,74 @@ it into the `Red Dwarf (1988)` show folder, so 67 bound items see that folder's
 counts move. Every predicate their binding rests on was traced and holds; see
 notes/loop/02. **That was read, not run** — see the limits below.
 
-## What could not be measured, named
+## What could not be measured — CORRECTED 2026-08-19
 
-**The strict replay harness is not on this machine.** No
-`server/crates/api/src/bin/replay.rs` in this tree or anywhere in its history,
-no media or NFO capture, no TMDB response cache, and no
-`NIGHTJAR_TMDB_CACHE_STRICT` in the shipped code. No control pair was run and
-none is claimed.
+**The first version of this note said the replay harness is not on this machine.
+That was wrong, and it was wrong in a specific way worth recording: I searched
+the repository tree and its git history, and concluded from that about the
+machine.**
 
-The substitute, built for this loop and used every iteration:
+The timeline of an earlier session on this project contains the same mistake —
+it records `out/cases.json` as "not on disk in either checkout or on the N150",
+and that file has been sitting in `~/nightjar-spikes/parser-corpus-2026-08-13/`
+the whole time. It is the corpus this loop was measured against. So this failure
+mode has now happened at least twice here.
 
-1. **`parse_all`** — the shipped parser over all 25,043 dogfood basenames.
-2. **`group_keys`** — the search input `drain_pending` would build for every
-   item, using the shipped predicates (`clean_movie_title`, `query_key`,
-   `year_from_path`, `show_folder_relpath`, `clean_show_title`,
-   `series_library_year`, `pick_reference_episode`). A bind is a function of
-   the group key and the group's search fields, so an item is at risk exactly
-   when its key moves, its group's fields move, or it shares a key with
-   something that moved.
+### What is actually on the Mac
 
-This **bounds** which items could change outcome. It does not run the matcher.
-It is weaker than a control pair and must not be read as one.
+- **`replay.rs`** — four identical copies (sha `e93f0a7a…`) under
+  `~/.claude/jobs/13c074c6/tmp/{conf,conf2src,wgsrc,cache}/server/crates/api/src/bin/`.
+- **`~/.claude/jobs/13c074c6/tmp/conf/`** — a complete tree with the harness
+  already applied: `measure_cache_key`, `measure_cache_write`,
+  `NIGHTJAR_TMDB_CACHE` and `NIGHTJAR_TMDB_CACHE_STRICT` all in
+  `crates/metadata/src/tmdb/mod.rs`.
+- **`apply_harness.py`** — lifts those spans into any other tree.
+- **`capture_media.py`**, **`capture_nfo.py`**, and `replay_add_reparse.py` in
+  `nightjar-meta/notes/scripts/`.
 
-**The corpus is parse-level.** It says nothing about provider search, candidate
-scoring, or binding. A green corpus is not a working pipeline.
+### The three captures
+
+| capture | on the Mac? | note |
+|---|---|---|
+| media (JSONL) | **regenerable, verified** | ran `capture_media.py` against a read-only copy of the dogfood db: **25,043 items, 9.8 MB, in seconds** |
+| NFO | **regenerable** | `/Volumes/media` is mounted over SMB and the NFOs are there — 1,784 movie NFOs, 847 show NFOs, episode NFOs per season folder. The script hardcodes `/mnt/media/...`, a Linux path, which is direct evidence it was written on the N150; it needs `/Volumes/media/{Movies,TV Shows}` |
+| TMDB response cache | **not here** | searched at unbounded depth with a verified-working tool: the only flat JSON cache directory over 1,000 entries anywhere under `~` is the 2,975-entry **TVDB** spike cache. There is no 7,967-entry TMDB cache on this machine |
+
+### So the blocker is narrower than stated
+
+**Only the response cache is missing, and it is the one piece that cannot be
+rebuilt offline.** Warming it needs live provider calls — forbidden in this
+loop, and a decision for a human. Three ways forward, in cost order: copy the
+cache from the N150 if it is there; warm it on the Mac with one live run (~10,400
+requests cold, per `nightjar-meta/notes/replay-harness-2026-08-18.md`); or run
+the measurement on the N150, where the harness was built.
+
+Everything else — writing the parser, scanner and queue changes, and unit-testing
+them — can be done here today.
+
+### A second false negative, in this very audit
+
+While checking for the NFO capture I ran `timeout 540 find /Volumes/media/Movies
+-iname "*.nfo" | wc -l` and reported **0 NFOs**. **`timeout` is not a command on
+macOS.** The pipeline never ran, `wc -l` counted an empty stream, and I read the
+zero as absence — three times, including once after writing "if this is 0 again
+the walk still did not finish". A glob contradicted it: `ls Movies/*/movie.nfo`
+returns 1,777.
+
+A zero can mean "nothing is there" or "the code never ran", and they are the same
+number. Check which before believing either — including when the instrument is
+your own shell command.
+
+### What the corpus still cannot say
+
+The corpus is **parse-level**. No provider, no search, no candidates. It says
+nothing about scoring or binding, and a green corpus is not a working pipeline.
+
+The substitute built for this loop and used every iteration — `parse_all` and
+`group_keys`, reproducing the search input `drain_pending` builds from the
+shipped predicates — **bounds** which items could change outcome. It does not run
+the matcher. It is weaker than a control pair and must not be read as one. That
+part of the original note stands.
 
 ## The ceiling, measured
 
