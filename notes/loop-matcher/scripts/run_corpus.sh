@@ -14,6 +14,11 @@
 # report its number, not a reason to skip it — it is the instrument that catches
 # parse collateral.
 set -euo pipefail
+# The wrapper is built inside $WORK and looked for there, so an inherited
+# CARGO_TARGET_DIR silently sends the binary elsewhere and the script reports a
+# missing file. That happened once, from a shell that had exported it for a
+# cargo test in the same command — the instrument was the command.
+unset CARGO_TARGET_DIR
 TREE=${1:?tree}
 OUTJSON=${2:-/dev/stdout}
 SPIKE=$HOME/nightjar-spikes/parser-corpus-2026-08-13
@@ -35,6 +40,8 @@ serde_json = "1"
 [workspace]
 EOF
 (cd "$WORK/crate" && cargo build --release -q 2>&1 | tail -20)
+[ -x "$WORK/crate/target/release/corpus_run" ] || {
+  echo "wrapper did not build — refusing to report a rate"; exit 1; }
 CASES="$SPIKE/out/cases.json" OUT="$WORK/results.json" \
   "$WORK/crate/target/release/corpus_run"
 python3 - "$WORK/results.json" "$OUTJSON" <<'PY'
