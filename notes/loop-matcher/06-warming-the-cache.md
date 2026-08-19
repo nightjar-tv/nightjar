@@ -419,3 +419,44 @@ reconcile exactly.
 **The claim that depended on it was re-checked and survives**: zero rows that were
 `correct` on `origin/main` stopped being correct across iterations 1–3, under the
 corrected key.
+
+---
+
+## Tranche 2 — prediction, revising the one I gave
+
+I said tranche 2 "should be the harshest number yet". **The rate will be, but the
+severity will not, and the distinction matters.**
+
+`tv.handmade` renders `Show/Season 1/01 - My Old Lady.mkv`. The parser returns
+title `01 My Old Lady`, kind **movie** — non-empty, so the scanner's
+`stored_title` never substitutes the folder. So the search is
+`/search/movie?query=01 my old lady`.
+
+**Almost nothing on TMDB is called `01 My Old Lady`.** The leading episode number
+is what stops the query folding equal to a real film. So I expect:
+
+| | predicted |
+|---|---|
+| tv.handmade correct% | **~0%** |
+| the failures | **overwhelmingly `absent`, not `wrong`** |
+| any wrong binds | movies bound to episode files — worst class, but few |
+
+That makes the *rate* the harshest in the suite and the *finding* weaker than
+tranche 1's, because `absent` is recoverable and `wrong` is not.
+
+And it leaves M2's real severity **still unmeasured**. The oracle's own README
+says so: *"`tv.handmade` writes `01 - Closure.mkv`, and the leading number is the
+only reason that query fails to fold equal to a real film. A library that writes
+`Closure.mkv` is the wrong-bind version of the same mechanism and nothing here
+generates it."*
+
+So the honest reading in advance: **M2's wrong-bind risk is latent, guarded only
+by an accident of naming, and warming cannot demonstrate it.** If tranche 2 comes
+back mostly-absent, that is not evidence M2 is benign — it is evidence this shape
+cannot ask the question. Generating a `Closure.mkv` shape would be a change to the
+oracle's entity set, which the hard limits forbid, and it is the next thing the
+instrument needs after this.
+
+If instead a large share binds *wrong*, my model of the query is wrong and the
+leading number folds away somewhere I have not looked — which would be the more
+interesting result.
