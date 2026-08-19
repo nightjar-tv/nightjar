@@ -690,8 +690,9 @@ fn status_query_groups(
     for it in &items {
         if it.kind == "episode" {
             let folder = show_folder_relpath(&it.path, &it.library_path);
+            let (ct, _) = clean_show_title(&it.title);
             ep_by_show
-                .entry((it.library_id, folder))
+                .entry(episode_group_key(it.library_id, &folder, &ct))
                 .or_default()
                 .push(it);
         }
@@ -745,9 +746,14 @@ fn status_query_groups(
             "episode" => {
                 let (ct, _) = clean_show_title(&it.title);
                 let show_folder = show_folder_relpath(&it.path, &it.library_path);
+                // Two keys, deliberately. `group_key` decides what shares a
+                // group; `folder_key` reads the folder's stored series identity
+                // and stays keyed on the real relpath, because that is what the
+                // `series` table holds.
+                let group_key = episode_group_key(it.library_id, &show_folder, &ct);
                 let folder_key = (it.library_id, show_folder.clone());
                 let siblings = ep_by_show
-                    .get(&folder_key)
+                    .get(&group_key)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
                 let years = siblings.iter().map(|s| s.year);
@@ -782,7 +788,7 @@ fn status_query_groups(
                     Some(show_id) => format!("tv|tmdb:{show_id}"),
                     None => format!("tv|{}", query_key(&ct, None)),
                 };
-                let g = ep_groups.entry(folder_key).or_insert_with(|| QueryGroup {
+                let g = ep_groups.entry(group_key).or_insert_with(|| QueryGroup {
                     resolve_kind: MetadataKind::Episode,
                     path: path0.to_string(),
                     library_path: library_path0.to_string(),
@@ -850,6 +856,44 @@ fn status_query_groups(
 }
 
 /// ADR-0033: every folder-keyed series row, keyed `(library_id, relpath)`.
+/// The key episode files group under.
+///
+/// Normally the show folder. ADR-0033 Q2 makes TV groups folder-scoped so that
+/// two folders folding to the same matcher key — `Shameless (US)` and
+/// `Shameless (UK)` — stay separate groups and never share one identity.
+///
+/// **A file directly in the library root has no show folder.**
+/// [`show_folder_relpath`] returns `""` for it. An empty string is not a folder
+/// that happens to be shared; it is the absence of one, and grouping on it
+/// inverts the protection above into its opposite: every show in the root lands
+/// in one bucket, and the bucket binds all of them to whichever entity won.
+/// Everything derived from the bucket pools with it too — the premiere year, the
+/// episode and season counts, and the reference episode.
+///
+/// The matcher oracle measures that directly. Its `tv.root` shape puts 20 shows
+/// in one root and scores **2,553 of 4,148 measured rows bound to the wrong
+/// entity**, against 150 correct.
+///
+/// So when there is no folder to scope by, scope by the title the filename
+/// carries. This is what the browse side already does: [`visible_show_unit_key`]
+/// falls back to the soft key `tv|{query_key}` when the folder has no series
+/// row, so browse splits root-level files by title while grouping merged them.
+/// The two now agree.
+///
+/// **It needs the basename to carry a title.** A shared root of `S01E01.mkv`
+/// has neither a folder nor a title, so it still groups as one — the case
+/// `resolve_episode_group`'s empty-title refusal already covers by declining to
+/// search at all.
+fn episode_group_key(library_id: i64, show_folder: &str, cleaned_title: &str) -> (i64, String) {
+    if show_folder.is_empty() {
+        // `\0` cannot appear in a relpath, so a synthesised key can never
+        // collide with a real folder's.
+        (library_id, format!("\0{}", query_key(cleaned_title, None)))
+    } else {
+        (library_id, show_folder.to_string())
+    }
+}
+
 fn load_series_rows(conn: &Connection) -> Result<HashMap<(i64, String), i64>, String> {
     let mut stmt = conn
         .prepare("SELECT library_id, relpath, tmdb_show_id FROM series")
