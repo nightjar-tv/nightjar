@@ -399,10 +399,41 @@ fn has_spaced_dash_number(s: &str) -> bool {
 /// start at a separator, so `HEVC` and `EAC3` are untouched — the `e` in
 /// `HEVC` follows a letter, and the `a` after `EAC3`'s `E` is not a digit.
 fn cut_at_episode_marker(s: &str) -> String {
+    // `to_ascii_lowercase` and not `to_lowercase`: the fold must preserve byte
+    // length, because `i` indexes `lower` and then slices `s`. A full Unicode
+    // fold can change the length of a character and the two would drift apart.
+    // The cost is that a non-ASCII letter is not folded, so `BÖLÜM` in capitals
+    // is not matched while `Bölüm` is. Every measured case is the latter.
     let lower = s.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // **The marker may come after the number.** Turkish releases write
+        // `69. Blm`, `60.Bolum`, `1. Bölüm` — the number first, then the word
+        // for "episode". The digit run in front is what makes these words safe
+        // to name at all; the 25,043-file dogfood library contains none of
+        // them anywhere, so it can neither confirm nor refute this one.
+        if bytes[i].is_ascii_digit() && (i == 0 || is_token_boundary(bytes[i - 1])) {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - i < 4 {
+                j += 1;
+            }
+            let mut k = j;
+            while k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_') {
+                k += 1;
+            }
+            for w in ["bölüm", "bolum", "blm"] {
+                if lower[k..].starts_with(w) {
+                    let end = k + w.len();
+                    if end >= bytes.len() || !bytes[end].is_ascii_alphanumeric() {
+                        let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
+                        if head.chars().any(char::is_alphabetic) {
+                            return head.to_string();
+                        }
+                    }
+                }
+            }
+        }
         if bytes[i] == b'e' && (i == 0 || is_token_boundary(bytes[i - 1])) {
             let mut j = i + 1;
             // `e`, `ep`, or the word spelled out — `episode`, `episodio`,
@@ -2151,6 +2182,57 @@ mod tests {
     fn a_stray_parenthesis_does_not_end_a_title() {
         let p = parse_filename("Anon nf) Anon Anon 2024 3 3");
         assert!(p.title.starts_with("Anon nf)"), "got {:?}", p.title);
+    }
+
+    /// The episode marker may come after the number. Turkish releases write
+    /// `69. Blm`, `60.Bolum`, `1. Bölüm`.
+    #[test]
+    fn an_episode_word_after_the_number_ends_the_title() {
+        for (name, title) in [
+            (
+                "Anon show 69. Blm (29.10.2023) 1080p WebDL #tag",
+                "Anon show",
+            ),
+            (
+                "Anon opera 01 BLM(01.11.2023) 1080p HDTV AC3 x264 GROUP",
+                "Anon opera",
+            ),
+            (
+                "Anon show 60.Bolum (31.01.2023) 720p WebDL AAC H.264 - GROUP",
+                "Anon show",
+            ),
+            (
+                "Anon show 1. Bölüm (23.10.2023) 720p WebDL AAC H.264 - GROUP",
+                "Anon show",
+            ),
+            (
+                "Anon show 79.BLM Sezon Finali(25.06.2023) 720p WEB-DL",
+                "Anon show",
+            ),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+    }
+
+    /// **The digit run in front is what makes these words safe to name.** The
+    /// dogfood library contains none of them anywhere, so it can neither
+    /// confirm nor refute this rule — the guard is the grammar. Without the
+    /// leading number the word is part of the title.
+    #[test]
+    fn an_episode_word_without_a_number_is_part_of_the_title() {
+        assert_eq!(
+            parse_filename("Anon Bolum Film (2011) Bluray-1080p.mkv").title,
+            "Anon Bolum Film"
+        );
+        assert_eq!(
+            parse_filename("Anon BLM Story (2020) Bluray-1080p.mkv").title,
+            "Anon BLM Story"
+        );
+        // Glued to another letter it is not the word.
+        assert_eq!(
+            parse_filename("Anon 12Blmx Film (2011) Bluray-1080p.mkv").title,
+            "Anon 12Blmx Film"
+        );
     }
 
     #[test]
