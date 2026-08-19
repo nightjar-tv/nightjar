@@ -6,8 +6,12 @@ reduced Sonarr/Radarr corpus. Fourteen kept, one reverted.
 Branch `loop/parser-corpus` in the worktree `~/Documents/GitHub/nightjar-wt-loop`.
 **Nothing is pushed.** The branch does not exist on the remote.
 
-**Correction 2026-08-19:** the "no replay harness on this machine" conclusion in
-the first version of this note was wrong. See the corrected section below.
+**Two corrections, 2026-08-19.** The "no replay harness on this machine"
+conclusion in the first version of this note was wrong — see below. And every
+iteration's "**0 items bound today at risk**" was read from `metadata_status` in
+the live database, which records what past drains did rather than what a fresh
+drain does; the strict pair (notes/loop/18) showed the gap. The end-to-end
+result now stands on the pair, not on that substitute.
 
 ## The number
 
