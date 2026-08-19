@@ -163,13 +163,14 @@ Counted properly, with `find` and no `timeout` prefix:
 | root | Mac (SMB) | N150 (local) |
 |---|---:|---:|
 | Movies | 1,783 | 1,783 |
-| TV Shows | *(walk in progress)* | 26,349 |
-| **total** | | **28,132** |
+| TV Shows | 26,349 | 26,349 |
+| **total** | **28,132** | **28,132** |
 
 That matches the 28,115 in `nightjar-meta/notes/replay-harness-2026-08-18.md`
-to within the files added since the capture. **The Movies count is identical on
-both hosts**, which is independent confirmation that the Mac's SMB mount and the
-N150's `/mnt/media` are the same library.
+to within the files added since the capture. **Every count is identical on both
+hosts** — independent confirmation that the Mac's SMB mount and the N150's
+`/mnt/media` are the same library, which is what makes the rewritten capture a
+faithful one rather than a plausible one.
 
 ### Four false negatives in one session, all the same shape
 
