@@ -169,6 +169,137 @@ fn cut_at_absolute_episode(s: &str) -> String {
     s.to_string()
 }
 
+/// Season words this recognises, and only these. Each is one the corpus
+/// actually contains: `season` (23 occurrences), `temporada` (6), `stagione`
+/// (2), `saison` (1).
+///
+/// **`series` is deliberately absent.** The English "Series 4" spelling earns
+/// one corpus case and costs a daily show: `Tree_Series_2018_06_22_Seth_Meyers`
+/// becomes season 2018. The word also appears 392 times in the corpus without
+/// a number after it, which is a measure of how ordinary it is inside a title.
+const SEASON_WORDS: &[&str] = &["season", "saison", "stagione", "temporada"];
+
+/// A season token carrying no episode — `Series.S01.720p`, `30 Series Season 04`.
+///
+/// Returns `(token_start, season)`. A season pack is a real shape: 77 corpus
+/// cases fail on season while the number is sitting in the basename, because
+/// [`find_season_episode`] requires an episode marker after the season digits
+/// and a pack has none.
+///
+/// Scanned on the **normalised** stem, where `_` and `.` are spaces. That
+/// replacement is byte-for-byte, so the index returned is an index into the
+/// original stem as well.
+///
+/// Three guards, each one paid for by a passing corpus case it would otherwise
+/// break:
+///
+/// 1. **A spaced dash-number anywhere means the token belongs to the title.**
+///    `Some Anime Show S3 - 12` is the anime absolute form and Sonarr keeps the
+///    `S3`; twelve corpus cases pass today because Nightjar keeps it too. The
+///    dash is matched loosely — one dash, any run of spaces — so an odd
+///    spelling makes the rule decline rather than fire.
+/// 2. **A year straight after the number means the `s` is not a marker.**
+///    `V.H.S.2.2013.LIMITED` is the film V/H/S/2. A season number is followed
+///    by release metadata, not by the work's year.
+/// 3. **The head must carry a letter**, so a name that is only a token has no
+///    title to end.
+fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
+    if has_spaced_dash_number(normalized) {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+
+    let mut best: Option<(usize, i32)> = None;
+    let mut consider = |i: usize, marker_len: usize| {
+        // One optional separator between the marker and the digits.
+        let mut j = i + marker_len;
+        if j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'.' || bytes[j] == b'_') {
+            j += 1;
+        }
+        let start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 4 {
+            j += 1;
+        }
+        if j == start
+            || (j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j].is_ascii_alphabetic()))
+        {
+            return;
+        }
+        if year_follows(bytes, j) {
+            return;
+        }
+        if !normalized[..i].chars().any(char::is_alphabetic) {
+            return;
+        }
+        let Ok(season) = lower[start..j].parse::<i32>() else {
+            return;
+        };
+        if best.is_none_or(|(b, _)| i < b) {
+            best = Some((i, season));
+        }
+    };
+
+    let mut i = 0;
+    while i < bytes.len() {
+        if i == 0 || is_token_boundary(bytes[i - 1]) {
+            if bytes[i] == b's' {
+                consider(i, 1);
+            }
+            for w in SEASON_WORDS {
+                if lower[i..].starts_with(w) {
+                    consider(i, w.len());
+                }
+            }
+        }
+        i += 1;
+    }
+    best
+}
+
+/// A separator a season marker may start after. An apostrophe is not one:
+/// without that, `Ocean's 11` is season 11.
+fn is_token_boundary(b: u8) -> bool {
+    matches!(b, b' ' | b'.' | b'_' | b'-' | b'[' | b'(')
+}
+
+/// A four-digit year at `j`, after an optional single separator.
+fn year_follows(bytes: &[u8], mut j: usize) -> bool {
+    if j < bytes.len() && matches!(bytes[j], b' ' | b'.' | b'_' | b'-') {
+        j += 1;
+    }
+    if j + 4 > bytes.len() || !bytes[j..j + 4].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if j + 4 < bytes.len() && bytes[j + 4].is_ascii_digit() {
+        return false;
+    }
+    let y = std::str::from_utf8(&bytes[j..j + 4])
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
+    (1900..=2100).contains(&y)
+}
+
+/// ` - 12` anywhere, with any run of spaces around the dash.
+fn has_spaced_dash_number(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'-' && i > 0 && bytes[i - 1] == b' ' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == b' ' {
+                j += 1;
+            }
+            if j > i + 1 && j < bytes.len() && bytes[j].is_ascii_digit() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let stem = strip_leading_group(strip_extension(file_name));
@@ -195,6 +326,25 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
             season: Some(season),
             episode: Some(episode),
             episode_end: end,
+        };
+    }
+
+    // A season token with no episode is a season pack. It runs after the
+    // season/episode scan, which owns every name that carries both, and before
+    // the year branch, which would otherwise call a pack a movie.
+    if let Some((before, season)) = find_bare_season(&normalized) {
+        let title = cut_at_title_junk(&clean_title(&stem[..before.min(stem.len())]));
+        return ParsedName {
+            title: if title.is_empty() {
+                stem.to_string()
+            } else {
+                title
+            },
+            kind: MediaKind::Episode,
+            year: None,
+            season: Some(season),
+            episode: None,
+            episode_end: None,
         };
     }
 
@@ -919,6 +1069,95 @@ mod tests {
         let m = parse_filename("Anon Film (2019) Bluray-1080p.mkv");
         assert_eq!(m.title, "Anon Film");
         assert_eq!(m.year, Some(2019));
+    }
+
+    /// A season token with no episode marker is a season, and it ends the
+    /// title. This is the season-pack shape and it was the largest
+    /// non-title class left in the corpus: 166 cases failed on season, and
+    /// this moves 53 of them to a full pass.
+    ///
+    /// The file carries no episode, so `episode` stays `None` and
+    /// `episode_numbers()` stays empty. A pack is TV, so the kind is
+    /// `Episode`.
+    #[test]
+    fn a_season_token_with_no_episode_is_a_season() {
+        for (name, title, season) in [
+            ("Anon.Show.S02.720p.x264-GROUP", "Anon Show", 2),
+            (
+                "The.Anon.Show.US.S03.720p.x264-GROUP",
+                "The Anon Show US",
+                3,
+            ),
+            ("30 Anon Show S03 WS PDTV XviD GROUP", "30 Anon Show", 3),
+            ("Anon Show Season 4 WS PDTV XviD GROUP", "Anon Show", 4),
+            ("Anon Show Season4 WS PDTV XviD GROUP", "Anon Show", 4),
+            (
+                "Anon Show S 01 720p WEB DL DD 5 1 h264 GROUP",
+                "Anon Show",
+                1,
+            ),
+            ("Anon.Show.Stagione.3.HDTV.XviD-NOTAG", "Anon Show", 3),
+            ("Anon.Show.Saison3.VOSTFR.HDTV.XviD-NOTAG", "Anon Show", 3),
+            ("Anon Show (1994) - Temporada 10", "Anon Show (1994)", 10),
+            // A season number that looks like a year is still a season when it
+            // is glued to the marker.
+            ("My.Anon.Show.S2014.720p.HDTV.x264-ME", "My Anon Show", 2014),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, Some(season), "{name}");
+            assert_eq!(p.episode, None, "{name}");
+            assert_eq!(p.kind, MediaKind::Episode, "{name}");
+            assert_eq!(p.title, title, "{name}");
+            assert!(p.episode_numbers().is_empty(), "{name}");
+        }
+    }
+
+    /// The three guards, each one bought by a passing corpus case it would
+    /// otherwise have broken.
+    #[test]
+    fn the_bare_season_rule_has_three_guards() {
+        // 1. A spaced dash-number means the token is part of the title. This is
+        //    the anime absolute form and Sonarr keeps the `S3`.
+        let a = parse_filename("[Anon] Anon Anime Show S3 - 12 [720p][D07C91FC]");
+        assert_eq!(a.title, "Anon Anime Show S3");
+        assert_eq!(a.season, None);
+
+        // 2. A year straight after the number means the `s` is not a marker.
+        //    `V.H.S.2` is the film, not season 2.
+        let b = parse_filename("V.H.S.2.2013.LIMITED.720p.BluRay.x264-GROUP");
+        assert_eq!(b.season, None);
+        assert_eq!(b.title, "V H S 2");
+        assert_eq!(b.year, Some(2013));
+
+        // 3. `series` is not a season word. It appears 392 times in the corpus
+        //    with no number after it, and taking it costs a daily show.
+        let c = parse_filename("Anon_Show_2018_06_22_A_Guest_720p_HEVC_x265-GROUP");
+        assert_eq!(c.season, None);
+        assert_eq!(c.title, "Anon Show");
+    }
+
+    /// An apostrophe is not a token boundary. Without that guard `Ocean's 11`
+    /// is season 11.
+    #[test]
+    fn an_apostrophe_does_not_start_a_season_marker() {
+        let p = parse_filename("Anon's 11 (2001) Bluray-1080p.mkv");
+        assert_eq!(p.season, None);
+        assert_eq!(p.title, "Anon's 11");
+        assert_eq!(p.year, Some(2001));
+    }
+
+    /// A name carrying both a season and an episode still takes the
+    /// season/episode branch, which owns it. The bare-season rule runs only
+    /// after that scan has declined.
+    #[test]
+    fn a_season_and_episode_still_beat_the_bare_season_rule() {
+        let p = parse_filename("Anon Show - S02E05 - An Episode - Bluray-1080p.mkv");
+        assert_eq!(p.season, Some(2));
+        assert_eq!(p.episode, Some(5));
+        assert_eq!(p.title, "Anon Show");
+        let q = parse_filename("Anon.Show.S01E01.720p.mkv");
+        assert_eq!(q.season, Some(1));
+        assert_eq!(q.episode, Some(1));
     }
 
     #[test]
