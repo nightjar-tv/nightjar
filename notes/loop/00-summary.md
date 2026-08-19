@@ -219,11 +219,20 @@ media at the captured path.
     J=~/.claude/jobs/13c074c6/tmp          # replay.rs, apply_harness.py, reference tree
     R=~/nightjar-wt-loop-scratch/replay    # cache + captures, copied from the N150
 
-    cp -R server /tmp/tree/server
+    S=~/Documents/GitHub/nightjar-meta/notes/scripts
+
+    git archive <commit> server | tar x -C /tmp/tree
     python3 $J/apply_harness.py $J/conf/server /tmp/tree/server   # TMDB cache + strict + NFO switch
+    mkdir -p /tmp/tree/server/crates/api/src/bin                  # the repo has no such directory
     cp $J/conf/server/crates/api/src/bin/replay.rs /tmp/tree/server/crates/api/src/bin/
-    python3 ~/Documents/GitHub/nightjar-meta/notes/scripts/replay_add_reparse.py /tmp/tree
+    python3 $S/replay_add_year.py    /tmp/tree                    # MUST come first
+    python3 $S/replay_add_reparse.py /tmp/tree
     cargo build --release --bin replay -p nightjar-api
+
+**`replay_add_year.py` is not optional and must run first.** The base
+`replay.rs` inserts no `year` column at all, and `replay_add_reparse.py` patches
+a span that only exists after the year patch — run alone it fails with
+"expected one match". The first version of this recipe omitted it.
 
     NIGHTJAR_DATA_DIR=/tmp/data-ctl \
     NIGHTJAR_CAPTURE=$R/capture-media-v2.jsonl \
