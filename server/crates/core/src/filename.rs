@@ -358,8 +358,15 @@ fn cut_at_episode_marker(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'e' && (i == 0 || is_token_boundary(bytes[i - 1])) {
             let mut j = i + 1;
-            if j < bytes.len() && bytes[j] == b'p' {
-                j += 1;
+            // `e`, `ep`, or the word spelled out — `episode`, `episodio`,
+            // `episodes`. Longest first, so `ep` does not shadow `episode`.
+            let mut spelled = false;
+            for w in ["pisodes", "pisodio", "pisode", "pisodi", "p"] {
+                if lower[j..].starts_with(w) {
+                    j += w.len();
+                    spelled = w.len() > 1;
+                    break;
+                }
             }
             if j < bytes.len() && matches!(bytes[j], b' ' | b'.' | b'_') {
                 j += 1;
@@ -371,7 +378,12 @@ fn cut_at_episode_marker(s: &str) -> String {
             let digits = j - start;
             let bounded =
                 j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j].is_ascii_alphabetic());
-            if (2..=4).contains(&digits) && !bounded {
+            // **The longer the marker, the less the number has to carry.**
+            // `E3` could be a title token, so the short marker needs two
+            // digits. `Episode 5` cannot be anything else, so one is enough —
+            // and it is worth two corpus cases.
+            let min_digits = if spelled { 1 } else { 2 };
+            if (min_digits..=4).contains(&digits) && !bounded {
                 let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
                 if head.chars().any(char::is_alphabetic) {
                     return head.to_string();
@@ -1411,6 +1423,55 @@ mod tests {
             assert_eq!(p.title, "Anon Film", "{ext}");
             assert_eq!(p.year, Some(2019), "{ext}");
         }
+    }
+
+    /// The marker spelled out. Same shape as `Ep01` — a marker and a number —
+    /// so this is still structural and not a vocabulary rule.
+    #[test]
+    fn the_episode_marker_may_be_spelled_out() {
+        for (name, title) in [
+            (
+                "Anon Show Episode 56 [VOSTFR V2][720p][AAC]-Group",
+                "Anon Show",
+            ),
+            (
+                "[Group] Anon Show Episode 69 [VOSTFR_Finale][1080p][AAC].mp4",
+                "Anon Show",
+            ),
+            (
+                "To Another Anon III - Episode 5 VOSTFR (1080p)",
+                "To Another Anon III",
+            ),
+            (
+                "[Group] Anon Show Super - Episode 013 VF [720p]",
+                "Anon Show Super",
+            ),
+            ("Anon Show Episodio 5 (1080p)", "Anon Show"),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+    }
+
+    /// **The longer the marker, the less the number has to carry.** `E3` could
+    /// be a title token, so the short marker needs two digits; `Episode 3`
+    /// cannot be anything else, so one is enough. The asymmetry is worth two
+    /// corpus cases and the library votes on neither — it holds 1,272 paths
+    /// containing `episod` and this rule fires on none of them, because they
+    /// are episode *titles* behind a season/episode token that is cut first.
+    #[test]
+    fn one_digit_needs_the_marker_spelled_out() {
+        assert_eq!(
+            parse_filename("Anon Show Episode 5 VOSTFR (1080p)").title,
+            "Anon Show"
+        );
+        assert_eq!(
+            parse_filename("Anon E5 Film (2011).mkv").title,
+            "Anon E5 Film"
+        );
+        // The episode title behind a season/episode token is never reached.
+        let p = parse_filename("Anon Show - 1x01 - Episode 1 - WEBRip-1080p.mkv");
+        assert_eq!(p.title, "Anon Show");
+        assert_eq!(p.episode, Some(1));
     }
 
     #[test]
