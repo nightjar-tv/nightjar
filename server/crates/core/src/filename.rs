@@ -787,8 +787,23 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
             // right, so no range guard and no whole-run guard separates them.
             // The `S` and the `E` do — a resolution has neither.
             let season_ok = digits < 4 || (1900..=2100).contains(&season);
+            // **The two halves may be separated.** `Series Title.S6.E1`,
+            // `Series.Title.S01.Ep06` and `Series s90 e43` are all one token
+            // written with a gap, and requiring the `e` to touch the season
+            // digits made the whole file report no episode at all. One
+            // separator before the `e`, an optional `p` for the `Ep`
+            // spelling, and one separator before the digits.
+            if season_ok && digits > 0 && j < bytes.len() && is_token_gap(bytes[j]) {
+                j += 1;
+            }
             if season_ok && digits > 0 && j < bytes.len() && bytes[j] == b'e' {
                 j += 1;
+                if j < bytes.len() && bytes[j] == b'p' {
+                    j += 1;
+                }
+                if j < bytes.len() && is_token_gap(bytes[j]) {
+                    j += 1;
+                }
                 let mut episode = 0i32;
                 let mut edigits = 0;
                 while j < bytes.len() && bytes[j].is_ascii_digit() && edigits < 3 {
@@ -928,6 +943,12 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
         j = k;
     }
     end
+}
+
+/// A separator that may sit inside a season/episode token — `S6.E1`, `S15 E06`,
+/// `S1-E1`, `S01_E01`.
+fn is_token_gap(b: u8) -> bool {
+    matches!(b, b' ' | b'.' | b'_' | b'-')
 }
 
 /// `s06` or `6x` immediately at `i`, returning the season and the offset after
@@ -1992,6 +2013,80 @@ mod tests {
             parse_filename("Anon Doc - Anon Film (2011).mkv").title,
             "Anon Doc - Anon Film"
         );
+    }
+
+    /// **The season and the episode marker may be separated.** Requiring the
+    /// `e` to touch the season digits made `Anon Title.S6.E1` report no
+    /// episode at all — not a wrong episode, none.
+    #[test]
+    fn a_separated_season_and_episode_still_parse() {
+        for (name, season, episode) in [
+            ("Anon Title.S6.E1.An Episode.1080p.WEB-DL", 6, 1),
+            ("anon.s03.e05.ws.dvdrip.xvid-group", 3, 5),
+            ("Anon.Title.S15.E06.City.Code", 15, 6),
+            ("Anon Title - S15 E06 - City Code", 15, 6),
+            ("Anon S1-E1-WEB-DL-1080p-group", 1, 1),
+            ("Super.Anon.S01.Ep06.1080p.BluRay.DTS.x264-MiR", 1, 6),
+            (
+                "Anon.Title.S01.Ep.01.English.AC3.DL.1080p.BluRay-Group",
+                1,
+                1,
+            ),
+            (
+                "Anon.Title.S01.E.01.English.AC3.DL.1080p.BluRay-Group",
+                1,
+                1,
+            ),
+            ("Anon.Title.S01EP01.English.AC3.DL.1080p.BluRay-Group", 1, 1),
+            ("Anon s90 e43 1080p HDTV AAC H264", 90, 43),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, Some(season), "{name}");
+            assert_eq!(p.episode, Some(episode), "{name}");
+        }
+    }
+
+    /// The span rules still apply across the gap.
+    #[test]
+    fn a_separated_token_still_spans() {
+        for (name, want) in [
+            ("Anon Title.S6.E1.E2.An Episode.1080p.WEB-DL", vec![1, 2]),
+            ("Anon Title.S6.E1-E2.An Episode.1080p.WEB-DL", vec![1, 2]),
+            (
+                "Anon Title.S6.E1-E2-E3.An Episode.1080p.WEB-DL",
+                vec![1, 2, 3],
+            ),
+            ("Anon Title.S6.E1-S6E2.An Episode.1080p.WEB-DL", vec![1, 2]),
+            // An unseparated repetition must land on the next number, so
+            // `E1E3` is one episode. That guard is iteration 12's and it is
+            // right — `E1E3` is not a range.
+            ("Anon Title.S6.E1E3.An Episode.1080p.WEB-DL", vec![1]),
+        ] {
+            assert_eq!(parse_filename(name).episode_numbers(), want, "{name}");
+        }
+    }
+
+    /// The gap is one separator, not a run, and the season/episode scan still
+    /// refuses everything it refused before.
+    #[test]
+    fn the_token_gap_does_not_widen_the_scan() {
+        // Two separators is not a token.
+        assert_eq!(
+            parse_filename("Anon Title S6 - E1 - Something.mkv").episode,
+            None
+        );
+        // A resolution is still not an episode.
+        assert_eq!(parse_filename("A Anon Name (1920x1080).mkv").episode, None);
+        // Episode 0 is still refused.
+        assert_eq!(
+            parse_filename("Anon Show S01 E00 - A Pilot.mkv").episode,
+            None
+        );
+        // The common form is unchanged.
+        let p = parse_filename("Anon Show - 4x11 - An Episode - Bluray-1080p.mkv");
+        assert_eq!(p.season, Some(4));
+        assert_eq!(p.episode, Some(11));
+        assert_eq!(p.title, "Anon Show");
     }
 
     #[test]
