@@ -63,9 +63,28 @@ F5. It is drained, it is warm, and it stalls 12 rows of 5,644.
 | tv.handmade | 5,644 | 0 | 0 | 0 | 0 | 5,644 | 0 | 0.0% |
 | tv.numbered | 5,644 | 0 | 0 | 0 | 0 | 5,644 | 0 | 0.0% |
 
-`tv.numbered` reads 0.0% here. The last recorded table before `tv.mixedroot`
-was generated read it at 100.0%. Nothing in this session touched it, and the
-shape was regenerated between those two runs; that is noted, not explained.
+### `tv.numbered` reads 0.0% here and read 99.9% at the last recorded run
+
+Checked rather than assumed, because a shape falling from 99.9% to 0.0% between
+two `main` commits would be a live regression on `main` and would outrank
+everything in the brief.
+
+It is not. The same generated library, drained at `6221c59` — the commit before
+this base — gives `ready=0 unmatched=5604`, the identical answer:
+
+    tv.numbered-b0   DONE groups=693 ready=0 unmatched=5604 errors=0 requests=0
+    tv.numbered-b1   DONE groups=5   ready=0 unmatched=40   errors=0 requests=0
+
+So the product did not move. `gen_library.py` was edited at 16:47 and `out/lib`
+regenerated at 18:14 on 2026-08-20, both after the last scored `main` run at
+14:51, and `tv.numbered` now renders `Dept. Q (2025)/Season 01/S01E01.mkv` —
+a basename carrying no title at all. **The shape changed under the number.**
+
+Consequence for this loop: `tv.numbered`'s 5,644 rows are not a rate. They are
+still usable differentially — both revisions give the same answer, so a move
+there would still be a move — but its absolute 0.0% says nothing about the
+matcher, and it is a large part of why `absent` here is 20,593 rather than the
+9,944 handed over.
 
 **Every `wrong` row outside `movie.*` and `tv.episodetitle` is in
 `tv.mixedroot`** — 6 `wrong.entity` and 8 `wrong.unknownepisode`. That is the
