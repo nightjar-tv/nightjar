@@ -54,6 +54,29 @@ fn title_from_folder(stored: &str, library_root: &str) -> String {
         .to_string()
 }
 
+/// The title the scanner stores for one file: the parsed title, or the show
+/// folder's name when the parse carries none.
+///
+/// **One rule, three consumers (Rule 4.11).** Both indexing paths built this
+/// expression inline and identically ([`hint_ingest`] and the batch walk), and
+/// the matcher oracle's replay harness needs the same answer — it loads a
+/// capture instead of walking a filesystem, so it re-derives every field the
+/// scanner interprets. It was re-deriving this one with `parse_filename` alone,
+/// which is not this rule: a titleless episode came out with an empty title, an
+/// empty title is not a query, and 5,644 generated rows scored `absent` for a
+/// reason that was the harness rather than the product. A reimplemented
+/// predicate has misreported this project before — hence a shared function
+/// rather than a copy.
+///
+/// Takes the title by value so the callers still move it rather than clone.
+pub fn stored_title(parsed_title: String, stored: &str, library_root: &str) -> String {
+    if parsed_title.is_empty() {
+        title_from_folder(stored, library_root)
+    } else {
+        parsed_title
+    }
+}
+
 /// ADR-0030 §3: refuse repoint if matched/current < this fraction.
 pub const REPOINT_RETAIN_FRACTION: f64 = 0.90;
 
@@ -276,11 +299,7 @@ pub fn hint_ingest(
         path: store_path.clone(),
         mtime_ms,
         size_bytes,
-        title: if parsed.title.is_empty() {
-            title_from_folder(&store_path, &library_root)
-        } else {
-            parsed.title
-        },
+        title: stored_title(parsed.title, &store_path, &library_root),
         kind: parsed.kind.as_str().to_string(),
         year: parsed.year,
         season: parsed.season,
@@ -735,11 +754,7 @@ fn run_index_pass(
                         path: store_path.clone(),
                         mtime_ms: file.mtime_ms,
                         size_bytes: file.size_bytes,
-                        title: if parsed.title.is_empty() {
-                            title_from_folder(&store_path, &library_root)
-                        } else {
-                            parsed.title
-                        },
+                        title: stored_title(parsed.title, &store_path, &library_root),
                         kind: parsed.kind.as_str().to_string(),
                         year: parsed.year,
                         season: parsed.season,
@@ -3660,7 +3675,7 @@ mod tests {
 
 #[cfg(test)]
 mod folder_title_tests {
-    use super::title_from_folder;
+    use super::{stored_title, title_from_folder};
     use nightjar_core::parse_filename;
 
     /// The scanner is the layer that has the folder. `parse_filename` only
@@ -3688,6 +3703,40 @@ mod folder_title_tests {
     #[test]
     fn a_file_in_the_library_root_borrows_nothing() {
         assert_eq!(title_from_folder("S01E04.mkv", "/media/TV"), "");
+    }
+
+    /// The rule both indexing paths and the oracle's replay harness share.
+    /// Asserted on the composed function rather than on its halves, because the
+    /// harness was re-deriving this with `parse_filename` alone and the halves
+    /// each looked right.
+    #[test]
+    fn stored_title_substitutes_the_folder_only_for_an_empty_parse() {
+        // Titleless episode: the folder carries it.
+        let p = parse_filename("S01E01.mkv");
+        assert_eq!(p.title, "");
+        assert_eq!(
+            stored_title(
+                p.title,
+                "Anon Show (1988)/Season 01/S01E01.mkv",
+                "/media/TV"
+            ),
+            "Anon Show (1988)"
+        );
+        // A parsed title always wins, and the folder is never consulted.
+        let p = parse_filename("Anon Show - S01E01 - Pilot.mkv");
+        assert!(!p.title.is_empty());
+        assert_eq!(
+            stored_title(
+                p.title.clone(),
+                "Other Folder (1999)/Season 01/x.mkv",
+                "/media/TV"
+            ),
+            p.title
+        );
+        // No folder to borrow from stays empty, so the drain still declines to
+        // search rather than searching on the library's name.
+        let p = parse_filename("S01E01.mkv");
+        assert_eq!(stored_title(p.title, "S01E01.mkv", "/media/TV"), "");
     }
 
     /// **Only an episode can reach the fallback**, which is why there is no

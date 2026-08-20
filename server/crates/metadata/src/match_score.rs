@@ -637,6 +637,71 @@ pub fn title_hit(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
         || original.is_some_and(|t| name_matches_query(t, query_norm, kind))
 }
 
+/// Does the candidate's name fold *equal* to the query, ignoring the extension
+/// arms of [`name_matches_query`]?
+pub fn title_hit_exact(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
+    let (primary, original) = match kind {
+        SearchKind::Movie => (hit.title.as_deref(), hit.original_title.as_deref()),
+        SearchKind::Tv => (hit.name.as_deref(), hit.original_name.as_deref()),
+    };
+    primary.is_some_and(|t| norm_key(t) == query_norm)
+        || original.is_some_and(|t| norm_key(t) == query_norm)
+}
+
+/// Drop title *extensions* when an exact fold survives (ADR-0047 option C).
+///
+/// [`name_matches_query`] admits a TV candidate whose name is the query plus a
+/// tail, so a folder called `The Continental` reaches
+/// `The Continental: From the World of John Wick`. That arm is load-bearing: the
+/// oracle's `tv.shortfolder` shape scores 58 of 113 rows through it and nothing
+/// else. But a franchise spin-off has the identical shape and the predicate
+/// cannot tell one from the other — measured over the collision tier's wrong
+/// bindings, **80 of 134 pairs were extensions admitted alongside an exact
+/// fold**: `Cross` against `Cross My Mind`, `Gilmore Girls` against
+/// `Gilmore Girls: A Year in the Life`. In every one the correct answer was the
+/// exact fold, and the extension won on a count tie-break.
+///
+/// A precedence rule rather than a length threshold, deliberately. 69% of those
+/// admissions had a one-word query, so a "query must be ≥2 words" gate would
+/// catch most — and it would be a number to tune rather than a statement about
+/// which evidence outranks which.
+///
+/// **Applied after the empty-shell exclusion, not before.** An exact fold that is
+/// an empty TMDB shell is not a candidate at all (ADR-0026 amended), and letting
+/// it suppress a viable extension is how the first cut of this broke
+/// `short_query_matches_long_official_title_over_empty_shell`: query `Charlie`,
+/// an exact-fold shell with zero episodes, and a real
+/// `Charlie: Extended Official Title` that the shell shadowed into nothing. A
+/// filter that narrows to an empty set has not expressed a preference, it has
+/// discarded the answer.
+fn prefer_exact_over_extension(
+    hits: &mut Vec<&SearchHit>,
+    shapes: &mut Vec<CandidateShape>,
+    query_norm: &str,
+    kind: SearchKind,
+) {
+    debug_assert_eq!(hits.len(), shapes.len());
+    if !hits.iter().any(|h| title_hit_exact(h, query_norm, kind)) {
+        return;
+    }
+    let keep: Vec<bool> = hits
+        .iter()
+        .map(|h| title_hit_exact(h, query_norm, kind))
+        .collect();
+    let mut i = 0;
+    hits.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+    let mut i = 0;
+    shapes.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+}
+
 /// Exact fold match, or (TV only) candidate is query plus a longer official name
 /// ("The Continental" → "The Continental: From the World of John Wick").
 fn name_matches_query(name: &str, query_norm: &str, kind: SearchKind) -> bool {
@@ -726,14 +791,72 @@ pub(crate) fn has_no_episodes(shape: &CandidateShape) -> bool {
 
 /// First discriminator that selects exactly one of `exact` wins.
 /// Order: episode count → season count → premiere year.
-/// Counts first so folder year cannot pin a miniseries when the library is a
-/// multi-season series (Battlestar Galactica 2003 folder vs 2004 series).
+///
+/// **The counts abstain entirely when any candidate carries a per-season
+/// list.** An earlier version of this comment called that condition "the folder
+/// is partial" and pointed at a `folder_is_partial` that has never existed. Both
+/// halves were wrong. The gate reads the *candidates*, not the folder, so it
+/// fires on a complete folder exactly as readily; and because
+/// [`crate::tmdb::TmdbClient::tv_candidate_shape`] fills `season_numbers` and
+/// `season_episode_counts` from the one `seasons[]` array that every `/tv/{id}`
+/// payload carries, **in production the gate fires on the first line and nothing
+/// below it runs at all.** The whole ladder in this function is reachable from
+/// tests only.
+///
+/// Abstaining is still not declining to answer, because the evidence that
+/// matters sits outside this function. [`sole_season_coverer`] and
+/// [`primary_by_slots_explained`] run ahead of it, and the ADR-0032
+/// episode-title pin runs after it in
+/// [`crate::tmdb::TmdbClient::match_search_with_series_shape`]. Over the warmed
+/// oracle, `exact_title_episode_count` is right 882 times and wrong 616, and
+/// `exact_title_season_count` is right 358 and wrong 440 — worse than a coin
+/// flip — while `exact_title_season_coverage` and `exact_title_slots_explained`
+/// are 104 right and 0 wrong.
+///
+/// **The year is not among what still runs**, and the same comment used to say
+/// it was. `exact_title_library_year` is below the gate, so the gate removes it
+/// with the counts. It is unreachable a second way as well: `queue.rs` sets the
+/// TV search year to `g.year.or(g.library_year)` with `g.year` always `None` for
+/// an episode group, so the search year and `LibrarySeriesShape::year` are one
+/// value — and the branch that calls this function is entered only when the
+/// search year is `None`, which makes `library.year` `None` too.
 fn pin_collision<'a>(
     exact: &[&'a SearchHit],
     shapes: &[CandidateShape],
     library: LibrarySeriesShape,
 ) -> Option<(&'a SearchHit, &'static str)> {
     debug_assert_eq!(exact.len(), shapes.len());
+    // **Where better evidence was available and declined, worse evidence must
+    // not decide** (ADR-0047).
+    //
+    // With a per-season list, `slots_explained` has already asked the
+    // containment question — *can this candidate explain every file the folder
+    // holds* — and `primary_by_slots_explained` runs before this function. If it
+    // declined, the folder is a race no count can settle, and firing proximity
+    // afterwards is the coin flip that was measured: `episode_count` right 882
+    // and wrong 616, `season_count` right 358 and wrong 440.
+    //
+    // The Firm is the case. The folder holds 10 files of a 22-episode season 1
+    // and the wrong candidate's season 1 holds about 10, so `close(10, 22)` is
+    // false, `close(10, 10)` is true, and exactly one candidate matched — the
+    // wrong one. Both explain all 10 files; nothing separates them; declining is
+    // the honest answer.
+    //
+    // Containment as *equality* with the folder's total was tried and is wrong
+    // for the same reason proximity is: it made an 18-against-20 difference
+    // decisive, which `a_close_slots_race_does_not_pick_a_primary` exists to
+    // forbid. The fix is not a sharper predicate, it is not overriding a
+    // declination.
+    //
+    // The counts survive only where no candidate has a per-season list, and no
+    // `/tv/{id}` payload leaves one out — `tv_candidate_shape` reads both season
+    // fields from the same `seasons[]` array. So this line is where the count
+    // tier ends in production, and the case it was written to keep — 181 files
+    // against candidates of 181 and 12 — survives in the tests below and nowhere
+    // else.
+    if shapes.iter().any(|sh| sh.season_episode_counts.is_some()) {
+        return None;
+    }
 
     let try_pin = |pred: &dyn Fn(usize) -> bool, method: &'static str| {
         let mut hit: Option<&SearchHit> = None;
@@ -751,6 +874,19 @@ fn pin_collision<'a>(
         hit.map(|h| (h, method))
     };
 
+    // The candidate's **total** episode count against the folder's file count.
+    // Two different quantities — the folder's files span only the seasons it
+    // holds, the candidate's episodes span every season it has — so the
+    // comparison prefers whichever candidate is *smallest*: 267 of 284 wrong
+    // bindings from this tier, 94.0%, went to an entity with fewer episodes than
+    // the correct one, `Archer`'s 140 over 14 seasons losing to a 6-episode 1975
+    // series (ADR-0047).
+    //
+    // Restricting the candidate's count to the folder's own seasons was written
+    // to fix that, and is gone again. It needed `season_episode_counts`, and the
+    // gate above returns before any shape can carry one, so it summed nothing
+    // and returned `shape.episode_count` unchanged on every call. What protects
+    // this comparison is the gate, not a narrower number.
     if let Some(le) = library.episode_count
         && let Some(p) = try_pin(
             &|i| {
@@ -763,6 +899,17 @@ fn pin_collision<'a>(
     {
         return Some(p);
     }
+    // Equal *counts* of seasons is not evidence that they are the same seasons:
+    // a folder asserting [1] and a spin-off holding [1] match on the count while
+    // the seven-season parent does not, which is how this discriminator came to
+    // be right 358 times and wrong 440 — worse than a coin flip.
+    //
+    // Requiring the candidate to hold exactly the folder's seasons was the
+    // like-for-like form of the question, and it is gone for the same reason the
+    // restricted episode count is: it read `season_numbers`, which the gate
+    // above proves absent on every shape that gets here. Count equality is what
+    // is left, and again the gate, not the predicate, is what keeps it from
+    // deciding anything in production.
     if let Some(ls) = library.season_count
         && let Some(p) = try_pin(
             &|i| shapes[i].season_count == Some(ls),
@@ -1159,6 +1306,17 @@ pub fn score_search_with_shape_and_sole(
         }
         _ => (exact_all, candidate_shapes.map(|s| s.to_vec())),
     };
+    // ADR-0047: now that empty shells are gone, an extension only competes when
+    // no exact fold is left standing. Runs here and not on the raw title-hits so
+    // a shell cannot shadow a viable extension into nothing.
+    let (exact, shapes) = match shapes {
+        Some(mut sh) if sh.len() == exact.len() => {
+            let mut hits = exact;
+            prefer_exact_over_extension(&mut hits, &mut sh, &nk, kind);
+            (hits, Some(sh))
+        }
+        other => (exact, other),
+    };
     let shapes = shapes.as_deref();
     if exact.is_empty() && had_title_hits {
         // Every title-hit was an empty shell: none is a candidate. Do not
@@ -1213,18 +1371,21 @@ pub fn score_search_with_shape_and_sole(
             } else {
                 (exact[0], 0.90, "exact_title")
             }
-        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library.clone()) {
-            (hit, 0.90, method)
         } else if let Some(hit) = sole_season_coverer(&exact, shapes, &library.folder_seasons) {
-            // Only after `pin_collision` declines, so no folder that pins today
-            // is re-attributed. This reaches exactly the folders that were
-            // landing at 0.72 with the answer already computed.
+            // **Ahead of `pin_collision` (ADR-0047).** This ran after it, on the
+            // reasoning that no folder which pins today should be re-attributed.
+            // That conservatism gave the two near-random count discriminators
+            // priority over this one, which is right every time it fires: 30
+            // correct and 0 wrong against their 1,240 correct and 1,056 wrong.
             (hit, 0.90, "exact_title_season_coverage")
         } else if let Some(hit) = primary_by_slots_explained(&exact, shapes, &library) {
             // No candidate can hold the whole folder — ADR-0046's spanning
             // case. The primary is the one that explains most of it; the rest
-            // is `bind_second_entities`' job and already ships.
+            // is `bind_second_entities`' job and already ships. 74 correct, 0
+            // wrong, and likewise moved ahead of the counts.
             (hit, 0.90, "exact_title_slots_explained")
+        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library.clone()) {
+            (hit, 0.90, method)
         } else {
             // Prefer first non-empty candidate for the unpinned method payload,
             // but stay below floor.
@@ -1649,6 +1810,50 @@ mod tests {
 
     /// Cleaned folder title is a short prefix of the official TMDB name;
     /// empty shell (0 seasons/eps) must not win.
+    /// ADR-0047: an extension only competes when no exact fold is left.
+    ///
+    /// `Gilmore Girls` against `Gilmore Girls: A Year in the Life`, both viable,
+    /// and the extension is the shorter one — which is exactly what the count
+    /// tie-breaks used to pick. The exact fold must win before any tie-break is
+    /// consulted.
+    #[test]
+    fn an_exact_fold_beats_a_title_extension() {
+        let parent = tv(1, "Gilmore Girls", 153);
+        let mut spinoff = tv(2, "Gilmore Girls: A Year in the Life", 4);
+        spinoff.first_air_date = Some("2016-11-25".into());
+        let results = vec![parent, spinoff];
+        let shapes = [
+            CandidateShape {
+                year: Some(2000),
+                episode_count: Some(153),
+                season_count: Some(7),
+                ..Default::default()
+            },
+            CandidateShape {
+                year: Some(2016),
+                episode_count: Some(4),
+                season_count: Some(1),
+                ..Default::default()
+            },
+        ];
+        // A folder holding one partial season: 10 files, one season. Under the
+        // old order `episode_count` picked the 4-episode spin-off uniquely.
+        let m = score_search_with_shape(
+            &results,
+            "Gilmore Girls",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                episode_count: Some(10),
+                season_count: Some(1),
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(m.tmdb_id, 1, "bound {:?} via {}", m.tmdb_id, m.method);
+    }
+
     #[test]
     fn short_query_matches_long_official_title_over_empty_shell() {
         let mut shell = tv(1, "Charlie", 0);
@@ -2162,13 +2367,30 @@ mod tests {
         assert_eq!(c.method, "exact_title_library_year");
     }
 
+    /// Nominal per-season episode count for the two shape helpers.
+    ///
+    /// They know a candidate's season *numbers*, not its season sizes, and
+    /// every test that turns on a size sets `season_episode_counts` itself.
+    /// This value exists so the two season fields can be filled together, which
+    /// is the only way `tv_candidate_shape` ever fills them.
+    const NOMINAL_SEASON_EPS: u32 = 10;
+
+    /// A candidate whose reference season was fetched.
+    ///
+    /// **Both season fields are filled together, deliberately.**
+    /// `tv_candidate_shape` reads `season_numbers` and `season_episode_counts`
+    /// from the one `seasons[]` array of the `/tv/{id}` payload, so for every
+    /// candidate production builds they are both present or both absent. A
+    /// helper that set the numbers and left the counts `None` described a
+    /// payload TMDB does not return, and the tests built on it were exercising
+    /// branches of `pin_collision` that no production call can reach.
     fn shape_eps(year: i32, seasons: &[i32], eps: &[(i32, &str)]) -> CandidateShape {
         CandidateShape {
             year: Some(year),
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
-            season_episode_counts: None,
+            season_episode_counts: Some(seasons.iter().map(|s| (*s, NOMINAL_SEASON_EPS)).collect()),
             reference_season_episodes: Some(eps.iter().map(|(n, t)| (*n, t.to_string())).collect()),
             candidate_season_episodes: None,
         }
@@ -2316,6 +2538,11 @@ mod tests {
     /// Two coverers decline. `star trek`, `doctor who` and `pride and prejudice`
     /// each have eight in the measured library, and pinning those would be
     /// worse than pinning none.
+    ///
+    /// The shapes carry per-season counts, as every `/tv/{id}` payload does, so
+    /// `pin_collision` abstains on its gate too. Coverage declines because two
+    /// candidates cover; the counts below the gate never get a turn. Neither
+    /// route to a pin is open, which is what the assertion checks.
     #[test]
     fn two_season_coverers_leave_the_collision_unpinned() {
         let hits = vec![tv(1, "Test Show", 1999), tv(2, "Test Show", 2015)];
@@ -2367,11 +2594,36 @@ mod tests {
             Some(&shapes),
         )
         .expect("a candidate");
-        assert_eq!(c.tmdb_id, 1);
+        // **ADR-0047 reverses this assertion, and the test's name still holds.**
+        // Coverage declines here — both candidates hold seasons 1 and 2 — so it
+        // does not re-attribute anything. What changed is that the count pin no
+        // longer owns it either.
+        //
+        // The route to that outcome is `pin_collision`'s gate. Both shapes carry
+        // a per-season list, as every `/tv/{id}` payload does, and *where better
+        // evidence was available and declined, worse evidence must not decide*:
+        // `slots_explained` had the list and said nothing, so the counts never
+        // get a turn.
+        //
+        // The count that would otherwise have fired is exactly the coincidence
+        // the gate exists to refuse. The folder holds 47 files across seasons
+        // [1, 2]; candidate 1 holds 47 episodes across seasons [1, 2, 3]. Those
+        // 47 span three seasons against the folder's two, so the folder cannot be
+        // this candidate's seasons 1–2 and `47 == 47` compares two different
+        // quantities.
+        //
+        // Measured over the warmed oracle before this change: that comparison
+        // was wrong 616 times against 882 right, and 94% of its wrong bindings
+        // went to an entity with fewer episodes than the correct one.
+        //
+        // Unpinned is the honest outcome — 0.72 is below the floor, so the folder
+        // goes unmatched rather than binding on a coincidence. Absent is
+        // recoverable; wrong is not.
         assert_eq!(
-            c.method, "exact_title_episode_count",
-            "the count pin still owns it"
+            c.method, "exact_title_collision_unpinned",
+            "a count spanning different seasons is not a pin"
         );
+        assert!(c.confidence < 0.90, "and it must stay below the floor");
     }
 
     /// Will & Grace: 246 files across two entities of 194 and 52. Every pin
@@ -2609,7 +2861,9 @@ mod tests {
             shape_eps(2004, &[1], &[(2, "Some Other Title")]),
         ];
         // A library year that matches neither, so no year pin fires and the
-        // collision branch is what picks — the 770's shape.
+        // collision branch is what picks — the 770's shape. `pin_collision`
+        // abstains on its gate, both shapes carrying a per-season list as every
+        // `/tv/{id}` payload does, and the branch falls through to `unpinned`.
         let c = score_search_with_shape(
             &hits,
             "Test Show",
@@ -2662,13 +2916,16 @@ mod tests {
         );
     }
 
+    /// A candidate with a season list and nothing fetched about its episode
+    /// names. Both season fields are filled together for the reason `shape_eps`
+    /// gives above.
     fn shape(year: i32, seasons: &[i32]) -> CandidateShape {
         CandidateShape {
             year: Some(year),
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
-            season_episode_counts: None,
+            season_episode_counts: Some(seasons.iter().map(|s| (*s, NOMINAL_SEASON_EPS)).collect()),
             reference_season_episodes: None,
             candidate_season_episodes: None,
         }

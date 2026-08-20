@@ -147,7 +147,7 @@ fn build_groups(
                     .first()
                     .map(|s| s.path.as_str())
                     .unwrap_or(it.path.as_str());
-                let library_year = series_library_year(years, path0);
+                let library_year = series_library_year(years, path0, "");
                 let seasons: HashSet<i32> = siblings.iter().filter_map(|s| s.season).collect();
                 let season_count = (!seasons.is_empty()).then_some(seasons.len() as u32);
                 let episode_count = Some(siblings.len() as u32);
