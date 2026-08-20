@@ -63,7 +63,8 @@ not here — this page is the reference, not the tour.
 | [0043](0043-season-fit-and-unmatched-reason.md) | Season fit as a candidate constraint, and a recorded unmatched reason | §1 superseded before shipping (Amendment 2026-08-12); §2 accepted, unbuilt | — | §1 by its own amendment |
 | [0046](0046-multi-entity-binding-one-unit-per-folder.md) | Multi-entity binding, one browse unit per folder | **Proposed** | — | — |
 | [0047](0047-title-extension-admission-and-collision-evidence.md) | What may count as a title match, and what evidence may break a tie | **Proposed** | — | — |
-| [0048](0048-yearless-movie-collisions.md) | What may decide a yearless movie collision | **Proposed** | — | — |
+| [0048](0048-yearless-movie-collisions.md) | What may decide a yearless movie collision | **Accepted** (option B) | — | — |
+| [0049](0049-what-is-a-show-folder.md) | What counts as a show folder when the directory is per-episode | **Proposed** | — | — |
 
 ## Why the numbers jump from 0043 to 0046
 
