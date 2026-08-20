@@ -720,9 +720,11 @@ fn status_query_groups(
     // that fold to the same matcher key (`Shameless (US)` / `Shameless (UK)`)
     // are separate groups and never share identity (the D2 wrong-match class).
     let mut ep_by_show: HashMap<(i64, String), Vec<&PendingItem>> = HashMap::new();
+    let mut any_root_group = false;
     for it in &items {
         if it.kind == "episode" {
             let folder = show_folder_relpath(&it.path, &it.library_path);
+            any_root_group |= folder.is_empty();
             let (ct, _) = clean_show_title(&it.title);
             ep_by_show
                 .entry(episode_group_key(it.library_id, &folder, &ct))
@@ -730,6 +732,19 @@ fn status_query_groups(
                 .push(it);
         }
     }
+
+    // Root-level episode files, bucketed by the same key `episode_group_key`
+    // gives them, read once for the pass (F5). See
+    // [`root_group_episode_basenames`] for what this replaces and why.
+    //
+    // Skipped entirely when nothing pending is at a library root, which is the
+    // ordinary case: this is one scan the drain did not do before, and a
+    // library organised into show folders should not pay for it.
+    let root_basenames = if any_root_group {
+        root_group_episode_basenames(conn)?
+    } else {
+        RootGroupBasenames::new()
+    };
 
     // Stored folder series identity, loaded once so group unit keys follow
     // the folder's row (`tv|tmdb:{show_id}`) instead of a soft key — a
@@ -785,6 +800,7 @@ fn status_query_groups(
                 // `series` table holds.
                 let group_key = episode_group_key(it.library_id, &show_folder, &ct);
                 let folder_key = (it.library_id, show_folder.clone());
+                let lookup_key = group_key.clone();
                 let siblings = ep_by_show
                     .get(&group_key)
                     .map(|v| v.as_slice())
@@ -860,13 +876,20 @@ fn status_query_groups(
                     ref_season: pref.as_ref().map(|p| p.0),
                     ref_episode: pref.as_ref().map(|p| p.1),
                     ref_episode_title: pref.map(|p| p.2),
-                    folder_episode_titles: folder_titles_from_db(
-                        conn,
-                        it.library_id,
-                        &show_folder,
-                        &ct,
-                    )
-                    .unwrap_or_default(),
+                    folder_episode_titles: if show_folder.is_empty() {
+                        // A root group's folder evidence is the root files that
+                        // group *with it*, not the library. The soft key is the
+                        // group's own, so `usable_episode_titles` still drops a
+                        // title that is only the show's name.
+                        let rows: Vec<(i32, i32, &str)> = root_basenames
+                            .get(&lookup_key)
+                            .map(|v| v.iter().map(|(s, e, b)| (*s, *e, b.as_str())).collect())
+                            .unwrap_or_default();
+                        usable_episode_titles(&rows, &ct)
+                    } else {
+                        folder_titles_from_db(conn, it.library_id, &show_folder, &ct)
+                            .unwrap_or_default()
+                    },
                     item_ids: Vec::new(),
                     max_id: it.id,
                     band,
@@ -1284,11 +1307,16 @@ fn folder_titles_from_db(
     show_folder: &str,
     show_soft_key: &str,
 ) -> Result<Vec<(i32, i32, String)>, String> {
-    let like = if show_folder.is_empty() {
-        "%".to_string()
-    } else {
-        format!("{show_folder}/%")
-    };
+    // **An empty show folder is not a folder every root file shares** — the
+    // same reading `episode_group_key` and `load_series_rows` already apply to
+    // it. This used to build `LIKE '%'` for that case, so a root group's folder
+    // evidence was every episode in the library. `status_query_groups` reads
+    // the root case from [`root_group_episode_basenames`] instead, and the
+    // fallback is gone rather than left where it can be reached again.
+    if show_folder.is_empty() {
+        return Ok(Vec::new());
+    }
+    let like = format!("{show_folder}/%");
     let mut stmt = conn
         .prepare(
             "SELECT path, season, episode FROM media_items
@@ -1315,6 +1343,94 @@ fn folder_titles_from_db(
         })
         .collect();
     Ok(usable_episode_titles(&basenames, show_soft_key))
+}
+
+/// Root-level episode basenames, bucketed by group key: what
+/// [`root_group_episode_basenames`] returns and `status_query_groups` reads.
+type RootGroupBasenames = HashMap<(i64, String), Vec<(i32, i32, String)>>;
+
+/// Every **root-level** episode file, bucketed by the group key
+/// [`episode_group_key`] gives it.
+///
+/// A local read. No provider request.
+///
+/// ## What this is for (F5)
+///
+/// `folder_titles_from_db` builds its `LIKE` from the group's show folder, and
+/// a file directly in the library root has none. The empty string then became
+/// `LIKE '%'`, so a root group's `folder_episode_titles` was **every episode in
+/// the library**. `usable_episode_titles` does not narrow that: it drops a title
+/// that is only the show's own name and a generic one, not a title belonging to
+/// a different show.
+///
+/// That evidence reaches `candidate_confirms_any_episode_title`, which compares
+/// **title-anywhere on both sides** — deliberately, because a folder title sits
+/// at a different number on a renumbered candidate. So one agreement with a
+/// *neighbour's* episode title is enough, and `confirmation_beats_pick` then
+/// either endorses the ladder's pick or redirects to another candidate. Both
+/// arms raise the confidence to 0.90, which is the auto-match floor. A root
+/// group could therefore bind automatically on a title belonging to a show it
+/// has nothing to do with.
+///
+/// The line is unchanged from before root-level grouping landed. What changed is
+/// what it costs: those groups used to bind wrong anyway, so contaminated
+/// evidence cost nothing. They bind correctly now.
+///
+/// ## Why once, rather than a narrower `LIKE`
+///
+/// There is no `LIKE` for "the files that group with this one" — the key is
+/// `query_key(clean_show_title(title))`, which SQL cannot compute. Filtering in
+/// Rust per group would keep the per-group full scan the `%` pattern already
+/// costs. One pass over the same rows serves every root group in every library.
+///
+/// Basenames, not titles: the caller applies `usable_episode_titles` with **its
+/// own** soft key, so the shipped rejection still runs against the right show
+/// name.
+fn root_group_episode_basenames(conn: &Connection) -> Result<RootGroupBasenames, String> {
+    let mut stmt = conn
+        .prepare(
+            // `l.reachable = 1` for the same reason `status_query_groups`
+            // applies it: these rows become evidence for groups that gate on
+            // it, and evidence from a library whose root is gone is not
+            // evidence (ADR-0014).
+            "SELECT m.library_id, l.path, m.path, m.title, m.season, m.episode
+             FROM media_items m
+             JOIN libraries l ON l.id = m.library_id
+             WHERE m.kind = 'episode' AND l.reachable = 1
+               AND m.season IS NOT NULL AND m.episode IS NOT NULL",
+        )
+        .map_err(|e| format!("prepare root titles: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i32>(4)?,
+                r.get::<_, i32>(5)?,
+            ))
+        })
+        .map_err(|e| format!("query root titles: {e}"))?;
+    let mut out: RootGroupBasenames = HashMap::new();
+    for row in rows {
+        let (library_id, library_path, path, title, season, episode) =
+            row.map_err(|e| format!("root title row: {e}"))?;
+        // The shipped derivations, not a second reading of the same convention.
+        if !show_folder_relpath(&path, &library_path).is_empty() {
+            continue;
+        }
+        let (ct, _) = clean_show_title(&title);
+        let base = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path.as_str())
+            .to_string();
+        out.entry(episode_group_key(library_id, "", &ct))
+            .or_default()
+            .push((season, episode, base));
+    }
+    Ok(out)
 }
 
 /// Unlink files bound to an entity this folder does not bind (issue 121).
@@ -6090,6 +6206,71 @@ mod tests {
             titles.len(),
             1,
             "a prefix-sharing sibling folder is not this folder"
+        );
+    }
+
+    /// **F5.** A group at the library root has no show folder, and the empty
+    /// string used to become `LIKE '%'` — so its "folder episode titles" were
+    /// every episode in the library, including every episode of every show in a
+    /// folder beside it. `candidate_confirms_any_episode_title` compares
+    /// title-anywhere on both sides, so one agreement with a neighbour's title
+    /// confirms a candidate, and both confirmation arms raise the confidence to
+    /// the 0.90 auto-match floor.
+    ///
+    /// The library below is `tv.mixedroot`'s shape in miniature: two loose files
+    /// at the root and one show in a folder. `Spree` belongs to the foldered
+    /// show and must not appear in the root group's evidence.
+    #[test]
+    fn a_root_group_does_not_read_the_library_s_episode_titles() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind) VALUES (1, 'S', '/S', 'shows');
+             INSERT INTO media_items
+                  (id, library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+                (1, 1, 'Monster - S01E03 - Blame it on the Rain.mkv',
+                     1, 1, 'Monster', 'episode', 1, 3),
+                (2, 1, 'Monster - S01E04 - Cold Open.mkv',
+                     1, 1, 'Monster', 'episode', 1, 4),
+                (3, 1, 'Ghosts (2021)/Season 1/Ghosts - S01E01 - Pilot.mkv',
+                     1, 1, 'Ghosts', 'episode', 1, 1),
+                (4, 1, 'Ghosts (2021)/Season 1/Ghosts - S01E02 - Spree.mkv',
+                     1, 1, 'Ghosts', 'episode', 1, 2);",
+        )
+        .unwrap();
+
+        let by_group = root_group_episode_basenames(&c).unwrap();
+        let key = episode_group_key(1, "", "Monster");
+        let rows: Vec<(i32, i32, &str)> = by_group
+            .get(&key)
+            .expect("the root group is present")
+            .iter()
+            .map(|(s, e, b)| (*s, *e, b.as_str()))
+            .collect();
+        let titles = usable_episode_titles(&rows, "Monster");
+
+        let names: Vec<&str> = titles.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Blame it on the Rain", "Cold Open"],
+            "the root group sees its own two files and neither of the foldered              show's — `Spree` is the neighbour's, and one agreement on it is              enough to push a candidate over the floor"
+        );
+
+        // The foldered show has a folder, so it is not in this map at all.
+        assert_eq!(
+            by_group.len(),
+            1,
+            "only root-level files are bucketed here; a foldered file keeps              reading through folder_titles_from_db"
+        );
+
+        // And the route that produced the defect can no longer be reached with
+        // an empty folder: a guard that makes the old line dead, not unreached.
+        assert!(
+            folder_titles_from_db(&c, 1, "", "Monster")
+                .unwrap()
+                .is_empty(),
+            "an empty show folder is the absence of a folder, not a folder every              root file shares"
         );
     }
 
