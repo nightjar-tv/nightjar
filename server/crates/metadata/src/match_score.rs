@@ -862,6 +862,36 @@ fn pin_collision<'a>(
     library: LibrarySeriesShape,
 ) -> Option<(&'a SearchHit, &'static str)> {
     debug_assert_eq!(exact.len(), shapes.len());
+    // **Where better evidence was available and declined, worse evidence must
+    // not decide** (ADR-0047).
+    //
+    // With a per-season list, `slots_explained` has already asked the
+    // containment question — *can this candidate explain every file the folder
+    // holds* — and `primary_by_slots_explained` runs before this function. If it
+    // declined, the folder is a race no count can settle, and firing proximity
+    // afterwards is the coin flip that was measured: `episode_count` right 882
+    // and wrong 616, `season_count` right 358 and wrong 440.
+    //
+    // The Firm is the case. The folder holds 10 files of a 22-episode season 1
+    // and the wrong candidate's season 1 holds about 10, so `close(10, 22)` is
+    // false, `close(10, 10)` is true, and exactly one candidate matched — the
+    // wrong one. Both explain all 10 files; nothing separates them; declining is
+    // the honest answer.
+    //
+    // Containment as *equality* with the folder's total was tried and is wrong
+    // for the same reason proximity is: it made an 18-against-20 difference
+    // decisive, which `a_close_slots_race_does_not_pick_a_primary` exists to
+    // forbid. The fix is not a sharper predicate, it is not overriding a
+    // declination.
+    //
+    // Without a per-season list nothing better has run, so the counts stay — that
+    // is the path 181 files against candidates of 181 and 12 takes.
+    if shapes
+        .iter()
+        .any(|sh| sh.season_episode_counts.is_some())
+    {
+        return None;
+    }
 
     let try_pin = |pred: &dyn Fn(usize) -> bool, method: &'static str| {
         let mut hit: Option<&SearchHit> = None;

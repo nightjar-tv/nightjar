@@ -1,6 +1,6 @@
 # ADR-0047: What may count as a title match, and what evidence may break a tie
 
-- Status: **proposed**
+- Status: **proposed** (amended 2026-08-20: the selection half is decided — see *Amendment: the count tier is gated*)
 - Date: 2026-08-20
 - Supersedes: nothing. It narrows two rules that ADR-0026 and ADR-0032 left
   open, and does not replace either record.
@@ -213,3 +213,75 @@ season 1 mostly, one drain from an empty database, no NFOs, and no manual-match 
 rescan path. `tv.shortfolder` covers only colon-named shows whose head is
 unambiguous — a provider name longer without a colon (`The Office US`) is not
 generated.
+
+
+---
+
+## Amendment, 2026-08-20 — the count tier is gated
+
+A severity-weighting decision, taken deliberately rather than derived from the
+rate, and recorded here because the rate argues the other way.
+
+### What was measured
+
+With `slots_explained` and `sole_season_coverer` ahead of the counts, the count
+discriminators still fire whenever those decline. Gating them off when any
+candidate carries a per-season list — *where better evidence was available and
+declined, worse evidence does not decide* — produces exactly three transitions,
+every one to `absent`:
+
+    correct              -> absent   836
+    wrong.unknownepisode -> absent   698
+    wrong.entity         -> absent    60
+
+| | keep | gate |
+|---|---:|---:|
+| correct | 59,101 | 58,265 |
+| wrong.entity | 64 | **4** |
+| wrong.unknownepisode | 698 | **0** |
+| absent | 13,302 | 14,896 |
+| **correct%** | **80.1%** | **79.0%** |
+
+`tv.noyear`, `tv.root` and `tv.scene` reach **zero wrong bindings of every
+class**.
+
+### Why gate, when the rate falls
+
+**The gated firings are 52.4% precise** — 836 right against 758 wrong. That is a
+coin flip selecting an entity at **0.90 confidence**, above the auto-match floor,
+and it has been selecting them all along.
+
+`BLOCK1_LEAVE_BAR` settles the direction: a wrong binding triggers fetches and
+corrupts watch state; an unmatched file is recoverable through the fix flow.
+Trading 758 unrecoverable failures for 836 recoverable ones is the exchange that
+bar exists to make. **79.0% honestly measured is worth more than 80.1% where a
+percentage point comes from a coin flip.**
+
+The counts are kept where nothing better has run — a candidate whose detail was
+fetched without its seasons — which is the path `long_run_episode_count_pins_
+over_short_reboot` and `episode_count_pins_supernatural_shape` exercise.
+
+### What was tried first and rejected
+
+Two sharper predicates, both wrong:
+
+1. **Abstain when any candidate has an unasserted season.** Broke five shipped
+   tests, including the discriminator working correctly on a long run against a
+   short reboot — those tests carry no per-season list, so the rule was silenced
+   entirely.
+2. **Containment as equality with the folder's total** —
+   `slots_explained == library.episode_count`. Broke
+   `a_close_slots_race_does_not_pick_a_primary`: 20 files, one candidate
+   explaining 20 and another 18, so an 18-against-20 difference became decisive.
+   That is proximity's brittleness through a different door.
+
+**The fix was never a sharper predicate.** `slots_explained` already asks the
+containment question and already runs first; the change is to stop a worse rule
+overriding its declination.
+
+### Reproducibility
+
+The gated tree was measured twice, and the second run differs from the first on
+**0 of 73,738 rows**. Noise floor 0 in both. 739 workspace tests pass; the single
+failure is a pre-existing flaky HLS seek assertion in `transcode` that fails
+identically on `origin/main`.

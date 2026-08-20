@@ -148,3 +148,52 @@ exactly one candidate in 17 of 20 folders and not consulted by this tier at all.
 
 **That is the next thing, and it is a better lead than either version of
 containment.**
+
+---
+
+## Iteration 12b — the gate is applied, and my next lead was wrong
+
+The gate is reapplied on the decision recorded as an ADR-0047 amendment. Measured
+twice: **0 of 73,738 rows differ between runs**, which checks the whole pipeline's
+reproducibility rather than only the scoring noise floor.
+
+## Correcting the lead I gave
+
+I said `folder_episode_titles` was *"evidence sitting unused"* and that this tier
+*"does not consult it"*. **Both halves of that are wrong.**
+
+`confirmation_beats_pick` already runs the wide comparator —
+`candidate_confirms_any_episode_title`, all folder titles against all fetched
+candidate episode names — after the ladder picks, as promotion or redirect, and it
+reaches even the unpinned 0.72 fallback. `sole_candidate_confirmed` uses it too.
+The evidence is consulted, one-directionally by construction, and the docstrings
+record the measurement behind that: confirmation held on 598 working folders and
+refutation never once identified a wrong entity.
+
+**And it cannot rescue the 836 rows the gate cost, for a reason nothing about the
+code:**
+
+| shape | filename form | episode title? | correct% |
+|---|---|---|---:|
+| tv.sonarr | `Show - S01E01 - Title.mkv` | **yes** | **100.0%** |
+| tv.flat.titled | `Show - S01E01 - Title.mkv` | **yes** | **100.0%** |
+| tv.noyear | `Show - S01E01.mkv` | no | 81.1% |
+| tv.root | `Show.S01E01.1080p.WEB-DL.mkv` | no | 81.1% |
+| tv.scene | `Show.S01E01.1080p.WEB-DL.x264-GRP.mkv` | no | 77.1% |
+
+**The shapes that carry episode titles are already at 100%. The shapes that fail
+are exactly the ones that carry none.** Title evidence is already doing its whole
+job; there is nothing for it to work with in the failing population, because those
+filenames contain no title to compare.
+
+So the residual is not "evidence unused". It is **the population where the filename
+carries neither a year nor an episode title, and the show's name collides.** For
+those rows there is no evidence in the filename, and `absent` is the correct
+answer, not a shortfall. That is what the gate now returns.
+
+**This also means the oracle cannot test a title-based fix for those shapes** — it
+would need a shape carrying titles *and* a collision *and* no year, and the two
+shapes that carry titles resolve at 100% without needing one.
+
+I should have checked the filename forms before proposing the lead. The claim was
+made from reading the call graph and not from reading what the shapes contain.
