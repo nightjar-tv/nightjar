@@ -896,11 +896,7 @@ mod tests {
         }
         // An episode year still wins over the folder.
         assert_eq!(
-            series_library_year(
-                [Some(1999)],
-                "Scrubs (2001)/Scrubs - S01E01.mkv",
-                root
-            ),
+            series_library_year([Some(1999)], "Scrubs (2001)/Scrubs - S01E01.mkv", root),
             Some(1999)
         );
         // Season and Specials directories still inherit the show folder.

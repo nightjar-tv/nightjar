@@ -111,15 +111,17 @@ pub fn to_relpath(library_root: &str, absolute: &Path) -> Option<String> {
     Some(rel)
 }
 
-/// Show folder relpath for an episode file (ADR-0033 Q2): the highest
-/// directory under the library root that contains episodes or season
-/// directories. `Season N/` and `Specials/` inherit the show folder's series
-/// row. Returns `""` when the library root is itself the show folder.
+/// Show folder relpath for an episode file (ADR-0033 Q2): the **deepest**
+/// directory holding the file that is not itself a season directory. `Season
+/// N/` and `Specials/` inherit the show folder's series row. Returns `""` when
+/// the library root is itself the show folder.
 ///
-/// Path-walk only: the show folder is the first directory component (from the
-/// file up) that is not a season-named directory. Both the migration that
-/// retro-derives series rows and the queue's group formation call this, so
-/// the two always agree on the folder key.
+/// Path-walk only: walk up from the file and stop at the first directory
+/// component that is not season-named. The first line of this doc used to read
+/// "the highest directory under the library root", which describes the opposite
+/// walk — under it, every show inside a genre or first-letter folder would share
+/// one show folder. Both the migration that retro-derives series rows and the
+/// queue's group formation call this, so the two always agree on the folder key.
 pub fn show_folder_relpath(stored: &str, library_root: &str) -> String {
     let rel = if is_absolute_stored(stored) {
         to_relpath(library_root, Path::new(stored)).unwrap_or_else(|| stored.to_string())

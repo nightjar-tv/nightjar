@@ -710,11 +710,15 @@ fn status_query_groups(
         items.push(row.map_err(|e| format!("status group row: {e}"))?);
     }
 
-    // ADR-0033 Q2: TV groups are folder-scoped. The show folder is the highest
-    // directory under the library root that contains episodes or season
-    // directories; `Season N/` and `Specials/` inherit it. Two folders that
-    // fold to the same matcher key (`Shameless (US)` / `Shameless (UK)`) are
-    // separate groups and never share identity (the D2 wrong-match class).
+    // ADR-0033 Q2: TV groups are folder-scoped. The show folder is the
+    // **deepest** directory holding the episode that is not itself a season
+    // directory — `show_folder_relpath` walks up from the file and stops at the
+    // first segment that is not `Season N/`, `Specials/`, `Extras/` or `SNN/`,
+    // so those inherit the folder above them. (This comment used to say "highest
+    // directory under the library root", which is the opposite walk and would
+    // put every show under a genre or letter folder into one group.) Two folders
+    // that fold to the same matcher key (`Shameless (US)` / `Shameless (UK)`)
+    // are separate groups and never share identity (the D2 wrong-match class).
     let mut ep_by_show: HashMap<(i64, String), Vec<&PendingItem>> = HashMap::new();
     for it in &items {
         if it.kind == "episode" {

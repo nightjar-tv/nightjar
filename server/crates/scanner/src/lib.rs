@@ -3715,14 +3715,22 @@ mod folder_title_tests {
         let p = parse_filename("S01E01.mkv");
         assert_eq!(p.title, "");
         assert_eq!(
-            stored_title(p.title, "Anon Show (1988)/Season 01/S01E01.mkv", "/media/TV"),
+            stored_title(
+                p.title,
+                "Anon Show (1988)/Season 01/S01E01.mkv",
+                "/media/TV"
+            ),
             "Anon Show (1988)"
         );
         // A parsed title always wins, and the folder is never consulted.
         let p = parse_filename("Anon Show - S01E01 - Pilot.mkv");
         assert!(!p.title.is_empty());
         assert_eq!(
-            stored_title(p.title.clone(), "Other Folder (1999)/Season 01/x.mkv", "/media/TV"),
+            stored_title(
+                p.title.clone(),
+                "Other Folder (1999)/Season 01/x.mkv",
+                "/media/TV"
+            ),
             p.title
         );
         // No folder to borrow from stays empty, so the drain still declines to

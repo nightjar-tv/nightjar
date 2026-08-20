@@ -1,6 +1,8 @@
 # ADR-0047: What may count as a title match, and what evidence may break a tie
 
-- Status: **proposed** (amended 2026-08-20: the selection half is decided — see *Amendment: the count tier is gated*)
+- Status: **proposed** (amended 2026-08-20: the selection half is decided — see
+  *Amendment: the count tier is gated*; corrected 2026-08-20 — see *Correction:
+  the gate removes the count tier*)
 - Date: 2026-08-20
 - Supersedes: nothing. It narrows two rules that ADR-0026 and ADR-0032 left
   open, and does not replace either record.
@@ -285,3 +287,70 @@ The gated tree was measured twice, and the second run differs from the first on
 **0 of 73,738 rows**. Noise floor 0 in both. 739 workspace tests pass; the single
 failure is a pre-existing flaky HLS seek assertion in `transcode` that fails
 identically on `origin/main`.
+
+---
+
+## Correction, 2026-08-20 — the gate removes the count tier, it does not narrow it
+
+**The decision above stands.** It was re-measured on a re-warmed oracle and its
+ledger reproduced. What is wrong is one sentence of the reasoning, and it is
+wrong in the direction that matters: it describes a path production does not
+have.
+
+### The false sentence
+
+> The counts are kept where nothing better has run — a candidate whose detail
+> was fetched without its seasons — which is the path
+> `long_run_episode_count_pins_over_short_reboot` and
+> `episode_count_pins_supernatural_shape` exercise.
+
+A candidate "whose detail was fetched without its seasons" is a `/tv/{id}`
+response carrying `number_of_episodes` and no `seasons[]`. TMDB does not return
+that. `tv_candidate_shape` fills `season_numbers` and `season_episode_counts`
+from the same `seasons[]` array, so a candidate carries both or neither, and it
+is the only production constructor of a shape that carries counts. The two named
+tests hand-build the shape TMDB withholds. They are the evidence for the claim,
+and they are also the only place it holds.
+
+The honest statement is the stronger one: **the gate does not narrow the count
+tier, it removes it.** `pin_collision` returns on its first line for every real
+payload. Everything below that line — both count discriminators, and the
+`exact_title_library_year` pin with them — is reachable from tests only.
+
+The year pin is unreachable a second way as well. `queue.rs` sets the TV search
+year to `g.year.or(g.library_year)`, and `g.year` is always `None` for an
+episode group, so the search year and `LibrarySeriesShape::year` are one value.
+The branch that calls `pin_collision` is entered only when that value is `None`.
+
+Nothing in the decision changes. What binds an entity today is
+`exact_title_season_coverage`, `exact_title_slots_explained`, the ADR-0032
+episode-title pin, and the year discriminators above this branch — the same four
+the amendment already called more precise than the counts.
+
+### The confirming measurement
+
+Re-warmed oracle, 79,382 rows. Both arms stall on the same count, so the two
+populations are like-for-like:
+
+| arm | correct | wrong.entity | wrong.unknownepisode | absent |
+|---|---:|---:|---:|---:|
+| gate in | 58,186 | 10 | 20 | 9,944 |
+| gate removed | 59,032 | 70 | 735 | 8,323 |
+
+Removing the gate buys **846 correct for 775 wrong — about 1.1 to 1**. That
+reproduces the amendment's own 836-against-758 ledger on a different warm. A
+coin flip at 0.90 confidence is still a coin flip, and `BLOCK1_LEAVE_BAR` still
+decides which way to take it.
+
+### The trap in that measurement
+
+On a **partially warmed** cache the same comparison read as **11 to 1 in favour
+of removing the gate**. That was not noise and not a different metric. The two
+arms stalled on different items, and 714 of the items hidden from one arm turned
+out to be wrong bindings. The arm that looked better looked better because more
+of its failures were unmeasured.
+
+**Two arms that leave different things unmeasured cannot be compared** — not at
+any sample size, and not however stable the ratio looks. Equal stall counts are
+what make the table above one comparison instead of two separate observations,
+which is why the table says so.

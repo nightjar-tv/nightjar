@@ -674,17 +674,14 @@ pub fn title_hit_exact(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> b
 /// `Charlie: Extended Official Title` that the shell shadowed into nothing. A
 /// filter that narrows to an empty set has not expressed a preference, it has
 /// discarded the answer.
-fn prefer_exact_over_extension<'a>(
-    hits: &mut Vec<&'a SearchHit>,
+fn prefer_exact_over_extension(
+    hits: &mut Vec<&SearchHit>,
     shapes: &mut Vec<CandidateShape>,
     query_norm: &str,
     kind: SearchKind,
 ) {
     debug_assert_eq!(hits.len(), shapes.len());
-    if !hits
-        .iter()
-        .any(|h| title_hit_exact(h, query_norm, kind))
-    {
+    if !hits.iter().any(|h| title_hit_exact(h, query_norm, kind)) {
         return;
     }
     let keep: Vec<bool> = hits
@@ -792,70 +789,37 @@ pub(crate) fn has_no_episodes(shape: &CandidateShape) -> bool {
     shape.episode_count == Some(0)
 }
 
-/// The candidate's episode count **restricted to the seasons the folder
-/// asserts** — the only version of this number that is comparable to the
-/// folder's file count (ADR-0047).
-///
-/// `library.episode_count` counts files in the folder.
-/// `CandidateShape::episode_count` counts the candidate's episodes across every
-/// season. Comparing them is comparing two different quantities, and it selects
-/// whichever candidate is *smallest* rather than whichever is right: a folder
-/// holding one season of a seven-season show is small, so it matches a small
-/// candidate. Measured over the warmed oracle, **267 of 284 wrong bindings from
-/// this tier, 94.0%, went to an entity with fewer episodes than the correct
-/// one** — `Archer`'s 140 episodes over 14 seasons losing to a 6-episode 1975
-/// series, `The Blacklist`'s 218 to an 8-episode spin-off.
-///
-/// Summing only the folder's own seasons cannot invert that way, for the same
-/// reason `slots_explained` cannot: a season the folder does not hold
-/// contributes nothing, so a long-running candidate is no longer penalised for
-/// being long.
-///
-/// **Falls back to the total when the total is a fair comparison.** With no
-/// per-season list there is nothing to restrict, and refusing outright would
-/// disable the discriminator on every candidate whose detail was not fetched with
-/// its seasons — including the cases it gets right, like a long-running show
-/// pinned over a short reboot. So the total is used when the candidate is *not
-/// broader than the folder*: every season it has, the folder asserts. Then the
-/// two numbers span the same seasons and cannot invert.
-///
-/// A candidate broader than the folder, with no per-season list to restrict,
-/// yields `None` — the comparison it would support is the one measured to be
-/// wrong 94% of the time. In production both fields come from the same `/tv/{id}`
-/// payload, so the restricted path is the one that runs.
-fn candidate_eps_in_folder_seasons(
-    shape: &CandidateShape,
-    folder_seasons: &[i32],
-) -> Option<u32> {
-    if folder_seasons.is_empty() {
-        return shape.episode_count;
-    }
-    if let Some(per) = shape.season_episode_counts.as_deref() {
-        return Some(
-            per.iter()
-                .filter(|(sn, _)| folder_seasons.contains(sn))
-                .map(|(_, n)| *n)
-                .sum(),
-        );
-    }
-    let broader = shape.season_numbers.as_deref().is_some_and(|have| {
-        have.iter()
-            .any(|sn| *sn > 0 && !folder_seasons.contains(sn))
-    });
-    if broader { None } else { shape.episode_count }
-}
-
 /// First discriminator that selects exactly one of `exact` wins.
 /// Order: episode count → season count → premiere year.
 ///
-/// **The counts abstain entirely when the folder is partial** — see
-/// [`folder_is_partial`]. Abstaining is not declining to answer: coverage, slots
-/// explained, the episode-title pin and the year all still run, and every one of
-/// them is more precise than these two. Over the warmed oracle,
-/// `exact_title_episode_count` is right 882 times and wrong 616, and
+/// **The counts abstain entirely when any candidate carries a per-season
+/// list.** An earlier version of this comment called that condition "the folder
+/// is partial" and pointed at a `folder_is_partial` that has never existed. Both
+/// halves were wrong. The gate reads the *candidates*, not the folder, so it
+/// fires on a complete folder exactly as readily; and because
+/// [`crate::tmdb::TmdbClient::tv_candidate_shape`] fills `season_numbers` and
+/// `season_episode_counts` from the one `seasons[]` array that every `/tv/{id}`
+/// payload carries, **in production the gate fires on the first line and nothing
+/// below it runs at all.** The whole ladder in this function is reachable from
+/// tests only.
+///
+/// Abstaining is still not declining to answer, because the evidence that
+/// matters sits outside this function. [`sole_season_coverer`] and
+/// [`primary_by_slots_explained`] run ahead of it, and the ADR-0032
+/// episode-title pin runs after it in
+/// [`crate::tmdb::TmdbClient::match_search_with_series_shape`]. Over the warmed
+/// oracle, `exact_title_episode_count` is right 882 times and wrong 616, and
 /// `exact_title_season_count` is right 358 and wrong 440 — worse than a coin
 /// flip — while `exact_title_season_coverage` and `exact_title_slots_explained`
 /// are 104 right and 0 wrong.
+///
+/// **The year is not among what still runs**, and the same comment used to say
+/// it was. `exact_title_library_year` is below the gate, so the gate removes it
+/// with the counts. It is unreachable a second way as well: `queue.rs` sets the
+/// TV search year to `g.year.or(g.library_year)` with `g.year` always `None` for
+/// an episode group, so the search year and `LibrarySeriesShape::year` are one
+/// value — and the branch that calls this function is entered only when the
+/// search year is `None`, which makes `library.year` `None` too.
 fn pin_collision<'a>(
     exact: &[&'a SearchHit],
     shapes: &[CandidateShape],
@@ -884,12 +848,13 @@ fn pin_collision<'a>(
     // forbid. The fix is not a sharper predicate, it is not overriding a
     // declination.
     //
-    // Without a per-season list nothing better has run, so the counts stay — that
-    // is the path 181 files against candidates of 181 and 12 takes.
-    if shapes
-        .iter()
-        .any(|sh| sh.season_episode_counts.is_some())
-    {
+    // The counts survive only where no candidate has a per-season list, and no
+    // `/tv/{id}` payload leaves one out — `tv_candidate_shape` reads both season
+    // fields from the same `seasons[]` array. So this line is where the count
+    // tier ends in production, and the case it was written to keep — 181 files
+    // against candidates of 181 and 12 — survives in the tests below and nowhere
+    // else.
+    if shapes.iter().any(|sh| sh.season_episode_counts.is_some()) {
         return None;
     }
 
@@ -909,10 +874,24 @@ fn pin_collision<'a>(
         hit.map(|h| (h, method))
     };
 
+    // The candidate's **total** episode count against the folder's file count.
+    // Two different quantities — the folder's files span only the seasons it
+    // holds, the candidate's episodes span every season it has — so the
+    // comparison prefers whichever candidate is *smallest*: 267 of 284 wrong
+    // bindings from this tier, 94.0%, went to an entity with fewer episodes than
+    // the correct one, `Archer`'s 140 over 14 seasons losing to a 6-episode 1975
+    // series (ADR-0047).
+    //
+    // Restricting the candidate's count to the folder's own seasons was written
+    // to fix that, and is gone again. It needed `season_episode_counts`, and the
+    // gate above returns before any shape can carry one, so it summed nothing
+    // and returned `shape.episode_count` unchanged on every call. What protects
+    // this comparison is the gate, not a narrower number.
     if let Some(le) = library.episode_count
         && let Some(p) = try_pin(
             &|i| {
-                candidate_eps_in_folder_seasons(&shapes[i], &library.folder_seasons)
+                shapes[i]
+                    .episode_count
                     .is_some_and(|ce| episode_count_close(le, ce))
             },
             "exact_title_episode_count",
@@ -923,26 +902,17 @@ fn pin_collision<'a>(
     // Equal *counts* of seasons is not evidence that they are the same seasons:
     // a folder asserting [1] and a spin-off holding [1] match on the count while
     // the seven-season parent does not, which is how this discriminator came to
-    // be right 358 times and wrong 440 — worse than a coin flip. Requiring the
-    // candidate to hold exactly the seasons the folder asserts is the like-for-
-    // like form of the same question.
-    if let Some(p) = try_pin(
-            &|i| match shapes[i].season_numbers.as_deref() {
-                // The candidate's seasons are known: require them to be exactly
-                // the folder's, not merely as many.
-                Some(have) => {
-                    let mut a: Vec<i32> = have.iter().copied().filter(|s| *s > 0).collect();
-                    let mut b = library.folder_seasons.clone();
-                    a.sort_unstable();
-                    b.sort_unstable();
-                    a == b
-                }
-                // Not fetched: fall back to the count, which is what this
-                // discriminator always compared. Unknown is not evidence either
-                // way, and refusing here would silence the cases it gets right.
-                None => library.season_count.is_some()
-                    && shapes[i].season_count == library.season_count,
-            },
+    // be right 358 times and wrong 440 — worse than a coin flip.
+    //
+    // Requiring the candidate to hold exactly the folder's seasons was the
+    // like-for-like form of the question, and it is gone for the same reason the
+    // restricted episode count is: it read `season_numbers`, which the gate
+    // above proves absent on every shape that gets here. Count equality is what
+    // is left, and again the gate, not the predicate, is what keeps it from
+    // deciding anything in production.
+    if let Some(ls) = library.season_count
+        && let Some(p) = try_pin(
+            &|i| shapes[i].season_count == Some(ls),
             "exact_title_season_count",
         )
     {
@@ -2397,13 +2367,30 @@ mod tests {
         assert_eq!(c.method, "exact_title_library_year");
     }
 
+    /// Nominal per-season episode count for the two shape helpers.
+    ///
+    /// They know a candidate's season *numbers*, not its season sizes, and
+    /// every test that turns on a size sets `season_episode_counts` itself.
+    /// This value exists so the two season fields can be filled together, which
+    /// is the only way `tv_candidate_shape` ever fills them.
+    const NOMINAL_SEASON_EPS: u32 = 10;
+
+    /// A candidate whose reference season was fetched.
+    ///
+    /// **Both season fields are filled together, deliberately.**
+    /// `tv_candidate_shape` reads `season_numbers` and `season_episode_counts`
+    /// from the one `seasons[]` array of the `/tv/{id}` payload, so for every
+    /// candidate production builds they are both present or both absent. A
+    /// helper that set the numbers and left the counts `None` described a
+    /// payload TMDB does not return, and the tests built on it were exercising
+    /// branches of `pin_collision` that no production call can reach.
     fn shape_eps(year: i32, seasons: &[i32], eps: &[(i32, &str)]) -> CandidateShape {
         CandidateShape {
             year: Some(year),
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
-            season_episode_counts: None,
+            season_episode_counts: Some(seasons.iter().map(|s| (*s, NOMINAL_SEASON_EPS)).collect()),
             reference_season_episodes: Some(eps.iter().map(|(n, t)| (*n, t.to_string())).collect()),
             candidate_season_episodes: None,
         }
@@ -2551,6 +2538,11 @@ mod tests {
     /// Two coverers decline. `star trek`, `doctor who` and `pride and prejudice`
     /// each have eight in the measured library, and pinning those would be
     /// worse than pinning none.
+    ///
+    /// The shapes carry per-season counts, as every `/tv/{id}` payload does, so
+    /// `pin_collision` abstains on its gate too. Coverage declines because two
+    /// candidates cover; the counts below the gate never get a turn. Neither
+    /// route to a pin is open, which is what the assertion checks.
     #[test]
     fn two_season_coverers_leave_the_collision_unpinned() {
         let hits = vec![tv(1, "Test Show", 1999), tv(2, "Test Show", 2015)];
@@ -2607,12 +2599,18 @@ mod tests {
         // does not re-attribute anything. What changed is that the count pin no
         // longer owns it either.
         //
-        // The folder holds 47 files across seasons [1, 2]. Candidate 1 holds 47
-        // episodes across seasons [1, 2, 3]. The old pin matched on `47 == 47`,
-        // but those 47 span three seasons against the folder's two, so the folder
-        // cannot be this candidate's seasons 1–2 and the equality is a
-        // coincidence between two different quantities. With no per-season list
-        // to restrict the count to seasons [1, 2], the comparison is refused.
+        // The route to that outcome is `pin_collision`'s gate. Both shapes carry
+        // a per-season list, as every `/tv/{id}` payload does, and *where better
+        // evidence was available and declined, worse evidence must not decide*:
+        // `slots_explained` had the list and said nothing, so the counts never
+        // get a turn.
+        //
+        // The count that would otherwise have fired is exactly the coincidence
+        // the gate exists to refuse. The folder holds 47 files across seasons
+        // [1, 2]; candidate 1 holds 47 episodes across seasons [1, 2, 3]. Those
+        // 47 span three seasons against the folder's two, so the folder cannot be
+        // this candidate's seasons 1–2 and `47 == 47` compares two different
+        // quantities.
         //
         // Measured over the warmed oracle before this change: that comparison
         // was wrong 616 times against 882 right, and 94% of its wrong bindings
@@ -2863,7 +2861,9 @@ mod tests {
             shape_eps(2004, &[1], &[(2, "Some Other Title")]),
         ];
         // A library year that matches neither, so no year pin fires and the
-        // collision branch is what picks — the 770's shape.
+        // collision branch is what picks — the 770's shape. `pin_collision`
+        // abstains on its gate, both shapes carrying a per-season list as every
+        // `/tv/{id}` payload does, and the branch falls through to `unpinned`.
         let c = score_search_with_shape(
             &hits,
             "Test Show",
@@ -2916,13 +2916,16 @@ mod tests {
         );
     }
 
+    /// A candidate with a season list and nothing fetched about its episode
+    /// names. Both season fields are filled together for the reason `shape_eps`
+    /// gives above.
     fn shape(year: i32, seasons: &[i32]) -> CandidateShape {
         CandidateShape {
             year: Some(year),
             episode_count: None,
             season_count: Some(seasons.len() as u32),
             season_numbers: Some(seasons.to_vec()),
-            season_episode_counts: None,
+            season_episode_counts: Some(seasons.iter().map(|s| (*s, NOMINAL_SEASON_EPS)).collect()),
             reference_season_episodes: None,
             candidate_season_episodes: None,
         }
