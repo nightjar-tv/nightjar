@@ -124,8 +124,10 @@ title match, and what evidence may then choose among the admitted candidates?**
 
 - **A. Leave it.** Keeps `The Continental`. Keeps 80 measured wrong bindings.
 - **B. Drop the prefix arm.** Removes ~80 wrong bindings and breaks every folder
-  whose provider name is legitimately longer. Cost unmeasured here because no
-  oracle shape generates it — that gap should be closed before choosing B.
+  whose provider name is legitimately longer. **Now measured** — see the
+  `tv.shortfolder` note below: it costs **58 correct rows**. So B trades roughly
+  58 correct for 80 wrong, which under the leave bar is defensible; it is still
+  dominated by C, which keeps the 58 *and* removes the 80.
 - **C. Admit the extension, but never let it *win* against an exact fold.**
   An extension becomes a candidate only when no exact fold survives. Cheap,
   keeps `The Continental`, and removes the 80 wherever an exact fold exists
@@ -171,8 +173,43 @@ bindings for unmatched files by design. That is the right direction: a wrong
 binding triggers fetches and corrupts watch state, an unmatched file is
 recoverable in the fix UI.
 
-**What this record does not settle.** The oracle is English names only, season 1
-mostly, one drain from an empty database, no NFOs, and no manual-match or rescan
-path. It cannot cost option B, because no shape generates a folder whose provider
-name is longer than the folder's — **that shape should be added before B is
-weighed**, the same way `tv.episodetitle` was added to cost M2.
+### `tv.shortfolder` — the shape that costs option B (added 2026-08-20)
+
+The gap this record named is closed. `tv.shortfolder` renders a folder under the
+head of a colon-named show — `Quiet on Set: The Dark Side of Kids TV` in a folder
+called `Quiet on Set` — in `tv.noyear`'s filename form with no year, so the
+title-extension rule is the only route to the right entity.
+
+**Ambiguity is tested against the provider, not the kept set.** The first cut
+checked the head against other oracle entities and passed 29 shows; **eleven of
+them are shows TMDB also lists under the bare head** — a folder called `Monarch`
+could honestly mean `Monarch`, `Spartacus` `Spartacus`. For those the oracle has
+no answer, and asserting one manufactures the bad-oracle rows that put six wrong
+answers through the parser sweep. Every exclusion is counted and printed:
+
+    two colon names share this head                  29
+    provider also lists a show under the bare head   11
+    head is another kept entity's full name           4
+    head shorter than 3 characters                    1
+    head's search not cached — unverifiable           1
+
+17 shows survive, 113 rows.
+
+**Measured, warm, `requests=0`:** 58 correct (51.3%), 54 absent, 1
+`wrong.unknownepisode`. Nine of the ten matched groups bound via `exact_title` —
+the extension admitted with no surviving competitor.
+
+So the admission rule **is** load-bearing, and it is worth **58 rows** here, not
+the near-total I assumed when this record was first drafted. That is the number to
+weigh option B against, and it makes C the dominant choice on evidence rather than
+on argument: with no exact fold competing, C keeps all 58.
+
+The shape is small and small in a way worth stating: 113 rows against the 80 wrong
+bindings the same rule produces. It can show the rule is load-bearing; it cannot
+show it is worth its cost.
+
+**What this record still does not settle.** The oracle is English names only,
+season 1 mostly, one drain from an empty database, no NFOs, and no manual-match or
+rescan path. `tv.shortfolder` covers only colon-named shows whose head is
+unambiguous — a provider name longer without a colon (`The Office US`) is not
+generated.
