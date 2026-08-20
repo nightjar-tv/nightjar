@@ -101,15 +101,25 @@ also removes a full `media_items` scan per root group.
 Oracle, same 2,410 entities and 79,382 rows, warmed cache, `requests=0`, noise
 floor **0 rows of 79,382** on both runs.
 
+**Measured twice, on two harnesses.** Mid-iteration the replay harness was found
+to derive the stored title with `parse_filename` alone rather than with the
+shipped `stored_title` (see note 00). Both arms were re-run on the corrected
+harness; the numbers below are the corrected ones, and the delta is identical on
+both — the same 26 rows, the same shape, the same direction.
+
 | verdict | base | iteration 2 | delta |
 |---|---:|---:|---:|
-| correct | 58,186 | **58,212** | **+26** |
-| absent | 20,593 | 20,593 | 0 |
+| correct | 63,830 | **63,856** | **+26** |
+| absent | 14,949 | 14,949 | 0 |
 | `wrong.kind` | 573 | 573 | 0 |
 | `wrong.entity` | 10 | **4** | **−6** |
 | `wrong.unknownepisode` | 8 | **0** | **−8** |
 | stalled | 12 | **0** | **−12** |
 | provider errors | 2 | **0** | −2 |
+
+**Every wrong binding outside `movie.*` and `tv.episodetitle` is now zero.** The
+4 remaining `wrong.entity` are one each in the four `movie.*` shapes; the 573
+`wrong.kind` are item 3.
 
 Row-level join over all 79,382 rows — because an identical summary can hide one
 shape losing what another gains:
@@ -134,7 +144,7 @@ why `provider errors` fell to zero.
 
 | instrument | base | after | reaches this change? |
 |---|---|---|---|
-| oracle | 58,186 correct / 10 wrong.entity / 8 wrong.unk / 12 stalled | **58,212 / 4 / 0 / 0** | **yes** |
+| oracle | 63,830 correct / 10 wrong.entity / 8 wrong.unk / 12 stalled | **63,856 / 4 / 0 / 0** | **yes** |
 | dogfood strict pair | `groups=3220 ready=24953 unmatched=51 errors=0 requests=0` | identical on every counter | yes, and reads flat — see below |
 | parser corpus | 71.0% (524/738) | **71.0% (524/738)** | links `nightjar-metadata`, but not the changed code |
 | parser sweep | 0 gains / 0 regressions at base | not re-run | **no** — `git diff origin/main -- server/crates/core` is empty |

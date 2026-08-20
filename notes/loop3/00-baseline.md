@@ -63,32 +63,55 @@ F5. It is drained, it is warm, and it stalls 12 rows of 5,644.
 | tv.handmade | 5,644 | 0 | 0 | 0 | 0 | 5,644 | 0 | 0.0% |
 | tv.numbered | 5,644 | 0 | 0 | 0 | 0 | 5,644 | 0 | 0.0% |
 
-### `tv.numbered` reads 0.0% here and read 99.9% at the last recorded run
+### `tv.numbered` read 0.0% here, and the cause was the harness
 
-Checked rather than assumed, because a shape falling from 99.9% to 0.0% between
-two `main` commits would be a live regression on `main` and would outrank
-everything in the brief.
+**Corrected after iteration 2. The first reading of this was wrong.**
 
-It is not. The same generated library, drained at `6221c59` — the commit before
-this base — gives `ready=0 unmatched=5604`, the identical answer:
+A shape falling from 99.9% to 0.0% between two `main` commits would be a live
+regression on `main`, so it was checked rather than assumed. The same generated
+library drained at `6221c59` — the commit before this base — gives the identical
+`ready=0 unmatched=5604`, so **the product did not move.** That much held.
 
-    tv.numbered-b0   DONE groups=693 ready=0 unmatched=5604 errors=0 requests=0
-    tv.numbered-b1   DONE groups=5   ready=0 unmatched=40   errors=0 requests=0
+The explanation offered here first — that `gen_library.py` was edited and the
+shape changed under the number — was wrong. The cause is the **replay harness**.
 
-So the product did not move. `gen_library.py` was edited at 16:47 and `out/lib`
-regenerated at 18:14 on 2026-08-20, both after the last scored `main` run at
-14:51, and `tv.numbered` now renders `Dept. Q (2025)/Season 01/S01E01.mkv` —
-a basename carrying no title at all. **The shape changed under the number.**
+`tv.numbered` renders `Dept. Q (2025)/Season 01/S01E01.mkv`: a basename carrying
+no title at all. The product's rule for that is `nightjar_scanner::stored_title`,
+which substitutes the show folder's name for an empty parse, and **both scanner
+indexing paths call it**. Its own doc comment says the replay harness needs the
+same answer, and names the consequence of it not having it: "a titleless episode
+came out with an empty title, an empty title is not a query, and 5,644 generated
+rows scored `absent` for a reason that was the harness rather than the product."
 
-Consequence for this loop: `tv.numbered`'s 5,644 rows are not a rate. They are
-still usable differentially — both revisions give the same answer, so a move
-there would still be a move — but its absolute 0.0% says nothing about the
-matcher, and it is a large part of why `absent` here is 20,593 rather than the
-9,944 handed over.
+5,644 is `tv.numbered`. The harness patch this loop inherited re-derives the
+title with `parse_filename` alone. It is the defect the product already fixed,
+still sitting in the instrument.
 
-**Every `wrong` row outside `movie.*` and `tv.episodetitle` is in
-`tv.mixedroot`** — 6 `wrong.entity` and 8 `wrong.unknownepisode`. That is the
-population item 2 is about.
+Corrected: `replay.rs` now calls the shipped `stored_title`. `tv.numbered` goes
+to **5,644 of 5,644, 100.0%**, and **no other shape moves at all**. The patch
+lives at `~/nightjar-wt-loop3-scratch/oracle-harness.patch`; it is deliberately
+not committed to the product tree.
+
+This is why the baseline table above is superseded. The corrected one:
+
+| verdict | first reading | corrected harness |
+|---|---:|---:|
+| correct | 58,186 | **63,830** |
+| absent | 20,593 | **14,949** |
+| `wrong.kind` | 573 | 573 |
+| `wrong.entity` | 10 | 10 |
+| `wrong.unknownepisode` | 8 | 8 |
+| stalled | 12 | 12 |
+| **total** | **79,382** | **79,382** |
+
+Only `tv.numbered` differs — 0 correct / 5,644 absent becomes 5,644 correct /
+0 absent. **Every measurement in this loop's later notes uses the corrected
+harness**, and iteration 2 was re-run on both arms against it. Its delta is
+unchanged: the same 26 rows move, in the same shape, in the same direction.
+
+**The lesson is the one already on the wall.** A zero from an instrument that
+derives a field differently from production is not a result, and this is the
+second time the same field has done it here.
 
 ## The parser sweep
 

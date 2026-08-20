@@ -72,6 +72,11 @@ no caller in the crate reads `suggested`. The flag is a rank.
 | instrument | before | after | can it see this change? |
 |---|---|---|---|
 | oracle, 79,382 rows | 58,186 correct / 573 `wrong.kind` / 10 `wrong.entity` / 8 `wrong.unk` / 20,593 absent / 12 stalled | **byte-identical per-shape table; 0 rows moved** | **no** — drain-only |
+
+Those oracle figures are the **uncorrected** harness's, which is what both arms
+ran on at the time; the comparison is sound because the harness was held
+constant. On the corrected harness (note 00) the same base reads 63,830 correct
+and 14,949 absent. This change moves no row on either.
 | oracle, row-level join | — | `rows joined 79382, verdict changed 0, same verdict different entity 0` | |
 | dogfood strict pair | `groups=3220 ready=24953 unmatched=51 errors=0 requests=0` | identical on every counter | **no** — drain-only |
 | parser corpus | 71.0% (524/738) | not re-run | **no** — `nightjar-core` untouched |
