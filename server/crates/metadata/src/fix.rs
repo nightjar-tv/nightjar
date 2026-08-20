@@ -13,7 +13,7 @@ use crate::item_links::{
     clear_all_links_for_media_item, effective_item_key, link_keys_for_item, path_item_key,
     set_manually_matched, upsert_link,
 };
-use crate::match_score::SearchKind;
+use crate::match_score::{SearchHit, SearchKind, score_search};
 use crate::migrator::{self, MigrateReport};
 use crate::model::item_key_for_metadata;
 use crate::negative_cache::{self, CacheKind, PROVIDER_TMDB, query_key};
@@ -42,6 +42,11 @@ pub struct FixCandidate {
     pub id: i64,
     pub title: String,
     pub year: Option<i32>,
+    /// ADR-0048 B: the candidate the shipped scorer chose, below the
+    /// auto-match floor. **A suggestion the caller confirms, never a binding**
+    /// — nothing in this crate assigns on it, and `assign` still requires the
+    /// id the user picked.
+    pub suggested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +92,39 @@ fn load_item(conn: &Connection, id: i64) -> Result<FixItemView, String> {
     .ok_or_else(|| format!("item {id} not found"))
 }
 
+/// The candidate the shipped scorer chose for these hits (ADR-0048 B).
+///
+/// **The scorer, not a second rule.** For a movie the drain reaches
+/// [`score_search`] with the same cleaned title and year and no candidate
+/// shapes, so what comes back here is the entity that scored below the floor —
+/// not a new opinion about which entity that should have been. Reimplementing
+/// the choice is the trap `norm_key` already fell into once.
+///
+/// **Movies only.** ADR-0048's 88.9% was measured over `movie.noyear`'s failing
+/// population, where a yearless collision has no discriminator left: a movie has
+/// no seasons, so season coverage, slots explained and per-season counts all
+/// have no analogue. A TV suggestion computed here would be scored *without* the
+/// season shape the drain has — no `folder_seasons`, no candidate detail counts,
+/// no reference episode title — and so would be a different and unmeasured
+/// signal wearing the same badge.
+fn suggested_candidate(
+    hits: &[SearchHit],
+    title: &str,
+    year: Option<i32>,
+    kind: SearchKind,
+) -> Option<i64> {
+    match kind {
+        SearchKind::Movie => score_search(hits, title, year, kind).map(|c| c.tmdb_id),
+        SearchKind::Tv => None,
+    }
+}
+
 /// Search TMDB for assign candidates (floor does not apply).
+///
+/// One candidate may come back `suggested` (ADR-0048 B): the entity the shipped
+/// scorer picked and the floor then declined. It changes nothing about what this
+/// function returns or what `assign` will accept — it is a rank, and the user
+/// still chooses.
 ///
 /// `_year` is still accepted so the endpoint's query contract is unchanged
 /// (Rule 2.3), and it is no longer used: search stopped narrowing on year at
@@ -100,21 +137,23 @@ pub fn search_candidates(
     q: Option<&str>,
     _year: Option<i32>,
 ) -> Result<Vec<FixCandidate>, String> {
-    let title = q
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if item.kind == "episode" {
-                clean_show_title(&item.title).0
-            } else {
-                clean_movie_title(&item.title, year_from_path(&item.path).or(item.year)).0
-            }
-        });
     let search_kind = if item.kind == "episode" {
         SearchKind::Tv
     } else {
         SearchKind::Movie
+    };
+    // The year the *scorer* gets, which is the year that came out of the same
+    // clean as the title. A caller-supplied `q` carries no year we can trust to
+    // stand for the file, so the suggestion is scored yearless there — which is
+    // the yearless case ADR-0048 is about anyway.
+    //
+    // Note the drain reads `it.year.or(folder_year)` and this route reads
+    // `year_from_path(..).or(item.year)`. The two precedences disagree; that
+    // predates this change and is left alone rather than moved underneath it.
+    let (title, year) = match q.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(given) => (given.to_string(), None),
+        None if item.kind == "episode" => (clean_show_title(&item.title).0, None),
+        None => clean_movie_title(&item.title, year_from_path(&item.path).or(item.year)),
     };
     // **An absent title is not a query.** `parse_filename` returns an empty
     // title when the filename carries none (`S03E09 WS PDTV XviD FUtV`), and
@@ -133,8 +172,24 @@ pub fn search_candidates(
     let hits = client
         .search(search_kind, &title)
         .map_err(|e| e.to_string())?;
-    Ok(hits
-        .into_iter()
+    Ok(candidates_from_hits(hits, &title, year, search_kind))
+}
+
+/// The search response, as the fix flow sees it.
+///
+/// Split from [`search_candidates`] so the suggestion can be tested through the
+/// list it lands on rather than only where it is computed: `search_candidates`
+/// takes a concrete [`TmdbClient`], so nothing can call it without a provider,
+/// and a flag that is right in one function and dropped in the next is exactly
+/// the kind of gap this codebase keeps finding.
+fn candidates_from_hits(
+    hits: Vec<SearchHit>,
+    query: &str,
+    year: Option<i32>,
+    search_kind: SearchKind,
+) -> Vec<FixCandidate> {
+    let suggested = suggested_candidate(&hits, query, year, search_kind);
+    hits.into_iter()
         .map(|h| {
             let (title, year) = match search_kind {
                 SearchKind::Movie => (
@@ -156,12 +211,13 @@ pub fn search_candidates(
                     SearchKind::Movie => "movie".into(),
                     SearchKind::Tv => "tv".into(),
                 },
+                suggested: suggested == Some(h.id),
                 id: h.id,
                 title,
                 year,
             }
         })
-        .collect())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -339,6 +395,98 @@ mod tests {
 
     struct CountingMiss {
         calls: Cell<usize>,
+    }
+
+    fn movie_hit(id: i64, title: &str, year: i32) -> SearchHit {
+        SearchHit {
+            id,
+            title: Some(title.into()),
+            name: None,
+            original_title: None,
+            original_name: None,
+            release_date: Some(format!("{year}-01-01")),
+            first_air_date: None,
+            poster_path: None,
+            backdrop_path: None,
+            overview: None,
+            vote_average: None,
+            vote_count: None,
+        }
+    }
+
+    /// **The suggestion is the scorer's pick, and it is below the floor.**
+    ///
+    /// `CODA` is the shape ADR-0048 measured: several real distinct films
+    /// sharing a title, no year anywhere in the path to separate them. The
+    /// matcher scores this `exact_title_collision_unpinned` at 0.72 and the
+    /// 0.90 floor declines it, which is why the file is in the fix flow at all.
+    /// What is asserted here is only that the id offered is the same id that
+    /// scored — not that it is the right film, which is what the user confirms.
+    #[test]
+    fn a_yearless_movie_collision_suggests_the_candidate_the_scorer_chose() {
+        let hits = vec![
+            movie_hit(776503, "CODA", 2021),
+            movie_hit(431478, "CODA", 2019),
+            movie_hit(1129593, "CODA", 2015),
+        ];
+        let scored = score_search(&hits, "CODA", None, SearchKind::Movie).unwrap();
+        assert!(
+            !crate::match_score::meets_auto_match_floor(scored.confidence),
+            "the population this serves is the one the floor declined; if this              clears the floor the fixture is no longer that population"
+        );
+        assert_eq!(
+            suggested_candidate(&hits, "CODA", None, SearchKind::Movie),
+            Some(scored.tmdb_id),
+            "the suggestion must be the shipped scorer's own pick, not a second rule"
+        );
+
+        // Through the list the route actually returns, so the flag is checked
+        // where a caller reads it and not only where it is decided.
+        let out = candidates_from_hits(hits, "CODA", None, SearchKind::Movie);
+        assert_eq!(out.len(), 3, "every hit is still offered");
+        let flagged: Vec<i64> = out.iter().filter(|c| c.suggested).map(|c| c.id).collect();
+        assert_eq!(
+            flagged,
+            vec![scored.tmdb_id],
+            "exactly one candidate carries the suggestion, and it is the scored one"
+        );
+    }
+
+    /// A TV search gets no suggestion, and the reason is evidence rather than
+    /// taste: this route has no `folder_seasons`, no candidate detail counts and
+    /// no reference episode title, so scoring here would answer a different
+    /// question from the one the drain answers. ADR-0048's 88.9% is a movie
+    /// number and does not carry.
+    #[test]
+    fn a_tv_search_carries_no_suggestion() {
+        let hits = vec![SearchHit {
+            id: 1,
+            title: None,
+            name: Some("Ghosts".into()),
+            original_title: None,
+            original_name: None,
+            release_date: None,
+            first_air_date: Some("2021-10-07".into()),
+            poster_path: None,
+            backdrop_path: None,
+            overview: None,
+            vote_average: None,
+            vote_count: None,
+        }];
+        assert!(
+            score_search(&hits, "Ghosts", None, SearchKind::Tv).is_some(),
+            "the scorer does answer for TV — the abstention below is this              route's decision, not an empty result"
+        );
+        assert_eq!(
+            suggested_candidate(&hits, "Ghosts", None, SearchKind::Tv),
+            None
+        );
+        let out = candidates_from_hits(hits, "Ghosts", None, SearchKind::Tv);
+        assert_eq!(out.len(), 1, "the candidate is still offered");
+        assert!(
+            !out.iter().any(|c| c.suggested),
+            "no TV candidate is marked, so a client cannot lead with one"
+        );
     }
 
     impl MetadataSource for CountingMiss {

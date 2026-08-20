@@ -922,6 +922,8 @@ export interface components {
             id: number;
             title: string;
             year?: number | null;
+            /** @description ADR-0048 B. At most one candidate in a response carries true: the entity the matcher's own scorer chose and the auto-match floor then declined. A rank for the client to lead with, never a binding — assign still takes the id the user picked. Movies only; a TV response has no suggestion, because the evidence the drain scores a show on is not available on this route. */
+            suggested: boolean;
         };
         MetadataCandidatesResponse: {
             candidates: components["schemas"]["MetadataCandidate"][];
