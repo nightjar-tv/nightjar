@@ -35,9 +35,27 @@ print(len(rows))
 PY
 )
 echo "population: $ents entities, $files generated rows"
-if [ "$files" != "67982" ] || [ "$ents" != "2410" ]; then
-  echo "ABORT: the population is not the 2,410 entities / 67,982 rows every"
-  echo "       earlier measurement used. Something re-ran pick_entities.py."
+# **The entity count is the invariant; the row count is not.** Adding a *shape*
+# adds rows and leaves the entity set alone, so every earlier comparison still
+# joins — that is why `tv.episodetitle` was added as a new shape rather than by
+# widening an existing one. Adding *entities* is the thing that breaks joins, and
+# it is what re-running `pick_entities.py` against a warmed cache would do: an
+# entity is kept only when the cache can serve it offline, and a warmed cache
+# serves more.
+#
+# So: entities are pinned hard at 2,410, and the row count must match what is
+# expected for the shape set in play — 67,982 for the original 17, 73,626 with
+# `tv.episodetitle`. Pass EXPECT_ROWS to change it deliberately.
+EXPECT_ROWS=${EXPECT_ROWS:-73626}
+if [ "$ents" != "2410" ]; then
+  echo "ABORT: $ents entities, not the 2,410 every earlier measurement used."
+  echo "       Something re-ran pick_entities.py — probably ./run.sh all against"
+  echo "       a warmed cache. Earlier comparisons will not join."
+  exit 1
+fi
+if [ "$files" != "$EXPECT_ROWS" ]; then
+  echo "ABORT: $files generated rows, expected $EXPECT_ROWS."
+  echo "       If a shape was added on purpose, pass EXPECT_ROWS=$files."
   exit 1
 fi
 

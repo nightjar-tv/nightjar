@@ -89,6 +89,7 @@ prev=$start
 for round in $(seq 1 "$ROUNDS"); do
   echo "=== round $round ==="
   rq=0
+  failed=0
   for cap in "$SPIKE"/out/lib/*/*/; do
     shape=$(basename "$(dirname "$cap")")
     batch=$(basename "$cap")
@@ -108,8 +109,9 @@ for round in $(seq 1 "$ROUNDS"); do
     NIGHTJAR_TMDB_CACHE="$CACHE" \
     NIGHTJAR_REPARSE=1 \
       "$WT/server/target/release/replay" > "$d/run.out" 2> "$d/run.err" || {
-        echo "  !! $shape-$batch replay failed; see $d/run.err" >&2
-        tail -3 "$d/run.err" >&2; }
+        echo "  !! $shape-$batch replay FAILED; see $d/run.err" >&2
+        tail -3 "$d/run.err" >&2
+        failed=$((failed + 1)); }
     n=$(grep -oE 'requests=[0-9]+' "$d/run.out" 2>/dev/null | tail -1 | cut -d= -f2 || true)
     n=${n:-0}
     rq=$((rq + n))
@@ -137,9 +139,21 @@ for round in $(seq 1 "$ROUNDS"); do
     exit 1
   fi
   prev=$now
+  # **A batch that never ran makes no request.** So does a batch with nothing
+  # left to fetch, and the round total cannot tell them apart. This reported
+  # "converged" once while `tv.episodetitle-b0` panicked on a UNIQUE constraint
+  # in every round — 5,604 rows never drained, and the summary said the warm was
+  # complete. Convergence is only meaningful over batches that actually ran.
+  if [ "$failed" -gt 0 ]; then
+    echo
+    echo "ABORT: $failed batch(es) failed this round. Their rows were never"
+    echo "       drained, so a zero request count says nothing about them."
+    echo "       Fix the failure before trusting any total."
+    exit 1
+  fi
   if [ "$rq" -eq 0 ]; then
     echo
-    echo "converged: a whole round made no request."
+    echo "converged: a whole round made no request, and every batch ran."
     break
   fi
 done
