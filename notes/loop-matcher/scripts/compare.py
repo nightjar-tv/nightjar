@@ -25,9 +25,9 @@ import collections, json, sys
 # id -> (season, episode) from cached season payloads and that season is not
 # cached. A correct bind into an uncached season looks identical. It is counted
 # apart from `wrong.entity` for exactly that reason.
-VERDICTS = ["correct", "wrong.entity", "wrong.episode", "wrong.unknownepisode",
-            "partial", "absent", "stalled"]
-WRONG = ("wrong.entity", "wrong.episode")   # unknownepisode excluded: unproven
+VERDICTS = ["correct", "wrong.kind", "wrong.entity", "wrong.episode",
+            "wrong.unknownepisode", "partial", "absent", "stalled"]
+WRONG = ("wrong.kind", "wrong.entity", "wrong.episode")  # unknownepisode excluded: unproven
 
 
 # **The row key must include the batch.** `(shape, path)` is not unique: two

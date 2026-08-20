@@ -325,6 +325,9 @@ impl TmdbClient {
             ));
         }
         let nk = norm_key(title);
+        // Deliberately the *unnarrowed* title-hit set: ADR-0047's exact-fold
+        // precedence runs inside `find_best`, after the empty-shell exclusion,
+        // and it needs the extensions still present to choose between them.
         let exact: Vec<&SearchHit> = results
             .iter()
             .filter(|r| crate::match_score::title_hit(r, &nk, kind))

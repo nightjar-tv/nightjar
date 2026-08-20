@@ -637,6 +637,74 @@ pub fn title_hit(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
         || original.is_some_and(|t| name_matches_query(t, query_norm, kind))
 }
 
+/// Does the candidate's name fold *equal* to the query, ignoring the extension
+/// arms of [`name_matches_query`]?
+pub fn title_hit_exact(hit: &SearchHit, query_norm: &str, kind: SearchKind) -> bool {
+    let (primary, original) = match kind {
+        SearchKind::Movie => (hit.title.as_deref(), hit.original_title.as_deref()),
+        SearchKind::Tv => (hit.name.as_deref(), hit.original_name.as_deref()),
+    };
+    primary.is_some_and(|t| norm_key(t) == query_norm)
+        || original.is_some_and(|t| norm_key(t) == query_norm)
+}
+
+/// Drop title *extensions* when an exact fold survives (ADR-0047 option C).
+///
+/// [`name_matches_query`] admits a TV candidate whose name is the query plus a
+/// tail, so a folder called `The Continental` reaches
+/// `The Continental: From the World of John Wick`. That arm is load-bearing: the
+/// oracle's `tv.shortfolder` shape scores 58 of 113 rows through it and nothing
+/// else. But a franchise spin-off has the identical shape and the predicate
+/// cannot tell one from the other — measured over the collision tier's wrong
+/// bindings, **80 of 134 pairs were extensions admitted alongside an exact
+/// fold**: `Cross` against `Cross My Mind`, `Gilmore Girls` against
+/// `Gilmore Girls: A Year in the Life`. In every one the correct answer was the
+/// exact fold, and the extension won on a count tie-break.
+///
+/// A precedence rule rather than a length threshold, deliberately. 69% of those
+/// admissions had a one-word query, so a "query must be ≥2 words" gate would
+/// catch most — and it would be a number to tune rather than a statement about
+/// which evidence outranks which.
+///
+/// **Applied after the empty-shell exclusion, not before.** An exact fold that is
+/// an empty TMDB shell is not a candidate at all (ADR-0026 amended), and letting
+/// it suppress a viable extension is how the first cut of this broke
+/// `short_query_matches_long_official_title_over_empty_shell`: query `Charlie`,
+/// an exact-fold shell with zero episodes, and a real
+/// `Charlie: Extended Official Title` that the shell shadowed into nothing. A
+/// filter that narrows to an empty set has not expressed a preference, it has
+/// discarded the answer.
+fn prefer_exact_over_extension<'a>(
+    hits: &mut Vec<&'a SearchHit>,
+    shapes: &mut Vec<CandidateShape>,
+    query_norm: &str,
+    kind: SearchKind,
+) {
+    debug_assert_eq!(hits.len(), shapes.len());
+    if !hits
+        .iter()
+        .any(|h| title_hit_exact(h, query_norm, kind))
+    {
+        return;
+    }
+    let keep: Vec<bool> = hits
+        .iter()
+        .map(|h| title_hit_exact(h, query_norm, kind))
+        .collect();
+    let mut i = 0;
+    hits.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+    let mut i = 0;
+    shapes.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+}
+
 /// Exact fold match, or (TV only) candidate is query plus a longer official name
 /// ("The Continental" → "The Continental: From the World of John Wick").
 fn name_matches_query(name: &str, query_norm: &str, kind: SearchKind) -> bool {
@@ -1159,6 +1227,17 @@ pub fn score_search_with_shape_and_sole(
         }
         _ => (exact_all, candidate_shapes.map(|s| s.to_vec())),
     };
+    // ADR-0047: now that empty shells are gone, an extension only competes when
+    // no exact fold is left standing. Runs here and not on the raw title-hits so
+    // a shell cannot shadow a viable extension into nothing.
+    let (exact, shapes) = match shapes {
+        Some(mut sh) if sh.len() == exact.len() => {
+            let mut hits = exact;
+            prefer_exact_over_extension(&mut hits, &mut sh, &nk, kind);
+            (hits, Some(sh))
+        }
+        other => (exact, other),
+    };
     let shapes = shapes.as_deref();
     if exact.is_empty() && had_title_hits {
         // Every title-hit was an empty shell: none is a candidate. Do not
@@ -1649,6 +1728,50 @@ mod tests {
 
     /// Cleaned folder title is a short prefix of the official TMDB name;
     /// empty shell (0 seasons/eps) must not win.
+    /// ADR-0047: an extension only competes when no exact fold is left.
+    ///
+    /// `Gilmore Girls` against `Gilmore Girls: A Year in the Life`, both viable,
+    /// and the extension is the shorter one — which is exactly what the count
+    /// tie-breaks used to pick. The exact fold must win before any tie-break is
+    /// consulted.
+    #[test]
+    fn an_exact_fold_beats_a_title_extension() {
+        let parent = tv(1, "Gilmore Girls", 153);
+        let mut spinoff = tv(2, "Gilmore Girls: A Year in the Life", 4);
+        spinoff.first_air_date = Some("2016-11-25".into());
+        let results = vec![parent, spinoff];
+        let shapes = [
+            CandidateShape {
+                year: Some(2000),
+                episode_count: Some(153),
+                season_count: Some(7),
+                ..Default::default()
+            },
+            CandidateShape {
+                year: Some(2016),
+                episode_count: Some(4),
+                season_count: Some(1),
+                ..Default::default()
+            },
+        ];
+        // A folder holding one partial season: 10 files, one season. Under the
+        // old order `episode_count` picked the 4-episode spin-off uniquely.
+        let m = score_search_with_shape(
+            &results,
+            "Gilmore Girls",
+            None,
+            SearchKind::Tv,
+            LibrarySeriesShape {
+                episode_count: Some(10),
+                season_count: Some(1),
+                ..Default::default()
+            },
+            Some(&shapes),
+        )
+        .expect("a candidate");
+        assert_eq!(m.tmdb_id, 1, "bound {:?} via {}", m.tmdb_id, m.method);
+    }
+
     #[test]
     fn short_query_matches_long_official_title_over_empty_shell() {
         let mut shell = tv(1, "Charlie", 0);
