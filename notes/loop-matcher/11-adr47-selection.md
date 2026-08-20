@@ -69,3 +69,127 @@ that says so is total wrong.
 
 If the 42 do not come back, my model of this half is wrong and the ordering was
 not the mechanism.
+
+---
+
+## The change, as it ended up
+
+**F — coverage before magnitudes.** `sole_season_coverer` and
+`primary_by_slots_explained` moved ahead of `pin_collision`.
+
+**H — the count restricted to the folder's own seasons**, via
+`candidate_eps_in_folder_seasons`. Not the abstention I first wrote. **The first
+version abstained whenever any candidate had a season the folder did not assert,
+and it broke five shipped tests** — including
+`long_run_episode_count_pins_over_short_reboot`, which is the discriminator doing
+real work in exactly the direction I was removing. Those tests set
+`episode_count` and no per-season list, so my version returned `None` and
+silenced the discriminator entirely.
+
+Corrected: use the per-season list when present; **fall back to the total only
+when the candidate is not broader than the folder**, so the two numbers span the
+same seasons; yield nothing when it is broader and there is no list to restrict.
+In production both fields come from the same `/tv/{id}` payload, so the restricted
+path is the one that runs.
+
+And `season_count` now requires the candidate to hold **exactly the folder's
+seasons**, not merely as many — with the same count fallback when the season list
+was not fetched.
+
+## One shipped test's assertion is reversed, and here is what changed
+
+`coverage_does_not_reattribute_a_count_pin` asserted *"the count pin still owns
+it"*. The test's **name still holds** — coverage declines there, both candidates
+hold seasons 1 and 2, so nothing is re-attributed. What changed is that the count
+pin no longer owns it either.
+
+The folder holds 47 files across seasons `[1,2]`; the candidate holds 47 episodes
+across `[1,2,3]`. The old pin matched `47 == 47`, but those 47 span three seasons
+against the folder's two, so the folder cannot be that candidate's seasons 1–2 and
+the equality is a coincidence between different quantities. With no per-season list
+to restrict to `[1,2]`, the comparison is refused and the folder goes unpinned at
+0.72 — below the floor, so unmatched. Absent is recoverable; wrong is not.
+
+The assertion was updated with that reasoning inline, not deleted. 743 workspace
+tests pass, 0 fail.
+
+## Measured — half two alone
+
+14 further requests, then strict: `provider errors 0`, `stalled 0`, noise floor 0.
+
+| shape | after half one | after half two |
+|---|---:|---:|
+| **tv.noyear** | 81.2% | **87.4%** |
+| **tv.root** | 81.2% | **87.4%** |
+| tv.scene | 78.3% | **79.2%** |
+| **tv.shortfolder** | 51.3% | **65.5%** |
+| all others | — | unchanged |
+
+correct **+765**, `wrong.unknownepisode` 1,037 → **698** (−339), absent −426,
+overall **79.1% → 80.1%**.
+
+## Whole of ADR-0047, both halves
+
+| verdict | before | after | delta |
+|---|---:|---:|---:|
+| correct | 55,435 | 59,101 | **+3,666** |
+| wrong.entity | 100 | 64 | −36 |
+| wrong.unknownepisode | 1,738 | 698 | **−1,040** |
+| wrong.kind | 573 | 573 | 0 |
+| absent | 15,892 | 13,302 | −2,590 |
+| **correct%** | **75.2%** | **80.1%** | **+4.97 pt** |
+
+**Total wrong 2,411 → 1,335, down 1,076 — a 45% reduction.**
+
+- **Sweep** 74,624 names, 0/0 — `nightjar-core` byte-identical.
+- **Corpus** 71.0% (524/738), unchanged.
+- **Dogfood pair** control `ac392035`, treatment `b878fc93`, distinct binaries,
+  identical on every counter, cache 8,185 before and after.
+
+## Where the prediction missed
+
+**I predicted the 42 rows half one lost would come back, "most or all". 22 of 42
+came back — 52%.** That is a miss, not a hit, and the reason is a real limit:
+
+    Red Dwarf       recovered via exact_title_slots_explained
+    Criminal Minds  recovered via exact_title_season_coverage
+    The Firm        still binds 236692 via exact_title_episode_count
+
+Coverage separated two of the three exactly as argued. **The Firm did not, and it
+shows what restricting to the folder's seasons does not fix.** The folder holds 10
+files of season 1; the correct entity's season 1 has 22 episodes and the wrong
+one's has about 10. `episode_count_close(10, 22)` is false, `close(10, 10)` is
+true, so exactly one matches and it is the wrong one.
+
+**Restricting the count to the folder's seasons fixes *cross-season* inversion. It
+does not fix *within-season* partiality.** Every oracle row is within-season
+partial — 10 episodes of a season — and most recovered only because coverage fired
+first. Where coverage cannot separate, the count still inverts. The fix for that is
+containment rather than proximity — *can this candidate's season 1 hold 10 files* —
+which is what `slots_explained` already asks, and putting it ahead of the counts
+gets most of the benefit without touching `episode_count_close`.
+
+**Two other predictions missed, both favourably:**
+
+- I predicted correct from the count methods would *fall*. It rose: correct +765
+  overall. The trade was better than argued.
+- I predicted `tv.shortfolder` would hold at 58. It went to **74**. Coverage now
+  runs before the counts for those folders too, and decides correctly where a
+  count had mispinned. An unpredicted gain in the shape that exists to catch
+  unpredicted losses.
+
+## What half two cost
+
+**36 rows that were correct after half one are not: 24 → absent, 12 →
+wrong.unknownepisode.** Three entities: Countdown (20), Laid (8), Bodies (8).
+These are folders the loose count pinned correctly and the tightened one no longer
+pins. Named, not netted — the whole-ADR figure above already includes them.
+
+Against that: 1,125 rows moved from `wrong.unknownepisode` to `correct`.
+
+## Verdict — KEEP
+
+Oracle up 4.97 points across both halves with **total wrong down 45%**; the other
+three instruments clean or provably insensitive; 743 tests pass with one added and
+one assertion deliberately reversed and documented; noise floor 0. The residual is
+characterised and points at a specific next change.

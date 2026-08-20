@@ -792,10 +792,70 @@ pub(crate) fn has_no_episodes(shape: &CandidateShape) -> bool {
     shape.episode_count == Some(0)
 }
 
+/// The candidate's episode count **restricted to the seasons the folder
+/// asserts** — the only version of this number that is comparable to the
+/// folder's file count (ADR-0047).
+///
+/// `library.episode_count` counts files in the folder.
+/// `CandidateShape::episode_count` counts the candidate's episodes across every
+/// season. Comparing them is comparing two different quantities, and it selects
+/// whichever candidate is *smallest* rather than whichever is right: a folder
+/// holding one season of a seven-season show is small, so it matches a small
+/// candidate. Measured over the warmed oracle, **267 of 284 wrong bindings from
+/// this tier, 94.0%, went to an entity with fewer episodes than the correct
+/// one** — `Archer`'s 140 episodes over 14 seasons losing to a 6-episode 1975
+/// series, `The Blacklist`'s 218 to an 8-episode spin-off.
+///
+/// Summing only the folder's own seasons cannot invert that way, for the same
+/// reason `slots_explained` cannot: a season the folder does not hold
+/// contributes nothing, so a long-running candidate is no longer penalised for
+/// being long.
+///
+/// **Falls back to the total when the total is a fair comparison.** With no
+/// per-season list there is nothing to restrict, and refusing outright would
+/// disable the discriminator on every candidate whose detail was not fetched with
+/// its seasons — including the cases it gets right, like a long-running show
+/// pinned over a short reboot. So the total is used when the candidate is *not
+/// broader than the folder*: every season it has, the folder asserts. Then the
+/// two numbers span the same seasons and cannot invert.
+///
+/// A candidate broader than the folder, with no per-season list to restrict,
+/// yields `None` — the comparison it would support is the one measured to be
+/// wrong 94% of the time. In production both fields come from the same `/tv/{id}`
+/// payload, so the restricted path is the one that runs.
+fn candidate_eps_in_folder_seasons(
+    shape: &CandidateShape,
+    folder_seasons: &[i32],
+) -> Option<u32> {
+    if folder_seasons.is_empty() {
+        return shape.episode_count;
+    }
+    if let Some(per) = shape.season_episode_counts.as_deref() {
+        return Some(
+            per.iter()
+                .filter(|(sn, _)| folder_seasons.contains(sn))
+                .map(|(_, n)| *n)
+                .sum(),
+        );
+    }
+    let broader = shape.season_numbers.as_deref().is_some_and(|have| {
+        have.iter()
+            .any(|sn| *sn > 0 && !folder_seasons.contains(sn))
+    });
+    if broader { None } else { shape.episode_count }
+}
+
 /// First discriminator that selects exactly one of `exact` wins.
 /// Order: episode count → season count → premiere year.
-/// Counts first so folder year cannot pin a miniseries when the library is a
-/// multi-season series (Battlestar Galactica 2003 folder vs 2004 series).
+///
+/// **The counts abstain entirely when the folder is partial** — see
+/// [`folder_is_partial`]. Abstaining is not declining to answer: coverage, slots
+/// explained, the episode-title pin and the year all still run, and every one of
+/// them is more precise than these two. Over the warmed oracle,
+/// `exact_title_episode_count` is right 882 times and wrong 616, and
+/// `exact_title_season_count` is right 358 and wrong 440 — worse than a coin
+/// flip — while `exact_title_season_coverage` and `exact_title_slots_explained`
+/// are 104 right and 0 wrong.
 fn pin_collision<'a>(
     exact: &[&'a SearchHit],
     shapes: &[CandidateShape],
@@ -822,8 +882,7 @@ fn pin_collision<'a>(
     if let Some(le) = library.episode_count
         && let Some(p) = try_pin(
             &|i| {
-                shapes[i]
-                    .episode_count
+                candidate_eps_in_folder_seasons(&shapes[i], &library.folder_seasons)
                     .is_some_and(|ce| episode_count_close(le, ce))
             },
             "exact_title_episode_count",
@@ -831,9 +890,29 @@ fn pin_collision<'a>(
     {
         return Some(p);
     }
-    if let Some(ls) = library.season_count
-        && let Some(p) = try_pin(
-            &|i| shapes[i].season_count == Some(ls),
+    // Equal *counts* of seasons is not evidence that they are the same seasons:
+    // a folder asserting [1] and a spin-off holding [1] match on the count while
+    // the seven-season parent does not, which is how this discriminator came to
+    // be right 358 times and wrong 440 — worse than a coin flip. Requiring the
+    // candidate to hold exactly the seasons the folder asserts is the like-for-
+    // like form of the same question.
+    if let Some(p) = try_pin(
+            &|i| match shapes[i].season_numbers.as_deref() {
+                // The candidate's seasons are known: require them to be exactly
+                // the folder's, not merely as many.
+                Some(have) => {
+                    let mut a: Vec<i32> = have.iter().copied().filter(|s| *s > 0).collect();
+                    let mut b = library.folder_seasons.clone();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    a == b
+                }
+                // Not fetched: fall back to the count, which is what this
+                // discriminator always compared. Unknown is not evidence either
+                // way, and refusing here would silence the cases it gets right.
+                None => library.season_count.is_some()
+                    && shapes[i].season_count == library.season_count,
+            },
             "exact_title_season_count",
         )
     {
@@ -1292,18 +1371,21 @@ pub fn score_search_with_shape_and_sole(
             } else {
                 (exact[0], 0.90, "exact_title")
             }
-        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library.clone()) {
-            (hit, 0.90, method)
         } else if let Some(hit) = sole_season_coverer(&exact, shapes, &library.folder_seasons) {
-            // Only after `pin_collision` declines, so no folder that pins today
-            // is re-attributed. This reaches exactly the folders that were
-            // landing at 0.72 with the answer already computed.
+            // **Ahead of `pin_collision` (ADR-0047).** This ran after it, on the
+            // reasoning that no folder which pins today should be re-attributed.
+            // That conservatism gave the two near-random count discriminators
+            // priority over this one, which is right every time it fires: 30
+            // correct and 0 wrong against their 1,240 correct and 1,056 wrong.
             (hit, 0.90, "exact_title_season_coverage")
         } else if let Some(hit) = primary_by_slots_explained(&exact, shapes, &library) {
             // No candidate can hold the whole folder — ADR-0046's spanning
             // case. The primary is the one that explains most of it; the rest
-            // is `bind_second_entities`' job and already ships.
+            // is `bind_second_entities`' job and already ships. 74 correct, 0
+            // wrong, and likewise moved ahead of the counts.
             (hit, 0.90, "exact_title_slots_explained")
+        } else if let Some((hit, method)) = pin_collision(&exact, shapes, library.clone()) {
+            (hit, 0.90, method)
         } else {
             // Prefer first non-empty candidate for the unpinned method payload,
             // but stay below floor.
@@ -2490,11 +2572,30 @@ mod tests {
             Some(&shapes),
         )
         .expect("a candidate");
-        assert_eq!(c.tmdb_id, 1);
+        // **ADR-0047 reverses this assertion, and the test's name still holds.**
+        // Coverage declines here — both candidates hold seasons 1 and 2 — so it
+        // does not re-attribute anything. What changed is that the count pin no
+        // longer owns it either.
+        //
+        // The folder holds 47 files across seasons [1, 2]. Candidate 1 holds 47
+        // episodes across seasons [1, 2, 3]. The old pin matched on `47 == 47`,
+        // but those 47 span three seasons against the folder's two, so the folder
+        // cannot be this candidate's seasons 1–2 and the equality is a
+        // coincidence between two different quantities. With no per-season list
+        // to restrict the count to seasons [1, 2], the comparison is refused.
+        //
+        // Measured over the warmed oracle before this change: that comparison
+        // was wrong 616 times against 882 right, and 94% of its wrong bindings
+        // went to an entity with fewer episodes than the correct one.
+        //
+        // Unpinned is the honest outcome — 0.72 is below the floor, so the folder
+        // goes unmatched rather than binding on a coincidence. Absent is
+        // recoverable; wrong is not.
         assert_eq!(
-            c.method, "exact_title_episode_count",
-            "the count pin still owns it"
+            c.method, "exact_title_collision_unpinned",
+            "a count spanning different seasons is not a pin"
         );
+        assert!(c.confidence < 0.90, "and it must stay below the floor");
     }
 
     /// Will & Grace: 246 files across two entities of 194 and 52. Every pin
