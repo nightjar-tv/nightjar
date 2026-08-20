@@ -62,6 +62,7 @@ not here — this page is the reference, not the tour.
 | [0042](0042-derived-artifact-versioning-and-reconciliation.md) | Derived artifact versioning and library reconciliation | **Proposed** | — | — |
 | [0043](0043-season-fit-and-unmatched-reason.md) | Season fit as a candidate constraint, and a recorded unmatched reason | §1 superseded before shipping (Amendment 2026-08-12); §2 accepted, unbuilt | — | §1 by its own amendment |
 | [0046](0046-multi-entity-binding-one-unit-per-folder.md) | Multi-entity binding, one browse unit per folder | **Proposed** | — | — |
+| [0047](0047-title-extension-admission-and-collision-evidence.md) | What may count as a title match, and what evidence may break a tie | **Proposed** | — | — |
 
 ## Why the numbers jump from 0043 to 0046
 

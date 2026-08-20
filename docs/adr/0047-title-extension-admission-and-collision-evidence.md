@@ -1,0 +1,178 @@
+# ADR-0047: What may count as a title match, and what evidence may break a tie
+
+- Status: **proposed**
+- Date: 2026-08-20
+- Supersedes: nothing. It narrows two rules that ADR-0026 and ADR-0032 left
+  open, and does not replace either record.
+- Depends on: ADR-0026 §2 (the scoring floor and the confidence tiers this
+  reads); ADR-0032 (the collision pin, whose discriminator order this
+  questions); ADR-0033 §8 (the folder cross-check, which catches some of what
+  gets through); ADR-0046 (multi-entity binding — a folder may legitimately
+  span a parent and its spin-off, so this must not make that unreachable)
+- Gate: Gate 3 — metadata auto-match ≥95% correct
+- Related: the matcher oracle, 2026-08-19, warmed 2026-08-20
+  (`notes/loop-matcher/06`–`08`); the analysis scripts
+  `notes/loop-matcher/scripts/collision_evidence.py` and `prefix_admission.py`,
+  which produce every number below
+
+## Context
+
+The matcher oracle now measures its whole population — 73,625 rows, 0 stalled,
+0 provider errors, `requests=0`, noise floor 0. Before warming, 39.3% of it was
+invisible. **The single largest class the warm exposed is confident wrong
+binding by the exact-title collision tier: 1,607 rows that bind at 0.90 and bind
+the wrong entity.** Before warming there were 20 wrong bindings in the whole
+suite; there are now 2,410.
+
+These rows are not the tier failing to pin — that is the `absent` class and it is
+a different record. These are the tier pinning, confidently, and being wrong.
+
+Two rules combine to produce them, and they need deciding together because
+fixing either alone leaves most of the population.
+
+### Half one: admission. `name_matches_query` accepts a title extension.
+
+`match_score.rs`:
+
+    // Prefix: "the continental from the world…" after colon fold.
+    if nk.starts_with(query_norm)
+        && nk.len() > query_norm.len()
+        && nk.as_bytes().get(query_norm.len()) == Some(&b' ')
+    { return true; }
+
+**The intent is real and should survive.** TMDB's official name is often longer
+than the folder's: `The Continental` →
+`The Continental: From the World of John Wick`. Without this arm that folder does
+not match at all.
+
+**But a franchise spin-off has exactly the same shape**, and the predicate cannot
+tell them apart. Measured over the collision tier's wrong bindings, by folding
+both names through the shipped chain (134 distinct `(entity, bound)` pairs where
+the bound entity's name is cached):
+
+| how the wrong candidate was admitted | pairs | share |
+|---|---:|---:|
+| **title extension — candidate is the query plus a tail** | **80** | **59.7%** |
+| exact fold — a genuine same-title collision | 52 | 38.8% |
+| neither | 2 | 1.5% |
+
+So the majority of these wrong bindings are **not** same-title collisions. They
+are admissions of a different show whose title begins with the folder's.
+
+And the harm is concentrated where "starts with" discriminates least — the query
+is the folder's title, and:
+
+| words in the query | prefix admissions |
+|---|---:|
+| **1** | **55** |
+| 2 | 15 |
+| 3–6 | 10 |
+
+**69% of them have a one-word query.** `Cross` admits `Cross My Mind`. `Sugar`
+admits `Sugar Highs`. `Silo`, `Luther`, `Archer` — a one-word show title admits
+every show whose name starts with that word.
+
+The discarded tails are mostly companion content: `Official Podcast`,
+`Webisodes`, `Tales from '85`, `The Interns`, `A Year in the Life`.
+
+### Half two: selection. The count discriminators invert on a partial library.
+
+`pin_collision` takes *"the first discriminator that selects exactly one of
+`exact`"*, in the order **episode count → season count → premiere year**. The
+uniqueness discipline is right — two matches means no pin. The **signals** are
+the problem.
+
+`library.episode_count` is the number of episode *files the folder holds*.
+`CandidateShape.episode_count` is the candidate's **total across all seasons**.
+A library holding one season of a long-running show — the normal state of anyone
+mid-collection — therefore looks nothing like the correct entity and very like a
+short one:
+
+| correct entity | its eps / seasons | bound instead | its eps / seasons |
+|---|---:|---|---:|
+| Archer | 140 / 14 | Archer (1975) | 6 / 1 |
+| The Blacklist | 218 / 10 | The Blacklist: Redemption | 8 / 1 |
+| The Mentalist | 151 / 7 | Mentalist | 10 / 1 |
+| The Good Wife | 156 / 7 | The Good Wife (2019) | 10 / 1 |
+| Gilmore Girls | 153 / 7 | …: A Year in the Life | 4 / 1 |
+| Rick and Morty | 91 / 9 | …: The Anime | 10 / 1 |
+
+**Of 284 wrong binds where both counts are known, 267 — 94.0% — went to an
+entity with *fewer* episodes than the correct one.**
+
+`episode_count_close` compounds it: the tolerance is
+`max(ceil(candidate × 0.15), 5)`, so a 6-episode candidate is "close" to any
+library of 1–11 files, while the 140-episode correct answer needs 119–161.
+
+`season_count` inverts identically: the folder asserts 1 season, the correct
+entity has 7, the spin-off has 1, and `== Some(1)` selects the spin-off uniquely.
+
+**The codebase already knows this.** `CandidateShape.season_episode_counts` exists
+with the docstring: *"a count of seasons cannot say whether a candidate could hold
+the folder's files, and a total episode count inverts on a folder holding more
+episodes than the entity has. Per-season counts answer both."* It was added for
+this and `pin_collision` does not consult it — the weakest, most inversion-prone
+signal is tried **first**, and because the first unique match wins, it pre-empts
+every better one.
+
+## Decision — the question, and the options
+
+**When may a candidate whose title strictly extends the query be treated as a
+title match, and what evidence may then choose among the admitted candidates?**
+
+### On admission
+
+- **A. Leave it.** Keeps `The Continental`. Keeps 80 measured wrong bindings.
+- **B. Drop the prefix arm.** Removes ~80 wrong bindings and breaks every folder
+  whose provider name is legitimately longer. Cost unmeasured here because no
+  oracle shape generates it — that gap should be closed before choosing B.
+- **C. Admit the extension, but never let it *win* against an exact fold.**
+  An extension becomes a candidate only when no exact fold survives. Cheap,
+  keeps `The Continental`, and removes the 80 wherever an exact fold exists
+  alongside — which is the case in every example above.
+- **D. Gate the arm on query length** (e.g. ≥2 words, or ≥N characters).
+  Addresses 69% of the measured harm with one condition. Arbitrary in a way the
+  others are not, and a threshold is exactly the "rule to tune" this record is
+  trying not to be.
+
+**Recommended: C**, with B's cost measured before it is ever reconsidered. C is a
+precedence rule rather than a threshold, it is expressible in the existing tier
+order, and `ADR-0046` still reaches a genuine parent-plus-spin-off folder through
+the multi-entity path rather than through a title extension.
+
+### On selection
+
+- **E. Leave the order.** Keeps 1,607.
+- **F. Reorder: per-season coverage before total counts.** Use
+  `season_episode_counts` — can this candidate hold the seasons the folder
+  asserts, at roughly the counts the folder holds? — ahead of
+  `episode_count`/`season_count`. Uses evidence already fetched and already
+  modelled; no new provider call.
+- **G. Require the total-count signals to be *corroborated*** rather than
+  sufficient alone.
+- **H. Withhold the pin when the library is plainly partial** (one season, few
+  files) and the candidates differ in magnitude. Declines instead of guessing:
+  turns wrong into absent, which is recoverable.
+
+**Recommended: F, with H as the fallback when F cannot separate.** F is what the
+existing field was built for; H matches this project's standing preference that a
+comparator may report agreement or silence but not disagreement on weak evidence.
+
+## Consequences
+
+**Measurable.** Every option above moves oracle rows, and the instrument now sees
+the whole population with a noise floor of 0 and a `wrong.kind` verdict that
+cannot hide in `partial`. The suite to watch is `tv.noyear` (63.9%), `tv.root`
+(63.9%) and `tv.scene` (61.6%) — where these 1,607 live — against the
+Sonarr-shaped shapes at 99.9–100.0%, which must not move.
+
+**Absent is an acceptable outcome; wrong is not.** Options H and C trade wrong
+bindings for unmatched files by design. That is the right direction: a wrong
+binding triggers fetches and corrupts watch state, an unmatched file is
+recoverable in the fix UI.
+
+**What this record does not settle.** The oracle is English names only, season 1
+mostly, one drain from an empty database, no NFOs, and no manual-match or rescan
+path. It cannot cost option B, because no shape generates a folder whose provider
+name is longer than the folder's — **that shape should be added before B is
+weighed**, the same way `tv.episodetitle` was added to cost M2.
