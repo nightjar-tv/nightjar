@@ -58,3 +58,93 @@ where it is right, which is the mistake half two's first cut made.
 absent, so the number that says whether it worked is *wrong down with correct
 roughly held* — and if correct falls materially further than wrong, it is not worth
 keeping and I will say so.
+
+---
+
+## Two implementations, both wrong before the third
+
+**Containment as equality with the folder's total.** Match when
+`slots_explained(shape, library) == library.episode_count`. It broke
+`a_close_slots_race_does_not_pick_a_primary`: folder 20 files, candidate A
+explains 20, candidate B explains 18, so exactly one matched and it pinned.
+
+**That test is right.** An 18-against-20 difference is a missing special or a
+mis-numbered file, and making it decisive is the same brittleness as proximity
+through a different door. `primary_by_slots_explained` declines that race
+deliberately, with a 2× clear-winner rule.
+
+So the fix was never a sharper predicate. **`slots_explained` already asks the
+containment question, and it already runs first.** If it declined, the folder is a
+race no count can settle — and the right change is to stop a worse rule overriding
+a better rule's declination.
+
+**Third implementation, the one measured:** the count discriminators return `None`
+when any candidate carries a per-season list. Where better evidence was available
+and declined, worse evidence does not decide. Without a per-season list nothing
+better has run, so the counts stay — the path 181 files against candidates of 181
+and 12 takes, and the three shipped count tests exercise.
+
+## Measured — and it fails the bar I set
+
+Fully warm, 0 new requests, `provider errors 0`, `stalled 0`, noise floor 0. Three
+transitions, every one to `absent`:
+
+    correct              -> absent   836
+    wrong.unknownepisode -> absent   698
+    wrong.entity         -> absent    60
+
+| | before | after | delta |
+|---|---:|---:|---:|
+| correct | 59,101 | 58,265 | **−836** |
+| wrong.entity | 64 | **4** | −60 |
+| wrong.unknownepisode | 698 | **0** | −698 |
+| absent | 13,302 | 14,896 | +1,594 |
+| **correct%** | **80.1%** | **79.0%** | **−1.13 pt** |
+
+`tv.noyear`, `tv.root` and `tv.scene` reach **zero wrong bindings of every class**.
+`tv.noyear` 87.4% → 81.1%, `tv.scene` 79.2% → 77.1%, `tv.shortfolder` 65.5% →
+56.6%.
+
+**The Firm declined to `absent` exactly as predicted** — the mechanism worked.
+
+## Verdict — REVERT
+
+The prediction said *"if correct falls materially further than wrong, it is not
+worth keeping and I will say so."* **Correct fell 836 against wrong's 758.** It
+fails the bar, and the oracle rate fell 1.13 points, so it is reverted. Reverting
+is a normal outcome and this is the first in twelve iterations.
+
+## What the number actually says, because it is not a clean loss
+
+The gated firings were **52.4% precise** — 836 right against 758 wrong. That is a
+coin flip deciding bindings at 0.90 confidence, and removing it eliminates *every
+remaining wrong binding* in the three shapes it touches.
+
+So the trade is **758 wrong bindings for 836 unmatched files.** Under
+`BLOCK1_LEAVE_BAR`'s own reasoning — a wrong binding triggers fetches and corrupts
+watch state, an unmatched file is recoverable in the fix UI — that exchange is
+arguably favourable, and a reasonable reading of the leave bar would take it.
+
+**That is a severity-weighting decision, not a measurement one, and it is not a
+loop's to make.** The measurement is above; the exchange rate belongs in ADR-0047
+as an amendment. Recorded here rather than decided:
+
+- **keep the coin flip**: 80.1%, 762 wrong bindings remain (698 + 64)
+- **gate it**: 79.0%, **4** wrong bindings remain, 836 more files unmatched
+
+If the answer is to gate it, the patch is
+`~/nightjar-wt-matcher-scratch/adr47-cont.patch` and it applies cleanly to the
+half-two tree.
+
+## The residual, now precisely bounded
+
+With the gate reverted, what remains in the collision tier is **762 wrong
+bindings, all from a 52%-precise magnitude comparison on partial libraries**, and
+no count-based evidence separates the candidates in any of them. Sharpening the
+predicate cannot fix it — that was implementation one. The options are to gate it
+(above) or to bring evidence that is not a count: the episode-title comparator
+already in `LibrarySeriesShape::folder_episode_titles`, measured to distinguish
+exactly one candidate in 17 of 20 folders and not consulted by this tier at all.
+
+**That is the next thing, and it is a better lead than either version of
+containment.**
