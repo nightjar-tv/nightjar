@@ -253,6 +253,84 @@ fn cut_at_absolute_episode(s: &str) -> String {
     s.to_string()
 }
 
+/// Cut a title at a date written as three number groups — `2016 02 25`,
+/// `2012.16.02`, `04.28.2014`.
+///
+/// A daily show's filename numbers its episodes by air date, and the date sits
+/// where an episode token would. Nothing cut it, so `Judge Developer 2016 02 25
+/// S20E142` searched the provider for `Judge Developer 2016 02 25`.
+///
+/// **Two arms reach this and one does not.** The episode arm cuts the stem at
+/// the season/episode marker and leaves whatever came before, date included.
+/// The movie arm cuts at the year first — and a date contains a year — so a
+/// mid-string date is already handled there and never arrives; what does arrive
+/// is the case where the year cut landed at index 0 because the *title* starts
+/// with a year-shaped number (`2020 A Late Talk Show`).
+///
+/// **Three whole numeric tokens, and one of the outer two is a year.** All
+/// three guards earn their place:
+///
+/// * *Three*, not two, because a title followed by its release year is two
+///   (`Blade Runner 2049 2017`) and cutting there would take the year of half
+///   the movie library.
+/// * *One end is a four-digit year in 1900–2100*, the same range every other
+///   year guard in this file uses. The remaining two are 1–31, so a resolution
+///   or a bitrate cannot pose as one.
+///
+/// **The head must contain a letter**, and that guard turned out to be the one
+/// carrying the weight. A third was written first — *the token before the date
+/// must not be numeric* — for `9-1-1`, a real show whose name offers `1 1 2018`
+/// as a perfectly good date. It was removed after measurement: the sweep holds
+/// five `9-1-1` names, and taking the guard out moved **none** of the 74,624,
+/// because `9-1-1` has no letter in it and the head rule already declines.
+/// A guard with a demonstrable cost — it also refuses the correct cut in
+/// `Show 5 2016 02 25` — and no demonstrable case is not one to keep.
+///
+/// The letter rule is the same one `cut_at_title_junk` and
+/// `cut_at_absolute_episode` apply, and for the same reason: a name that is
+/// only a date must keep itself, because the caller substitutes the whole stem
+/// for an empty title.
+///
+/// **ASCII digits only.** `is_ascii_digit` and not a Unicode digit class: an
+/// Arabic-Indic date in an Arabic title is not this form, and a prototype of
+/// this rule written in Python cut one because `str.isdigit()` said yes.
+fn cut_at_date(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut toks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_token_boundary(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !is_token_boundary(bytes[i]) {
+            i += 1;
+        }
+        toks.push((start, i));
+    }
+    let numeric = |t: (usize, usize)| bytes[t.0..t.1].iter().all(u8::is_ascii_digit);
+    let value = |t: (usize, usize)| s[t.0..t.1].parse::<i32>().unwrap_or(-1);
+    let is_year = |t: (usize, usize)| t.1 - t.0 == 4 && (1900..=2100).contains(&value(t));
+    let is_day = |t: (usize, usize)| t.1 - t.0 <= 2 && (1..=31).contains(&value(t));
+    for w in 0..toks.len().saturating_sub(2) {
+        let (a, b, c) = (toks[w], toks[w + 1], toks[w + 2]);
+        if !(numeric(a) && numeric(b) && numeric(c)) {
+            continue;
+        }
+        let dated =
+            (is_year(a) && is_day(b) && is_day(c)) || (is_day(a) && is_day(b) && is_year(c));
+        if !dated {
+            continue;
+        }
+        let head = s[..a.0].trim().trim_matches([' ', '-', '_', '.']).trim();
+        if head.chars().any(char::is_alphabetic) {
+            return head.to_string();
+        }
+    }
+    s.to_string()
+}
+
 /// Season words this recognises, and only these. Each is one the corpus
 /// actually contains: `season` (23 occurrences), `temporada` (6), `stagione`
 /// (2), `saison` (1).
@@ -771,7 +849,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
         let title = run_title.clone().unwrap_or_else(|| {
             cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
-                &cut_at_title_junk(&cut_stem_at(stem, before)),
+                &cut_at_date(&cut_at_title_junk(&cut_stem_at(stem, before))),
             )))
         });
         let end = if episode_end > episode {
@@ -809,8 +887,8 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // the year branch, which would otherwise call a pack a movie.
     if let Some((before, season)) = find_bare_season(&normalized) {
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_title_junk(&cut_stem_at(
-                stem, before,
+            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(&cut_at_title_junk(
+                &cut_stem_at(stem, before),
             ))))
         });
         return ParsedName {
@@ -846,7 +924,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         None => cut_at_title_junk(&clean_title(stem)),
     };
     let title = run_title.unwrap_or_else(|| {
-        cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(&title)))
+        cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
+            &cut_at_date(&title),
+        )))
     });
 
     ParsedName {
@@ -1501,6 +1581,69 @@ mod tests {
         assert_eq!(p.episode, Some(5));
         assert_eq!(p.episode_end, None);
         assert_eq!(p.title, "The Show");
+    }
+
+    /// **A daily show numbers its episodes by air date, and nothing cut it.**
+    /// `Judge Developer 2016 02 25 S20E142` searched the provider for
+    /// `Judge Developer 2016 02 25`.
+    #[test]
+    fn a_date_written_as_three_number_groups_ends_the_title() {
+        let p = parse_filename("Judge Developer 2016 02 25 S20E142.mkv");
+        assert_eq!(p.title, "Judge Developer");
+        assert_eq!(p.season, Some(20));
+        assert_eq!(p.episode, Some(142));
+
+        // Year first, and the title itself begins with a number — the cut must
+        // find the *date*, not the first four digits in the name.
+        let p = parse_filename("2020.A.Late.Talk.Show.2012.16.02.PDTV.XviD-C4TV.mkv");
+        assert_eq!(p.title, "2020 A Late Talk Show");
+
+        // **Where this rule does *not* run, and why that is fine.** On the
+        // movie arm the year cut goes first, and a date contains a year — so
+        // `The_Series_US_25.02.2016_hdtv` is already cut at `2016` and never
+        // reaches here. It leaves `25 02` behind, which is two groups and not
+        // a date; recovering those needs the year branch, not this one.
+        assert_eq!(
+            parse_filename("The_Series_US_25.02.2016_hdtv.x264.mp4").title,
+            "The Series US 25 02"
+        );
+        // Mid-string and year-first, the year cut alone gets it right.
+        assert_eq!(
+            parse_filename("Series.Title.2016.02.25.1080i.HDTV.mkv").title,
+            "Series Title"
+        );
+    }
+
+    /// **Two number groups are a title and its year**, which is half the movie
+    /// library, so the rule needs three. `Blade Runner 2049` and `1883` are
+    /// both real and both bound today.
+    #[test]
+    fn a_title_and_its_year_are_not_a_date() {
+        assert_eq!(
+            parse_filename("Blade.Runner.2049.2017.1080p.BluRay.mkv").title,
+            "Blade Runner"
+        );
+        assert_eq!(
+            parse_filename("1883.2019.1080p.BluRay.x264-GRP.mkv").title,
+            "1883"
+        );
+        // Three groups, none of them a year in range.
+        assert_eq!(
+            parse_filename("Series 1 2 3 S01E01.mkv").title,
+            "Series 1 2 3"
+        );
+    }
+
+    /// A head with no letter in it is not a title to keep, so the cut declines
+    /// rather than leaving `9`. **This is the guard that carries `9-1-1`** — a
+    /// real show whose name offers `1 1 2016` as a date — and the sweep's five
+    /// `9-1-1` names are what said so.
+    #[test]
+    fn a_date_cut_that_would_leave_no_letters_does_not_happen() {
+        let p = parse_filename("9-1-1 2016 02 25 S20E142.mkv");
+        assert_eq!(p.title, "9-1-1 2016 02 25");
+        assert_eq!(p.season, Some(20));
+        assert_eq!(p.episode, Some(142));
     }
 
     /// **A truncated episode number is a wrong claim, not a missing one.**
