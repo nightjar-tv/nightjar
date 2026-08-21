@@ -139,12 +139,13 @@ are byte-identical in the run that counts.
 ## What I would do next, and why
 
 1. **Warm 4,691 TV searches, then take item 3.** That is the only thing standing
-   between the 573 `wrong.kind` and a judgeable attempt. The rule is *a file
-   inside a numbered season directory is not a film*; it moves `tv.episodetitle`
-   from a movie search to a TV one, and the cache cannot serve those. Both
-   prerequisites are otherwise ready: `movie.specials` guards the `Specials/`
-   failure with 1,712 paired rows, and splitting `numbered_season_directory` out
-   of `nightjar-db` is fifteen lines the moment it has a caller.
+   between the 573 `wrong.kind` and a judgeable attempt. **The command, the
+   candidate patch and the measured bill are in `07-wrong-kind-warming.md`** —
+   prepared and drained strict after this note was first written, so the rule is
+   one human-run step from being judgeable rather than an open question. Under
+   the candidate the 573 `wrong.kind` become stalls, `tv.sonarr` is untouched,
+   and `movie.specials` stays byte-identical to `movie.noyear` — the guard the
+   previous attempt did not have, holding.
 
 2. **Build the shape ADR-0049 needs before accepting it.** `tv.scene` forms one
    group per file — 5,644 for 5,644, against every other TV shape's 698 — and
@@ -171,7 +172,10 @@ are byte-identical in the run that counts.
 5. **Free the disk.** The volume sat at 100% for part of this loop and it
    produced a fake regression: the `transcode` suite went from 1 failure to 8 at
    head and 20+ at base, a difference that looked like a result and was the
-   machine. A measurement drain needs 4.2 GB.
+   machine. A measurement drain needs 4.2 GB. Recorded in the oracle's own
+   README, under **Amendments, 2026-08-21 — three ways this instrument lied**,
+   with the `stored_title` and `TMDB_CACHE` defects, so the next person reads it
+   before running rather than after.
 
 ## What could not be measured, named
 
