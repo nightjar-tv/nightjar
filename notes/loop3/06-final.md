@@ -1,0 +1,209 @@
+# The loop, stopped — five iterations, four kept, no reverts
+
+Base `origin/main` at `2f6efb7`. Branch `loop/matcher-residual`, never pushed,
+never merged, `main` untouched.
+
+## Iterations
+
+| # | what | outcome |
+|---|---|---|
+| 0 | re-measure every instrument at the base | — |
+| 1 | ADR-0048 B: the fix flow keeps the candidate the floor declined | **kept** |
+| 2 | F5: a root group's episode-title evidence is its own files | **kept** |
+| 3 | `movie.specials`, and item 3 reported blocked | instrument only |
+| 4 | an episode number is read whole, or the token is not an episode | **kept** |
+| 5 | a date written as three number groups ends the title | **kept** |
+| — | ADR-0049 written for `tv.scene` fragmentation | proposed |
+
+**Four kept, none reverted.** No change was reverted, so the two-consecutive-revert
+stop was never approached; the loop stopped because the remaining work is not
+safe work, which is the first line of the brief.
+
+## Per instrument, before and after
+
+### The matcher oracle
+
+2,410 entities throughout. 79,382 rows for iterations 0–2, **81,094** from
+iteration 3 when `movie.specials` was added; both arms were re-measured on the
+new population so every table joins. Warmed cache, `requests=0` on every run,
+noise floor **0 rows** on every run.
+
+| verdict | base | final | delta |
+|---|---:|---:|---:|
+| correct | 64,836 | **64,862** | **+26** |
+| absent | 15,654 | 15,654 | 0 |
+| `wrong.kind` | 573 | 573 | 0 |
+| `wrong.entity` | 11 | **5** | **−6** |
+| `wrong.unknownepisode` | 8 | **0** | **−8** |
+| stalled | 12 | **0** | **−12** |
+| provider errors | 2 | **0** | −2 |
+
+**Total wrong 592 → 578, and every wrong binding outside `movie.*` and
+`tv.episodetitle` is gone.** The 5 remaining `wrong.entity` are one each in the
+four `movie.*` shapes plus one; the 573 `wrong.kind` are item 3, reported blocked.
+
+Twenty of twenty-one shapes are byte-identical between base and final. The one
+that moved is `tv.mixedroot`, and every row it moved went to `correct`.
+
+### The parser corpus
+
+| | pass | applicable | rate |
+|---|---:|---:|---:|
+| base | 524 | 738 | 71.0% |
+| after iteration 4 | 530 | 738 | 71.8% |
+| final | **532** | 738 | **72.1%** |
+
+**+8 cases, 0 regressions**, every gain named in a prediction written before the
+run. Six more titles are corrected without their case passing — they fail on a
+different field — which the rate cannot show and `corpus_diff.py` does.
+
+### The parser sweep
+
+74,624 names, base `2f6efb7` against final: **0 gains, 0 regressions**, recorded
+at the base first as the brief asked.
+
+The zero means two different things in two iterations, and the difference is
+recorded rather than netted:
+
+- **Iterations 1–2**: `nightjar-core` byte-identical to `origin/main`, so the
+  sweep is insensitive by construction.
+- **Iteration 4**: the crate changed, and the sweep is blind by *population* —
+  `gen_names.py` emits one-digit episode numbers only, checked rather than
+  assumed.
+- **Iteration 5**: the crate changed and the sweep **does** hold the shape — 332
+  names carry a numeric run around a four-digit year, including `1883.2019`,
+  `1899.2019`, `300.2019` and five `9-1-1`s. None moved. That zero is evidence.
+
+### The dogfood strict pair
+
+25,004 files, run at iterations 1, 2, 4 and 5. Every run: binaries `sha256`'d
+distinct, separate target directories, `NIGHTJAR_REPARSE=1` and
+`NIGHTJAR_TMDB_CACHE_STRICT=1` on both arms, `errors=0` and `requests=0` on both,
+cache 8,185 entries before and after.
+
+    groups 3220  ready 24953  unmatched 51   — identical on every arm, every time
+
+**Every one of those zeros is explained rather than reported.** The real library
+has no root-level episode file (iteration 2), no four-digit episode number
+(iteration 4) and no date-numbered file (iteration 5). The pair earns its place
+by proving the two arms are two things and that both ran offline — not by the
+count.
+
+### Tests
+
+743 → 749 pass, 3 ignored. Nine new. One failure throughout:
+`hls::tests::mapped_real_library_end_moov_mp4_copy_keeps_aac`, which fails
+**identically at the base** when the `transcode` package runs its 158 tests
+together and passes alone. `cargo fmt --check` and `cargo clippy --all-targets
+-D warnings` green at every commit.
+
+## Per-iteration one-liners
+
+- **0** — the handed-over baseline did not reconcile: it summed to 79,950 against
+  a stated population of 79,382, and three of its cells were wrong.
+- **1** — `search_candidates` marks the id the shipped scorer chose and the 0.90
+  floor declined; movies only, and nothing binds on it. Moves no oracle row by
+  design, which ADR-0048 says in advance.
+- **2** — `folder_titles_from_db` built `LIKE '%'` for a group with no show
+  folder, so a root group's episode-title evidence was the whole library's; one
+  agreement with a neighbour's title lifted a candidate to the auto-match floor.
+  26 rows moved, all to `correct`.
+- **3** — built `movie.specials`, 1,712 rows pairing exactly with `movie.noyear`,
+  so the `Specials/`-shaped failure has a guard bigger than five dogfood files.
+  Refused the second prerequisite on Rule 4.7 and left the 573.
+- **4** — the episode digit run was capped at three and truncated, so `S22E5363`
+  reported episode 536 — a wrong claim where the name carried a right one.
+- **5** — a date is three number groups with a year at one end; and the guard
+  written for `9-1-1` was measured out of existence rather than kept on faith.
+
+## Two instrument defects found, both of a kind this project keeps finding
+
+**The replay harness was not deriving the stored title as production does.** The
+product's `stored_title` substitutes the show folder's name for an empty parse
+and both scanner indexing paths call it; its own doc comment says the harness
+needs the same answer and names the consequence — "5,644 generated rows scored
+`absent` for a reason that was the harness rather than the product". The
+inherited harness patch still used `parse_filename` alone. Corrected;
+`tv.numbered` goes 0.0% → 100.0% and no other shape moves. **The loop base
+re-reads 63,830 correct instead of 58,186 over the same rows**, and iteration 2
+was re-run on both arms against the corrected instrument — same 26 rows, same
+direction.
+
+**`gen_library.py` reads `TMDB_CACHE` and silently drops a shape without it.**
+Regenerating for `movie.specials` without the variable in the environment
+produced 20 shapes instead of 21: `tv.shortfolder` went from 17 entities to 0,
+because the entity filter verifies truncated names against the *cache*. Caught
+by checksumming all 39 pre-existing `capture.jsonl` files before and after — they
+are byte-identical in the run that counts.
+
+## What I would do next, and why
+
+1. **Warm 4,691 TV searches, then take item 3.** That is the only thing standing
+   between the 573 `wrong.kind` and a judgeable attempt. The rule is *a file
+   inside a numbered season directory is not a film*; it moves `tv.episodetitle`
+   from a movie search to a TV one, and the cache cannot serve those. Both
+   prerequisites are otherwise ready: `movie.specials` guards the `Specials/`
+   failure with 1,712 paired rows, and splitting `numbered_season_directory` out
+   of `nightjar-db` is fifteen lines the moment it has a caller.
+
+2. **Build the shape ADR-0049 needs before accepting it.** `tv.scene` forms one
+   group per file — 5,644 for 5,644, against every other TV shape's 698 — and
+   costs 1,295 unmatched. The oracle can price the status quo and cannot price
+   any alternative, because no shape puts two *different* shows in scene folders
+   that a merge rule would join. That number is what decides between the four
+   options, and without it the record cannot be accepted honestly.
+
+3. **Fix the harness's `duration_ms`, then weigh runtime for `movie.noyear`.**
+   705 rows sit behind it and ADR-0048 says plainly that runtime is likely the
+   strongest signal and is unmeasurable while the generator takes each file's
+   duration from the correct entity's own runtime. Jitter it, or draw from a real
+   distribution, and the 88.9% ceiling on provider rank stops being the best
+   available evidence.
+
+4. **The parser's remaining clusters, in this order:** the glued date forms
+   (`140722`, `20201013`) at 3 cases, which need the boundary against
+   `cut_at_absolute_episode`'s absolute number; the ` - ` range separator at 2;
+   and then stop, because the two big ones — `Series.103` = S1E3 at 17 cases, and
+   season/episode from the parent folder at 11 — are respectively too dangerous
+   for any instrument here to clear and blocked on the signature change item 5
+   names.
+
+5. **Free the disk.** The volume sat at 100% for part of this loop and it
+   produced a fake regression: the `transcode` suite went from 1 failure to 8 at
+   head and 20+ at base, a difference that looked like a result and was the
+   machine. A measurement drain needs 4.2 GB.
+
+## What could not be measured, named
+
+- **Whether any of this helps a user.** The oracle has no fix flow — no manual
+  match, no rescan, no second pass — so the cost ADR-0048 option B changes is
+  the one thing this instrument does not model.
+- **`movie.noyear`'s 705.** Untouched by design. A below-floor suggestion still
+  scores `absent`, and raising the score to make it measurable is the thing
+  ADR-0048 refuses.
+- **`tv.episodetitle`'s 573.** 4,691 cached TV searches away from judgeable.
+- **`tv.handmade`'s 5,644.** Untouched: `01 - Closure.mkv` needs both the folder
+  title and the episode number out of an `NN - ` prefix.
+- **Runtime, NFOs, non-English names, deep seasons, second-pass matching, manual
+  match, rescan, movie versions and editions** — all still outside the population,
+  exactly as the previous loop left them.
+- **Frequency, anywhere.** Every count here is "this many generated rows have the
+  shape that breaks". The one real library is the library whose narrowness caused
+  all this, so its zeros mean "not this library", never "not anywhere".
+
+## What is not claimed
+
+**Neither the matcher nor the parser is shown to work.**
+
+The matcher binds 64,862 of 81,094 generated rows to the entity their name came
+from, carries 5 wrong bindings where the base carried 11, and no longer carries
+any wrong binding at all outside the two shapes named above. That is what the
+oracle says about a generated population of English-named, mostly-first-season,
+NFO-free libraries drained once from empty.
+
+The parser passes 532 of 738 applicable corpus cases against a measured ceiling
+of 91.2% for parse-only work, and is byte-for-byte unchanged on 74,624 swept
+names. Two of its four fields — absolute numbering and date-based numbering —
+have no scorable expectation in the corpus at all.
+
+Everything outside those populations is unmeasured.
