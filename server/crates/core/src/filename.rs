@@ -949,14 +949,8 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
                 if let Some(end) = token_gap_end(bytes, j) {
                     j = end;
                 }
-                let mut episode = 0i32;
-                let mut edigits = 0;
-                while j < bytes.len() && bytes[j].is_ascii_digit() && edigits < 3 {
-                    episode = episode * 10 + (bytes[j] - b'0') as i32;
-                    j += 1;
-                    edigits += 1;
-                }
-                if edigits > 0 && episode > 0 {
+                let (episode, edigits, whole) = read_episode_digits(bytes, &mut j);
+                if edigits > 0 && episode > 0 && whole {
                     let end = extend_episode_span(bytes, j, season, episode);
                     return Some((i, season, episode, end));
                 }
@@ -984,14 +978,8 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
             }
             if (1..=2).contains(&digits) && j < bytes.len() && bytes[j] == b'x' {
                 j += 1;
-                let mut episode = 0i32;
-                let mut edigits = 0;
-                while j < bytes.len() && bytes[j].is_ascii_digit() && edigits < 3 {
-                    episode = episode * 10 + (bytes[j] - b'0') as i32;
-                    j += 1;
-                    edigits += 1;
-                }
-                if edigits > 0 && episode > 0 {
+                let (episode, edigits, whole) = read_episode_digits(bytes, &mut j);
+                if edigits > 0 && episode > 0 && whole {
                     let end = extend_episode_span(bytes, j, season, episode);
                     return Some((i, season, episode, end));
                 }
@@ -1000,6 +988,51 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
         i += 1;
     }
     None
+}
+
+/// The widest episode number an episode marker may carry.
+///
+/// Five, because a daily serial really does reach one: `S42 Ep10722` is a real
+/// name and so is `S22E5363`. Six is not an episode number.
+const MAX_EPISODE_DIGITS: usize = 5;
+
+/// Read the digit run at `*at`, and say whether it is a **whole** run.
+///
+/// Returns `(value, digits, whole)` and advances `*at` past the digits it took.
+/// `whole` is false when the run keeps going past [`MAX_EPISODE_DIGITS`] — the
+/// token is then not an episode marker, and the caller must decline it rather
+/// than use the prefix.
+///
+/// **The truncation this replaces asserted a wrong number where the name
+/// carried a right one.** The cap was three digits and the loop simply stopped:
+/// `S22E5363` reported episode 536, `S14E3533` reported 353, `S2020E1527`
+/// reported 152. Each is a *wrong* claim, not a missing one — the drain takes it
+/// to the provider and binds the wrong episode, where reporting nothing would
+/// have left the file unmatched and recoverable.
+///
+/// **A whole run, the way `cut_at_episode_marker` already requires one.** That
+/// function reads up to four digits and rejects the token when another digit
+/// follows (`bounded`); this is the same rule in the other scanner. The widths
+/// differ on purpose: a bare `E1135` with no season has only the marker to
+/// vouch for it, while an `S` in front is the same evidence that lets the
+/// season arm carry four digits — "the `S` and the `E` do; a resolution has
+/// neither".
+///
+/// Only a following **digit** breaks the run. A following letter must not: the
+/// multi-episode forms are `S01E01E02` and `8x01x02`, and rejecting on a letter
+/// would refuse every one of them.
+fn read_episode_digits(bytes: &[u8], at: &mut usize) -> (i32, usize, bool) {
+    let mut j = *at;
+    let mut value = 0i32;
+    let mut digits = 0;
+    while j < bytes.len() && bytes[j].is_ascii_digit() && digits < MAX_EPISODE_DIGITS {
+        value = value * 10 + (bytes[j] - b'0') as i32;
+        j += 1;
+        digits += 1;
+    }
+    let whole = !(j < bytes.len() && bytes[j].is_ascii_digit());
+    *at = j;
+    (value, digits, whole)
 }
 
 /// Consume the episode tokens that follow `S<season>E<start>` or `N x <start>`
@@ -1064,14 +1097,8 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
         if k == j {
             break;
         }
-        let mut next = 0i32;
-        let mut digits = 0;
-        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 3 {
-            next = next * 10 + (bytes[k] - b'0') as i32;
-            k += 1;
-            digits += 1;
-        }
-        if digits == 0 {
+        let (next, digits, whole) = read_episode_digits(bytes, &mut k);
+        if digits == 0 || !whole {
             break;
         }
         // A dash introduces a range end; anything else is a repetition and
@@ -1474,6 +1501,62 @@ mod tests {
         assert_eq!(p.episode, Some(5));
         assert_eq!(p.episode_end, None);
         assert_eq!(p.title, "The Show");
+    }
+
+    /// **A truncated episode number is a wrong claim, not a missing one.**
+    ///
+    /// The digit run after the marker was capped at three and the loop simply
+    /// stopped, so a daily serial's four- and five-digit numbers came out as
+    /// their first three digits: `S22E5363` reported 536, `S14E3533` reported
+    /// 353, `S2020E1527` reported 152. Each sends the drain to the provider
+    /// with a number the name never carried; reporting nothing would at least
+    /// have left the file unmatched and recoverable.
+    ///
+    /// Every name here is a real release form. `Shortland Street` really is on
+    /// episode 5,363 of season 22, and the corpus holds all three.
+    #[test]
+    fn a_long_episode_number_is_read_whole_and_not_truncated() {
+        let p = parse_filename("Shortland.Series.S22E5363-E5366.HDTV.x264-FiHTV.mkv");
+        assert_eq!(p.season, Some(22));
+        assert_eq!(p.episode, Some(5363));
+        assert_eq!(p.episode_end, Some(5366));
+        assert_eq!(p.episode_numbers(), vec![5363, 5364, 5365, 5366]);
+        assert_eq!(p.title, "Shortland Series");
+
+        let p = parse_filename("The Series And the Show - S41 E10478 - 2014-08-15.mp4");
+        assert_eq!(p.season, Some(41));
+        assert_eq!(
+            p.episode,
+            Some(10478),
+            "five digits, and the date after it \
+             is not a range end"
+        );
+        assert_eq!(p.episode_end, None);
+
+        let p = parse_filename("Anime Title - S2020E1527 [1527] [2020-10-11].mkv");
+        assert_eq!(p.season, Some(2020), "a year-season keeps its four digits");
+        assert_eq!(p.episode, Some(1527));
+    }
+
+    /// A run wider than an episode number means the token is not an episode
+    /// marker — the parser declines it rather than using the first five digits.
+    /// Declining is the safe direction: the file reports no episode instead of
+    /// the wrong one.
+    #[test]
+    fn a_digit_run_too_wide_for_an_episode_is_not_an_episode() {
+        let p = parse_filename("Series.S01E123456.1080p.mkv");
+        assert_eq!(p.season, None);
+        assert_eq!(p.episode, None);
+    }
+
+    /// The run breaks on a following **digit** and must not break on a
+    /// following letter: every multi-episode spelling puts one there.
+    #[test]
+    fn a_letter_after_the_digits_still_ends_the_run() {
+        let p = parse_filename("Series.S01E01E02.mkv");
+        assert_eq!(p.episode_numbers(), vec![1, 2]);
+        let p = parse_filename("Series 8x01x02.mkv");
+        assert_eq!(p.episode_numbers(), vec![1, 2]);
     }
 
     #[test]
