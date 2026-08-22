@@ -126,6 +126,22 @@ the cache's own key function):
     tv search missing 5592 rows, 4691 distinct queries
     cache dir         tmdb-cache-warm (20350 entries)
 
+**Both halves of that estimate turned out wrong, and the warm on 2026-08-22
+settled it at 1,758 calls, not 4,691.**
+
+*Too high, by 4x.* This counts one query per **file**. The drain groups by show
+folder and searches once per **group** — 697 groups for `tv.episodetitle`'s 5,643
+files. The real cost was **1,154**.
+
+*Too narrow.* It costed the shape carrying the 573. The rule flips the kind of
+**any** file under a numbered season directory that parses as a movie, and
+`tv.handmade` renders `Show/Season 1/01 - Closure.mkv`, which does. Warming only
+`tv.episodetitle` left `tv.handmade` **100% stalled** and the whole measurement
+unreadable until a second warm of **604** calls.
+
+The lesson is the general one: **warm the shapes the rule reaches, not the shape
+the defect is in.**
+
 So shipping the rule turns 573 `wrong.kind` and 5,070 `absent` into **5,592
 stalled**, and the scorer's own rule is that a stall is *not a result, not
 measured*. The change would ship unjudged — and unjudged is what the previous

@@ -70,9 +70,10 @@ Three things, and the middle one is the point of the whole iteration-3 shape:
    saying it did not happen.
 3. **`tv.sonarr` is untouched**, 5,604 ready — the ordinary layout pays nothing.
 
-The stalls are the bill: **5,585 rows pending on 690 group errors**, against
-**4,691 distinct TV searches** measured separately with the shipped cleaner
-(`scripts/tv_query_for_paths.sh` and `scripts/kind_rule_warm_cost.py`).
+The stalls are the bill. It was estimated at 4,691 and **measured at 1,758** —
+1,154 for `tv.episodetitle` and 604 for `tv.handmade`. The estimate counted one
+query per file where the drain searches once per group, and it missed
+`tv.handmade` entirely. See note 03.
 
 ## The command
 
@@ -94,8 +95,10 @@ entities.
     # 2. a copy of the cache, so every earlier table still reproduces
     cp -r ~/nightjar-wt-matcher-scratch/tmdb-cache-warm ~/nightjar-wt-matcher-scratch/tmdb-cache-kind
 
-    # 3. the only networked step. ~4,691 searches, one shape.
-    SHAPES="tv.episodetitle" TMDB_SECRETS_FILE=/path/to/secrets \
+    # 3. the only networked step. 1,758 searches over TWO shapes — the rule
+    #    reaches every file under a numbered season directory that parses as a
+    #    movie, which is tv.handmade as well as tv.episodetitle.
+    SHAPES="tv.episodetitle tv.handmade" TMDB_SECRETS_FILE=~/nightjar-data-v9/secrets \
       ~/Documents/GitHub/nightjar-meta/notes/loop-matcher/scripts/warm_cache.sh \
         ~/nightjar-wt-kind ~/nightjar-wt-matcher-scratch/tmdb-cache-kind
 
