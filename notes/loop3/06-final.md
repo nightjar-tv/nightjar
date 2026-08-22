@@ -1,4 +1,8 @@
-# The loop, stopped — five iterations, four kept, no reverts
+# The loop — six iterations, five kept, no reverts
+
+**Amended 2026-08-22.** Item 3 was blocked when this was first written. The
+warming run removed the block, the rule was measured and kept, and the tables
+below are updated. See `08-wrong-kind-landed.md`.
 
 Base `origin/main` at `2f6efb7`. Branch `loop/matcher-residual`, never pushed,
 never merged, `main` untouched.
@@ -13,9 +17,10 @@ never merged, `main` untouched.
 | 3 | `movie.specials`, and item 3 reported blocked | instrument only |
 | 4 | an episode number is read whole, or the token is not an episode | **kept** |
 | 5 | a date written as three number groups ends the title | **kept** |
+| 6 | a numbered season directory means the file is not a film | **kept** |
 | — | ADR-0049 written for `tv.scene` fragmentation | proposed |
 
-**Four kept, none reverted.** No change was reverted, so the two-consecutive-revert
+**Five kept, none reverted.** No change was reverted, so the two-consecutive-revert
 stop was never approached; the loop stopped because the remaining work is not
 safe work, which is the first line of the brief.
 
@@ -31,16 +36,21 @@ noise floor **0 rows** on every run.
 | verdict | base | final | delta |
 |---|---:|---:|---:|
 | correct | 64,836 | **64,862** | **+26** |
-| absent | 15,654 | 15,654 | 0 |
-| `wrong.kind` | 573 | 573 | 0 |
+| absent | 15,654 | 16,227 | +573 |
+| `wrong.kind` | 573 | **0** | **−573** |
 | `wrong.entity` | 11 | **5** | **−6** |
 | `wrong.unknownepisode` | 8 | **0** | **−8** |
 | stalled | 12 | **0** | **−12** |
 | provider errors | 2 | **0** | −2 |
 
-**Total wrong 592 → 578, and every wrong binding outside `movie.*` and
-`tv.episodetitle` is gone.** The 5 remaining `wrong.entity` are one each in the
-four `movie.*` shapes plus one; the 573 `wrong.kind` are item 3, reported blocked.
+**Total wrong 592 → 5, and the worst class is empty.** The 5 remaining
+`wrong.entity` are in the `movie.*` shapes. Every `wrong.kind` and every
+`wrong.unknownepisode` is gone.
+
+The base column is on the old cache and the final on `tmdb-cache-kind`; the
+573 row is the tip-versus-rule comparison, both arms on the warmed cache, in
+note 08. Nothing else differs between the two caches — the warm added only TV
+searches the base never issues.
 
 Twenty of twenty-one shapes are byte-identical between base and final. The one
 that moved is `tv.mixedroot`, and every row it moved went to `correct`.
@@ -138,7 +148,12 @@ are byte-identical in the run that counts.
 
 ## What I would do next, and why
 
-1. **Warm 4,691 TV searches, then take item 3.** That is the only thing standing
+1. ~~**Warm 4,691 TV searches, then take item 3.**~~ **Done** — 1,758 requests,
+   not 4,691, and the rule is kept (note 08). The next thing here is making
+   those 573 *correct* rather than merely `absent`, which needs the folder's
+   title and season and is item 5's signature change.
+
+   The superseded plan, for the record: That is the only thing standing
    between the 573 `wrong.kind` and a judgeable attempt. **The command, the
    candidate patch and the measured bill are in `07-wrong-kind-warming.md`** —
    prepared and drained strict after this note was first written, so the rule is
