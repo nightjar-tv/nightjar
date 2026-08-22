@@ -174,6 +174,31 @@ The four are the Futurama films. The three that remain episodes are the Top Gear
 `NNx00` specials the branch's own iteration 6 gained. Files under `Specials/` or
 `Extras/`: **10 movie, 6 episode — identical under all three rules.**
 
+### The dogfood strict pair — and what it cannot see
+
+Distinct binaries, separate target directories, `NIGHTJAR_REPARSE=1` and
+`NIGHTJAR_TMDB_CACHE_STRICT=1` on both, cache 8,185 before and after.
+
+    control:   DONE groups=3217 ready=24953 unmatched=51 pending=0 errors=0 requests=0
+    treatment: DONE groups=3217 ready=24953 unmatched=51 pending=0 errors=0 requests=0
+
+**Bindings compared row by row**, because identical counts cannot see a swap:
+
+    paths joined 25004   kind differs 0   bindings differ 0   status differs 0
+    total links: control 25026   treatment 25026
+
+    files under Specials/ or Extras/
+      control    5 movie ready, 5 movie unmatched, 4 episode ready, 2 episode unmatched
+      treatment  identical
+
+**Nothing moved, and that is not the same as nothing to move.** The pair replays
+the **capture**, which holds 25,004 paths against the database's 25,043. All four
+Futurama files are among the 610 database paths the capture does not carry — the
+replayed database contains **zero** of them. This instrument was never able to
+see the defect, and the earlier reading *3 bindings differ, all gains* was true
+of the capture and false of the library. The zero here proves the two arms are
+two things and that both ran offline. It proves nothing about the four files.
+
 ### The parser corpus
 
     844 cases, 738 applicable, pass 532, fail 206 = 72.1%   — both arms
