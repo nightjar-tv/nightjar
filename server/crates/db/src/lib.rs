@@ -21,8 +21,9 @@ pub use content_id::{
 };
 pub use migrate::migrate;
 pub use paths::{
-    fold_path, is_absolute_stored, normalize_library_root, paths_fold_equal, require_library_root,
-    require_relpath, resolve_media_path, show_folder_relpath, to_relpath,
+    fold_path, is_absolute_stored, is_numbered_season_directory, normalize_library_root,
+    paths_fold_equal, require_library_root, require_relpath, resolve_media_path,
+    show_folder_relpath, to_relpath, under_numbered_season_directory,
 };
 pub use status::{
     SidecarPresence, SubtitleTrackKind, backoff_days, classify_subtitle_status,

@@ -136,16 +136,56 @@ pub fn show_folder_relpath(stored: &str, library_root: &str) -> String {
     parts.join("/")
 }
 
-fn is_season_directory(seg: &str) -> bool {
+/// A directory segment naming a **numbered** season — `Season 3`, `S03`.
+///
+/// **Not `Specials`, `Special`, `Extras` or `Extra`.** Those are season
+/// directories for the purpose of [`show_folder_relpath`], which must walk up
+/// past all of them, and they are *not* numbered for the purpose of deciding
+/// what a file inside one can be. TMDB models `Top Gear: Polar Special` as a
+/// standalone **movie**, so a file in a `Specials/` folder may honestly bind to
+/// a film; a file in `Season 3/` may not.
+///
+/// Exposed here, beside the rule it is half of, rather than rewritten in the
+/// scanner. A second predicate about the same naming convention written
+/// somewhere else is the reimplemented-`norm_key` trap — it reported 25 folders
+/// against the shipped chain's 12.
+pub fn is_numbered_season_directory(seg: &str) -> bool {
     let s = seg.trim().to_ascii_lowercase();
-    if matches!(s.as_str(), "specials" | "special" | "extras" | "extra") {
-        return true;
-    }
     if let Some(rest) = s.strip_prefix("season ") {
         return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
     }
     let b = s.as_bytes();
     b.len() >= 2 && b[0] == b's' && b[1..].iter().all(u8::is_ascii_digit)
+}
+
+fn is_season_directory(seg: &str) -> bool {
+    let s = seg.trim().to_ascii_lowercase();
+    matches!(s.as_str(), "specials" | "special" | "extras" | "extra")
+        || is_numbered_season_directory(seg)
+}
+
+/// Does this stored path sit inside a **numbered** season directory?
+///
+/// The same walk [`show_folder_relpath`] performs — up from the file, through
+/// the season-directory tail — asking of that tail whether any segment is
+/// numbered. One walk, two questions, so the two cannot disagree about where
+/// the show folder starts.
+///
+/// `Show/Specials/x.mkv` is **false**. `Show/Season 03/x.mkv` is true, and so is
+/// `Show/Season 03/Extras/x.mkv`: the tail holds a numbered season.
+pub fn under_numbered_season_directory(stored: &str, library_root: &str) -> bool {
+    let rel = if is_absolute_stored(stored) {
+        to_relpath(library_root, Path::new(stored)).unwrap_or_else(|| stored.to_string())
+    } else {
+        stored.to_string()
+    };
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop(); // filename
+    let mut numbered = false;
+    while parts.last().is_some_and(|seg| is_season_directory(seg)) {
+        numbered |= is_numbered_season_directory(parts.pop().unwrap_or_default());
+    }
+    numbered
 }
 
 /// Case-fold each path segment for identity match (ADR-0030 §2).
@@ -164,6 +204,59 @@ pub fn paths_fold_equal(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`Specials/` is a season directory and is not a numbered one**, and the
+    /// whole `wrong.kind` rule turns on the difference. TMDB models `Top Gear:
+    /// Polar Special` as a standalone movie record, so a file in a `Specials/`
+    /// folder may honestly bind to a film; a file in `Season 3/` may not.
+    ///
+    /// The earlier attempt at this rule did not draw the distinction, scored as
+    /// a free win on the generated oracle, and destroyed five correct bindings
+    /// in the real library.
+    #[test]
+    fn specials_is_a_season_directory_but_not_a_numbered_one() {
+        for seg in ["Season 3", "Season 03", "S03", "s3", "SEASON 12"] {
+            assert!(is_season_directory(seg), "{seg}");
+            assert!(is_numbered_season_directory(seg), "{seg}");
+        }
+        for seg in ["Specials", "specials", "Special", "Extras", "extra"] {
+            assert!(is_season_directory(seg), "{seg}");
+            assert!(
+                !is_numbered_season_directory(seg),
+                "{seg} must not read as a numbered season — a film may live here"
+            );
+        }
+        for seg in ["Top Gear", "Season", "Sxx", "Season two"] {
+            assert!(!is_numbered_season_directory(seg), "{seg}");
+        }
+    }
+
+    /// The walk is the one `show_folder_relpath` performs, asked a second
+    /// question — so the two cannot disagree about where the show folder starts.
+    #[test]
+    fn under_numbered_season_reads_the_whole_season_tail() {
+        let root = "/media/TV";
+        for p in [
+            "Top Gear/Season 16/Top Gear - 16x00 - Special.mkv",
+            "Top Gear/S16/x.mkv",
+            "/media/TV/Top Gear/Season 16/x.mkv",
+            // A numbered season anywhere in the season tail counts.
+            "Top Gear/Season 16/Extras/x.mkv",
+        ] {
+            assert!(under_numbered_season_directory(p, root), "{p}");
+        }
+        for p in [
+            "Top Gear/Specials/Polar Special.mkv",
+            "Top Gear/Extras/x.mkv",
+            "Top Gear/x.mkv",
+            "x.mkv",
+        ] {
+            assert!(
+                !under_numbered_season_directory(p, root),
+                "{p} — nothing here says the file cannot be a film"
+            );
+        }
+    }
 
     #[test]
     fn relpath_strips_root() {
