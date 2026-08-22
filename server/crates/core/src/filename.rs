@@ -846,16 +846,25 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     let normalized = stem.replace(['_', '.'], " ");
     let compact = stem.to_ascii_lowercase();
 
-    if let Some((before, season, episode, episode_end)) = find_season_episode(&compact) {
+    if let Some((before, season, numbers)) = find_season_episode(&compact) {
         let title = run_title.clone().unwrap_or_else(|| {
             cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
                 &cut_at_date(&cut_at_title_junk(&cut_stem_at(stem, before))),
             )))
         });
-        let end = if episode_end > episode {
-            Some(episode_end)
-        } else {
-            None
+        // `None` is the declined-number case: the token said television and
+        // the digits were unreadable, so the season, the title cut and the kind
+        // stand and the episode alone is absent.
+        let (episode, end) = match numbers {
+            Some((episode, episode_end)) => (
+                Some(episode),
+                if episode_end > episode {
+                    Some(episode_end)
+                } else {
+                    None
+                },
+            ),
+            None => (None, None),
         };
         return ParsedName {
             // **An absent title is absent.** When the season/episode token
@@ -877,7 +886,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
             kind: MediaKind::Episode,
             year: None,
             season: Some(season),
-            episode: Some(episode),
+            episode,
             episode_end: end,
         };
     }
@@ -974,7 +983,27 @@ fn clean_title(s: &str) -> String {
     out.trim().trim_matches('-').trim().to_string()
 }
 
-/// `(token_start, season, episode_start, episode_end)` — end inclusive.
+/// Where an episode marker starts, the season it names, and the episodes it
+/// covers — `None` for the episodes when the marker's digit run was too wide to
+/// be an episode number.
+type SeasonEpisodeHit = (usize, i32, Option<(i32, i32)>);
+
+/// `(token_start, season, Some((episode_start, episode_end)))` — end inclusive
+/// — or `(token_start, season, None)` when the token **is** an episode marker
+/// whose number could not be read.
+///
+/// **Declining the number must not decline the token.** A run wider than an
+/// episode number means the digits are not an episode number; it does not mean
+/// `S01E123456` is a film. Returning `None` for the whole scan sent the name to
+/// the movie arm, which threw away the title cut and flipped the kind — and a
+/// wrong kind is the worst class in the oracle's `ORDER`, traded for the one
+/// wrong field the decline was written to avoid. The token is still evidence of
+/// television; only its number is unreadable, so the season, the cut and the
+/// kind all survive and the episode alone goes absent.
+///
+/// **A later whole token still wins.** The declined candidate is remembered and
+/// the scan runs on, so a name carrying both an unreadable and a readable
+/// marker reports the readable one.
 ///
 /// Season 0 is a season. Every provider models specials as season 0, and the
 /// coverage predicate already excludes it from the fit check by name
@@ -983,9 +1012,13 @@ fn clean_title(s: &str) -> String {
 /// it. Episode 0 is still refused: nothing measured asserts a real `E00`, and
 /// the one corpus case that expects episode 0 is Sonarr's sentinel for "this
 /// name carries no standard episode number", not an episode called zero.
-fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
+fn find_season_episode(lower: &str) -> Option<SeasonEpisodeHit> {
     // S01E02 / s1e2 (no range forms in dogfood; single episode only)
     let bytes = lower.as_bytes();
+    // The first `S<season>E<digits…>` whose digit run was too wide to be an
+    // episode number. Held rather than returned, so a whole token later in the
+    // name still wins.
+    let mut declined: Option<(usize, i32)> = None;
     let mut i = 0;
     // `i + 2` because the shortest token is three bytes (`1x1`). `i + 3`
     // stopped at `len - 4` and so could never read a token that ended the
@@ -1032,7 +1065,16 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
                 let (episode, edigits, whole) = read_episode_digits(bytes, &mut j);
                 if edigits > 0 && episode > 0 && whole {
                     let end = extend_episode_span(bytes, j, season, episode);
-                    return Some((i, season, episode, end));
+                    return Some((i, season, Some((episode, end))));
+                }
+                // **The marked spelling, and only the marked spelling.** An `S`
+                // and an `E` around the digits are the same evidence that lets
+                // the season arm carry four digits. The bare `NNxNNNNNN` has
+                // neither, and it is the shape of a resolution — so a wide run
+                // there stays a decline of the whole token rather than an
+                // assertion that the file is television.
+                if edigits > 0 && !whole && declined.is_none() {
+                    declined = Some((i, season));
                 }
             }
         }
@@ -1061,13 +1103,13 @@ fn find_season_episode(lower: &str) -> Option<(usize, i32, i32, i32)> {
                 let (episode, edigits, whole) = read_episode_digits(bytes, &mut j);
                 if edigits > 0 && episode > 0 && whole {
                     let end = extend_episode_span(bytes, j, season, episode);
-                    return Some((i, season, episode, end));
+                    return Some((i, season, Some((episode, end))));
                 }
             }
         }
         i += 1;
     }
-    None
+    declined.map(|(at, season)| (at, season, None))
 }
 
 /// The widest episode number an episode marker may carry.
@@ -1681,15 +1723,58 @@ mod tests {
         assert_eq!(p.episode, Some(1527));
     }
 
-    /// A run wider than an episode number means the token is not an episode
-    /// marker — the parser declines it rather than using the first five digits.
-    /// Declining is the safe direction: the file reports no episode instead of
-    /// the wrong one.
+    /// A run wider than an episode number means the **number** is not an
+    /// episode number. The parser declines the number rather than using the
+    /// first five digits, and it declines nothing else.
+    ///
+    /// **Asserting the two fields that motivated the rule is what let the last
+    /// version of this through.** It checked `season` and `episode` and never
+    /// looked at `kind` or `title`, so it read as a pass while the decline was
+    /// also throwing away the title cut and calling the file a film — one wrong
+    /// field traded for three, and a wrong kind is the worst class in the
+    /// oracle's `ORDER`. All four are asserted here, on every case.
+    ///
+    /// What the parser returns for `S<season>E<unreadable>`: **season** the
+    /// season it read, **episode** `None`, **kind** `Episode`, **title** the cut
+    /// at the token — exactly what it returns for a season pack, because that is
+    /// what the name now amounts to.
     #[test]
-    fn a_digit_run_too_wide_for_an_episode_is_not_an_episode() {
-        let p = parse_filename("Series.S01E123456.1080p.mkv");
+    fn a_digit_run_too_wide_for_an_episode_declines_the_number_and_nothing_else() {
+        let p = parse_filename("Show.Name.S01E123456.720p.HDTV.x264-GRP.mkv");
+        assert_eq!(p.season, Some(1));
+        assert_eq!(p.episode, None, "six digits is not an episode number");
+        assert_eq!(
+            p.kind,
+            MediaKind::Episode,
+            "an unreadable episode number does not make the file a film"
+        );
+        assert_eq!(p.title, "Show Name", "the title cut survives the decline");
+        assert_eq!(p.episode_end, None);
+        assert_eq!(p.year, None);
+
+        // A daily serial: season is the year, the episode is the air date, and
+        // the air date is too wide. The title cut is the whole point here — the
+        // movie arm cut this one at the year and returned `Show S`.
+        let p = parse_filename("Show.S2016E20160225.mkv");
+        assert_eq!(p.season, Some(2016));
+        assert_eq!(p.episode, None);
+        assert_eq!(p.kind, MediaKind::Episode);
+        assert_eq!(p.title, "Show");
+        assert_eq!(p.year, None);
+
+        // **The bare `NxNNN` spelling keeps declining the whole token.** It has
+        // no `S` and no `E` to vouch for it and it is the shape of a
+        // resolution, so a wide run there must not assert television.
+        let p = parse_filename("Movie Name 12x3456789 1080p.mkv");
+        assert_eq!(p.kind, MediaKind::Movie);
         assert_eq!(p.season, None);
         assert_eq!(p.episode, None);
+
+        // A whole token later in the name still wins over an earlier decline.
+        let p = parse_filename("Show.S01E123456.S02E03.mkv");
+        assert_eq!(p.season, Some(2));
+        assert_eq!(p.episode, Some(3));
+        assert_eq!(p.kind, MediaKind::Episode);
     }
 
     /// The run breaks on a following **digit** and must not break on a

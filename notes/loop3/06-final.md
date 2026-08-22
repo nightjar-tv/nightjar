@@ -101,7 +101,17 @@ count.
 
 ### Tests
 
-743 → 749 pass, 3 ignored. Nine new. One failure throughout:
+**746 → 758. Twelve new**, split `core +6, db +2, scanner +1, metadata +3`.
+
+The figures published here first — *743 → 749 pass, nine new* — were wrong twice
+over, and did not even reconcile with each other: `743 → 749` is a delta of six,
+against a claim of nine, against an actual twelve. Counted two ways that agree:
+`#[test]` and `#[tokio::test]` attributes under `server/` give 746 at
+`origin/main` and 758 at the tip, and `cargo test --workspace -- --list` at the
+tip lists 758. A per-iteration count that is never added up is how three tests
+went missing from the total.
+
+One failure throughout:
 `hls::tests::mapped_real_library_end_moov_mp4_copy_keeps_aac`, which fails
 **identically at the base** when the `transcode` package runs its 158 tests
 together and passes alone. `cargo fmt --check` and `cargo clippy --all-targets
