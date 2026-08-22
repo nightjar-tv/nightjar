@@ -1,6 +1,6 @@
 # Iteration 2 — F5: a root group read the whole library's episode titles
 
-**Kept.** `c50e157`. Every wrong binding outside `movie.*` and `tv.episodetitle`
+**Kept.** `5c52e01`. Every wrong binding outside `movie.*` and `tv.episodetitle`
 is gone, and nothing traded for it.
 
 ## The population

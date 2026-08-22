@@ -1,6 +1,6 @@
 # Iteration 5 — a date is not part of the title
 
-**Kept.** `9c29ce9`. Corpus 71.8% → **72.1%**.
+**Kept.** `36048bb`. Corpus 71.8% → **72.1%**.
 
 ## The population
 
@@ -56,7 +56,7 @@ The sweep holds **five `9-1-1` names**. So the guard was tested rather than
 trusted: a variant with it removed, built as a `git stash create` commit so the
 branch never carried it, run through the whole sweep.
 
-    base (539c477): 74624 parsed
+    base (48dc403): 74624 parsed
     head (ce54bd2 — guard removed): 74624 parsed
     HEAD right, BASE wrong 0
     BASE right, HEAD wrong 0

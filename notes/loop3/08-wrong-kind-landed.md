@@ -1,6 +1,6 @@
 # Iteration 6 — `wrong.kind`: warmed, measured, kept
 
-**Kept.** `cb780b8`. The 573 are gone. Nothing else moved.
+**Kept.** `a840f1a`. The 573 are gone. Nothing else moved.
 
 Iteration 3 left this blocked because the instrument could not judge it. The
 warm on 2026-08-22 removed the block, and the rule then passed on both
