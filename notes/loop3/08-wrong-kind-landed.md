@@ -77,6 +77,14 @@ directories, `NIGHTJAR_REPARSE=1` both, cache 8,185 before and after.
     ready 24953 = 24953   unmatched 51 = 51   errors 0   requests 0
     groups 3220 -> 3217   (-3)
 
+**Read that as a result about the capture, not about the library.** The capture
+holds 25,004 paths and the dogfood database holds 25,043; 610 database paths are
+absent from the capture and 571 capture paths are absent from the database. The
+two numbers appear a few lines apart in this note as if they were one
+population. They are not — and **all four of the Futurama films this rule
+misclassifies sit in the 610**, so the pair below could not have seen them
+however carefully it was read. What follows is true of 25,004 files.
+
 **The `−3` was chased rather than netted.** Three files, all `Top Gear`:
 
     Top Gear/Season 16/… - 16x00 - The three wise men christmas special
@@ -97,6 +105,21 @@ And the number that decides it:
 **The five `Specials/` movie bindings the previous attempt destroyed are
 untouched.** That is the real library saying the distinction is right, not the
 oracle.
+
+**And the distinction was still too coarse.** A later sweep of `stored_kind`
+over all 25,043 **database** paths — not the capture — found four more files the
+rule moved and should not have:
+
+    Futurama/Season 5/Futurama Bender's Big Score (2007).avi
+    Futurama/Season 5/Futurama Bender's Game (2008).avi
+    Futurama/Season 5/Futurama Into the Wild Green Yonder (2009).avi
+    Futurama/Season 5/Futurama The Beast with a Billion Backs (2008).avi
+
+Four standalone features with their own TMDB movie records, filed under a
+numbered season. The premise *a file under a season directory is not a film* is
+false for them, and `episode_group_key` then bound them to the Futurama series
+with no route back to their movie records. Fixed by reading the file rather than
+the folder — see the commit that follows this note.
 
 | instrument | reading |
 |---|---|

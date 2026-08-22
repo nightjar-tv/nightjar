@@ -86,6 +86,21 @@ recorded rather than netted:
 
 ### The dogfood strict pair
 
+**The capture and the database are two populations, and this note has quoted
+them as one.** The pair replays `capture-media-mac.jsonl`, which holds **25,004**
+paths. The dogfood database holds **25,043**. They are not the same 25,000:
+
+    paths in the database, absent from the capture     610
+    paths in the capture, absent from the database     571
+
+So a row reading *25,004 files* and a row reading *25,043 files* — both appear
+above — describe different libraries, and a claim proved on one is not proved on
+the other. **All four Futurama films are in the 610.** The strict pair cannot
+see them; "3 bindings differ, all gains" was true of the capture and false of
+the library, and it took a `stored_kind` sweep over the database's own paths to
+find that out. Wherever this pair's result is reported, say which population it
+is a result about.
+
 25,004 files, run at iterations 1, 2, 4 and 5. Every run: binaries `sha256`'d
 distinct, separate target directories, `NIGHTJAR_REPARSE=1` and
 `NIGHTJAR_TMDB_CACHE_STRICT=1` on both arms, `errors=0` and `requests=0` on both,
