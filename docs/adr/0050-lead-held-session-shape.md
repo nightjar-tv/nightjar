@@ -178,10 +178,25 @@ run, and the bench now refuses a run where one would not.
 
 ## Consequences
 
-`Session.child: Option<Child>` becomes a per-run set, and `restart_at`,
-`may_kill_cooking_encode`, `coalesce_preempt_before_land` and the segment
-waiter machinery are rewritten around spawn-and-reap rather than kill-and-
-restart. That is the largest single change this ADR implies.
+`Session.child: Option<Child>` becomes a per-run set.
+
+**This deletes more than it adds.** Fifteen functions and three constants in
+`hls.rs` exist to manage the races that killing an encoder mid-scrub creates:
+may this cook be killed yet, is a client still holding the land about to be
+abandoned, is this retained segment stale, should three rapid scrubs coalesce
+into one restart. `classify_restart_desire`, `pending_restart_due`,
+`may_kill_cooking_encode`, `coalesce_preempt_before_land`,
+`no_fill_release_for_new_land`, `prefetch_advances_pending`,
+`digback_behind_committed`, `pending_waiter_action`, `desire_restart`,
+`maybe_apply_pending_restart`, `serve_ok_after_pending_apply`,
+`serve_ok_retained_during_stale_guard`, `restart_at`, `restart_spawn_gap`,
+`disable_preempt`, with `RESTART_MIN_INTERVAL`, `RESTART_COALESCE_QUIET` and
+`STALE_RETAIN_REFUSE`, plus eighteen tests pinning their behaviour.
+
+Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
+client is still asking for it, because the superseded encoder keeps serving its
+land until it is reaped. The replacement is three steps: spawn, suspend, reap
+after the delay in decision 5. Rule 4.5 is satisfied by subtraction.
 
 The 2 s IDR grid is load-bearing here and does not hold on Intel today
 (ADR-0052). A long encoder makes that worse, not better, because it produces
