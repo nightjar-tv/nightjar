@@ -3,6 +3,29 @@
 Branch `loop/board-residual` off `origin/main` at `e3208cc`. Nothing pushed,
 nothing merged, `main` untouched.
 
+## Amendment, 2026-08-23 — iteration 1 is no longer on this branch
+
+**The resolver moved to `metadata/ipv6-interleave`.** A review read the branch
+against `origin/main` and found the product diff was six files, not two, and
+that the IPv4/IPv6 interleave was live at `tmdb/mod.rs:143`, wired into
+`AgentBuilder::resolver`.
+
+It was never hidden — it is board item 1 and this report lists it as kept. But
+it changes the network path for **every user**, and this report's own iteration-1
+entry records that **none of the four instruments can see it**: all four are
+offline, and the resolver closure is only entered on a connect. A change no
+instrument here can measure should not merge on a parser branch's evidence.
+
+So the table below still reads three iterations, and this branch now carries
+**two**. Iteration 1's note, `01-resolver.md`, went with the commit;
+`00-phase0-oracle.md` stayed here, because it is instrument work rather than
+resolver work.
+
+`interleave_families` itself was checked and is sound — exhaustive over all
+2,047 family arrangements of up to ten addresses, with the multiset, the
+per-family order and the leading family all preserved. That is a reason to land
+it cleanly, not a reason to land it here.
+
 ## Phase 0 — the oracle repo
 
 ### What was already done
