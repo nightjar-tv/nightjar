@@ -7765,6 +7765,44 @@ mod tests {
     /// interleaved titles. Synthetic fixtures do not reproduce that pattern:
     /// this path must run against a household end-moov file when the NAS is
     /// mounted. Skips cleanly in CI.
+    ///
+    /// # Run this once, first, or not at all
+    ///
+    /// **Its result depends on run order, so consecutive runs are not
+    /// independent samples and a failure count over a loop of them measures the
+    /// mount rather than the code.**
+    ///
+    /// It reads a 727 MB file over an SMB mount and probes it with `ffmpeg`,
+    /// then asserts where the video lands:
+    ///
+    /// ```text
+    /// video starts at 63.646s, land was 58.975s
+    /// ```
+    ///
+    /// Measured 2026-08-23, eight A/B pairs across two trees, each pair run
+    /// back to back, with the order reversed for the second four:
+    ///
+    /// | | ran first | ran second |
+    /// |---|---|---|
+    /// | tree A | 2/4 failed | 2/4 failed |
+    /// | tree B | 1/4 failed | 4/4 failed |
+    /// | **either tree** | **3/8** | **6/8** |
+    ///
+    /// **By tree the two are 4/8 and 5/8 — indistinguishable. By position, 3/8
+    /// against 6/8.** Tree B looked like a regression at 4/4 purely because it
+    /// had been placed second every time; moving it to the front took it to 1/4.
+    /// The preceding run leaves the mount in a state the next one inherits.
+    ///
+    /// **This has now been misread as a regression twice**, in two different
+    /// sessions, and both readers were looking at this test rather than at
+    /// anyone's notes — which is why the finding is written here.
+    ///
+    /// A skip is honest and a pass is honest. A failure means *this test ran
+    /// second, or the NAS was slow*, until an order-controlled A/B says
+    /// otherwise. Before attributing one to a change, check that the change can
+    /// reach this crate at all: it depends only on `nightjar-core` and
+    /// `nightjar-db`, and only on `VideoEncodePlan`, `content_id_for_path`, `Db`
+    /// and `open` from them.
     #[test]
     fn mapped_real_library_end_moov_mp4_copy_keeps_aac() {
         if !ffmpeg_available() {
