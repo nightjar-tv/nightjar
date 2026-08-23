@@ -1889,6 +1889,18 @@ impl HlsSessionRegistry {
     /// as the declarative alternative and rejected, because it paces against
     /// wall clock and so cannot see a viewer who has stopped: in a 400 s pause
     /// its lead grew from 40 s to 418 s and never recovered.
+    ///
+    /// Applies to copy and remux sessions too. A remux is also one long
+    /// FFmpeg holding a lead, and one concept gets one path (Rule 4.11).
+    ///
+    /// **This runs in tests.** The playhead only moves when a segment is
+    /// fetched through [`HlsSessionRegistry::asset`], so a test that drives
+    /// production without fetching never advances it, reaches
+    /// [`LEAD_TARGET_MS`] and has its encoder suspended. That presents as a
+    /// hang rather than as a throttle. No test does this today. If one starts
+    /// to, fetch the segments rather than reaching for a switch to turn this
+    /// off: a knob here would be standing in for a decision already made
+    /// (Rule 4.12).
     fn throttle_loop(&self) {
         loop {
             std::thread::sleep(THROTTLE_TICK);
