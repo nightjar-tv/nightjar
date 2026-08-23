@@ -835,6 +835,86 @@ fn cut_at_unmatched_close(s: &str) -> String {
     s.to_string()
 }
 
+/// What the layer above the parser knows about the folder a file sits in.
+///
+/// `parse_filename` takes a basename by design and that does not change. This
+/// is how the caller hands it the two things a basename cannot carry, **without
+/// this crate learning where a show folder starts.** `nightjar-core` has no
+/// internal dependencies and `nightjar-db` owns the path walk
+/// (`show_folder_relpath`, `under_numbered_season_directory`,
+/// `season_number_for_path`); a second walk written here would be the
+/// reimplemented-`norm_key` trap, which once reported 25 non-folding folders
+/// where the shipped chain gave 12.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderContext<'a> {
+    /// The show folder's own name — the last segment left once the
+    /// season-directory tail is gone. `nightjar_db::show_folder_relpath`'s
+    /// final component.
+    pub folder_title: Option<&'a str>,
+    /// The numbered season directory the file sits in.
+    /// `nightjar_db::season_number_for_path`.
+    pub season: Option<i32>,
+}
+
+/// [`parse_filename`], then let the folder answer what the basename did not.
+///
+/// **Additive and unwired.** Nothing in the product calls this yet; the three
+/// production call sites still use [`parse_filename`]. It exists so the seam can
+/// be reviewed on its own, before anything moves through it.
+///
+/// ## What it does
+///
+/// 1. **An empty title takes the folder's name.** This is
+///    `nightjar_scanner::stored_title`, moved down unchanged — `S01E01.mkv`
+///    parses to an empty title and the show folder names the show. Moving it
+///    here is behaviour-identical, which is what makes the call sites safe to
+///    move later.
+/// 2. **An episode with no season number takes the folder's.**
+///
+/// ## What it deliberately does not do, and why
+///
+/// **It does not decide the kind.** `nightjar_scanner::stored_kind` remains the
+/// only owner of *a yearless film under a numbered season directory is an
+/// episode*, because that rule reads the whole season tail through
+/// `under_numbered_season_directory` — and that predicate and
+/// `season_number_for_path` disagree on purpose for an over-wide season, where
+/// the file is still not a film but the number is unusable.
+///
+/// **So rule 2 is gated on the kind the basename gave**, and never invents a
+/// season for something the basename called a film. `Futurama/Season 5/Futurama
+/// Bender's Big Score (2007).avi` is a real film in a real library; it keeps
+/// `season: None` here, and `stored_kind` keeps it a film.
+///
+/// **And that gate is why this does not yet move the two shapes it was written
+/// for.** Measured through the shipped chain:
+///
+/// | basename | kind | title | season |
+/// |---|---|---|---|
+/// | `Season 01/Episode 1.mkv` | `Movie` | `"Episode 1"` | `None` |
+/// | `Season 1/01 - Closure.mkv` | `Movie` | `"01 - Closure"` | `None` |
+///
+/// Both parse to `Movie`, so rule 2 does not fire. Both parse to a **non-empty**
+/// title, so rule 1 does not fire either — the folder would have to *override* a
+/// title the basename did assert, which is a different rule from filling a
+/// silence.
+///
+/// Both of those need the kind decided before the title and season are, and the
+/// kind is decided a layer up. **Resolving that layering is the next slice's
+/// work, not this one's** — it is the whole of `tv.handmade` (5,840 oracle rows)
+/// and `tv.episodetitle` (5,844), which read 0.0% correct.
+pub fn parse_filename_in(file_name: &str, ctx: FolderContext<'_>) -> ParsedName {
+    let mut parsed = parse_filename(file_name);
+    if parsed.title.is_empty()
+        && let Some(folder) = ctx.folder_title
+    {
+        parsed.title = folder.trim().to_string();
+    }
+    if parsed.kind == MediaKind::Episode && parsed.season.is_none() {
+        parsed.season = ctx.season;
+    }
+    parsed
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let whole = strip_extension(file_name);
@@ -1182,36 +1262,98 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
     let mut end = start;
     loop {
         let mut k = j;
-        let separated = k < bytes.len() && bytes[k] == b'-';
         // **A dash is not the only separator**, and the other three cost
         // nothing only because a marker has to follow them. `S02E09 E10`,
         // `Series.S03E01.S03E02` and `2x04.2x05` are all one file holding two
         // episodes; a dash-only rule reported the first and claimed success,
         // which is worse than reporting nothing.
-        let soft_separated =
-            !separated && k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_');
-        if separated || soft_separated {
+        //
+        // **The separator is a run, not a byte.** `S07E22 - S07E23` pads its
+        // dash with spaces, and reading one byte stopped on the space with the
+        // second token still in front of it. At most one dash: `--` is not a
+        // separator anyone writes on purpose, and letting the run swallow two
+        // would join things nobody joined.
+        let sep_start = k;
+        let mut dashes = 0;
+        while k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_' | b'-') {
+            if bytes[k] == b'-' {
+                if dashes == 1 {
+                    break;
+                }
+                dashes += 1;
+            }
             k += 1;
         }
+        let sep_len = k - sep_start;
+        let separated = dashes == 1;
         // An optional repeat of the season, in either spelling it appears in:
         // `s06` before an `e`, or `6x` before the number.
         let mut marked = false;
+        // **A repeated season and a two-letter `ep` are *distinctive* markers**;
+        // a lone `e` or `x` is not. See the padded-separator rule below.
+        let mut distinctive = false;
         if let Some((repeated, after)) = read_repeated_season(bytes, k) {
             if repeated != season {
                 break;
             }
             k = after;
             marked = true;
+            distinctive = true;
         }
         if k < bytes.len() && (bytes[k] == b'e' || bytes[k] == b'x') {
+            let e_marker = bytes[k] == b'e';
             k += 1;
+            // **`ep` is a two-letter spelling of the same marker**, and
+            // `S42 Ep10718 - Ep10722` is a real daily-serial name. The digit
+            // has to come **immediately** after the `p`, which is the whole
+            // reason this is safe: the generated library holds 2,877 rows of
+            // `Series - S01E01 - Episode 1.mkv`, and `episode` puts an `i`
+            // where this requires a digit. Consuming `p` on anything looser
+            // would turn every one of those episode titles into a range.
+            if e_marker && k + 1 < bytes.len() && bytes[k] == b'p' && bytes[k + 1].is_ascii_digit()
+            {
+                k += 1;
+                distinctive = true;
+            }
             marked = true;
         }
-        // **A soft separator needs a marker behind it.** Without one the
-        // corpus is full of names where the next token is an episode-title
+        // **Anything but a bare dash needs a marker behind it.** Without one
+        // the corpus is full of names where the next token is an episode-title
         // numeral: `S01E06 3 Beers For Batali`, `S01E04.2-45.PM`,
         // `S02E21 18 5 4`. All three parse correctly today.
-        if soft_separated && !marked {
+        //
+        // A *bare* dash is exempt, and only a bare one: `S15E06-08` is a range
+        // and has always been one. The moment whitespace pads the dash the
+        // exemption goes with it, because ` - ` is also how a name separates an
+        // episode from its title — `Series - S01E04 - 6 Feet Under` must not
+        // read as episodes 4 through 6.
+        //
+        // **And behind a padded separator a lone `e` or `x` is not enough.**
+        // ` - ` is the ordinary separator between an episode and its title, so
+        // the next token is usually a title — and a title may open with a
+        // letter this loop reads as a marker followed by a digit:
+        //
+        //     Show - S01E01 - E3 2019 Highlights.mkv   E3 is an expo
+        //     Show - S01E01 - X2.mkv                   X2 is a film
+        //     Show - S01E01 - E2E Testing.mkv          E2E is end-to-end
+        //
+        // All three read as ranges when a bare marker is accepted here, and
+        // `MAX_EPISODE_RANGE` hides it only when the number is large: `x264`
+        // is refused for its size, `X2` is not. The two names this rule was
+        // written for both carry something a title does not — `S07E22 -
+        // S07E23` repeats the season, `S42 Ep10718 - Ep10722` spells the
+        // marker with two letters. So a padded separator requires one of
+        // those, and a bare `e`/`x` extends only behind a bare dash, exactly
+        // as it did before this rule existed.
+        //
+        // This declines `Show - S01E01 - E02.mkv`, which may well be a range.
+        // Declining is the right failure: an absent claim costs a range, a
+        // wrong one costs the episode a file binds to.
+        let padded = sep_len > 1;
+        if (!separated || padded) && !marked {
+            break;
+        }
+        if padded && !distinctive {
             break;
         }
         // Something must separate this token from the last, or a stray trailing
@@ -1381,6 +1523,131 @@ fn find_bare_year(s: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx<'a>(folder: Option<&'a str>, season: Option<i32>) -> FolderContext<'a> {
+        FolderContext {
+            folder_title: folder,
+            season,
+        }
+    }
+
+    /// **With nothing to say, the folder says nothing.** This is the property
+    /// that makes the call sites safe to move: an empty context must leave the
+    /// parse byte-identical, so a caller that has no folder gets exactly what it
+    /// gets today.
+    #[test]
+    fn an_empty_context_changes_nothing() {
+        for name in [
+            "Show - S01E01 - Pilot.mkv",
+            "S01E01.mkv",
+            "Episode 1.mkv",
+            "01 - Closure.mkv",
+            "Fight Club (1999).mkv",
+            "Series Title - S07E22 - S07E23 - And Lots of Security.. [HDTV-720p].mkv",
+            "The Series And The Code - S42 Ep10718 - Ep10722",
+            "",
+            "no-extension",
+            "1x01x02 - Two.mkv",
+        ] {
+            assert_eq!(
+                parse_filename_in(name, FolderContext::default()),
+                parse_filename(name),
+                "empty context moved {name:?}"
+            );
+        }
+    }
+
+    /// Rule 1 — `stored_title`'s substitution, moved down and unchanged.
+    /// `S01E01.mkv` parses to an empty title; the show folder names the show.
+    #[test]
+    fn an_empty_title_takes_the_folder_name() {
+        let p = parse_filename_in("S01E01.mkv", ctx(Some("Dept. Q (2025)"), None));
+        assert_eq!(p.title, "Dept. Q (2025)");
+        assert_eq!(p.kind, MediaKind::Episode);
+        assert_eq!(p.season, Some(1), "the basename's own season is untouched");
+        assert_eq!(p.episode, Some(1));
+    }
+
+    /// **A title the basename asserted is never overwritten.** Filling a silence
+    /// and overriding a claim are different rules, and only the first is here.
+    #[test]
+    fn a_parsed_title_is_never_overwritten_by_the_folder() {
+        for name in [
+            "Show - S01E01 - Pilot.mkv",
+            "Episode 1.mkv",
+            "01 - Closure.mkv",
+        ] {
+            let with = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
+            let without = parse_filename(name);
+            assert_eq!(with.title, without.title, "folder overwrote {name:?}");
+        }
+    }
+
+    /// Rule 2 — an episode with no season of its own takes the folder's.
+    #[test]
+    fn an_episode_without_a_season_takes_the_folders() {
+        // `E05.mkv` is an episode marker with no season.
+        let p = parse_filename_in("E05.mkv", ctx(Some("Some Show"), Some(3)));
+        if p.kind == MediaKind::Episode && parse_filename("E05.mkv").season.is_none() {
+            assert_eq!(p.season, Some(3));
+        }
+        // A basename that names its own season keeps it.
+        let q = parse_filename_in("S01E01.mkv", ctx(Some("Some Show"), Some(9)));
+        assert_eq!(
+            q.season,
+            Some(1),
+            "the folder must not overrule the basename"
+        );
+    }
+
+    /// **A film under a numbered season directory keeps no season.**
+    /// `Futurama/Season 5/Futurama Bender's Big Score (2007).avi` is a real film
+    /// in a real library. Inventing a season for it here would put a season on a
+    /// movie row, and `stored_kind` — which correctly keeps it a film, because it
+    /// carries its own year — would never get the chance to disagree.
+    #[test]
+    fn a_film_under_a_season_directory_gets_no_season() {
+        let name = "Futurama Benders Big Score (2007).avi";
+        let p = parse_filename_in(name, ctx(Some("Futurama"), Some(5)));
+        assert_eq!(p.kind, MediaKind::Movie);
+        assert_eq!(p.year, Some(2007));
+        assert_eq!(p.season, None, "a film has no season");
+    }
+
+    /// The two shapes this seam exists for, asserted as **still unmoved**, so
+    /// the next slice starts from a recorded position rather than a memory.
+    /// Both parse to `Movie` with a non-empty title, so neither rule fires.
+    #[test]
+    fn the_two_shapes_it_was_written_for_do_not_move_yet() {
+        // The **parsed** title, not the cleaned search query. `oracle_query`
+        // prints `clean_show_title`'s output — `01 Closure` — and reading that
+        // as the parse is how this test was wrong the first time.
+        for (name, title) in [
+            ("Episode 1.mkv", "Episode 1"),
+            ("01 - Closure.mkv", "01 - Closure"),
+        ] {
+            let p = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
+            assert_eq!(p.kind, MediaKind::Movie, "{name:?} kind");
+            assert_eq!(p.title, title, "{name:?} title");
+            assert_eq!(p.season, None, "{name:?} season");
+            assert_eq!(p.episode, None, "{name:?} episode");
+        }
+    }
+
+    /// A folder name is trimmed, and an absent one leaves the empty title empty
+    /// rather than substituting something that is not a title.
+    #[test]
+    fn folder_title_is_trimmed_and_optional() {
+        assert_eq!(
+            parse_filename_in("S01E01.mkv", ctx(Some("  Spaced Show  "), None)).title,
+            "Spaced Show"
+        );
+        assert_eq!(
+            parse_filename_in("S01E01.mkv", ctx(None, None)).title,
+            "",
+            "no folder, no title"
+        );
+    }
 
     /// **A number in the title is not the year.** `find_year` took the first
     /// four digits anywhere, so `Wonder Woman 1984 (2020)` parsed as 1984 —
@@ -3006,6 +3273,70 @@ mod multi_episode_spellings {
         assert_eq!(
             parse_filename("Series.S01E91-E100.mkv").episode_numbers(),
             vec![91]
+        );
+    }
+
+    /// **What the padded-separator rule permits, not just what it rejects.**
+    ///
+    /// ` - ` is the ordinary separator between an episode and its title, so
+    /// the token after it is usually a title — and a title may open with a
+    /// letter this loop reads as a marker followed by a digit. Each of these
+    /// read as a range while a bare `e`/`x` was accepted behind a padded
+    /// separator, and `MAX_EPISODE_RANGE` hid it only where the number was
+    /// large enough to trip the cap: `x264` was refused for its size, `X2`
+    /// was not.
+    ///
+    /// Every field is asserted, because the rule that shipped before this one
+    /// moved two nobody checked.
+    #[test]
+    fn a_padded_separator_does_not_read_a_title_as_a_range() {
+        for name in [
+            "Show - S01E01 - E3 2019 Highlights.mkv", // E3 is an expo
+            "Show - S01E01 - X2.mkv",                 // X2 is a film
+            "Show - S01E01 - X2 Review.mkv",
+            "Show - S01E01 - E2E Testing.mkv", // E2E is end-to-end
+            "Show - S01E01 - x264-GRP.mkv",
+            "Show - S01E01 - Exit 8.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.kind, crate::MediaKind::Episode, "{name:?} kind");
+            assert_eq!(p.title, "Show", "{name:?} title");
+            assert_eq!(p.season, Some(1), "{name:?} season");
+            assert_eq!(p.episode, Some(1), "{name:?} episode");
+            assert_eq!(p.episode_end, None, "{name:?} must not open a range");
+            assert_eq!(p.year, None, "{name:?} year");
+            assert_eq!(p.episode_numbers(), vec![1], "{name:?} run");
+        }
+    }
+
+    /// And the two names the rule exists for still extend, because each
+    /// carries a marker a title does not: a repeated season, or `ep` spelled
+    /// with two letters.
+    #[test]
+    fn a_padded_separator_still_extends_a_distinctive_marker() {
+        let p = parse_filename(
+            "Series Title - S07E22 - S07E23 - And Lots of Security.. [HDTV-720p].mkv",
+        );
+        assert_eq!(p.season, Some(7));
+        assert_eq!(p.episode_numbers(), vec![22, 23]);
+        let q = parse_filename("The Series And The Code - S42 Ep10718 - Ep10722");
+        assert_eq!(q.season, Some(42));
+        assert_eq!(q.episode, Some(10718));
+        assert_eq!(q.episode_end, Some(10722));
+    }
+
+    /// **A bare dash keeps the exemption it always had.** The padded rule
+    /// narrows nothing behind an unpadded dash, so `S15E06-08` and
+    /// `S01E01-E02` read exactly as they did before either rule existed.
+    #[test]
+    fn a_bare_dash_still_needs_no_distinctive_marker() {
+        assert_eq!(
+            parse_filename("Show.S15E06-08.mkv").episode_numbers(),
+            vec![6, 7, 8]
+        );
+        assert_eq!(
+            parse_filename("Show.S01E01-E02.mkv").episode_numbers(),
+            vec![1, 2]
         );
     }
 
