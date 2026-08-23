@@ -56,6 +56,19 @@ A synthetic full-title playlist cannot be reintroduced without new player
 evidence that overturns that probe. Drawing a scrubber from item duration
 covers the bar, not the seek — that is the ADR-0016 failure mode.
 
+**Superseded for transcode 2026-08-23 by
+[ADR-0054](0054-full-title-playlist-for-transcode.md), which meets this bar.**
+The probe above tested shapes that listed a *window*, and nobody could build a
+full-title listing in July: it needs a cheap encoder start at arbitrary media
+time, which [ADR-0023](0023-cluster-map-byte-offset-start.md) delivered the
+following day, and a bounded wait for a cold URI, which
+[ADR-0050](0050-lead-held-session-shape.md) §4 delivered by spawning an encoder
+on a seek rather than restarting one. The full-title shape was then measured on
+AVPlayer, iPhone Safari and hls.js on 2026-08-20: seekable range spans the
+title with a fifth of the segments on disk, and far seeks land without
+clamping. The copy measurement below is untouched and copy keeps this section's
+listing.
+
 ## Decision
 
 1. **Producer owns boundaries.** Muxer cut rules are the source of truth for
