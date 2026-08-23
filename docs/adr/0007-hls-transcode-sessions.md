@@ -1,6 +1,8 @@
 # ADR-0007: HLS software-transcode sessions
 
-- Status: accepted
+- Status: **§3 (concurrency cap model) and §4 (seek as kill and restart)
+  superseded by [ADR-0050](0050-lead-held-session-shape.md). The rest
+  stands.**
 - Date: 2026-07-25
 
 ## Context
@@ -24,14 +26,23 @@ on long titles.
    a refcount so two browsers at the same encode window share one FFmpeg.
    `DELETE` decrements the refcount and only reaps when it hits zero. Playback-info
    exposes `sessionsUrl`; `streamUrl` stays for byte streams (direct/remux).
-3. **Lifecycle (Gate 2: no orphaned FFmpeg).** Concurrent sessions are capped by
+3. **Lifecycle (Gate 2: no orphaned FFmpeg).** **Superseded by
+   [ADR-0050](0050-lead-held-session-shape.md) §6–§8:** the live-session cap
+   is replaced by admission on measured encoder load, and concurrent encoding
+   is never capped below the live transcode-session count. Idle timeout,
+   explicit DELETE, startup sweep and reap-without-zombies all stand.
+   Concurrent sessions are capped by
    `NIGHTJAR_HLS_MAX_SESSIONS` (default 3, the Gate 2 N100 figure). Idle
    timeout: no playlist or segment request for 60 seconds force-reaps the
    session **regardless of refcount**. Crashed or sleeping tabs never DELETE;
    without idle beating the counter, refs only go up. Explicit DELETE on
    teardown (and `pagehide`) still releases a holder. Startup sweeps leftover
    session dirs. Process kill waits and reaps so no zombies remain.
-4. **Seek = restart or fork, retain prior segments.** A lone holder may restart
+4. **Seek = restart or fork, retain prior segments.** **Superseded by
+   [ADR-0050](0050-lead-held-session-shape.md) §4–§5:** a seek starts a second
+   encoder and reaps the prior one on an idle delay, measured at 1132 ms
+   against 2187 ms for kill-and-restart. Retaining prior segments stands and
+   is now the segment map's job (ADR-0020). A lone holder may restart
    in place via playlist `?startMs=` or a far-ahead segment fetch (kill FFmpeg,
    `-ss` / `-start_number` / `-output_ts_offset`, do **not** wipe prior-window
    segments — Gate 2: in-flight fetches must not 404 while the new window

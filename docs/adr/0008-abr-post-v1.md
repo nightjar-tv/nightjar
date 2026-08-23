@@ -1,6 +1,10 @@
 # ADR-0008: Adaptive bitrate is post-v1
 
-- Status: accepted
+- Status: **§1 superseded by [ADR-0051](0051-abr-is-v1.md) — ABR ships in
+  v1. §2, §3 and §4 stand, and stop being conditions for later: they are now
+  requirements of the shipping product. §3 is amended by
+  [ADR-0052](0052-keyframe-cadence-per-encode-leg.md), which makes the IDR
+  cadence per encode leg and derives it from the source frame rate.**
 - Date: 2026-07-26
 
 ## Context
@@ -26,6 +30,13 @@ keyframe alignment across any future renditions.
    from the client capability profile, plus manual quality selection in clients.
    Automatic quality adjustment for changing network conditions is a Later
    roadmap item, not committed work.
+
+   **Superseded by [ADR-0051](0051-abr-is-v1.md) (2026-08-23):** ABR ships in
+   v1, as three rungs with the client choosing. The reasoning that changed is
+   recorded there: the server-to-client contract is cheaper to get right
+   before the Flutter clients exist than after, and a ladder is the same
+   session contract with more than one rendition rather than a feature bolted
+   onto it.
 
 2. **Segment duration is locked at 2 seconds for encoded renditions.** The HLS
    media playlist for transcode (and any future ABR ladder) uses a 2s target

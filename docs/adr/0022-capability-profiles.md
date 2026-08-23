@@ -101,7 +101,9 @@ web-player inspection 2026-08-02 (Garrett): HDR10, P8.1, P7 MEL, P7 FEL
 correct; P8.4 visual unknown; P5 failed session via named refuse —
 the libplacebo DV spike note, 2026-08-02.
 
-ABR ladder selection stays post-v1 (ADR-0008). v1 still picks one server
+ABR ladder selection was post-v1 (ADR-0008) and now ships in v1
+([ADR-0051](0051-abr-is-v1.md)); the ceilings below decide which rungs a
+client may be offered. v1 still picks one server
 rendition (Auto / High / Original) from the profile ceiling.
 
 ### 5. Capability ceilings vs policy ceilings
@@ -178,6 +180,10 @@ direct play on Matroska for the clients we already decided exist.
 
 **Fold bitrate into ADR-0008 ABR now.** Rejected: ADR-0008 parked ABR post-v1;
 a single ceiling for Auto is enough for Gate 2 remote watchability.
+**The premise changed 2026-08-23** ([ADR-0051](0051-abr-is-v1.md)): ABR ships
+in v1. The rejection still reads correctly for what it decided at the time,
+which was not to fold bitrate selection into a ladder that did not exist. The
+ceilings here now choose which rungs a client is offered.
 
 ## Consequences
 

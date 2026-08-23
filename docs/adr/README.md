@@ -24,8 +24,8 @@ not here — this page is the reference, not the tour.
 | [0004](0004-async-scan-jobs.md) | Async scan jobs and Gate 1 index-pass criterion | Accepted | — | — |
 | [0005](0005-gate1-close-pi-carry.md) | Close Gate 1 with Pi hardware scan carried forward | Accepted | — | — |
 | [0006](0006-phase2-remux-decision.md) | Phase 2 playback decision engine and remux delivery | Partially superseded | [0003](0003-phase1-schema-api.md) §5 | [0011](0011-remux-session-convergence.md) (delivery / remux job / cache / `remuxState`; decision-engine shape stands) |
-| [0007](0007-hls-transcode-sessions.md) | HLS software-transcode sessions | Accepted | — | — |
-| [0008](0008-abr-post-v1.md) | Adaptive bitrate is post-v1 | Accepted | — | — |
+| [0007](0007-hls-transcode-sessions.md) | HLS software-transcode sessions | Partially superseded | — | §3 (cap model) and §4 (seek = restart) by [0050](0050-lead-held-session-shape.md) |
+| [0008](0008-abr-post-v1.md) | Adaptive bitrate is post-v1 | Partially superseded | — | §1 by [0051](0051-abr-is-v1.md) (ABR ships in v1; §2–§4 stand and are now load-bearing), §3 amended by [0052](0052-keyframe-cadence-per-encode-leg.md) |
 | [0009](0009-hw-accel-detection.md) | Hardware encode detection by verification | Accepted (amended 2026-08-03, 2026-08-11) | — | — |
 | [0010](0010-text-subs-webvtt.md) | Text subtitle tracks as WebVTT sidecars | Partially superseded | — | §7 by [0013](0013-subtitle-extraction-at-scan.md) |
 | [0011](0011-remux-session-convergence.md) | Remux converges onto the session model | Accepted | [0006](0006-phase2-remux-decision.md) (delivery decisions) | — |
@@ -65,6 +65,9 @@ not here — this page is the reference, not the tour.
 | [0047](0047-title-extension-admission-and-collision-evidence.md) | What may count as a title match, and what evidence may break a tie | **Proposed** | — | — |
 | [0048](0048-yearless-movie-collisions.md) | What may decide a yearless movie collision | **Accepted** (option B) | — | — |
 | [0049](0049-what-is-a-show-folder.md) | What counts as a show folder when the directory is per-episode | **Proposed** | — | — |
+| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
+| [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
+| [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
 
 ## Why the numbers jump from 0043 to 0046
 
