@@ -1,6 +1,6 @@
 # ADR-0050: A transcode session is one throttled encoder holding a lead
 
-- Status: **proposed**
+- Status: **proposed** (§5 reap delay measured and amended 2026-08-23)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -117,10 +117,31 @@ run, and the bench now refuses a run where one would not.
    shrinks, seven accumulated in ten minutes at N=4, and about 22 fit in that
    box's free memory.
 
-   Reaping on a delay bounds memory at roughly seek-rate times delay while
-   keeping decision 4's benefit. **The delay is not yet measured** and must
-   be, before this ships. Do not guess it, and do not ship an unbounded held
-   set.
+   **Measured 2026-08-23 (amendment).** Five runs at N=4, a 300 s forward seek
+   every 120 s, the superseded encode suspended on the seek and terminated
+   after the delay:
+
+   | delay | median seek | max | held RSS |
+   |---|---|---|---|
+   | 2 s | 1438 ms | 2381 | 0 |
+   | 5 s | 976 ms | 1961 | 0 |
+   | 15 s | 1083 ms | 2120 | 0 |
+   | never | 1241 ms | 2065 | 1591 MB |
+
+   Every delayed arm ends holding nothing, and 5 s and 15 s match or beat
+   never reaping. **2 s is the worst arm because it is not clear of the seek
+   it follows**: first byte lands at a 1.0-1.4 s median and a 2.4 s maximum, so
+   at 2 s the destruction still fires while a new encoder is starting. That is
+   the same contention as decision 4, and it sets the floor.
+
+   **The delay must clear the measured first-byte maximum, with margin.** 5 s
+   on this hardware. It is not a tuned optimum: it beats never reaping by
+   200-300 ms against a 110 ms run-to-run spread, on one run of seven seeks.
+   What is established is that a delay past the first byte costs nothing and
+   removes 1591 MB.
+
+   Memory is then bounded by seek-rate times delay, so there is no budget to
+   size and no eviction order to choose. Do not ship an unbounded held set.
 
 6. **Do not cap concurrent encoding below the live transcode-session count.**
    `slots = N`. Capping saves no work; it selects which session waits. At
@@ -157,10 +178,25 @@ run, and the bench now refuses a run where one would not.
 
 ## Consequences
 
-`Session.child: Option<Child>` becomes a per-run set, and `restart_at`,
-`may_kill_cooking_encode`, `coalesce_preempt_before_land` and the segment
-waiter machinery are rewritten around spawn-and-reap rather than kill-and-
-restart. That is the largest single change this ADR implies.
+`Session.child: Option<Child>` becomes a per-run set.
+
+**This deletes more than it adds.** Fifteen functions and three constants in
+`hls.rs` exist to manage the races that killing an encoder mid-scrub creates:
+may this cook be killed yet, is a client still holding the land about to be
+abandoned, is this retained segment stale, should three rapid scrubs coalesce
+into one restart. `classify_restart_desire`, `pending_restart_due`,
+`may_kill_cooking_encode`, `coalesce_preempt_before_land`,
+`no_fill_release_for_new_land`, `prefetch_advances_pending`,
+`digback_behind_committed`, `pending_waiter_action`, `desire_restart`,
+`maybe_apply_pending_restart`, `serve_ok_after_pending_apply`,
+`serve_ok_retained_during_stale_guard`, `restart_at`, `restart_spawn_gap`,
+`disable_preempt`, with `RESTART_MIN_INTERVAL`, `RESTART_COALESCE_QUIET` and
+`STALE_RETAIN_REFUSE`, plus eighteen tests pinning their behaviour.
+
+Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
+client is still asking for it, because the superseded encoder keeps serving its
+land until it is reaped. The replacement is three steps: spawn, suspend, reap
+after the delay in decision 5. Rule 4.5 is satisfied by subtraction.
 
 The 2 s IDR grid is load-bearing here and does not hold on Intel today
 (ADR-0052). A long encoder makes that worse, not better, because it produces
@@ -170,7 +206,7 @@ Copy and remux sessions keep ADR-0020's per-run map-assembled playlist. They
 cut at source keyframes and cannot hold a uniform grid, which is the same
 reason ADR-0020 gave and is unaffected by anything here.
 
-Unmeasured, and not to be guessed: the reap delay in decision 5, and any
-Windows suspend behaviour. Real seek and rung-hop rates are still uncaptured;
+Unmeasured, and not to be guessed: any Windows suspend behaviour. The reap
+delay in decision 5 was measured on 2026-08-23 and is recorded there. Real seek and rung-hop rates are still uncaptured;
 the origin sees every one of them in the GET stream, so they are an
 observation to collect after shipping rather than a constant to invent.
