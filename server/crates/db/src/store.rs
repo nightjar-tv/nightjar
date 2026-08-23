@@ -131,6 +131,9 @@ pub struct MediaItemRow {
     pub height: Option<i32>,
     /// Video stream bitrate from ffprobe (ADR-0022); NULL until probed.
     pub video_bitrate_bps: Option<i64>,
+    /// Source frame rate as a rational (ADR-0052); NULL until probed.
+    pub video_frame_rate_num: Option<i64>,
+    pub video_frame_rate_den: Option<i64>,
     /// Source HDR: `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` (ADR-0022).
     pub hdr: Option<String>,
     pub probe_status: String,
@@ -183,6 +186,9 @@ pub struct ProbeUpdate {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub video_bitrate_bps: Option<i64>,
+    /// Source frame rate as a rational (ADR-0052).
+    pub video_frame_rate_num: Option<i64>,
+    pub video_frame_rate_den: Option<i64>,
     pub hdr: Option<String>,
     pub probe_status: String,
     pub scan_error: Option<String>,
@@ -509,13 +515,28 @@ impl Db {
         .map_err(|e| format!("count items for library {library_id}: {e}"))
     }
 
+    /// Record a frame rate resolved outside the probe (ADR-0052 decision 4).
+    /// Does not touch `probe_status`: this is one field filled in, not a probe.
+    pub fn set_item_frame_rate(&self, id: i64, num: i64, den: i64) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE media_items
+                SET video_frame_rate_num = ?2, video_frame_rate_den = ?3
+              WHERE id = ?1",
+            params![id, num, den],
+        )
+        .map_err(|e| format!("set frame rate for item {id}: {e}"))?;
+        Ok(())
+    }
+
     pub fn list_items(&self, library_id: i64) -> Result<Vec<MediaItemRow>, String> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                         year, season, episode, duration_ms, container, video_codec,
-                        audio_codec, audio_channels, width, height, video_bitrate_bps, hdr,
+                        audio_codec, audio_channels, width, height, video_bitrate_bps,
+                        video_frame_rate_num, video_frame_rate_den, hdr,
                         probe_status, scan_error, subtitle_status,
                         content_id, probed_content_id,
                         subtitle_content_id, usable_extent_ms, usable_extent_content_id,
@@ -537,7 +558,8 @@ impl Db {
         conn.query_row(
             "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
                     year, season, episode, duration_ms, container, video_codec,
-                    audio_codec, audio_channels, width, height, video_bitrate_bps, hdr,
+                    audio_codec, audio_channels, width, height, video_bitrate_bps,
+                    video_frame_rate_num, video_frame_rate_den, hdr,
                     probe_status, scan_error, subtitle_status,
                     content_id, probed_content_id,
                     subtitle_content_id, usable_extent_ms, usable_extent_content_id,
@@ -619,6 +641,8 @@ impl Db {
                         width = NULL,
                         height = NULL,
                         video_bitrate_bps = NULL,
+                        video_frame_rate_num = NULL,
+                        video_frame_rate_den = NULL,
                         hdr = NULL,
                         probe_status = 'indexed',
                         scan_error = NULL,
@@ -689,6 +713,8 @@ impl Db {
                 width = ?7,
                 height = ?8,
                 video_bitrate_bps = ?9,
+                video_frame_rate_num = ?13,
+                video_frame_rate_den = ?14,
                 hdr = ?10,
                 probe_status = ?11,
                 scan_error = ?12,
@@ -708,6 +734,8 @@ impl Db {
                 update.hdr,
                 status,
                 update.scan_error,
+                update.video_frame_rate_num,
+                update.video_frame_rate_den,
             ],
         )
         .map_err(|e| format!("apply probe for item {}: {e}", update.item_id))?;
@@ -1544,18 +1572,20 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         width: r.get(15)?,
         height: r.get(16)?,
         video_bitrate_bps: r.get(17)?,
-        hdr: r.get(18)?,
-        probe_status: r.get(19)?,
-        scan_error: r.get(20)?,
-        subtitle_status: r.get(21)?,
-        content_id: r.get(22)?,
-        probed_content_id: r.get(23)?,
-        subtitle_content_id: r.get(24)?,
-        usable_extent_ms: r.get(25)?,
-        usable_extent_content_id: r.get(26)?,
-        map_status: r.get(27)?,
-        map_content_id: r.get(28)?,
-        metadata_status: r.get(29)?,
+        video_frame_rate_num: r.get(18)?,
+        video_frame_rate_den: r.get(19)?,
+        hdr: r.get(20)?,
+        probe_status: r.get(21)?,
+        scan_error: r.get(22)?,
+        subtitle_status: r.get(23)?,
+        content_id: r.get(24)?,
+        probed_content_id: r.get(25)?,
+        subtitle_content_id: r.get(26)?,
+        usable_extent_ms: r.get(27)?,
+        usable_extent_content_id: r.get(28)?,
+        map_status: r.get(29)?,
+        map_content_id: r.get(30)?,
+        metadata_status: r.get(31)?,
     })
 }
 

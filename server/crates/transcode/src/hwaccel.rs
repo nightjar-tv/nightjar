@@ -55,6 +55,16 @@ pub struct EncodeLeg {
     pub encoder_extra: Vec<String>,
     /// Render node or device path recorded by probe (`None` when unused).
     pub device: Option<String>,
+    /// Whether this encoder honours `-force_key_frames` (ADR-0052 decision 3).
+    ///
+    /// `h264_qsv` discards it: measured 2026-08-23 on an N150, the product
+    /// recipe produced 25.025 s segments (600 frames at 23.976 fps) instead of
+    /// the 2 s grid, because `-g` was the only thing it read. That leg needs
+    /// `-forced_idr 1` and a frame-count `-g` derived from the source rate.
+    ///
+    /// A leg whose cadence has not been verified on real hardware keeps the
+    /// conservative pair: send both the expression and the derived `-g`.
+    pub honours_force_key_frames: bool,
 }
 
 impl EncodeLeg {
@@ -62,6 +72,7 @@ impl EncodeLeg {
         Self {
             encoder: "libx264".into(),
             backend: "software".into(),
+            honours_force_key_frames: true,
             pre_input: Vec::new(),
             upload_vf: None,
             pix_fmt: Some("yuv420p".into()),
@@ -74,6 +85,7 @@ impl EncodeLeg {
         Self {
             encoder: "h264_videotoolbox".into(),
             backend: "videotoolbox".into(),
+            honours_force_key_frames: true,
             pre_input: Vec::new(),
             upload_vf: None,
             pix_fmt: Some("yuv420p".into()),
@@ -87,6 +99,7 @@ impl EncodeLeg {
         Self {
             encoder: "h264_qsv".into(),
             backend: "qsv".into(),
+            honours_force_key_frames: false,
             pre_input: Vec::new(),
             upload_vf: None,
             pix_fmt: Some("nv12".into()),
@@ -101,6 +114,7 @@ impl EncodeLeg {
         Self {
             encoder: "h264_vaapi".into(),
             backend: "vaapi".into(),
+            honours_force_key_frames: false,
             pre_input: vec!["-vaapi_device".into(), device.clone()],
             upload_vf: Some("format=nv12,hwupload".into()),
             pix_fmt: None,
@@ -117,6 +131,8 @@ impl EncodeLeg {
         Self {
             encoder: encoder.into(),
             backend: backend.into(),
+            // Unverified leg: assume nothing, send both forms.
+            honours_force_key_frames: false,
             pre_input: Vec::new(),
             upload_vf: None,
             pix_fmt: Some("yuv420p".into()),

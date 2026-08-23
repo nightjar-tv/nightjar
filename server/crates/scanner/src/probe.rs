@@ -18,6 +18,11 @@ pub struct ProbeResult {
     /// `none` | `hdr10` | `dolby_vision` | `dolby_vision_p5` (ADR-0022).
     /// Profile 5 is distinct: IPT-PQ has no zscale tonemap path.
     pub hdr: Option<String>,
+    /// Source frame rate as ffprobe's `avg_frame_rate` rational, numerator
+    /// and denominator (ADR-0052). Kept rational because the encoder derives
+    /// its IDR interval from it: 24000/1001 is not 23.976, and rounding here
+    /// drifts the 2 s grid over a title.
+    pub video_frame_rate: Option<(i64, i64)>,
     /// Subtitle streams the container carries (ADR-0041 Decision 1). The
     /// parser no longer drops them; the probe persists one row per stream.
     pub subtitle_streams: Vec<ProbeSubtitleStream>,
@@ -58,6 +63,7 @@ struct FfStream {
     width: Option<i32>,
     height: Option<i32>,
     bit_rate: Option<String>,
+    avg_frame_rate: Option<String>,
     color_transfer: Option<String>,
     #[serde(default)]
     tags: Option<FfTags>,
@@ -193,6 +199,7 @@ pub fn ffprobe(
     let mut width = None;
     let mut height = None;
     let mut video_bitrate_bps = None;
+    let mut video_frame_rate = None;
     let mut hdr = None;
     let mut subtitle_streams = Vec::new();
     for stream in parsed.streams.unwrap_or_default() {
@@ -207,6 +214,7 @@ pub fn ffprobe(
                     .and_then(|b| b.parse::<i64>().ok())
                     .filter(|&b| b > 0)
                     .or(format_bitrate);
+                video_frame_rate = parse_frame_rate(stream.avg_frame_rate.as_deref());
                 hdr = Some(classify_hdr(
                     stream.color_transfer.as_deref(),
                     &stream.side_data_list,
@@ -247,9 +255,23 @@ pub fn ffprobe(
         width,
         height,
         video_bitrate_bps,
+        video_frame_rate,
         hdr,
         subtitle_streams,
     })
+}
+
+/// Parse ffprobe's `avg_frame_rate` (`"24000/1001"`). Returns `None` for the
+/// forms that carry no rate: absent, `"0/0"` on a stream ffprobe could not
+/// time, and any zero denominator.
+fn parse_frame_rate(raw: Option<&str>) -> Option<(i64, i64)> {
+    let (num, den) = raw?.split_once('/')?;
+    let num: i64 = num.trim().parse().ok()?;
+    let den: i64 = den.trim().parse().ok()?;
+    if num <= 0 || den <= 0 {
+        return None;
+    }
+    Some((num, den))
 }
 
 /// Drain one of ffprobe's pipes on a reader thread so the child can never
