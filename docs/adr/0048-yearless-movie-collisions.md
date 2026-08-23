@@ -1,6 +1,6 @@
 # ADR-0048: What may decide a yearless movie collision
 
-- Status: **proposed**
+- Status: **accepted** (option B)
 - Date: 2026-08-20
 - Supersedes: nothing
 - Depends on: ADR-0026 §2 (the 0.90 auto-match floor this record argues against
@@ -96,6 +96,13 @@ B is the shape that respects both: the evidence is good enough to *rank a
 suggestion* and not good enough to *assert a binding*.
 
 ## Consequences
+
+**Implemented as B.** `fix::search_candidates` marks at most one candidate
+`suggested` — the id the shipped `score_search` chose over the same hits, which
+below the floor is the `exact_title_collision_unpinned` pick. Movies only: the
+88.9% is a movie number, and a show scored on this route would be scored without
+the season shape the drain has. Nothing assigns on the flag; `assign` still takes
+the id the user sent.
 
 **Measurable, but not by the rate.** B moves no oracle row — a below-floor
 suggestion still scores `absent` — so this record cannot be validated by

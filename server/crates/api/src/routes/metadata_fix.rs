@@ -32,6 +32,11 @@ pub struct MetadataCandidateDto {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub year: Option<i32>,
+    /// ADR-0048 B. At most one candidate carries `true`: the entity the
+    /// matcher's own scorer chose and the auto-match floor then declined. A
+    /// rank for the client to lead with, not a binding — assign still needs
+    /// the id the user picked.
+    pub suggested: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +129,7 @@ fn candidates_blocking(
                 id: c.id,
                 title: c.title,
                 year: c.year,
+                suggested: c.suggested,
             })
             .collect(),
     }))

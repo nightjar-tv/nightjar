@@ -1,0 +1,42 @@
+--- /Users/gmacarthur/nightjar-wt-loop3-scratch/gen_library.py.before	2026-08-21 09:44:35
++++ gen_library.py	2026-08-21 09:44:55
+@@ -321,8 +321,39 @@
+                                 None, None, None)]
+     yield "movie.yearfile", [("%s/%s.%s.1080p.BluRay.mkv" % (name, d, yr),
+                               None, None, None)]
++    # **A `Specials/` directory over a file whose correct binding is a movie
++    # record.** No shape had this, and its absence is why a `wrong.kind` fix
++    # scored as a free win on this instrument while it destroyed five correct
++    # bindings in the real library: TMDB models `Top Gear: Polar Special` as a
++    # standalone movie, and the rule "a season directory means the file is not a
++    # film" is false for exactly that shape. Five dogfood files were the only
++    # guard, which is thin for a rule that broad.
++    #
++    # The parent is a **show's** name, not the film's, because that is the real
++    # case — a film sitting in a show's `Specials/` folder. It does not reach the
++    # query: the shipped chain gives `Top Gear/Specials/Polar Special.mkv` the
++    # query `Polar Special` with no year, the same query `movie.noyear` builds,
++    # so the only difference between the two shapes that the drain can act on is
++    # the directory. The folder carries no `(YYYY)` for the same reason —
++    # `year_from_path` reads one two parents up and would resolve the collision
++    # `movie.noyear` exists to keep unresolved.
++    #
++    # Every query this shape needs is already cached: it is `movie.noyear`'s.
++    yield "movie.specials", [("%s/Specials/%s.1080p.BluRay.mkv"
++                              % (specials_folder(e), d), None, None, None)]
+ 
+ 
++# The show folder `movie.specials` hangs its `Specials/` directory under. Keyed
++# on the entity id so the same film lands under the same folder on every run and
++# a row can be traced back; the set is the oracle's own TV entities, so the name
++# is a real show name rather than an invented one.
++_SPECIALS_PARENTS = sorted(safe(e["name"]) for e in ents if e["kind"] == "tv")
++
++
++def specials_folder(e):
++    return _SPECIALS_PARENTS[e["id"] % len(_SPECIALS_PARENTS)]
++
++
+ # ---- build -----------------------------------------------------------------
+ byshape = collections.defaultdict(list)   # shape -> [(entity, rows)]
+ for e in ents:

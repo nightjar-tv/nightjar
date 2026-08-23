@@ -17,9 +17,10 @@ pub use walk::{
 };
 pub use watch::spawn_library_watcher;
 
-use nightjar_core::parse_filename;
+use nightjar_core::{MediaKind, parse_filename};
 use nightjar_db::{
     Db, ItemPathRow, UpsertItem, fold_path, resolve_media_path, show_folder_relpath, to_relpath,
+    under_numbered_season_directory,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,107 @@ pub fn stored_title(parsed_title: String, stored: &str, library_root: &str) -> S
     } else {
         parsed_title
     }
+}
+
+/// The kind the scanner stores for one file: the parsed kind, except that a
+/// file inside a **numbered** season directory is an episode — unless the
+/// basename asserts its own year, which no episode title does and every film
+/// does.
+///
+/// **One rule, three consumers (Rule 4.11)**, and the third is the reason this
+/// is a function rather than two lines inline. Both scanner indexing paths need
+/// it, and so does the matcher oracle's replay harness — which re-derives every
+/// field the scanner interprets and has now been caught twice re-deriving one of
+/// them differently. `stored_title` is the sibling this copies.
+///
+/// ## Why the folder decides
+///
+/// `parse_filename` takes a basename. `Closure.mkv` carries no season, no
+/// episode and nothing that says "television", so the parser calls it a movie —
+/// correctly, on the evidence it has. **The scanner is the layer that has the
+/// folder**, and `Show/Season 1/Closure.mkv` is not a film. The oracle measures
+/// 573 episode files bound to films for exactly this reason, and a wrong kind is
+/// the worst verdict in the suite: the file has left the TV library altogether,
+/// which no re-match inside that library can fix.
+///
+/// ## Why the file overrides the folder
+///
+/// **The folder is evidence, not proof.** The first cut of this rule read the
+/// folder alone, and "a file under a season directory is not a film" is false
+/// wherever a library files a film under `Season N/` — which the dogfood
+/// library does, four times:
+///
+/// ```text
+/// Futurama/Season 5/Futurama Bender's Big Score (2007).avi
+/// Futurama/Season 5/Futurama Bender's Game (2008).avi
+/// Futurama/Season 5/Futurama Into the Wild Green Yonder (2009).avi
+/// Futurama/Season 5/Futurama The Beast with a Billion Backs (2008).avi
+/// ```
+///
+/// Four standalone direct-to-DVD features, each with its own TMDB movie record.
+/// They are misfiled — they belong in a specials directory — and the matcher
+/// still has to cope, because real libraries are misfiled. **And it is worse
+/// than a wrong search**: `episode_group_key` ignores the cleaned title when the
+/// show folder is non-empty, so once these are episodes they join the group
+/// bound to the Futurama series and cannot reach their movie records by any
+/// route.
+///
+/// So the discriminator is the file, not the folder: **a basename asserting its
+/// own year and carrying no episode marker is a film, wherever it sits.** A
+/// `MediaKind::Movie` from `parse_filename` is already the statement that no
+/// season/episode token was read — the parser's movie arm is the only one that
+/// returns it, and it returns `season: None, episode: None` with it — so the
+/// year is the one bit this needs beyond the kind.
+///
+/// **The cost is measured, and it is zero.** All 573 `wrong.kind` rows the
+/// oracle scores are `tv.episodetitle` — `Dept. Q/Season 1/Episode 1.mkv` — and
+/// **not one of the 573 carries a four-digit run of any kind in its basename**,
+/// let alone a year. The rule buys the four Futurama films and gives up none of
+/// the 573. What it does give up is an episode whose *title* contains a year and
+/// which carries no episode number — `Season 1/Christmas 1999.mkv`. None exists
+/// in the dogfood library or in any generated shape; it is the honest price, and
+/// it is a file the folder rule was guessing about anyway.
+///
+/// ## Why *numbered*, and not any season directory
+///
+/// **The specials season is not numbered, deliberately.** TMDB models
+/// `Top Gear: Polar Special` as a standalone movie record, so a file in a
+/// specials folder may honestly bind to a film. The rule "a season directory
+/// means the file is not a film" was tried, scored as a free win on the oracle,
+/// and destroyed five correct bindings in the real library — because no
+/// generated shape held a `Specials/` directory over a file whose right answer
+/// was a movie. One does now (`movie.specials`, 1,712 rows).
+///
+/// That carve-out is [`is_numbered_season_directory`]'s, and it covers
+/// `Season 0` and `S00` as well as `Specials` — see its doc for why the first
+/// cut of it did not. **The two rules are not redundant**: this one keeps a
+/// specials film that carries its own year wherever it is filed, and that one
+/// keeps a specials film that carries no year — `Polar Special.mkv` — when the
+/// library spells its specials folder the Plex way.
+///
+/// ## What this does **not** do
+///
+/// It does not give the file a title, a season or an episode number. A file that
+/// flips to `episode` here searches under whatever title its basename carries —
+/// the *episode* title, for the population this serves — which is a wrong show
+/// rather than a wrong library. Better, and not right. Reaching right needs the
+/// folder's title and season too, which is a signature change to the parser's
+/// two production call sites, not this rule.
+///
+/// [`is_numbered_season_directory`]: nightjar_db::is_numbered_season_directory
+pub fn stored_kind(
+    parsed: MediaKind,
+    parsed_year: Option<i32>,
+    stored: &str,
+    library_root: &str,
+) -> &'static str {
+    if parsed == MediaKind::Movie
+        && parsed_year.is_none()
+        && under_numbered_season_directory(stored, library_root)
+    {
+        return MediaKind::Episode.as_str();
+    }
+    parsed.as_str()
 }
 
 /// ADR-0030 §3: refuse repoint if matched/current < this fraction.
@@ -300,7 +402,7 @@ pub fn hint_ingest(
         mtime_ms,
         size_bytes,
         title: stored_title(parsed.title, &store_path, &library_root),
-        kind: parsed.kind.as_str().to_string(),
+        kind: stored_kind(parsed.kind, parsed.year, &store_path, &library_root).to_string(),
         year: parsed.year,
         season: parsed.season,
         episode: parsed.episode,
@@ -755,7 +857,8 @@ fn run_index_pass(
                         mtime_ms: file.mtime_ms,
                         size_bytes: file.size_bytes,
                         title: stored_title(parsed.title, &store_path, &library_root),
-                        kind: parsed.kind.as_str().to_string(),
+                        kind: stored_kind(parsed.kind, parsed.year, &store_path, &library_root)
+                            .to_string(),
                         year: parsed.year,
                         season: parsed.season,
                         episode: parsed.episode,
@@ -3675,8 +3778,8 @@ mod tests {
 
 #[cfg(test)]
 mod folder_title_tests {
-    use super::{stored_title, title_from_folder};
-    use nightjar_core::parse_filename;
+    use super::{stored_kind, stored_title, title_from_folder};
+    use nightjar_core::{MediaKind, parse_filename};
 
     /// The scanner is the layer that has the folder. `parse_filename` only
     /// ever sees a basename, so a name carrying no title at all — `S01E04.mkv`
@@ -3703,6 +3806,99 @@ mod folder_title_tests {
     #[test]
     fn a_file_in_the_library_root_borrows_nothing() {
         assert_eq!(title_from_folder("S01E04.mkv", "/media/TV"), "");
+    }
+
+    /// **The folder decides, and only a numbered one.** `Closure.mkv` carries
+    /// no season, no episode and nothing that says television, so the parser
+    /// calls it a movie on the evidence it has. The scanner has the folder.
+    ///
+    /// Measured on the warmed oracle: this removes all 573 `wrong.kind` rows and
+    /// moves nothing else across 81,094. On the real library it reclassified
+    /// three `Top Gear` specials — `16x00`, episode zero, which the matcher
+    /// rejects — and left the five `Specials/` files whose correct binding is a
+    /// movie record exactly where they were.
+    ///
+    /// **The negative cases are not the whole guard.** The first cut of this
+    /// test had four of them and no positive-but-wrong case, and the rule it
+    /// guarded was false for every film a library files under `Season N/`. The
+    /// Futurama block below is that case, taken from the real library.
+    #[test]
+    fn a_numbered_season_directory_means_the_file_is_not_a_film() {
+        use MediaKind::{Episode, Movie};
+        let root = "/media/TV";
+
+        // The population this exists for.
+        assert_eq!(
+            stored_kind(Movie, None, "Show/Season 1/Closure.mkv", root),
+            "episode"
+        );
+        assert_eq!(
+            stored_kind(Movie, None, "Show/S01/Closure.mkv", root),
+            "episode"
+        );
+
+        // **The counterexample that killed the previous attempt.** A film in a
+        // show's Specials folder stays a film.
+        assert_eq!(
+            stored_kind(Movie, None, "Top Gear/Specials/Polar Special.mkv", root),
+            "movie",
+            "TMDB models this as a movie record; a rule that says otherwise \
+             destroyed five real bindings"
+        );
+        assert_eq!(
+            stored_kind(Movie, None, "Top Gear/Extras/x.mkv", root),
+            "movie"
+        );
+
+        // **The positive-but-wrong case: the film filed under a numbered
+        // season.** Four of these sit in the dogfood library, each with its own
+        // TMDB movie record, and the folder rule alone called every one an
+        // episode — after which `episode_group_key` bound them to the Futurama
+        // series with no route back. The basename asserts its own year, and no
+        // episode title does.
+        for (name, year) in [
+            ("Futurama Bender's Big Score (2007).avi", 2007),
+            ("Futurama Bender's Game (2008).avi", 2008),
+            ("Futurama Into the Wild Green Yonder (2009).avi", 2009),
+            ("Futurama The Beast with a Billion Backs (2008).avi", 2008),
+        ] {
+            let rel = format!("Futurama/Season 5/{name}");
+            let p = parse_filename(name);
+            assert_eq!(p.kind, Movie, "{name}");
+            assert_eq!(p.year, Some(year), "{name}");
+            assert_eq!(
+                stored_kind(p.kind, p.year, &rel, root),
+                "movie",
+                "{rel} — the file says what it is; the folder is only evidence"
+            );
+        }
+
+        // The year travels with the file, not the folder: the same basename
+        // under a plain show folder is a film for the same reason.
+        assert_eq!(
+            stored_kind(
+                Movie,
+                Some(2007),
+                "Futurama/Bender's Big Score (2007).avi",
+                root
+            ),
+            "movie"
+        );
+
+        // A parsed episode is unaffected wherever it sits, and an ordinary
+        // movie outside any season directory is untouched.
+        assert_eq!(
+            stored_kind(Episode, None, "Show/Season 1/Show - S01E01.mkv", root),
+            "episode"
+        );
+        assert_eq!(
+            stored_kind(Episode, None, "Top Gear/Specials/x.mkv", root),
+            "episode"
+        );
+        assert_eq!(
+            stored_kind(Movie, Some(1999), "Fight Club (1999)/Fight Club.mkv", root),
+            "movie"
+        );
     }
 
     /// The rule both indexing paths and the oracle's replay harness share.
