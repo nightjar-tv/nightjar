@@ -835,6 +835,86 @@ fn cut_at_unmatched_close(s: &str) -> String {
     s.to_string()
 }
 
+/// What the layer above the parser knows about the folder a file sits in.
+///
+/// `parse_filename` takes a basename by design and that does not change. This
+/// is how the caller hands it the two things a basename cannot carry, **without
+/// this crate learning where a show folder starts.** `nightjar-core` has no
+/// internal dependencies and `nightjar-db` owns the path walk
+/// (`show_folder_relpath`, `under_numbered_season_directory`,
+/// `season_number_for_path`); a second walk written here would be the
+/// reimplemented-`norm_key` trap, which once reported 25 non-folding folders
+/// where the shipped chain gave 12.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderContext<'a> {
+    /// The show folder's own name — the last segment left once the
+    /// season-directory tail is gone. `nightjar_db::show_folder_relpath`'s
+    /// final component.
+    pub folder_title: Option<&'a str>,
+    /// The numbered season directory the file sits in.
+    /// `nightjar_db::season_number_for_path`.
+    pub season: Option<i32>,
+}
+
+/// [`parse_filename`], then let the folder answer what the basename did not.
+///
+/// **Additive and unwired.** Nothing in the product calls this yet; the three
+/// production call sites still use [`parse_filename`]. It exists so the seam can
+/// be reviewed on its own, before anything moves through it.
+///
+/// ## What it does
+///
+/// 1. **An empty title takes the folder's name.** This is
+///    `nightjar_scanner::stored_title`, moved down unchanged — `S01E01.mkv`
+///    parses to an empty title and the show folder names the show. Moving it
+///    here is behaviour-identical, which is what makes the call sites safe to
+///    move later.
+/// 2. **An episode with no season number takes the folder's.**
+///
+/// ## What it deliberately does not do, and why
+///
+/// **It does not decide the kind.** `nightjar_scanner::stored_kind` remains the
+/// only owner of *a yearless film under a numbered season directory is an
+/// episode*, because that rule reads the whole season tail through
+/// `under_numbered_season_directory` — and that predicate and
+/// `season_number_for_path` disagree on purpose for an over-wide season, where
+/// the file is still not a film but the number is unusable.
+///
+/// **So rule 2 is gated on the kind the basename gave**, and never invents a
+/// season for something the basename called a film. `Futurama/Season 5/Futurama
+/// Bender's Big Score (2007).avi` is a real film in a real library; it keeps
+/// `season: None` here, and `stored_kind` keeps it a film.
+///
+/// **And that gate is why this does not yet move the two shapes it was written
+/// for.** Measured through the shipped chain:
+///
+/// | basename | kind | title | season |
+/// |---|---|---|---|
+/// | `Season 01/Episode 1.mkv` | `Movie` | `"Episode 1"` | `None` |
+/// | `Season 1/01 - Closure.mkv` | `Movie` | `"01 - Closure"` | `None` |
+///
+/// Both parse to `Movie`, so rule 2 does not fire. Both parse to a **non-empty**
+/// title, so rule 1 does not fire either — the folder would have to *override* a
+/// title the basename did assert, which is a different rule from filling a
+/// silence.
+///
+/// Both of those need the kind decided before the title and season are, and the
+/// kind is decided a layer up. **Resolving that layering is the next slice's
+/// work, not this one's** — it is the whole of `tv.handmade` (5,840 oracle rows)
+/// and `tv.episodetitle` (5,844), which read 0.0% correct.
+pub fn parse_filename_in(file_name: &str, ctx: FolderContext<'_>) -> ParsedName {
+    let mut parsed = parse_filename(file_name);
+    if parsed.title.is_empty() {
+        if let Some(folder) = ctx.folder_title {
+            parsed.title = folder.trim().to_string();
+        }
+    }
+    if parsed.kind == MediaKind::Episode && parsed.season.is_none() {
+        parsed.season = ctx.season;
+    }
+    parsed
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let whole = strip_extension(file_name);
@@ -1417,6 +1497,123 @@ fn find_bare_year(s: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx<'a>(folder: Option<&'a str>, season: Option<i32>) -> FolderContext<'a> {
+        FolderContext {
+            folder_title: folder,
+            season,
+        }
+    }
+
+    /// **With nothing to say, the folder says nothing.** This is the property
+    /// that makes the call sites safe to move: an empty context must leave the
+    /// parse byte-identical, so a caller that has no folder gets exactly what it
+    /// gets today.
+    #[test]
+    fn an_empty_context_changes_nothing() {
+        for name in [
+            "Show - S01E01 - Pilot.mkv",
+            "S01E01.mkv",
+            "Episode 1.mkv",
+            "01 - Closure.mkv",
+            "Fight Club (1999).mkv",
+            "Series Title - S07E22 - S07E23 - And Lots of Security.. [HDTV-720p].mkv",
+            "The Series And The Code - S42 Ep10718 - Ep10722",
+            "",
+            "no-extension",
+            "1x01x02 - Two.mkv",
+        ] {
+            assert_eq!(
+                parse_filename_in(name, FolderContext::default()),
+                parse_filename(name),
+                "empty context moved {name:?}"
+            );
+        }
+    }
+
+    /// Rule 1 — `stored_title`'s substitution, moved down and unchanged.
+    /// `S01E01.mkv` parses to an empty title; the show folder names the show.
+    #[test]
+    fn an_empty_title_takes_the_folder_name() {
+        let p = parse_filename_in("S01E01.mkv", ctx(Some("Dept. Q (2025)"), None));
+        assert_eq!(p.title, "Dept. Q (2025)");
+        assert_eq!(p.kind, MediaKind::Episode);
+        assert_eq!(p.season, Some(1), "the basename's own season is untouched");
+        assert_eq!(p.episode, Some(1));
+    }
+
+    /// **A title the basename asserted is never overwritten.** Filling a silence
+    /// and overriding a claim are different rules, and only the first is here.
+    #[test]
+    fn a_parsed_title_is_never_overwritten_by_the_folder() {
+        for name in ["Show - S01E01 - Pilot.mkv", "Episode 1.mkv", "01 - Closure.mkv"] {
+            let with = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
+            let without = parse_filename(name);
+            assert_eq!(with.title, without.title, "folder overwrote {name:?}");
+        }
+    }
+
+    /// Rule 2 — an episode with no season of its own takes the folder's.
+    #[test]
+    fn an_episode_without_a_season_takes_the_folders() {
+        // `E05.mkv` is an episode marker with no season.
+        let p = parse_filename_in("E05.mkv", ctx(Some("Some Show"), Some(3)));
+        if p.kind == MediaKind::Episode && parse_filename("E05.mkv").season.is_none() {
+            assert_eq!(p.season, Some(3));
+        }
+        // A basename that names its own season keeps it.
+        let q = parse_filename_in("S01E01.mkv", ctx(Some("Some Show"), Some(9)));
+        assert_eq!(q.season, Some(1), "the folder must not overrule the basename");
+    }
+
+    /// **A film under a numbered season directory keeps no season.**
+    /// `Futurama/Season 5/Futurama Bender's Big Score (2007).avi` is a real film
+    /// in a real library. Inventing a season for it here would put a season on a
+    /// movie row, and `stored_kind` — which correctly keeps it a film, because it
+    /// carries its own year — would never get the chance to disagree.
+    #[test]
+    fn a_film_under_a_season_directory_gets_no_season() {
+        let name = "Futurama Benders Big Score (2007).avi";
+        let p = parse_filename_in(name, ctx(Some("Futurama"), Some(5)));
+        assert_eq!(p.kind, MediaKind::Movie);
+        assert_eq!(p.year, Some(2007));
+        assert_eq!(p.season, None, "a film has no season");
+    }
+
+    /// The two shapes this seam exists for, asserted as **still unmoved**, so
+    /// the next slice starts from a recorded position rather than a memory.
+    /// Both parse to `Movie` with a non-empty title, so neither rule fires.
+    #[test]
+    fn the_two_shapes_it_was_written_for_do_not_move_yet() {
+        // The **parsed** title, not the cleaned search query. `oracle_query`
+        // prints `clean_show_title`'s output — `01 Closure` — and reading that
+        // as the parse is how this test was wrong the first time.
+        for (name, title) in [
+            ("Episode 1.mkv", "Episode 1"),
+            ("01 - Closure.mkv", "01 - Closure"),
+        ] {
+            let p = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
+            assert_eq!(p.kind, MediaKind::Movie, "{name:?} kind");
+            assert_eq!(p.title, title, "{name:?} title");
+            assert_eq!(p.season, None, "{name:?} season");
+            assert_eq!(p.episode, None, "{name:?} episode");
+        }
+    }
+
+    /// A folder name is trimmed, and an absent one leaves the empty title empty
+    /// rather than substituting something that is not a title.
+    #[test]
+    fn folder_title_is_trimmed_and_optional() {
+        assert_eq!(
+            parse_filename_in("S01E01.mkv", ctx(Some("  Spaced Show  "), None)).title,
+            "Spaced Show"
+        );
+        assert_eq!(
+            parse_filename_in("S01E01.mkv", ctx(None, None)).title,
+            "",
+            "no folder, no title"
+        );
+    }
 
     /// **A number in the title is not the year.** `find_year` took the first
     /// four digits anywhere, so `Wonder Woman 1984 (2020)` parsed as 1984 —

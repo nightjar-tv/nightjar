@@ -227,6 +227,65 @@ pub fn under_numbered_season_directory(stored: &str, library_root: &str) -> bool
     numbered
 }
 
+/// The number of the numbered season directory this stored path sits in, or
+/// `None`.
+///
+/// **The same walk again, asking a third question.**
+/// [`show_folder_relpath`] asks *where does the show folder start*,
+/// [`under_numbered_season_directory`] asks *is any of the tail numbered*, and
+/// this asks *which number*. One walk, three questions, so none of the three can
+/// disagree about where the tail is — the reason the second was written here
+/// rather than in the scanner, and the reason the third is too.
+///
+/// **This is not the predicate, and must not be used as one.**
+/// `season_number_for_path(..).is_some()` agrees with
+/// [`under_numbered_season_directory`] on every path either function will meet
+/// in a real library — but they disagree by design on one, and the disagreement
+/// is the right way round:
+///
+/// | path | `under_numbered_…` | `season_number_for_path` |
+/// |---|---|---|
+/// | `Show/Season 03/x.mkv` | true | `Some(3)` |
+/// | `Show/Specials/x.mkv` | false | `None` |
+/// | `Show/Season 0/x.mkv` | false | `None` |
+/// | `Show/Season 99999999999999999999/x.mkv` | **true** | **`None`** |
+///
+/// A digit run too wide for a `u32` is still a season directory — a file inside
+/// one is not a film, and the predicate must keep saying so. It is not a season
+/// *number*, so this refuses it rather than handing on a number no provider will
+/// ever have.
+///
+/// **So ask the predicate about the kind and ask this about the number.** A
+/// caller that reaches for `.is_some()` to decide whether a file is an episode
+/// has silently changed the answer for that one path. A test asserts both
+/// halves, including the divergence.
+///
+/// The number is the numbered season directory **nearest the file**, so
+/// `Show/Season 03/Extras/x.mkv` is season 3: the walk pops `Extras`, then
+/// `Season 03`, and stops at the first numbered segment it finds.
+///
+/// `Specials`, `Extras` and `Season 0` yield `None` — they are season
+/// directories and they are not *numbered* ones, which is the distinction the
+/// whole file-kind rule turns on.
+///
+pub fn season_number_for_path(stored: &str, library_root: &str) -> Option<u32> {
+    let rel = if is_absolute_stored(stored) {
+        to_relpath(library_root, Path::new(stored)).unwrap_or_else(|| stored.to_string())
+    } else {
+        stored.to_string()
+    };
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop(); // filename
+    while parts.last().is_some_and(|seg| is_season_directory(seg)) {
+        let seg = parts.pop().unwrap_or_default();
+        match season_directory_number(seg) {
+            Some(n) if n > 0 && n != u32::MAX => return Some(n),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Case-fold each path segment for identity match (ADR-0030 §2).
 pub fn fold_path(path: &str) -> String {
     path.replace('\\', "/")
@@ -243,6 +302,93 @@ pub fn paths_fold_equal(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The number, and the walk that finds it. `Season 03/Extras/` is season 3:
+    /// the tail is popped from the file upward and stops at the first numbered
+    /// segment.
+    #[test]
+    fn season_number_reads_the_nearest_numbered_directory() {
+        let root = "/lib";
+        for (path, want) in [
+            ("Show/Season 03/x.mkv", Some(3)),
+            ("Show/S03/x.mkv", Some(3)),
+            ("Show/season 3/x.mkv", Some(3)),
+            ("Show/Season 03/Extras/x.mkv", Some(3)),
+            ("Show/Season 03/Specials/x.mkv", Some(3)),
+            ("Show/x.mkv", None),
+            ("Show/Specials/x.mkv", None),
+            ("Show/Extras/x.mkv", None),
+            // Season zero is the specials season, not a numbered one.
+            ("Show/Season 0/x.mkv", None),
+            ("Show/Season 00/x.mkv", None),
+            ("Show/S00/x.mkv", None),
+        ] {
+            assert_eq!(
+                season_number_for_path(path, root),
+                want,
+                "season_number_for_path({path:?})"
+            );
+        }
+    }
+
+    /// **The one path where the number and the predicate disagree, asserted so
+    /// the divergence cannot be removed by accident.**
+    ///
+    /// A digit run too wide for a `u32` is still a season directory, so a file
+    /// inside one is still not a film and the predicate must keep saying `true`.
+    /// It is not a season number, so the number is `None`. Anyone who "fixes"
+    /// one of these to match the other has changed what a file in that folder
+    /// is allowed to bind to.
+    #[test]
+    fn an_overwide_season_is_a_directory_but_not_a_number() {
+        let root = "/lib";
+        let path = "Show/Season 99999999999999999999/x.mkv";
+        assert!(
+            under_numbered_season_directory(path, root),
+            "a file here is not a film"
+        );
+        assert_eq!(
+            season_number_for_path(path, root),
+            None,
+            "and that is not a season number"
+        );
+    }
+
+    /// Everywhere else the two agree, and the show folder agrees with both —
+    /// one walk, three questions.
+    #[test]
+    fn the_three_questions_agree_about_where_the_tail_is() {
+        let root = "/lib";
+        for path in [
+            "Show/Season 03/x.mkv",
+            "Show/Season 03/Extras/x.mkv",
+            "Show/Specials/x.mkv",
+            "Show/Season 0/x.mkv",
+            "Show/x.mkv",
+            "A/B/Show/Season 1/x.mkv",
+        ] {
+            assert_eq!(
+                season_number_for_path(path, root).is_some(),
+                under_numbered_season_directory(path, root),
+                "number and predicate disagree for {path:?}"
+            );
+            // The show folder is what is left once the same tail is gone.
+            assert!(
+                !show_folder_relpath(path, root).ends_with("Extras"),
+                "show folder kept a season-tail segment for {path:?}"
+            );
+        }
+        assert_eq!(show_folder_relpath("A/B/Show/Season 1/x.mkv", root), "A/B/Show");
+    }
+
+    /// An absolute stored path is relativised first, the same as the other two.
+    #[test]
+    fn season_number_handles_an_absolute_stored_path() {
+        assert_eq!(
+            season_number_for_path("/lib/Show/Season 07/x.mkv", "/lib"),
+            Some(7)
+        );
+    }
 
     /// **`Specials/` is a season directory and is not a numbered one**, and the
     /// whole `wrong.kind` rule turns on the difference. TMDB models `Top Gear:
