@@ -47,6 +47,7 @@ Corpus 533 → 535. Sweep 0 regressions. Oracle **0 rows changed**, because the
 | parser corpus | 533 / 738 | **535 / 738 (72.5%)** | +2 gained, **0 lost** — exactly the two named |
 | parser sweep | 74,624 names | 74,624 | 0 regressions, 0 gains |
 | matcher oracle | correct 71,434 | **71,434** | **0 rows changed**; wrong 6, absent 18,153, stall 479 all identical |
+| dogfood strict pair (capture, 25,004) | `ready=24953 unmatched=51 errors=0 requests=0` | **identical** | 0 changed |
 | `cargo test -p nightjar-core` | 111 pass | 111 pass | 0 failures |
 
 Oracle: `requests=0`, 55 batches, noise floor 0 of 90,072, same library

@@ -95,7 +95,7 @@ board asked for. Item 4 scoped and not started, as instructed.
 | **matcher oracle** | 90,072 rows, correct **71,434**, `wrong.kind` 0, `wrong.entity` 6, absent 18,153, stalled 479 (0.5%), noise floor 0, `requests=0` | correct **71,434**, all counters identical | **0 rows changed** |
 | **parser corpus** | 532 / 738 = **72.1%** | **535 / 738 = 72.5%** | +3 gained, **0 lost** |
 | **parser sweep** | 74,624 names | 74,624 | 0 regressions, 0 gains |
-| **dogfood strict pair** (capture, 25,004) | see below | see below | see below |
+| **dogfood strict pair** (capture, 25,004) | `groups=3217 ready=24953 unmatched=51 errors=0 requests=0` | **identical on every counter** | 0 changed |
 | `cargo test --workspace` | 1 known-flaky transcode failure | same | not attributable |
 
 Both oracle arms ran the same generated library, checksum `aa9657b`, with
@@ -124,10 +124,22 @@ showing the real answer reordered `666666664444 -> 646464646666`.
 - **Sweep: narrow by population.** It sees parser changes; none of its 74,624
   generated names pads a dash between two episode tokens.
 - **Core tests: sensitive and unchanged.** 111 pass on both arms.
+- **Dogfood strict pair: sensitive for iteration 2, narrow for iteration 3.**
+  **1,632 of the 25,004 captured basenames** carry a padded dash after an
+  episode token — `30 Rock - 2x10 - Episode 210 - Bluray-1080p.mkv` is a real
+  file, and it is the adversarial case written by a real library rather than by
+  a generator. Zero moved. No captured name spells a marker `Ep<digit>`, so
+  iteration 3 is unmeasured here.
 
-**One thing the oracle cannot see, found while checking:** it contains **no
-bare-dash range at all** (`S15E06-08`, 0 of 90,072). The exemption iteration 2
-preserves rests on the corpus and the unit tests alone.
+**And the gap the oracle left is covered by the dogfood pair.** The oracle holds
+**no bare-dash range at all** (`S15E06-08`, 0 of 90,072), so the exemption
+iteration 2 preserves is invisible to it. The real library has **33**, and they
+are unchanged across the pair. Two instruments, two populations, and the
+exemption is only measured because both were run.
+
+**Which population was measured, said plainly:** the **capture, 25,004 files**.
+Not the database's 25,043. The 610 paths in one and not the other are where the
+Futurama regression hid, and no count here is quoted across that gap.
 
 ## What I would do next, and why
 
@@ -150,7 +162,9 @@ preserves rests on the corpus and the unit tests alone.
 
 ## What I could not measure, named
 
-- **Item 1 in production.** No instrument here opens a socket. The fix is
+- **Item 1 in production.** No instrument here opens a socket. The dogfood pair
+  and the oracle both report `requests=0`, which is their pass condition, not a
+  reading of this change. The fix is
   argued from ureq's source, a DNS answer and a unit test — not from a drain.
   And it turns *never* into *slow*, not into *fast*: ~5s per call is still spent
   on the first dead IPv6 address, which at 1,758 calls is about 2.6 hours of
@@ -178,7 +192,8 @@ preserves rests on the corpus and the unit tests alone.
 ## Not claimed
 
 Nothing here says the matcher or the parser works. The corpus reads 72.5% of 738
-applicable cases and its own ceiling is 91.2%. The oracle reads 71,434 correct of
+applicable cases, against a measured ceiling of 91.2% that this loop **took from
+the board and did not re-derive**. The oracle reads 71,434 correct of
 90,072 rows with 18,153 absent, on generated English-only names with no NFOs,
 mostly season 1, one drain from empty, and no rescan, manual match or fix flow
 anywhere in it. Two of its shapes read 0.0%.

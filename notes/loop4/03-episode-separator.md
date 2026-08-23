@@ -36,6 +36,7 @@ to be run rather than reasoned about.
 | parser corpus | 532 / 738 (72.1%) | **533 / 738 (72.2%)** | +1 gained, **0 lost** |
 | parser sweep | 74,624 names | 74,624 | 0 regressions, 0 gains |
 | matcher oracle | correct 71,434 | **71,434** | **0 rows changed**, wrong 6, absent 18,153 |
+| dogfood strict pair (capture, 25,004) | `ready=24953 unmatched=51 errors=0 requests=0` | **identical** | 0 changed |
 | `cargo test -p nightjar-core` | 111 pass | 111 pass | 0 failures |
 
 Oracle drain: `requests=0`, 55 batches, 479 stalls (0.5%, unchanged), noise floor
@@ -73,9 +74,16 @@ So the three zeros read:
   74,624 generated names pads a dash between two episode tokens.
 - **core tests — sensitive, and unchanged.** 111 pass on both arms.
 
-One more thing the oracle cannot see: **it contains no bare-dash range at all**
-(`S15E06-08`, 0 of 90,072). The exemption this change preserves is unmeasured
-here, and rests on the corpus and the unit tests alone.
+- **dogfood strict pair — sensitive, and zero.** **1,632 of the 25,004 captured
+  basenames** carry a padded dash after an episode token. `30 Rock - 2x10 -
+  Episode 210 - Bluray-1080p.mkv` is a real file, and it is the adversarial case
+  written by a real library rather than by a generator.
+
+**The oracle cannot see the exemption; the dogfood pair can.** The oracle holds
+**no bare-dash range at all** (`S15E06-08`, 0 of 90,072), so the behaviour this
+change deliberately preserves is invisible to it. The real library has **33**,
+unchanged across the pair. The exemption is measured only because both
+instruments were run, and the population each speaks for is different.
 
 ## Judgement
 
