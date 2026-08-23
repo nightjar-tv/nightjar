@@ -226,8 +226,16 @@ Neither is a sensitive instrument reporting no change.
 **746 → 759.** Twelve from the branch, one from this slice
 (`season_zero_is_a_season_directory_and_is_not_a_numbered_one`). `cargo test
 --workspace -- --list` lists 759; `#[test]` and `#[tokio::test]` attributes agree.
+
+    756 passed   0 failed   3 ignored
+
 `cargo fmt --check` and `cargo clippy --all-targets -D warnings` green on the
 three changed crates.
+
+**The `transcode` HLS test that this loop recorded as failing throughout does
+not fail throughout.** It is flaky under workspace concurrency and fails with a
+different message again on a full disk. See note 06 — the point for a reader
+here is that the suite is green and nothing on the branch touches that crate.
 
 ## What this could not measure, named
 

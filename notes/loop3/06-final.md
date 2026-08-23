@@ -126,11 +126,28 @@ against a claim of nine, against an actual twelve. Counted two ways that agree:
 tip lists 758. A per-iteration count that is never added up is how three tests
 went missing from the total.
 
-One failure throughout:
-`hls::tests::mapped_real_library_end_moov_mp4_copy_keeps_aac`, which fails
-**identically at the base** when the `transcode` package runs its 158 tests
-together and passes alone. `cargo fmt --check` and `cargo clippy --all-targets
--D warnings` green at every commit.
+`cargo fmt --check` and `cargo clippy --all-targets -D warnings` green at every
+commit.
+
+**`hls::tests::mapped_real_library_end_moov_mp4_copy_keeps_aac` was blamed on the
+wrong thing twice.** This note first recorded it as *one failure throughout*,
+failing when the `transcode` package runs its 158 tests together and passing
+alone. Both halves are wrong:
+
+- `cargo test -p nightjar-transcode` runs all 158 together and **passes**.
+- Under `cargo test --workspace` it sometimes fails and sometimes does not. Two
+  consecutive runs on the same tree: one failed, one green at 756 passed, 3
+  ignored, **0 failed**.
+- On a full disk it fails for a third reason again — `Error submitting a packet
+  to the muxer: No space left on device` — which is not the same failure at all,
+  and reads as a regression to anyone who does not check the message.
+
+It is **flaky under workspace-level concurrency**, and its two assertions fail
+with different messages (`hls.rs:7833`, a seek landing at 84.333s against
+58.975s; `hls.rs:7985`, the muxer running out of disk). Nothing on this branch
+can reach it: `git diff origin/main..HEAD -- server/crates/transcode` is empty.
+**Read the panic message before calling it a regression** — a green suite and
+either failure are all reachable from one unchanged tree.
 
 ## Per-iteration one-liners
 
