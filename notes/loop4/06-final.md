@@ -96,10 +96,27 @@ board asked for. Item 4 scoped and not started, as instructed.
 | **parser corpus** | 532 / 738 = **72.1%** | **535 / 738 = 72.5%** | +3 gained, **0 lost** |
 | **parser sweep** | 74,624 names | 74,624 | 0 regressions, 0 gains |
 | **dogfood strict pair** (capture, 25,004) | `groups=3217 ready=24953 unmatched=51 errors=0 requests=0` | **identical on every counter** | 0 changed |
-| `cargo test --workspace` | 1 known-flaky transcode failure | same | not attributable |
+| `cargo test --workspace` | 762 pass, 1 flaky transcode failure under load | **762 pass, 0 failed** | clean |
 
 Both oracle arms ran the same generated library, checksum `aa9657b`, with
 `requests=0` on all 55 batches.
+
+### The one failure, and why it was not a regression
+
+`nightjar-transcode`'s `hls::tests::mapped_real_library_end_moov_mp4_copy_keeps_aac`
+failed in the first workspace run. Four checks, because the README records a full
+volume turning 1 transcode failure into 20 and reading exactly like a change:
+
+1. `nightjar-transcode` does not depend on `nightjar-metadata` — not in its
+   `Cargo.toml`, no reference anywhere in the crate. The change could not reach
+   it.
+2. Base tree, same suite: 158 passed, 0 failed.
+3. Same tree, same binary, three consecutive runs: **FAILED, ok, ok**.
+4. Final workspace run with all three commits and 5.8 GB free: **762 passed, 0
+   failed**, transcode 158/158.
+
+Flaky under parallel execution. Disk was checked first and was never the cause
+here — but it was checked first, because it has been the cause before.
 
 ## Every zero, and what kind of zero it is
 
