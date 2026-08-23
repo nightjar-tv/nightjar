@@ -843,6 +843,7 @@ dependencies = [
 name = "nightjar-transcode"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "nightjar-core",
  "nightjar-db",
  "serde",

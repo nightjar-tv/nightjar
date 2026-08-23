@@ -12,5 +12,12 @@ tracing.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Signal numbers differ by platform: SIGSTOP is 19 on Linux and 17 on macOS,
+# and 18 is SIGCONT on Linux but SIGTSTP on macOS. Hand-written constants had
+# them inverted on Darwin. Already in the build via sha2 -> cpufeatures, so
+# this compiles nothing new (Rule 4.4).
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

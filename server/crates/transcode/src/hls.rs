@@ -2075,6 +2075,10 @@ fn restart_at(
         session.current_run_eof = true;
         session.start_ms = play_start_ms;
         session.play_start_ms = play_start_ms;
+        // A seek moves the playhead, including backwards. Left at the old
+        // high-water mark the lead reads as zero for the rest of the session
+        // and the throttle never fires again (ADR-0050 §2).
+        session.last_requested_ms = play_start_ms;
         session.landed_ms = mapped.start_ms;
         session.failed = None;
         session.last_restart = Instant::now();
@@ -2149,6 +2153,7 @@ fn restart_at(
     session.current_run_eof = false;
     session.start_ms = start_ms;
     session.play_start_ms = play_start_ms;
+    session.last_requested_ms = play_start_ms;
     session.landed_ms = start_ms;
     session.failed = None;
     session.last_restart = Instant::now();
@@ -3363,16 +3368,16 @@ fn stop_child(child: &mut Option<Child>) {
 /// been measured on Windows.
 #[cfg(unix)]
 fn signal_child(child: &Child, stop: bool) -> bool {
-    // Declared rather than pulling in a crate for two constants and one call
-    // (Rule 4.4). SIGSTOP is 19 and SIGCONT 18 on Linux and macOS alike.
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    let sig = if stop { 19 } else { 18 };
-    // SAFETY: `child` is alive for this call and `id()` is its real pid; the
-    // process is our own child, so the pid cannot have been recycled behind us
-    // while we hold it.
-    unsafe { kill(child.id() as i32, sig) == 0 }
+    // Take the numbers from libc, never by hand: SIGSTOP is 19 on Linux and
+    // 17 on macOS, and 18 is SIGCONT on Linux but SIGTSTP on macOS. Written
+    // out by hand they were inverted on Darwin, which suspends a session at
+    // the floor and never resumes it.
+    let sig = if stop { libc::SIGSTOP } else { libc::SIGCONT };
+    // SAFETY: `kill` with a pid we own and a valid signal number. The pid
+    // cannot have been recycled: this is our own child and nothing reaps it
+    // except `stop_child`, which takes the `Child` out of the session under
+    // the same lock this call is made under.
+    unsafe { libc::kill(child.id() as libc::pid_t, sig) == 0 }
 }
 
 #[cfg(not(unix))]
@@ -3407,14 +3412,26 @@ fn lead_ms(produced_end_ms: Option<u64>, last_requested_ms: u64) -> Option<u64> 
     Some(produced_end_ms?.saturating_sub(last_requested_ms))
 }
 
-/// [`lead_ms`] for one session, reading the frontier from its segment map.
+/// [`lead_ms`] for one session, reading the frontier from the run that is
+/// currently producing.
+///
+/// The segment map is session-global and keeps prior runs' entries so scrub
+/// back stays a plain file serve (ADR-0020 §3). Its maximum is therefore a
+/// frontier the live encoder may be nowhere near after a backward seek, and
+/// using it would report no lead for the rest of the session.
 fn session_lead_ms(session: &Session) -> Option<u64> {
-    let produced_end = session
-        .segment_map
-        .iter_ordered()
-        .next_back()
-        .map(|s| s.start_ms.saturating_add(s.duration_ms));
+    let produced_end = frontier_ms(session.segment_map.iter_ordered(), session.current_run_id);
     lead_ms(produced_end, session.last_requested_ms)
+}
+
+/// Furthest media end produced by `run_id`, ignoring every other run.
+fn frontier_ms<'a>(
+    mut segments: impl DoubleEndedIterator<Item = &'a crate::hls_segment_map::MappedSegment>,
+    run_id: u64,
+) -> Option<u64> {
+    segments
+        .rfind(|s| s.run_id == run_id)
+        .map(|s| s.start_ms.saturating_add(s.duration_ms))
 }
 
 /// Holds a refcount on `Session::segment_waiters` for one asset_wait call.
@@ -3546,6 +3563,53 @@ mod tests {
         assert_eq!(lead_ms(Some(4000), 4000), Some(0));
         // A prefetch past the frontier saturates rather than wrapping.
         assert_eq!(lead_ms(Some(4000), 10_000), Some(0));
+    }
+
+    /// The frontier is the producing run's, not the session map's maximum.
+    ///
+    /// The map keeps prior runs so scrub back is a plain file serve
+    /// (ADR-0020 §3). After a seek back from 50 min to 10 min it still holds
+    /// segments out to 50 min while the live encoder is at 10. Reading the
+    /// map maximum reports a frontier far past the playhead, the lead
+    /// saturates to zero, and the throttle never fires again for that session.
+    #[test]
+    fn backward_seek_does_not_disable_the_throttle() {
+        use crate::hls_segment_map::MappedSegment;
+        let seg = |start_ms, run_id| MappedSegment {
+            start_ms,
+            duration_ms: 2000,
+            run_id,
+            rel_path: PathBuf::from(format!("run_{run_id}/seg.m4s")),
+        };
+        // Run 0 reached 50 minutes before the seek; run 1 landed at 10 and has
+        // produced 40 s past it. Map order is by start time, so run 0's entry
+        // sorts last.
+        let segs = [seg(600_000, 1), seg(638_000, 1), seg(3_000_000, 0)];
+
+        assert_eq!(
+            frontier_ms(segs.iter(), 1),
+            Some(640_000),
+            "the producing run's frontier, not the map's maximum"
+        );
+        let lead = lead_ms(frontier_ms(segs.iter(), 1), 600_000);
+        assert_eq!(lead, Some(40_000));
+        assert_eq!(
+            throttle_action(false, lead.unwrap()),
+            Some(true),
+            "a session 40 s ahead must suspend, whatever prior runs left behind"
+        );
+
+        // The bug this pins: the map maximum saturates the lead to zero.
+        let stale = lead_ms(
+            segs.iter().next_back().map(|s| s.start_ms + s.duration_ms),
+            600_000,
+        );
+        assert_eq!(stale, Some(2_402_000));
+        assert_eq!(
+            throttle_action(false, 0),
+            None,
+            "a lead read as zero never suspends"
+        );
     }
 
     #[test]
