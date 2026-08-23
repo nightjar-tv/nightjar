@@ -2048,6 +2048,11 @@ fn restart_at(
         "hls seek restart_at: stop prior encode"
     );
     stop_child(&mut session.child);
+    // `throttled` describes a live process. This session keeps going with a
+    // new child, so leaving it set would make the next tick send a resume to
+    // a child that was never suspended and skip the suspend it needs. The
+    // other two `stop_child` callers remove the session outright.
+    session.throttled = false;
     sync_segment_map(session);
     sync_all_run_indexes(session);
     // Duplicate-write stop: scrub-back (or re-land) into media the global map
