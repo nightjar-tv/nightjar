@@ -37,7 +37,7 @@ not here — this page is the reference, not the tour.
 | [0017](0017-desktop-safari-hlsjs.md) | Desktop Safari attaches with hls.js | Accepted | — | — |
 | [0018](0018-subtitle-burn-in.md) | Image and ASS subtitle burn-in | Partially superseded | — | §5 by [0019](0019-ass-burn-extract-at-scan.md) |
 | [0019](0019-ass-burn-extract-at-scan.md) | ASS burn-in extract at scan time | Accepted | [0018](0018-subtitle-burn-in.md) §5 | — |
-| [0020](0020-copy-mode-segment-boundaries.md) | Producer-owned segment boundaries (time-keyed) | Accepted | — | — |
+| [0020](0020-copy-mode-segment-boundaries.md) | Producer-owned segment boundaries (time-keyed) | Partially superseded | — | §4 window listing by [0054](0054-full-title-playlist-for-transcode.md) for transcode only; copy and remux unchanged |
 | [0021](0021-client-architecture.md) | Client architecture (Flutter UI, per-platform engines) | Accepted (Apple engine closed 2026-08-06) | [0001](0001-client-platforms.md); prior Rule 2.4 wording | — |
 | [0022](0022-capability-profiles.md) | Client capability profiles (bitrate, resolution, HDR) | Accepted | — | — |
 | [0023](0023-cluster-map-byte-offset-start.md) | Keyframe map and byte-offset session start | Accepted (amended 2026-08-06) | — | — |
@@ -69,6 +69,7 @@ not here — this page is the reference, not the tour.
 | [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
 | [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
 | [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** | — | — |
+| [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** | [0020](0020-copy-mode-segment-boundaries.md) §4 for transcode only | — |
 
 ## Why the numbers jump from 0043 to 0046
 
