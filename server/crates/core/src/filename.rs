@@ -1289,12 +1289,16 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
         // An optional repeat of the season, in either spelling it appears in:
         // `s06` before an `e`, or `6x` before the number.
         let mut marked = false;
+        // **A repeated season and a two-letter `ep` are *distinctive* markers**;
+        // a lone `e` or `x` is not. See the padded-separator rule below.
+        let mut distinctive = false;
         if let Some((repeated, after)) = read_repeated_season(bytes, k) {
             if repeated != season {
                 break;
             }
             k = after;
             marked = true;
+            distinctive = true;
         }
         if k < bytes.len() && (bytes[k] == b'e' || bytes[k] == b'x') {
             let e_marker = bytes[k] == b'e';
@@ -1312,6 +1316,7 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
                 && bytes[k + 1].is_ascii_digit()
             {
                 k += 1;
+                distinctive = true;
             }
             marked = true;
         }
@@ -1324,10 +1329,34 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
         // and has always been one. The moment whitespace pads the dash the
         // exemption goes with it, because ` - ` is also how a name separates an
         // episode from its title — `Series - S01E04 - 6 Feet Under` must not
-        // read as episodes 4 through 6. The marker is the whole difference
-        // between that and `S07E22 - S07E23`.
-        let require_marker = !separated || sep_len > 1;
-        if require_marker && !marked {
+        // read as episodes 4 through 6.
+        //
+        // **And behind a padded separator a lone `e` or `x` is not enough.**
+        // ` - ` is the ordinary separator between an episode and its title, so
+        // the next token is usually a title — and a title may open with a
+        // letter this loop reads as a marker followed by a digit:
+        //
+        //     Show - S01E01 - E3 2019 Highlights.mkv   E3 is an expo
+        //     Show - S01E01 - X2.mkv                   X2 is a film
+        //     Show - S01E01 - E2E Testing.mkv          E2E is end-to-end
+        //
+        // All three read as ranges when a bare marker is accepted here, and
+        // `MAX_EPISODE_RANGE` hides it only when the number is large: `x264`
+        // is refused for its size, `X2` is not. The two names this rule was
+        // written for both carry something a title does not — `S07E22 -
+        // S07E23` repeats the season, `S42 Ep10718 - Ep10722` spells the
+        // marker with two letters. So a padded separator requires one of
+        // those, and a bare `e`/`x` extends only behind a bare dash, exactly
+        // as it did before this rule existed.
+        //
+        // This declines `Show - S01E01 - E02.mkv`, which may well be a range.
+        // Declining is the right failure: an absent claim costs a range, a
+        // wrong one costs the episode a file binds to.
+        let padded = sep_len > 1;
+        if (!separated || padded) && !marked {
+            break;
+        }
+        if padded && !distinctive {
             break;
         }
         // Something must separate this token from the last, or a stray trailing
@@ -3239,6 +3268,70 @@ mod multi_episode_spellings {
         assert_eq!(
             parse_filename("Series.S01E91-E100.mkv").episode_numbers(),
             vec![91]
+        );
+    }
+
+    /// **What the padded-separator rule permits, not just what it rejects.**
+    ///
+    /// ` - ` is the ordinary separator between an episode and its title, so
+    /// the token after it is usually a title — and a title may open with a
+    /// letter this loop reads as a marker followed by a digit. Each of these
+    /// read as a range while a bare `e`/`x` was accepted behind a padded
+    /// separator, and `MAX_EPISODE_RANGE` hid it only where the number was
+    /// large enough to trip the cap: `x264` was refused for its size, `X2`
+    /// was not.
+    ///
+    /// Every field is asserted, because the rule that shipped before this one
+    /// moved two nobody checked.
+    #[test]
+    fn a_padded_separator_does_not_read_a_title_as_a_range() {
+        for name in [
+            "Show - S01E01 - E3 2019 Highlights.mkv", // E3 is an expo
+            "Show - S01E01 - X2.mkv",                 // X2 is a film
+            "Show - S01E01 - X2 Review.mkv",
+            "Show - S01E01 - E2E Testing.mkv", // E2E is end-to-end
+            "Show - S01E01 - x264-GRP.mkv",
+            "Show - S01E01 - Exit 8.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.kind, crate::MediaKind::Episode, "{name:?} kind");
+            assert_eq!(p.title, "Show", "{name:?} title");
+            assert_eq!(p.season, Some(1), "{name:?} season");
+            assert_eq!(p.episode, Some(1), "{name:?} episode");
+            assert_eq!(p.episode_end, None, "{name:?} must not open a range");
+            assert_eq!(p.year, None, "{name:?} year");
+            assert_eq!(p.episode_numbers(), vec![1], "{name:?} run");
+        }
+    }
+
+    /// And the two names the rule exists for still extend, because each
+    /// carries a marker a title does not: a repeated season, or `ep` spelled
+    /// with two letters.
+    #[test]
+    fn a_padded_separator_still_extends_a_distinctive_marker() {
+        let p = parse_filename(
+            "Series Title - S07E22 - S07E23 - And Lots of Security.. [HDTV-720p].mkv",
+        );
+        assert_eq!(p.season, Some(7));
+        assert_eq!(p.episode_numbers(), vec![22, 23]);
+        let q = parse_filename("The Series And The Code - S42 Ep10718 - Ep10722");
+        assert_eq!(q.season, Some(42));
+        assert_eq!(q.episode, Some(10718));
+        assert_eq!(q.episode_end, Some(10722));
+    }
+
+    /// **A bare dash keeps the exemption it always had.** The padded rule
+    /// narrows nothing behind an unpadded dash, so `S15E06-08` and
+    /// `S01E01-E02` read exactly as they did before either rule existed.
+    #[test]
+    fn a_bare_dash_still_needs_no_distinctive_marker() {
+        assert_eq!(
+            parse_filename("Show.S15E06-08.mkv").episode_numbers(),
+            vec![6, 7, 8]
+        );
+        assert_eq!(
+            parse_filename("Show.S01E01-E02.mkv").episode_numbers(),
+            vec![1, 2]
         );
     }
 
