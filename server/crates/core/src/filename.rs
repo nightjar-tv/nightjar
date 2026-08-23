@@ -1182,17 +1182,30 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
     let mut end = start;
     loop {
         let mut k = j;
-        let separated = k < bytes.len() && bytes[k] == b'-';
         // **A dash is not the only separator**, and the other three cost
         // nothing only because a marker has to follow them. `S02E09 E10`,
         // `Series.S03E01.S03E02` and `2x04.2x05` are all one file holding two
         // episodes; a dash-only rule reported the first and claimed success,
         // which is worse than reporting nothing.
-        let soft_separated =
-            !separated && k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_');
-        if separated || soft_separated {
+        //
+        // **The separator is a run, not a byte.** `S07E22 - S07E23` pads its
+        // dash with spaces, and reading one byte stopped on the space with the
+        // second token still in front of it. At most one dash: `--` is not a
+        // separator anyone writes on purpose, and letting the run swallow two
+        // would join things nobody joined.
+        let sep_start = k;
+        let mut dashes = 0;
+        while k < bytes.len() && matches!(bytes[k], b' ' | b'.' | b'_' | b'-') {
+            if bytes[k] == b'-' {
+                if dashes == 1 {
+                    break;
+                }
+                dashes += 1;
+            }
             k += 1;
         }
+        let sep_len = k - sep_start;
+        let separated = dashes == 1;
         // An optional repeat of the season, in either spelling it appears in:
         // `s06` before an `e`, or `6x` before the number.
         let mut marked = false;
@@ -1207,11 +1220,19 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
             k += 1;
             marked = true;
         }
-        // **A soft separator needs a marker behind it.** Without one the
-        // corpus is full of names where the next token is an episode-title
+        // **Anything but a bare dash needs a marker behind it.** Without one
+        // the corpus is full of names where the next token is an episode-title
         // numeral: `S01E06 3 Beers For Batali`, `S01E04.2-45.PM`,
         // `S02E21 18 5 4`. All three parse correctly today.
-        if soft_separated && !marked {
+        //
+        // A *bare* dash is exempt, and only a bare one: `S15E06-08` is a range
+        // and has always been one. The moment whitespace pads the dash the
+        // exemption goes with it, because ` - ` is also how a name separates an
+        // episode from its title — `Series - S01E04 - 6 Feet Under` must not
+        // read as episodes 4 through 6. The marker is the whole difference
+        // between that and `S07E22 - S07E23`.
+        let require_marker = !separated || sep_len > 1;
+        if require_marker && !marked {
             break;
         }
         // Something must separate this token from the last, or a stray trailing
