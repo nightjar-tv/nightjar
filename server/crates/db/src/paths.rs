@@ -378,7 +378,10 @@ mod tests {
                 "show folder kept a season-tail segment for {path:?}"
             );
         }
-        assert_eq!(show_folder_relpath("A/B/Show/Season 1/x.mkv", root), "A/B/Show");
+        assert_eq!(
+            show_folder_relpath("A/B/Show/Season 1/x.mkv", root),
+            "A/B/Show"
+        );
     }
 
     /// An absolute stored path is relativised first, the same as the other two.

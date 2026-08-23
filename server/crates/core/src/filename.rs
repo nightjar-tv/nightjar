@@ -904,10 +904,10 @@ pub struct FolderContext<'a> {
 /// and `tv.episodetitle` (5,844), which read 0.0% correct.
 pub fn parse_filename_in(file_name: &str, ctx: FolderContext<'_>) -> ParsedName {
     let mut parsed = parse_filename(file_name);
-    if parsed.title.is_empty() {
-        if let Some(folder) = ctx.folder_title {
-            parsed.title = folder.trim().to_string();
-        }
+    if parsed.title.is_empty()
+        && let Some(folder) = ctx.folder_title
+    {
+        parsed.title = folder.trim().to_string();
     }
     if parsed.kind == MediaKind::Episode && parsed.season.is_none() {
         parsed.season = ctx.season;
@@ -1310,10 +1310,7 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
             // `Series - S01E01 - Episode 1.mkv`, and `episode` puts an `i`
             // where this requires a digit. Consuming `p` on anything looser
             // would turn every one of those episode titles into a range.
-            if e_marker
-                && k + 1 < bytes.len()
-                && bytes[k] == b'p'
-                && bytes[k + 1].is_ascii_digit()
+            if e_marker && k + 1 < bytes.len() && bytes[k] == b'p' && bytes[k + 1].is_ascii_digit()
             {
                 k += 1;
                 distinctive = true;
@@ -1575,7 +1572,11 @@ mod tests {
     /// and overriding a claim are different rules, and only the first is here.
     #[test]
     fn a_parsed_title_is_never_overwritten_by_the_folder() {
-        for name in ["Show - S01E01 - Pilot.mkv", "Episode 1.mkv", "01 - Closure.mkv"] {
+        for name in [
+            "Show - S01E01 - Pilot.mkv",
+            "Episode 1.mkv",
+            "01 - Closure.mkv",
+        ] {
             let with = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
             let without = parse_filename(name);
             assert_eq!(with.title, without.title, "folder overwrote {name:?}");
@@ -1592,7 +1593,11 @@ mod tests {
         }
         // A basename that names its own season keeps it.
         let q = parse_filename_in("S01E01.mkv", ctx(Some("Some Show"), Some(9)));
-        assert_eq!(q.season, Some(1), "the folder must not overrule the basename");
+        assert_eq!(
+            q.season,
+            Some(1),
+            "the folder must not overrule the basename"
+        );
     }
 
     /// **A film under a numbered season directory keeps no season.**
