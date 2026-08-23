@@ -1217,7 +1217,22 @@ fn extend_episode_span(bytes: &[u8], mut j: usize, season: i32, start: i32) -> i
             marked = true;
         }
         if k < bytes.len() && (bytes[k] == b'e' || bytes[k] == b'x') {
+            let e_marker = bytes[k] == b'e';
             k += 1;
+            // **`ep` is a two-letter spelling of the same marker**, and
+            // `S42 Ep10718 - Ep10722` is a real daily-serial name. The digit
+            // has to come **immediately** after the `p`, which is the whole
+            // reason this is safe: the generated library holds 2,877 rows of
+            // `Series - S01E01 - Episode 1.mkv`, and `episode` puts an `i`
+            // where this requires a digit. Consuming `p` on anything looser
+            // would turn every one of those episode titles into a range.
+            if e_marker
+                && k + 1 < bytes.len()
+                && bytes[k] == b'p'
+                && bytes[k + 1].is_ascii_digit()
+            {
+                k += 1;
+            }
             marked = true;
         }
         // **Anything but a bare dash needs a marker behind it.** Without one
