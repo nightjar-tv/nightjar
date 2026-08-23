@@ -3,6 +3,8 @@
 mod credentials;
 mod map;
 
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -98,6 +100,71 @@ const MOVIE_APPEND: &str = "images,credits,videos,release_dates,external_ids";
 const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggregate_credits";
 const SEASON_APPEND: &str = "images,credits,videos,external_ids";
 
+/// Order resolved addresses so the two IP families alternate, starting with
+/// whichever family the resolver returned first.
+///
+/// ## The failure this exists for
+///
+/// `ureq` does try every address — `stream.rs` loops the resolver's list and
+/// breaks on the first that connects. **What it does not do is give them equal
+/// time.** When there is more than one address it halves the *remaining*
+/// connect budget for each attempt, so the n-th address gets `timeout / 2ⁿ`.
+///
+/// On a host whose network advertises an IPv6 route it cannot use, that is the
+/// whole bug. `api.themoviedb.org` answers with **8 AAAA records and then 4 A
+/// records**, and `getaddrinfo` returns the AAAA block first. With the 10s
+/// connect timeout below, the eight dead addresses consume
+/// `5 + 2.5 + 1.25 + 0.625 + 0.31 + 0.16 + 0.08 + 0.04`, about **9.96s**,
+/// and the first IPv4 address is reached with 19ms left. Measured on this
+/// network, IPv6 to TMDB hangs 75s and never completes, while IPv4 connects in
+/// **0.28s** — so every provider call fails with `Connect error: connection
+/// timed out` having never once tried an address that works. 141 warming
+/// requests failed that way in 23 minutes on 2026-08-22, and it reads exactly
+/// like a bad key or a sandbox.
+///
+/// Interleaving puts an IPv4 address at attempt 2, where the budget is still
+/// 2.5s. The call then succeeds about 5s in — one dead IPv6 timeout, then a
+/// working connection.
+///
+/// ## Why not simply prefer IPv4
+///
+/// Because that is a different bug, shipped to everyone. An IPv4-only resolver
+/// strands any host on a v6-only network, and it silently discards the
+/// preference the OS expressed through RFC 6724. This keeps **both** families
+/// and only stops one of them from spending the entire budget first. A host
+/// with working IPv6 still connects on attempt 1 and never notices.
+///
+/// ## What it cannot fix
+///
+/// The ~5s spent on the first dead address. Avoiding that needs the two
+/// families raced in parallel (RFC 8305 Happy Eyeballs), and `ureq` 2.x
+/// connects strictly in sequence from inside its own loop — a resolver cannot
+/// reach it. This turns *never* into *slow*, and no further.
+fn interleave_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let (mut first, mut second): (Vec<_>, Vec<_>) = match addrs.first() {
+        // Keep the resolver's own leading family in front. Reversing that
+        // would override RFC 6724 for every host, which is the mistake this
+        // function exists to avoid making in the other direction.
+        Some(a) => {
+            let lead_v4 = a.is_ipv4();
+            addrs.into_iter().partition(|a| a.is_ipv4() == lead_v4)
+        }
+        None => return Vec::new(),
+    };
+    first.reverse();
+    second.reverse();
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    while !first.is_empty() || !second.is_empty() {
+        if let Some(a) = first.pop() {
+            out.push(a);
+        }
+        if let Some(b) = second.pop() {
+            out.push(b);
+        }
+    }
+    out
+}
+
 #[derive(Debug)]
 pub struct TmdbClient {
     creds: TmdbCredentials,
@@ -118,6 +185,11 @@ impl TmdbClient {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(30))
+            // See [`interleave_families`]. Without this, a host with an
+            // unroutable IPv6 route never reaches an address that works.
+            .resolver(|netloc: &str| -> io::Result<Vec<SocketAddr>> {
+                Ok(interleave_families(netloc.to_socket_addrs()?.collect()))
+            })
             .build();
         Self {
             creds,
@@ -881,6 +953,127 @@ fn scrub_tmdb_url_secret(msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::match_score::AUTO_MATCH_FLOOR;
+
+    fn addrs(spec: &str) -> Vec<SocketAddr> {
+        // "6666666644 44" -> eight v6 then four v4, each distinct.
+        let (mut n6, mut n4) = (0u16, 0u16);
+        spec.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| match c {
+                '6' => {
+                    n6 += 1;
+                    SocketAddr::from(([0x2600, 0x9000, 0, 0, 0, 0, 0, n6], 443))
+                }
+                '4' => {
+                    n4 += 1;
+                    SocketAddr::from(([18, 244, 214, n4 as u8], 443))
+                }
+                other => panic!("bad spec char {other:?}"),
+            })
+            .collect()
+    }
+
+    fn families(a: &[SocketAddr]) -> String {
+        a.iter()
+            .map(|a| if a.is_ipv4() { '4' } else { '6' })
+            .collect()
+    }
+
+    /// The shape that actually fails: what `api.themoviedb.org` answers on this
+    /// network — eight AAAA, then four A.
+    #[test]
+    fn tmdb_shape_reaches_ipv4_at_attempt_two() {
+        let out = interleave_families(addrs("66666666 4444"));
+        assert_eq!(families(&out), "646464646666");
+        // The claim that matters. `ureq` halves the remaining connect budget
+        // per attempt, so position is time: index 1 still has 2.5s of the 10s,
+        // where index 8 has 19ms and IPv4 needs 280ms.
+        assert!(out[1].is_ipv4(), "an IPv4 address must be the second attempt");
+        assert!(out[0].is_ipv6(), "the resolver's leading family stays first");
+    }
+
+    /// **Nothing may be dropped, duplicated or rewritten.** A reordering that
+    /// loses an address is a resolver that fails where DNS succeeded, and the
+    /// count alone would not show it — eight of twelve still connects.
+    #[test]
+    fn interleaving_preserves_the_exact_multiset() {
+        for spec in ["66666666 4444", "4 6", "66 4", "4444 66666666", "6", "4"] {
+            let input = addrs(spec);
+            let mut before = input.clone();
+            let mut after = interleave_families(input);
+            before.sort();
+            after.sort();
+            assert_eq!(before, after, "addresses changed for {spec:?}");
+        }
+    }
+
+    /// A host whose OS prefers IPv4 keeps IPv4 first. This function reorders
+    /// within the resolver's preference; it does not impose one.
+    #[test]
+    fn leading_family_is_preserved_both_ways() {
+        assert!(interleave_families(addrs("4444 66"))[0].is_ipv4());
+        assert!(interleave_families(addrs("6666 44"))[0].is_ipv6());
+    }
+
+    /// One family only — the v6-only network an IPv4-only resolver would have
+    /// stranded. Order is untouched and every address survives.
+    #[test]
+    fn single_family_is_left_alone() {
+        let v6 = addrs("666666");
+        assert_eq!(interleave_families(v6.clone()), v6);
+        let v4 = addrs("4444");
+        assert_eq!(interleave_families(v4.clone()), v4);
+    }
+
+    /// The real DNS answer, through the shipped function — **DNS only, no
+    /// connection and no request.** `#[ignore]`d because a test that needs a
+    /// resolver is not a test, it is a network check; run it by hand with
+    /// `cargo test -p nightjar-metadata -- --ignored real_dns`.
+    ///
+    /// Recorded 2026-08-23: `api.themoviedb.org` → 8 AAAA then 4 A, and this
+    /// puts an A record at index 1.
+    #[test]
+    #[ignore = "needs DNS"]
+    fn real_dns_answer_puts_ipv4_within_the_first_two() {
+        let raw: Vec<SocketAddr> = ("api.themoviedb.org", 443)
+            .to_socket_addrs()
+            .expect("resolve")
+            .collect();
+        let first_v4_before = raw.iter().position(|a| a.is_ipv4());
+        let out = interleave_families(raw.clone());
+        let first_v4_after = out.iter().position(|a| a.is_ipv4());
+        eprintln!(
+            "{} addrs; first IPv4 at {:?} -> {:?}; families {} -> {}",
+            raw.len(),
+            first_v4_before,
+            first_v4_after,
+            families(&raw),
+            families(&out),
+        );
+        if first_v4_before.is_none() {
+            eprintln!("no IPv4 in this answer — nothing for this fix to reorder");
+            return;
+        }
+        assert!(
+            first_v4_after.unwrap() <= 1,
+            "IPv4 must be reachable while the connect budget is still whole"
+        );
+    }
+
+    #[test]
+    fn empty_resolves_to_empty() {
+        assert!(interleave_families(Vec::new()).is_empty());
+    }
+
+    /// The surplus of the longer family lands after the pairs, in its original
+    /// order — not interleaved with nothing, and not discarded.
+    #[test]
+    fn surplus_addresses_keep_their_order() {
+        let out = interleave_families(addrs("666666 44"));
+        assert_eq!(families(&out), "64646666");
+        let sixes: Vec<_> = out.iter().filter(|a| a.is_ipv6()).copied().collect();
+        assert_eq!(sixes, addrs("666666"), "IPv6 order changed");
+    }
 
     #[test]
     fn resolve_title_floor_is_adr_value() {
