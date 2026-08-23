@@ -115,7 +115,35 @@ depend on `nightjar-metadata`, so the change could not reach it. True then. This
 slice touches `nightjar-core` **and** `nightjar-db`, and transcode depends on
 both. So it was re-derived rather than recalled.
 
-**It is not this slice**, on three independent grounds:
+### The A/B that was wrong before it was right
+
+The first attribution attempt ran four pairs, `HEAD~1` then `HEAD` each time,
+and produced this:
+
+    HEAD~1 (first)   2/4 failed
+    HEAD   (second)  4/4 failed
+
+Read alone, that is a regression. **It is an artefact of the harness**: `HEAD`
+was in second position every time. Running the same four pairs with the order
+reversed:
+
+| | ran first | ran second |
+|---|---|---|
+| `HEAD~1` | 2/4 | 2/4 |
+| `HEAD` | **1/4** | **4/4** |
+| **both** | **3/8** | **6/8** |
+
+**By tree, `HEAD~1` 4/8 and `HEAD` 5/8 — indistinguishable. By position, 3/8
+against 6/8.** `HEAD` went from 4/4 to 1/4 by being moved to the front. The
+second run in a quick succession fails roughly twice as often, whichever tree it
+is, because the preceding run leaves the SMB mount in a different state.
+
+This is the *verify the two things you compare are two things* trap wearing a
+different hat: two trees were compared, and what was really being compared was
+two positions. The fix was to reverse the order, which costs one more batch and
+settles it.
+
+**It is not this slice**, on four independent grounds:
 
 1. **It fails on both sides.** `HEAD~1`: ok, ok, FAILED. `HEAD`: ok, FAILED,
    FAILED. Same test, same machine, minutes apart.
@@ -125,6 +153,7 @@ both. So it was re-derived rather than recalled.
    `parse_filename` is byte-identical over 74,624 names.
 3. **It fails alone**, not only under parallel load, so it is not test
    interference either.
+4. **Order-controlled A/B says position, not tree** — the table above.
 
 **What it actually is.** The test reads a **727 MB file over an SMB network
 mount** — `//GUEST:@RM400._smb._tcp.local/media` — probes it with ffmpeg, and
@@ -136,6 +165,10 @@ A keyframe-landing assertion over a network filesystem. It skips when the mount
 is absent, so it does not fail in that case; it fails when the mount is *present
 and slow*, which is the worst of the three states because it looks like a code
 result.
+
+**Run it once, first, or not at all.** Back-to-back runs of this test are not
+independent samples, so a failure count from a loop of them measures the mount,
+not the code.
 
 **It should not be counted as a regression signal by anyone**, and the README's
 "single known-flaky failure" undersells it: the flakiness has a cause, and the
