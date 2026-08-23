@@ -3420,11 +3420,20 @@ fn lead_ms(produced_end_ms: Option<u64>, last_requested_ms: u64) -> Option<u64> 
 /// frontier the live encoder may be nowhere near after a backward seek, and
 /// using it would report no lead for the rest of the session.
 fn session_lead_ms(session: &Session) -> Option<u64> {
+    // One live encoder per session, so the current run is the serving run.
+    // ADR-0050 §4 breaks that: see the note on `frontier_ms`.
     let produced_end = frontier_ms(session.segment_map.iter_ordered(), session.current_run_id);
     lead_ms(produced_end, session.last_requested_ms)
 }
 
 /// Furthest media end produced by `run_id`, ignoring every other run.
+///
+/// `run_id` is the run **serving this playhead**, which today is the same as
+/// the session's current run because a seek kills the previous encoder before
+/// starting the next. Under ADR-0050 §4 a seek spawns instead, so two runs are
+/// live at once and "current" stops meaning "the one this playhead reads
+/// from". Pass the serving run explicitly then; do not reach for
+/// `session.current_run_id` here.
 fn frontier_ms<'a>(
     mut segments: impl DoubleEndedIterator<Item = &'a crate::hls_segment_map::MappedSegment>,
     run_id: u64,
