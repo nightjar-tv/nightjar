@@ -445,6 +445,9 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
                 probe.height.and_then(|h| u32::try_from(h).ok()),
                 probe.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),
                 probe.hdr.as_deref(),
+                probe
+                    .video_frame_rate
+                    .and_then(|(n, d)| Some((u32::try_from(n).ok()?, u32::try_from(d).ok()?))),
                 &BROWSER_V0,
             );
             let is_p5 = probe.hdr.as_deref() == Some("dolby_vision_p5");

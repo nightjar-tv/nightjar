@@ -259,6 +259,29 @@ pub struct VideoEncodePlan {
     pub max_bitrate_bps: Option<u64>,
     /// Source is HDR and the session encodes H.264 SDR → real tonemap graph.
     pub tone_map: bool,
+    /// Source frame rate as `(numerator, denominator)` (ADR-0052). The encode
+    /// leg derives its IDR interval from this and `SEGMENT_MS`. Rational, not
+    /// a float: 24000/1001 is not 23.976 and the error drifts the 2 s grid.
+    /// `None` when the source has not been probed for it.
+    pub source_frame_rate: Option<(u32, u32)>,
+}
+
+impl VideoEncodePlan {
+    /// Frames in one segment of `segment_ms` at this source's rate, rounded to
+    /// the nearest frame and never below 1. `None` when the rate is unknown,
+    /// which is the caller's signal to resolve it rather than guess (ADR-0052
+    /// decision 4).
+    ///
+    /// A frame count is only ever two seconds at one frame rate. `-g 48` is
+    /// 2 s at 23.976 fps and 0.8 s at 60, which is the failure Rule 4.9 names.
+    pub fn gop_frames(&self, segment_ms: u64) -> Option<u32> {
+        let (num, den) = self.source_frame_rate?;
+        if num == 0 || den == 0 {
+            return None;
+        }
+        let frames = (u64::from(num) * segment_ms).div_ceil(u64::from(den) * 1000);
+        Some(frames.max(1) as u32)
+    }
 }
 
 /// Build the encode plan from source probe fields × profile ceilings.
@@ -271,6 +294,7 @@ pub fn video_encode_plan(
     source_height: Option<u32>,
     source_bitrate_bps: Option<u64>,
     source_hdr: Option<&str>,
+    source_frame_rate: Option<(u32, u32)>,
     profile: &ClientCapabilityProfile,
 ) -> VideoEncodePlan {
     let max_height = match profile.max_height {
@@ -301,6 +325,7 @@ pub fn video_encode_plan(
         max_height,
         max_bitrate_bps,
         tone_map,
+        source_frame_rate,
     }
 }
 
@@ -955,7 +980,7 @@ mod tests {
             max_bitrate_bps: Some(5_000_000),
             ..BROWSER_V0
         };
-        let plan = video_encode_plan(Some(2160), Some(40_000_000), Some("none"), &capped);
+        let plan = video_encode_plan(Some(2160), Some(40_000_000), Some("none"), None, &capped);
         assert_eq!(plan.max_height, Some(1080));
         assert_eq!(plan.max_bitrate_bps, Some(5_000_000));
         assert!(!plan.tone_map);
@@ -967,18 +992,18 @@ mod tests {
             max_height: Some(1080),
             ..BROWSER_V0
         };
-        let plan = video_encode_plan(Some(720), Some(2_000_000), Some("none"), &capped);
+        let plan = video_encode_plan(Some(720), Some(2_000_000), Some("none"), None, &capped);
         assert_eq!(plan.max_height, None);
         assert!(!plan.tone_map);
     }
 
     #[test]
     fn encode_plan_tone_maps_hdr_sources() {
-        let plan = video_encode_plan(Some(1080), None, Some("hdr10"), &BROWSER_V0);
+        let plan = video_encode_plan(Some(1080), None, Some("hdr10"), None, &BROWSER_V0);
         assert!(plan.tone_map);
-        let dv = video_encode_plan(Some(1080), None, Some("dolby_vision"), &MEDIA3_V0);
+        let dv = video_encode_plan(Some(1080), None, Some("dolby_vision"), None, &MEDIA3_V0);
         assert!(dv.tone_map);
-        let p5 = video_encode_plan(Some(1080), None, Some("dolby_vision_p5"), &BROWSER_V0);
+        let p5 = video_encode_plan(Some(1080), None, Some("dolby_vision_p5"), None, &BROWSER_V0);
         assert!(!p5.tone_map, "P5 must not select a tonemap graph");
     }
 

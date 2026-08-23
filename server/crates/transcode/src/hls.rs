@@ -2986,24 +2986,44 @@ fn spawn_ffmpeg(
                 let buf = (bps.saturating_mul(2)).to_string();
                 cmd.args(["-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf]);
             }
-            cmd.args([
+            // IDR cadence is per encode leg (ADR-0052). The interval is
+            // always SEGMENT_MS; how the leg is made to hit it differs.
+            let gop = encode_plan.gop_frames(SEGMENT_MS);
+            if encode_leg.honours_force_key_frames {
                 // Time-based IDRs derived from SEGMENT_MS (same source as
                 // -hls_time and the generated playlist EXTINF). A frame-count
                 // -g alone is only 2s at 24 fps; at 60 fps it splits every
-                // 0.8s (ADR-0008).
-                "-force_key_frames",
-                force_kf.as_str(),
-                // Ceiling only; force_key_frames owns the cadence. Keep this
-                // large enough that high-fps sources still hit the SEGMENT_MS
-                // wall first. Scenecut off so FFmpeg cannot insert unaligned
-                // IDRs.
-                "-g",
-                "600",
-                "-keyint_min",
-                "48",
-                "-sc_threshold",
-                "0",
-            ]);
+                // 0.8s (ADR-0008 §3).
+                cmd.args(["-force_key_frames", force_kf.as_str()]);
+                // Ceiling only; force_key_frames owns the cadence. Derived
+                // from the source rate when known so it cannot land inside a
+                // segment; otherwise a wide fallback that keeps the
+                // expression as the binding constraint.
+                let g = gop.map_or_else(|| "600".to_string(), |g| g.to_string());
+                cmd.args(["-g", &g, "-sc_threshold", "0"]);
+            } else {
+                // This leg discards -force_key_frames, so -g is the cadence
+                // and has to be exactly one segment of frames. Measured on
+                // h264_qsv 2026-08-23: with -g 600 a 23.976 fps source cut
+                // 25.025 s segments and the 2 s grid did not exist.
+                match gop {
+                    Some(g) => {
+                        let g = g.to_string();
+                        cmd.args(["-g", &g, "-keyint_min", &g, "-forced_idr", "1"]);
+                    }
+                    None => {
+                        // No rate means no honest frame count. Send the
+                        // expression so a leg that quietly does honour it
+                        // still lands on the grid, and say so: this session's
+                        // segments may not be SEGMENT_MS.
+                        tracing::warn!(
+                            encoder = %encode_leg.encoder,
+                            "no source frame rate: cannot derive the IDR interval                              for a leg that ignores -force_key_frames; segment                              duration may not hold (ADR-0052)"
+                        );
+                        cmd.args(["-force_key_frames", force_kf.as_str()]);
+                    }
+                }
+            }
             push_audio_encode(&mut cmd, downmix.as_deref());
         }
     }
@@ -3351,12 +3371,51 @@ mod tests {
         ok
     }
 
+    /// ADR-0052: the frame count for one segment comes from the source rate,
+    /// so it is a different number per source and never a constant. This is
+    /// the arithmetic that `-g 48` got wrong by being written down once.
+    #[test]
+    fn gop_frames_follow_the_source_rate() {
+        let plan_at = |num, den| VideoEncodePlan {
+            source_frame_rate: Some((num, den)),
+            ..VideoEncodePlan::default()
+        };
+        // 23.976 fps: 48 frames is exactly 2 s, which is why the constant
+        // looked right for years on one corpus.
+        assert_eq!(plan_at(24000, 1001).gop_frames(2000), Some(48));
+        assert_eq!(plan_at(24, 1).gop_frames(2000), Some(48));
+        // 60 fps needs 120. A hardcoded 48 would cut every 0.8 s here.
+        assert_eq!(plan_at(60, 1).gop_frames(2000), Some(120));
+        assert_eq!(plan_at(30000, 1001).gop_frames(2000), Some(60));
+        assert_eq!(plan_at(25, 1).gop_frames(2000), Some(50));
+        // The interval follows SEGMENT_MS, not a second copy of it.
+        assert_eq!(plan_at(24000, 1001).gop_frames(4000), Some(96));
+        // No rate means no honest answer, and the caller must not invent one.
+        assert_eq!(VideoEncodePlan::default().gop_frames(2000), None);
+        assert_eq!(plan_at(0, 1).gop_frames(2000), None);
+        assert_eq!(plan_at(24, 0).gop_frames(2000), None);
+    }
+
+    /// A leg that discards `-force_key_frames` must be given the cadence as a
+    /// frame count plus `-forced_idr`. Measured on h264_qsv 2026-08-23: with
+    /// `-g 600` a 23.976 fps source cut 25.025 s segments and the 2 s grid did
+    /// not exist. Software honours the expression, so it keeps it.
+    #[test]
+    fn idr_arguments_differ_per_encode_leg() {
+        assert!(crate::EncodeLeg::software().honours_force_key_frames);
+        assert!(crate::EncodeLeg::videotoolbox().honours_force_key_frames);
+        assert!(!crate::EncodeLeg::qsv_sysmem().honours_force_key_frames);
+        // An unverified leg claims nothing and takes the explicit cadence.
+        assert!(!crate::EncodeLeg::generic_hw("h264_nvenc", "nvenc").honours_force_key_frames);
+    }
+
     #[test]
     fn video_filter_scales_and_retags_sdr() {
         let plan = VideoEncodePlan {
             max_height: Some(1080),
             max_bitrate_bps: Some(5_000_000),
             tone_map: false,
+            source_frame_rate: None,
         };
         let vf = transcode_video_filter_chain(plan, None).unwrap();
         assert!(vf.contains("min(1080,ih)"), "{vf}");

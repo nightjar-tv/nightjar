@@ -194,10 +194,19 @@ fn start_blocking(
 
     let start_ms = query.start_ms.unwrap_or(0);
     let keyframe_map = keyframe_map_for(&state, &row);
+    // ADR-0052: a transcode session needs the source frame rate to derive its
+    // IDR interval. Items probed before that migration have none, so resolve
+    // it here and write it back rather than encoding without it (Rule 4.13).
+    let frame_rate = match (row.video_frame_rate_num, row.video_frame_rate_den) {
+        (Some(n), Some(d)) if n > 0 && d > 0 => Some((n as u32, d as u32)),
+        _ if mode == SessionMode::Transcode => resolve_frame_rate(&state, &row),
+        _ => None,
+    };
     let encode_plan = video_encode_plan(
         row.height.and_then(|h| u32::try_from(h).ok()),
         row.video_bitrate_bps.and_then(|b| u64::try_from(b).ok()),
         row.hdr.as_deref(),
+        frame_rate,
         &profile,
     );
     // Profile 5: no tonemap attempt (decide already names the refuse reason).
@@ -265,6 +274,50 @@ fn start_blocking(
 /// A missing map is the ADR-0023 §8 fallback: the session starts with `-ss`
 /// on the real file and a rebuild goes on the library pool. Identity is
 /// re-checked against the bytes on disk at every bind, inside the session.
+/// Read the source frame rate for an item the probe never recorded one for
+/// (ADR-0052 decision 4). One `ffprobe` on the video stream, written back so
+/// the next session reads it from the row. Returns `None` when the file
+/// cannot be probed; `spawn_ffmpeg` logs that the grid may not hold.
+fn resolve_frame_rate(state: &AppState, row: &MediaItemRow) -> Option<(u32, u32)> {
+    let root = library_root(state, row.library_id).ok()?;
+    let abs = abs_path(&root, &row.path);
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&abs)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        tracing::warn!(item_id = row.id, "frame-rate probe failed at session start");
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (num, den) = text.trim().split_once('/')?;
+    let num: u32 = num.trim().parse().ok()?;
+    let den: u32 = den.trim().parse().ok()?;
+    if num == 0 || den == 0 {
+        return None;
+    }
+    if let Err(e) = state.db.set_item_frame_rate(row.id, num as i64, den as i64) {
+        // Not fatal: the session can encode on the value we just read.
+        tracing::warn!(item_id = row.id, error = %e, "frame-rate write-back failed");
+    }
+    tracing::info!(
+        item_id = row.id,
+        frame_rate = %format!("{num}/{den}"),
+        "resolved source frame rate at session start"
+    );
+    Some((num, den))
+}
+
 fn keyframe_map_for(state: &AppState, row: &MediaItemRow) -> Option<KeyframeMap> {
     let map = match state.db.keyframe_map(row.id) {
         Ok(Some(rows)) => KeyframeMap::from_db_rows(&rows),
