@@ -2149,7 +2149,13 @@ fn restart_at(
     session.last_restart = Instant::now();
     session.primed = false;
     session.first_segment_ready = false;
-    session.stale_retain_refuse_until = Some(Instant::now() + STALE_RETAIN_REFUSE);
+    // Not armed any more. This refused segments behind the new land for 15 s,
+    // because under kill-and-restart those bytes belonged to a land the client
+    // should have stopped playing and whose encoder was gone. The prior
+    // encoder now survives the seek and keeps producing that land until it is
+    // reaped (ADR-0050 §4-§5), so its media is valid and refusing it would 503
+    // a segment that is on disk.
+    session.stale_retain_refuse_until = None;
     if session.pending_play_ms == Some(play_start_ms) {
         session.pending_play_ms = None;
         session.pending_since = None;
