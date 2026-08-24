@@ -1,6 +1,7 @@
 # ADR-0050: A transcode session is one throttled encoder holding a lead
 
-- Status: **proposed** (§5 reap delay measured and amended 2026-08-23)
+- Status: **proposed** (§5 amended 2026-08-23 with the measured delay, and
+  2026-08-24: a superseded encoder runs until reap rather than being suspended)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -117,9 +118,34 @@ run, and the bench now refuses a run where one would not.
    shrinks, seven accumulated in ten minutes at N=4, and about 22 fit in that
    box's free memory.
 
-   **Measured 2026-08-23 (amendment).** Five runs at N=4, a 300 s forward seek
-   every 120 s, the superseded encode suspended on the seek and terminated
-   after the delay:
+   **Amended 2026-08-24 — do not suspend it. It keeps running until reap.**
+   The sentence above is what this decision said, and implementing it showed
+   why it is wrong. This is the one place in the design where the obvious move
+   is the wrong one, so the original claim stays visible rather than being
+   quietly replaced.
+
+   Suspending stops the encoder producing. A client may be waiting on a
+   segment of that encoder's land which has not finished writing, and a
+   suspended encoder never finishes it: the wait then runs to its timeout and
+   the encoder is killed at reap having never produced the byte someone asked
+   for. Under kill-and-restart this case had a guard —
+   `may_kill_cooking_encode` deferred the kill until the cooking land had no
+   waiter. Spawn-and-reap removes that guard, on the reasoning that nothing is
+   destroyed. Suspension destroys production, which is the half of the
+   reasoning that does not survive. The encoder must run until it is reaped.
+
+   **The fast arm and the correct arm are the same arm.** Leaving the prior
+   encoder running measured a 1132 ms median seek, the best of the three
+   policies in §4, so keeping it alive costs nothing in latency. A later
+   reader finding that suspension is required for correctness will not also
+   have to trade it against speed; there is no trade to make.
+
+   The memory figures above survive the amendment and are the reason
+   suspending bought little regardless: it frees encoder time and not memory.
+   The delay, not the suspension, is what bounds the held set.
+
+   **The delay, measured 2026-08-23.** Five runs at N=4, a 300 s forward seek
+   every 120 s, the superseded encode terminated after the delay:
 
    | delay | median seek | max | held RSS |
    |---|---|---|---|
@@ -195,8 +221,16 @@ into one restart. `classify_restart_desire`, `pending_restart_due`,
 
 Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
 client is still asking for it, because the superseded encoder keeps serving its
-land until it is reaped. The replacement is three steps: spawn, suspend, reap
-after the delay in decision 5. Rule 4.5 is satisfied by subtraction.
+land until it is reaped. The replacement is two steps: spawn, then reap after
+the delay in decision 5. **There is no suspend step** — decision 5's amendment
+of 2026-08-24 says why, and an implementer reading only this paragraph is
+exactly the reader that amendment exists for. Rule 4.5 is satisfied by
+subtraction.
+
+Because the prior encoder outlives the seek, "the current run" stops being the
+only live run. Anything reading a session-global maximum where it means one
+particular run has to name the run: the encode frontier the throttle reads, and
+any per-run cleanup that treats "not the current run" as "finished".
 
 The 2 s IDR grid is load-bearing here and does not hold on Intel today
 (ADR-0052). A long encoder makes that worse, not better, because it produces

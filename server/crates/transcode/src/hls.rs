@@ -8124,9 +8124,26 @@ mod tests {
     /// had been placed second every time; moving it to the front took it to 1/4.
     /// The preceding run leaves the mount in a state the next one inherits.
     ///
-    /// **This has now been misread as a regression twice**, in two different
-    /// sessions, and both readers were looking at this test rather than at
-    /// anyone's notes — which is why the finding is written here.
+    /// **This has now been misread as a regression four times**, in four
+    /// different sessions, each in a different way, and every reader was
+    /// looking at this test rather than at anyone's notes — which is why the
+    /// finding is written here.
+    ///
+    /// The fourth (2026-08-24) is worth its own line, because the note above
+    /// did not stop it. The reader saw the failure print the same numbers on
+    /// every run, took a constant value as evidence of determinism, and
+    /// bisected: pass on the parent commit, fail on the child, therefore the
+    /// child caused it. Then the parent failed too, on a repeat.
+    ///
+    /// **The constant value is this test's signature, not a fingerprint of a
+    /// cause.** It is quoted verbatim eight lines above. Two stable outcomes
+    /// is what an order-dependent mount produces, and a failure that always
+    /// reads the same is indistinguishable by symptom from a regression.
+    ///
+    /// **Only a same-commit repeat separates the two.** A bisect changes
+    /// commits between samples, so it cannot: one sample per commit will
+    /// happily draw a clean line through noise. Run the suspect commit twice
+    /// before running any other.
     ///
     /// A skip is honest and a pass is honest. A failure means *this test ran
     /// second, or the NAS was slow*, until an order-controlled A/B says
