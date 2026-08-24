@@ -3344,7 +3344,21 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
 /// handled by letting the encoder finish. Leaving it running is also the
 /// fastest of the three seek policies measured, at a 1132 ms median, so
 /// correctness and speed agree (ADR-0050 §4-§5).
+///
+/// "Left running" includes resuming one the throttle had already suspended.
+/// A session that has caught up sits SIGSTOPped at [`LEAD_TARGET_MS`], which
+/// is the design's steady state, so that is the common case at a seek and not
+/// the rare one. Without the SIGCONT this function would set aside a stopped
+/// process for [`REAP_AFTER`] and then kill it — suspend-then-reap, the exact
+/// policy ADR-0050 §5 was amended to forbid.
 fn supersede_child(session: &mut Session) {
+    // Resume before setting it aside, while the child is still `session.child`
+    // and the only thing that can signal it is this call under this lock.
+    if session.throttled
+        && let Some(child) = session.child.as_ref()
+    {
+        signal_child(child, false);
+    }
     let Some(child) = session.child.take() else {
         return;
     };
@@ -3628,19 +3642,71 @@ mod tests {
         }
     }
 
-    /// Whether a pid still exists. Signal 0 checks permission to signal and
-    /// delivers nothing.
+    /// What a stand-in encoder is actually doing.
+    ///
+    /// `Running` and `Stopped` have to be separable. `kill(pid, 0)` succeeds
+    /// for a SIGSTOPped process, so an existence check passes against a
+    /// supersede that suspends the encoder instead of keeping it producing —
+    /// which is the whole point of ADR-0050 §5.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum ChildState {
+        Running,
+        Stopped,
+        Gone,
+    }
+
+    /// Read a stand-in encoder's state.
     ///
     /// The reap `wait()`s, so a reaped child is gone rather than a zombie and
-    /// this reads false. Assert on this rather than on
+    /// reads `Gone`. Assert on this rather than on
     /// `session.superseded.len()`: a reap that dropped the `Child` without
     /// killing it satisfies the length and leaks an FFmpeg per seek.
+    ///
+    /// `ps` rather than `waitpid`, deliberately. `waitpid` with `WUNTRACED`
+    /// reports a stop **once** and then clears it, so a caller that has
+    /// already waited for the child to stop reads the next check as `Running`
+    /// and a test asserting "resumed" passes against code that never resumed
+    /// it. That was written first and it did pass. `ps` reads the current
+    /// state every time. `T` is stopped on both macOS and Linux; a running
+    /// child is `S` or `R`.
     #[cfg(unix)]
-    fn pid_alive(pid: u32) -> bool {
+    fn child_state(pid: u32) -> ChildState {
         // SAFETY: signal 0 delivers nothing. The pid comes from a child this
         // test spawned and has not waited on except through the reap under
         // test, so it is either ours or unallocated.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return ChildState::Gone;
+        }
+        let out = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if state.is_empty() {
+            return ChildState::Gone;
+        }
+        if state.starts_with('T') {
+            ChildState::Stopped
+        } else {
+            ChildState::Running
+        }
+    }
+
+    /// Wait, bounded, for a signal to be delivered and reflected.
+    ///
+    /// `kill` returns once the signal is queued, not once the target has acted
+    /// on it, so reading the state straight after can race the delivery.
+    #[cfg(unix)]
+    fn wait_for_state(pid: u32, want: ChildState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if child_state(pid) == want {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pid {pid} never reached {want:?}");
     }
 
     /// Stands in for an encoder mid-run: alive, and long enough that only the
@@ -3671,11 +3737,12 @@ mod tests {
         session.current_run_id = 7;
         session.child = Some(spawn_stand_in_encoder());
         let pid = session.child.as_ref().unwrap().id();
-        assert!(pid_alive(pid), "the stand-in encoder must start alive");
+        assert_eq!(child_state(pid), ChildState::Running);
 
         supersede_child(&mut session);
-        assert!(
-            pid_alive(pid),
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
             "a seek supersedes the prior encoder, it does not kill it"
         );
         assert_eq!(
@@ -3686,14 +3753,61 @@ mod tests {
 
         // Not due yet.
         reap_superseded(&mut session);
-        assert!(pid_alive(pid), "not past REAP_AFTER, so still producing");
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "not past REAP_AFTER, so still producing"
+        );
         assert_eq!(session.superseded.len(), 1);
 
         // Due.
         session.superseded[0].reap_at = Instant::now() - Duration::from_millis(1);
         reap_superseded(&mut session);
-        assert!(!pid_alive(pid), "past its delay, so the process is gone");
+        assert_eq!(
+            child_state(pid),
+            ChildState::Gone,
+            "past its delay, so the process is gone"
+        );
         assert!(session.superseded.is_empty());
+    }
+
+    /// A seek on a session the throttle had suspended resumes the encoder
+    /// before setting it aside.
+    ///
+    /// This is the common case, not the rare one: a session that has caught
+    /// up sits SIGSTOPped at `LEAD_TARGET_MS`, which is the shape ADR-0050 §2
+    /// designs for. Without the SIGCONT the seek sets aside a stopped process
+    /// for `REAP_AFTER` and then kills it, which is suspend-then-reap — the
+    /// policy §5 was amended to forbid, arriving through the throttle instead
+    /// of through `supersede_child` asking for it.
+    ///
+    /// `kill(pid, 0)` cannot see this: it succeeds for a stopped process.
+    #[cfg(unix)]
+    #[test]
+    fn superseding_a_throttled_encoder_resumes_it_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.child = Some(spawn_stand_in_encoder());
+        let pid = session.child.as_ref().unwrap().id();
+
+        // What the throttle does at the lead target.
+        assert!(signal_child(session.child.as_ref().unwrap(), true));
+        session.throttled = true;
+        wait_for_state(pid, ChildState::Stopped);
+
+        supersede_child(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "a superseded encoder has to keep producing until it is reaped"
+        );
+        assert!(
+            !session.throttled,
+            "the flag described the child that just left"
+        );
+
+        reap_all_superseded(&mut session);
+        assert_eq!(child_state(pid), ChildState::Gone);
     }
 
     /// Session teardown takes them all, whatever their delay: nothing may
@@ -3713,12 +3827,16 @@ mod tests {
                 run_id,
             });
         }
-        assert!(pids.iter().all(|p| pid_alive(*p)));
+        assert!(pids.iter().all(|p| child_state(*p) == ChildState::Running));
 
         reap_all_superseded(&mut session);
         assert!(session.superseded.is_empty());
         for pid in pids {
-            assert!(!pid_alive(pid), "teardown leaves no encoder behind");
+            assert_eq!(
+                child_state(pid),
+                ChildState::Gone,
+                "teardown leaves no encoder behind"
+            );
         }
     }
 
