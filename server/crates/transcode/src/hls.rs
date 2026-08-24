@@ -660,6 +660,11 @@ struct Session {
 struct SupersededEncoder {
     child: Child,
     reap_at: Instant,
+    /// The run this encoder is still writing into. Its directory is not the
+    /// current run's any more, and every per-run cleanup path in this file
+    /// reads "not the current run" as "finished". It is not finished: the
+    /// process is alive until [`reap_at`](Self::reap_at).
+    run_id: u64,
 }
 
 /// Snapshot returned by start / seek / get (ADR-0020 wire fields).
@@ -864,6 +869,7 @@ fn dir_tree_bytes(path: &Path) -> u64 {
 fn maybe_evict_finished_runs(session: &mut Session) {
     reap_empty_finished_run_dirs(session);
     let budget = session_run_cache_budget_bytes();
+    let live = live_run_ids(session);
     loop {
         let total = session_disk_bytes(&session.dir);
         if total <= budget {
@@ -886,7 +892,9 @@ fn maybe_evict_finished_runs(session: &mut Session) {
             let Ok(id) = id_str.parse::<u64>() else {
                 continue;
             };
-            if id == session.current_run_id {
+            // Not just the current run: a superseded encoder is still writing
+            // into its own run for up to `REAP_AFTER`.
+            if live.contains(&id) {
                 continue;
             }
             let bytes = dir_tree_bytes(&entry.path());
@@ -938,6 +946,7 @@ fn maybe_evict_finished_runs(session: &mut Session) {
 
 /// Remove finished run directories that hold no bytes. Not a budget eviction.
 fn reap_empty_finished_run_dirs(session: &mut Session) {
+    let live = live_run_ids(session);
     let Ok(entries) = fs::read_dir(&session.dir) else {
         return;
     };
@@ -952,7 +961,11 @@ fn reap_empty_finished_run_dirs(session: &mut Session) {
         let Ok(id) = id_str.parse::<u64>() else {
             continue;
         };
-        if id == session.current_run_id {
+        // A live run is never empty today, because `write_run_encode_start`
+        // seeds every run dir before the spawn. That is a seeding detail in
+        // another function, not a property of this one, so exclude live runs
+        // here rather than depending on it.
+        if live.contains(&id) {
             continue;
         }
         if dir_tree_bytes(&entry.path()) > 0 {
@@ -3344,7 +3357,27 @@ fn supersede_child(session: &mut Session) {
     session.superseded.push(SupersededEncoder {
         child,
         reap_at: Instant::now() + REAP_AFTER,
+        // `restart_at` calls this before it assigns the new run, so
+        // `current_run_id` here is exactly the run being set aside. Read it,
+        // do not infer it later.
+        run_id: session.current_run_id,
     });
+}
+
+/// Runs with an encoder still writing into them: the current one, plus every
+/// superseded encoder that has not been reaped yet.
+///
+/// Every per-run cleanup in this file has to consult this rather than
+/// `current_run_id` alone. A seek used to kill the prior encoder before any
+/// cleanup ran, so "not current" meant "nothing is writing here". Under
+/// ADR-0050 §4-§5 the prior encoder outlives the seek by [`REAP_AFTER`], and
+/// unlinking its directory would take away the media the whole policy exists
+/// to keep serving.
+fn live_run_ids(session: &Session) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(session.superseded.len() + 1);
+    ids.push(session.current_run_id);
+    ids.extend(session.superseded.iter().map(|s| s.run_id));
+    ids
 }
 
 /// Terminate superseded encoders whose delay has elapsed.
@@ -3633,6 +3666,7 @@ mod tests {
         session.superseded.push(SupersededEncoder {
             child,
             reap_at: Instant::now() + Duration::from_secs(30),
+            run_id: session.current_run_id,
         });
         reap_superseded(&mut session);
         assert_eq!(
@@ -3661,6 +3695,7 @@ mod tests {
             session.superseded.push(SupersededEncoder {
                 child,
                 reap_at: Instant::now() + Duration::from_secs(30),
+                run_id: session.current_run_id,
             });
         }
         reap_all_superseded(&mut session);
