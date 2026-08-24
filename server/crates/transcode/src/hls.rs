@@ -1325,16 +1325,10 @@ impl HlsSessionRegistry {
             return Ok(session_view(session_id, session));
         }
         let leg = session.encode_leg.clone();
-        match restart_at(session, aligned, &leg)? {
-            RestartAtOutcome::Applied => {
-                maybe_evict_finished_runs(session);
-            }
-            RestartAtOutcome::DeferredLandWaiter => {
-                // Keep intent; client can poll view until the run advances.
-                session.pending_play_ms = Some(aligned);
-                session.pending_since = Some(Instant::now());
-            }
-        }
+        // A seek always applies: nothing is destroyed, so nothing can be in
+        // the way of destroying it (ADR-0050 §4).
+        restart_at(session, aligned, &leg)?;
+        maybe_evict_finished_runs(session);
         Ok(session_view(session_id, session))
     }
 
@@ -2016,81 +2010,29 @@ impl EncoderKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestartAtOutcome {
-    Applied,
-    /// Cooking land still unfinished and an asset_wait holds it — leave the
-    /// encoder alone so mid bytes can land; caller must keep pending.
-    DeferredLandWaiter,
-}
-
 fn restart_at(
     session: &mut Session,
     play_ms: u64,
     _encode_leg: &crate::EncodeLeg,
-) -> Result<RestartAtOutcome, PlaylistError> {
+) -> Result<(), PlaylistError> {
     let play_start_ms = align_to_segment(play_ms);
     let prior_play = session.play_start_ms;
     let prior_ready = session.first_segment_ready;
-    let cooking_land = align_to_segment(prior_play);
-    let cooking_waiters = session
-        .segment_waiters
-        .get(&cooking_land)
-        .copied()
-        .unwrap_or(0);
-    // Gate immediately before kill, under the same sessions mutex that
-    // SegmentWaiterGuard attach/drop uses — check-then-kill is atomic vs
-    // concurrent waiter attach for this process.
-    if !may_kill_cooking_encode(prior_ready, cooking_waiters) {
-        if !session.preempt_defer_logged {
-            session.preempt_defer_logged = true;
-            tracing::info!(
-                prior_play_start_ms = prior_play,
-                prior_first_segment_ready = prior_ready,
-                cooking_land_waiters = cooking_waiters,
-                new_play_start_ms = play_start_ms,
-                "hls seek restart_at: defer kill (cooking land waiter)"
-            );
-        }
-        return Ok(RestartAtOutcome::DeferredLandWaiter);
-    }
+    // No gate before the kill, because there is no kill. This used to ask
+    // whether a client still held the cooking land, and defer if so, because
+    // killing the encoder would strand that waiter. The encoder is now kept
+    // and left running (ADR-0050 §4-§5), so it finishes the segment the
+    // waiter is holding for and the question cannot arise.
     session.preempt_defer_logged = false;
-    let had_child = session.child.is_some();
-    // Snapshot all waiters at kill time — correlates attach/drop races on
-    // double-scrub sticks (cooking land may be 0 while another want_ms holds).
-    let waiters_snapshot: String = {
-        let mut parts: Vec<String> = session
-            .segment_waiters
-            .iter()
-            .map(|(ms, n)| format!("{ms}:{n}"))
-            .collect();
-        parts.sort();
-        if parts.is_empty() {
-            "-".into()
-        } else {
-            parts.join(",")
-        }
-    };
-    if !prior_ready && cooking_waiters == 0 {
-        tracing::info!(
-            prior_play_start_ms = prior_play,
-            cooking_land_ms = cooking_land,
-            cooking_land_waiters = cooking_waiters,
-            segment_waiters = %waiters_snapshot,
-            new_play_start_ms = play_start_ms,
-            "hls seek restart_at: preempt kill before land (no cooking waiter)"
-        );
-    }
     tracing::info!(
         prior_play_start_ms = prior_play,
         prior_first_segment_ready = prior_ready,
-        killing_encoder = had_child,
-        cooking_land_waiters = cooking_waiters,
-        segment_waiters = %waiters_snapshot,
+        superseding_encoder = session.child.is_some(),
+        held_encoders = session.superseded.len(),
         new_play_start_ms = play_start_ms,
-        "hls seek restart_at: stop prior encode"
+        "hls seek: supersede prior encode"
     );
-    stop_child(&mut session.child);
+    supersede_child(session);
     // `throttled` describes a live process. This session keeps going with a
     // new child, so leaving it set would make the next tick send a resume to
     // a child that was never suspended and skip the suspend it needs. The
@@ -2147,7 +2089,7 @@ fn restart_at(
             path = %session.src.display(),
             "hls session seek map hit (duplicate-write stop)"
         );
-        return Ok(RestartAtOutcome::Applied);
+        return Ok(());
     }
     if let Some(gap) = restart_spawn_gap() {
         tracing::info!(
@@ -2226,7 +2168,7 @@ fn restart_at(
         path = %session.src.display(),
         "hls session seek restart"
     );
-    Ok(RestartAtOutcome::Applied)
+    Ok(())
 }
 
 /// Mapped segment that already covers title-absolute `play_ms`.
@@ -2333,29 +2275,22 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
         && coalesce_preempt_before_land(cooking, pending)
         && since >= RESTART_MIN_INTERVAL;
     let leg = session.encode_leg.clone();
-    match restart_at(session, pending, &leg)? {
-        RestartAtOutcome::DeferredLandWaiter => {
-            // restart_at already logged once per defer streak.
-            Ok(())
-        }
-        RestartAtOutcome::Applied => {
-            if preempt_before_land {
-                tracing::info!(
-                    pending_play_ms = pending,
-                    cooking_play_ms = cooking,
-                    since_last_restart_ms = since.as_millis(),
-                    "hls seek restart preempted (before land)"
-                );
-            }
-            // restart_at clears pending when it matches the new play; clear
-            // any leftover (e.g. already applied path).
-            if session.pending_play_ms == Some(pending) {
-                session.pending_play_ms = None;
-                session.pending_since = None;
-            }
-            Ok(())
-        }
+    restart_at(session, pending, &leg)?;
+    if preempt_before_land {
+        tracing::info!(
+            pending_play_ms = pending,
+            cooking_play_ms = cooking,
+            since_last_restart_ms = since.as_millis(),
+            "hls seek restart preempted (before land)"
+        );
     }
+    // restart_at clears pending when it matches the new play; clear any
+    // leftover (e.g. already applied path).
+    if session.pending_play_ms == Some(pending) {
+        session.pending_play_ms = None;
+        session.pending_since = None;
+    }
+    Ok(())
 }
 
 /// Whether bytes read for a segment request may still be returned after
