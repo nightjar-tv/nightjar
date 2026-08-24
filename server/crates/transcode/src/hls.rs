@@ -627,8 +627,6 @@ struct Session {
     /// in flight. The API wires it to the library pool; a seek consults it
     /// before deciding to wait, bounded, for the build to land.
     map_build_in_flight: Option<Arc<MapBuildInFlight>>,
-    /// Avoid log spam while polls re-hit deferred preempt before land.
-    preempt_defer_logged: bool,
     /// Title-absolute start of the furthest segment this session has been
     /// asked for. The playhead, as the server can see it (ADR-0050 §2).
     last_requested_ms: u64,
@@ -1207,7 +1205,6 @@ impl HlsSessionRegistry {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
-                preempt_defer_logged: false,
                 // The playhead starts where the session was asked to start,
                 // so a session created at a mid-title land does not read as
                 // holding a title's worth of lead on its first tick.
@@ -1991,7 +1988,6 @@ fn restart_at(
     // killing the encoder would strand that waiter. The encoder is now kept
     // and left running (ADR-0050 §4-§5), so it finishes the segment the
     // waiter is holding for and the question cannot arise.
-    session.preempt_defer_logged = false;
     tracing::info!(
         prior_play_start_ms = prior_play,
         prior_first_segment_ready = prior_ready,
@@ -3505,7 +3501,6 @@ mod tests {
             pending_since: None,
             failed: None,
             subtitle_tracks: vec![],
-            preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
             superseded: Vec::new(),
@@ -4685,7 +4680,6 @@ mod tests {
             pending_since: None,
             failed: None,
             subtitle_tracks: vec![],
-            preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
             superseded: Vec::new(),
@@ -6711,7 +6705,6 @@ mod tests {
             pending_since: None,
             failed: None,
             subtitle_tracks: vec![],
-            preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
             superseded: Vec::new(),
@@ -6916,7 +6909,6 @@ mod tests {
             pending_since: None,
             failed: None,
             subtitle_tracks: vec![],
-            preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
             superseded: Vec::new(),
@@ -7002,7 +6994,6 @@ mod tests {
             pending_since: None,
             failed: None,
             subtitle_tracks: vec![],
-            preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
             superseded: Vec::new(),
