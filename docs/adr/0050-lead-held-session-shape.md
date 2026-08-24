@@ -1,6 +1,7 @@
 # ADR-0050: A transcode session is one throttled encoder holding a lead
 
-- Status: **proposed** (§5 reap delay measured and amended 2026-08-23)
+- Status: **proposed** (§5 amended 2026-08-23 with the measured delay, and
+  2026-08-24: a superseded encoder runs until reap rather than being suspended)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -110,16 +111,35 @@ run, and the bench now refuses a run where one would not.
    with creating one. Confirming it needs instrumentation this bench does not
    have, so it is recorded as a hypothesis.
 
-5. **A superseded encoder is suspended, then reaped on a short idle delay.**
-   Suspending is not enough on its own. SIGSTOP frees encoder time and does
-   not release memory: held encoders measured 1593 MB suspended against
-   1586 MB running, identical within noise. Each costs 226 MB and never
-   shrinks, seven accumulated in ten minutes at N=4, and about 22 fit in that
-   box's free memory.
+5. **A superseded encoder keeps running, and is reaped on a short idle
+   delay.** It is **not** suspended, and this is the one place where the
+   obvious move is wrong.
 
-   **Measured 2026-08-23 (amendment).** Five runs at N=4, a 300 s forward seek
-   every 120 s, the superseded encode suspended on the seek and terminated
-   after the delay:
+   **Why not suspend it (amended 2026-08-24, found in implementation).**
+   Suspending stops the encoder producing. A client may be waiting on a
+   segment of that encoder's land which has not finished writing, and a
+   suspended encoder never finishes it: the wait then runs to its timeout and
+   the encoder is killed at reap having never produced the byte someone asked
+   for. Under kill-and-restart this case had a guard —
+   `may_kill_cooking_encode` deferred the kill until the cooking land had no
+   waiter. Spawn-and-reap removes that guard, on the reasoning that nothing is
+   destroyed. Suspension destroys production, which is the half of the
+   reasoning that does not survive. The encoder must run until it is reaped.
+
+   **The fast arm and the correct arm are the same arm.** Leaving the prior
+   encoder running measured a 1132 ms median seek, the best of the three
+   policies in §4, so keeping it alive costs nothing in latency. A later
+   reader finding that suspension is required for correctness will not also
+   have to trade it against speed; there is no trade to make.
+
+   Suspending would not have bought much anyway. SIGSTOP frees encoder time
+   and does not release memory: held encoders measured 1593 MB suspended
+   against 1586 MB running, identical within noise. Each costs 226 MB and
+   never shrinks, seven accumulated in ten minutes at N=4, and about 22 fit in
+   that box's free memory. The delay, not the suspension, is what bounds it.
+
+   **The delay, measured 2026-08-23.** Five runs at N=4, a 300 s forward seek
+   every 120 s, the superseded encode terminated after the delay:
 
    | delay | median seek | max | held RSS |
    |---|---|---|---|
