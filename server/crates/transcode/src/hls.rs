@@ -1893,6 +1893,7 @@ impl HlsSessionRegistry {
             return false;
         };
         stop_child(&mut session.child);
+        reap_all_superseded(&mut session);
         if let Err(e) = fs::remove_dir_all(&session.dir) {
             tracing::warn!(
                 path = %session.dir.display(),
@@ -1934,6 +1935,9 @@ impl HlsSessionRegistry {
                 continue;
             };
             for (id, session) in sessions.iter_mut() {
+                // The 250 ms tick already walks every session under the lock,
+                // so the reap rides along rather than taking its own thread.
+                reap_superseded(session);
                 let Some(child) = session.child.as_ref() else {
                     // No producer: a finished run holds no lead, and a child
                     // that exited while suspended must not stay marked.
@@ -1984,6 +1988,7 @@ impl HlsSessionRegistry {
             return;
         };
         stop_child(&mut session.child);
+        reap_all_superseded(&mut session);
         let _ = fs::remove_dir_all(&session.dir);
     }
 }
@@ -3391,6 +3396,50 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
         Some(filter) => cmd.args(["-filter:a", filter]),
         None => cmd.args(["-ac", "2"]),
     };
+}
+
+/// Move this session's producer aside for a seek: keep it, reap it later.
+///
+/// It is left **running**. Suspending would free encoder time, but it also
+/// stops production, and a client may be waiting on a segment of this land
+/// that has not finished writing. Under kill-and-restart that case was
+/// handled by deferring the kill (`may_kill_cooking_encode`); here it is
+/// handled by letting the encoder finish. Leaving it running is also the
+/// fastest of the three seek policies measured, at a 1132 ms median, so
+/// correctness and speed agree (ADR-0050 §4-§5).
+fn supersede_child(session: &mut Session) {
+    let Some(child) = session.child.take() else {
+        return;
+    };
+    // The flag described the child that just left.
+    session.throttled = false;
+    session.superseded.push(SupersededEncoder {
+        child,
+        reap_at: Instant::now() + REAP_AFTER,
+    });
+}
+
+/// Terminate superseded encoders whose delay has elapsed.
+fn reap_superseded(session: &mut Session) {
+    let now = Instant::now();
+    session.superseded.retain_mut(|s| {
+        if s.reap_at > now {
+            return true;
+        }
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        false
+    });
+}
+
+/// Terminate every superseded encoder now, whatever their delay. Session
+/// teardown: nothing may outlive the session that spawned it.
+fn reap_all_superseded(session: &mut Session) {
+    for s in session.superseded.iter_mut() {
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    session.superseded.clear();
 }
 
 fn stop_child(child: &mut Option<Child>) {
