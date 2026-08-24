@@ -3635,22 +3635,39 @@ mod tests {
         }
     }
 
-    /// ADR-0050 §5: the delay has to outlast the seek that replaced the
-    /// encoder, or the teardown lands while the new encoder is still starting
-    /// and contends with it. That cost 462 ms at 2 s.
-    #[test]
-    fn reap_delay_outlasts_the_seek_it_follows() {
-        // Worst measured first byte for a seek was near 2.4 s.
-        assert!(
-            REAP_AFTER > Duration::from_millis(2400),
-            "reap must be clear of the seek's own first byte"
-        );
+    /// Whether a pid still exists. Signal 0 checks permission to signal and
+    /// delivers nothing.
+    ///
+    /// The reap `wait()`s, so a reaped child is gone rather than a zombie and
+    /// this reads false. Assert on this rather than on
+    /// `session.superseded.len()`: a reap that dropped the `Child` without
+    /// killing it satisfies the length and leaks an FFmpeg per seek.
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 delivers nothing. The pid comes from a child this
+        // test spawned and has not waited on except through the reap under
+        // test, so it is either ours or unallocated.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
-    /// A superseded encoder is kept and reaped on its delay, not before.
-    /// Reaping early is what a seek used to do, and it cost 1055 ms.
+    /// Stands in for an encoder mid-run: alive, and long enough that only the
+    /// reap can end it inside the test.
+    #[cfg(unix)]
+    fn spawn_stand_in_encoder() -> Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// A seek keeps the prior encoder alive and reaps it on its delay, not
+    /// before (ADR-0050 §4-§5). Killing it at the seek is what the old shape
+    /// did, and it cost 1055 ms.
+    ///
+    /// Every assertion here is on the process, not on the bookkeeping.
+    #[cfg(unix)]
     #[test]
-    fn superseded_encoders_are_reaped_only_once_due() {
+    fn a_superseded_encoder_lives_until_its_delay_is_up() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = make_test_session(dir.path());
 
@@ -3658,48 +3675,103 @@ mod tests {
         reap_superseded(&mut session);
         assert!(session.superseded.is_empty());
 
-        // A long-lived child stands in for an encoder mid-run.
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        session.superseded.push(SupersededEncoder {
-            child,
-            reap_at: Instant::now() + Duration::from_secs(30),
-            run_id: session.current_run_id,
-        });
-        reap_superseded(&mut session);
+        session.current_run_id = 7;
+        session.child = Some(spawn_stand_in_encoder());
+        let pid = session.child.as_ref().unwrap().id();
+        assert!(pid_alive(pid), "the stand-in encoder must start alive");
+
+        supersede_child(&mut session);
+        assert!(
+            pid_alive(pid),
+            "a seek supersedes the prior encoder, it does not kill it"
+        );
         assert_eq!(
-            session.superseded.len(),
-            1,
-            "not due yet, so it must still be running"
+            session.superseded.first().map(|s| s.run_id),
+            Some(7),
+            "the held encoder carries the run it is still writing into"
         );
 
-        // Due: it goes.
+        // Not due yet.
+        reap_superseded(&mut session);
+        assert!(pid_alive(pid), "not past REAP_AFTER, so still producing");
+        assert_eq!(session.superseded.len(), 1);
+
+        // Due.
         session.superseded[0].reap_at = Instant::now() - Duration::from_millis(1);
         reap_superseded(&mut session);
-        assert!(session.superseded.is_empty(), "past its delay, so reaped");
+        assert!(!pid_alive(pid), "past its delay, so the process is gone");
+        assert!(session.superseded.is_empty());
     }
 
     /// Session teardown takes them all, whatever their delay: nothing may
     /// outlive the session that spawned it.
+    #[cfg(unix)]
     #[test]
     fn teardown_reaps_every_superseded_encoder() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = make_test_session(dir.path());
-        for _ in 0..3 {
-            let child = std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("spawn sleep");
+        let mut pids = Vec::new();
+        for run_id in 0..3u64 {
+            let child = spawn_stand_in_encoder();
+            pids.push(child.id());
             session.superseded.push(SupersededEncoder {
                 child,
                 reap_at: Instant::now() + Duration::from_secs(30),
-                run_id: session.current_run_id,
+                run_id,
             });
         }
+        assert!(pids.iter().all(|p| pid_alive(*p)));
+
         reap_all_superseded(&mut session);
         assert!(session.superseded.is_empty());
+        for pid in pids {
+            assert!(!pid_alive(pid), "teardown leaves no encoder behind");
+        }
+    }
+
+    /// The run a superseded encoder is still writing into is not evictable.
+    ///
+    /// Eviction excluded only `current_run_id`, which was safe while a seek
+    /// killed the prior encoder before any cleanup ran. Under spawn-and-reap
+    /// that run is live for [`REAP_AFTER`], and unlinking it takes away the
+    /// media the policy exists to keep serving — silently, because nothing
+    /// waits on a superseded child.
+    #[cfg(unix)]
+    #[test]
+    fn eviction_leaves_a_live_superseded_run_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // Three runs on disk. run_1 is finished, run_2 is the one the seek
+        // set aside, run_3 is the new producer.
+        for run_id in 1..=3u64 {
+            let run = dir.path().join(format!("run_{run_id}"));
+            fs::create_dir_all(&run).unwrap();
+            fs::write(run.join("seg.m4s"), vec![0u8; 4096]).unwrap();
+        }
+        session.current_run_id = 3;
+        session.superseded.push(SupersededEncoder {
+            child: spawn_stand_in_encoder(),
+            reap_at: Instant::now() + Duration::from_secs(30),
+            run_id: 2,
+        });
+
+        // A budget everything on disk exceeds, so eviction must pick a victim.
+        unsafe { std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "0") };
+        maybe_evict_finished_runs(&mut session);
+        unsafe { std::env::remove_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES") };
+
+        assert!(
+            !dir.path().join("run_1").exists(),
+            "a finished run is still evictable"
+        );
+        assert!(
+            dir.path().join("run_2").exists(),
+            "a superseded encoder is still writing into run_2"
+        );
+        assert!(dir.path().join("run_3").exists(), "the current run stays");
+
+        reap_all_superseded(&mut session);
     }
 
     #[test]
