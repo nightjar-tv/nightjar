@@ -60,6 +60,18 @@ const _: () = assert!(LEAD_FLOOR_MS < LEAD_TARGET_MS);
 /// How often the throttle re-reads every session's lead. Fine enough that a
 /// resumed encoder is producing again well inside one segment.
 const THROTTLE_TICK: Duration = Duration::from_millis(250);
+/// How long an encoder a seek replaced is kept before being terminated
+/// (ADR-0050 §5).
+///
+/// Destroying an encoder context contends with creating one, so tearing the
+/// old one down while the new one starts is paid for at the seek: 2187 ms for
+/// kill-then-start, 1761 ms for start-then-kill, against 976-1132 ms once the
+/// teardown is clear of the new encoder. The delay has to outlast the seek's
+/// own first byte, which tops out near 2.4 s; at 2 s it still overlapped and
+/// cost 462 ms. Five seconds is clear of that, not a tuned optimum.
+const REAP_AFTER: Duration = Duration::from_secs(5);
+// Useless if it does not outlast the seek it follows.
+const _: () = assert!(REAP_AFTER.as_millis() > 2400);
 /// Still justified under producer-truth: EVENT playlists list segments the
 /// producer is still writing; Safari prefetches ~two past the on-disk
 /// frontier. Those GETs Wait (cook), they do not scrub. Far scrub is
@@ -80,12 +92,6 @@ const MAP_BUILD_WAIT_POLL: Duration = Duration::from_millis(50);
 /// the pending target (dogfood: three `seek restart` lines in ~9s; the last
 /// fired 45ms after the previous `first_segment_ready`).
 const RESTART_COALESCE_QUIET: Duration = Duration::from_millis(400);
-/// Re-derived under ADR-0020: after `POST /seek` + source swap, in-flight
-/// GETs for mapped segments behind the new play land can still arrive. Serving
-/// them paints the prior scrub keyframe. Short TTL covers cook+retarget; then
-/// scrub-back via the global map is a plain file serve again. Not the old
-/// "Safari 503-retrying a superseded full-title land" band.
-const STALE_RETAIN_REFUSE: Duration = Duration::from_secs(15);
 /// Deleted under ADR-0020. Was the dig-back band for unlisted-but-requested
 /// segments on the synthetic full-title VOD. Producer-truth playlists do not
 /// list those URIs; far scrub is `POST /seek`. Kept as 0 so coalesce "far"
@@ -319,17 +325,6 @@ fn disable_preempt() -> bool {
         std::env::var("NIGHTJAR_DISABLE_PREEMPT").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "YES")
     )
-}
-
-/// Whether [`restart_at`] may `stop_child` while the cooking encode is still
-/// unfinished. Land-ready always kills (land-then-yank). Before land, a
-/// cooking-land waiter blocks kill so dig-back can still see mid bytes;
-/// zero waiters keep far-scrub preempt speed.
-///
-/// Pure helper for unit tests — production uses the same predicate under the
-/// session mutex immediately before `stop_child`.
-pub fn may_kill_cooking_encode(first_segment_ready: bool, cooking_land_waiter_count: u32) -> bool {
-    first_segment_ready || cooking_land_waiter_count == 0
 }
 
 /// Optional pause after kill before the next FFmpeg spawn (`restart_at`).
@@ -648,6 +643,24 @@ struct Session {
     last_requested_ms: u64,
     /// True while this session's encoder is SIGSTOPped by the throttle.
     throttled: bool,
+    /// Encoders a seek replaced, kept until [`REAP_AFTER`] has put their
+    /// teardown clear of the seek that replaced them (ADR-0050 §5).
+    ///
+    /// They keep **running**, not suspended. A client may still be waiting on
+    /// a segment of that land which has not finished writing, and a suspended
+    /// encoder never finishes it.
+    superseded: Vec<SupersededEncoder>,
+}
+
+/// An encoder a seek replaced, waiting out [`REAP_AFTER`].
+struct SupersededEncoder {
+    child: Child,
+    reap_at: Instant,
+    /// The run this encoder is still writing into. Its directory is not the
+    /// current run's any more, and every per-run cleanup path in this file
+    /// reads "not the current run" as "finished". It is not finished: the
+    /// process is alive until [`reap_at`](Self::reap_at).
+    run_id: u64,
 }
 
 /// Snapshot returned by start / seek / get (ADR-0020 wire fields).
@@ -852,6 +865,7 @@ fn dir_tree_bytes(path: &Path) -> u64 {
 fn maybe_evict_finished_runs(session: &mut Session) {
     reap_empty_finished_run_dirs(session);
     let budget = session_run_cache_budget_bytes();
+    let live = live_run_ids(session);
     loop {
         let total = session_disk_bytes(&session.dir);
         if total <= budget {
@@ -874,7 +888,9 @@ fn maybe_evict_finished_runs(session: &mut Session) {
             let Ok(id) = id_str.parse::<u64>() else {
                 continue;
             };
-            if id == session.current_run_id {
+            // Not just the current run: a superseded encoder is still writing
+            // into its own run for up to `REAP_AFTER`.
+            if live.contains(&id) {
                 continue;
             }
             let bytes = dir_tree_bytes(&entry.path());
@@ -926,6 +942,7 @@ fn maybe_evict_finished_runs(session: &mut Session) {
 
 /// Remove finished run directories that hold no bytes. Not a budget eviction.
 fn reap_empty_finished_run_dirs(session: &mut Session) {
+    let live = live_run_ids(session);
     let Ok(entries) = fs::read_dir(&session.dir) else {
         return;
     };
@@ -940,7 +957,11 @@ fn reap_empty_finished_run_dirs(session: &mut Session) {
         let Ok(id) = id_str.parse::<u64>() else {
             continue;
         };
-        if id == session.current_run_id {
+        // A live run is never empty today, because `write_run_encode_start`
+        // seeds every run dir before the spawn. That is a seeding detail in
+        // another function, not a property of this one, so exclude live runs
+        // here rather than depending on it.
+        if live.contains(&id) {
             continue;
         }
         if dir_tree_bytes(&entry.path()) > 0 {
@@ -1203,6 +1224,7 @@ impl HlsSessionRegistry {
                 // holding a title's worth of lead on its first tick.
                 last_requested_ms: play_start_ms,
                 throttled: false,
+                superseded: Vec::new(),
             },
         );
         Ok(id)
@@ -1299,16 +1321,10 @@ impl HlsSessionRegistry {
             return Ok(session_view(session_id, session));
         }
         let leg = session.encode_leg.clone();
-        match restart_at(session, aligned, &leg)? {
-            RestartAtOutcome::Applied => {
-                maybe_evict_finished_runs(session);
-            }
-            RestartAtOutcome::DeferredLandWaiter => {
-                // Keep intent; client can poll view until the run advances.
-                session.pending_play_ms = Some(aligned);
-                session.pending_since = Some(Instant::now());
-            }
-        }
+        // A seek always applies: nothing is destroyed, so nothing can be in
+        // the way of destroying it (ADR-0050 §4).
+        restart_at(session, aligned, &leg)?;
+        maybe_evict_finished_runs(session);
         Ok(session_view(session_id, session))
     }
 
@@ -1867,6 +1883,7 @@ impl HlsSessionRegistry {
             return false;
         };
         stop_child(&mut session.child);
+        reap_all_superseded(&mut session);
         if let Err(e) = fs::remove_dir_all(&session.dir) {
             tracing::warn!(
                 path = %session.dir.display(),
@@ -1908,6 +1925,9 @@ impl HlsSessionRegistry {
                 continue;
             };
             for (id, session) in sessions.iter_mut() {
+                // The 250 ms tick already walks every session under the lock,
+                // so the reap rides along rather than taking its own thread.
+                reap_superseded(session);
                 let Some(child) = session.child.as_ref() else {
                     // No producer: a finished run holds no lead, and a child
                     // that exited while suspended must not stay marked.
@@ -1958,6 +1978,7 @@ impl HlsSessionRegistry {
             return;
         };
         stop_child(&mut session.child);
+        reap_all_superseded(&mut session);
         let _ = fs::remove_dir_all(&session.dir);
     }
 }
@@ -1985,81 +2006,29 @@ impl EncoderKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestartAtOutcome {
-    Applied,
-    /// Cooking land still unfinished and an asset_wait holds it — leave the
-    /// encoder alone so mid bytes can land; caller must keep pending.
-    DeferredLandWaiter,
-}
-
 fn restart_at(
     session: &mut Session,
     play_ms: u64,
     _encode_leg: &crate::EncodeLeg,
-) -> Result<RestartAtOutcome, PlaylistError> {
+) -> Result<(), PlaylistError> {
     let play_start_ms = align_to_segment(play_ms);
     let prior_play = session.play_start_ms;
     let prior_ready = session.first_segment_ready;
-    let cooking_land = align_to_segment(prior_play);
-    let cooking_waiters = session
-        .segment_waiters
-        .get(&cooking_land)
-        .copied()
-        .unwrap_or(0);
-    // Gate immediately before kill, under the same sessions mutex that
-    // SegmentWaiterGuard attach/drop uses — check-then-kill is atomic vs
-    // concurrent waiter attach for this process.
-    if !may_kill_cooking_encode(prior_ready, cooking_waiters) {
-        if !session.preempt_defer_logged {
-            session.preempt_defer_logged = true;
-            tracing::info!(
-                prior_play_start_ms = prior_play,
-                prior_first_segment_ready = prior_ready,
-                cooking_land_waiters = cooking_waiters,
-                new_play_start_ms = play_start_ms,
-                "hls seek restart_at: defer kill (cooking land waiter)"
-            );
-        }
-        return Ok(RestartAtOutcome::DeferredLandWaiter);
-    }
+    // No gate before the kill, because there is no kill. This used to ask
+    // whether a client still held the cooking land, and defer if so, because
+    // killing the encoder would strand that waiter. The encoder is now kept
+    // and left running (ADR-0050 §4-§5), so it finishes the segment the
+    // waiter is holding for and the question cannot arise.
     session.preempt_defer_logged = false;
-    let had_child = session.child.is_some();
-    // Snapshot all waiters at kill time — correlates attach/drop races on
-    // double-scrub sticks (cooking land may be 0 while another want_ms holds).
-    let waiters_snapshot: String = {
-        let mut parts: Vec<String> = session
-            .segment_waiters
-            .iter()
-            .map(|(ms, n)| format!("{ms}:{n}"))
-            .collect();
-        parts.sort();
-        if parts.is_empty() {
-            "-".into()
-        } else {
-            parts.join(",")
-        }
-    };
-    if !prior_ready && cooking_waiters == 0 {
-        tracing::info!(
-            prior_play_start_ms = prior_play,
-            cooking_land_ms = cooking_land,
-            cooking_land_waiters = cooking_waiters,
-            segment_waiters = %waiters_snapshot,
-            new_play_start_ms = play_start_ms,
-            "hls seek restart_at: preempt kill before land (no cooking waiter)"
-        );
-    }
     tracing::info!(
         prior_play_start_ms = prior_play,
         prior_first_segment_ready = prior_ready,
-        killing_encoder = had_child,
-        cooking_land_waiters = cooking_waiters,
-        segment_waiters = %waiters_snapshot,
+        superseding_encoder = session.child.is_some(),
+        held_encoders = session.superseded.len(),
         new_play_start_ms = play_start_ms,
-        "hls seek restart_at: stop prior encode"
+        "hls seek: supersede prior encode"
     );
-    stop_child(&mut session.child);
+    supersede_child(session);
     // `throttled` describes a live process. This session keeps going with a
     // new child, so leaving it set would make the next tick send a resume to
     // a child that was never suspended and skip the suspend it needs. The
@@ -2116,7 +2085,7 @@ fn restart_at(
             path = %session.src.display(),
             "hls session seek map hit (duplicate-write stop)"
         );
-        return Ok(RestartAtOutcome::Applied);
+        return Ok(());
     }
     if let Some(gap) = restart_spawn_gap() {
         tracing::info!(
@@ -2176,7 +2145,13 @@ fn restart_at(
     session.last_restart = Instant::now();
     session.primed = false;
     session.first_segment_ready = false;
-    session.stale_retain_refuse_until = Some(Instant::now() + STALE_RETAIN_REFUSE);
+    // Not armed any more. This refused segments behind the new land for 15 s,
+    // because under kill-and-restart those bytes belonged to a land the client
+    // should have stopped playing and whose encoder was gone. The prior
+    // encoder now survives the seek and keeps producing that land until it is
+    // reaped (ADR-0050 §4-§5), so its media is valid and refusing it would 503
+    // a segment that is on disk.
+    session.stale_retain_refuse_until = None;
     if session.pending_play_ms == Some(play_start_ms) {
         session.pending_play_ms = None;
         session.pending_since = None;
@@ -2195,7 +2170,7 @@ fn restart_at(
         path = %session.src.display(),
         "hls session seek restart"
     );
-    Ok(RestartAtOutcome::Applied)
+    Ok(())
 }
 
 /// Mapped segment that already covers title-absolute `play_ms`.
@@ -2302,29 +2277,22 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
         && coalesce_preempt_before_land(cooking, pending)
         && since >= RESTART_MIN_INTERVAL;
     let leg = session.encode_leg.clone();
-    match restart_at(session, pending, &leg)? {
-        RestartAtOutcome::DeferredLandWaiter => {
-            // restart_at already logged once per defer streak.
-            Ok(())
-        }
-        RestartAtOutcome::Applied => {
-            if preempt_before_land {
-                tracing::info!(
-                    pending_play_ms = pending,
-                    cooking_play_ms = cooking,
-                    since_last_restart_ms = since.as_millis(),
-                    "hls seek restart preempted (before land)"
-                );
-            }
-            // restart_at clears pending when it matches the new play; clear
-            // any leftover (e.g. already applied path).
-            if session.pending_play_ms == Some(pending) {
-                session.pending_play_ms = None;
-                session.pending_since = None;
-            }
-            Ok(())
-        }
+    restart_at(session, pending, &leg)?;
+    if preempt_before_land {
+        tracing::info!(
+            pending_play_ms = pending,
+            cooking_play_ms = cooking,
+            since_last_restart_ms = since.as_millis(),
+            "hls seek restart preempted (before land)"
+        );
     }
+    // restart_at clears pending when it matches the new play; clear any
+    // leftover (e.g. already applied path).
+    if session.pending_play_ms == Some(pending) {
+        session.pending_play_ms = None;
+        session.pending_since = None;
+    }
+    Ok(())
 }
 
 /// Whether bytes read for a segment request may still be returned after
@@ -3367,6 +3335,84 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
     };
 }
 
+/// Move this session's producer aside for a seek: keep it, reap it later.
+///
+/// It is left **running**. Suspending would free encoder time, but it also
+/// stops production, and a client may be waiting on a segment of this land
+/// that has not finished writing. Under kill-and-restart that case was
+/// handled by deferring the kill (`may_kill_cooking_encode`); here it is
+/// handled by letting the encoder finish. Leaving it running is also the
+/// fastest of the three seek policies measured, at a 1132 ms median, so
+/// correctness and speed agree (ADR-0050 §4-§5).
+///
+/// "Left running" includes resuming one the throttle had already suspended.
+/// A session that has caught up sits SIGSTOPped at [`LEAD_TARGET_MS`], which
+/// is the design's steady state, so that is the common case at a seek and not
+/// the rare one. Without the SIGCONT this function would set aside a stopped
+/// process for [`REAP_AFTER`] and then kill it — suspend-then-reap, the exact
+/// policy ADR-0050 §5 was amended to forbid.
+fn supersede_child(session: &mut Session) {
+    // Resume before setting it aside, while the child is still `session.child`
+    // and the only thing that can signal it is this call under this lock.
+    if session.throttled
+        && let Some(child) = session.child.as_ref()
+    {
+        signal_child(child, false);
+    }
+    let Some(child) = session.child.take() else {
+        return;
+    };
+    // The flag described the child that just left.
+    session.throttled = false;
+    session.superseded.push(SupersededEncoder {
+        child,
+        reap_at: Instant::now() + REAP_AFTER,
+        // `restart_at` calls this before it assigns the new run, so
+        // `current_run_id` here is exactly the run being set aside. Read it,
+        // do not infer it later.
+        run_id: session.current_run_id,
+    });
+}
+
+/// Runs with an encoder still writing into them: the current one, plus every
+/// superseded encoder that has not been reaped yet.
+///
+/// Every per-run cleanup in this file has to consult this rather than
+/// `current_run_id` alone. A seek used to kill the prior encoder before any
+/// cleanup ran, so "not current" meant "nothing is writing here". Under
+/// ADR-0050 §4-§5 the prior encoder outlives the seek by [`REAP_AFTER`], and
+/// unlinking its directory would take away the media the whole policy exists
+/// to keep serving.
+fn live_run_ids(session: &Session) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(session.superseded.len() + 1);
+    ids.push(session.current_run_id);
+    ids.extend(session.superseded.iter().map(|s| s.run_id));
+    ids
+}
+
+/// Terminate superseded encoders whose delay has elapsed.
+fn reap_superseded(session: &mut Session) {
+    let now = Instant::now();
+    session.superseded.retain_mut(|s| {
+        if s.reap_at > now {
+            return true;
+        }
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        false
+    });
+}
+
+/// Terminate every superseded encoder now, whatever their delay. Session
+/// teardown: nothing may outlive the session that spawned it.
+fn reap_all_superseded(session: &mut Session) {
+    for s in session.superseded.iter_mut() {
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    session.superseded.clear();
+}
+
 fn stop_child(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
         // SIGKILL, deliberately. A SIGSTOPped child does not act on SIGTERM
@@ -3391,9 +3437,12 @@ fn signal_child(child: &Child, stop: bool) -> bool {
     // the floor and never resumes it.
     let sig = if stop { libc::SIGSTOP } else { libc::SIGCONT };
     // SAFETY: `kill` with a pid we own and a valid signal number. The pid
-    // cannot have been recycled: this is our own child and nothing reaps it
-    // except `stop_child`, which takes the `Child` out of the session under
-    // the same lock this call is made under.
+    // cannot have been recycled. This is only ever called on `session.child`,
+    // and the three paths that reap a child all run under the same lock as
+    // this call: `stop_child` takes the `Child` out of the session, and
+    // `reap_superseded` / `reap_all_superseded` only ever reap children
+    // `supersede_child` already moved out of `session.child`. So a `Child`
+    // this call can see is not one any of them can be waiting on.
     unsafe { libc::kill(child.id() as libc::pid_t, sig) == 0 }
 }
 
@@ -3547,6 +3596,293 @@ mod tests {
             panic!("NIGHTJAR_TEST_REQUIRE_FFMPEG is set but ffmpeg is not on PATH");
         }
         ok
+    }
+
+    /// A minimal session for unit tests that only touch process bookkeeping.
+    fn make_test_session(dir: &Path) -> Session {
+        Session {
+            item_id: 1,
+            src: PathBuf::from("/dev/null"),
+            dir: dir.to_path_buf(),
+            mode: SessionMode::Copy,
+            audio: stereo(),
+            burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
+            map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
+            video_encoder: "copy".into(),
+            start_ms: 0,
+            play_start_ms: 0,
+            landed_ms: 0,
+            usable_extent_ms: None,
+            duration_ms: 60_000,
+            current_run_id: 0,
+            next_run_id: 1,
+            segment_map: Default::default(),
+            current_run_eof: false,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: false,
+            first_segment_ready: false,
+            pending_play_ms: None,
+            pending_since: None,
+            stale_retain_refuse_until: None,
+            failed: None,
+            subtitle_tracks: vec![],
+            segment_waiters: HashMap::new(),
+            preempt_defer_logged: false,
+            last_requested_ms: 0,
+            throttled: false,
+            superseded: Vec::new(),
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
+        }
+    }
+
+    /// What a stand-in encoder is actually doing.
+    ///
+    /// `Running` and `Stopped` have to be separable. `kill(pid, 0)` succeeds
+    /// for a SIGSTOPped process, so an existence check passes against a
+    /// supersede that suspends the encoder instead of keeping it producing —
+    /// which is the whole point of ADR-0050 §5.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum ChildState {
+        Running,
+        Stopped,
+        Gone,
+    }
+
+    /// Read a stand-in encoder's state.
+    ///
+    /// The reap `wait()`s, so a reaped child is gone rather than a zombie and
+    /// reads `Gone`. Assert on this rather than on
+    /// `session.superseded.len()`: a reap that dropped the `Child` without
+    /// killing it satisfies the length and leaks an FFmpeg per seek.
+    ///
+    /// `ps` rather than `waitpid`, deliberately. `waitpid` with `WUNTRACED`
+    /// reports a stop **once** and then clears it, so a caller that has
+    /// already waited for the child to stop reads the next check as `Running`
+    /// and a test asserting "resumed" passes against code that never resumed
+    /// it. That was written first and it did pass. `ps` reads the current
+    /// state every time. `T` is stopped on both macOS and Linux; a running
+    /// child is `S` or `R`.
+    #[cfg(unix)]
+    fn child_state(pid: u32) -> ChildState {
+        // SAFETY: signal 0 delivers nothing. The pid comes from a child this
+        // test spawned and has not waited on except through the reap under
+        // test, so it is either ours or unallocated.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return ChildState::Gone;
+        }
+        let out = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if state.is_empty() {
+            return ChildState::Gone;
+        }
+        if state.starts_with('T') {
+            ChildState::Stopped
+        } else {
+            ChildState::Running
+        }
+    }
+
+    /// Wait, bounded, for a signal to be delivered and reflected.
+    ///
+    /// `kill` returns once the signal is queued, not once the target has acted
+    /// on it, so reading the state straight after can race the delivery.
+    #[cfg(unix)]
+    fn wait_for_state(pid: u32, want: ChildState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if child_state(pid) == want {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pid {pid} never reached {want:?}");
+    }
+
+    /// Stands in for an encoder mid-run: alive, and long enough that only the
+    /// reap can end it inside the test.
+    #[cfg(unix)]
+    fn spawn_stand_in_encoder() -> Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// A seek keeps the prior encoder alive and reaps it on its delay, not
+    /// before (ADR-0050 §4-§5). Killing it at the seek is what the old shape
+    /// did, and it cost 1055 ms.
+    ///
+    /// Every assertion here is on the process, not on the bookkeeping.
+    #[cfg(unix)]
+    #[test]
+    fn a_superseded_encoder_lives_until_its_delay_is_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // Nothing held: reaping is a no-op rather than an error.
+        reap_superseded(&mut session);
+        assert!(session.superseded.is_empty());
+
+        session.current_run_id = 7;
+        session.child = Some(spawn_stand_in_encoder());
+        let pid = session.child.as_ref().unwrap().id();
+        assert_eq!(child_state(pid), ChildState::Running);
+
+        supersede_child(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "a seek supersedes the prior encoder, it does not kill it"
+        );
+        assert_eq!(
+            session.superseded.first().map(|s| s.run_id),
+            Some(7),
+            "the held encoder carries the run it is still writing into"
+        );
+
+        // Not due yet.
+        reap_superseded(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "not past REAP_AFTER, so still producing"
+        );
+        assert_eq!(session.superseded.len(), 1);
+
+        // Due.
+        session.superseded[0].reap_at = Instant::now() - Duration::from_millis(1);
+        reap_superseded(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Gone,
+            "past its delay, so the process is gone"
+        );
+        assert!(session.superseded.is_empty());
+    }
+
+    /// A seek on a session the throttle had suspended resumes the encoder
+    /// before setting it aside.
+    ///
+    /// This is the common case, not the rare one: a session that has caught
+    /// up sits SIGSTOPped at `LEAD_TARGET_MS`, which is the shape ADR-0050 §2
+    /// designs for. Without the SIGCONT the seek sets aside a stopped process
+    /// for `REAP_AFTER` and then kills it, which is suspend-then-reap — the
+    /// policy §5 was amended to forbid, arriving through the throttle instead
+    /// of through `supersede_child` asking for it.
+    ///
+    /// `kill(pid, 0)` cannot see this: it succeeds for a stopped process.
+    #[cfg(unix)]
+    #[test]
+    fn superseding_a_throttled_encoder_resumes_it_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.child = Some(spawn_stand_in_encoder());
+        let pid = session.child.as_ref().unwrap().id();
+
+        // What the throttle does at the lead target.
+        assert!(signal_child(session.child.as_ref().unwrap(), true));
+        session.throttled = true;
+        wait_for_state(pid, ChildState::Stopped);
+
+        supersede_child(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "a superseded encoder has to keep producing until it is reaped"
+        );
+        assert!(
+            !session.throttled,
+            "the flag described the child that just left"
+        );
+
+        reap_all_superseded(&mut session);
+        assert_eq!(child_state(pid), ChildState::Gone);
+    }
+
+    /// Session teardown takes them all, whatever their delay: nothing may
+    /// outlive the session that spawned it.
+    #[cfg(unix)]
+    #[test]
+    fn teardown_reaps_every_superseded_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        let mut pids = Vec::new();
+        for run_id in 0..3u64 {
+            let child = spawn_stand_in_encoder();
+            pids.push(child.id());
+            session.superseded.push(SupersededEncoder {
+                child,
+                reap_at: Instant::now() + Duration::from_secs(30),
+                run_id,
+            });
+        }
+        assert!(pids.iter().all(|p| child_state(*p) == ChildState::Running));
+
+        reap_all_superseded(&mut session);
+        assert!(session.superseded.is_empty());
+        for pid in pids {
+            assert_eq!(
+                child_state(pid),
+                ChildState::Gone,
+                "teardown leaves no encoder behind"
+            );
+        }
+    }
+
+    /// The run a superseded encoder is still writing into is not evictable.
+    ///
+    /// Eviction excluded only `current_run_id`, which was safe while a seek
+    /// killed the prior encoder before any cleanup ran. Under spawn-and-reap
+    /// that run is live for [`REAP_AFTER`], and unlinking it takes away the
+    /// media the policy exists to keep serving — silently, because nothing
+    /// waits on a superseded child.
+    #[cfg(unix)]
+    #[test]
+    fn eviction_leaves_a_live_superseded_run_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // Three runs on disk. run_1 is finished, run_2 is the one the seek
+        // set aside, run_3 is the new producer.
+        for run_id in 1..=3u64 {
+            let run = dir.path().join(format!("run_{run_id}"));
+            fs::create_dir_all(&run).unwrap();
+            fs::write(run.join("seg.m4s"), vec![0u8; 4096]).unwrap();
+        }
+        session.current_run_id = 3;
+        session.superseded.push(SupersededEncoder {
+            child: spawn_stand_in_encoder(),
+            reap_at: Instant::now() + Duration::from_secs(30),
+            run_id: 2,
+        });
+
+        // A budget everything on disk exceeds, so eviction must pick a victim.
+        unsafe { std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "0") };
+        maybe_evict_finished_runs(&mut session);
+        unsafe { std::env::remove_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES") };
+
+        assert!(
+            !dir.path().join("run_1").exists(),
+            "a finished run is still evictable"
+        );
+        assert!(
+            dir.path().join("run_2").exists(),
+            "a superseded encoder is still writing into run_2"
+        );
+        assert!(dir.path().join("run_3").exists(), "the current run stays");
+
+        reap_all_superseded(&mut session);
     }
 
     /// ADR-0052: the frame count for one segment comes from the source rate,
@@ -4321,32 +4657,11 @@ mod tests {
         );
     }
 
-    /// Waiter on cooking land blocks preempt kill; no waiter matches today's
-    /// preempt-on immediate kill. Land-ready always may kill (land-then-yank).
+    /// Selecting which pending land is due is unchanged by a seek keeping the
+    /// prior encoder: the gate that used to defer the kill is gone, but the
+    /// due decision it sat beside is not.
     #[test]
-    fn waiter_gates_kill_before_land() {
-        assert!(
-            may_kill_cooking_encode(false, 0),
-            "no waiter: preempt-on may kill before land"
-        );
-        assert!(
-            !may_kill_cooking_encode(false, 1),
-            "waiter present: must not kill before land"
-        );
-        assert!(
-            !may_kill_cooking_encode(false, 3),
-            "any positive waiter count blocks kill"
-        );
-        assert!(
-            may_kill_cooking_encode(true, 1),
-            "land ready: kill allowed even with waiter (land-then-yank)"
-        );
-        assert!(
-            may_kill_cooking_encode(true, 0),
-            "land ready + no waiter: kill allowed"
-        );
-        // pending_restart_due still selects far C when allow_preempt; the
-        // kill gate is separate (restart_at / may_kill_cooking_encode).
+    fn pending_restart_selects_the_far_land() {
         let land_b = 1_494_000u64;
         let land_c = 2_070_000u64;
         assert_eq!(
@@ -4360,11 +4675,6 @@ mod tests {
                 true,
             ),
             Some(land_c),
-            "due decision unchanged when a waiter may later defer the kill"
-        );
-        assert!(
-            !may_kill_cooking_encode(false, 1),
-            "same due pending must still defer kill while waiter holds B's land"
         );
     }
 
@@ -4497,13 +4807,19 @@ mod tests {
             first_segment_ready: false,
             pending_play_ms: None,
             pending_since: None,
-            stale_retain_refuse_until: Some(Instant::now() + STALE_RETAIN_REFUSE),
+            // Armed by hand: nothing in production arms this any more, since
+            // a seek keeps the prior encoder and its land stays valid
+            // (ADR-0050 §4). The clearing path is still live code, so the
+            // test still exercises something; the guard itself is removed
+            // with the rest of the scrub machinery.
+            stale_retain_refuse_until: Some(Instant::now() + Duration::from_secs(15)),
             failed: None,
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -6564,6 +6880,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -6770,6 +7087,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -6857,6 +7175,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
