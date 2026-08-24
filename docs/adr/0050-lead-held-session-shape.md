@@ -185,6 +185,14 @@ run, and the bench now refuses a run where one would not.
    Memory is then bounded by seek-rate times delay, so there is no budget to
    size and no eviction order to choose. Do not ship an unbounded held set.
 
+   **Open and unowned.** The bound is seek-rate times delay, and this design
+   records the viewer seek rate as uncaptured. `HlsSessionRegistry::seek` has
+   no rate limit: the only gate is that the aligned land differs from the
+   current one. The web client mitigates by seeking on scrub commit rather
+   than per drag position; the HTTP API does not. Nothing checks that the
+   held set stays bounded, so the line above is currently an assertion rather
+   than a guarantee.
+
 6. **Do not cap concurrent encoding below the live transcode-session count.**
    `slots = N`. Capping saves no work; it selects which session waits. At
    `slots=1` one session waited 19.5 s while another waited 3.3 s; at
