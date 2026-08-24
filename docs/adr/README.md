@@ -65,7 +65,7 @@ not here — this page is the reference, not the tour.
 | [0047](0047-title-extension-admission-and-collision-evidence.md) | What may count as a title match, and what evidence may break a tie | **Proposed** | — | — |
 | [0048](0048-yearless-movie-collisions.md) | What may decide a yearless movie collision | **Accepted** (option B) | — | — |
 | [0049](0049-what-is-a-show-folder.md) | What counts as a show folder when the directory is per-episode | **Proposed** | — | — |
-| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
+| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap; 2026-08-25, §5 measured vs inferred) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
 | [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
 | [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
 | [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** | — | — |

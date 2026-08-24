@@ -1,7 +1,9 @@
 # ADR-0050: A transcode session is one throttled encoder holding a lead
 
-- Status: **proposed** (§5 amended 2026-08-23 with the measured delay, and
-  2026-08-24: a superseded encoder runs until reap rather than being suspended)
+- Status: **proposed** (§5 amended 2026-08-23 with the measured delay;
+  2026-08-24: a superseded encoder runs until reap rather than being
+  suspended; 2026-08-25: §5 separates what was measured from what is
+  inferred, and Consequences records that its deletion list is two slices)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -134,11 +136,25 @@ run, and the bench now refuses a run where one would not.
    destroyed. Suspension destroys production, which is the half of the
    reasoning that does not survive. The encoder must run until it is reaped.
 
-   **The fast arm and the correct arm are the same arm.** Leaving the prior
-   encoder running measured a 1132 ms median seek, the best of the three
-   policies in §4, so keeping it alive costs nothing in latency. A later
-   reader finding that suspension is required for correctness will not also
-   have to trade it against speed; there is no trade to make.
+   **The fast arm and the correct arm look like the same arm, and that is
+   reasoned rather than measured.** Leaving the prior encoder running
+   measured a 1132 ms median seek in §4, the best of the three policies
+   there, so correctness appears to cost nothing in latency and a later
+   reader need not go hunting for the speed it must have cost.
+
+   **But the shipped policy was never an arm.** §4's 1132 ms is the
+   never-reap arm, which ends holding 1586 MB. The delay table below is the
+   suspend arm: every row held the superseded encode SIGSTOPped for the
+   delay before terminating it. What ships — run, then reap at 5 s — is
+   neither, and the bench data has no name for it (`spawn`,
+   `spawn-suspend`, `spawn-then-kill`, `kill`).
+
+   The claim that running beats suspending rests on 1132 ms (run, never
+   reaped) against 1241 ms (suspend, never reaped). That gap is 109 ms
+   against a stated run-to-run spread of about 110 ms, so it is inside the
+   noise. **Do not quote 1132 ms as the shipped policy's latency.** A
+   run-then-reap arm would settle it; nothing gates on it, which is why this
+   is written down rather than re-run.
 
    The memory figures above survive the amendment and are the reason
    suspending bought little regardless: it frees encoder time and not memory.
@@ -218,6 +234,20 @@ into one restart. `classify_restart_desire`, `pending_restart_due`,
 `serve_ok_retained_during_stale_guard`, `restart_at`, `restart_spawn_gap`,
 `disable_preempt`, with `RESTART_MIN_INTERVAL`, `RESTART_COALESCE_QUIET` and
 `STALE_RETAIN_REFUSE`, plus eighteen tests pinning their behaviour.
+
+**That list is two deletions, not one, and only the first has happened.**
+`may_kill_cooking_encode`, `STALE_RETAIN_REFUSE` and `RestartAtOutcome` went
+with the seek change; `segment_waiters`, the stale-retain field and predicate
+and `preempt_defer_logged` followed as pure deletions, each established
+write-only or never-armed first. The rest — `classify_restart_desire`,
+`pending_restart_due`, `coalesce_preempt_before_land`,
+`prefetch_advances_pending`, `digback_behind_committed`,
+`pending_waiter_action`, `desire_restart`, `maybe_apply_pending_restart` and
+`serve_ok_after_pending_apply` — all take or set `pending_play_ms`, which is
+**live**: `desire_restart` runs from two production paths in `asset_wait`
+with preempt on by default, so removing it changes whether an encoder
+spawns. That is a behavioural change and needs its own decision, not a
+tidy-up.
 
 Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
 client is still asking for it, because the superseded encoder keeps serving its
