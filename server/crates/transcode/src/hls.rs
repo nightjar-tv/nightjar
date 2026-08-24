@@ -92,10 +92,6 @@ const MAP_BUILD_WAIT_POLL: Duration = Duration::from_millis(50);
 /// the pending target (dogfood: three `seek restart` lines in ~9s; the last
 /// fired 45ms after the previous `first_segment_ready`).
 const RESTART_COALESCE_QUIET: Duration = Duration::from_millis(400);
-/// Re-derived under ADR-0020: after `POST /seek` + source swap, in-flight
-/// GETs for mapped segments behind the new play land can still arrive. Serving
-/// them paints the prior scrub keyframe. Short TTL covers cook+retarget; then
-/// scrub-back via the global map is a plain file serve again. Not the old
 /// Deleted under ADR-0020. Was the dig-back band for unlisted-but-requested
 /// segments on the synthetic full-title VOD. Producer-truth playlists do not
 /// list those URIs; far scrub is `POST /seek`. Kept as 0 so coalesce "far"
@@ -3427,9 +3423,12 @@ fn signal_child(child: &Child, stop: bool) -> bool {
     // the floor and never resumes it.
     let sig = if stop { libc::SIGSTOP } else { libc::SIGCONT };
     // SAFETY: `kill` with a pid we own and a valid signal number. The pid
-    // cannot have been recycled: this is our own child and nothing reaps it
-    // except `stop_child`, which takes the `Child` out of the session under
-    // the same lock this call is made under.
+    // cannot have been recycled. This is only ever called on `session.child`,
+    // and the three paths that reap a child all run under the same lock as
+    // this call: `stop_child` takes the `Child` out of the session, and
+    // `reap_superseded` / `reap_all_superseded` only ever reap children
+    // `supersede_child` already moved out of `session.child`. So a `Child`
+    // this call can see is not one any of them can be waiting on.
     unsafe { libc::kill(child.id() as libc::pid_t, sig) == 0 }
 }
 
@@ -3585,12 +3584,6 @@ mod tests {
         ok
     }
 
-    /// ADR-0052: the frame count for one segment comes from the source rate,
-    /// so it is a different number per source and never a constant. This is
-    /// the arithmetic that `-g 48` got wrong by being written down once.
-    /// ADR-0050 §2: the band is hysteresis. Suspend at the target, resume at
-    /// the floor, and do nothing between, or a session at the threshold
-    /// suspends and resumes on adjacent ticks for its whole life.
     /// A minimal session for unit tests that only touch process bookkeeping.
     fn make_test_session(dir: &Path) -> Session {
         Session {
@@ -3774,6 +3767,12 @@ mod tests {
         reap_all_superseded(&mut session);
     }
 
+    /// ADR-0052: the frame count for one segment comes from the source rate,
+    /// so it is a different number per source and never a constant. This is
+    /// the arithmetic that `-g 48` got wrong by being written down once.
+    /// ADR-0050 §2: the band is hysteresis. Suspend at the target, resume at
+    /// the floor, and do nothing between, or a session at the threshold
+    /// suspends and resumes on adjacent ticks for its whole life.
     #[test]
     fn throttle_band_is_hysteresis_not_a_threshold() {
         // Running, below the target: leave it alone.
