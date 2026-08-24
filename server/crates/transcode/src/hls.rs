@@ -60,6 +60,18 @@ const _: () = assert!(LEAD_FLOOR_MS < LEAD_TARGET_MS);
 /// How often the throttle re-reads every session's lead. Fine enough that a
 /// resumed encoder is producing again well inside one segment.
 const THROTTLE_TICK: Duration = Duration::from_millis(250);
+/// How long an encoder a seek replaced is kept before being terminated
+/// (ADR-0050 §5).
+///
+/// Destroying an encoder context contends with creating one, so tearing the
+/// old one down while the new one starts is paid for at the seek: 2187 ms for
+/// kill-then-start, 1761 ms for start-then-kill, against 976-1132 ms once the
+/// teardown is clear of the new encoder. The delay has to outlast the seek's
+/// own first byte, which tops out near 2.4 s; at 2 s it still overlapped and
+/// cost 462 ms. Five seconds is clear of that, not a tuned optimum.
+const REAP_AFTER: Duration = Duration::from_secs(5);
+// Useless if it does not outlast the seek it follows.
+const _: () = assert!(REAP_AFTER.as_millis() > 2400);
 /// Still justified under producer-truth: EVENT playlists list segments the
 /// producer is still writing; Safari prefetches ~two past the on-disk
 /// frontier. Those GETs Wait (cook), they do not scrub. Far scrub is
@@ -648,6 +660,19 @@ struct Session {
     last_requested_ms: u64,
     /// True while this session's encoder is SIGSTOPped by the throttle.
     throttled: bool,
+    /// Encoders a seek replaced, kept until [`REAP_AFTER`] has put their
+    /// teardown clear of the seek that replaced them (ADR-0050 §5).
+    ///
+    /// They keep **running**, not suspended. A client may still be waiting on
+    /// a segment of that land which has not finished writing, and a suspended
+    /// encoder never finishes it.
+    superseded: Vec<SupersededEncoder>,
+}
+
+/// An encoder a seek replaced, waiting out [`REAP_AFTER`].
+struct SupersededEncoder {
+    child: Child,
+    reap_at: Instant,
 }
 
 /// Snapshot returned by start / seek / get (ADR-0020 wire fields).
@@ -1203,6 +1228,7 @@ impl HlsSessionRegistry {
                 // holding a title's worth of lead on its first tick.
                 last_requested_ms: play_start_ms,
                 throttled: false,
+                superseded: Vec::new(),
             },
         );
         Ok(id)
@@ -4504,6 +4530,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -6564,6 +6591,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -6770,6 +6798,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -6857,6 +6886,7 @@ mod tests {
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
+            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
