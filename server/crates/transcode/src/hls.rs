@@ -614,11 +614,6 @@ struct Session {
     pending_play_ms: Option<u64>,
     /// When [`Session::pending_play_ms`] was last updated (debounce clock).
     pending_since: Option<Instant>,
-    /// Refuse retained behind-play serves until this instant (see
-    /// [`STALE_RETAIN_REFUSE`]). Cleared when elapsed, or when the new play
-    /// land appears ([`note_first_segment_ready`]) so Safari is not stuck
-    /// 503-retrying a superseded middle land for the full TTL after cook.
-    stale_retain_refuse_until: Option<Instant>,
     failed: Option<String>,
     /// Tracks declared in the master, snapshotted at create.
     subtitle_tracks: Vec<HlsSubtitleTrack>,
@@ -1202,7 +1197,6 @@ impl HlsSessionRegistry {
                 first_segment_ready: false,
                 pending_play_ms: None,
                 pending_since: None,
-                stale_retain_refuse_until: None,
                 failed: None,
                 subtitle_tracks,
                 piggyback,
@@ -1702,19 +1696,6 @@ impl HlsSessionRegistry {
                     ) {
                         return Err(PlaylistError::NotReady);
                     }
-                    if let Some(ms) = requested_ms {
-                        let guard = match session.stale_retain_refuse_until {
-                            Some(until) if Instant::now() < until => true,
-                            Some(_) => {
-                                session.stale_retain_refuse_until = None;
-                                false
-                            }
-                            None => false,
-                        };
-                        if !serve_ok_retained_during_stale_guard(ms, session.play_start_ms, guard) {
-                            return Err(PlaylistError::NotReady);
-                        }
-                    }
                     return Ok(bytes);
                 }
                 if let Some(err) = note_child_exit(session) {
@@ -2061,7 +2042,6 @@ fn restart_at(
         session.last_restart = Instant::now();
         session.primed = true;
         session.first_segment_ready = true;
-        session.stale_retain_refuse_until = None;
         if session.pending_play_ms == Some(play_start_ms) {
             session.pending_play_ms = None;
             session.pending_since = None;
@@ -2136,13 +2116,6 @@ fn restart_at(
     session.last_restart = Instant::now();
     session.primed = false;
     session.first_segment_ready = false;
-    // Not armed any more. This refused segments behind the new land for 15 s,
-    // because under kill-and-restart those bytes belonged to a land the client
-    // should have stopped playing and whose encoder was gone. The prior
-    // encoder now survives the seek and keeps producing that land until it is
-    // reaped (ADR-0050 §4-§5), so its media is valid and refusing it would 503
-    // a segment that is on disk.
-    session.stale_retain_refuse_until = None;
     if session.pending_play_ms == Some(play_start_ms) {
         session.pending_play_ms = None;
         session.pending_since = None;
@@ -2307,36 +2280,12 @@ pub fn serve_ok_after_pending_apply(
     }
 }
 
-/// Whether a retained on-disk segment may be served while the post-restart
-/// stale guard is active.
-///
-/// Near-land dig-back (within [`ENCODE_LEAD_SEGMENTS`]) and anything at/ahead
-/// of play stay servable. Farther behind is the superseded scrub Safari still
-/// GETs after coalesce — refuse only while `guard_active` (TTL until land
-/// ready, or until TTL elapses if land never clears it), not forever.
-pub fn serve_ok_retained_during_stale_guard(
-    want_ms: u64,
-    play_start_ms: u64,
-    guard_active: bool,
-) -> bool {
-    if !guard_active {
-        return true;
-    }
-    let want = align_to_segment(want_ms);
-    let play = align_to_segment(play_start_ms);
-    want + encode_lead_segments() * SEGMENT_MS >= play
-}
-
 /// Logs once when the **play land** segment appears (not merely the lead-in
 /// first window). Pending scrub apply waits for this when the new target is
 /// near the cooking land so a coalesced restart does not yank before that
 /// land exists — that left Safari retrying the prior land seg forever
 /// (dogfood: seg415 after scrub to 1188). Far pending may preempt earlier
 /// via [`coalesce_preempt_before_land`] once [`RESTART_MIN_INTERVAL`] elapses.
-///
-/// Clears [`Session::stale_retain_refuse_until`]: the guard protects while the
-/// new land cooks; keeping it for the full TTL after land is ready left Safari
-/// 503-retrying the superseded middle land (~15s) before dig-back (dogfood).
 ///
 /// Called from playlist serve and from every `asset_wait` poll — not only when
 /// the requested URI is the cooking land. Middle waiters may enter no-fill
@@ -2353,7 +2302,6 @@ fn note_first_segment_ready(session_id: &str, session: &mut Session) {
         session.landed_ms = landed;
     }
     session.first_segment_ready = true;
-    session.stale_retain_refuse_until = None;
     let elapsed_ms = session.last_restart.elapsed().as_millis();
     let lead_ms = session.play_start_ms.saturating_sub(session.start_ms);
     let disk_bytes = session_disk_bytes(&session.dir);
@@ -3555,7 +3503,6 @@ mod tests {
             first_segment_ready: false,
             pending_play_ms: None,
             pending_since: None,
-            stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
             preempt_defer_logged: false,
@@ -4703,8 +4650,10 @@ mod tests {
         );
     }
 
+    /// `note_first_segment_ready` has three production call sites and this is
+    /// its only unit test, so it outlives the stale guard it used to check.
     #[test]
-    fn stale_retain_cleared_when_play_land_ready() {
+    fn first_segment_ready_is_set_once_the_play_land_is_mapped() {
         let dir = tempfile::tempdir().expect("tempdir");
         let play_ms = 2_538_000u64;
         let mut session = Session {
@@ -4734,12 +4683,6 @@ mod tests {
             first_segment_ready: false,
             pending_play_ms: None,
             pending_since: None,
-            // Armed by hand: nothing in production arms this any more, since
-            // a seek keeps the prior encoder and its land stays valid
-            // (ADR-0050 §4). The clearing path is still live code, so the
-            // test still exercises something; the guard itself is removed
-            // with the rest of the scrub machinery.
-            stale_retain_refuse_until: Some(Instant::now() + Duration::from_secs(15)),
             failed: None,
             subtitle_tracks: vec![],
             preempt_defer_logged: false,
@@ -4762,43 +4705,10 @@ mod tests {
         fs::create_dir_all(dir.path().join("run_0")).unwrap();
         fs::write(dir.path().join("run_0/seg000.m4s"), b"seg").unwrap();
         note_first_segment_ready("test", &mut session);
-        assert!(session.first_segment_ready);
-        assert!(
-            session.stale_retain_refuse_until.is_none(),
-            "land ready must clear stale guard so Safari is not stuck 503-retrying"
-        );
-    }
-
-    #[test]
-    fn stale_retain_guard_refuses_far_behind_only_while_active() {
-        // Lifecycle: armed during cook (refuse far-behind retained); cleared
-        // when play land is ready (note_first_segment_ready) or TTL elapses —
-        // same as guard_active=false so Safari can dig-back after coalesce.
-        let play_b = 1_332_000u64;
-        let land_a = 910_000u64;
-        assert!(
-            !serve_ok_retained_during_stale_guard(land_a, play_b, true),
-            "prior land during guard: refuse"
-        );
-        assert!(
-            serve_ok_retained_during_stale_guard(land_a, play_b, false),
-            "after land-ready clear / TTL: retained prior land may serve"
-        );
-        assert!(
-            serve_ok_retained_during_stale_guard(play_b, play_b, true),
-            "exact play land: serve"
-        );
-        assert!(
-            serve_ok_retained_during_stale_guard(
-                play_b - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
-                play_b,
-                true
-            ),
-            "lead dig-back: serve"
-        );
-        assert!(
-            serve_ok_retained_during_stale_guard(play_b + SEGMENT_MS, play_b, true),
-            "ahead of play: serve"
+        assert!(session.first_segment_ready, "the play land is in the map");
+        assert_eq!(
+            session.landed_ms, play_ms,
+            "land moves to the first segment of the current run"
         );
     }
 
@@ -6799,7 +6709,6 @@ mod tests {
             first_segment_ready: false,
             pending_play_ms: None,
             pending_since: None,
-            stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
             preempt_defer_logged: false,
@@ -7005,7 +6914,6 @@ mod tests {
             first_segment_ready: false,
             pending_play_ms: None,
             pending_since: None,
-            stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
             preempt_defer_logged: false,
@@ -7092,7 +7000,6 @@ mod tests {
             first_segment_ready: true,
             pending_play_ms: None,
             pending_since: None,
-            stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
             preempt_defer_logged: false,
