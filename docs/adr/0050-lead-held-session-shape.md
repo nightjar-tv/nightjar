@@ -111,11 +111,19 @@ run, and the bench now refuses a run where one would not.
    with creating one. Confirming it needs instrumentation this bench does not
    have, so it is recorded as a hypothesis.
 
-5. **A superseded encoder keeps running, and is reaped on a short idle
-   delay.** It is **not** suspended, and this is the one place where the
-   obvious move is wrong.
+5. **A superseded encoder is suspended, then reaped on a short idle delay.**
+   Suspending is not enough on its own. SIGSTOP frees encoder time and does
+   not release memory: held encoders measured 1593 MB suspended against
+   1586 MB running, identical within noise. Each costs 226 MB and never
+   shrinks, seven accumulated in ten minutes at N=4, and about 22 fit in that
+   box's free memory.
 
-   **Why not suspend it (amended 2026-08-24, found in implementation).**
+   **Amended 2026-08-24 — do not suspend it. It keeps running until reap.**
+   The sentence above is what this decision said, and implementing it showed
+   why it is wrong. This is the one place in the design where the obvious move
+   is the wrong one, so the original claim stays visible rather than being
+   quietly replaced.
+
    Suspending stops the encoder producing. A client may be waiting on a
    segment of that encoder's land which has not finished writing, and a
    suspended encoder never finishes it: the wait then runs to its timeout and
@@ -132,11 +140,9 @@ run, and the bench now refuses a run where one would not.
    reader finding that suspension is required for correctness will not also
    have to trade it against speed; there is no trade to make.
 
-   Suspending would not have bought much anyway. SIGSTOP frees encoder time
-   and does not release memory: held encoders measured 1593 MB suspended
-   against 1586 MB running, identical within noise. Each costs 226 MB and
-   never shrinks, seven accumulated in ten minutes at N=4, and about 22 fit in
-   that box's free memory. The delay, not the suspension, is what bounds it.
+   The memory figures above survive the amendment and are the reason
+   suspending bought little regardless: it frees encoder time and not memory.
+   The delay, not the suspension, is what bounds the held set.
 
    **The delay, measured 2026-08-23.** Five runs at N=4, a 300 s forward seek
    every 120 s, the superseded encode terminated after the delay:
@@ -215,8 +221,16 @@ into one restart. `classify_restart_desire`, `pending_restart_due`,
 
 Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
 client is still asking for it, because the superseded encoder keeps serving its
-land until it is reaped. The replacement is three steps: spawn, suspend, reap
-after the delay in decision 5. Rule 4.5 is satisfied by subtraction.
+land until it is reaped. The replacement is two steps: spawn, then reap after
+the delay in decision 5. **There is no suspend step** — decision 5's amendment
+of 2026-08-24 says why, and an implementer reading only this paragraph is
+exactly the reader that amendment exists for. Rule 4.5 is satisfied by
+subtraction.
+
+Because the prior encoder outlives the seek, "the current run" stops being the
+only live run. Anything reading a session-global maximum where it means one
+particular run has to name the run: the encode frontier the throttle reads, and
+any per-run cleanup that treats "not the current run" as "finished".
 
 The 2 s IDR grid is load-bearing here and does not hold on Intel today
 (ADR-0052). A long encoder makes that worse, not better, because it produces
