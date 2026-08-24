@@ -632,10 +632,6 @@ struct Session {
     /// in flight. The API wires it to the library pool; a seek consults it
     /// before deciding to wait, bounded, for the build to land.
     map_build_in_flight: Option<Arc<MapBuildInFlight>>,
-    /// Refcount of in-flight [`HlsSessionRegistry::asset_wait`] calls keyed by
-    /// aligned want_ms. Used to defer preempt kill while a client still holds
-    /// the cooking land (native dig-back / land-ensure).
-    segment_waiters: HashMap<u64, u32>,
     /// Avoid log spam while polls re-hit deferred preempt before land.
     preempt_defer_logged: bool,
     /// Title-absolute start of the furthest segment this session has been
@@ -1217,7 +1213,6 @@ impl HlsSessionRegistry {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
-                segment_waiters: HashMap::new(),
                 preempt_defer_logged: false,
                 // The playhead starts where the session was asked to start,
                 // so a session created at a mid-title land does not read as
@@ -1584,10 +1579,6 @@ impl HlsSessionRegistry {
         }
         let file_name = name.to_string();
         let requested_ms = crate::hls_segment_map::parse_time_keyed_segment_name(name);
-        // Register before the poll loop so a concurrent preempt sees this
-        // waiter under the same mutex as stop_child (see restart_at).
-        let _segment_waiter =
-            requested_ms.and_then(|ms| SegmentWaiterGuard::attach(&self.sessions, session_id, ms));
         let mut deadline = Instant::now() + SEGMENT_WAIT;
         let mut holding_for_land = false;
         let mut holding_no_fill = false;
@@ -3509,69 +3500,6 @@ fn frontier_ms<'a>(
         .map(|s| s.start_ms.saturating_add(s.duration_ms))
 }
 
-/// Holds a refcount on `Session::segment_waiters` for one asset_wait call.
-/// Attach and Drop take the registry mutex — the same lock `restart_at` holds
-/// when deciding whether to `stop_child`, so waiter presence and kill are
-/// mutually exclusive (no check-then-kill race against concurrent attach).
-struct SegmentWaiterGuard<'a> {
-    sessions: &'a Mutex<HashMap<String, Session>>,
-    session_id: String,
-    want_ms: u64,
-}
-
-impl<'a> SegmentWaiterGuard<'a> {
-    fn attach(
-        sessions: &'a Mutex<HashMap<String, Session>>,
-        session_id: &str,
-        want_ms: u64,
-    ) -> Option<Self> {
-        let mut guard = sessions.lock().ok()?;
-        let session = guard.get_mut(session_id)?;
-        let count = session.segment_waiters.entry(want_ms).or_insert(0);
-        *count += 1;
-        tracing::info!(
-            session_id,
-            want_ms,
-            waiter_count = *count,
-            cooking_play_ms = session.play_start_ms,
-            pending_play_ms = session.pending_play_ms,
-            "hls segment waiter attach"
-        );
-        Some(Self {
-            sessions,
-            session_id: session_id.to_string(),
-            want_ms,
-        })
-    }
-}
-
-impl Drop for SegmentWaiterGuard<'_> {
-    fn drop(&mut self) {
-        let Ok(mut guard) = self.sessions.lock() else {
-            return;
-        };
-        let Some(session) = guard.get_mut(&self.session_id) else {
-            return;
-        };
-        let Some(count) = session.segment_waiters.get_mut(&self.want_ms) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        let after = *count;
-        if after == 0 {
-            session.segment_waiters.remove(&self.want_ms);
-        }
-        tracing::info!(
-            session_id = %self.session_id,
-            want_ms = self.want_ms,
-            waiter_count = after,
-            cooking_play_ms = session.play_start_ms,
-            pending_play_ms = session.pending_play_ms,
-            "hls segment waiter drop"
-        );
-    }
-}
-
 fn is_safe_asset(name: &str) -> bool {
     if name == "init.mp4" {
         return true;
@@ -3630,7 +3558,6 @@ mod tests {
             stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
-            segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
@@ -4815,7 +4742,6 @@ mod tests {
             stale_retain_refuse_until: Some(Instant::now() + Duration::from_secs(15)),
             failed: None,
             subtitle_tracks: vec![],
-            segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
@@ -6876,7 +6802,6 @@ mod tests {
             stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
-            segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
@@ -7083,7 +7008,6 @@ mod tests {
             stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
-            segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
@@ -7171,7 +7095,6 @@ mod tests {
             stale_retain_refuse_until: None,
             failed: None,
             subtitle_tracks: vec![],
-            segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
             last_requested_ms: 0,
             throttled: false,
