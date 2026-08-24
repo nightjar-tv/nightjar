@@ -47,6 +47,19 @@ const SEGMENT_MS: u64 = 2000;
 /// seg1098 after a Chrome seek on Up 1080p).
 const SEGMENT_WAIT: Duration = Duration::from_secs(30);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
+/// Media seconds a session's encoder may run ahead of the playhead before it
+/// is suspended, and the lead at which it is resumed (ADR-0050 §2). Product
+/// constants: the knee replicated across two encoders, two operating systems
+/// and both run orders. Below it a session pays half a second of latency for
+/// no saving; above it, encode for no gain. Not settings (Rule 4.12).
+const LEAD_TARGET_MS: u64 = 40_000;
+const LEAD_FLOOR_MS: u64 = 20_000;
+// The band must have room in it. Equal values would suspend and resume on
+// adjacent ticks for a session's whole life.
+const _: () = assert!(LEAD_FLOOR_MS < LEAD_TARGET_MS);
+/// How often the throttle re-reads every session's lead. Fine enough that a
+/// resumed encoder is producing again well inside one segment.
+const THROTTLE_TICK: Duration = Duration::from_millis(250);
 /// Still justified under producer-truth: EVENT playlists list segments the
 /// producer is still writing; Safari prefetches ~two past the on-disk
 /// frontier. Those GETs Wait (cook), they do not scrub. Far scrub is
@@ -630,6 +643,11 @@ struct Session {
     segment_waiters: HashMap<u64, u32>,
     /// Avoid log spam while polls re-hit deferred preempt before land.
     preempt_defer_logged: bool,
+    /// Title-absolute start of the furthest segment this session has been
+    /// asked for. The playhead, as the server can see it (ADR-0050 §2).
+    last_requested_ms: u64,
+    /// True while this session's encoder is SIGSTOPped by the throttle.
+    throttled: bool,
 }
 
 /// Snapshot returned by start / seek / get (ADR-0020 wire fields).
@@ -1009,6 +1027,11 @@ impl HlsSessionRegistry {
             .name("hls-reaper".into())
             .spawn(move || reaper.reaper_loop())
             .map_err(|e| format!("spawn hls reaper: {e}"))?;
+        let throttle = Arc::clone(&registry);
+        std::thread::Builder::new()
+            .name("hls-throttle".into())
+            .spawn(move || throttle.throttle_loop())
+            .map_err(|e| format!("spawn hls throttle: {e}"))?;
         Ok(registry)
     }
 
@@ -1175,6 +1198,11 @@ impl HlsSessionRegistry {
                     .clone(),
                 segment_waiters: HashMap::new(),
                 preempt_defer_logged: false,
+                // The playhead starts where the session was asked to start,
+                // so a session created at a mid-title land does not read as
+                // holding a title's worth of lead on its first tick.
+                last_requested_ms: play_start_ms,
+                throttled: false,
             },
         );
         Ok(id)
@@ -1579,6 +1607,12 @@ impl HlsSessionRegistry {
                     .get_mut(session_id)
                     .ok_or(PlaylistError::NotFound)?;
                 session.last_access = Instant::now();
+                if let Some(ms) = requested_ms {
+                    // Monotonic: a prefetch that runs ahead moves the
+                    // playhead, a scrub back does not rewind it. A seek
+                    // resets it explicitly, where the land is known.
+                    session.last_requested_ms = session.last_requested_ms.max(ms);
+                }
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
@@ -1847,6 +1881,54 @@ impl HlsSessionRegistry {
     /// Idle and failed sessions are reaped without a DELETE. Crashed or
     /// sleeping tabs never send one; without this Gate 2's zero-orphan
     /// criterion fails 48 hours later.
+    /// Hold each session's encoder at [`LEAD_TARGET_MS`] and let it run again
+    /// at [`LEAD_FLOOR_MS`] (ADR-0050 §2, §3).
+    ///
+    /// Suspending is what makes a lead a lead. An unthrottled encoder runs to
+    /// EOF and produces media nobody has asked for. `-readrate` was measured
+    /// as the declarative alternative and rejected, because it paces against
+    /// wall clock and so cannot see a viewer who has stopped: in a 400 s pause
+    /// its lead grew from 40 s to 418 s and never recovered.
+    ///
+    /// Applies to copy and remux sessions too. A remux is also one long
+    /// FFmpeg holding a lead, and one concept gets one path (Rule 4.11).
+    ///
+    /// **This runs in tests.** The playhead only moves when a segment is
+    /// fetched through [`HlsSessionRegistry::asset`], so a test that drives
+    /// production without fetching never advances it, reaches
+    /// [`LEAD_TARGET_MS`] and has its encoder suspended. That presents as a
+    /// hang rather than as a throttle. No test does this today. If one starts
+    /// to, fetch the segments rather than reaching for a switch to turn this
+    /// off: a knob here would be standing in for a decision already made
+    /// (Rule 4.12).
+    fn throttle_loop(&self) {
+        loop {
+            std::thread::sleep(THROTTLE_TICK);
+            let Ok(mut sessions) = self.sessions.lock() else {
+                continue;
+            };
+            for (id, session) in sessions.iter_mut() {
+                let Some(child) = session.child.as_ref() else {
+                    // No producer: a finished run holds no lead, and a child
+                    // that exited while suspended must not stay marked.
+                    session.throttled = false;
+                    continue;
+                };
+                let Some(lead_ms) = session_lead_ms(session) else {
+                    continue;
+                };
+                let Some(stop) = throttle_action(session.throttled, lead_ms) else {
+                    continue;
+                };
+                if signal_child(child, stop) {
+                    session.throttled = stop;
+                    let action = if stop { "suspend" } else { "resume" };
+                    tracing::debug!(session_id = %id, lead_ms, action, "hls throttle");
+                }
+            }
+        }
+    }
+
     fn reaper_loop(&self) {
         loop {
             std::thread::sleep(REAPER_TICK);
@@ -1978,6 +2060,11 @@ fn restart_at(
         "hls seek restart_at: stop prior encode"
     );
     stop_child(&mut session.child);
+    // `throttled` describes a live process. This session keeps going with a
+    // new child, so leaving it set would make the next tick send a resume to
+    // a child that was never suspended and skip the suspend it needs. The
+    // other two `stop_child` callers remove the session outright.
+    session.throttled = false;
     sync_segment_map(session);
     sync_all_run_indexes(session);
     // Duplicate-write stop: scrub-back (or re-land) into media the global map
@@ -2005,6 +2092,10 @@ fn restart_at(
         session.current_run_eof = true;
         session.start_ms = play_start_ms;
         session.play_start_ms = play_start_ms;
+        // A seek moves the playhead, including backwards. Left at the old
+        // high-water mark the lead reads as zero for the rest of the session
+        // and the throttle never fires again (ADR-0050 §2).
+        session.last_requested_ms = play_start_ms;
         session.landed_ms = mapped.start_ms;
         session.failed = None;
         session.last_restart = Instant::now();
@@ -2079,6 +2170,7 @@ fn restart_at(
     session.current_run_eof = false;
     session.start_ms = start_ms;
     session.play_start_ms = play_start_ms;
+    session.last_requested_ms = play_start_ms;
     session.landed_ms = start_ms;
     session.failed = None;
     session.last_restart = Instant::now();
@@ -3277,9 +3369,95 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
 
 fn stop_child(child: &mut Option<Child>) {
     if let Some(mut c) = child.take() {
+        // SIGKILL, deliberately. A SIGSTOPped child does not act on SIGTERM
+        // until it is continued, which leaked 23 FFmpeg processes across one
+        // bench sweep (ADR-0050 §3). SIGKILL cannot be blocked and terminates
+        // a stopped process, so the throttle cannot strand a reap. Do not
+        // "improve" this to terminate() without continuing the child first.
         let _ = c.kill();
         let _ = c.wait();
     }
+}
+
+/// Suspend or resume one encoder. Unix only: ADR-0050 §9 scopes throttling to
+/// Linux and macOS, because the property it depends on — that a suspended
+/// encoder releases the hardware encoder — is a driver question that has not
+/// been measured on Windows.
+#[cfg(unix)]
+fn signal_child(child: &Child, stop: bool) -> bool {
+    // Take the numbers from libc, never by hand: SIGSTOP is 19 on Linux and
+    // 17 on macOS, and 18 is SIGCONT on Linux but SIGTSTP on macOS. Written
+    // out by hand they were inverted on Darwin, which suspends a session at
+    // the floor and never resumes it.
+    let sig = if stop { libc::SIGSTOP } else { libc::SIGCONT };
+    // SAFETY: `kill` with a pid we own and a valid signal number. The pid
+    // cannot have been recycled: this is our own child and nothing reaps it
+    // except `stop_child`, which takes the `Child` out of the session under
+    // the same lock this call is made under.
+    unsafe { libc::kill(child.id() as libc::pid_t, sig) == 0 }
+}
+
+#[cfg(not(unix))]
+fn signal_child(_child: &Child, _stop: bool) -> bool {
+    false
+}
+
+/// Whether a session at `lead_ms` should change throttle state. `None` means
+/// leave it alone.
+///
+/// The band is hysteresis, not a target: suspend at [`LEAD_TARGET_MS`], resume
+/// at [`LEAD_FLOOR_MS`], do nothing between. A single threshold would suspend
+/// and resume on adjacent ticks for the whole session.
+fn throttle_action(throttled: bool, lead_ms: u64) -> Option<bool> {
+    if !throttled && lead_ms >= LEAD_TARGET_MS {
+        Some(true)
+    } else if throttled && lead_ms <= LEAD_FLOOR_MS {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Media milliseconds produced beyond the playhead. `None` when nothing has
+/// been produced, which is a session that has not started rather than one with
+/// no lead: the throttle must leave it alone rather than read it as zero.
+///
+/// Saturating, because a playhead can legitimately sit past the frontier — a
+/// client prefetching across the end of what is written asks for a segment
+/// before it exists.
+fn lead_ms(produced_end_ms: Option<u64>, last_requested_ms: u64) -> Option<u64> {
+    Some(produced_end_ms?.saturating_sub(last_requested_ms))
+}
+
+/// [`lead_ms`] for one session, reading the frontier from the run that is
+/// currently producing.
+///
+/// The segment map is session-global and keeps prior runs' entries so scrub
+/// back stays a plain file serve (ADR-0020 §3). Its maximum is therefore a
+/// frontier the live encoder may be nowhere near after a backward seek, and
+/// using it would report no lead for the rest of the session.
+fn session_lead_ms(session: &Session) -> Option<u64> {
+    // One live encoder per session, so the current run is the serving run.
+    // ADR-0050 §4 breaks that: see the note on `frontier_ms`.
+    let produced_end = frontier_ms(session.segment_map.iter_ordered(), session.current_run_id);
+    lead_ms(produced_end, session.last_requested_ms)
+}
+
+/// Furthest media end produced by `run_id`, ignoring every other run.
+///
+/// `run_id` is the run **serving this playhead**, which today is the same as
+/// the session's current run because a seek kills the previous encoder before
+/// starting the next. Under ADR-0050 §4 a seek spawns instead, so two runs are
+/// live at once and "current" stops meaning "the one this playhead reads
+/// from". Pass the serving run explicitly then; do not reach for
+/// `session.current_run_id` here.
+fn frontier_ms<'a>(
+    mut segments: impl DoubleEndedIterator<Item = &'a crate::hls_segment_map::MappedSegment>,
+    run_id: u64,
+) -> Option<u64> {
+    segments
+        .rfind(|s| s.run_id == run_id)
+        .map(|s| s.start_ms.saturating_add(s.duration_ms))
 }
 
 /// Holds a refcount on `Session::segment_waiters` for one asset_wait call.
@@ -3374,6 +3552,92 @@ mod tests {
     /// ADR-0052: the frame count for one segment comes from the source rate,
     /// so it is a different number per source and never a constant. This is
     /// the arithmetic that `-g 48` got wrong by being written down once.
+    /// ADR-0050 §2: the band is hysteresis. Suspend at the target, resume at
+    /// the floor, and do nothing between, or a session at the threshold
+    /// suspends and resumes on adjacent ticks for its whole life.
+    #[test]
+    fn throttle_band_is_hysteresis_not_a_threshold() {
+        // Running, below the target: leave it alone.
+        assert_eq!(throttle_action(false, 0), None);
+        assert_eq!(throttle_action(false, LEAD_FLOOR_MS), None);
+        assert_eq!(throttle_action(false, LEAD_TARGET_MS - 1), None);
+        // Running, at or past the target: suspend.
+        assert_eq!(throttle_action(false, LEAD_TARGET_MS), Some(true));
+        assert_eq!(throttle_action(false, LEAD_TARGET_MS * 4), Some(true));
+        // Suspended, still above the floor: stay suspended. This is the half
+        // a single threshold would get wrong.
+        assert_eq!(throttle_action(true, LEAD_TARGET_MS), None);
+        assert_eq!(throttle_action(true, LEAD_FLOOR_MS + 1), None);
+        // Suspended, at or below the floor: resume.
+        assert_eq!(throttle_action(true, LEAD_FLOOR_MS), Some(false));
+        assert_eq!(throttle_action(true, 0), Some(false));
+    }
+
+    /// The lead is measured from the furthest segment asked for, not from the
+    /// encode start. A session that has produced nothing has no lead to read,
+    /// which is different from having a lead of zero.
+    #[test]
+    fn lead_is_produced_media_beyond_the_playhead() {
+        // Nothing produced is not a lead of zero: the throttle must not act.
+        assert_eq!(lead_ms(None, 0), None);
+        assert_eq!(lead_ms(None, 500_000), None);
+        // Produced to 4 s with the playhead at the start.
+        assert_eq!(lead_ms(Some(4000), 0), Some(4000));
+        // Mid-title: the lead is the gap, not the frontier.
+        assert_eq!(lead_ms(Some(640_000), 600_000), Some(40_000));
+        // Playhead level with the frontier.
+        assert_eq!(lead_ms(Some(4000), 4000), Some(0));
+        // A prefetch past the frontier saturates rather than wrapping.
+        assert_eq!(lead_ms(Some(4000), 10_000), Some(0));
+    }
+
+    /// The frontier is the producing run's, not the session map's maximum.
+    ///
+    /// The map keeps prior runs so scrub back is a plain file serve
+    /// (ADR-0020 §3). After a seek back from 50 min to 10 min it still holds
+    /// segments out to 50 min while the live encoder is at 10. Reading the
+    /// map maximum reports a frontier far past the playhead, the lead
+    /// saturates to zero, and the throttle never fires again for that session.
+    #[test]
+    fn backward_seek_does_not_disable_the_throttle() {
+        use crate::hls_segment_map::MappedSegment;
+        let seg = |start_ms, run_id| MappedSegment {
+            start_ms,
+            duration_ms: 2000,
+            run_id,
+            rel_path: PathBuf::from(format!("run_{run_id}/seg.m4s")),
+        };
+        // Run 0 reached 50 minutes before the seek; run 1 landed at 10 and has
+        // produced 40 s past it. Map order is by start time, so run 0's entry
+        // sorts last.
+        let segs = [seg(600_000, 1), seg(638_000, 1), seg(3_000_000, 0)];
+
+        assert_eq!(
+            frontier_ms(segs.iter(), 1),
+            Some(640_000),
+            "the producing run's frontier, not the map's maximum"
+        );
+        let lead = lead_ms(frontier_ms(segs.iter(), 1), 600_000);
+        assert_eq!(lead, Some(40_000));
+        assert_eq!(
+            throttle_action(false, lead.unwrap()),
+            Some(true),
+            "a session 40 s ahead must suspend, whatever prior runs left behind"
+        );
+
+        // The bug this pins: the map maximum saturates the lead to zero.
+        let stale = lead_ms(
+            segs.iter().next_back().map(|s| s.start_ms + s.duration_ms),
+            600_000,
+        );
+        assert_eq!(stale, Some(2_402_000));
+        assert_eq!(
+            throttle_action(false, 0),
+            None,
+            "a lead read as zero never suspends"
+        );
+    }
+
     #[test]
     fn gop_frames_follow_the_source_rate() {
         let plan_at = |num, den| VideoEncodePlan {
@@ -4238,6 +4502,8 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            last_requested_ms: 0,
+            throttled: false,
             piggyback: None,
             subs: None,
             db: None,
@@ -6296,6 +6562,8 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            last_requested_ms: 0,
+            throttled: false,
             piggyback: None,
             subs: None,
             db: None,
@@ -6500,6 +6768,8 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            last_requested_ms: 0,
+            throttled: false,
             piggyback: None,
             subs: None,
             db: None,
@@ -6585,6 +6855,8 @@ mod tests {
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
             preempt_defer_logged: false,
+            last_requested_ms: 0,
+            throttled: false,
             piggyback: None,
             subs: None,
             db: None,
