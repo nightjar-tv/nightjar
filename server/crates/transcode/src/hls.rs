@@ -96,8 +96,6 @@ const RESTART_COALESCE_QUIET: Duration = Duration::from_millis(400);
 /// GETs for mapped segments behind the new play land can still arrive. Serving
 /// them paints the prior scrub keyframe. Short TTL covers cook+retarget; then
 /// scrub-back via the global map is a plain file serve again. Not the old
-/// "Safari 503-retrying a superseded full-title land" band.
-const STALE_RETAIN_REFUSE: Duration = Duration::from_secs(15);
 /// Deleted under ADR-0020. Was the dig-back band for unlisted-but-requested
 /// segments on the synthetic full-title VOD. Producer-truth playlists do not
 /// list those URIs; far scrub is `POST /seek`. Kept as 0 so coalesce "far"
@@ -331,17 +329,6 @@ fn disable_preempt() -> bool {
         std::env::var("NIGHTJAR_DISABLE_PREEMPT").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "YES")
     )
-}
-
-/// Whether [`restart_at`] may `stop_child` while the cooking encode is still
-/// unfinished. Land-ready always kills (land-then-yank). Before land, a
-/// cooking-land waiter blocks kill so dig-back can still see mid bytes;
-/// zero waiters keep far-scrub preempt speed.
-///
-/// Pure helper for unit tests — production uses the same predicate under the
-/// session mutex immediately before `stop_child`.
-pub fn may_kill_cooking_encode(first_segment_ready: bool, cooking_land_waiter_count: u32) -> bool {
-    first_segment_ready || cooking_land_waiter_count == 0
 }
 
 /// Optional pause after kill before the next FFmpeg spawn (`restart_at`).
@@ -3571,6 +3558,115 @@ mod tests {
     /// ADR-0050 §2: the band is hysteresis. Suspend at the target, resume at
     /// the floor, and do nothing between, or a session at the threshold
     /// suspends and resumes on adjacent ticks for its whole life.
+    /// A minimal session for unit tests that only touch process bookkeeping.
+    fn make_test_session(dir: &Path) -> Session {
+        Session {
+            item_id: 1,
+            src: PathBuf::from("/dev/null"),
+            dir: dir.to_path_buf(),
+            mode: SessionMode::Copy,
+            audio: stereo(),
+            burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
+            map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
+            video_encoder: "copy".into(),
+            start_ms: 0,
+            play_start_ms: 0,
+            landed_ms: 0,
+            usable_extent_ms: None,
+            duration_ms: 60_000,
+            current_run_id: 0,
+            next_run_id: 1,
+            segment_map: Default::default(),
+            current_run_eof: false,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: false,
+            first_segment_ready: false,
+            pending_play_ms: None,
+            pending_since: None,
+            stale_retain_refuse_until: None,
+            failed: None,
+            subtitle_tracks: vec![],
+            segment_waiters: HashMap::new(),
+            preempt_defer_logged: false,
+            last_requested_ms: 0,
+            throttled: false,
+            superseded: Vec::new(),
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
+        }
+    }
+
+    /// ADR-0050 §5: the delay has to outlast the seek that replaced the
+    /// encoder, or the teardown lands while the new encoder is still starting
+    /// and contends with it. That cost 462 ms at 2 s.
+    #[test]
+    fn reap_delay_outlasts_the_seek_it_follows() {
+        // Worst measured first byte for a seek was near 2.4 s.
+        assert!(
+            REAP_AFTER > Duration::from_millis(2400),
+            "reap must be clear of the seek's own first byte"
+        );
+    }
+
+    /// A superseded encoder is kept and reaped on its delay, not before.
+    /// Reaping early is what a seek used to do, and it cost 1055 ms.
+    #[test]
+    fn superseded_encoders_are_reaped_only_once_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // Nothing held: reaping is a no-op rather than an error.
+        reap_superseded(&mut session);
+        assert!(session.superseded.is_empty());
+
+        // A long-lived child stands in for an encoder mid-run.
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        session.superseded.push(SupersededEncoder {
+            child,
+            reap_at: Instant::now() + Duration::from_secs(30),
+        });
+        reap_superseded(&mut session);
+        assert_eq!(
+            session.superseded.len(),
+            1,
+            "not due yet, so it must still be running"
+        );
+
+        // Due: it goes.
+        session.superseded[0].reap_at = Instant::now() - Duration::from_millis(1);
+        reap_superseded(&mut session);
+        assert!(session.superseded.is_empty(), "past its delay, so reaped");
+    }
+
+    /// Session teardown takes them all, whatever their delay: nothing may
+    /// outlive the session that spawned it.
+    #[test]
+    fn teardown_reaps_every_superseded_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        for _ in 0..3 {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
+            session.superseded.push(SupersededEncoder {
+                child,
+                reap_at: Instant::now() + Duration::from_secs(30),
+            });
+        }
+        reap_all_superseded(&mut session);
+        assert!(session.superseded.is_empty());
+    }
+
     #[test]
     fn throttle_band_is_hysteresis_not_a_threshold() {
         // Running, below the target: leave it alone.
@@ -4337,32 +4433,11 @@ mod tests {
         );
     }
 
-    /// Waiter on cooking land blocks preempt kill; no waiter matches today's
-    /// preempt-on immediate kill. Land-ready always may kill (land-then-yank).
+    /// Selecting which pending land is due is unchanged by a seek keeping the
+    /// prior encoder: the gate that used to defer the kill is gone, but the
+    /// due decision it sat beside is not.
     #[test]
-    fn waiter_gates_kill_before_land() {
-        assert!(
-            may_kill_cooking_encode(false, 0),
-            "no waiter: preempt-on may kill before land"
-        );
-        assert!(
-            !may_kill_cooking_encode(false, 1),
-            "waiter present: must not kill before land"
-        );
-        assert!(
-            !may_kill_cooking_encode(false, 3),
-            "any positive waiter count blocks kill"
-        );
-        assert!(
-            may_kill_cooking_encode(true, 1),
-            "land ready: kill allowed even with waiter (land-then-yank)"
-        );
-        assert!(
-            may_kill_cooking_encode(true, 0),
-            "land ready + no waiter: kill allowed"
-        );
-        // pending_restart_due still selects far C when allow_preempt; the
-        // kill gate is separate (restart_at / may_kill_cooking_encode).
+    fn pending_restart_selects_the_far_land() {
         let land_b = 1_494_000u64;
         let land_c = 2_070_000u64;
         assert_eq!(
@@ -4376,11 +4451,6 @@ mod tests {
                 true,
             ),
             Some(land_c),
-            "due decision unchanged when a waiter may later defer the kill"
-        );
-        assert!(
-            !may_kill_cooking_encode(false, 1),
-            "same due pending must still defer kill while waiter holds B's land"
         );
     }
 
@@ -4513,7 +4583,12 @@ mod tests {
             first_segment_ready: false,
             pending_play_ms: None,
             pending_since: None,
-            stale_retain_refuse_until: Some(Instant::now() + STALE_RETAIN_REFUSE),
+            // Armed by hand: nothing in production arms this any more, since
+            // a seek keeps the prior encoder and its land stays valid
+            // (ADR-0050 §4). The clearing path is still live code, so the
+            // test still exercises something; the guard itself is removed
+            // with the rest of the scrub machinery.
+            stale_retain_refuse_until: Some(Instant::now() + Duration::from_secs(15)),
             failed: None,
             subtitle_tracks: vec![],
             segment_waiters: HashMap::new(),
