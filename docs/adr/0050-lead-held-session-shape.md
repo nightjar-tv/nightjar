@@ -1,7 +1,10 @@
 # ADR-0050: A transcode session is one throttled encoder holding a lead
 
-- Status: **proposed** (§5 amended 2026-08-23 with the measured delay, and
-  2026-08-24: a superseded encoder runs until reap rather than being suspended)
+- Status: **proposed** (§5 amended 2026-08-23 with the measured delay;
+  2026-08-24: a superseded encoder runs until reap rather than being
+  suspended; 2026-08-25: §5 separates what was measured from what is
+  inferred, and Consequences reconciles its deletion list against the
+  eighteen items it named)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -140,6 +143,40 @@ run, and the bench now refuses a run where one would not.
    reader finding that suspension is required for correctness will not also
    have to trade it against speed; there is no trade to make.
 
+   **Amended 2026-08-25 — that is an inference, and the shipped policy was
+   never an arm.** The paragraph above is what this decision claimed, kept
+   visible under the same convention as the amendment above it.
+
+   §4's 1132 ms is the never-reap arm, which ends holding 1586 MB. The delay
+   table below is the suspend-then-reap pass, but only three of its four rows
+   are: 2 s, 5 s and 15 s ran `spawn-suspend-reap`, holding the superseded
+   encode SIGSTOPped for the delay and then terminating it. The `never` row
+   is that pass's control and ran plain `spawn` — no SIGSTOP, no reap — which
+   is why it ends holding 1591 MB. What ships — run, then reap at 5 s — is
+   none of them, and the bench data has no name for it (`spawn`,
+   `spawn-suspend`, `spawn-then-kill`, `spawn-suspend-reap`, `kill`).
+
+   One comparison bears on whether running beats suspending, not two:
+
+   | pairing | run | suspend | gap | same experiment? |
+   |---|---|---|---|---|
+   | Spike B, four runs, n=7 each | `spawn` 1294 ms | `spawn-suspend` 1385 ms | 91 ms | **yes** |
+
+   The pairing this ADR carried was §4's 1132 ms (n=7) against the delay
+   table's 1241 ms (n=14), a 109 ms gap. **Both of those arms are `spawn`.**
+   §4's row and the `never` row are the same policy measured in two passes,
+   so that gap is run against run and says nothing about suspending. It is
+   cross-pass as well, and cross-pass variance is larger still: Spike B's two
+   `kill` repeats differ by 530 ms at the median.
+
+   The 91 ms that does bear on the question sits inside the run-to-run spread
+   of about 110 ms this section states below. So running beating suspending
+   stays an inference. What changes is the support: one pairing, not two.
+
+   **Do not quote 1132 ms as the shipped policy's latency.** A run-then-reap
+   arm would settle it; nothing gates on it, which is why this is written
+   down rather than re-run.
+
    The memory figures above survive the amendment and are the reason
    suspending bought little regardless: it frees encoder time and not memory.
    The delay, not the suspension, is what bounds the held set.
@@ -168,6 +205,14 @@ run, and the bench now refuses a run where one would not.
 
    Memory is then bounded by seek-rate times delay, so there is no budget to
    size and no eviction order to choose. Do not ship an unbounded held set.
+
+   **Open and unowned.** The bound is seek-rate times delay, and this design
+   records the viewer seek rate as uncaptured. `HlsSessionRegistry::seek` has
+   no rate limit: the only gate is that the aligned land differs from the
+   current one. The web client mitigates by seeking on scrub commit rather
+   than per drag position; the HTTP API does not. Nothing checks that the
+   held set stays bounded, so the line above is currently an assertion rather
+   than a guarantee.
 
 6. **Do not cap concurrent encoding below the live transcode-session count.**
    `slots = N`. Capping saves no work; it selects which session waits. At
@@ -218,6 +263,50 @@ into one restart. `classify_restart_desire`, `pending_restart_due`,
 `serve_ok_retained_during_stale_guard`, `restart_at`, `restart_spawn_gap`,
 `disable_preempt`, with `RESTART_MIN_INTERVAL`, `RESTART_COALESCE_QUIET` and
 `STALE_RETAIN_REFUSE`, plus eighteen tests pinning their behaviour.
+
+**Amended 2026-08-25 — that list is not one deletion, and it was wrong about
+four of its own entries.** The paragraph above named eighteen items: fifteen
+functions and three constants. Three have gone, eleven are live, and four
+should never have been on the list. All eighteen are accounted for below.
+
+**Gone (3).** `may_kill_cooking_encode` and `STALE_RETAIN_REFUSE` went with
+the seek change; `serve_ok_retained_during_stale_guard` followed as a pure
+deletion, its guard established never-armed first.
+
+**Live, and behind `pending_play_ms` (11).** Seven take or set it directly:
+`pending_restart_due`, `coalesce_preempt_before_land`,
+`prefetch_advances_pending`, `digback_behind_committed`,
+`pending_waiter_action`, `desire_restart` and `maybe_apply_pending_restart`.
+Two are pure predicates that touch no pending state and are reachable only
+through that machinery — `classify_restart_desire`, whose sole production
+caller is `desire_restart`, and `serve_ok_after_pending_apply`, which exists
+to check the result of an apply in `asset_wait`. `RESTART_COALESCE_QUIET` is
+the family's own debounce and has no other reader. `RESTART_MIN_INTERVAL`
+gates the preempt path in `pending_restart_due`, but it is **not** the
+family's alone: it is also the cool-off argument to `decide_segment_miss`,
+at two call sites, and `decide_segment_miss` is not on this list. Deleting
+the family would not free it.
+
+The list above said all of these "take or set `pending_play_ms`". Two do
+not, and the difference matters: they go with the family by call graph
+rather than by signature, so a search on the field name would not find them.
+
+Removing any of them is **behavioural, not a tidy-up**: `desire_restart`
+runs from two production paths in `asset_wait` and `disable_preempt()`
+leaves preempt on unless an operator sets the variable, so removing it
+changes whether an encoder spawns. It needs its own decision.
+
+**Live, and wrongly listed (4).** These are not races that killing an
+encoder creates, and no deletion of the coalescing family reaches them.
+`restart_at` is the seek path itself — `HlsSessionRegistry::seek` calls it,
+and this design keeps it. It does clear `pending_play_ms`, so it is not
+independent of that family, but it cannot go with it.
+`no_fill_release_for_new_land` neither reads nor writes any pending state.
+`restart_spawn_gap` and `disable_preempt` read environment variables.
+
+Three items removed alongside these — `RestartAtOutcome`, `segment_waiters`
+and `preempt_defer_logged` — were never on the original list. Counting them
+as part of it is what made an unbalanced ledger look balanced.
 
 Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
 client is still asking for it, because the superseded encoder keeps serving its
