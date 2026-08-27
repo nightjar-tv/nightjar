@@ -148,26 +148,30 @@ run, and the bench now refuses a run where one would not.
    visible under the same convention as the amendment above it.
 
    §4's 1132 ms is the never-reap arm, which ends holding 1586 MB. The delay
-   table below is the suspend arm: every row held the superseded encode
-   SIGSTOPped for the delay, and every row but `never` then terminated it —
-   `never` stayed suspended and ends holding 1591 MB. What ships — run, then
-   reap at 5 s — is neither, and the bench data has no name for it (`spawn`,
-   `spawn-suspend`, `spawn-then-kill`, `kill`).
+   table below is the suspend-then-reap pass, but only three of its four rows
+   are: 2 s, 5 s and 15 s ran `spawn-suspend-reap`, holding the superseded
+   encode SIGSTOPped for the delay and then terminating it. The `never` row
+   is that pass's control and ran plain `spawn` — no SIGSTOP, no reap — which
+   is why it ends holding 1591 MB. What ships — run, then reap at 5 s — is
+   none of them, and the bench data has no name for it (`spawn`,
+   `spawn-suspend`, `spawn-then-kill`, `spawn-suspend-reap`, `kill`).
 
-   Two comparisons bear on whether running beats suspending, and they are
-   not the same comparison:
+   One comparison bears on whether running beats suspending, not two:
 
    | pairing | run | suspend | gap | same experiment? |
    |---|---|---|---|---|
    | Spike B, four runs, n=7 each | `spawn` 1294 ms | `spawn-suspend` 1385 ms | 91 ms | **yes** |
-   | §4 against the delay table | `spawn` 1132 ms (n=7) | `never` 1241 ms (n=14) | 109 ms | no — two passes |
 
-   The second is the pairing this ADR carried, and it crosses passes: 1132 ms
-   is Spike B2's `spawn` row and 1241 ms is the reap-delay pass's `never`
-   row. Both gaps sit inside the run-to-run spread of about 110 ms this
-   section states, so the conclusion holds either way — and the cross-pass
-   pairing should be judged against cross-pass variance, which is larger
-   still: Spike B's two `kill` repeats differ by 530 ms at the median.
+   The pairing this ADR carried was §4's 1132 ms (n=7) against the delay
+   table's 1241 ms (n=14), a 109 ms gap. **Both of those arms are `spawn`.**
+   §4's row and the `never` row are the same policy measured in two passes,
+   so that gap is run against run and says nothing about suspending. It is
+   cross-pass as well, and cross-pass variance is larger still: Spike B's two
+   `kill` repeats differ by 530 ms at the median.
+
+   The 91 ms that does bear on the question sits inside the run-to-run spread
+   of about 110 ms this section states below. So running beating suspending
+   stays an inference. What changes is the support: one pairing, not two.
 
    **Do not quote 1132 ms as the shipped policy's latency.** A run-then-reap
    arm would settle it; nothing gates on it, which is why this is written
@@ -276,8 +280,12 @@ deletion, its guard established never-armed first.
 Two are pure predicates that touch no pending state and are reachable only
 through that machinery — `classify_restart_desire`, whose sole production
 caller is `desire_restart`, and `serve_ok_after_pending_apply`, which exists
-to check the result of an apply in `asset_wait`. `RESTART_MIN_INTERVAL` and
-`RESTART_COALESCE_QUIET` are the family's own timing constants.
+to check the result of an apply in `asset_wait`. `RESTART_COALESCE_QUIET` is
+the family's own debounce and has no other reader. `RESTART_MIN_INTERVAL`
+gates the preempt path in `pending_restart_due`, but it is **not** the
+family's alone: it is also the cool-off argument to `decide_segment_miss`,
+at two call sites, and `decide_segment_miss` is not on this list. Deleting
+the family would not free it.
 
 The list above said all of these "take or set `pending_play_ms`". Two do
 not, and the difference matters: they go with the family by call graph
