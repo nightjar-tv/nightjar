@@ -2,6 +2,9 @@
 
 - Status: accepted
 - Date: 2026-07-26
+- Amended: 2026-08-25 — fix (a)'s mechanism is gone. ADR-0050 §4-§5 replaced
+  kill-and-restart, so there is no kill to defer; the decision stands, the
+  machinery named in it does not.
 
 ## Context
 
@@ -173,6 +176,20 @@ path iOS/tvOS need).
    still select, but `restart_at` defers `stop_child` while a cooking-land
    segment waiter is held (`may_kill_cooking_encode` / `segment_waiters`).
    Land-ready still kills (land-then-yank). Fix (b) not taken.
+
+   > **Amended 2026-08-25 — fix (a)'s mechanism no longer exists.** The
+   > paragraph above stays as written, because it records what was chosen
+   > and why. ADR-0050 §4-§5 replaced kill-and-restart: a seek now
+   > supersedes the prior encoder and leaves it running until a reap
+   > clears the seek, so `restart_at` no longer calls `stop_child` and
+   > there is no kill to defer. `may_kill_cooking_encode` went with that
+   > change; `segment_waiters` and its guard followed once nothing read
+   > them. The race fix (a) addressed — a client holding a cooking land
+   > that the kill would strand — is answered structurally instead: the
+   > encoder that owns the land is still producing it.
+   >
+   > This is a mechanism replaced, not a decision reversed. Fix (b) is
+   > still not taken.
 
 Fix (a) targets **mid-playback double-scrub under preempt-on** (kill
 before mid land). Scrub-before-play ablation under preempt-on passed

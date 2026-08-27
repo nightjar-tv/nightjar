@@ -3,7 +3,8 @@
 - Status: **proposed** (§5 amended 2026-08-23 with the measured delay;
   2026-08-24: a superseded encoder runs until reap rather than being
   suspended; 2026-08-25: §5 separates what was measured from what is
-  inferred, and Consequences records that its deletion list is two slices)
+  inferred, and Consequences reconciles its deletion list against the
+  eighteen items it named)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -136,25 +137,41 @@ run, and the bench now refuses a run where one would not.
    destroyed. Suspension destroys production, which is the half of the
    reasoning that does not survive. The encoder must run until it is reaped.
 
-   **The fast arm and the correct arm look like the same arm, and that is
-   reasoned rather than measured.** Leaving the prior encoder running
-   measured a 1132 ms median seek in §4, the best of the three policies
-   there, so correctness appears to cost nothing in latency and a later
-   reader need not go hunting for the speed it must have cost.
+   **The fast arm and the correct arm are the same arm.** Leaving the prior
+   encoder running measured a 1132 ms median seek, the best of the three
+   policies in §4, so keeping it alive costs nothing in latency. A later
+   reader finding that suspension is required for correctness will not also
+   have to trade it against speed; there is no trade to make.
 
-   **But the shipped policy was never an arm.** §4's 1132 ms is the
-   never-reap arm, which ends holding 1586 MB. The delay table below is the
-   suspend arm: every row held the superseded encode SIGSTOPped for the
-   delay before terminating it. What ships — run, then reap at 5 s — is
-   neither, and the bench data has no name for it (`spawn`,
+   **Amended 2026-08-25 — that is an inference, and the shipped policy was
+   never an arm.** The paragraph above is what this decision claimed, kept
+   visible under the same convention as the amendment above it.
+
+   §4's 1132 ms is the never-reap arm, which ends holding 1586 MB. The delay
+   table below is the suspend arm: every row held the superseded encode
+   SIGSTOPped for the delay, and every row but `never` then terminated it —
+   `never` stayed suspended and ends holding 1591 MB. What ships — run, then
+   reap at 5 s — is neither, and the bench data has no name for it (`spawn`,
    `spawn-suspend`, `spawn-then-kill`, `kill`).
 
-   The claim that running beats suspending rests on 1132 ms (run, never
-   reaped) against 1241 ms (suspend, never reaped). That gap is 109 ms
-   against a stated run-to-run spread of about 110 ms, so it is inside the
-   noise. **Do not quote 1132 ms as the shipped policy's latency.** A
-   run-then-reap arm would settle it; nothing gates on it, which is why this
-   is written down rather than re-run.
+   Two comparisons bear on whether running beats suspending, and they are
+   not the same comparison:
+
+   | pairing | run | suspend | gap | same experiment? |
+   |---|---|---|---|---|
+   | Spike B, four runs, n=7 each | `spawn` 1294 ms | `spawn-suspend` 1385 ms | 91 ms | **yes** |
+   | §4 against the delay table | `spawn` 1132 ms (n=7) | `never` 1241 ms (n=14) | 109 ms | no — two passes |
+
+   The second is the pairing this ADR carried, and it crosses passes: 1132 ms
+   is Spike B2's `spawn` row and 1241 ms is the reap-delay pass's `never`
+   row. Both gaps sit inside the run-to-run spread of about 110 ms this
+   section states, so the conclusion holds either way — and the cross-pass
+   pairing should be judged against cross-pass variance, which is larger
+   still: Spike B's two `kill` repeats differ by 530 ms at the median.
+
+   **Do not quote 1132 ms as the shipped policy's latency.** A run-then-reap
+   arm would settle it; nothing gates on it, which is why this is written
+   down rather than re-run.
 
    The memory figures above survive the amendment and are the reason
    suspending bought little regardless: it frees encoder time and not memory.
@@ -243,19 +260,45 @@ into one restart. `classify_restart_desire`, `pending_restart_due`,
 `disable_preempt`, with `RESTART_MIN_INTERVAL`, `RESTART_COALESCE_QUIET` and
 `STALE_RETAIN_REFUSE`, plus eighteen tests pinning their behaviour.
 
-**That list is two deletions, not one, and only the first has happened.**
-`may_kill_cooking_encode`, `STALE_RETAIN_REFUSE` and `RestartAtOutcome` went
-with the seek change; `segment_waiters`, the stale-retain field and predicate
-and `preempt_defer_logged` followed as pure deletions, each established
-write-only or never-armed first. The rest — `classify_restart_desire`,
+**Amended 2026-08-25 — that list is not one deletion, and it was wrong about
+four of its own entries.** The paragraph above named eighteen items: fifteen
+functions and three constants. Three have gone, eleven are live, and four
+should never have been on the list. All eighteen are accounted for below.
+
+**Gone (3).** `may_kill_cooking_encode` and `STALE_RETAIN_REFUSE` went with
+the seek change; `serve_ok_retained_during_stale_guard` followed as a pure
+deletion, its guard established never-armed first.
+
+**Live, and behind `pending_play_ms` (11).** Seven take or set it directly:
 `pending_restart_due`, `coalesce_preempt_before_land`,
 `prefetch_advances_pending`, `digback_behind_committed`,
-`pending_waiter_action`, `desire_restart`, `maybe_apply_pending_restart` and
-`serve_ok_after_pending_apply` — all take or set `pending_play_ms`, which is
-**live**: `desire_restart` runs from two production paths in `asset_wait`
-with preempt on by default, so removing it changes whether an encoder
-spawns. That is a behavioural change and needs its own decision, not a
-tidy-up.
+`pending_waiter_action`, `desire_restart` and `maybe_apply_pending_restart`.
+Two are pure predicates that touch no pending state and are reachable only
+through that machinery — `classify_restart_desire`, whose sole production
+caller is `desire_restart`, and `serve_ok_after_pending_apply`, which exists
+to check the result of an apply in `asset_wait`. `RESTART_MIN_INTERVAL` and
+`RESTART_COALESCE_QUIET` are the family's own timing constants.
+
+The list above said all of these "take or set `pending_play_ms`". Two do
+not, and the difference matters: they go with the family by call graph
+rather than by signature, so a search on the field name would not find them.
+
+Removing any of them is **behavioural, not a tidy-up**: `desire_restart`
+runs from two production paths in `asset_wait` and `disable_preempt()`
+leaves preempt on unless an operator sets the variable, so removing it
+changes whether an encoder spawns. It needs its own decision.
+
+**Live, and wrongly listed (4).** These are not races that killing an
+encoder creates, and no deletion of the coalescing family reaches them.
+`restart_at` is the seek path itself — `HlsSessionRegistry::seek` calls it,
+and this design keeps it. It does clear `pending_play_ms`, so it is not
+independent of that family, but it cannot go with it.
+`no_fill_release_for_new_land` neither reads nor writes any pending state.
+`restart_spawn_gap` and `disable_preempt` read environment variables.
+
+Three items removed alongside these — `RestartAtOutcome`, `segment_waiters`
+and `preempt_defer_logged` — were never on the original list. Counting them
+as part of it is what made an unbalanced ledger look balanced.
 
 Spawn-and-reap answers all of those structurally. Nothing is abandoned while a
 client is still asking for it, because the superseded encoder keeps serving its
