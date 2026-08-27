@@ -4664,7 +4664,9 @@ mod tests {
             video_encoder: "libx264".into(),
             start_ms: play_ms - ENCODE_LEAD_SEGMENTS * SEGMENT_MS,
             play_start_ms: play_ms,
-            landed_ms: play_ms,
+            // Not the answer: the assignment under test has to run for the
+            // assertion below to hold. Seeded to `play_ms` this pinned nothing.
+            landed_ms: 0,
             usable_extent_ms: None,
             duration_ms: 3_600_000,
             current_run_id: 0,
