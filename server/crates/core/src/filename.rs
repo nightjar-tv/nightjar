@@ -630,6 +630,95 @@ const GROUP_METADATA: &[&str] = &[
 /// Returns `None` unless the name really is a run: at least three groups, and
 /// nothing alphanumeric outside them. The 25,043-file dogfood library holds no
 /// name of this shape, so the rule is measured on the corpus alone.
+/// A **trailing run** of bracket groups ends the title.
+///
+/// `Series_Title_2_[01]_[AniLibria_TV]_[WEBRip_1080p]` — from `[01]` to the end
+/// there is nothing but groups and the separators between them, so none of it
+/// is title. `One Series (1017-1088) (WEB 1080p)` is the same shape in
+/// parentheses.
+///
+/// **The test is position, not content.** No vocabulary: the rule never asks
+/// what a group *says*, only whether anything outside the run does. That is why
+/// it can cut `[AniLibria TV]`, a release group nobody has listed, without a
+/// list.
+///
+/// **What keeps a title's own brackets:** something alphanumeric after them.
+/// `(500) Days of Summer (2009) Bluray-1080p` has words after both groups, so
+/// neither opens a trailing run. **The input this does cut wrongly is a title
+/// whose last word is parenthesised and which carries nothing after it but
+/// tags** — `Birdman (or The Unexpected Virtue of Ignorance) [1080p]` loses the
+/// subtitle. The dogfood library holds two names of that shape and an `S/E`
+/// token cuts both before this rule is reached; a library without one would
+/// lose the parenthesis.
+///
+/// Parentheses as well as brackets, so [`bracket_groups`] is not reused —
+/// widening that would change [`bracket_run_title`]'s selection too.
+fn cut_at_trailing_bracket_run(s: &str) -> String {
+    // `(open, body_start, body_end, end)`. The body span is recorded while
+    // scanning rather than derived as `start + 1`: `【` is three bytes, and
+    // slicing at `start + 1` panics inside it.
+    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '(' | '【' => open = Some((i, i + c.len_utf8())),
+            ']' | ')' | '】' => {
+                if let Some((start, body_start)) = open.take() {
+                    groups.push((start, body_start, i, i + c.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (k, &(start, body_start, body_end, _)) in groups.iter().enumerate() {
+        let body = &s[body_start..body_end];
+        // **A four-digit run in the year range is a year**, the guard
+        // [`cut_at_absolute_episode`], [`cut_at_episode_marker`] and
+        // [`find_season_episode`] all already carry. A year is not release
+        // metadata, so it cannot open the run — `Series Title [2022] [S25E13]`
+        // keeps its year, and the 27 corpus cases whose expected title keeps a
+        // parenthesised year keep theirs for the same reason.
+        let is_year = body.len() == 4
+            && body
+                .parse::<i32>()
+                .is_ok_and(|y| (1900..=2100).contains(&y));
+        if is_year || !is_group_metadata(body) {
+            continue;
+        }
+        // **The group that opens the run must say nothing.** Position alone
+        // eats a title's own parenthesis: `Series E (Series J) (Season 04)
+        // [1080p]` wants `Series E (Series J)`, and four corpus cases are that
+        // shape. Judged by [`is_group_metadata`] — every alphanumeric word a
+        // known tag or a bare number — the same predicate the bracket-run
+        // selection uses. Still no new vocabulary; the list is asked about a
+        // different span.
+
+        // Everything from this opener to the end, with the remaining groups
+        // removed, must carry nothing alphanumeric.
+        let mut rest = String::new();
+        let mut cursor = start;
+        for &(gs, _, _, ge) in &groups[k..] {
+            if gs >= cursor {
+                rest.push_str(&s[cursor..gs]);
+                cursor = ge;
+            }
+        }
+        rest.push_str(&s[cursor..]);
+        if rest.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let head = s[..start].trim().trim_matches([' ', '-', '_', '.']).trim();
+        // The same guard every other terminator carries: a head with no letter
+        // is not a title, and cutting to empty is what makes the caller
+        // substitute the raw stem.
+        if head.chars().any(char::is_alphabetic) {
+            return head.to_string();
+        }
+        break;
+    }
+    s.to_string()
+}
+
 fn bracket_run_title(stem: &str) -> Option<String> {
     let groups = bracket_groups(stem);
     if groups.len() < 3 {
@@ -929,7 +1018,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     if let Some((before, season, numbers)) = find_season_episode(&compact) {
         let title = run_title.clone().unwrap_or_else(|| {
             cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
-                &cut_at_date(&cut_at_title_junk(&cut_stem_at(stem, before))),
+                &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
+                    &cut_stem_at(stem, before),
+                ))),
             )))
         });
         // `None` is the declined-number case: the token said television and
@@ -976,9 +1067,9 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // the year branch, which would otherwise call a pack a movie.
     if let Some((before, season)) = find_bare_season(&normalized) {
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(&cut_at_title_junk(
-                &cut_stem_at(stem, before),
-            ))))
+            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
+                &cut_at_trailing_bracket_run(&cut_at_title_junk(&cut_stem_at(stem, before))),
+            )))
         });
         return ParsedName {
             title: if title.is_empty() {
@@ -1038,7 +1129,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     };
     let title = run_title.unwrap_or_else(|| {
         cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
-            &cut_at_date(&title),
+            &cut_at_date(&cut_at_trailing_bracket_run(&title)),
         )))
     });
 
@@ -1681,6 +1772,68 @@ mod tests {
     /// Four of the six real files affected bind correctly *only* because the
     /// folder year overrules this parse, which is why this lands before that
     /// precedence is touched.
+    /// A trailing run of bracket groups is not title.
+    #[test]
+    fn a_trailing_bracket_run_ends_the_title() {
+        for (name, title) in [
+            (
+                "Series_Title_2_[01]_[AniLibria_TV]_[WEBRip_1080p]",
+                "Series Title 2",
+            ),
+            (
+                "[HorribleSubs] Some Anime Show!! (01-25) [1080p] (Batch)",
+                "Some Anime Show!!",
+            ),
+            ("[HatSubs] One Series (1017-1088) (WEB 1080p)", "One Series"),
+            (
+                "[Moxie] One Series - The Country (892-916) (BD Remux 1080p AAC FLAC) [Dual Audio]",
+                "One Series - The Country",
+            ),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+    }
+
+    /// **The guards, each with the case that pays for it.** Negative controls:
+    /// delete a guard and one of these fails.
+    #[test]
+    fn a_trailing_bracket_run_keeps_a_title_that_owns_its_brackets() {
+        // Content: an unknown word in the group means it is not metadata.
+        assert_eq!(
+            parse_filename("[Judas] Series E (Series J) (Season 04) [1080p][HEVC x265 10bit]")
+                .title,
+            "Series E (Series J)"
+        );
+        // Year: a four-digit year is not metadata, so it cannot open the run.
+        assert_eq!(
+            parse_filename("Series Title [2022] [S25E13] [PL] [720p] [WEB-DL-CZRG] [x264]").title,
+            "Series Title [2022]"
+        );
+        // Position: words after the group mean there is no trailing run at all.
+        assert_eq!(
+            parse_filename("(500) Days of Summer (2009) Bluray-1080p.mkv").title,
+            "(500) Days of Summer"
+        );
+        // Head: nothing but groups leaves no title to end. `strip_leading_group`
+        // takes `[01]` first, so what reaches this rule is `[1080p]` — whose
+        // head is empty, so it declines rather than cutting to nothing. Cutting
+        // to empty is what makes the caller substitute the raw stem.
+        assert_eq!(parse_filename("[01] [1080p]").title, "[1080p]");
+    }
+
+    /// `【` is three bytes. Recording the body span while scanning rather than
+    /// deriving `start + 1` is what keeps this from panicking.
+    #[test]
+    fn a_trailing_bracket_run_is_char_boundary_safe() {
+        for name in [
+            "【动漫国字幕组】★01月新番[Anime Series Title～！][01][1080P][简体][MP4]",
+            "[星空字幕组] 剃须。然后捡到女高中生。 / Anime Series Title [05][1080p][简日内嵌]",
+            "【傲娇零】[刀剑神域 UnderWorld][17][GB]",
+        ] {
+            let _ = parse_filename(name);
+        }
+    }
+
     #[test]
     fn a_parenthesised_year_outranks_a_number_in_the_title() {
         for (name, title, year) in [
