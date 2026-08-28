@@ -995,6 +995,30 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     }
 
     let year = find_year(&normalized);
+    // **The date cut has to see the whole date.** `cut_at_date` needs all three
+    // tokens together — `13.02.2025`, `04.28.2014` — and the year cut below
+    // removes the last one first. By the time the chain below reached the date
+    // rule the date was already half gone, so `Series.Title.13.02.2025` kept
+    // `Series Title 13 02`. Running it on the uncut stem is the same rule in
+    // the same place in the chain; only what it is handed changes.
+    let dated = cut_at_date(stem);
+    if dated != stem {
+        let title = cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
+            &cut_at_title_junk(&clean_title(&dated)),
+        )));
+        return ParsedName {
+            title: if title.is_empty() {
+                stem.to_string()
+            } else {
+                title
+            },
+            kind: MediaKind::Movie,
+            year,
+            season: None,
+            episode: None,
+            episode_end: None,
+        };
+    }
     let title = match year {
         Some(y) => {
             let token = format!("({y})");
@@ -1907,14 +1931,22 @@ mod tests {
         let p = parse_filename("2020.A.Late.Talk.Show.2012.16.02.PDTV.XviD-C4TV.mkv");
         assert_eq!(p.title, "2020 A Late Talk Show");
 
-        // **Where this rule does *not* run, and why that is fine.** On the
-        // movie arm the year cut goes first, and a date contains a year — so
+        // **This expectation changed on 2026-08-28, because the behaviour is
+        // now right — not to make a change pass.** It read
+        // `"The Series US 25 02"`, and the comment above it read: *"Where this
+        // rule does not run, and why that is fine. On the movie arm the year
+        // cut goes first, and a date contains a year — so
         // `The_Series_US_25.02.2016_hdtv` is already cut at `2016` and never
         // reaches here. It leaves `25 02` behind, which is two groups and not
-        // a date; recovering those needs the year branch, not this one.
+        // a date; recovering those needs the year branch, not this one."*
+        //
+        // That described the defect accurately and then accepted it. The movie
+        // arm now runs the date cut on the uncut stem, before the year cut can
+        // take the third group away, so the date is whole when the rule sees
+        // it. Two corpus cases turn on this.
         assert_eq!(
             parse_filename("The_Series_US_25.02.2016_hdtv.x264.mp4").title,
-            "The Series US 25 02"
+            "The Series US"
         );
         // Mid-string and year-first, the year cut alone gets it right.
         assert_eq!(
