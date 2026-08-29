@@ -377,6 +377,151 @@ fn cut_at_date(s: &str) -> String {
     s.to_string()
 }
 
+/// Month names, three letters or spelled out. **A closed list, and the ordinal
+/// in front of it is what makes the list safe**: `May` is an ordinary English
+/// word and `Series May 2025` keeps its title, because only `5th May` reads as
+/// a date here.
+const MONTHS: &[&str] = &[
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
+];
+
+/// A date written as one token — `140722`, `20201013` — or written out —
+/// `5th Mar 2025`. Returns the title and the date's year.
+///
+/// **[`cut_at_date`] already ends a title at a date, but only at three separate
+/// numeric tokens** — `2011.01.10`, `13.02.2025`. A daily show whose date is
+/// one run, or spelled with a month, ran straight past it and the date stayed
+/// in the title.
+///
+/// **The cut and the year are one read.** The date carries a year, and three of
+/// the six corpus cases fail on `year` as well as `title`; deriving the year
+/// somewhere else from the same digits is how the two come to disagree.
+///
+/// ## The guards, and the case each one is paid for by
+///
+/// **Month and day are range-checked.** Six digits that are not a date are
+/// common — a CRC, a release id, an episode code. `1017-1088` is an absolute
+/// episode range and a loose rule read it as a date; the classifier that found
+/// this class made that mistake first.
+///
+/// **A four-digit year is 1900–2100**, the same range every other year guard in
+/// this file uses, which is what keeps CRCs out: `[97681524]` would be the year
+/// 9768 and `[34073169]` the year 3407.
+///
+/// **The head must hold a letter**, as in [`cut_at_date`] — a name that is only
+/// a date must keep itself, because the caller substitutes the whole stem for
+/// an empty title.
+///
+/// **And for the one-token form the head must be more than one word.** This is
+/// the guard the corpus paid for: `ror-240618_1007-1022-` parses correctly
+/// today, and `240618` is a valid date — 2024-06-18. It is a release id glued
+/// to a three-letter tag, and cutting there turns the title into `ror`. **A
+/// compact date behind a single short token is not a date.** The written form
+/// does not need this guard: `Series 5th Mar 2025` has a one-word head, and the
+/// ordinal plus the month name is already the evidence.
+fn cut_at_written_date(s: &str) -> (String, Option<i32>) {
+    let lower = s.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut toks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_token_boundary(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !is_token_boundary(bytes[i]) {
+            i += 1;
+        }
+        toks.push((start, i));
+    }
+    let text = |t: (usize, usize)| &lower[t.0..t.1];
+    let numeric = |t: (usize, usize)| bytes[t.0..t.1].iter().all(u8::is_ascii_digit);
+    let head_of = |at: usize| {
+        s[..at]
+            .trim()
+            .trim_matches([' ', '-', '_', '.'])
+            .trim()
+            .to_string()
+    };
+
+    for (n, &t) in toks.iter().enumerate() {
+        // The one-token form: `YYMMDD` or `YYYYMMDD`.
+        if numeric(t) {
+            let d = text(t);
+            let ymd = match d.len() {
+                8 => d[..4].parse::<i32>().ok().map(|y| (y, &d[4..6], &d[6..])),
+                6 => d[..2]
+                    .parse::<i32>()
+                    .ok()
+                    .map(|y| (2000 + y, &d[2..4], &d[4..])),
+                _ => None,
+            };
+            if let Some((year, m, day)) = ymd
+                && (1900..=2100).contains(&year)
+                && (1..=12).contains(&m.parse::<i32>().unwrap_or(0))
+                && (1..=31).contains(&day.parse::<i32>().unwrap_or(0))
+            {
+                let head = head_of(t.0);
+                let words = head
+                    .split([' ', '.', '_'])
+                    .filter(|w| !w.is_empty())
+                    .count();
+                if head.chars().any(char::is_alphabetic) && words > 1 {
+                    return (head, Some(year));
+                }
+            }
+        }
+        // The written form: `5th Mar 2025`, `23rd Feb 2024`.
+        // **Compared as bytes, not as a string slice.** A token may be CJK,
+        // and slicing it two bytes from the end lands inside a character and
+        // panics — the corpus crashed the first draft of this rule on
+        // `나는 SOLO`. `to_ascii_lowercase` preserves byte length, so these
+        // indices are the original stem's.
+        let tb = &bytes[t.0..t.1];
+        let ordinal = tb.len() >= 3
+            && tb[..tb.len() - 2].iter().all(u8::is_ascii_digit)
+            && matches!(&tb[tb.len() - 2..], b"st" | b"nd" | b"rd" | b"th");
+        if ordinal
+            && let Some(&month) = toks.get(n + 1)
+            && MONTHS.contains(&text(month))
+        {
+            let head = head_of(t.0);
+            if head.chars().any(char::is_alphabetic) {
+                let year = toks
+                    .get(n + 2)
+                    .filter(|&&y| numeric(y) && y.1 - y.0 == 4)
+                    .and_then(|&y| text(y).parse::<i32>().ok())
+                    .filter(|y| (1900..=2100).contains(y));
+                return (head, year);
+            }
+        }
+    }
+    (s.to_string(), None)
+}
+
 /// Season words this recognises, and only these. Each is one the corpus
 /// actually contains: `season` (23 occurrences), `temporada` (6), `stagione`
 /// (2), `saison` (1).
@@ -1226,7 +1371,16 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // rule the date was already half gone, so `Series.Title.13.02.2025` kept
     // `Series Title 13 02`. Running it on the uncut stem is the same rule in
     // the same place in the chain; only what it is handed changes.
-    let dated = cut_at_date(stem);
+    // **Two date forms, one arm.** `cut_at_date` reads three separate numeric
+    // tokens; `cut_at_written_date` reads a date written as one run or with a
+    // month name. The second also returns the date's year, and it is used only
+    // when the name gave no year of its own — a name that states its year
+    // states it, and the date must not overrule it.
+    let (dated, date_year) = match cut_at_date(stem) {
+        cut if cut != stem => (cut, None),
+        _ => cut_at_written_date(stem),
+    };
+    let year = year.or(date_year);
     if dated != stem {
         let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_title_junk(
             &clean_title(&dated),
@@ -1850,6 +2004,83 @@ mod tests {
             let without = parse_filename(name);
             assert_eq!(with.title, without.title, "folder overwrote {name:?}");
         }
+    }
+
+    /// **A date written as one run, or with a month, ends the title** — and
+    /// yields its year, because the two come out of the same digits.
+    #[test]
+    fn a_written_date_ends_the_title() {
+        for (name, title, year) in [
+            (
+                "A.Late.Talk.Show.140722.720p.HDTV.x264-YesTV",
+                "A Late Talk Show",
+                Some(2014),
+            ),
+            (
+                "A_Late_Talk_Show_140722_720p_HDTV_x264-YesTV",
+                "A Late Talk Show",
+                Some(2014),
+            ),
+            (
+                "Series and Title 20201013 Ep7432 [720p WebRip (x264)] [SUBS]",
+                "Series and Title",
+                Some(2020),
+            ),
+            ("Series 5th Mar 2025 1080 (Deep61)", "Series", Some(2025)),
+            ("Series 31st Jan 2025 1080 (Deep61)", "Series", Some(2025)),
+            ("Series 23rd Feb 2024 (Deep61)", "Series", Some(2024)),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.year, year, "the date carries the year: {name}");
+        }
+    }
+
+    /// **Every guard, and the name that pays for it.** Each line here parses
+    /// correctly today and would break without the guard beside it.
+    ///
+    /// **Negative controls, one guard each, and each line verified red when its
+    /// own guard alone is removed.** Four guards were claimed in the first
+    /// draft and only one of them had a test that could fail: the other three
+    /// were masked by the word-count rule declining first, or by the month
+    /// check catching what the year range was supposed to. **The heads below
+    /// are multi-word on purpose**, so the word rule cannot answer for a guard
+    /// that is not doing the work.
+    #[test]
+    fn a_number_that_is_not_a_date_is_not_cut() {
+        for (name, title) in [
+            // **Month/day range.** `100000` is six digits and `00` is not a
+            // month. The head is three words, so the word rule does not
+            // decline first and this line tests the range and nothing else.
+            (
+                "Some Long Title 100000 1080p x264",
+                "Some Long Title 100000",
+            ),
+            // **Year range, 1900–2100.** `35010115` reads as 3501-01-15: the
+            // month and the day are both valid, so the year range is the only
+            // guard standing between this and a cut.
+            ("Some Long Title 35010115 1080p", "Some Long Title 35010115"),
+            // **More than one word in the head.** `240618` is a real date —
+            // 2024-06-18 — and this is a release id glued to a three-letter
+            // tag. Cutting makes the title `ror`. This name parses correctly
+            // in the corpus today.
+            ("ror-240618_1007-1022-", "ror-240618 1007-1022"),
+            // **An ordinal in front of the month.** Without it, `May` alone
+            // ends the title and this becomes `Series`.
+            ("Series Title May 2025", "Series Title May"),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+        // The corpus's own eight-digit runs, which stay whole for the same
+        // reasons: the years 9768 and 3407 do not exist.
+        assert_eq!(
+            parse_filename("[MTBB] Kimi no Na wa. (2016) v2 [97681524].mkv").title,
+            "Kimi no Na wa"
+        );
+        assert_eq!(
+            parse_filename("[Impatience] Series - 0x01 [720p][34073169].mkv").title,
+            "Series"
+        );
     }
 
     /// **An unambiguous marker with no season claims the number, absolutely.**
