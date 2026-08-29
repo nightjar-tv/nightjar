@@ -1683,6 +1683,65 @@ fn has_episode_marker(s: &str) -> bool {
     false
 }
 
+/// A basename that **begins** with a one- or two-digit number:
+/// `01 Pilot (1080p HD).mkv`, `2 Honor Thy Developer.m4v`.
+///
+/// **This reads the number and decides nothing.** Whether it is an episode
+/// depends on where the file sits, which a basename cannot see —
+/// `nightjar_scanner::stored_parse` is the only caller, and it asks only for
+/// files inside a numbered season directory. **A first draft claimed it here,
+/// in the parser, and turned `12.Angry.Men.1080p.BluRay.x264-GRP.mkv` into
+/// episode 12** — a yearless film, and the sweep renders 360 names of that
+/// shape.
+///
+/// **The number is season-relative, not absolute.** A file numbered this way
+/// sits in a season directory and takes that season — which is why the flag
+/// this returns is `false` and `nightjar_scanner::stored_parse`'s walk is
+/// allowed to give it one.
+///
+/// ## Why this is not the blocked mechanism
+///
+/// **A bare three- or four-digit run cannot be split** — `H.264` reads as season
+/// 2 episode 64 — and `Cap.101` is only splittable because a word precedes it.
+/// **This rule separates by position, not vocabulary, which is weaker**, so the
+/// guards carry the whole weight and every one is measured:
+///
+/// **The run is anchored at the start.** Not a token boundary anywhere in the
+/// name: the very first byte. `tvs-amgo-dd51-dl-7p-azhd-x264-103` starts with a
+/// letter and `Movie.2018…H.264-NTG` starts with `M`, so neither is reachable.
+///
+/// **One or two digits, never three.** Three is the run this board keeps
+/// blocked.
+///
+/// **Nothing else may have claimed an episode.** 587 of the 597 dogfood
+/// basenames that begin this way are episodes that already carry `1x01` —
+/// `24 - 1x01 - 12-00 A.M.` — and the season/episode scan claims them long
+/// before this.
+///
+/// **A year in the name refuses it.** The other 10 are films: `65 (2023)`,
+/// `12 Angry Men (1957)`, `28 Days Later (2002)`. **`65` is the counterexample
+/// this rule would otherwise get wrong**, and it is a real library file, not a
+/// constructed one. The guard is `nightjar_scanner::stored_kind`'s sentence
+/// again — *"unless the basename asserts its own year, which no episode title
+/// does and every film does"*.
+///
+/// **Measured: of the 597, 10 have a year, 587 already claim, and 0 are left.**
+/// The two guards cover the whole real population.
+///
+/// Boundary combination, for comparison with its siblings: **left is the start
+/// of the name** — stricter than the token boundary `find_chapter_season_episode`
+/// and `episode_marker_cut` use — **width one to two**, **right not
+/// alphanumeric** as both of those, and **the number must be at least 1**,
+/// because episode 0 is refused everywhere else in this file.
+pub fn leading_episode_number(stem: &str) -> Option<i32> {
+    let b = stem.as_bytes();
+    let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    if !(1..=2).contains(&n) || b.get(n).is_none_or(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    stem[..n].parse::<i32>().ok().filter(|e| *e >= 1)
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
 ///
 /// ## A name that begins with a date
