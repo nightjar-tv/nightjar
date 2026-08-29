@@ -17,10 +17,10 @@ pub use walk::{
 };
 pub use watch::spawn_library_watcher;
 
-use nightjar_core::{MediaKind, parse_filename};
+use nightjar_core::MediaKind;
 use nightjar_db::{
-    Db, ItemPathRow, UpsertItem, fold_path, resolve_media_path, show_folder_relpath, to_relpath,
-    under_numbered_season_directory,
+    Db, ItemPathRow, UpsertItem, fold_path, resolve_media_path, season_number_for_path,
+    show_folder_relpath, to_relpath, under_numbered_season_directory,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -76,6 +76,84 @@ pub fn stored_title(parsed_title: String, stored: &str, library_root: &str) -> S
     } else {
         parsed_title
     }
+}
+
+/// The whole stored record for one file, from its path.
+///
+/// **One layer decides.** Until now the parser answered from a basename, the
+/// scanner overrode `kind` afterwards with [`stored_kind`], and
+/// `nightjar_core::parse_filename_in` had a third opinion nothing called. Three
+/// places, three answers, and eight corpus cases sat on the disagreement.
+///
+/// ## The reconciliation, as a rule rather than as control flow
+///
+/// | field | who decides | with what |
+/// |---|---|---|
+/// | season, episode, year | `parse_with_parent` | the basename and its **immediate parent**, by the precedence stated there |
+/// | title | the basename, then [`stored_title`] | **not the immediate parent** — that is often `Season 1`, and `stored_title` walks to the show folder |
+/// | `kind` | this function, via [`stored_kind`] | the **merged** record and the path, never the basename alone |
+/// | season, when still absent **and the record is an episode** | this function | `season_number_for_path`, which **walks** the path — `Show/Season 03/Extras/x.mkv` is season 3 |
+/// | title, when still empty | this function, via [`stored_title`] | the show folder's name |
+///
+/// **[`stored_kind`] is no longer an override.** It was applied to the parser's
+/// answer and could contradict it; it is applied to the merged record now, so
+/// there is one chain and one decision point. Its rule is unchanged and its
+/// tests are untouched — what changed is what it is handed.
+///
+/// **Both of the parser's blind spots are answered here** and nowhere else: a
+/// basename cannot tell whether it is an episode, and it cannot tell whether its
+/// number is absolute. This function sees the path, so it is the layer that can.
+///
+/// ## Why the walk stays here rather than moving into the merge
+///
+/// `nightjar_core` parses names and knows nothing about libraries or roots.
+/// `season_number_for_path` is a path rule and lives in `nightjar-db` with the
+/// rest of them. **The merge takes an immediate parent because that is a name;
+/// the walk stays with the layer that owns paths.**
+pub fn stored_parse(store_path: &str, library_root: &str) -> nightjar_core::ParsedName {
+    let unix = store_path.replace('\\', "/");
+    let base = unix.rsplit('/').next().unwrap_or(&unix).to_string();
+    let parent = unix.rsplit('/').nth(1).map(str::to_string);
+    let mut parsed = nightjar_core::parse_with_parent(&base, parent.as_deref());
+
+    // **The immediate parent must not name the show.** `parse_with_parent`
+    // fills an empty title from the directory beside the file, and that
+    // directory is often `Season 1`. [`stored_title`] walks past the
+    // season-directory tail to the show folder, which is the rule this scanner
+    // has always used, so the title is handed back to it. **Nothing in the
+    // 25,043-path library has an empty basename title, so the probe cannot see
+    // this** — a test is the only thing that can.
+    if nightjar_core::parse_filename(&base).title.is_empty() {
+        parsed.title.clear();
+    }
+
+    // **The walk answers what one parent name cannot.** `Season 16` on its own
+    // parses to no season — `find_bare_season` wants a letter in the head — and
+    // a file two directories below its season folder has no season in its
+    // parent at all. Three real library paths turn on the first and two on the
+    // second.
+    //
+    // **An absolute number still refuses it**, for the reason
+    // `ParsedName::episode_absolute` gives: the folder's season and a
+    // series-wide number are different schemes, and pairing them binds a slot
+    // that does not exist.
+    // **Kind first, then the season — in that order, and the order is the
+    // rule.** A season belongs to an episode. Filling it before the kind is
+    // settled put season 5 on four real films:
+    // `Futurama/Season 5/Futurama Bender's Big Score (2007).avi` and its three
+    // siblings, which `stored_kind` correctly keeps as films because they carry
+    // their own year. **`title_from_folder` names that exact file as the thing
+    // not to do**, in this file, and a first draft did it anyway.
+    parsed.kind = match stored_kind(parsed.kind, parsed.year, store_path, library_root) {
+        "episode" => MediaKind::Episode,
+        "movie" => MediaKind::Movie,
+        _ => parsed.kind,
+    };
+    if parsed.kind == MediaKind::Episode && parsed.season.is_none() && !parsed.episode_absolute {
+        parsed.season = season_number_for_path(store_path, library_root).map(|n| n as i32);
+    }
+    parsed.title = stored_title(parsed.title, store_path, library_root);
+    parsed
 }
 
 /// The kind the scanner stores for one file: the parsed kind, except that a
@@ -381,11 +459,6 @@ pub fn hint_ingest(
         .first()
         .map(|r| r.path.clone())
         .unwrap_or_else(|| rel.clone());
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| rel.clone());
-    let parsed = parse_filename(&file_name);
     let content_id = match nightjar_db::content_id_for_path(path) {
         Ok(id) => Some(id),
         Err(e) => {
@@ -397,12 +470,13 @@ pub fn hint_ingest(
             None
         }
     };
+    let parsed = stored_parse(&store_path, &library_root);
     let item = UpsertItem {
         path: store_path.clone(),
         mtime_ms,
         size_bytes,
-        title: stored_title(parsed.title, &store_path, &library_root),
-        kind: stored_kind(parsed.kind, parsed.year, &store_path, &library_root).to_string(),
+        title: parsed.title,
+        kind: parsed.kind.as_str().to_string(),
         year: parsed.year,
         season: parsed.season,
         episode: parsed.episode,
@@ -835,12 +909,6 @@ fn run_index_pass(
                         _ => rel.clone(),
                     };
                     let were_existing = matches!(other, Some([_]));
-                    let file_name = file
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| rel.clone());
-                    let parsed = parse_filename(&file_name);
                     let content_id = match nightjar_db::content_id_for_path(&file.path) {
                         Ok(id) => Some(id),
                         Err(e) => {
@@ -852,13 +920,13 @@ fn run_index_pass(
                             None
                         }
                     };
+                    let parsed = stored_parse(&store_path, &library_root);
                     pending_upserts.push(UpsertItem {
                         path: store_path.clone(),
                         mtime_ms: file.mtime_ms,
                         size_bytes: file.size_bytes,
-                        title: stored_title(parsed.title, &store_path, &library_root),
-                        kind: stored_kind(parsed.kind, parsed.year, &store_path, &library_root)
-                            .to_string(),
+                        title: parsed.title,
+                        kind: parsed.kind.as_str().to_string(),
                         year: parsed.year,
                         season: parsed.season,
                         episode: parsed.episode,
@@ -3784,7 +3852,7 @@ mod tests {
 
 #[cfg(test)]
 mod folder_title_tests {
-    use super::{stored_kind, stored_title, title_from_folder};
+    use super::{stored_kind, stored_parse, stored_title, title_from_folder};
     use nightjar_core::{MediaKind, parse_filename};
 
     /// The scanner is the layer that has the folder. `parse_filename` only
@@ -3828,6 +3896,130 @@ mod folder_title_tests {
     /// test had four of them and no positive-but-wrong case, and the rule it
     /// guarded was false for every film a library files under `Season N/`. The
     /// Futurama block below is that case, taken from the real library.
+    /// **The three paths this reconciliation exists for.** `16x00` makes
+    /// `find_season_episode` decline, so the basename parses as a movie with no
+    /// numbering; `stored_kind` calls it an episode because it sits under a
+    /// numbered season directory; and until now nothing gave it the season.
+    ///
+    /// **Negative control:** remove the walk in [`stored_parse`] and all three
+    /// lose their season.
+    #[test]
+    fn a_season_directory_supplies_the_season_an_episode_lacks() {
+        let root = "/media/TV";
+        for (path, season) in [
+            (
+                "Top Gear/Season 16/Top Gear - 16x00 -  The three wise men christmas special - 720p.mkv",
+                16,
+            ),
+            (
+                "Top Gear/Season 22/Top Gear - 22x00 - Special Patagonia Part One.mkv",
+                22,
+            ),
+            (
+                "Top Gear/Season 22/Top Gear - 22x00 - Special Patagonia Part Two.mkv",
+                22,
+            ),
+        ] {
+            let p = stored_parse(path, root);
+            assert_eq!(p.kind, MediaKind::Episode, "{path}");
+            assert_eq!(p.season, Some(season), "{path}");
+            assert_eq!(p.episode, None, "episode 0 stays refused: {path}");
+            // The title is untouched by this slice: the basename's own title
+            // is not empty, so `stored_title` leaves it alone.
+            assert!(p.title.starts_with("Top Gear"), "{path}");
+        }
+    }
+
+    /// **A film under a numbered season directory gets no season, and the order
+    /// of the two rules is what makes that true.**
+    ///
+    /// `stored_kind` keeps these as films because they carry their own year, and
+    /// **deciding the kind before filling the season is the whole guard** — a
+    /// first draft filled first and put season 5 on all four. `title_from_folder`
+    /// names the first of them as exactly the thing not to do.
+    ///
+    /// **Negative control:** move the season fill above the kind decision and
+    /// every line fails. **Every field the guard covers is asserted** — kind,
+    /// season and episode — because a guard applied to one field of a merged
+    /// record is not applied to the record.
+    #[test]
+    fn a_film_in_a_season_directory_gets_no_season() {
+        let root = "/media/TV";
+        for path in [
+            "Futurama/Season 5/Futurama Bender's Big Score (2007).avi",
+            "Futurama/Season 5/Futurama Bender's Game (2008).avi",
+            "Futurama/Season 5/Futurama Into the Wild Green Yonder (2009).avi",
+            "Futurama/Season 5/Futurama The Beast with a Billion Backs (2008).avi",
+        ] {
+            let p = stored_parse(path, root);
+            assert_eq!(p.kind, MediaKind::Movie, "{path}");
+            assert_eq!(p.season, None, "a season on a movie row: {path}");
+            assert_eq!(p.episode, None, "{path}");
+        }
+    }
+
+    /// **The walk reaches past a directory that is not a season directory** —
+    /// the shape a merge taking only the immediate parent cannot see. The two
+    /// real library paths of this shape carry their season in the basename, so
+    /// the first line asserts they are unaffected.
+    #[test]
+    fn the_walk_reaches_a_season_directory_that_is_not_the_parent() {
+        let root = "/media/TV";
+        let p = stored_parse(
+            "Show (2023)/Season 3/Show.S01E03.1080p.WEB.H264-CBFM/Sample/show.s01e03.1080p-sample.mkv",
+            root,
+        );
+        assert_eq!(
+            (p.season, p.episode),
+            (Some(1), Some(3)),
+            "the basename claims and wins"
+        );
+
+        // **The walk pops season directories, not arbitrary ones.** `Extras`
+        // and `Specials` it knows; a release directory it does not, and it
+        // stops there. That is `is_season_directory`'s rule and this slice does
+        // not widen it.
+        let q = stored_parse("Show (2023)/Season 3/Extras/whatever.mkv", root);
+        assert_eq!(q.kind, MediaKind::Episode);
+        assert_eq!(
+            q.season,
+            Some(3),
+            "the walk pops `Extras` and finds the season"
+        );
+
+        let r = stored_parse("Show (2023)/Season 3/Some Release Dir/whatever.mkv", root);
+        assert_eq!(
+            r.season, None,
+            "an unknown directory stops the walk, and it still does"
+        );
+    }
+
+    /// **An absolute number refuses the walked season, exactly as it refuses a
+    /// folder's.** `Season 2/Show - E56.mkv` is season 2 of the folder and
+    /// episode 56 of the series; pairing them binds a slot that does not exist.
+    ///
+    /// **Negative control:** drop `!parsed.episode_absolute` and the season
+    /// becomes `Some(2)`.
+    #[test]
+    fn an_absolute_number_refuses_the_walked_season() {
+        let p = stored_parse("Show/Season 2/Show - E56.mkv", "/media/TV");
+        assert!(p.episode_absolute);
+        assert_eq!(p.episode, Some(56));
+        assert_eq!(p.season, None, "different numbering schemes must not pair");
+    }
+
+    /// **`stored_title` and `stored_kind` still run, and on the merged record.**
+    #[test]
+    fn the_stored_record_still_borrows_the_folders_title() {
+        let p = stored_parse("Anon Show/Season 1/S01E04.mkv", "/media/TV");
+        assert_eq!(
+            p.title, "Anon Show",
+            "an empty title takes the show folder's name"
+        );
+        assert_eq!((p.season, p.episode), (Some(1), Some(4)));
+        assert_eq!(p.kind, MediaKind::Episode);
+    }
+
     #[test]
     fn a_numbered_season_directory_means_the_file_is_not_a_film() {
         use MediaKind::{Episode, Movie};
