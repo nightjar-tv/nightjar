@@ -90,6 +90,30 @@ const TITLE_JUNK: &[&str] = &[
     "extended",
     "truefrench",
     "imax",
+    // **Three anime production markers, added 2026-08-28.** `NCOP` and `NCED`
+    // are a non-credit opening and ending; `OVA` is an original video
+    // animation. Each earns one corpus case, and each appears in **no title
+    // anywhere in the available evidence** — zero of the corpus's title
+    // expectations, zero of the 25,043 dogfood `db_title`s, zero of its
+    // basenames.
+    //
+    // **The evidence is weaker than that count makes it sound**, and it is
+    // recorded here so the next reader does not overrate it. The parser sweep —
+    // the instrument most likely to catch a word that eats a title — renders
+    // **0 of its 74,624 names** containing any of the three, because it is
+    // built from the dogfood library and that library holds almost no anime.
+    // So two corpora agree and the third cannot see the question.
+    //
+    // **`v2` was measured with them and refused.** It earns two, more than any
+    // of these, and no title in either corpus contains it. But `V2: Escape from
+    // Hell` (2021) is a real film, and it survives this list only because the
+    // token leads the name and the empty-head guard returns the title whole —
+    // position, not the word boundary. `Operation V2 (2021)` becomes
+    // `Operation`. Two cases is a thin trade for a failure that can be
+    // demonstrated rather than only imagined.
+    "ncop",
+    "nced",
+    "ova",
 ];
 
 /// Cut a title at the first whole-word release-junk token.
@@ -1831,6 +1855,42 @@ mod tests {
             "【傲娇零】[刀剑神域 UnderWorld][17][GB]",
         ] {
             let _ = parse_filename(name);
+        }
+    }
+
+    /// Three anime production markers end a title.
+    #[test]
+    fn an_anime_production_marker_ends_the_title() {
+        for (name, title) in [
+            (
+                "[sam] Long Series - NCOP [BD 1080p FLAC] [BBC3BC68].mkv",
+                "Long Series",
+            ),
+            (
+                "[sam] Long Series - NCED [BD 1080p FLAC] [BBC3BC68].mkv",
+                "Long Series",
+            ),
+            (
+                "[Underwater] Another OVA - The Other -Karma- (BD 1080p) [3A561D0E].mkv",
+                "Another",
+            ),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+    }
+
+    /// **The word boundary is what makes these three safe**, and these are the
+    /// words that would break without it. Negative control: drop the
+    /// `left_ok`/`right_ok` check in `cut_at_title_junk` and every line fails.
+    #[test]
+    fn an_anime_marker_inside_a_word_is_not_a_marker() {
+        for (name, title) in [
+            ("Nova (2023) Bluray-1080p.mkv", "Nova"),
+            ("Casanova (2005) Bluray-1080p.mkv", "Casanova"),
+            ("Supernova (2020) Bluray-1080p.mkv", "Supernova"),
+            ("Ovation (2019) Bluray-1080p.mkv", "Ovation"),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
         }
     }
 
