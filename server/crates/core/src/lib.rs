@@ -7,8 +7,8 @@ mod scan_progress;
 mod track_select;
 
 pub use filename::{
-    FolderContext, MAX_EPISODE_RANGE, ParsedName, parse_filename, parse_filename_in,
-    parse_with_parent,
+    FolderContext, MAX_EPISODE_RANGE, ParsedName, leading_episode_number, parse_filename,
+    parse_filename_in, parse_with_parent,
 };
 pub use models::{LibraryKind, MediaKind, Role};
 pub use playback::{

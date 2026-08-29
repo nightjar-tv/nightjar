@@ -93,6 +93,7 @@ pub fn stored_title(parsed_title: String, stored: &str, library_root: &str) -> S
 /// | title | the basename, then [`stored_title`] | **not the immediate parent** — that is often `Season 1`, and `stored_title` walks to the show folder |
 /// | `kind` | this function, via [`stored_kind`] | the **merged** record and the path, never the basename alone |
 /// | season, when still absent **and the record is an episode** | this function | `season_number_for_path`, which **walks** the path — `Show/Season 03/Extras/x.mkv` is season 3 |
+/// | episode, when still absent **and a season is known** | this function | a leading one- or two-digit number in the basename |
 /// | title, when still empty | this function, via [`stored_title`] | the show folder's name |
 ///
 /// **[`stored_kind`] is no longer an override.** It was applied to the parser's
@@ -151,6 +152,33 @@ pub fn stored_parse(store_path: &str, library_root: &str) -> nightjar_core::Pars
     };
     if parsed.kind == MediaKind::Episode && parsed.season.is_none() && !parsed.episode_absolute {
         parsed.season = season_number_for_path(store_path, library_root).map(|n| n as i32);
+    }
+
+    // **A leading number is the episode, but only once a season is known.**
+    // `Season 01/01 Pilot (1080p HD).mkv` is episode 1, and the season above is
+    // what licenses the claim — evidence a basename cannot see.
+    //
+    // **`under_numbered_season_directory` was written here as well and
+    // removed.** Its control stayed green: `parsed.season.is_some()` refuses
+    // everything it refused, in every case there is. A guard whose control
+    // cannot fail is a comment, and this file has already dropped two on that
+    // basis.
+    //
+    // **A first draft put this in the parser and it was wrong there.** The
+    // sweep renders 360 names beginning with a one- or two-digit run, and
+    // `12.Angry.Men.1080p.BluRay.x264-GRP.mkv` — a yearless film — became
+    // episode 12. Nothing in a basename separates it from `01 Pilot`; the
+    // season directory does.
+    //
+    // The year guard rides along for the same reason it does everywhere else in
+    // this file: `65 (2023)` is a film even in a folder that looks televisual.
+    if parsed.kind == MediaKind::Episode
+        && parsed.episode.is_none()
+        && parsed.season.is_some()
+        && parsed.year.is_none()
+        && let Some(n) = nightjar_core::leading_episode_number(&base)
+    {
+        parsed.episode = Some(n);
     }
     parsed.title = stored_title(parsed.title, store_path, library_root);
     parsed
@@ -3928,6 +3956,89 @@ mod folder_title_tests {
             // is not empty, so `stored_title` leaves it alone.
             assert!(p.title.starts_with("Top Gear"), "{path}");
         }
+    }
+
+    /// **A leading number is the episode once a season is known.** The season
+    /// above the file is what licenses the claim, and it is evidence a basename
+    /// cannot see.
+    #[test]
+    fn a_leading_number_is_the_episode_in_a_season_directory() {
+        let root = "/media/TV";
+        for (path, season, episode) in [
+            ("Series/Season 01/01 Pilot (1080p HD).mkv", 1, 1),
+            ("Series/Season 01/1 Pilot (1080p HD).mkv", 1, 1),
+            ("Series/Season 1/02 Honor Thy Father (1080p HD).m4v", 1, 2),
+            ("Series/Season 1/2 Honor Thy Developer (1080p HD).m4v", 1, 2),
+        ] {
+            let p = stored_parse(path, root);
+            assert_eq!(p.kind, MediaKind::Episode, "{path}");
+            assert_eq!(
+                (p.season, p.episode),
+                (Some(season), Some(episode)),
+                "{path}"
+            );
+        }
+    }
+
+    /// **What the leading-number rule must not claim.**
+    ///
+    /// **Line 1 is the case a first draft got wrong.** The rule lived in the
+    /// parser, where a basename is all there is, and
+    /// `12.Angry.Men.1080p.BluRay.x264-GRP.mkv` — a yearless film — became
+    /// episode 12. **The parser sweep renders 360 names beginning with a one-
+    /// or two-digit run**, and nothing in a basename separates that from
+    /// `01 Pilot`. The season directory does, so the rule moved here.
+    ///
+    /// **Negative controls.** Remove the year condition and line 2 claims.
+    /// Remove the
+    /// `episode.is_none()` condition and line 3 is overwritten. Remove
+    /// `season.is_some()` and **both line 1 and line 4** claim — line 4 an
+    /// episode with no season at all, which is the path
+    /// `season_number_for_path`'s own doc predicts: a digit run too wide for a
+    /// `u32` is a season directory and is not a season number. **Every field
+    /// each guard covers is asserted** — kind, season and episode — because a
+    /// guard applied to one field of a merged record is not applied to the
+    /// record.
+    #[test]
+    fn a_leading_number_outside_a_season_directory_is_not_an_episode() {
+        let root = "/media";
+        // A yearless film, in a film's folder.
+        let p = stored_parse(
+            "Movies/12 Angry Men/12.Angry.Men.1080p.BluRay.x264-GRP.mkv",
+            root,
+        );
+        assert_eq!(p.kind, MediaKind::Movie);
+        assert_eq!((p.season, p.episode), (None, None));
+
+        // A film that asserts its own year, even inside a season directory.
+        let q = stored_parse("Series/Season 3/65 (2023) WEBDL-1080p.mkv", root);
+        assert_eq!(q.kind, MediaKind::Movie);
+        assert_eq!(
+            (q.season, q.episode),
+            (None, None),
+            "a year says film wherever it sits"
+        );
+
+        // A name that already claims keeps its own numbers.
+        let r = stored_parse("Series/Season 3/07 Show - 4x09 - Title.mkv", root);
+        assert_eq!(
+            (r.season, r.episode),
+            (Some(4), Some(9)),
+            "the basename's claim stands"
+        );
+
+        // **The one path where the two conditions diverge**, and
+        // `season_number_for_path`'s own doc predicts it: a digit run too wide
+        // for a `u32` **is** a season directory and **is not** a season number.
+        // Without `season.is_some()` this claims episode 5 with no season —
+        // a season-relative number and nothing to relate it to.
+        let w = stored_parse("Series/Season 99999999999999999999/05 Title.mkv", root);
+        assert_eq!(w.kind, MediaKind::Episode, "it is still a season directory");
+        assert_eq!(
+            (w.season, w.episode),
+            (None, None),
+            "and still not a season number"
+        );
     }
 
     /// **A film under a numbered season directory gets no season, and the order
