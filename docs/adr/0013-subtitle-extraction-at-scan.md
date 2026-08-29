@@ -3,7 +3,11 @@
 - Status: accepted; **§1 and §2 superseded 2026-08-06 by
   [ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md)**
   (probe-time classification and client/method-gated on-demand trigger,
-  replacing the unconditional scan-time enqueue below). §3–§12 stand.
+  replacing the unconditional scan-time enqueue below). §3–§12 stand, with
+  one exception marked in place: **§4's mtime/size validity stamps are
+  superseded by [ADR-0023](0023-cluster-map-byte-offset-start.md) §6**
+  (columns dropped in migration `019`; `subtitle_content_id` is the sole
+  stamp). Marker added 2026-08-30.
 - Date: 2026-07-26
 - Supersedes: ADR-0010 §7 (byte-capped subtitle cache and playback-time extract)
 
@@ -95,6 +99,23 @@ longer runs.
      different mtime or size sets `subtitle_status = pending` and the next
      extract overwrites the item directory. Stale filenames do not
      accumulate under a path-shaped key.
+
+     > **Superseded by [ADR-0023](0023-cluster-map-byte-offset-start.md) §6
+     > (amended 2026-08-07); marker added 2026-08-30.** Both columns are
+     > **dropped**, in migration `019_drop_subtitle_source_stamps.sql`.
+     > `subtitle_content_id` is the sole validity stamp for extracted
+     > subtitles, the same `content_id` every other derived artifact is
+     > keyed on. The rule is unchanged in kind — a changed source still
+     > sets `subtitle_status = pending` and the next extract overwrites —
+     > only what detects the change moved, from an mtime/size pair nothing
+     > read back to the fingerprint ADR-0023 §6 already owned.
+     >
+     > The marker is late by three weeks. This ADR's Status line says
+     > §3–§12 stand, ADR-0023 recorded the deletion in its own file, and
+     > nothing pointed here — so a reader opening the record that
+     > *established* the stamps found them presented as live. That gap is
+     > the failure Rule 6.1 asks a superseding change to close in the
+     > superseded ADR's own file.
    - Remove `NIGHTJAR_SUBS_CACHE_BYTES` and all LRU eviction. Keep a
      free-space check before extraction: refuse the job (leave `pending`,
      log clearly) when the data volume cannot hold a conservative minimum

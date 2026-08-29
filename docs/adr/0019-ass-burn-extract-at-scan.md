@@ -1,6 +1,9 @@
 # ADR-0019: ASS burn-in extract at scan time
 
-- Status: accepted
+- Status: accepted; **amendment §5's invalidation stamps superseded by
+  [ADR-0023](0023-cluster-map-byte-offset-start.md) §6** (columns dropped in
+  migration `019`; `subtitle_content_id` is the sole stamp) — marked in
+  place 2026-08-30
 - Date: 2026-07-30
 - Supersedes: ADR-0018 §5 session-dir ASS demux (playback-time extract)
 
@@ -114,6 +117,15 @@ does not constrain this shape. When it unparks, it uses this same store.
    `subtitle_source_mtime_ms` / `subtitle_source_size_bytes` on the item.
    Source mtime or size change → `subtitle_status = pending`, next extract
    overwrites `{trackId}.ass` in place. No mtime/hash in the filename.
+
+   > **Superseded by [ADR-0023](0023-cluster-map-byte-offset-start.md) §6
+   > (amended 2026-08-07); marker added 2026-08-30.** The two columns named
+   > above are dropped in migration `019_drop_subtitle_source_stamps.sql`;
+   > `subtitle_content_id` is the sole stamp. **"Same as WebVTT" still
+   > holds** and is the reason this item needs no rule of its own — it
+   > inherits whatever ADR-0013 §4 inherits, and that is now the
+   > `content_id` fingerprint. Burn `.ass` and soft `.vtt` share one store
+   > and one validity mechanism, which is what §6 below means by one store.
 
 6. **One store, confirmed.** Soft `.vtt` and burn `.ass` share
    `{NIGHTJAR_DATA_DIR}/subs/{itemId}/` and the extract worker. Item-level

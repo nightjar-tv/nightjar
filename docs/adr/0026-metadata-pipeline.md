@@ -34,6 +34,8 @@
   the prefix rule is unchanged because it was not the failure (§2)
 - Amended: 2026-08-13 — an entity with episodes but **no episode identity**
   is a distinct provider state from an entity with no episodes (§2)
+- Amended: 2026-08-30 — §2's method table reconciled against the strings
+  `match_score.rs` emits: one row renamed, three shipped rows added
 - Depends on: ADR-0025 (item identity / season-append episode ids)
 - Gate: Gate 3 — auto-match ≥95% correct; every mismatch fixable in-UI in
   under 30 seconds; API requests per 1,000 items published for first run and
@@ -96,7 +98,7 @@ the discrete method classes from the spike matcher:
 |---|---:|---|
 | `exact_title_year` (unique) | 0.98 | Normalised title hit and year match; one candidate |
 | `exact_title` (unique) | 0.90 | Title hit; no year on the file, one candidate |
-| `exact_title_empty_shell` | 0.72 | Sole title hit is a TMDB shell (`number_of_seasons` 0, episode count unknown) — never auto-match; a shell with `number_of_episodes` 0 is not a candidate at all (2026-08-13 amend, below) |
+| `exact_title_zero_seasons` | 0.72 | Sole title hit is a TMDB shell (`number_of_seasons` 0, episode count unknown) — never auto-match; a shell with `number_of_episodes` 0 is not a candidate at all (2026-08-13 amend, below) |
 | `exact_title_year` (multi) | 0.80 | Title+year hit; more than one candidate |
 | `exact_title` (multi) | 0.72 | Title hit; more than one candidate; **superseded for TV** by the collision pin below when a discriminator fires |
 | `exact_title_collision_unpinned` | 0.72 | Multi exact-title; no discriminator selected exactly one candidate |
@@ -106,6 +108,37 @@ the discrete method classes from the spike matcher:
 | `exact_title_episode_title` | 0.90 | Multi exact-title; reference episode name uniquely matched one candidate (ADR-0032; TV only) |
 | `exact_title_year_nearest` | 0.70 | Title hit; year present but no exact year row |
 | `top1_rank` | 0.45–0.65 | No exact title hit; took search ranking |
+
+> **Amended 2026-08-30 — this table had drifted from the string the scorer
+> emits, and was three classes short of it.**
+>
+> **The renamed row.** The row above read `exact_title_empty_shell` from this
+> ADR's first draft until now. `match_score.rs` emits
+> **`exact_title_zero_seasons`**, and has since the 2026-08-13 amend below
+> landed. The predicate function is still called `is_empty_shell`, which is why
+> the drift survived: a grep for the concept passes, and the string that
+> reaches logs, `match_method`, `BelowThreshold { method }` and the fix flow is
+> the one that did not match. The rule is unchanged — only the name this
+> document gave it was wrong.
+>
+> **The three missing rows.** These ship and score, and this table did not
+> carry them:
+>
+> | Method | Score | Meaning | Decided in |
+> |---|---:|---|---|
+> | `exact_title_episode_confirmed` | 0.90 | Multi exact-title; a fetched reference episode confirmed one candidate | [ADR-0032](0032-multi-exact-collision-order.md) |
+> | `exact_title_season_coverage` | 0.90 | Multi exact-title; the library's season coverage fits one candidate | [ADR-0047](0047-title-extension-admission-and-collision-evidence.md) |
+> | `exact_title_slots_explained` | 0.90 | Multi exact-title; one candidate explains the folder's episode slots | [ADR-0047](0047-title-extension-admission-and-collision-evidence.md) |
+>
+> **Two of the three are decided only in a `proposed` ADR.** ADR-0047 is
+> `proposed` and its two classes are in the shipped scorer, so until that
+> status is settled the accepted register does not fully describe the scorer.
+> Recorded here rather than resolved: promoting an ADR is not this
+> amendment's call, and there is no documented rule for it to follow.
+>
+> **What did not change.** The floor stays 0.80, the collision pin below is
+> untouched, and no weight moved. This corrects what the table says, not what
+> the code does.
 
 **Auto-match only when confidence ≥ 0.80.** Below that the item stays
 unmatched and keeps its path `item_key`. Do not write a provider key for a

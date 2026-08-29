@@ -1,6 +1,9 @@
 # ADR-0053: Which layer decides a file's kind, once the parser can see its folder
 
-- Status: **proposed**
+- Status: **proposed**; amended 2026-08-30 — `#171` and `#172` answered the
+  Decision question in a shape none of options A–D lists, and option A's
+  seam is deliberately kept unwired on measured evidence (see the amendment
+  at the end)
 - Date: 2026-08-23
 - Supersedes: nothing
 - Amends: nothing yet — whichever option wins changes where ADR-0033's
@@ -216,3 +219,82 @@ turns them into episodes trades 2,024 correct bindings for a wrong kind, which
   this library*, never *not anywhere* — and no count here should be quoted from
   the dogfood database, whose 25,043 paths are a different population from the
   capture's 25,004.
+
+---
+
+## Amendment 2026-08-30 — the question was answered in code, and this record still posed it as open
+
+This section records what shipped. **It does not choose between the options
+above**, because the shipped chain is none of them and the one decision that
+looked open is settled elsewhere.
+
+### 1. What `#171` and `#172` landed
+
+`nightjar_scanner::stored_parse` (`scanner/src/lib.rs`) is now one chain for
+the scanner's two call sites, `hint_ingest` and `run_index_pass`. It merges
+the basename with its **immediate parent** through a new
+`nightjar_core::parse_with_parent`, then applies `stored_kind` to the
+**merged** record rather than as an override on the parser's answer, then
+fills a season by path walk and a title through `stored_title`.
+
+**One chain for the scanner, not for the product.** The third production
+caller is outside it: `nightjar_metadata::queue::EpisodeSlot::season_episodes`
+(`queue.rs:1696`) still calls `nightjar_core::parse_filename` on a bare
+basename, so it sees no parent, no path walk and no `stored_kind`. It re-parses
+only to recover an episode **span**, which is why it has survived unchanged —
+but it means "one layer decides the kind" is true of the scanner and not yet
+of the tree. The metadata plan's step 16 owns that signature change and names
+all three sites.
+
+**That is a fifth shape.** It is not A (nothing moved), not B (the kind did
+not move down into the parser), not C (`FolderContext` was not handed a
+decided kind), and not D (no filename grammar moved up into the scanner).
+What actually changed is narrower than any of them and is the thing all four
+were circling: `stored_kind` stopped being an override that could contradict
+the parser, and became the last step of one chain. Its rule is unchanged and
+its tests are untouched — what changed is what it is handed.
+
+Both are step 16's pieces 1 and 2 in the metadata plan, which records that
+they moved no rate on purpose: **no shipped harness passes a parent**, so a
+scanner-level change is invisible to all three instruments and each reports
+it as "no effect" rather than "cannot see."
+
+### 2. The shipped chain is named in no ADR, and that is why this is a finding
+
+Neither `stored_parse` nor `parse_with_parent` appears in any ADR, accepted or
+proposed. The decision this record exists to make was taken in a pull request
+and the record kept asking the question — the mirror of an ADR describing code
+that has been deleted, and the same defect: **the register stopped describing
+the tree.**
+
+### 3. The seam is deliberately kept unwired, on measured evidence
+
+Option A said that if nothing moved, `parse_filename_in` "is then dead code
+and should be deleted rather than left as an invitation." Nothing moved
+*through it* — its only callers are still `nightjar-core`'s own tests — and it
+was not deleted. **That is not neglect, and A did not anticipate the reason.**
+
+The metadata plan decided it on 2026-08-28: the seam was built to a premise
+the corpus does not contain. `kind == Episode` with `season == None` occurs
+**0 times across 738 parses**, because the parser calls a name with no season a
+movie, so the season rule it exists for can never fire. Fourteen of the
+twenty-three failures it was meant to serve need the *episode*, which sits in
+the parent folder name, and `FolderContext` carries no episode. Wiring it
+earns zero cases **even given a perfect folder walk**.
+
+So the third outcome is: **keep it, unwired, measured at zero, and do not wire
+it.** The plan states the trap in as many words — *"the seam already exists" is
+exactly the argument that would get it wired.* Recording that here is the
+point of this amendment, because this ADR is where someone will look before
+touching it, and option A as written invites the opposite conclusion.
+
+### 4. What is still open
+
+The population option A leaves at 0.0% is not closed by any of this. Step 16's
+piece 3 is outstanding, its rule lives in the parser rather than the scanner,
+and it is therefore the piece the shipped harness *can* see. The
+`NN - ` episode-number rule named above stays unspecified for the same reason
+it always was.
+
+**Status is unchanged.** This record stays `proposed`: promoting it is not
+this amendment's call, and there is no documented rule for it to follow.
