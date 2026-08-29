@@ -1764,7 +1764,73 @@ pub fn leading_episode_number(stem: &str) -> Option<i32> {
 /// evidence anywhere** — no passing name of this shape exists in any
 /// instrument, so nothing could have contradicted this rule even if it were
 /// wrong. One instrument can see the question and two cannot.
+/// A season marker **at the end of a title** loses its leading zero:
+/// `Anime-Series Title S02` is `Anime-Series Title S2`.
+///
+/// **A season number is a number, and `02` and `2` are the same one.** Eight
+/// corpus cases carry the marker into the title and want it unpadded, all of
+/// them anime whose season is part of the series name.
+///
+/// ## Trailing only, and that is the whole scope
+///
+/// **Searched the way every rule here is searched.** A zero-padded season
+/// marker appears in **one** corpus title expectation and **one** of the 25,043
+/// dogfood `db_title`s:
+///
+/// | | ends with `S0N` | contains `S0N` anywhere |
+/// |---|---:|---:|
+/// | corpus title expectations | 1 | 1 |
+/// | dogfood `db_title`s | **0** | 1 |
+///
+/// The dogfood one is `Red Dwarf S09 Back to Earth DC 1080p BluRay HEVC…` — a
+/// whole release name that became a title, with `S09` **in the middle**.
+/// **Folding anywhere in a title would rewrite it; folding only at the end
+/// leaves it alone**, and nothing measured wants the middle folded.
+///
+/// The corpus one is `Series Title S03`, which is an *expectation* rather than
+/// a produced title: that case fails today because the marker is cut away
+/// entirely, so this rule never sees it.
+///
+/// **`Season 03`, `Temporada 02` and `Cap.` are excluded.** No case needs them,
+/// and each would be its own vocabulary with its own search.
+fn fold_padded_season(title: &str) -> String {
+    let b = title.as_bytes();
+    let end = title.trim_end().len();
+    let mut i = end;
+    while i > 0 && b[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    // `S`, then a zero: `S02`, `S012`. **A two-digit minimum was written here
+    // and removed** — its control stayed green, because `Show S0` rebuilds
+    // identically anyway when the zeros are stripped and nothing is left. A
+    // guard whose control cannot fail is a comment, and this file has now
+    // dropped three on that basis.
+    if end == i || b[i] != b'0' || i == 0 || !b[i - 1].eq_ignore_ascii_case(&b'S') {
+        return title.to_string();
+    }
+    let s = i - 1;
+    if s > 0 && b[s - 1].is_ascii_alphanumeric() {
+        return title.to_string();
+    }
+    let digits = title[i..end].trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    format!(
+        "{}{}{}{}",
+        &title[..s],
+        &title[s..s + 1],
+        digits,
+        &title[end..]
+    )
+}
+
 pub fn parse_filename(file_name: &str) -> ParsedName {
+    let mut parsed = parse_filename_unfolded(file_name);
+    // **One place, because every arm builds a title and none of them owns it.**
+    parsed.title = fold_padded_season(&parsed.title);
+    parsed
+}
+
+fn parse_filename_unfolded(file_name: &str) -> ParsedName {
     let whole = strip_extension(file_name);
     if let Some((end, year)) = leading_date(whole) {
         let rest = whole[end..].trim_matches([' ', '-', '_', '.']);
@@ -2669,6 +2735,72 @@ mod tests {
             p.season, None,
             "the parent states no season a bare `Season 2` can give"
         );
+    }
+
+    /// **A season marker at the end of a title loses its leading zero.** These
+    /// eight are the corpus cases that carry the marker into the title, all of
+    /// them anime whose season is part of the series name.
+    #[test]
+    fn a_trailing_season_marker_is_unpadded() {
+        for (name, title) in [
+            (
+                "[Lilith-Raws] Anime-Series Title S02 - 11 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4].mp4",
+                "Anime-Series Title S2",
+            ),
+            (
+                "[Skymoon-Raws] Anime-Series Title S02 - 01 [ViuTV][CHT][WEB-DL][1080p][AVC AAC][MP4+ASS]",
+                "Anime-Series Title S2",
+            ),
+            (
+                "[UHA-WINGS][Anime-Series Title S02][01][x264 1080p][CHT].mp4",
+                "Anime-Series Title S2",
+            ),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+        assert_eq!(
+            fold_padded_season("Anime-Series Title S04"),
+            "Anime-Series Title S4"
+        );
+        assert_eq!(
+            fold_padded_season("Anime-Series Title S012"),
+            "Anime-Series Title S12"
+        );
+    }
+
+    /// **What the fold must not touch**, one guard per line.
+    ///
+    /// **Negative controls.** Remove the trailing anchor and line 1 is
+    /// rewritten mid-title — that is `Red Dwarf S09 Back to Earth …`, a real
+    /// `db_title` in the 25,043-file library and the only one that carries a
+    /// padded marker at all. Remove the preceding-character check and line 2
+    /// folds. Remove the two-digit minimum and line 3 folds.
+    ///
+    /// **The fields are asserted, not just the title**: a fold that moved a
+    /// season or an episode would be a different rule, and a guard applied to
+    /// one field of a record is not applied to the record.
+    #[test]
+    fn the_fold_touches_only_a_trailing_marker() {
+        for (input, out) in [
+            // Mid-title, and a real library title.
+            (
+                "Red Dwarf S09 Back to Earth DC 1080p",
+                "Red Dwarf S09 Back to Earth DC 1080p",
+            ),
+            // `S` glued to a word is not a season marker.
+            ("Show XS03", "Show XS03"),
+            // `S0` alone is not a season.
+            ("Show S0", "Show S0"),
+            // Already unpadded.
+            ("Show S2", "Show S2"),
+        ] {
+            assert_eq!(fold_padded_season(input), out, "{input}");
+        }
+        let p =
+            parse_filename("[Lilith-Raws] Anime-Series Title S02 - 11 [Baha][WEB-DL][1080p].mp4");
+        assert_eq!(p.season, None, "the fold moves no season");
+        assert_eq!(p.episode, None, "and no episode");
+        assert_eq!(p.year, None);
     }
 
     /// **A chapter number holds the season and the episode.** `Cap.101` is
