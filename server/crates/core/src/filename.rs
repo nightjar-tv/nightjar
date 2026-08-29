@@ -1280,9 +1280,149 @@ pub fn parse_filename_in(file_name: &str, ctx: FolderContext<'_>) -> ParsedName 
     parsed
 }
 
+/// A date at the very start of the name, **written year first**.
+///
+/// Returns where it ends and the year it states.
+///
+/// **Year first, and that is the guard.** `2011.01.10`, `20161024`, `221208`
+/// all lead with the year, which is why they lead at all — a date written on
+/// the front of a filename is there to sort. **`20-1.2014.S02E01` is not one**:
+/// it is day-day-year, and it is a real title, `20-1`, followed by its year.
+/// A previous attempt read it as 20 January 2014 and lost the case. The file
+/// names the same hazard one show along — `9-1-1`, whose name offers
+/// `1 1 2018` as a perfectly good date — and `9` is not a four-digit year, so
+/// this rule declines it too.
+///
+/// **This does not touch [`cut_at_date`]'s head-has-a-letter guard**, which is
+/// doing two jobs and is left doing both. This rule is anchored at the start,
+/// so there is no head to judge.
+fn leading_date(s: &str) -> Option<(usize, i32)> {
+    let b = s.as_bytes();
+    let digits = |from: usize, n: usize| {
+        (from + n <= b.len() && b[from..from + n].iter().all(u8::is_ascii_digit))
+            .then(|| s[from..from + n].parse::<i32>().unwrap_or(-1))
+    };
+    let ok = |y: i32, m: i32, d: i32| {
+        (1900..=2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)
+    };
+    let ends = |at: usize| at >= b.len() || !b[at].is_ascii_alphanumeric();
+
+    // `20161024`, then `221208`. One token, no separators.
+    if let (Some(y), Some(m), Some(d)) = (digits(0, 4), digits(4, 2), digits(6, 2))
+        && ok(y, m, d)
+        && ends(8)
+    {
+        return Some((8, y));
+    }
+    if let (Some(yy), Some(m), Some(d)) = (digits(0, 2), digits(2, 2), digits(4, 2))
+        && ok(2000 + yy, m, d)
+        && ends(6)
+    {
+        return Some((6, 2000 + yy));
+    }
+    // `2011.01.10`, `2018-11-14`, `2019 08 20`. Three tokens, year first.
+    let sep = |at: usize| at < b.len() && matches!(b[at], b' ' | b'.' | b'_' | b'-');
+    if let (Some(y), Some(m), Some(d)) = (digits(0, 4), digits(5, 2), digits(8, 2))
+        && sep(4)
+        && sep(7)
+        && ok(y, m, d)
+        && ends(10)
+    {
+        return Some((10, y));
+    }
+    None
+}
+
+/// Whether the name marks an episode **with a word or a hash**, rather than
+/// with a bare number.
+///
+/// `ep34`, `E56`, `Episode 5`, `#17`. **`21x41` and `2009x09` are deliberately
+/// not this**: they are season-by-episode tokens, and counting them puts
+/// `20161024- Exotic Payback.21x41_720` on the wrong side of the rule below.
+///
+/// **`#NN` is here because one case needed it and the board already knew it.**
+/// `221205 ABC123 17研究所！ #17` wants a title and marks its episode with a
+/// hash; with only the lettered spellings the rule gets it wrong. `#957` is
+/// recorded elsewhere in this corpus as the same spelling, so the hash is a
+/// convention this evidence already contains rather than one fitted to a case.
+fn has_episode_marker(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    for i in 0..b.len() {
+        if i > 0 && !is_token_boundary(b[i - 1]) {
+            continue;
+        }
+        let mut j = i;
+        if b[i] == b'#' {
+            j += 1;
+        } else if b[i] == b'e' {
+            j += 1;
+            for w in ["pisodes", "pisodio", "pisode", "pisodi", "p"] {
+                if lower[j..].starts_with(w) {
+                    j += w.len();
+                    break;
+                }
+            }
+            if j < b.len() && matches!(b[j], b' ' | b'.' | b'_') {
+                j += 1;
+            }
+        } else {
+            continue;
+        }
+        let start = j;
+        while j < b.len() && b[j].is_ascii_digit() && j - start < 4 {
+            j += 1;
+        }
+        if j > start && (j >= b.len() || !b[j].is_ascii_alphanumeric()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse a media filename (not a full path) into title / kind / episode fields.
+///
+/// ## A name that begins with a date
+///
+/// **The episode marker decides what the date is.** A date on the front of a
+/// name is either a stamp in front of a title — `221208 ABC123 Series Title
+/// ep34` — or the whole name, with the series title living in the folder —
+/// `2011.01.10 - A Late Talk Show`. **Position cannot tell them apart**; both
+/// are `<date> <words>`. A marker behind the date can: a name that says which
+/// episode it is has a title in front of that, and a name that says nothing
+/// but a date has none.
+///
+/// Measured over every applicable corpus case beginning with a date, passing
+/// and failing alike: **12 of 12, none wrong.**
+///
+/// **This is unrefuted, not proven safe, and the difference is not small
+/// here.** Zero of the parser sweep's 74,624 generated names and zero of the
+/// 25,043 dogfood basenames begin with a date at all, and every one of the 12
+/// corpus cases is one the parser gets wrong today. **There is no negative
+/// evidence anywhere** — no passing name of this shape exists in any
+/// instrument, so nothing could have contradicted this rule even if it were
+/// wrong. One instrument can see the question and two cannot.
 pub fn parse_filename(file_name: &str) -> ParsedName {
     let whole = strip_extension(file_name);
+    if let Some((end, year)) = leading_date(whole) {
+        let rest = whole[end..].trim_matches([' ', '-', '_', '.']);
+        if has_episode_marker(rest) {
+            // A stamp. The title is what follows it, parsed as any other name.
+            return parse_stem(rest);
+        }
+        // The date is the name. The title is absent, and the scanner's
+        // `stored_title` gives the file its show folder's name — it does that
+        // for any file, not only an episode. The date's year still stands,
+        // and it is the only year such a name has.
+        let mut parsed = parse_stem(whole);
+        parsed.title.clear();
+        parsed.year = parsed.year.or(Some(year));
+        return parsed;
+    }
+    parse_stem(whole)
+}
+
+fn parse_stem(whole: &str) -> ParsedName {
     // A name that is nothing but bracket groups has no text outside them for a
     // terminator to cut at, so its title is selected from the groups rather
     // than derived by cutting.
@@ -2003,6 +2143,92 @@ mod tests {
             let with = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
             let without = parse_filename(name);
             assert_eq!(with.title, without.title, "folder overwrote {name:?}");
+        }
+    }
+
+    /// **A date on the front of a name, with an episode marker behind it, is a
+    /// stamp.** The title is what follows the date, and the marker still claims
+    /// its episode.
+    #[test]
+    fn a_leading_date_with_a_marker_is_a_stamp() {
+        for (name, title) in [
+            (
+                "221208 ABC123 Series Title ep34[1080p60 H264].mp4",
+                "ABC123 Series Title",
+            ),
+            (
+                "221201 Series Title! ABC123 ep219[720p.h264].mp4",
+                "Series Title! ABC123",
+            ),
+            ("221206 Series Title! ep08(Tanaka Miku).ts", "Series Title!"),
+            ("210810 ABC123 Series Title ep05.mp4", "ABC123 Series Title"),
+            ("221204 乃木坂工事中 ep389.mp4", "乃木坂工事中"),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
+        }
+        // The episode behind the stamp survives being stripped of it.
+        assert_eq!(
+            parse_filename("221208 ABC123 Series Title ep34[1080p60 H264].mp4").episode,
+            Some(34)
+        );
+    }
+
+    /// **A date on the front with no marker behind it is the whole name.** The
+    /// title is absent and the folder names the show — `stored_title` does that
+    /// for any file, not only an episode. The date's year still stands.
+    #[test]
+    fn a_leading_date_with_no_marker_leaves_no_title() {
+        for (name, year) in [
+            ("2011.01.10 - A Late Talk Show- HD TV.mkv", 2011),
+            ("2011.03.13 - A Late Talk Show - HD TV.mkv", 2011),
+            ("2018-11-14.1080.all.mp4", 2018),
+            ("2019_08_20_1080_all.mp4", 2019),
+            ("20161024- Exotic Payback.21x41_720.mkv", 2016),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, "", "{name}");
+            assert_eq!(
+                p.year,
+                Some(year),
+                "the date is the only year such a name has: {name}"
+            );
+        }
+        // And the numbering behind it is untouched.
+        let p = parse_filename("20161024- Exotic Payback.21x41_720.mkv");
+        assert_eq!((p.season, p.episode), (Some(21), Some(41)));
+    }
+
+    /// **What the leading-date rule must not take**, one guard per line.
+    ///
+    /// **Negative controls.** Make `has_episode_marker` return false and line 1
+    /// loses its title and its episode. Remove the 1900–2100 year range and
+    /// line 2 goes titleless; the month/day ranges, line 3; the
+    /// not-followed-by-alphanumeric check, line 4.
+    ///
+    /// **Lines 5 and 6 pin the shape rather than a clause.** The rule matches a
+    /// **year-first** date only, so a day-first one never reaches it — widen it
+    /// to accept day-day-year and both fail. `20-1.2014` is a real corpus case
+    /// that a previous attempt read as 20 January 2014, and `9-1-1` is the
+    /// hazard this file already names for `cut_at_date`.
+    #[test]
+    fn a_leading_run_that_is_not_a_date_keeps_its_title() {
+        for (name, title) in [
+            // A stamp needs a marker; without one this is the whole name.
+            (
+                "221208 ABC123 Series Title ep34[1080p60 H264].mp4",
+                "ABC123 Series Title",
+            ),
+            // The year 3501 does not exist.
+            ("35010115 Some Show 1080p", "35010115 Some Show"),
+            // Day 99 is not a day.
+            ("20251399 Some Show 1080p", "20251399 Some Show"),
+            // Nine digits is not an eight-digit date with something after it.
+            ("202510155 Some Show", "202510155 Some Show"),
+            // **Day first is a title, not a date.**
+            ("20-1.2014.S02E01.720p.HDTV.x264-CROOKS", "20-1 2014"),
+            ("9-1-1.2018.01.03.HDTV.x264", "9-1-1"),
+        ] {
+            assert_eq!(parse_filename(name).title, title, "{name}");
         }
     }
 
