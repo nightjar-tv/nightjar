@@ -1355,9 +1355,169 @@ pub struct FolderContext<'a> {
     pub season: Option<i32>,
 }
 
+/// Parse a basename **and** the directory it sits in, and merge the two.
+///
+/// A parsed parent is the same problem as a parsed basename, so it is the same
+/// function: two [`ParsedName`]s and a stated precedence, rather than a context
+/// type that grows a field every time a directory turns out to say something
+/// new. **[`parse_filename_in`] is the version that grew fields, and this
+/// supersedes it** — see the note there.
+///
+/// ## The precedence, as a table
+///
+/// | field | winner | why |
+/// |---|---|---|
+/// | `season` | the basename if it claims one **or asserts a year**, else the parent | the name nearest the file is the more specific statement, and a year says "film" |
+/// | `episode` | the basename if it claims one **or asserts a year**, else the parent | the same reason |
+/// | `episode_end` | whichever supplied the `episode` | a range belongs to the claim it came with, never half of one |
+/// | `title` | the basename if it is not empty, else the parent | this is [`parse_filename_in`]'s rule 1, unchanged |
+/// | `year` | the basename if it has one, else the parent | |
+/// | `kind` | [`merged_kind`] decides from the pair | a basename cannot settle it; see below |
+/// | `episode_absolute` | [`merged_absolute`] decides from the pair | a basename cannot settle it either |
+///
+/// **The table is here rather than in the order of the `if`s below** because a
+/// precedence that exists only as control flow has had to be reverse-engineered
+/// from this file three times.
+///
+/// ## Two facts a basename cannot settle
+///
+/// **`kind`.** `01 Pilot (1080p HD).mkv` is a movie to a rule that sees only the
+/// basename, and it genuinely reads like one. `nightjar_scanner::stored_kind`
+/// knows better because it sees the path. **The merge sees both, so the merge
+/// owns the answer** — and it must reach `stored_kind`'s, not a second one.
+/// That reconciliation is its own piece of work; [`merged_kind`] is where it
+/// goes, so that piece is a placement rather than a rewrite.
+///
+/// **`episode_absolute`.** `01. Title - Episode 1` is marked absolute because a
+/// marker with no season *looks* absolute to a rule that can only see the
+/// basename. Inside `Season 2/` it is season-relative, and the parent is what
+/// says so. **The flag is not wrong to consult — it is wrong for that file**,
+/// and only the pair can tell. [`merged_absolute`] is where that is decided,
+/// and it keeps today's answer deliberately: see its own note.
+///
+/// ## Unwired, and the corpus cannot see it
+///
+/// **Nothing calls this yet**, and the reduced Sonarr/Radarr corpus hands its
+/// harness a basename, so **no corpus figure moves when this lands**. What it
+/// would earn is measured separately and stated as a projection, never as the
+/// rate.
+pub fn parse_with_parent(file_name: &str, parent: Option<&str>) -> ParsedName {
+    let base = parse_filename(file_name);
+    let Some(parent) = parent.map(str::trim).filter(|p| !p.is_empty()) else {
+        return base;
+    };
+    let above = parse_filename(parent);
+
+    // `season` and `episode` move together: taking a season from one parse and
+    // an episode from the other pairs two numbering schemes, which is the bind
+    // this whole seam exists to avoid.
+    let (season, episode, episode_end) =
+        if base.season.is_some() || base.episode.is_some() || base.year.is_some() {
+            // **A basename that asserts its own year does not inherit numbering.**
+            // `Some Show - 1x02 - The Episode [SDTV]/Some Film (2019).mkv` is the
+            // input this merge otherwise gets wrong: a film in a directory named
+            // for an episode takes that episode's numbers, keeps its own year, and
+            // becomes an episode.
+            //
+            // **The guard is `nightjar_scanner::stored_kind`'s, reused rather than
+            // invented** — it promotes a movie under a numbered season directory
+            // *"unless the basename asserts its own year, which no episode title
+            // does and every film does"*. The same sentence answers the same
+            // question here.
+            //
+            // **It costs nothing measured**: none of the ten corpus cases a parsed
+            // parent earns carries a year, and 0 of the 25,043 dogfood paths have a
+            // silent basename under a claiming parent at all.
+            (base.season, base.episode, base.episode_end)
+        } else {
+            (above.season, above.episode, above.episode_end)
+        };
+    let title = if base.title.is_empty() {
+        above.title.clone()
+    } else {
+        base.title.clone()
+    };
+    ParsedName {
+        kind: merged_kind(&base, &above, season, episode),
+        episode_absolute: merged_absolute(&base, &above, season),
+        title,
+        year: base.year.or(above.year),
+        season,
+        episode,
+        episode_end,
+    }
+}
+
+/// What the pair says the file is.
+///
+/// **Today's rule, stated so it can be changed in one place.** Either parse
+/// saying television is enough, and a merged season-and-episode says it too.
+///
+/// **This is where the reconciliation with `nightjar_scanner::stored_kind`
+/// goes.** That function promotes a no-year movie under a numbered season
+/// directory to an episode, because it sees the path; this sees the same path
+/// and must agree with it rather than answer separately. **Until it does, the
+/// two layers can still disagree** — eight corpus cases sit on that
+/// disagreement, and they are not this function's to fix yet.
+fn merged_kind(
+    base: &ParsedName,
+    above: &ParsedName,
+    season: Option<i32>,
+    episode: Option<i32>,
+) -> MediaKind {
+    // **A basename that asserts its own year is a film, whatever the parent
+    // is.** The same guard as the precedence above, and for the same reason —
+    // `stored_kind`'s *"unless the basename asserts its own year, which no
+    // episode title does and every film does"*. Without it a film in a
+    // directory named for an episode kept its own year and no numbering and
+    // still came out an episode: the guard protected the numbers and left the
+    // kind behind.
+    if base.kind != MediaKind::Episode && base.year.is_some() {
+        return base.kind;
+    }
+    if base.kind == MediaKind::Episode
+        || above.kind == MediaKind::Episode
+        || (season.is_some() && episode.is_some())
+    {
+        MediaKind::Episode
+    } else {
+        base.kind
+    }
+}
+
+/// Whether the merged episode number is a series-wide one.
+///
+/// **Today's answer, kept deliberately**: the basename's flag stands, and a
+/// number that came from the parent is season-relative because the parent
+/// stated a season beside it.
+///
+/// **What is not decided here.** `Season 2/01. Title - Episode 1` is marked
+/// absolute by the basename rule and the corpus wants it paired with the
+/// folder's season; `Season 2/Show - E56.mkv` is the constructed hazard that
+/// must not pair. **One real case says pair and one constructed case says do
+/// not**, and choosing between them is the kind decision's work, not this
+/// slice's. **The point of this function is that it is one line to change when
+/// that is settled**, rather than a rule spread through the merge.
+fn merged_absolute(base: &ParsedName, above: &ParsedName, season: Option<i32>) -> bool {
+    if base.season.is_some() || base.episode.is_some() {
+        base.episode_absolute
+    } else if season.is_some() && season == above.season {
+        above.episode_absolute
+    } else {
+        base.episode_absolute
+    }
+}
+
 /// [`parse_filename`], then let the folder answer what the basename did not.
 ///
-/// **Additive and unwired.** Nothing in the product calls this yet; the three
+/// **Superseded 2026-08-29 by [`parse_with_parent`].** A parsed parent is the
+/// same problem as a parsed basename, and this type answers it by growing a
+/// field per question — a second, weaker parser for directories. **It is left
+/// in place rather than deleted** because its removal touches its own tests and
+/// nothing else, so it is a deletion with its own diff and not part of the
+/// merge's.
+///
+/// **Additive and unwired.** Nothing in the product calls this either; the three
 /// production call sites still use [`parse_filename`]. It exists so the seam can
 /// be reviewed on its own, before anything moves through it.
 ///
@@ -2320,6 +2480,136 @@ mod tests {
             let without = parse_filename(name);
             assert_eq!(with.title, without.title, "folder overwrote {name:?}");
         }
+    }
+
+    /// **A parsed parent answers what the basename does not.** These ten are
+    /// the corpus cases whose numbering lives in the directory; the basename
+    /// gives nothing at all.
+    #[test]
+    fn a_parsed_parent_supplies_the_numbering() {
+        for (parent, base, season, episode) in [
+            ("Series - 10x11 - Title [SDTV]", "1011 - Title.avi", 10, 11),
+            (
+                "Series Title - 10x12 - 24 Hours of Development [SDTV]",
+                "1012 - Hours of Development.avi",
+                10,
+                12,
+            ),
+            // Two files in one episode directory, and both inherit. The corpus
+            // asks for exactly that.
+            (
+                "Series Title - 10x12 - 24 Hours of Development [SDTV]",
+                "Hours of Development.avi",
+                10,
+                12,
+            ),
+            ("Series.Title.S01E01.720p.HDTV", "tbbt101.avi", 1, 1),
+            (
+                "Series.Title.S01E01.720p.HDTV",
+                "ajifajjjeaeaeqwer_eppj.avi",
+                1,
+                1,
+            ),
+            (
+                "Series.Title.S02E19.720p.BluRay.x264-SiNNERS-RP",
+                "ba27283b17c00d01193eacc.mkv",
+                2,
+                19,
+            ),
+        ] {
+            let p = parse_with_parent(base, Some(parent));
+            assert_eq!(
+                (p.season, p.episode),
+                (Some(season), Some(episode)),
+                "{parent} / {base}"
+            );
+            assert_eq!(p.kind, MediaKind::Episode, "{parent} / {base}");
+        }
+    }
+
+    /// **The precedence, asserted rather than described.** The basename is the
+    /// nearer statement and wins every field it makes one about.
+    #[test]
+    fn the_basename_outranks_the_parent() {
+        let p = parse_with_parent("Show.S03E04.1080p.mkv", Some("Show - 10x11 - Title [SDTV]"));
+        assert_eq!(
+            (p.season, p.episode),
+            (Some(3), Some(4)),
+            "the basename claims, so it wins"
+        );
+        // A title only comes from the parent when the basename has none.
+        let q = parse_with_parent("S01E01.mkv", Some("Some Show - 1x02 - Title"));
+        assert_eq!(
+            q.title, "Some Show",
+            "an empty basename title takes the parent's"
+        );
+        let r = parse_with_parent("Some Show S01E01.mkv", Some("Other Name - 1x02 - Title"));
+        assert_eq!(r.title, "Some Show", "a basename title stands");
+        // No parent is the old answer, exactly.
+        let s = parse_with_parent("Show.S03E04.1080p.mkv", None);
+        assert_eq!(parse_filename("Show.S03E04.1080p.mkv").season, s.season);
+        assert_eq!(
+            parse_with_parent("Show.S03E04.1080p.mkv", Some("   ")).season,
+            s.season
+        );
+    }
+
+    /// **What the merge must not take**, one guard per line.
+    ///
+    /// **Negative controls.** Remove `base.year.is_some()` from the precedence
+    /// and line 1 inherits its parent's episode. Take the season and the
+    /// episode from different parses and line 2 pairs two numbering schemes.
+    /// Prefer the parent over the basename and line 3 breaks.
+    #[test]
+    fn a_film_does_not_inherit_its_folders_episode() {
+        // **A film in a directory named for an episode.** It asserts its own
+        // year, which no episode title does and every film does.
+        let p = parse_with_parent(
+            "Some Film (2019) Bluray-1080p.mkv",
+            Some("Some Show - 1x02 - The Episode [SDTV]"),
+        );
+        assert_eq!((p.season, p.episode), (None, None));
+        assert_eq!(p.kind, MediaKind::Movie);
+        assert_eq!(p.year, Some(2019));
+
+        // **A season from one parse and an episode from the other is the bind
+        // this seam exists to avoid.** The basename claims a season alone, so
+        // the parent's episode must not join it.
+        let q = parse_with_parent("Show.S05.1080p.mkv", Some("Show - 10x11 - Title [SDTV]"));
+        assert_eq!((q.season, q.episode), (Some(5), None));
+
+        // The basename's own numbering is never overruled.
+        let r = parse_with_parent(
+            "Show - 2x02 - Title.mkv",
+            Some("Show - 10x11 - Title [SDTV]"),
+        );
+        assert_eq!((r.season, r.episode), (Some(2), Some(2)));
+    }
+
+    /// **An absolute number still refuses a parent's season, and that is piece
+    /// two's question rather than this one's.**
+    ///
+    /// `Season 2/01. Title - Episode 1` is marked absolute by a rule that sees
+    /// only the basename, and the corpus wants it paired with the folder's
+    /// season. `Season 2/Show - E56.mkv` is the constructed hazard that must
+    /// not pair. **One real case says pair and one constructed case says do
+    /// not.** This pins today's answer so the change is visible when it is
+    /// made.
+    #[test]
+    fn an_absolute_number_still_refuses_a_parents_season() {
+        let p = parse_with_parent(
+            "01. Total Series Action - Episode 1 - Monster Cash.mkv",
+            Some("Season 2"),
+        );
+        assert!(
+            parse_filename("01. Total Series Action - Episode 1 - Monster Cash.mkv")
+                .episode_absolute
+        );
+        assert_eq!(p.episode, Some(1));
+        assert_eq!(
+            p.season, None,
+            "the parent states no season a bare `Season 2` can give"
+        );
     }
 
     /// **A chapter number holds the season and the episode.** `Cap.101` is
