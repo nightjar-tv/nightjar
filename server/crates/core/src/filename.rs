@@ -14,6 +14,28 @@ pub struct ParsedName {
     /// Inclusive end when the basename encodes a contiguous range (`5x20-21`).
     /// `None` means a single episode (or not an episode).
     pub episode_end: Option<i32>,
+    /// **`episode` is an absolute number, not a season-relative one.**
+    ///
+    /// A release that marks an episode and gives no season — `E56`, `Ep06`,
+    /// `69. Bölüm` — is numbering the series end to end. `season` is `None`
+    /// beside it, and that pairing is a true statement about the filename:
+    /// *this episode, season unstated*. Synthesising `Some(1)` would be an
+    /// invention.
+    ///
+    /// **No consumer may pair this number with a season from anywhere else.**
+    /// A folder season is season-relative and this number is not, so
+    /// `Season 2/…E56….mkv` is not `(2, 56)` — it is a wrong bind that no
+    /// error reports. [`parse_filename_in`] is the one place that fills a
+    /// missing season, and it refuses when this flag is set.
+    ///
+    /// **Deliberately unconsumed.** Nothing resolves an absolute number to a
+    /// season yet; that is the episode-group question, and it is not this
+    /// field's job. `EpisodeSlot::season_episodes` in `nightjar-metadata`
+    /// already returns nothing without a season, so such a file reaches the
+    /// database and is not slotted. **The flag exists so the number cannot be
+    /// silently misread later, not because something reads it now** — do not
+    /// delete it as unused, and do not wire it to a guessed season.
+    pub episode_absolute: bool,
 }
 
 impl ParsedName {
@@ -544,6 +566,19 @@ fn has_spaced_dash_number(s: &str) -> bool {
 /// start at a separator, so `HEVC` and `EAC3` are untouched — the `e` in
 /// `HEVC` follows a letter, and the `a` after `EAC3`'s `E` is not a digit.
 fn cut_at_episode_marker(s: &str) -> String {
+    episode_marker_cut(s).0
+}
+
+/// [`cut_at_episode_marker`], and the number the marker carried.
+///
+/// **The cut and the claim are one rule, so they are one function.** The title
+/// ends where the marker begins, and the digits the marker names are the
+/// episode number — reading them twice with two rules is how the two drift
+/// apart. Callers that must not claim a number take `.0` through
+/// [`cut_at_episode_marker`] and are unchanged.
+///
+/// `None` means no marker fired, so the title is returned whole.
+fn episode_marker_cut(s: &str) -> (String, Option<i32>) {
     // `to_ascii_lowercase` and not `to_lowercase`: the fold must preserve byte
     // length, because `i` indexes `lower` and then slices `s`. A full Unicode
     // fold can change the length of a character and the two would drift apart.
@@ -580,7 +615,12 @@ fn cut_at_episode_marker(s: &str) -> String {
                         if end >= bytes.len() || !bytes[end].is_ascii_alphanumeric() {
                             let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
                             if head.chars().any(char::is_alphabetic) {
-                                return head.to_string();
+                                let number = if states_a_season(head) {
+                                    None
+                                } else {
+                                    lower[i..j].parse::<i32>().ok()
+                                };
+                                return (head.to_string(), number);
                             }
                         }
                     }
@@ -617,13 +657,71 @@ fn cut_at_episode_marker(s: &str) -> String {
             if (min_digits..=4).contains(&digits) && !bounded {
                 let head = s[..i].trim().trim_matches([' ', '-', '_', '.']).trim();
                 if head.chars().any(char::is_alphabetic) {
-                    return head.to_string();
+                    // **A span is not one episode.** `Ep01-12` and `E07-E08`
+                    // cover a range, and claiming the first number alone would
+                    // be a wrong claim where there was none — the failure mode
+                    // the differential sweep exists to catch. The title still
+                    // ends here; only the claim is refused.
+                    let number = if range_follows(bytes, j) || states_a_season(head) {
+                        None
+                    } else {
+                        lower[start..j].parse::<i32>().ok()
+                    };
+                    return (head.to_string(), number);
                 }
             }
         }
         i += 1;
     }
-    s.to_string()
+    (s.to_string(), None)
+}
+
+/// A second number behind the marker — `Ep01-12`, `E07-E08` — makes it a span.
+///
+/// The shape is a dash, an optional `e`, one to four digits, and no letter or
+/// digit behind them. **That last part is what keeps a resolution out of it**:
+/// `-720p` ends in a letter, so `kill-roy-was-here-e07-720p` is episode 7 and
+/// not a range, and the same check already guards the marker itself.
+fn range_follows(bytes: &[u8], mut j: usize) -> bool {
+    if j >= bytes.len() || bytes[j] != b'-' {
+        return false;
+    }
+    j += 1;
+    if j < bytes.len() && bytes[j] == b'e' {
+        j += 1;
+    }
+    let start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 4 {
+        j += 1;
+    }
+    j > start && (j >= bytes.len() || !bytes[j].is_ascii_alphanumeric())
+}
+
+/// **A name that states a season states one, whatever else it does.**
+///
+/// `Show.S01E00-E01` reaches the no-season arms only because episode 0 is
+/// refused, and the `-E01` behind it then looks exactly like a bare marker.
+/// Claiming it would produce `episode: 1, season: None` for a name whose own
+/// text says season 1 — an absolute number invented out of a declined parse.
+/// **A shipped test caught this**, which is why the guard reads the head rather
+/// than trusting that the season scan would have claimed the name already: the
+/// scan declines for reasons that have nothing to do with the season.
+fn states_a_season(head: &str) -> bool {
+    let lower = head.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b's' && (i == 0 || is_token_boundary(bytes[i - 1])) {
+            let mut j = i + 1;
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 4 {
+                j += 1;
+            }
+            if j > start {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Tokens that make a **bracket group** release metadata rather than a title.
@@ -1022,7 +1120,16 @@ pub fn parse_filename_in(file_name: &str, ctx: FolderContext<'_>) -> ParsedName 
     {
         parsed.title = folder.trim().to_string();
     }
-    if parsed.kind == MediaKind::Episode && parsed.season.is_none() {
+    // **An absolute number must never take the folder's season.** The folder
+    // says "season 2"; `E56` says "the fifty-sixth episode of the series". The
+    // two are different numbering schemes, so pairing them produces `(2, 56)`
+    // — a slot that does not exist, bound with no error and no way to tell it
+    // from a real one afterwards. See [`ParsedName::episode_absolute`].
+    //
+    // **This guard is written before the seam is wired**, deliberately. The
+    // seam is dead code today, and dead code is not a guard: whoever wires it
+    // would otherwise be the one to discover this, in bindings.
+    if parsed.kind == MediaKind::Episode && parsed.season.is_none() && !parsed.episode_absolute {
         parsed.season = ctx.season;
     }
     parsed
@@ -1083,6 +1190,8 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
             season: Some(season),
             episode,
             episode_end: end,
+            // The name carried a season, so the number is relative to it.
+            episode_absolute: false,
         };
     }
 
@@ -1106,6 +1215,7 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
             season: Some(season),
             episode: None,
             episode_end: None,
+            episode_absolute: false,
         };
     }
 
@@ -1118,20 +1228,22 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
     // the same place in the chain; only what it is handed changes.
     let dated = cut_at_date(stem);
     if dated != stem {
-        let title = cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
-            &cut_at_title_junk(&clean_title(&dated)),
+        let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_title_junk(
+            &clean_title(&dated),
         )));
+        let title = cut_at_unmatched_close(&marked);
         return ParsedName {
             title: if title.is_empty() {
                 stem.to_string()
             } else {
                 title
             },
-            kind: MediaKind::Movie,
+            kind: claimed_kind(MediaKind::Movie, absolute),
             year,
             season: None,
-            episode: None,
+            episode: absolute,
             episode_end: None,
+            episode_absolute: absolute.is_some(),
         };
     }
     let title = match year {
@@ -1151,11 +1263,10 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         }
         None => cut_at_title_junk(&clean_title(stem)),
     };
-    let title = run_title.unwrap_or_else(|| {
-        cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
-            &cut_at_date(&cut_at_trailing_bracket_run(&title)),
-        )))
-    });
+    let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_date(
+        &cut_at_trailing_bracket_run(&title),
+    )));
+    let title = run_title.unwrap_or_else(|| cut_at_unmatched_close(&marked));
 
     ParsedName {
         title: if title.is_empty() {
@@ -1163,11 +1274,30 @@ pub fn parse_filename(file_name: &str) -> ParsedName {
         } else {
             title
         },
-        kind: MediaKind::Movie,
+        kind: claimed_kind(MediaKind::Movie, absolute),
         year,
         season: None,
-        episode: None,
+        episode: absolute,
         episode_end: None,
+        episode_absolute: absolute.is_some(),
+    }
+}
+
+/// A claimed absolute number makes the file an episode.
+///
+/// **The marker is the statement.** `Anon Show E56` says episode as plainly as
+/// `S01E01` does; only the season is missing. Leaving `kind` at `Movie` while
+/// `episode` holds a number would file a television episode as a film and put
+/// an episode number on a movie row.
+///
+/// This is the same promotion `nightjar_scanner::stored_kind` already makes for
+/// a no-year movie under a numbered season directory — there the folder says
+/// television, here the filename does.
+fn claimed_kind(otherwise: MediaKind, absolute: Option<i32>) -> MediaKind {
+    if absolute.is_some() {
+        MediaKind::Episode
+    } else {
+        otherwise
     }
 }
 
@@ -1719,6 +1849,105 @@ mod tests {
             let with = parse_filename_in(name, ctx(Some("Some Show (2020)"), Some(1)));
             let without = parse_filename(name);
             assert_eq!(with.title, without.title, "folder overwrote {name:?}");
+        }
+    }
+
+    /// **An unambiguous marker with no season claims the number, absolutely.**
+    ///
+    /// `E56` says episode as plainly as `S01E01` does; only the season is
+    /// missing. `season: None, episode: Some(56)` is what the filename says.
+    /// Every one of these is a corpus case that this rule turns from failing to
+    /// passing, and each carries `episode_absolute` so no consumer can pair the
+    /// number with a season from somewhere else.
+    #[test]
+    fn an_unambiguous_marker_claims_an_absolute_episode() {
+        for (name, title, episode) in [
+            ("kill-roy-was-here-e07-720p", "kill-roy-was-here", 7),
+            (
+                "It's a Series Title.E56.190121.720p-NEXT.mp4",
+                "It's a Series Title",
+                56,
+            ),
+            ("Series.E191.190121.720p-NEXT.mp4", "Series", 191),
+            ("Anon Show Ep01 (D2201EC5).mkv", "Anon Show", 1),
+            ("Anon Show EP06 720p x265 GROUP.mp4", "Anon Show", 6),
+            ("The Movie Episode 5", "The Movie", 5),
+            ("Some Show 69. Bolum 720p", "Some Show", 69),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, title, "{name}");
+            assert_eq!(p.episode, Some(episode), "{name}");
+            assert_eq!(p.season, None, "a season must never be synthesised: {name}");
+            assert!(p.episode_absolute, "{name}");
+            assert_eq!(p.kind, MediaKind::Episode, "{name}");
+        }
+    }
+
+    /// **The claim is refused where the marker is not unambiguous.** These are
+    /// the shapes the rule must not take, and each one is a different guard:
+    /// one digit is a title word, a codec token is not a marker, and a marker
+    /// with no title in front of it names nothing.
+    ///
+    /// **Negative control:** the assertions below fail if the digit minimum,
+    /// the bound check or the alphabetic-head check is removed.
+    #[test]
+    fn an_ambiguous_marker_claims_nothing() {
+        for name in [
+            // One digit after a short marker — `E3` is as likely a title word.
+            "Some Movie E3 1080p",
+            // `HEVC` and `EAC3`: the `e` is inside a word, or the digits do not
+            // follow the marker.
+            "Movie Title 2019 1080p BluRay x264 HEVC-GROUP",
+            "Movie.Title.2019.1080p.WEB-DL.EAC3.5.1.x264-GRP",
+            // A four-digit run in the year range is a year, not an episode.
+            "Anon 2020 BLM Documentary",
+            // No title in front of the marker — the folder carries the title
+            // and there is nothing here to cut.
+            "E05.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.episode, None, "{name}");
+            assert!(!p.episode_absolute, "{name}");
+            assert_eq!(p.kind, MediaKind::Movie, "{name}");
+        }
+    }
+
+    /// **A name that carries its own season is not absolute.** The flag marks
+    /// series-wide numbering, and `S01E05` is season-relative, so the folder
+    /// fill below stays available to it exactly as before.
+    #[test]
+    fn a_season_bearing_name_is_not_absolute() {
+        let p = parse_filename("Series.Title.S01E05.1080p");
+        assert_eq!((p.season, p.episode), (Some(1), Some(5)));
+        assert!(!p.episode_absolute);
+    }
+
+    /// **The folder season must never reach an absolute number.**
+    ///
+    /// `Season 2/…E56….mkv` is season 2 of the folder and episode 56 of the
+    /// series. Pairing them gives `(2, 56)` — a slot that does not exist, bound
+    /// with no error raised and nothing afterwards to tell it from a real bind.
+    ///
+    /// **This is the negative control for the guard in `parse_filename_in`.**
+    /// Delete `&& !parsed.episode_absolute` there and every line here fails:
+    /// each name becomes `Some(2)`.
+    ///
+    /// The seam is unwired dead code today. The guard is written now precisely
+    /// because it is: whoever wires it would otherwise meet this in bindings
+    /// rather than in a test.
+    #[test]
+    fn the_folder_season_never_reaches_an_absolute_number() {
+        for name in [
+            "It's a Series Title.E56.190121.720p-NEXT.mp4",
+            "Anon Show Ep01 (D2201EC5).mkv",
+            "Some Show 69. Bolum 720p",
+        ] {
+            let p = parse_filename_in(name, ctx(Some("Some Show"), Some(2)));
+            assert!(p.episode_absolute, "{name}");
+            assert_eq!(
+                p.season, None,
+                "the folder season must not pair with an absolute number: {name}"
+            );
         }
     }
 
@@ -2632,26 +2861,45 @@ mod tests {
     /// the season/episode scan declines and the title used to run on through
     /// the marker and the episode title behind it.
     ///
-    /// The number itself is not parsed — it is an absolute episode number and
-    /// `ParsedName` has nowhere to put one.
+    /// **The number is now parsed, and it is marked absolute.** This test read:
+    ///
+    /// > *The number itself is not parsed — it is an absolute episode number
+    /// > and `ParsedName` has nowhere to put one.*
+    ///
+    /// The second half was false about the type: `season` and `episode` are
+    /// independent `Option`s and always were. What had nowhere to go was the
+    /// *fact that the number is absolute*, and `episode_absolute` is that
+    /// place. **The titles below are unchanged** — every one is the expectation
+    /// this test already asserted, and none was touched.
+    ///
+    /// The span keeps the old answer, for the old reason: one number cannot
+    /// stand for `Ep01-12`.
     #[test]
     fn a_bare_episode_marker_ends_the_title() {
-        for (name, title) in [
-            ("[Anon] Anon Show Ep01 (D2201EC5).mkv", "Anon Show"),
-            ("Anon Show EP06 720p x265 GROUP.mp4", "Anon Show"),
+        for (name, title, episode) in [
+            ("[Anon] Anon Show Ep01 (D2201EC5).mkv", "Anon Show", Some(1)),
+            ("Anon Show EP06 720p x265 GROUP.mp4", "Anon Show", Some(6)),
             (
                 "AnonShow.E1135.Ein.Titel.GERMAN.1080p.WEBRip.x264-Group",
                 "AnonShow",
+                Some(1135),
             ),
-            ("Anon_Show_e66_time_is_money_part_one", "Anon Show"),
+            (
+                "Anon_Show_e66_time_is_money_part_one",
+                "Anon Show",
+                Some(66),
+            ),
             (
                 "Anon.Show.Ep01-12.Complete.English.AC3.DL.1080p.BluRay.x264",
                 "Anon Show",
+                None,
             ),
         ] {
             let p = parse_filename(name);
             assert_eq!(p.title, title, "{name}");
-            assert_eq!(p.episode, None, "{name}");
+            assert_eq!(p.episode, episode, "{name}");
+            assert_eq!(p.season, None, "no season is ever synthesised: {name}");
+            assert_eq!(p.episode_absolute, episode.is_some(), "{name}");
         }
     }
 
