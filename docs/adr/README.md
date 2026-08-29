@@ -30,20 +30,20 @@ not here — this page is the reference, not the tour.
 | [0010](0010-text-subs-webvtt.md) | Text subtitle tracks as WebVTT sidecars | Partially superseded | — | §7 by [0013](0013-subtitle-extraction-at-scan.md) |
 | [0011](0011-remux-session-convergence.md) | Remux converges onto the session model | Accepted (amended 2026-08-25, fix (a)'s mechanism replaced by [0050](0050-lead-held-session-shape.md) §4-§5) | [0006](0006-phase2-remux-decision.md) (delivery decisions) | — |
 | [0012](0012-audio-downmix-and-track-selection.md) | Audio downmix and multi-track selection | Accepted | — | — |
-| [0013](0013-subtitle-extraction-at-scan.md) | Subtitle extraction at scan time | Partially superseded | [0010](0010-text-subs-webvtt.md) §7 | §1–§2 by [0041](0041-subtitle-classification-and-client-gated-extraction.md) (§3–§12 stand) |
+| [0013](0013-subtitle-extraction-at-scan.md) | Subtitle extraction at scan time | Partially superseded | [0010](0010-text-subs-webvtt.md) §7 | §1–§2 by [0041](0041-subtitle-classification-and-client-gated-extraction.md); §4 mtime/size stamps by [0023](0023-cluster-map-byte-offset-start.md) §6 (migration `019`) — rest of §3–§12 stand |
 | [0014](0014-library-availability.md) | Library availability and failure classification | Accepted | — | — |
 | [0015](0015-library-discovery-scheduling.md) | Library discovery scheduling | Accepted (amended 2026-08-03, 2026-08-04) | — | — |
 | [0016](0016-rejected-playlist-sole-authority.md) | Reject playlist-as-sole-authority seek rewrite | Accepted | — | — |
 | [0017](0017-desktop-safari-hlsjs.md) | Desktop Safari attaches with hls.js | Accepted | — | — |
 | [0018](0018-subtitle-burn-in.md) | Image and ASS subtitle burn-in | Partially superseded | — | §5 by [0019](0019-ass-burn-extract-at-scan.md) |
-| [0019](0019-ass-burn-extract-at-scan.md) | ASS burn-in extract at scan time | Accepted | [0018](0018-subtitle-burn-in.md) §5 | — |
+| [0019](0019-ass-burn-extract-at-scan.md) | ASS burn-in extract at scan time | Partially superseded | [0018](0018-subtitle-burn-in.md) §5 | amendment §5 invalidation stamps by [0023](0023-cluster-map-byte-offset-start.md) §6 (migration `019`) |
 | [0020](0020-copy-mode-segment-boundaries.md) | Producer-owned segment boundaries (time-keyed) | Partially superseded | — | §4 window listing by [0054](0054-full-title-playlist-for-transcode.md) for transcode only; copy and remux unchanged |
 | [0021](0021-client-architecture.md) | Client architecture (Flutter UI, per-platform engines) | Accepted (Apple engine closed 2026-08-06) | [0001](0001-client-platforms.md); prior Rule 2.4 wording | — |
 | [0022](0022-capability-profiles.md) | Client capability profiles (bitrate, resolution, HDR) | Accepted | — | — |
-| [0023](0023-cluster-map-byte-offset-start.md) | Keyframe map and byte-offset session start | Accepted (amended 2026-08-06) | — | — |
+| [0023](0023-cluster-map-byte-offset-start.md) | Keyframe map and byte-offset session start | Accepted (amended 2026-08-06, 2026-08-07) | [0013](0013-subtitle-extraction-at-scan.md) §4 and [0019](0019-ass-burn-extract-at-scan.md) §5 invalidation stamps (§6) | — |
 | [0024](0024-ranked-track-selection.md) | Ranked track selection | Accepted | — | — |
 | [0025](0025-item-identity.md) | Item identity | Accepted | — | — |
-| [0026](0026-metadata-pipeline.md) | Metadata pipeline | Partially superseded (amended 11×) | — | §8.4 item 3 by [0037](0037-kids-scoping-and-overrides.md) (in place) |
+| [0026](0026-metadata-pipeline.md) | Metadata pipeline | Partially superseded (amended 12×) | — | §8.4 item 3 by [0037](0037-kids-scoping-and-overrides.md) (in place) |
 | [0027](0027-artwork-pipeline.md) | Artwork pipeline | Accepted (amended 2026-08-04, 2026-08-10) | — | — |
 | [0028](0028-manual-metadata-fix.md) | Manual metadata fix | Accepted | — | — |
 | [0029](0029-canonical-metadata-and-item-links.md) | Canonical metadata store and file↔item links | Accepted (amended 2026-08-04, 2026-08-11) | — | — |
@@ -68,7 +68,7 @@ not here — this page is the reference, not the tour.
 | [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap; 2026-08-25, §5 measured vs inferred and the deletion ledger reconciled) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
 | [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
 | [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
-| [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** | — | — |
+| [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** (amended 2026-08-30 — `#171`/`#172` answered it in an unlisted shape; the seam stays unwired) | — | — |
 | [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** | [0020](0020-copy-mode-segment-boundaries.md) §4 for transcode only | — |
 
 ## Why the numbers jump from 0043 to 0046
@@ -102,9 +102,24 @@ number, and reading it alone would say 0044 and 0045 are free. They are not.
   still needs the warning.
 - **`—` in Supersedes/Superseded by** means exactly what it says: no
   relationship recorded either direction, not "not checked."
-- ADR-0002 is the one `Proposed` entry. See the note in `CONTRIBUTING.md`
-  and below — it is not sign-off debt, it is an open decision every ADR
-  that touches it (ADR-0034) correctly defers to rather than assumes.
+- **`Proposed` means the decision is open, not that the code is absent.**
+  Ten entries carry it: 0002, 0042, 0046, 0047, 0049, 0050, 0051, 0052,
+  0053 and 0054. Count them in the table above rather than from this
+  paragraph — it said "ADR-0002 is the one `Proposed` entry" from 2026-08-07
+  until 2026-08-30, and it was wrong about its own table for most of that
+  time. It also pointed at a note in `CONTRIBUTING.md` that does not exist;
+  that pointer is removed rather than replaced, because there is no
+  documented rule for when a `proposed` ADR becomes `accepted`.
+- **Three of the ten have shipped in whole or in part**, which is why the
+  status cannot be read as "not built": ADR-0052 shipped in `#153`
+  (migration `024` names it), most of ADR-0050 shipped across `#158`–`#162`,
+  and ADR-0053's question was answered by `#171`/`#172` in a shape that
+  record did not list, now marked in its own file. ADR-0047's two collision
+  classes are in the shipped scorer and are recorded nowhere accepted; see
+  [ADR-0026](0026-metadata-pipeline.md) §2's 2026-08-30 amendment.
+- ADR-0002 in particular is not sign-off debt: it is an open decision every
+  ADR that touches it (ADR-0034) correctly defers to rather than assumes.
+  See the section below.
 
 ## ADR-0001 and ADR-0002
 
