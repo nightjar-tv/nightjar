@@ -532,6 +532,149 @@ fn cut_at_written_date(s: &str) -> (String, Option<i32>) {
 /// a number after it, which is a measure of how ordinary it is inside a title.
 const SEASON_WORDS: &[&str] = &["season", "saison", "stagione", "temporada"];
 
+/// The Spanish chapter marker, and only this spelling.
+///
+/// **`cap` is a real English word and this list is safe because the digits are
+/// required.** Searched the way every word in this file is searched: `cap`
+/// appears **0 times in the corpus's title expectations, 0 times in the 25,043
+/// dogfood `db_title`s**, and **3 times in the dogfood basenames** — `Dad's Red
+/// Cap`, `The Cap Table`, `The Cap'n Toby Show`, all episode titles and **none
+/// of them followed by digits**. `Cap` followed by a number appears nowhere
+/// outside the nine cases this rule is for.
+const CHAPTER_WORDS: &[&str] = &["cap", "capitulo"];
+
+/// Episode words spelled out, for a name that already states its season.
+///
+/// **This list is dangerous and the guard is what makes it safe.** `Episode`
+/// followed by a number appears in **1,248 of the 25,043 dogfood basenames** —
+/// `30 Rock - 2x10 - Episode 210`, `A Discovery of Witches - 1x01 - Episode 1` —
+/// because a show whose episodes have no names gets "Episode N" as the episode
+/// *title*. Reading that as the episode number would be wrong 1,248 times.
+///
+/// **All 1,248 also carry a `NxNN` or `SxxExx` token**, so [`find_season_episode`]
+/// claims them and this rule is never reached. **It runs only in the bare-season
+/// arm, where a season is known and no episode has been claimed** — which is
+/// exactly the shape the 1,248 are not.
+const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo"];
+
+/// `Cap.101`, `Cap.1901`, `Cap. 408` — one run holding the season and the
+/// episode, behind a word that says so.
+///
+/// Returns `(token_start, season, episode)`. The last two digits are the
+/// episode and the rest is the season: `101` is season 1 episode 1, `1901` is
+/// season 19 episode 1, `408` is season 4 episode 8.
+///
+/// **The split is reachable only behind the marker, and that is the whole
+/// point.** Splitting a bare three- or four-digit run is the mechanism this
+/// board has blocked: `H.264` reads as season 2 episode 64, measured at 18
+/// gains against 15 regressions. **The word is what removes the ambiguity**, so
+/// the digits are never examined unless `cap` precedes them. A rule that also
+/// made a bare run splittable would have reopened that.
+///
+/// **The number wins over a season word.** `Series - Temporada 2 [Cap.1901]` is
+/// season 19, not season 2 — the corpus says so twice, in `Cap.1901` and
+/// `Cap.408`. So this runs before [`find_bare_season`].
+///
+/// **A range needs no guard, and one was written and removed.** `Cap.111_120`
+/// covers chapters 111 to 120, and the split reads it as season 1 episode 11 —
+/// **which is right**: it is the first chapter of the range, and the case still
+/// fails only because the *rest* of the range is missing. A guard declining
+/// spans would have thrown that away, and no corpus case spells one with a
+/// dash. **A guard with a demonstrable cost and no demonstrable case is not one
+/// to keep**, which is the reasoning `cut_at_date` already records for its own
+/// removed guard.
+///
+/// Boundary combination, stated so it can be compared with its siblings: **left
+/// is a token boundary, the digits may be separated from the word by one `.` or
+/// space, the width is exactly 3 or 4, the right boundary is
+/// not-alphanumeric, and the season part must be at least 1.** The left and
+/// right halves are [`episode_marker_cut`]'s and [`find_bare_season`]'s; the
+/// width floor of three and the season floor are this rule's own, because a
+/// two-digit run cannot hold both numbers.
+fn find_chapter_season_episode(normalized: &str) -> Option<(usize, i32, i32)> {
+    let lower = normalized.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    for i in 0..b.len() {
+        if i > 0 && !is_token_boundary(b[i - 1]) {
+            continue;
+        }
+        for w in CHAPTER_WORDS {
+            if !lower[i..].starts_with(w) {
+                continue;
+            }
+            // **At most two separators, because this runs on the normalised
+            // stem** where `.` and `_` are already spaces: `[Cap. 101]` arrives
+            // as `Cap  101`, two of them. Allowing one silently dropped that
+            // case — a corpus name, and the only one of the nine written with a
+            // space after the dot.
+            let mut j = i + w.len();
+            let sep_from = j;
+            while j < b.len() && matches!(b[j], b'.' | b' ' | b'_') && j - sep_from < 2 {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && b[j].is_ascii_digit() && j - start < 4 {
+                j += 1;
+            }
+            // **Three digits minimum, and the ceiling is not written here
+            // because it cannot be reached**: the loop above stops at four
+            // digits and the boundary check below refuses a fifth, so
+            // `Cap.10101` is already declined twice over. A redundant clause
+            // was written and removed rather than left to look load-bearing.
+            //
+            // **The floor is kept even though the season check would also
+            // catch a two-digit run** — with a width of two, the season slice
+            // is empty and `unwrap_or(0)` makes it season 0. That is an
+            // accident of parsing, not a rule, and a reader should be able to
+            // see why `Cap.10` is refused without tracing it.
+            if j - start < 3 {
+                continue;
+            }
+            if j < b.len() && b[j].is_ascii_alphanumeric() {
+                continue;
+            }
+            let season = lower[start..j - 2].parse::<i32>().unwrap_or(0);
+            let episode = lower[j - 2..j].parse::<i32>().unwrap_or(0);
+            if season >= 1 {
+                return Some((i, season, episode));
+            }
+        }
+    }
+    None
+}
+
+/// `Season 1 - Episode 01` — the episode word, for a name that already states
+/// its season and claims no episode.
+///
+/// See [`SPELLED_EPISODE_WORDS`] for why this may only be called from the
+/// bare-season arm.
+fn find_spelled_episode(normalized: &str) -> Option<i32> {
+    let lower = normalized.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    for i in 0..b.len() {
+        if i > 0 && !is_token_boundary(b[i - 1]) {
+            continue;
+        }
+        for w in SPELLED_EPISODE_WORDS {
+            if !lower[i..].starts_with(w) {
+                continue;
+            }
+            let mut j = i + w.len();
+            if j < b.len() && matches!(b[j], b'.' | b' ' | b'_') {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && b[j].is_ascii_digit() && j - start < 4 {
+                j += 1;
+            }
+            if j > start && !(j < b.len() && b[j].is_ascii_alphanumeric()) {
+                return lower[start..j].parse::<i32>().ok();
+            }
+        }
+    }
+    None
+}
+
 /// A season token carrying no episode — `Series.S01.720p`, `30 Series Season 04`.
 ///
 /// Returns `(token_start, season)`. A season pack is a real shape: 77 corpus
@@ -1483,6 +1626,37 @@ fn parse_stem(whole: &str) -> ParsedName {
     // A season token with no episode is a season pack. It runs after the
     // season/episode scan, which owns every name that carries both, and before
     // the year branch, which would otherwise call a pack a movie.
+    // **Before the season word, because the chapter number outranks it.**
+    // `Series - Temporada 2 [Cap.1901]` is season 19.
+    if let Some((chapter_at, season, episode)) = find_chapter_season_episode(&normalized) {
+        // **The title ends at whichever marker comes first.** These names carry
+        // both — `Series Title - Temporada 2 [HDTV 720p][Cap.1901]` — and the
+        // chapter number outranks the season word for the *numbering* while the
+        // season word still ends the *title*. Cutting at the chapter alone left
+        // `Temporada 2` in five titles, which `--diff` reported and no verdict
+        // did: every one of the five was already failing.
+        let before = find_bare_season(&normalized)
+            .map_or(chapter_at, |(season_at, _)| season_at.min(chapter_at));
+        let title = run_title.clone().unwrap_or_else(|| {
+            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
+                &cut_at_trailing_bracket_run(&cut_at_title_junk(&cut_stem_at(stem, before))),
+            )))
+        });
+        return ParsedName {
+            title: if title.is_empty() {
+                stem.to_string()
+            } else {
+                title
+            },
+            kind: MediaKind::Episode,
+            year: None,
+            season: Some(season),
+            episode: Some(episode),
+            episode_end: None,
+            episode_absolute: false,
+        };
+    }
+
     if let Some((before, season)) = find_bare_season(&normalized) {
         let title = run_title.clone().unwrap_or_else(|| {
             cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
@@ -1498,7 +1672,9 @@ fn parse_stem(whole: &str) -> ParsedName {
             kind: MediaKind::Episode,
             year: None,
             season: Some(season),
-            episode: None,
+            // **The season is known and no episode has been claimed**, which is
+            // the only place the spelled episode word is safe to read.
+            episode: find_spelled_episode(&normalized),
             episode_end: None,
             episode_absolute: false,
         };
@@ -2144,6 +2320,109 @@ mod tests {
             let without = parse_filename(name);
             assert_eq!(with.title, without.title, "folder overwrote {name:?}");
         }
+    }
+
+    /// **A chapter number holds the season and the episode.** `Cap.101` is
+    /// season 1 episode 1, `Cap.1901` is season 19 episode 1, `Cap.408` is
+    /// season 4 episode 8 — and the number outranks a season word beside it.
+    #[test]
+    fn a_chapter_number_carries_both_numbers() {
+        for (name, season, episode) in [
+            ("Series Title [HDTV 720p][Cap.101](website.com).mkv", 1, 1),
+            ("Series Title [HDTV][Cap.104](website.com).avi", 1, 4),
+            ("Series Title [HDTV][Cap.402](website.com).avi", 4, 2),
+            // **The chapter outranks `Temporada 2`.** The corpus says so twice.
+            (
+                "Series Title - Temporada 2 [HDTV 720p][Cap.1901][AC3 5.1 Castellano]",
+                19,
+                1,
+            ),
+            ("Series Title - Temporada 2 [HDTV 720p][Cap.408]", 4, 8),
+            // A space after the dot. This runs on the normalised stem, where
+            // the dot is already a space, so the separator run is two.
+            ("Series [HDTV 1080p][Cap. 101](wolfmax4k.com).mkv", 1, 1),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(
+                (p.season, p.episode),
+                (Some(season), Some(episode)),
+                "{name}"
+            );
+        }
+        // **The season word still ends the title**, even though the chapter
+        // number wins the numbering. Cutting at the chapter alone left
+        // `Temporada 2` in five titles.
+        assert_eq!(
+            parse_filename("Series Title - Temporada 2 [HDTV 720p][Cap.408]").title,
+            "Series Title"
+        );
+    }
+
+    /// **A spelled-out episode word, only where a season is known and no
+    /// episode has been claimed.**
+    #[test]
+    fn a_spelled_episode_word_is_read_beside_a_season() {
+        for (name, season, episode) in [
+            ("Series - Season 1 - Episode 01 (Resolution).avi", 1, 1),
+            ("Series Title Season 01 Episode 05 720p", 1, 5),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(
+                (p.season, p.episode),
+                (Some(season), Some(episode)),
+                "{name}"
+            );
+        }
+    }
+
+    /// **What these two rules must not take**, one guard per line.
+    ///
+    /// **Negative controls.** Make `CHAPTER_WORDS` match anything and lines 1
+    /// and 2 break — that is the guard keeping the run-splitting behind the
+    /// marker, and `H.264` is what it protects. Drop the 3–4 width and line 3
+    /// or 4 breaks; drop the season-at-least-one check and line 5; drop the
+    /// not-alphanumeric right boundary and line 6; shorten the separator run to
+    /// one and the `Cap. 101` case above fails. Call `find_spelled_episode`
+    /// outside the bare-season arm and lines 7 and 8 break — **1,248 dogfood
+    /// basenames have that shape.**
+    #[test]
+    fn a_number_without_its_marker_is_not_split() {
+        for (name, season, episode) in [
+            // **The blocked mechanism stays blocked.** A bare three- or
+            // four-digit run is not splittable; `H.264` would be season 2
+            // episode 64.
+            ("Movie.2018.1080p.AMZN.WEB-DL.DD5.1.H.264-NTG", None, None),
+            ("tvs-amgo-dd51-dl-7p-azhd-x264-103", None, None),
+            // Two digits cannot hold both numbers; five is not this shape.
+            ("Some Show [Cap.10]", None, None),
+            ("Some Show [Cap.10101]", None, None),
+            // Season 0 is not a chapter's season.
+            ("Some Show [Cap.001]", None, None),
+            // A letter behind the digits means the run is not the number.
+            ("Some Show [Cap.101x]", None, None),
+            // **`Episode NN` is an episode *title* in 1,248 library names.**
+            // Both of these already claim an episode, so the word is never
+            // reached and `210` is not read as the episode.
+            (
+                "30 Rock - 2x10 - Episode 210 - Bluray-1080p.mkv",
+                Some(2),
+                Some(10),
+            ),
+            (
+                "A Discovery of Witches - 1x01 - Episode 1 - Bluray-1080p.mkv",
+                Some(1),
+                Some(1),
+            ),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!((p.season, p.episode), (season, episode), "{name}");
+        }
+        // `Cap` with no number is an ordinary word, and these are real library
+        // names: `The Cap Table`, `Dad's Red Cap`.
+        assert_eq!(
+            parse_filename("Silicon Valley - 1x02 - The Cap Table - HDTV-720p.mkv").title,
+            "Silicon Valley"
+        );
     }
 
     /// **A date on the front of a name, with an episode marker behind it, is a
