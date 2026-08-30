@@ -3850,11 +3850,15 @@ mod tests {
             "indexing alone must not queue a map build"
         );
 
-        pool.prioritize_map_rebuild(item_id, lib.id, mkv);
         // Hold the bulk-reader gate so the build cannot pop before we observe
         // it queued (ADR-0041 8.6): the pool must report the build pending
-        // until it actually runs.
+        // until it actually runs. The gate is taken *before* the enqueue: a
+        // worker takes it at pop time, so holding it first is what keeps the
+        // item in the queue. Taken after, the worker can pop, build and clear
+        // in the gap, and the assertion below reads a finished build as a
+        // missing one.
         let _gate = pool.bulk_reader.lock().unwrap();
+        pool.prioritize_map_rebuild(item_id, lib.id, mkv);
         assert!(
             pool.map_build_pending(item_id),
             "the build must be visible as queued while the gate is held"
