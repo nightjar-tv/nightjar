@@ -1205,7 +1205,7 @@ impl HlsSessionRegistry {
             map_binding.map =
                 wait_for_map_build(item_id, self.db.as_ref(), map_build_in_flight.as_ref());
         }
-        let grid = grid_cadence_ms(mode, burn_in.is_some(), &self.encode_leg, &encode_plan);
+        let grid = grid_cadence_ms(mode, burn_in.is_some(), &encode_plan);
         let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
         let mut plan = map_binding.plan(src, want);
         if let Some(p) = grid {
@@ -2192,7 +2192,6 @@ fn restart_at(
     let grid = grid_cadence_ms(
         session.mode,
         session.burn_in.is_some(),
-        &session.encode_leg,
         &session.encode_plan,
     );
     let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
@@ -2630,6 +2629,17 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
 /// A full-title listing built on `N x SEGMENT_MS` would have named a URI the
 /// producer never writes at every entry but the first.
 ///
+/// **Corrected 2026-08-30: this is every leg, not only the ones that discard
+/// `-force_key_frames`.** It returned `SEGMENT_MS` for a leg that honours the
+/// flag, on the reasoning that such a leg "cuts on time". It does not. **An
+/// IDR can only be placed on a frame**, so the expression picks the nearest
+/// one; it does not create a frame at 2.000 s. Measured through this crate's
+/// own start path on `libx264`, which honours the flag: `24000/1001` produced
+/// keys 83, 2085, 4087 — a cadence of **2002 ms**, not 2000. `25` and `60`
+/// produced 2000, because at those rates 2000 ms is a whole number of frames
+/// (50 and 120). `honours_force_key_frames` decides which arguments a leg is
+/// given; it does not decide where the frames are.
+///
 /// `None` means there is no honest answer and the caller must not invent one:
 /// either the source rate is unknown, or the frame count does not divide into
 /// whole milliseconds, in which case no integer-ms grid exists at all.
@@ -2657,16 +2667,11 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
 /// `None` for copy and remux — they place no IDRs and cannot drop the
 /// `(cue, grid]` media — and for any session whose leg has no honest cadence,
 /// which keeps a per-run listing rather than inventing a grid.
-fn grid_cadence_ms(
-    mode: SessionMode,
-    has_burn_in: bool,
-    leg: &crate::EncodeLeg,
-    plan: &VideoEncodePlan,
-) -> Option<u64> {
+fn grid_cadence_ms(mode: SessionMode, has_burn_in: bool, plan: &VideoEncodePlan) -> Option<u64> {
     // Burn-in re-encodes video whatever the session mode says (ADR-0018), so
     // it is transcode for this question.
     let transcode = mode == SessionMode::Transcode || has_burn_in;
-    transcode.then(|| produced_segment_ms(leg, plan))?
+    transcode.then(|| produced_segment_ms(plan))?
 }
 
 /// Is this want one the session's own playlist offers?
@@ -2688,7 +2693,6 @@ fn want_is_listed(session: &Session, want_ms: u64) -> bool {
     let Some(step) = grid_cadence_ms(
         session.mode,
         session.burn_in.is_some(),
-        &session.encode_leg,
         &session.encode_plan,
     ) else {
         return false;
@@ -2704,10 +2708,7 @@ fn snap_plan_to_grid(plan: &mut StartPlan, produced_ms: u64) {
     plan.window_start_ms = grid;
 }
 
-fn produced_segment_ms(leg: &crate::EncodeLeg, plan: &VideoEncodePlan) -> Option<u64> {
-    if leg.honours_force_key_frames {
-        return Some(SEGMENT_MS);
-    }
+fn produced_segment_ms(plan: &VideoEncodePlan) -> Option<u64> {
     let frames = u64::from(plan.gop_frames(SEGMENT_MS)?);
     let (num, den) = plan.source_frame_rate?;
     let (num, den) = (u64::from(num), u64::from(den));
@@ -4516,30 +4517,24 @@ mod tests {
             source_frame_rate: Some((24000, 1001)),
             ..VideoEncodePlan::default()
         };
-        let leg = crate::EncodeLeg::qsv_sysmem();
         assert_eq!(
-            grid_cadence_ms(SessionMode::Transcode, false, &leg, &film),
+            grid_cadence_ms(SessionMode::Transcode, false, &film),
             Some(2002)
         );
         assert_eq!(
-            grid_cadence_ms(SessionMode::Copy, false, &leg, &film),
+            grid_cadence_ms(SessionMode::Copy, false, &film),
             None,
             "copy cannot drop to a grid and must keep its own phase"
         );
         // Burn-in re-encodes video whatever the mode says (ADR-0018).
         assert_eq!(
-            grid_cadence_ms(SessionMode::Copy, true, &leg, &film),
+            grid_cadence_ms(SessionMode::Copy, true, &film),
             Some(2002),
             "burn-in is a transcode for this question"
         );
         // No honest cadence means no grid, even for transcode.
         assert_eq!(
-            grid_cadence_ms(
-                SessionMode::Transcode,
-                false,
-                &leg,
-                &VideoEncodePlan::default()
-            ),
+            grid_cadence_ms(SessionMode::Transcode, false, &VideoEncodePlan::default()),
             None
         );
     }
@@ -4556,13 +4551,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut session = eof_test_session(dir.path(), 1_354_496);
         session.mode = SessionMode::Transcode;
-        session.encode_leg = crate::EncodeLeg::software();
         session.encode_plan = VideoEncodePlan {
             source_frame_rate: Some((24000, 1001)),
             ..VideoEncodePlan::default()
         };
-        // software honours -force_key_frames, so the grid is SEGMENT_MS.
-        let step = SEGMENT_MS;
+        // 48 frames at 24000/1001 is 2002 ms, whatever the leg is told.
+        let step = 2002;
 
         assert!(
             want_is_listed(&session, 40 * step),
@@ -4642,50 +4636,40 @@ mod tests {
     /// The cadence a leg will actually produce, which is not always the one
     /// the session asked for.
     #[test]
-    fn produced_segment_ms_follows_the_leg_not_the_constant() {
+    fn produced_segment_ms_follows_the_frames_not_the_constant() {
         let plan_at = |num, den| VideoEncodePlan {
             source_frame_rate: Some((num, den)),
             ..VideoEncodePlan::default()
         };
         let film = plan_at(24000, 1001);
 
-        // A leg that cuts on time hits SEGMENT_MS at any rate.
+        // The cadence is the frame count, on every leg. An IDR lands on a
+        // frame, so a leg that honours -force_key_frames picks the nearest
+        // one rather than creating a frame at 2.000 s. Measured on libx264 —
+        // which honours it — at 24000/1001: keys 83, 2085, 4087, spacing 2002.
         assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::software(), &film),
-            Some(2000),
-            "a leg that honours -force_key_frames cuts on time"
-        );
-        assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::videotoolbox(), &film),
-            Some(2000)
-        );
-
-        // A leg that cuts on a frame count does not, and this is the case the
-        // full-title listing exists to survive.
-        assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &film),
+            produced_segment_ms(&film),
             Some(2002),
-            "48 frames at 24000/1001 is 2002 ms, and the listing must say so"
+            "48 frames at 24000/1001 is 2002 ms, whatever the leg is told"
         );
 
-        // Rates that do divide evenly still land on the constant.
+        // Rates where 2000 ms is a whole number of frames still land on it.
         assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(60, 1)),
-            Some(2000)
+            produced_segment_ms(&plan_at(60, 1)),
+            Some(2000),
+            "120 frames"
         );
         assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(25, 1)),
-            Some(2000)
+            produced_segment_ms(&plan_at(25, 1)),
+            Some(2000),
+            "50 frames"
         );
-        assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(30000, 1001)),
-            Some(2002)
-        );
+        assert_eq!(produced_segment_ms(&plan_at(30000, 1001)), Some(2002));
 
         // No rate is no answer. The caller falls back to a per-run listing
         // rather than listing a grid it cannot justify.
         assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &VideoEncodePlan::default()),
+            produced_segment_ms(&VideoEncodePlan::default()),
             None,
             "no source rate means no honest cadence"
         );
@@ -4694,7 +4678,7 @@ mod tests {
         // list. 7/3 is constructed to exercise that guard, not a real rate:
         // 5 frames at 7/3 fps is 15000/7 ms, which is not an integer.
         assert_eq!(
-            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(7, 3)),
+            produced_segment_ms(&plan_at(7, 3)),
             None,
             "a fractional-millisecond cadence has no grid, and must not be rounded into one"
         );
@@ -8289,6 +8273,17 @@ mod tests {
     /// a full-title listing can name the entries in advance. The splice still
     /// opens at the cue — that is what `map_binding.bound` and `!fell_back`
     /// assert beside this.
+    /// The mapped fixtures are `testsrc rate=25`, where 2000 ms is exactly 50
+    /// frames, so the produced cadence is `SEGMENT_MS`. Declaring the rate is
+    /// what gives the session a grid at all: without it `produced_segment_ms`
+    /// is `None` and no run is snapped.
+    fn plan_25fps() -> VideoEncodePlan {
+        VideoEncodePlan {
+            source_frame_rate: Some((25, 1)),
+            ..VideoEncodePlan::default()
+        }
+    }
+
     fn grid_start(cue_ms: u64) -> u64 {
         cue_ms.div_ceil(SEGMENT_MS) * SEGMENT_MS
     }
@@ -8322,7 +8317,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -8374,7 +8369,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -8810,7 +8805,7 @@ mod tests {
                 vec![],
                 None,
                 None,
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -9038,7 +9033,7 @@ mod tests {
                 vec![],
                 None,
                 None,
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
