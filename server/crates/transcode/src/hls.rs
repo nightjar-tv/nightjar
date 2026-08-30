@@ -748,6 +748,8 @@ fn sync_segment_map(session: &mut Session) {
     };
     let encode_start_ms = read_run_encode_start(&run);
     let cadence = session_cadence_ms(session);
+    let points = session_listed_points(session);
+    let snap = session_key_snap(cadence, &points);
     let run_id = session.current_run_id;
     let session_dir = session.dir.clone();
     if let Err(e) = crate::hls_segment_map::ingest_run_index(
@@ -756,7 +758,7 @@ fn sync_segment_map(session: &mut Session) {
         run_id,
         &text,
         encode_start_ms,
-        cadence,
+        snap,
     ) {
         tracing::warn!(
             run_id = session.current_run_id,
@@ -797,6 +799,8 @@ fn sync_segment_map(session: &mut Session) {
 /// incrementally, and this function inherits that rather than introducing it.
 fn sync_superseded_run_indexes(session: &mut Session) {
     let cadence = session_cadence_ms(session);
+    let points = session_listed_points(session);
+    let snap = session_key_snap(cadence, &points);
     let run_ids: Vec<u64> = session.superseded.iter().map(|s| s.run_id).collect();
     for run_id in run_ids {
         let run_path = session.dir.join(format!("run_{run_id}"));
@@ -810,7 +814,7 @@ fn sync_superseded_run_indexes(session: &mut Session) {
             run_id,
             &text,
             encode_start_ms,
-            cadence,
+            snap,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (superseded run)");
         }
@@ -821,6 +825,8 @@ fn sync_superseded_run_indexes(session: &mut Session) {
 /// even if the current run's index is empty after stop_child.
 fn sync_all_run_indexes(session: &mut Session) {
     let cadence = session_cadence_ms(session);
+    let points = session_listed_points(session);
+    let snap = session_key_snap(cadence, &points);
     let Ok(entries) = fs::read_dir(&session.dir) else {
         return;
     };
@@ -847,7 +853,7 @@ fn sync_all_run_indexes(session: &mut Session) {
             run_id,
             &text,
             encode_start_ms,
-            cadence,
+            snap,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (all-runs sync)");
         }
@@ -2816,6 +2822,32 @@ fn session_cadence_ms(session: &Session) -> Option<u64> {
         session.burn_in.is_some(),
         &session.encode_plan,
     )
+}
+
+/// The points this session's listing names, for copy's key snap.
+///
+/// Copy's listing is the keyframe walk, which is irregular, so a produced key
+/// rounds onto the nearest listed point rather than onto a cadence. Empty when
+/// the session has no walk, and the caller then passes no snap at all.
+fn session_listed_points(session: &Session) -> Vec<u64> {
+    if session_cadence_ms(session).is_some() {
+        return Vec::new();
+    }
+    copy_window_entries(session)
+        .map(|entries| entries.into_iter().map(|(start, _)| start).collect())
+        .unwrap_or_default()
+}
+
+/// How this session's producer keys are put onto its listing's keys.
+fn session_key_snap<'a>(
+    cadence: Option<u64>,
+    points: &'a [u64],
+) -> Option<crate::hls_segment_map::KeySnap<'a>> {
+    match cadence {
+        Some(c) => Some(crate::hls_segment_map::KeySnap::Cadence(c)),
+        None if !points.is_empty() => Some(crate::hls_segment_map::KeySnap::Points(points)),
+        None => None,
+    }
 }
 
 fn grid_cadence_ms(mode: SessionMode, has_burn_in: bool, plan: &VideoEncodePlan) -> Option<u64> {

@@ -210,6 +210,67 @@ pub fn sidx_title_offset_ms(encode_start_ms: u64, first_sidx_ms: u64) -> u64 {
     }
 }
 
+/// How a producer key is put onto the listing's keys.
+///
+/// Transcode's listing is a regular cadence, so a key rounds onto a multiple.
+/// Copy's is the keyframe walk, which is irregular by construction, so a key
+/// rounds onto the nearest listed point.
+#[derive(Debug, Clone, Copy)]
+pub enum KeySnap<'a> {
+    Cadence(u64),
+    Points(&'a [u64]),
+}
+
+/// How far a copy key may sit from the point the walk listed.
+///
+/// **Measured 2026-08-30 on the N150 through the session API, two titles.**
+/// `Camp Rock 3` (h264+aac Matroska, pure `-c copy`) and `Birder` (the same
+/// with a 5.1 downmix), 18 segments between them: the producer's sidx is
+/// **exactly 1 ms below** the keyframe `pts_ms` the walk lists, on every
+/// window after the first, and the first is exact. Distinct offsets across the
+/// run: `[-1, 0]` and nothing else.
+///
+/// It is a rounding difference between the map's stored keyframe time and the
+/// sidx the muxer stamps, not drift — it does not accumulate.
+///
+/// **100 ms is two orders of magnitude above that measurement**, half a
+/// percent of a [`super::hls::COPY_WINDOW_MS`] window, and nowhere near far
+/// enough to reach a neighbouring listed point. Beyond it the key is not this
+/// rounding and the snap refuses.
+///
+/// **The listing is not adjusted to match.** Emitting `pts_ms - 1` would put a
+/// rounding artefact into the wire format and be wrong the moment the
+/// truncation changes.
+pub const COPY_KEY_TOLERANCE_MS: u64 = 100;
+
+/// Round a producer key onto the nearest listed point, or refuse.
+///
+/// The copy half of [`snap_to_cadence`]. Same contract: within the bound it
+/// returns the listed key, beyond it `None`, and the caller keeps the
+/// producer's own key and says so.
+pub fn snap_to_points(key_ms: u64, points: &[u64]) -> Option<u64> {
+    let nearest = match points.binary_search(&key_ms) {
+        Ok(_) => return Some(key_ms),
+        Err(i) => {
+            let before = i.checked_sub(1).and_then(|j| points.get(j)).copied();
+            let after = points.get(i).copied();
+            match (before, after) {
+                (Some(b), Some(a)) => {
+                    if key_ms - b <= a - key_ms {
+                        b
+                    } else {
+                        a
+                    }
+                }
+                (Some(b), None) => b,
+                (None, Some(a)) => a,
+                (None, None) => return None,
+            }
+        }
+    };
+    (key_ms.abs_diff(nearest) <= COPY_KEY_TOLERANCE_MS).then_some(nearest)
+}
+
 /// Round a producer key onto the run's cadence, or refuse.
 ///
 /// **The producer's first segment is not always where it was asked to start.**
@@ -257,7 +318,7 @@ pub fn ingest_run_index(
     run_id: u64,
     index_text: &str,
     encode_start_ms: u64,
-    cadence_ms: Option<u64>,
+    snap: Option<KeySnap<'_>>,
 ) -> Result<usize, String> {
     let entries = parse_ffmpeg_index(index_text)?;
     let run_rel = PathBuf::from(format!("run_{run_id}"));
@@ -295,18 +356,21 @@ pub fn ingest_run_index(
         // producer's key and say so: the listing will then hold on a URI it
         // named, which is visible, rather than mapping content to a time it
         // does not have.
-        let start_ms = match cadence_ms.and_then(|c| snap_to_cadence(raw_start_ms, c)) {
+        let snapped = snap.and_then(|policy| match policy {
+            KeySnap::Cadence(c) => snap_to_cadence(raw_start_ms, c),
+            KeySnap::Points(points) => snap_to_points(raw_start_ms, points),
+        });
+        let start_ms = match snapped {
             Some(snapped) => snapped,
             None => {
-                if let Some(c) = cadence_ms {
+                if snap.is_some() {
                     tracing::warn!(
                         run_id,
                         file = %entry.file_name,
                         raw_start_ms,
-                        cadence_ms = c,
-                        bound_ms = c / 8,
-                        "producer key is further off the cadence than the \
-                         first-segment offset explains; keeping it unsnapped"
+                        policy = ?snap,
+                        "producer key is further from the listing than the \
+                         measured rounding explains; keeping it unsnapped"
                     );
                 }
                 raw_start_ms
@@ -395,6 +459,45 @@ pub fn build_map_playlist(entries: &[(u64, u64)], init_uri: &str, start_offset_m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Copy's producer key rounds onto the point the walk listed.
+    #[test]
+    fn copy_keys_snap_onto_the_listed_walk_and_refuse_beyond_it() {
+        // The walk for a 20 s window on keyframes that are not on a grid.
+        let points = [0u64, 20_020, 40_040, 60_060, 80_080];
+
+        // Measured on the N150, two titles, 18 segments: the producer's sidx
+        // is exactly 1 ms below the listed keyframe on every window after the
+        // first, and the first is exact.
+        assert_eq!(snap_to_points(0, &points), Some(0));
+        assert_eq!(snap_to_points(20_019, &points), Some(20_020));
+        assert_eq!(snap_to_points(40_039, &points), Some(40_040));
+        assert_eq!(snap_to_points(60_059, &points), Some(60_060));
+        assert_eq!(snap_to_points(80_079, &points), Some(80_080));
+
+        // An exact key is itself.
+        assert_eq!(snap_to_points(40_040, &points), Some(40_040));
+
+        // The bound, asserted on both sides. 100 ms is two orders above the
+        // measurement and half a percent of a window.
+        assert_eq!(
+            snap_to_points(20_020 + COPY_KEY_TOLERANCE_MS, &points),
+            Some(20_020),
+            "exactly the bound snaps"
+        );
+        assert_eq!(
+            snap_to_points(20_020 + COPY_KEY_TOLERANCE_MS + 1, &points),
+            None,
+            "one past the bound is not this rounding"
+        );
+        assert_eq!(
+            snap_to_points(30_000, &points),
+            None,
+            "halfway between two listed points is never a snap"
+        );
+        assert_eq!(snap_to_points(500_000, &points), None, "past the walk");
+        assert_eq!(snap_to_points(5, &[]), None, "no listing, no snap");
+    }
 
     /// The measured first-segment offset snaps; anything larger does not.
     #[test]
