@@ -539,6 +539,47 @@ mod tests {
         assert_eq!(snap_to_cadence(5, 0), None, "no cadence, no snap");
     }
 
+    /// A segment URI's bytes are **not** immutable within a session.
+    ///
+    /// Written for the cache-header slice, where the question was whether a
+    /// segment could carry a long `max-age` and `immutable`. It cannot: the
+    /// map is keyed on title-absolute start and [`SegmentMap::insert`]
+    /// replaces, so a later run that produces a different packing at the same
+    /// start takes over that URI. The doc on `by_start` says so; this asserts
+    /// it, because a header was about to rest on the opposite.
+    #[test]
+    fn a_segment_uri_is_not_immutable_within_a_session() {
+        let mut map = SegmentMap::default();
+        map.insert(MappedSegment {
+            start_ms: 42_000,
+            duration_ms: 2_000,
+            run_id: 0,
+            rel_path: PathBuf::from("run_0/seg000.m4s"),
+        });
+        assert_eq!(
+            map.get(42_000).map(|s| s.rel_path.clone()),
+            Some(PathBuf::from("run_0/seg000.m4s"))
+        );
+
+        // A later run produces its own packing at the same title start.
+        map.insert(MappedSegment {
+            start_ms: 42_000,
+            duration_ms: 2_000,
+            run_id: 3,
+            rel_path: PathBuf::from("run_3/seg007.m4s"),
+        });
+
+        let now = map.get(42_000).expect("the key still resolves");
+        assert_eq!(now.run_id, 3, "the newer run owns the URI");
+        assert_eq!(
+            now.rel_path,
+            PathBuf::from("run_3/seg007.m4s"),
+            "same URI, different bytes on disk — so no `immutable`, and no \
+             max-age that outlives a replacement"
+        );
+        assert_eq!(map.len(), 1, "one entry per start, replaced not appended");
+    }
+
     #[test]
     fn time_keyed_round_trip() {
         let name = time_keyed_segment_name(1_277_151);
