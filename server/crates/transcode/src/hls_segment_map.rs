@@ -210,6 +210,99 @@ pub fn sidx_title_offset_ms(encode_start_ms: u64, first_sidx_ms: u64) -> u64 {
     }
 }
 
+/// How a producer key is put onto the listing's keys.
+///
+/// Transcode's listing is a regular cadence, so a key rounds onto a multiple.
+/// Copy's is the keyframe walk, which is irregular by construction, so a key
+/// rounds onto the nearest listed point.
+#[derive(Debug, Clone, Copy)]
+pub enum KeySnap<'a> {
+    Cadence(u64),
+    Points(&'a [u64]),
+}
+
+/// How far a copy key may sit from the point the walk listed.
+///
+/// **Measured 2026-08-30 on the N150 through the session API, two titles.**
+/// `Camp Rock 3` (h264+aac Matroska, pure `-c copy`) and `Birder` (the same
+/// with a 5.1 downmix), 18 segments between them: the producer's sidx is
+/// **exactly 1 ms below** the keyframe `pts_ms` the walk lists, on every
+/// window after the first, and the first is exact. Distinct offsets across the
+/// run: `[-1, 0]` and nothing else.
+///
+/// It is a rounding difference between the map's stored keyframe time and the
+/// sidx the muxer stamps, not drift — it does not accumulate.
+///
+/// **100 ms is two orders of magnitude above that measurement**, half a
+/// percent of a [`super::hls::COPY_WINDOW_MS`] window, and nowhere near far
+/// enough to reach a neighbouring listed point. Beyond it the key is not this
+/// rounding and the snap refuses.
+///
+/// **The listing is not adjusted to match.** Emitting `pts_ms - 1` would put a
+/// rounding artefact into the wire format and be wrong the moment the
+/// truncation changes.
+pub const COPY_KEY_TOLERANCE_MS: u64 = 100;
+
+/// Round a producer key onto the nearest listed point, or refuse.
+///
+/// The copy half of [`snap_to_cadence`]. Same contract: within the bound it
+/// returns the listed key, beyond it `None`, and the caller keeps the
+/// producer's own key and says so.
+pub fn snap_to_points(key_ms: u64, points: &[u64]) -> Option<u64> {
+    let nearest = match points.binary_search(&key_ms) {
+        Ok(_) => return Some(key_ms),
+        Err(i) => {
+            let before = i.checked_sub(1).and_then(|j| points.get(j)).copied();
+            let after = points.get(i).copied();
+            match (before, after) {
+                (Some(b), Some(a)) => {
+                    if key_ms - b <= a - key_ms {
+                        b
+                    } else {
+                        a
+                    }
+                }
+                (Some(b), None) => b,
+                (None, Some(a)) => a,
+                (None, None) => return None,
+            }
+        }
+    };
+    (key_ms.abs_diff(nearest) <= COPY_KEY_TOLERANCE_MS).then_some(nearest)
+}
+
+/// Round a producer key onto the run's cadence, or refuse.
+///
+/// **The producer's first segment is not always where it was asked to start.**
+/// Measured through the transcode crate's own start path, at land 0 with no
+/// seek to discard the encoder's priming frames, the first sidx lands **two
+/// video frames late** and every later key inherits the same offset: 83 ms at
+/// `24000/1001` (keys 83, 2085, 4087), 80 ms at `25`, 33 ms at `60`. At any
+/// land above zero the `-ss` discards those frames and the keys are exact.
+///
+/// Nothing we pass ffmpeg moves it. Both candidate fixes were measured and
+/// refused to: passing `-output_ts_offset 0` at land 0, and passing a nominal
+/// `-ss 0`. So the wire key is snapped here instead of chased there.
+///
+/// **The bound is asserted, not assumed.** A correction beyond an eighth of a
+/// segment is not this offset — it is drift, or a cadence that does not match
+/// the producer — and this returns `None` so the caller keeps the producer's
+/// own key and says so. At `SEGMENT_MS` that bound is 250 ms, three times the
+/// largest offset measured, and far inside half a segment.
+pub fn snap_to_cadence(key_ms: u64, cadence_ms: u64) -> Option<u64> {
+    if cadence_ms == 0 {
+        return None;
+    }
+    let nearest = key_ms.div_ceil(cadence_ms) * cadence_ms;
+    let below = (key_ms / cadence_ms) * cadence_ms;
+    let nearest = if key_ms - below <= nearest - key_ms {
+        below
+    } else {
+        nearest
+    };
+    (key_ms.abs_diff(nearest) <= cadence_ms / 8).then_some(nearest)
+}
+
 /// Ingest one producer run's `index.m3u8` into `map`.
 ///
 /// For each EXTINF entry, reads the segment file, requires contiguous
@@ -225,6 +318,7 @@ pub fn ingest_run_index(
     run_id: u64,
     index_text: &str,
     encode_start_ms: u64,
+    snap: Option<KeySnap<'_>>,
 ) -> Result<usize, String> {
     let entries = parse_ffmpeg_index(index_text)?;
     let run_rel = PathBuf::from(format!("run_{run_id}"));
@@ -256,7 +350,32 @@ pub fn ingest_run_index(
             }
             off
         });
-        let start_ms = sidx_ms.saturating_add(offset);
+        let raw_start_ms = sidx_ms.saturating_add(offset);
+        // Put the wire key on the run's cadence, so a full-title listing can
+        // name it before the producer has written it. Out of bound, keep the
+        // producer's key and say so: the listing will then hold on a URI it
+        // named, which is visible, rather than mapping content to a time it
+        // does not have.
+        let snapped = snap.and_then(|policy| match policy {
+            KeySnap::Cadence(c) => snap_to_cadence(raw_start_ms, c),
+            KeySnap::Points(points) => snap_to_points(raw_start_ms, points),
+        });
+        let start_ms = match snapped {
+            Some(snapped) => snapped,
+            None => {
+                if snap.is_some() {
+                    tracing::warn!(
+                        run_id,
+                        file = %entry.file_name,
+                        raw_start_ms,
+                        policy = ?snap,
+                        "producer key is further from the listing than the \
+                         measured rounding explains; keeping it unsnapped"
+                    );
+                }
+                raw_start_ms
+            }
+        };
         // Gate: after the first segment, wire starts should equal the previous
         // end within one millisecond (contiguous producer output).
         if let Some(expect) = prev_end_ms {
@@ -289,12 +408,28 @@ pub fn ingest_run_index(
 /// Build an EVENT (or ENDLIST) media playlist from ordered map segments.
 ///
 /// `init_uri` is the EXT-X-MAP URI (run-relative or session-absolute).
-/// `#EXT-X-START` is window-relative (0) when `window_relative_start` is true.
-pub fn build_map_playlist(segments: &[&MappedSegment], init_uri: &str, endlist: bool) -> Vec<u8> {
+/// Media playlist for a set of `(start_ms, duration_ms)` entries.
+///
+/// **Always `VOD` with `ENDLIST`.** It was `EVENT` without one until
+/// 2026-08-30, because the listing grew between fetches: it named the segments
+/// that existed, so a client had to be told to expect more. A full-title
+/// listing names every entry from the first fetch and only the backing files
+/// arrive, so there is nothing left for `EVENT` to describe.
+///
+/// Entries are `(start_ms, duration_ms)` rather than [`MappedSegment`] because
+/// a full-title listing names URIs before any run has written them, and a
+/// mapped segment is by definition already on disk.
+///
+/// `start_offset_ms` is where a fresh attach begins, title-absolute. It was
+/// always `0` while the listing began at the land, because the window's start
+/// *was* the land. **A full-title listing begins at 0, so a zero offset would
+/// attach at the title start rather than where the session landed** — the two
+/// have to be said separately now that they differ.
+pub fn build_map_playlist(entries: &[(u64, u64)], init_uri: &str, start_offset_ms: u64) -> Vec<u8> {
     use std::fmt::Write;
-    let target = segments
+    let target = entries
         .iter()
-        .map(|s| ((s.duration_ms as f64) / 1000.0).ceil() as u64)
+        .map(|(_, duration_ms)| ((*duration_ms as f64) / 1000.0).ceil() as u64)
         .max()
         .unwrap_or(2)
         .max(1);
@@ -302,29 +437,107 @@ pub fn build_map_playlist(segments: &[&MappedSegment], init_uri: &str, endlist: 
         "#EXTM3U\n\
          #EXT-X-VERSION:7\n\
          #EXT-X-TARGETDURATION:{target}\n\
-         #EXT-X-PLAYLIST-TYPE:EVENT\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n\
          #EXT-X-MEDIA-SEQUENCE:0\n\
          #EXT-X-INDEPENDENT-SEGMENTS\n\
          #EXT-X-MAP:URI=\"{init_uri}\"\n\
-         #EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES\n"
+         #EXT-X-START:TIME-OFFSET={start_secs:.3},PRECISE=YES\n",
+        start_secs = start_offset_ms as f64 / 1000.0
     );
-    for s in segments {
-        let secs = s.duration_ms as f64 / 1000.0;
+    for (start_ms, duration_ms) in entries {
+        let secs = *duration_ms as f64 / 1000.0;
         let _ = writeln!(
             out,
             "#EXTINF:{secs:.6},\n{}",
-            time_keyed_segment_name(s.start_ms)
+            time_keyed_segment_name(*start_ms)
         );
     }
-    if endlist {
-        out.push_str("#EXT-X-ENDLIST\n");
-    }
+    out.push_str("#EXT-X-ENDLIST\n");
     out.into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Copy's producer key rounds onto the point the walk listed.
+    #[test]
+    fn copy_keys_snap_onto_the_listed_walk_and_refuse_beyond_it() {
+        // The walk for a 20 s window on keyframes that are not on a grid.
+        let points = [0u64, 20_020, 40_040, 60_060, 80_080];
+
+        // Measured on the N150, two titles, 18 segments: the producer's sidx
+        // is exactly 1 ms below the listed keyframe on every window after the
+        // first, and the first is exact.
+        assert_eq!(snap_to_points(0, &points), Some(0));
+        assert_eq!(snap_to_points(20_019, &points), Some(20_020));
+        assert_eq!(snap_to_points(40_039, &points), Some(40_040));
+        assert_eq!(snap_to_points(60_059, &points), Some(60_060));
+        assert_eq!(snap_to_points(80_079, &points), Some(80_080));
+
+        // An exact key is itself.
+        assert_eq!(snap_to_points(40_040, &points), Some(40_040));
+
+        // The bound, asserted on both sides. 100 ms is two orders above the
+        // measurement and half a percent of a window.
+        assert_eq!(
+            snap_to_points(20_020 + COPY_KEY_TOLERANCE_MS, &points),
+            Some(20_020),
+            "exactly the bound snaps"
+        );
+        assert_eq!(
+            snap_to_points(20_020 + COPY_KEY_TOLERANCE_MS + 1, &points),
+            None,
+            "one past the bound is not this rounding"
+        );
+        assert_eq!(
+            snap_to_points(30_000, &points),
+            None,
+            "halfway between two listed points is never a snap"
+        );
+        assert_eq!(snap_to_points(500_000, &points), None, "past the walk");
+        assert_eq!(snap_to_points(5, &[]), None, "no listing, no snap");
+    }
+
+    /// The measured first-segment offset snaps; anything larger does not.
+    #[test]
+    fn snap_takes_the_first_segment_offset_and_refuses_drift() {
+        // Measured through the transcode start path at land 0: the producer's
+        // first sidx is two video frames late and every later key inherits it.
+        // 24000/1001, cadence 2002, keys 83 / 2085 / 4087.
+        assert_eq!(snap_to_cadence(83, 2002), Some(0));
+        assert_eq!(snap_to_cadence(2085, 2002), Some(2002));
+        assert_eq!(snap_to_cadence(4087, 2002), Some(4004));
+        // 25 fps, cadence 2000, offset 80. 60 fps, offset 33.
+        assert_eq!(snap_to_cadence(80, 2000), Some(0));
+        assert_eq!(snap_to_cadence(2080, 2000), Some(2000));
+        assert_eq!(snap_to_cadence(33, 2000), Some(0));
+        // A key already on the cadence is unchanged.
+        assert_eq!(snap_to_cadence(4004, 2002), Some(4004));
+        assert_eq!(snap_to_cadence(0, 2002), Some(0));
+
+        // The bound is an eighth of a segment, asserted on both sides so it
+        // fails loudly rather than absorbing real drift. At 2000 that is 250.
+        assert_eq!(
+            snap_to_cadence(250, 2000),
+            Some(0),
+            "exactly the bound snaps"
+        );
+        assert_eq!(
+            snap_to_cadence(251, 2000),
+            None,
+            "one past the bound is drift, not the first-segment offset"
+        );
+        assert_eq!(
+            snap_to_cadence(1750, 2000),
+            Some(2000),
+            "the bound is symmetric below the next multiple"
+        );
+        assert_eq!(snap_to_cadence(1749, 2000), None);
+        // Half a segment is never a snap.
+        assert_eq!(snap_to_cadence(1000, 2000), None);
+        assert_eq!(snap_to_cadence(5, 0), None, "no cadence, no snap");
+    }
 
     #[test]
     fn time_keyed_round_trip() {
@@ -360,7 +573,7 @@ seg021.m4s
 #EXT-X-ENDLIST
 ";
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000).unwrap();
+        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000, None).unwrap();
         assert_eq!(n, 2);
         assert_eq!(map.get(40_000).unwrap().duration_ms, 2000);
         assert_eq!(map.get(42_000).unwrap().duration_ms, 2000);
@@ -383,7 +596,7 @@ seg021.m4s
 #EXT-X-ENDLIST
 ";
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000).unwrap();
+        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000, None).unwrap();
         assert_eq!(n, 2);
         assert!(map.get(40_000).is_some());
         assert!(map.get(42_000).is_some());
@@ -445,19 +658,32 @@ seg006.m4s
                 rel_path: PathBuf::from("run_0/b.m4s"),
             },
         ];
-        let refs: Vec<&MappedSegment> = segs.iter().collect();
-        let bytes = build_map_playlist(&refs, "init.mp4", false);
+        let entries: Vec<(u64, u64)> = segs.iter().map(|s| (s.start_ms, s.duration_ms)).collect();
+        let bytes = build_map_playlist(&entries, "init.mp4", 0);
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(
+            text.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "every playlist is VOD; EVENT described a listing that grew"
+        );
+        assert!(
+            !text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "EVENT must not appear in any playlist: {text}"
+        );
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES"));
         assert!(text.contains("seg_00000008008.m4s"));
         assert!(text.contains("seg_00000012012.m4s"));
-        assert!(!text.contains("#EXT-X-ENDLIST"));
-        let with_end = build_map_playlist(&refs, "init.mp4", true);
         assert!(
-            String::from_utf8(with_end)
+            text.contains("#EXT-X-ENDLIST"),
+            "a complete listing always ends"
+        );
+        // A full-title listing begins at 0, so the attach point has to be
+        // stated rather than implied by where the listing starts.
+        let landed = build_map_playlist(&entries, "init.mp4", 8008);
+        assert!(
+            String::from_utf8(landed)
                 .unwrap()
-                .contains("#EXT-X-ENDLIST")
+                .contains("#EXT-X-START:TIME-OFFSET=8.008,PRECISE=YES"),
+            "the attach point is the land, not the first listed entry"
         );
     }
 }

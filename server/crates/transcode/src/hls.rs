@@ -42,6 +42,24 @@ const USABLE_SHORTFALL_MS: u64 = 30_000;
 /// Locked HLS segment duration for **transcode** force-IDR / subtitle VTT
 /// grid (ADR-0008 / ADR-0010). Copy segment durations come from the producer.
 const SEGMENT_MS: u64 = 2000;
+/// One copy/remux window. **Its own constant, not a multiple of
+/// [`SEGMENT_MS`].**
+///
+/// They are different kinds of thing: `SEGMENT_MS` is an encoder IDR cadence,
+/// this is how much media one copy window holds. Deriving it would let a
+/// change to the IDR cadence silently move copy's scrub granularity.
+///
+/// **20 s is measured, not chosen.** `stay-ahead-vt-2026-08-20.md` §S8, a
+/// human trial on a real title through the spike origin: a 2 s grid gave one
+/// FFmpeg per skipped cue, a 4 s worst wait, short GOPs named as later URIs,
+/// and on the second seek a video stall with audio that went robotic and
+/// stayed robotic. One MPEG-TS per 20 s window was "stable" — 67 windows
+/// listed, 20 on disk, last first byte 574 ms. §S8b confirmed it on iPhone
+/// with `-c:a copy`.
+///
+/// **Scrub granularity is the window, not 2 s. Fine-grained seek stays
+/// transcode.**
+const COPY_WINDOW_MS: u64 = 20_000;
 /// How long a segment or init fetch may block before returning 503. Mid-title
 /// hardware transcodes on a NAS library can exceed 15s (dogfood: ~16s to
 /// seg1098 after a Chrome seek on Up 1080p).
@@ -216,15 +234,43 @@ pub enum SegmentMissAction {
     Restart,
 }
 
-/// Deliberate miss policy under ADR-0020 producer-truth playlists.
+/// What to do when a listed segment is not on disk.
 ///
-/// Segment GETs never move the encode window. Far scrub is
-/// `POST /sessions/{id}/seek`. A miss is always Wait: listed-but-not-ready
-/// cooks under fill-forward; unlisted URIs are 404'd by the asset path once
-/// unreachable. The old behind-play Restart band ([`ALIGN_BEHIND_SEGMENTS`])
-/// and ahead-of-frontier Restart past [`CATCH_UP_SEGMENTS`] fitted WebKit
-/// requesting URIs the synthetic full-title VOD listed but the producer
-/// never wrote — that playlist is gone.
+/// **Overturned 2026-08-30 — a cold listed URI starts an encoder.** ADR-0054
+/// decision 3: *"A listed URI is never 404 and never 503. … A cold URI is a
+/// seek: the session starts an encoder at that media time."*
+///
+/// This function returned `Wait` unconditionally, discarding all six of its
+/// arguments, and its comment stated that as policy. It is kept here because
+/// it is what is being reversed, not a detail being adjusted:
+///
+/// > *Deliberate miss policy under ADR-0020 producer-truth playlists.*
+/// >
+/// > *Segment GETs never move the encode window. Far scrub is
+/// > `POST /sessions/{id}/seek`. A miss is always Wait: listed-but-not-ready
+/// > cooks under fill-forward; unlisted URIs are 404'd by the asset path once
+/// > unreachable. The old behind-play Restart band ([`ALIGN_BEHIND_SEGMENTS`])
+/// > and ahead-of-frontier Restart past [`CATCH_UP_SEGMENTS`] fitted WebKit
+/// > requesting URIs the synthetic full-title VOD listed but the producer
+/// > never wrote — that playlist is gone.*
+///
+/// **That playlist is coming back**, and its last clause is why the policy has
+/// to go with it. Fill-forward reaches a want only while every listed URI sits
+/// near the running producer, which is true of a one-window listing and false
+/// of a full-title one. For a want no run is heading towards, `Wait` never
+/// ends: the hold runs to [`IDLE_TIMEOUT`] and returns an empty 204.
+///
+/// `Restart` for a want this run cannot reach:
+///
+/// - **behind the encode window** — this run produces forward from
+///   `window_start_ms` and never goes back;
+/// - **past the catch-up band** — further ahead of the producer's frontier
+///   than [`CATCH_UP_SEGMENTS`], so waiting is not a cook, it is a stall.
+///
+/// `Wait` otherwise, and `Wait` always while the run is still starting
+/// (`!primed`, where the frontier is not yet meaningful) or inside
+/// [`RESTART_MIN_INTERVAL`] of the last restart, which is what stops a
+/// prefetching client turning a listing into a restart storm.
 pub fn decide_segment_miss(
     want_ms: u64,
     window_start_ms: u64,
@@ -233,14 +279,23 @@ pub fn decide_segment_miss(
     primed: bool,
     since_last_restart: Duration,
 ) -> SegmentMissAction {
-    let _ = (
-        want_ms,
-        window_start_ms,
-        play_start_ms,
-        latest_on_disk_ms,
-        primed,
-        since_last_restart,
-    );
+    // A run that has served nothing yet has no honest frontier, and the want
+    // is usually its own land arriving. `play_start_ms` is what it is heading
+    // for, so a want at or after it is that case and not a miss to act on.
+    if !primed && want_ms >= align_to_segment(play_start_ms) {
+        return SegmentMissAction::Wait;
+    }
+    if since_last_restart < RESTART_MIN_INTERVAL {
+        return SegmentMissAction::Wait;
+    }
+    let want = align_to_segment(want_ms);
+    if want < align_to_segment(window_start_ms) {
+        return SegmentMissAction::Restart;
+    }
+    let frontier = latest_on_disk_ms.unwrap_or(window_start_ms);
+    if want.saturating_sub(frontier) > CATCH_UP_SEGMENTS * SEGMENT_MS {
+        return SegmentMissAction::Restart;
+    }
     SegmentMissAction::Wait
 }
 
@@ -692,12 +747,18 @@ fn sync_segment_map(session: &mut Session) {
         return;
     };
     let encode_start_ms = read_run_encode_start(&run);
+    let cadence = session_cadence_ms(session);
+    let points = session_listed_points(session);
+    let snap = session_key_snap(cadence, &points);
+    let run_id = session.current_run_id;
+    let session_dir = session.dir.clone();
     if let Err(e) = crate::hls_segment_map::ingest_run_index(
         &mut session.segment_map,
-        &session.dir,
-        session.current_run_id,
+        &session_dir,
+        run_id,
         &text,
         encode_start_ms,
+        snap,
     ) {
         tracing::warn!(
             run_id = session.current_run_id,
@@ -737,6 +798,9 @@ fn sync_segment_map(session: &mut Session) {
 /// older cost — the map is rebuilt from disk rather than maintained
 /// incrementally, and this function inherits that rather than introducing it.
 fn sync_superseded_run_indexes(session: &mut Session) {
+    let cadence = session_cadence_ms(session);
+    let points = session_listed_points(session);
+    let snap = session_key_snap(cadence, &points);
     let run_ids: Vec<u64> = session.superseded.iter().map(|s| s.run_id).collect();
     for run_id in run_ids {
         let run_path = session.dir.join(format!("run_{run_id}"));
@@ -750,6 +814,7 @@ fn sync_superseded_run_indexes(session: &mut Session) {
             run_id,
             &text,
             encode_start_ms,
+            snap,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (superseded run)");
         }
@@ -759,6 +824,9 @@ fn sync_superseded_run_indexes(session: &mut Session) {
 /// Re-read every `run_*/index.m3u8` so scrub-back map hits see prior runs
 /// even if the current run's index is empty after stop_child.
 fn sync_all_run_indexes(session: &mut Session) {
+    let cadence = session_cadence_ms(session);
+    let points = session_listed_points(session);
+    let snap = session_key_snap(cadence, &points);
     let Ok(entries) = fs::read_dir(&session.dir) else {
         return;
     };
@@ -785,6 +853,7 @@ fn sync_all_run_indexes(session: &mut Session) {
             run_id,
             &text,
             encode_start_ms,
+            snap,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (all-runs sync)");
         }
@@ -840,23 +909,123 @@ fn first_current_run_start(session: &Session) -> Option<u64> {
         .map(|s| s.start_ms)
 }
 
+/// Copy's whole-title listing: the greedy [`COPY_WINDOW_MS`] walk of the
+/// keyframe map.
+///
+/// **Copy cuts at source keyframes and cannot hold a grid, but its cut points
+/// are known in advance** — the keyframe map already holds every one. Walk it
+/// from 0, taking the first entry at or after each window boundary, and that
+/// set is what a run will actually write: FFmpeg's `-hls_time` cuts at the
+/// first keyframe at or after each boundary, and a seek to a listed point
+/// lands exactly on it because the map entry is exact.
+///
+/// **The walk is run-independent** — it depends only on the map and on 0 —
+/// which is what makes it listable before anything has been written. A listing
+/// derived from where *this* run happened to start would differ per run.
+///
+/// `None` without a keyframe map: an `-ss` copy run's cut points are not
+/// knowable ahead of time, so that session keeps the per-run listing.
+///
+/// **Unverified against the product.** §S8 measured this shape through the
+/// spike origin, which never calls the session API. That `-hls_time` cuts
+/// where the walk says is FFmpeg's documented stream-copy behaviour, checked
+/// here against a fixture map and not against a real copy run.
+fn copy_window_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
+    let map = session.map_binding.map.as_ref()?;
+    let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
+    if end == 0 {
+        return None;
+    }
+    let mut starts: Vec<u64> = Vec::new();
+    let mut boundary = 0u64;
+    for entry in &map.entries {
+        if entry.pts_ms >= end {
+            break;
+        }
+        if entry.pts_ms >= boundary {
+            starts.push(entry.pts_ms);
+            boundary = entry.pts_ms.saturating_add(COPY_WINDOW_MS);
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    Some(
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let next = starts.get(i + 1).copied().unwrap_or(end);
+                (*start, next.saturating_sub(*start))
+            })
+            .collect(),
+    )
+}
+
+/// The whole title on the grid this session's runs share (ADR-0054 decision 1).
+///
+/// `None` when there is no shared grid — copy and remux, or a leg with no
+/// honest cadence — and the caller keeps the per-run listing.
+///
+/// The bound is `usable_extent_ms` when the producer reached EOF short of the
+/// claimed duration, and `duration_ms` otherwise. `usable_extent_ms` is the
+/// **session maximum**, the furthest point known reachable (#181). The per-run
+/// reading is `0` when a run ends having produced nothing, and this would then
+/// list nothing at all.
+fn full_title_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
+    // Copy and remux list the same whole title on a different grid. That is
+    // the only difference between the modes: both are full-title VOD, and
+    // scrub granularity differs because copy cuts where the source does.
+    let Some(step) = grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_plan,
+    ) else {
+        return copy_window_entries(session);
+    };
+    let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
+    if end == 0 || step == 0 {
+        return None;
+    }
+    Some(
+        (0..end)
+            .step_by(step as usize)
+            .map(|start| (start, step.min(end - start)))
+            .collect(),
+    )
+}
+
 fn build_run_media_playlist(session_id: &str, session: &Session) -> Vec<u8> {
-    let window = session.start_ms;
-    // ADR-0020: never list a URI whose bytes are gone. Eviction updates the
-    // map, but defend in depth so a race cannot reintroduce listed-404.
-    let segs: Vec<&crate::hls_segment_map::MappedSegment> = session
-        .segment_map
-        .iter_ordered()
-        .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
-        .filter(|s| session.dir.join(&s.rel_path).is_file())
-        .collect();
     // Path-absolute URIs (ADR-0008): run-dir depth cannot break resolution.
     let init_uri = format!(
         "/api/v0/sessions/{session_id}/runs/{}/init.mp4",
         session.current_run_id
     );
-    let bytes =
-        crate::hls_segment_map::build_map_playlist(&segs, &init_uri, session.current_run_eof);
+    // A full-title listing starts at 0, so the attach point is the land and
+    // must be said. The per-run listing still begins at the land, where a zero
+    // offset already means it.
+    let mut start_offset_ms = 0;
+    let entries = match full_title_entries(session) {
+        Some(entries) => {
+            start_offset_ms = session.play_start_ms;
+            entries
+        }
+        None => {
+            // No shared grid: list what the map holds for this window, as
+            // before. ADR-0020: never list a URI whose bytes are gone.
+            // Eviction updates the map, but defend in depth so a race cannot
+            // reintroduce listed-404.
+            let window = session.start_ms;
+            session
+                .segment_map
+                .iter_ordered()
+                .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
+                .filter(|s| session.dir.join(&s.rel_path).is_file())
+                .map(|s| (s.start_ms, s.duration_ms))
+                .collect()
+        }
+    };
+    let bytes = crate::hls_segment_map::build_map_playlist(&entries, &init_uri, start_offset_ms);
     with_session_absolute_segment_uris(session_id, &bytes)
 }
 
@@ -1168,7 +1337,12 @@ impl HlsSessionRegistry {
             map_binding.map =
                 wait_for_map_build(item_id, self.db.as_ref(), map_build_in_flight.as_ref());
         }
-        let mut plan = map_binding.plan(src, play_start_ms);
+        let grid = grid_cadence_ms(mode, burn_in.is_some(), &encode_plan);
+        let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
+        let mut plan = map_binding.plan(src, want);
+        if let Some(p) = grid {
+            snap_plan_to_grid(&mut plan, p);
+        }
         let start_ms = plan.window_start_ms;
         write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
         let burn_in =
@@ -1827,7 +2001,8 @@ impl HlsSessionRegistry {
                                     session.play_start_ms,
                                     session.pending_play_ms,
                                     want_ms,
-                                ) {
+                                ) && !want_is_listed(session, want_ms)
+                                {
                                     if pending_waiter_action(session.pending_play_ms, want_ms)
                                         == PendingWaiterAction::Release
                                     {
@@ -1856,11 +2031,11 @@ impl HlsSessionRegistry {
                             SegmentMissAction::Wait => {
                                 if scrub_shaped
                                     && !prefetch_advances_pending(session.pending_play_ms, want_ms)
-                                    && !digback_behind_committed(
+                                    && !(digback_behind_committed(
                                         session.play_start_ms,
                                         session.pending_play_ms,
                                         want_ms,
-                                    )
+                                    ) && !want_is_listed(session, want_ms))
                                 {
                                     desire_restart(session, want_ms);
                                     holding_for_land = true;
@@ -1880,9 +2055,19 @@ impl HlsSessionRegistry {
                                     );
                                 } else if session.child.is_none() {
                                     return Err(PlaylistError::NotFound);
-                                } else if want_ms < window_start {
-                                    // Producer-truth: URI behind the cooking
-                                    // window was never listed for this run.
+                                } else if want_ms < window_start
+                                    && !want_is_listed(session, want_ms)
+                                {
+                                    // Producer-truth: a URI behind the cooking
+                                    // window was never listed *for this run*.
+                                    //
+                                    // The third site carrying ADR-0020's miss
+                                    // policy, narrowed the same way as the
+                                    // other two. With a full-title listing the
+                                    // session did list it, so a 404 here
+                                    // refuses a URI the playlist offers. An
+                                    // unlisted want behind the window still
+                                    // 404s, which is what this line was for.
                                     return Err(PlaylistError::NotFound);
                                 }
                             }
@@ -2143,7 +2328,19 @@ fn restart_at(
             session.map_build_in_flight.as_ref(),
         );
     }
-    let mut plan = session.map_binding.plan(&session.src, play_start_ms);
+    // Bind at the grid point at or before the land, not at the land, so the
+    // cue this snaps to is at or before a grid point and the snap up can
+    // never overshoot the play land.
+    let grid = grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_plan,
+    );
+    let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
+    let mut plan = session.map_binding.plan(&session.src, want);
+    if let Some(p) = grid {
+        snap_plan_to_grid(&mut plan, p);
+    }
     let start_ms = plan.window_start_ms;
     write_run_encode_start(&run_dir, start_ms).map_err(PlaylistError::Failed)?;
     let burn_in = prepare_ass_burn_file(&session.src, &session.dir, session.burn_in.clone())
@@ -2558,6 +2755,155 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Milliseconds of media in one segment this leg will actually produce.
+///
+/// [`SEGMENT_MS`] is the interval the session *asks* for. A leg that honours
+/// `-force_key_frames` is given `expr:gte(t,n_forced*N)` and cuts on time, so
+/// it hits it. A leg that discards the expression is given `-g <frames>`, and
+/// a frame count only lands on `SEGMENT_MS` when the source rate divides it
+/// into whole frames.
+///
+/// At `24000/1001` it does not. 2000 ms is 47.952 frames,
+/// [`VideoEncodePlan::gop_frames`] rounds up to 48, and 48 frames is
+/// `48 x 1001 / 24000 = 2002 ms`. **Measured on the N150 at `c43b440`,
+/// `h264_qsv`, 1080p h264: 1061 of 1062 distinct segment starts were off the
+/// 2000 ms grid, with a modal consecutive delta of 2002 ms across 923 pairs.**
+/// A full-title listing built on `N x SEGMENT_MS` would have named a URI the
+/// producer never writes at every entry but the first.
+///
+/// **Corrected 2026-08-30: this is every leg, not only the ones that discard
+/// `-force_key_frames`.** It returned `SEGMENT_MS` for a leg that honours the
+/// flag, on the reasoning that such a leg "cuts on time". It does not. **An
+/// IDR can only be placed on a frame**, so the expression picks the nearest
+/// one; it does not create a frame at 2.000 s. Measured through this crate's
+/// own start path on `libx264`, which honours the flag: `24000/1001` produced
+/// keys 83, 2085, 4087 — a cadence of **2002 ms**, not 2000. `25` and `60`
+/// produced 2000, because at those rates 2000 ms is a whole number of frames
+/// (50 and 120). `honours_force_key_frames` decides which arguments a leg is
+/// given; it does not decide where the frames are.
+///
+/// `None` means there is no honest answer and the caller must not invent one:
+/// either the source rate is unknown, or the frame count does not divide into
+/// whole milliseconds, in which case no integer-ms grid exists at all.
+// Wired to the spawn path by the phase change and to the playlist by the
+// full-title listing; this commit lands the arithmetic and its controls alone,
+// because the comment it corrects is what hid the defect and should not arrive
+// buried in a behaviour change.
+#[allow(dead_code)]
+/// Put this run's output on the grid every other run shares.
+///
+/// Without this each run is phased to its own land — the cue the map snapped
+/// it to — so two runs of the same session produce two unrelated sets of
+/// segment times. Measured at `c43b440`, three runs of one session produced
+/// first segments at `0`, `3780110` and `590632`: three phases, no shared
+/// grid, and nothing a full-title listing could name in advance.
+///
+/// `want` is already a grid multiple at or before the play land, so the cue
+/// (mapped) or lead-in start (`-ss`) is at or before it, and rounding that
+/// **up** to the grid can never overshoot the play land.
+///
+/// Transcode only. Copy places no IDRs and re-encodes nothing, so it cannot
+/// drop the `(cue, grid]` media and keeps its own phase.
+/// The grid this session's runs share, or `None` when they cannot share one.
+///
+/// `None` for copy and remux — they place no IDRs and cannot drop the
+/// `(cue, grid]` media — and for any session whose leg has no honest cadence,
+/// which keeps a per-run listing rather than inventing a grid.
+/// The cadence this session's producer writes at, for the map ingest.
+///
+/// Unlike [`grid_cadence_ms`] this is not gated on transcode: copy's keys are
+/// source keyframes and have no cadence to snap to, so it answers `None` there
+/// through [`produced_segment_ms`]'s own rate check only when a rate is
+/// absent. Copy is excluded by the mode test below for the same reason it is
+/// excluded from the grid — it places no IDRs.
+fn session_cadence_ms(session: &Session) -> Option<u64> {
+    grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_plan,
+    )
+}
+
+/// The points this session's listing names, for copy's key snap.
+///
+/// Copy's listing is the keyframe walk, which is irregular, so a produced key
+/// rounds onto the nearest listed point rather than onto a cadence. Empty when
+/// the session has no walk, and the caller then passes no snap at all.
+fn session_listed_points(session: &Session) -> Vec<u64> {
+    if session_cadence_ms(session).is_some() {
+        return Vec::new();
+    }
+    copy_window_entries(session)
+        .map(|entries| entries.into_iter().map(|(start, _)| start).collect())
+        .unwrap_or_default()
+}
+
+/// How this session's producer keys are put onto its listing's keys.
+fn session_key_snap<'a>(
+    cadence: Option<u64>,
+    points: &'a [u64],
+) -> Option<crate::hls_segment_map::KeySnap<'a>> {
+    match cadence {
+        Some(c) => Some(crate::hls_segment_map::KeySnap::Cadence(c)),
+        None if !points.is_empty() => Some(crate::hls_segment_map::KeySnap::Points(points)),
+        None => None,
+    }
+}
+
+fn grid_cadence_ms(mode: SessionMode, has_burn_in: bool, plan: &VideoEncodePlan) -> Option<u64> {
+    // Burn-in re-encodes video whatever the session mode says (ADR-0018), so
+    // it is transcode for this question.
+    let transcode = mode == SessionMode::Transcode || has_burn_in;
+    transcode.then(|| produced_segment_ms(plan))?
+}
+
+/// Is this want one the session's own playlist offers?
+///
+/// **The narrowing that lets a cold URI spawn behind the committed land.**
+/// [`digback_behind_committed`] declines a behind-committed GET as dig-back,
+/// which was right while the only such GETs were WebKit asking for URIs the
+/// session never offered. **A URI the playlist lists is not junk, it is the
+/// contract** — and under ADR-0054 decision 3 it must be served, in either
+/// direction.
+///
+/// So the guard keeps declining what it was built for (an unlisted want) and
+/// stops declining what it never intended (our own listing). Off the grid or
+/// past the extent is still unlisted and still 404s.
+///
+/// `false` for a session with no full-title listing — copy and remux, or a leg
+/// with no honest cadence — which leaves the guard exactly as it was for them.
+fn want_is_listed(session: &Session, want_ms: u64) -> bool {
+    // Ask the listing, not the cadence. A predicate that answers "on the grid"
+    // claims wants the playlist does not offer, and every caller reads this as
+    // "the session listed it".
+    let Some(entries) = full_title_entries(session) else {
+        return false;
+    };
+    entries
+        .binary_search_by_key(&want_ms, |(start, _)| *start)
+        .is_ok()
+}
+
+fn snap_plan_to_grid(plan: &mut StartPlan, produced_ms: u64) {
+    let cue = plan.window_start_ms;
+    let grid = cue.div_ceil(produced_ms) * produced_ms;
+    plan.drop_ms = grid - cue;
+    plan.window_start_ms = grid;
+}
+
+fn produced_segment_ms(plan: &VideoEncodePlan) -> Option<u64> {
+    let frames = u64::from(plan.gop_frames(SEGMENT_MS)?);
+    let (num, den) = plan.source_frame_rate?;
+    let (num, den) = (u64::from(num), u64::from(den));
+    if num == 0 {
+        return None;
+    }
+    let ms_numerator = frames * den * 1000;
+    // A cadence that is not a whole number of milliseconds has no integer grid
+    // to list, so say so rather than rounding one into existence.
+    (ms_numerator % num == 0).then_some(ms_numerator / num)
+}
+
 fn align_to_segment(ms: u64) -> u64 {
     (ms / SEGMENT_MS) * SEGMENT_MS
 }
@@ -2806,6 +3152,14 @@ struct StartPlan {
     container_kind: &'static str,
     /// Cost of the bind-time identity re-read (ADR-0023 §4).
     fingerprint_cost_ms: u128,
+    /// Media to decode and discard between the splice point and
+    /// [`window_start_ms`], so this run's output starts on the shared grid
+    /// rather than on its own land. Zero when there is no grid to share.
+    ///
+    /// The spike's locked decision: *"Transcode must not emit the (cue, land]
+    /// media: decode from the cue, drop until the grid."* Copy cannot do this
+    /// — it re-encodes nothing — so it never gets a non-zero value here.
+    drop_ms: u64,
     virtual_input: Option<crate::virtual_input::VirtualInput>,
 }
 
@@ -2864,6 +3218,7 @@ impl MapBinding {
                     start_path: "mapped",
                     container_kind: map.container_kind.as_str(),
                     fingerprint_cost_ms: cost_ms,
+                    drop_ms: 0,
                     virtual_input: bind.virtual_input,
                 };
                 self.map = Some(map);
@@ -2891,6 +3246,7 @@ fn ss_start_plan(src: &Path, play_start_ms: u64, fingerprint_cost_ms: u128) -> S
         start_path: "ss",
         container_kind: "-",
         fingerprint_cost_ms,
+        drop_ms: 0,
         virtual_input: None,
     }
 }
@@ -2949,7 +3305,17 @@ fn spawn_ffmpeg(
     let start_number = (start_ms / SEGMENT_MS).to_string();
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
     let force_kf = format!("expr:gte(t,n_forced*{segment_secs})");
-    let hls_time = format!("{segment_secs}");
+    // Copy cuts at source keyframes, so `-hls_time` is a target it rounds up
+    // to the next one. At 2 s that produced a segment per GOP — §S8 measured
+    // robotic audio and a video stall — and at COPY_WINDOW_MS it produces the
+    // windows the listing names. Transcode keeps SEGMENT_MS, where forced
+    // IDRs make the target exact.
+    let hls_time_ms = if mode == SessionMode::Copy {
+        COPY_WINDOW_MS
+    } else {
+        SEGMENT_MS
+    };
+    let hls_time = format!("{}", hls_time_ms as f64 / 1000.0);
     // Burn-in always re-encodes video (ADR-0018).
     let mode = if burn_in.is_some() {
         SessionMode::Transcode
@@ -2975,6 +3341,14 @@ fn spawn_ffmpeg(
         cmd.args(["-ss", &start_secs]);
     }
     cmd.arg("-i").arg(&input.input);
+    if input.drop_ms > 0 {
+        // Output-side seek: decode from the splice, discard until the grid.
+        // Before `-i` this would move the splice; after it, it moves where
+        // output begins, which is the whole point — every run then starts on
+        // the same grid instead of on its own land.
+        let drop_secs = format!("{}.{:03}", input.drop_ms / 1000, input.drop_ms % 1000);
+        cmd.args(["-ss", &drop_secs]);
+    }
     if start_ms > 0 {
         // ADR-0020: load-bearing under copy. Does not rewrite tfdt/trun (those
         // stay segment-local at 0); it stamps title-absolute time into the
@@ -3952,6 +4326,7 @@ mod tests {
             0,
             &fs::read_to_string(session_dir.join("run_0/index.m3u8")).unwrap(),
             0,
+            None,
         )
         .unwrap();
         session.current_run_id = 1;
@@ -4282,14 +4657,358 @@ mod tests {
         );
     }
 
+    /// Every run shares one grid, whatever land it was snapped to.
+    ///
+    /// Without this each run is phased to its own cue. Measured at `c43b440`,
+    /// three runs of one session started at `0`, `3780110` and `590632`.
+    #[test]
+    fn snapping_puts_every_run_on_one_phase() {
+        let plan_for = |cue: u64| StartPlan {
+            input: std::ffi::OsString::from("/dev/null"),
+            window_start_ms: cue,
+            seek_input: false,
+            start_path: "mapped",
+            container_kind: "matroska",
+            fingerprint_cost_ms: 0,
+            drop_ms: 0,
+            virtual_input: None,
+        };
+
+        // The three cues measured on the N150, against the 2002 ms cadence
+        // that hardware actually produces.
+        for cue in [0u64, 3_780_110, 590_632] {
+            let mut plan = plan_for(cue);
+            snap_plan_to_grid(&mut plan, 2002);
+            assert_eq!(
+                plan.window_start_ms % 2002,
+                0,
+                "cue {cue} must land on the shared grid, not its own phase"
+            );
+            assert_eq!(
+                plan.window_start_ms - plan.drop_ms,
+                cue,
+                "the drop is exactly the media between the cue and the grid"
+            );
+            assert!(
+                plan.drop_ms < 2002,
+                "never drop a whole segment: {} at cue {cue}",
+                plan.drop_ms
+            );
+        }
+
+        // A cue already on the grid drops nothing.
+        let mut on_grid = plan_for(4004);
+        snap_plan_to_grid(&mut on_grid, 2002);
+        assert_eq!(on_grid.window_start_ms, 4004);
+        assert_eq!(on_grid.drop_ms, 0, "a cue on the grid has nothing to drop");
+    }
+
+    /// Copy never gets a grid: it re-encodes nothing, so it cannot drop the
+    /// media between the cue and the grid.
+    #[test]
+    fn only_transcode_gets_a_shared_grid() {
+        let film = VideoEncodePlan {
+            source_frame_rate: Some((24000, 1001)),
+            ..VideoEncodePlan::default()
+        };
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Transcode, false, &film),
+            Some(2002)
+        );
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Copy, false, &film),
+            None,
+            "copy cannot drop to a grid and must keep its own phase"
+        );
+        // Burn-in re-encodes video whatever the mode says (ADR-0018).
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Copy, true, &film),
+            Some(2002),
+            "burn-in is a transcode for this question"
+        );
+        // No honest cadence means no grid, even for transcode.
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Transcode, false, &VideoEncodePlan::default()),
+            None
+        );
+    }
+
+    /// The narrowing keeps what the dig-back guard was built for.
+    ///
+    /// `digback_behind_committed` declines a behind-committed GET as junk. A
+    /// URI the playlist lists is not junk, so the guard now yields to it — but
+    /// **an unlisted want must still decline**, or a prefetching client turns
+    /// a full-title listing into the restart storm the guard was measured to
+    /// stop.
+    #[test]
+    fn only_a_listed_want_escapes_the_digback_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 1_354_496);
+        session.mode = SessionMode::Transcode;
+        session.encode_plan = VideoEncodePlan {
+            source_frame_rate: Some((24000, 1001)),
+            ..VideoEncodePlan::default()
+        };
+        // 48 frames at 24000/1001 is 2002 ms, whatever the leg is told.
+        let step = 2002;
+
+        assert!(
+            want_is_listed(&session, 40 * step),
+            "on the grid and inside the title is listed"
+        );
+        assert!(
+            !want_is_listed(&session, 40 * step + 1),
+            "off the grid is not listed and must keep declining"
+        );
+        assert!(
+            !want_is_listed(&session, 2_000_000),
+            "past the extent is not listed and must keep declining"
+        );
+
+        // Copy has no full-title listing yet, so the guard is untouched for it.
+        session.mode = SessionMode::Copy;
+        assert!(
+            !want_is_listed(&session, 40 * step),
+            "a session with no full-title listing offers nothing to escape with"
+        );
+    }
+
+    /// The playlist lists the whole title, not the run's window.
+    ///
+    /// **This needs a declared source rate.** Without one there is no honest
+    /// cadence, so no grid, so no full-title listing — and 53 of this file's
+    /// sessions pass `VideoEncodePlan::default()`, which reaches the per-run
+    /// path instead. A green suite is not evidence for this listing; these
+    /// are.
+    #[test]
+    fn the_playlist_lists_the_whole_title_not_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 1_354_496);
+        // `eof_test_session` builds a Copy session; the full-title listing is
+        // transcode's, so say so rather than inheriting it.
+        session.mode = SessionMode::Transcode;
+        session.encode_plan = plan_25fps();
+        session.start_ms = 400_000;
+        session.play_start_ms = 400_000;
+
+        let pl = build_run_media_playlist("s1", &session);
+        let text = String::from_utf8_lossy(&pl);
+
+        assert!(
+            text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"),
+            "a run landed at 400 s still lists the title from 0: {text}"
+        );
+        assert!(
+            text.contains("/api/v0/sessions/s1/seg_00001354000.m4s"),
+            "and lists to the usable extent"
+        );
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(!text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(text.contains("#EXT-X-ENDLIST"));
+        assert!(
+            text.contains("#EXT-X-START:TIME-OFFSET=400.000,PRECISE=YES"),
+            "the attach point is the land, not the first entry: {text}"
+        );
+
+        // 1354496 / 2000 entries, and the last one is short rather than past
+        // the extent.
+        let listed = text.matches("seg_").count();
+        assert_eq!(listed, 678, "0..1354496 on a 2000 ms grid");
+    }
+
+    /// Copy lists the whole title too, on the greedy 20 s keyframe walk.
+    ///
+    /// Until this commit copy had no full-title listing and this test asserted
+    /// that. **That was a waypoint, not a decision** — the only difference
+    /// between the modes is the grid, and both are full-title VOD.
+    #[test]
+    fn copy_lists_the_whole_title_on_the_keyframe_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 100_000);
+        session.mode = SessionMode::Copy;
+        session.encode_plan = plan_25fps();
+        // Keyframes every 8 s, so a 20 s walk takes every third one.
+        session.map_binding.map = Some(KeyframeMap {
+            container_kind: MapContainerKind::Matroska,
+            content_id: "probe".into(),
+            entries: (0..13)
+                .map(|i| KeyframeEntry {
+                    pts_ms: i * 8_000,
+                    byte_offset: i * 1_000,
+                })
+                .collect(),
+        });
+
+        let entries = copy_window_entries(&session).expect("copy lists from its map");
+        let starts: Vec<u64> = entries.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            starts,
+            vec![0, 24_000, 48_000, 72_000, 96_000],
+            "the first keyframe at or after each 20 s boundary, not the boundary"
+        );
+        assert!(
+            starts.windows(2).all(|w| w[1] - w[0] >= COPY_WINDOW_MS),
+            "every window holds at least COPY_WINDOW_MS of media"
+        );
+        assert_eq!(
+            entries.last().map(|(s, d)| s + d),
+            Some(100_000),
+            "the last window runs to the extent, not past it"
+        );
+
+        // The walk depends only on the map and 0, which is what makes it
+        // listable before anything is written. Where this run started must not
+        // change it.
+        session.start_ms = 48_000;
+        session.play_start_ms = 48_000;
+        let after_seek: Vec<u64> = copy_window_entries(&session)
+            .expect("still lists")
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(starts, after_seek, "the listing is run-independent");
+
+        let pl = build_run_media_playlist("s1", &session);
+        let text = String::from_utf8_lossy(&pl);
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(!text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
+        assert!(text.contains("/api/v0/sessions/s1/seg_00000024000.m4s"));
+    }
+
+    /// Without a keyframe map, copy's cut points are not knowable ahead of
+    /// time, so that session keeps the per-run listing.
+    #[test]
+    fn copy_without_a_map_keeps_the_per_run_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 100_000);
+        session.mode = SessionMode::Copy;
+        session.encode_plan = plan_25fps();
+        assert!(session.map_binding.map.is_none());
+        assert!(
+            full_title_entries(&session).is_none(),
+            "an -ss copy run cannot say where it will cut"
+        );
+    }
+
+    /// A cold listed URI starts an encoder (ADR-0054 decision 3).
+    ///
+    /// Each arm is a want no run is heading towards. Under the policy this
+    /// reverses every one of them returned `Wait`, and a full-title listing
+    /// would have held them to `IDLE_TIMEOUT`.
+    #[test]
+    fn a_cold_listed_uri_restarts_rather_than_waiting_forever() {
+        let long_ago = RESTART_MIN_INTERVAL * 2;
+        let frontier = Some(40_000);
+
+        // Behind the encode window: this run produces forward and never
+        // returns to it.
+        assert_eq!(
+            decide_segment_miss(10_000, 30_000, 40_000, frontier, true, long_ago),
+            SegmentMissAction::Restart,
+            "a want behind the window is never produced by this run"
+        );
+
+        // Further ahead than the catch-up band: waiting is a stall, not a cook.
+        let far = 40_000 + (CATCH_UP_SEGMENTS + 3) * SEGMENT_MS;
+        assert_eq!(
+            decide_segment_miss(far, 30_000, 40_000, frontier, true, long_ago),
+            SegmentMissAction::Restart,
+            "a want past the catch-up band is not reachable by fill-forward"
+        );
+
+        // Inside the band is a cook, and still waits.
+        let near = 40_000 + CATCH_UP_SEGMENTS * SEGMENT_MS;
+        assert_eq!(
+            decide_segment_miss(near, 30_000, 40_000, frontier, true, long_ago),
+            SegmentMissAction::Wait,
+            "the producer is heading for this one"
+        );
+    }
+
+    /// The two guards that stop a prefetching client turning a full-title
+    /// listing into a restart storm.
+    #[test]
+    fn a_cold_uri_does_not_restart_while_starting_or_inside_the_interval() {
+        let far = 400_000;
+
+        assert_eq!(
+            decide_segment_miss(far, 30_000, 40_000, Some(40_000), true, Duration::ZERO),
+            SegmentMissAction::Wait,
+            "inside RESTART_MIN_INTERVAL nothing restarts, however cold the want"
+        );
+
+        assert_eq!(
+            decide_segment_miss(far, 30_000, 40_000, None, false, RESTART_MIN_INTERVAL * 2),
+            SegmentMissAction::Wait,
+            "a run that has served nothing has no frontier to be far from"
+        );
+    }
+
+    /// The cadence a leg will actually produce, which is not always the one
+    /// the session asked for.
+    #[test]
+    fn produced_segment_ms_follows_the_frames_not_the_constant() {
+        let plan_at = |num, den| VideoEncodePlan {
+            source_frame_rate: Some((num, den)),
+            ..VideoEncodePlan::default()
+        };
+        let film = plan_at(24000, 1001);
+
+        // The cadence is the frame count, on every leg. An IDR lands on a
+        // frame, so a leg that honours -force_key_frames picks the nearest
+        // one rather than creating a frame at 2.000 s. Measured on libx264 —
+        // which honours it — at 24000/1001: keys 83, 2085, 4087, spacing 2002.
+        assert_eq!(
+            produced_segment_ms(&film),
+            Some(2002),
+            "48 frames at 24000/1001 is 2002 ms, whatever the leg is told"
+        );
+
+        // Rates where 2000 ms is a whole number of frames still land on it.
+        assert_eq!(
+            produced_segment_ms(&plan_at(60, 1)),
+            Some(2000),
+            "120 frames"
+        );
+        assert_eq!(
+            produced_segment_ms(&plan_at(25, 1)),
+            Some(2000),
+            "50 frames"
+        );
+        assert_eq!(produced_segment_ms(&plan_at(30000, 1001)), Some(2002));
+
+        // No rate is no answer. The caller falls back to a per-run listing
+        // rather than listing a grid it cannot justify.
+        assert_eq!(
+            produced_segment_ms(&VideoEncodePlan::default()),
+            None,
+            "no source rate means no honest cadence"
+        );
+
+        // A cadence that is not whole milliseconds has no integer grid to
+        // list. 7/3 is constructed to exercise that guard, not a real rate:
+        // 5 frames at 7/3 fps is 15000/7 ms, which is not an integer.
+        assert_eq!(
+            produced_segment_ms(&plan_at(7, 3)),
+            None,
+            "a fractional-millisecond cadence has no grid, and must not be rounded into one"
+        );
+    }
+
     #[test]
     fn gop_frames_follow_the_source_rate() {
         let plan_at = |num, den| VideoEncodePlan {
             source_frame_rate: Some((num, den)),
             ..VideoEncodePlan::default()
         };
-        // 23.976 fps: 48 frames is exactly 2 s, which is why the constant
-        // looked right for years on one corpus.
+        // 23.976 fps: 48 frames is 2.002 s, not 2 s. 2000 ms is 47.952
+        // frames, so no frame count hits the grid at this rate, and this
+        // comment claimed the opposite until 2026-08-30. That claim is why
+        // nobody checked: measured on the N150 at c43b440, 1061 of 1062
+        // segment starts were off the 2000 ms grid, modal delta 2002 ms.
+        // `produced_segment_ms` is the honest cadence; `gop_frames` is only
+        // the frame count that produces it.
         assert_eq!(plan_at(24000, 1001).gop_frames(2000), Some(48));
         assert_eq!(plan_at(24, 1).gop_frames(2000), Some(48));
         // 60 fps needs 120. A hardcoded 48 would cut every 0.8 s here.
@@ -4595,13 +5314,18 @@ mod tests {
             .unwrap_or_else(|| panic!("no time-keyed segment in playlist"))
     }
 
-    /// Producer sidx land for a mid-start / seek window (may be tens of ms
-    /// off the aligned play ms — do not hardcode `seg_00000040000`).
+    /// Producer land for a mid-start / seek window (may be tens of ms off the
+    /// aligned play ms — do not hardcode `seg_00000040000`).
+    ///
+    /// **Read from the session view, not from the first listed URI.** The
+    /// first entry was the land while the playlist listed one window; a
+    /// full-title listing starts at 0 for every session, so the playlist no
+    /// longer says where a run landed. `landedMs` is what a client reads, and
+    /// after the grid snap it is exactly the first segment this run writes.
     fn wait_land_near(reg: &HlsSessionRegistry, id: &str, play_ms: u64) -> (String, u64) {
-        let playlist = wait_playlist(reg, id);
-        let name = first_listed_seg(&playlist);
-        let ms = crate::hls_segment_map::parse_time_keyed_segment_name(&name)
-            .expect("listed segment parses");
+        let _ = wait_playlist(reg, id);
+        let ms = reg.view(id).expect("session view").landed_ms;
+        let name = crate::hls_segment_map::time_keyed_segment_name(ms);
         let slack = SEGMENT_MS.saturating_mul(2);
         assert!(
             ms + slack >= play_ms && ms < play_ms.saturating_add(slack),
@@ -4669,26 +5393,41 @@ mod tests {
     fn segment_miss_decision_table() {
         let cool = RESTART_MIN_INTERVAL;
         let hot = Duration::from_millis(0);
-        // ADR-0020: segment GETs never Restart. Far scrub is POST /seek.
+        // Overturned 2026-08-30. Every row said Wait under ADR-0020's "segment
+        // GETs never Restart". Three of them are now Restart, because a
+        // full-title listing names URIs fill-forward cannot reach and Wait on
+        // those never ends. The two that still Wait are the guards that keep
+        // a prefetching client from restart-storming.
         let cases = [
             (
-                "behind window waits (no dig-back restart)",
+                "behind window restarts: this run never produces it",
                 0,
                 600,
                 616,
                 None,
                 false,
                 cool,
+                SegmentMissAction::Restart,
             ),
-            ("near behind play waits", 0, 4, 4, Some(10), true, cool),
             (
-                "far ahead of frontier waits (seek API owns scrub)",
+                "just behind the window still restarts: direction, not distance",
+                0,
+                4,
+                4,
+                Some(10),
+                true,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "far ahead of frontier restarts: waiting there is a stall",
                 20,
                 4,
                 4,
                 Some(10),
                 true,
                 cool,
+                SegmentMissAction::Restart,
             ),
             (
                 "near frontier waits (cooking)",
@@ -4698,6 +5437,7 @@ mod tests {
                 Some(10),
                 true,
                 cool,
+                SegmentMissAction::Wait,
             ),
             (
                 "hot restart interval still waits",
@@ -4707,9 +5447,10 @@ mod tests {
                 Some(10),
                 true,
                 hot,
+                SegmentMissAction::Wait,
             ),
         ];
-        for (name, idx, window, play, latest, primed, since) in cases {
+        for (name, idx, window, play, latest, primed, since, want) in cases {
             assert_eq!(
                 decide_segment_miss(
                     idx * SEGMENT_MS,
@@ -4719,14 +5460,18 @@ mod tests {
                     primed,
                     since,
                 ),
-                SegmentMissAction::Wait,
+                want,
                 "{name}"
             );
         }
     }
 
     #[test]
-    fn miss_never_restarts_encode_from_segment_get() {
+    fn miss_restarts_behind_the_window_and_keeps_the_seek_arithmetic() {
+        // These three were `Wait` under ADR-0020's miss policy. Each is a want
+        // behind its run's encode window, which that run never produces, so
+        // each is now a Restart. The `encode_start_ms` assertion below is what
+        // this test was also guarding and is unchanged.
         let cases = [(1040u64, 1052u64), (0u64, 4u64), (1610u64, 1614u64)];
         for (idx, window) in cases {
             let action = decide_segment_miss(
@@ -4737,7 +5482,7 @@ mod tests {
                 true,
                 RESTART_MIN_INTERVAL,
             );
-            assert_eq!(action, SegmentMissAction::Wait, "idx={idx}");
+            assert_eq!(action, SegmentMissAction::Restart, "idx={idx}");
             let want_ms = idx * SEGMENT_MS;
             let new_window = encode_start_ms(want_ms) / SEGMENT_MS;
             assert_eq!(
@@ -5190,11 +5935,12 @@ mod tests {
                 true,
                 RESTART_MIN_INTERVAL,
             ),
-            SegmentMissAction::Wait
+            SegmentMissAction::Restart,
+            "a dig-back want is behind the window, so the miss decision is Restart"
         );
         assert!(
             digback_behind_committed(cooking, None, dig),
-            "asset_wait must skip desire_restart for this miss"
+            "and the dig-back guard is what still decides, at the call site"
         );
     }
 
@@ -5332,7 +6078,7 @@ mod tests {
     /// Same-run fill-forward may eventually produce the bytes; that is not a
     /// scrub. What must not happen is a new `run_id` without POST /seek.
     #[test]
-    fn segment_miss_without_seek_cannot_cook_far_ahead() {
+    fn a_far_ahead_listed_want_cooks_and_the_seek_path_still_works() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -5371,16 +6117,20 @@ mod tests {
             !String::from_utf8_lossy(&playlist).contains(&land),
             "far-ahead segment must not already be listed"
         );
-        // Miss may Wait/404/abandon, or Ok via same-run fill-forward — never
-        // a new producer run.
+        // Overturned 2026-08-30: a listed want past the catch-up band is a
+        // cold URI, and ADR-0054 decision 3 makes it a seek. It used to be
+        // declined here, which a full-title listing turns into a hold that
+        // never ends.
         let _ = reg.asset(&id, &land, None);
-        let run_after_miss = {
+        let (run_after_miss, pending) = {
             let sessions = reg.sessions.lock().unwrap();
-            sessions.get(&id).unwrap().current_run_id
+            let session = sessions.get(&id).unwrap();
+            (session.current_run_id, session.pending_play_ms)
         };
-        assert_eq!(
-            run_after_miss, run_before,
-            "segment miss must not cook a far-ahead land"
+        assert!(
+            run_after_miss != run_before || pending == Some(land_ms),
+            "a far-ahead listed want must cook: run {run_before} -> \
+             {run_after_miss}, pending {pending:?}"
         );
 
         let view = reg.seek(&id, land_ms).expect("seek");
@@ -5599,10 +6349,14 @@ mod tests {
             !wait_asset(&reg, &switched, &land).is_empty(),
             "play-land segment servable"
         );
+        // Overturned 2026-08-30: a want behind the window is one this run
+        // never produces, so waiting on it never ends. Whether it actually
+        // cooks is decided at the call site by the dig-back guard, which now
+        // yields only to a want the playlist lists.
         assert_eq!(
             decide_segment_miss(0, 40_000, 40_000, None, false, RESTART_MIN_INTERVAL),
-            SegmentMissAction::Wait,
-            "seg at t=0 behind a 40s window must wait"
+            SegmentMissAction::Restart,
+            "seg at t=0 behind a 40s window is not reachable by fill-forward"
         );
 
         // Behind encode window: unlisted under producer-truth → 404, not a
@@ -5706,7 +6460,11 @@ mod tests {
         );
         let playlist = wait_playlist(&reg, &id);
         let text = String::from_utf8_lossy(&playlist);
-        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{text}");
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{text}");
+        assert!(
+            !text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "EVENT is gone from every mode: {text}"
+        );
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=0.000"), "{text}");
         let land = first_listed_seg(&playlist);
         assert!(reg.asset(&id, &land, None).is_ok(), "land={land}");
@@ -7829,6 +8587,28 @@ mod tests {
         assert_audio_decodes(joined);
     }
 
+    /// Where a transcode run whose splice landed on `cue_ms` now starts.
+    ///
+    /// Runs no longer keep the cue's own phase. `snap_plan_to_grid` moves the
+    /// output up to the grid every run shares and drops the media between, so
+    /// a full-title listing can name the entries in advance. The splice still
+    /// opens at the cue — that is what `map_binding.bound` and `!fell_back`
+    /// assert beside this.
+    /// The mapped fixtures are `testsrc rate=25`, where 2000 ms is exactly 50
+    /// frames, so the produced cadence is `SEGMENT_MS`. Declaring the rate is
+    /// what gives the session a grid at all: without it `produced_segment_ms`
+    /// is `None` and no run is snapped.
+    fn plan_25fps() -> VideoEncodePlan {
+        VideoEncodePlan {
+            source_frame_rate: Some((25, 1)),
+            ..VideoEncodePlan::default()
+        }
+    }
+
+    fn grid_start(cue_ms: u64) -> u64 {
+        cue_ms.div_ceil(SEGMENT_MS) * SEGMENT_MS
+    }
+
     const MAPPED_FIXTURE_MS: u64 = 12_000;
 
     /// ADR-0023 §3a: the Matroska splice opens at the land Cluster with no
@@ -7858,7 +8638,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -7871,12 +8651,14 @@ mod tests {
             );
             assert!(!session.map_binding.fell_back);
             assert_eq!(
-                session.start_ms, land_ms,
-                "encode window is the land Cluster PTS, not an -ss lead-in"
+                session.start_ms,
+                grid_start(land_ms),
+                "the splice opens at the land Cluster and the output starts on \
+                 the shared grid above it, not on an -ss lead-in"
             );
         }
         let joined = run_to_eof_and_join(&reg, &id, dir.path());
-        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+        assert_av_landed(&joined, grid_start(land_ms), MAPPED_FIXTURE_MS);
     }
 
     /// A seek re-splices at the new land: the session keeps the map, so the
@@ -7908,7 +8690,7 @@ mod tests {
                 vec![],
                 None,
                 Some(map),
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -7920,11 +8702,11 @@ mod tests {
             let sessions = reg.sessions.lock().unwrap();
             let session = sessions.get(&id).unwrap();
             assert!(session.map_binding.bound.is_some(), "seek re-splices");
-            assert_eq!(session.start_ms, land_ms);
+            assert_eq!(session.start_ms, grid_start(land_ms));
         }
         assert!(!reg.map_fallback(&id), "rebind must hold across a seek");
         let joined = run_to_eof_and_join(&reg, &id, dir.path());
-        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+        assert_av_landed(&joined, grid_start(land_ms), MAPPED_FIXTURE_MS);
     }
 
     /// Copy leaves the source frames untouched, so a splice that lands
@@ -8344,7 +9126,7 @@ mod tests {
                 vec![],
                 None,
                 None,
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -8364,8 +9146,10 @@ mod tests {
                 "seek must use the map the bounded wait produced"
             );
             assert_eq!(
-                session.start_ms, land_ms,
-                "encode window is the land Cluster PTS, not an -ss lead-in"
+                session.start_ms,
+                grid_start(land_ms),
+                "the splice opens at the land Cluster and the output starts on \
+                 the shared grid above it, not on an -ss lead-in"
             );
         }
         assert!(!reg.map_fallback(&id), "map landed; no §8 fallback");
@@ -8570,7 +9354,7 @@ mod tests {
                 vec![],
                 None,
                 None,
-                VideoEncodePlan::default(),
+                plan_25fps(),
                 None,
             )
             .unwrap();
@@ -8586,8 +9370,10 @@ mod tests {
                 "start must use the map the bounded wait produced"
             );
             assert_eq!(
-                session.start_ms, land_ms,
-                "encode window is the land Cluster PTS, not an -ss lead-in"
+                session.start_ms,
+                grid_start(land_ms),
+                "the splice opens at the land Cluster and the output starts on \
+                 the shared grid above it, not on an -ss lead-in"
             );
         }
         assert!(!reg.map_fallback(&id), "map landed; no §8 fallback");
