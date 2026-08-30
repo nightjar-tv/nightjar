@@ -1,9 +1,13 @@
 # ADR-0054: The transcode playlist lists the whole title
 
-- Status: **proposed**
+- Status: **proposed** (decisions 1 and 2 corrected 2026-08-31 by measurement,
+  and decision 3 now names what it overturns; see each in place)
 - Date: 2026-08-23
 - Supersedes: [ADR-0020](0020-copy-mode-segment-boundaries.md) §4's per-run
-  window listing, for `SessionMode::Transcode` only. Copy and remux keep it.
+  window listing, **in every mode** — corrected 2026-08-31; it read
+  "`SessionMode::Transcode` only, copy and remux keep it" until copy's own
+  listing was measured. Also supersedes ADR-0020's **miss policy**: see
+  decision 3.
 - Depends on: [ADR-0023](0023-cluster-map-byte-offset-start.md) (keyframe map,
   byte-offset start); [ADR-0050](0050-lead-held-session-shape.md) (the session
   shape, and the seek that answers a cold URI);
@@ -56,6 +60,32 @@ and its own map. The 2 s grid holds on all three rungs.
    listing is honest because forced IDRs put every boundary on
    `N × SEGMENT_MS`, which ADR-0020 §2 states itself.
 
+   > **Corrected 2026-08-31 — the boundaries are frame-quantised, not
+   > `N × SEGMENT_MS`.** The sentence above is what this decision claimed and
+   > it is false. **An IDR can only be placed on a frame**, so
+   > `-force_key_frames` picks the nearest one; it does not create a frame at
+   > 2.000 s. `SEGMENT_MS` is only a boundary when the source rate divides it
+   > into whole frames.
+   >
+   > Measured at `c43b440` on the N150, `h264_qsv`, 1080p h264: **1061 of 1062
+   > distinct segment starts were off the 2000 ms grid**, modal consecutive
+   > delta **2002 ms** across 923 pairs. Measured again through the transcode
+   > start path on `libx264`, which *does* honour `-force_key_frames`:
+   > `24000/1001` produced keys 83, 2085, 4087 — cadence 2002. `25` and `60`
+   > produced 2000, because 2000 ms is 50 and 120 frames exactly.
+   >
+   > **So this applies to every leg, not only the ones that ignore the flag.**
+   > At 23.976 the segments are 2002 ms apart on software and VideoToolbox as
+   > well as on QSV.
+   >
+   > **The decision stands; its arithmetic does not.** The listing is honest
+   > because it names the cadence the leg will actually produce, derived from
+   > the source rate, rather than asserting a constant. `produced_segment_ms`
+   > answers it and returns `None` when there is no honest answer — no source
+   > rate, or a cadence that is not whole milliseconds — and the session then
+   > keeps a per-run listing rather than naming a grid it cannot justify.
+   > Shipped in #182.
+
 2. **Copy and remux keep the per-run map-assembled playlist** of ADR-0020 §4.
    Copy cuts at source keyframes and cannot hold a uniform grid: on a healthy
    title, 77% of the URIs a synthetic grid listed were never written. That is a
@@ -64,12 +94,56 @@ and its own map. The 2 s grid holds on all three rungs.
    is session mode, and the reason is recorded here rather than left as an
    unexplained fork.
 
+   > **Corrected 2026-08-31 — copy lists the whole title too, on a 20 s
+   > grid.** What the 77% measured is that **copy cannot hold a 2 s grid**,
+   > not that it cannot have a full-title listing. That figure is ADR-0020's,
+   > dated 2026-07-31, on a synthetic 2 s grid over Elementary 3x05.
+   >
+   > **§S8 of `nightjar-meta`'s `stay-ahead-vt-2026-08-20.md` measured the
+   > 20 s shape three days before this ADR was written, and this decision
+   > cited the 77% instead.** A human trial on a real title: the 2 s grid gave
+   > one FFmpeg per skipped cue, a 4 s worst wait, and on the second seek a
+   > video stall with audio that went robotic and stayed. One MPEG-TS per 20 s
+   > window was **"stable"** — 67 windows listed, 20 on disk, last first byte
+   > 574 ms. §S8b confirmed it on iPhone with `-c:a copy`.
+   >
+   > **And it is now measured against this product**, which §S8 was not — that
+   > spike never calls the session API. On the N150, two titles and both copy
+   > variants: the producer cut one segment per 20 s window at exactly the
+   > keyframes predicted, and **8 of 8 listed URIs served `200` in 42-288 ms**.
+   >
+   > **What makes it listable is that copy's cut points are already known.**
+   > The keyframe map (ADR-0023) holds every one, so the listing is the greedy
+   > 20 s walk of that map from 0 — run-independent, and therefore nameable
+   > before anything is written. No per-window cook is needed.
+   >
+   > **What survives of this decision**: copy keeps a coarser grid, and
+   > **scrub granularity is the window, not 2 s. Fine-grained seek stays
+   > transcode.** Shipped in #182.
+
 3. **A listed URI is never 404 and never 503.** The request is held until that
    segment lands in the store, and released then — not when the encoder that
    produced it finishes. A cold URI is a seek: the session starts an encoder at
    that media time (ADR-0050 §4), measured at a 976 to 1132 ms median and under
    2.4 s worst case. 404 is reserved for a URI outside the title or off the
    grid.
+
+   > **This overturns ADR-0020's miss policy, and did not say so until
+   > 2026-08-31.** That policy is *"segment GETs never move the encode window;
+   > far scrub is `POST /seek`"*, and it is the negation of the sentence above
+   > on the same path for the same request. Both were on the books from
+   > 2026-08-23 to 2026-08-31.
+   >
+   > It went unnoticed because fill-forward covers every listed URI while the
+   > playlist lists one window. **A full-title listing names URIs no encoder is
+   > near**, and for those `Wait` never ends: the hold runs to `IDLE_TIMEOUT`
+   > and returns an empty 204.
+   >
+   > **The policy had three sites**, all narrowed in #182 to yield only to a
+   > want the playlist lists: `decide_segment_miss`, the
+   > `digback_behind_committed` gate, and a `want_ms < window_start` 404 in the
+   > wait loop. **An unlisted want still declines**, which is what the dig-back
+   > guard was measured to be for.
 
    Holding is viable because the wait is bounded by a spawn, and only because
    of that. ADR-0011 paired full-title listing with an unbounded wait and

@@ -1,6 +1,9 @@
 # ADR-0020: Producer-owned segment boundaries (time-keyed)
 
-- Status: accepted
+- Status: accepted (the **miss policy** is overturned 2026-08-31 by
+  [ADR-0054](0054-full-title-playlist-for-transcode.md) decision 3; the 77%
+  figure is re-scoped the same day by its decision 2 — both marked in place
+  below)
 - Date: 2026-07-31
 
 ## Context
@@ -14,6 +17,15 @@ indexes by `N × SEGMENT_MS`. The server deletes FFmpeg's own `index.m3u8` on
 every `restart_at` and replaces it with that synthetic body.
 
 Measured on a healthy WEBDL title (Elementary 3x05, mid-seek, Copy):
+
+> **Re-scoped 2026-08-31. This measures a 2 s grid, and was read as excluding
+> copy from any full-title listing.** ADR-0054 decision 2 cited it for that
+> exclusion. §S8 of `nightjar-meta`'s `stay-ahead-vt-2026-08-20.md` measured a
+> **20 s** window on a real title three days before that ADR was written and
+> found it stable, and it is now measured against the product: 8 of 8 listed
+> URIs served. **Copy cannot hold a 2 s grid — which is what the table below
+> says — and it can hold a full-title listing on a coarser one.** The figure is
+> correct; the conclusion drawn from it was wider than the measurement.
 
 | Fact | Value |
 |---|---|
@@ -36,6 +48,25 @@ tail.
 
 **Root question:** who owns segment boundaries — not "windowed vs full-title"
 as a first fork.
+
+## The miss policy is overturned, 2026-08-31
+
+> **Segment GETs never move the encode window. Far scrub is
+> `POST /sessions/{id}/seek`. A miss is always Wait.**
+
+That is what this ADR shipped, stated in `decide_segment_miss`'s own doc
+comment, and **ADR-0054 decision 3 is its negation**: *"a cold URI is a seek:
+the session starts an encoder at that media time."* Both were on the books from
+2026-08-23 until this was written.
+
+**The reason it held here is in this ADR's own last clause**: the Restart bands
+were removed because *"that playlist is gone"* — the synthetic full-title VOD.
+**ADR-0054 brings that playlist back**, and fill-forward only reaches a want
+while every listed URI sits near the running producer, which is true of a
+one-window listing and false of a full-title one.
+
+Overturned in #182, at all three sites that carried it. **An unlisted want
+still declines**, which is what the guard was measured to be for.
 
 ### Why the probe killed full-title VOD
 
