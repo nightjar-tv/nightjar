@@ -1168,7 +1168,12 @@ impl HlsSessionRegistry {
             map_binding.map =
                 wait_for_map_build(item_id, self.db.as_ref(), map_build_in_flight.as_ref());
         }
-        let mut plan = map_binding.plan(src, play_start_ms);
+        let grid = grid_cadence_ms(mode, burn_in.is_some(), &self.encode_leg, &encode_plan);
+        let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
+        let mut plan = map_binding.plan(src, want);
+        if let Some(p) = grid {
+            snap_plan_to_grid(&mut plan, p);
+        }
         let start_ms = plan.window_start_ms;
         write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
         let burn_in =
@@ -2143,7 +2148,20 @@ fn restart_at(
             session.map_build_in_flight.as_ref(),
         );
     }
-    let mut plan = session.map_binding.plan(&session.src, play_start_ms);
+    // Bind at the grid point at or before the land, not at the land, so the
+    // cue this snaps to is at or before a grid point and the snap up can
+    // never overshoot the play land.
+    let grid = grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_leg,
+        &session.encode_plan,
+    );
+    let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
+    let mut plan = session.map_binding.plan(&session.src, want);
+    if let Some(p) = grid {
+        snap_plan_to_grid(&mut plan, p);
+    }
     let start_ms = plan.window_start_ms;
     write_run_encode_start(&run_dir, start_ms).map_err(PlaylistError::Failed)?;
     let burn_in = prepare_ass_burn_file(&session.src, &session.dir, session.burn_in.clone())
@@ -2582,6 +2600,44 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
 // because the comment it corrects is what hid the defect and should not arrive
 // buried in a behaviour change.
 #[allow(dead_code)]
+/// Put this run's output on the grid every other run shares.
+///
+/// Without this each run is phased to its own land — the cue the map snapped
+/// it to — so two runs of the same session produce two unrelated sets of
+/// segment times. Measured at `c43b440`, three runs of one session produced
+/// first segments at `0`, `3780110` and `590632`: three phases, no shared
+/// grid, and nothing a full-title listing could name in advance.
+///
+/// `want` is already a grid multiple at or before the play land, so the cue
+/// (mapped) or lead-in start (`-ss`) is at or before it, and rounding that
+/// **up** to the grid can never overshoot the play land.
+///
+/// Transcode only. Copy places no IDRs and re-encodes nothing, so it cannot
+/// drop the `(cue, grid]` media and keeps its own phase.
+/// The grid this session's runs share, or `None` when they cannot share one.
+///
+/// `None` for copy and remux — they place no IDRs and cannot drop the
+/// `(cue, grid]` media — and for any session whose leg has no honest cadence,
+/// which keeps a per-run listing rather than inventing a grid.
+fn grid_cadence_ms(
+    mode: SessionMode,
+    has_burn_in: bool,
+    leg: &crate::EncodeLeg,
+    plan: &VideoEncodePlan,
+) -> Option<u64> {
+    // Burn-in re-encodes video whatever the session mode says (ADR-0018), so
+    // it is transcode for this question.
+    let transcode = mode == SessionMode::Transcode || has_burn_in;
+    transcode.then(|| produced_segment_ms(leg, plan))?
+}
+
+fn snap_plan_to_grid(plan: &mut StartPlan, produced_ms: u64) {
+    let cue = plan.window_start_ms;
+    let grid = cue.div_ceil(produced_ms) * produced_ms;
+    plan.drop_ms = grid - cue;
+    plan.window_start_ms = grid;
+}
+
 fn produced_segment_ms(leg: &crate::EncodeLeg, plan: &VideoEncodePlan) -> Option<u64> {
     if leg.honours_force_key_frames {
         return Some(SEGMENT_MS);
@@ -2846,6 +2902,14 @@ struct StartPlan {
     container_kind: &'static str,
     /// Cost of the bind-time identity re-read (ADR-0023 §4).
     fingerprint_cost_ms: u128,
+    /// Media to decode and discard between the splice point and
+    /// [`window_start_ms`], so this run's output starts on the shared grid
+    /// rather than on its own land. Zero when there is no grid to share.
+    ///
+    /// The spike's locked decision: *"Transcode must not emit the (cue, land]
+    /// media: decode from the cue, drop until the grid."* Copy cannot do this
+    /// — it re-encodes nothing — so it never gets a non-zero value here.
+    drop_ms: u64,
     virtual_input: Option<crate::virtual_input::VirtualInput>,
 }
 
@@ -2904,6 +2968,7 @@ impl MapBinding {
                     start_path: "mapped",
                     container_kind: map.container_kind.as_str(),
                     fingerprint_cost_ms: cost_ms,
+                    drop_ms: 0,
                     virtual_input: bind.virtual_input,
                 };
                 self.map = Some(map);
@@ -2931,6 +2996,7 @@ fn ss_start_plan(src: &Path, play_start_ms: u64, fingerprint_cost_ms: u128) -> S
         start_path: "ss",
         container_kind: "-",
         fingerprint_cost_ms,
+        drop_ms: 0,
         virtual_input: None,
     }
 }
@@ -3015,6 +3081,14 @@ fn spawn_ffmpeg(
         cmd.args(["-ss", &start_secs]);
     }
     cmd.arg("-i").arg(&input.input);
+    if input.drop_ms > 0 {
+        // Output-side seek: decode from the splice, discard until the grid.
+        // Before `-i` this would move the splice; after it, it moves where
+        // output begins, which is the whole point — every run then starts on
+        // the same grid instead of on its own land.
+        let drop_secs = format!("{}.{:03}", input.drop_ms / 1000, input.drop_ms % 1000);
+        cmd.args(["-ss", &drop_secs]);
+    }
     if start_ms > 0 {
         // ADR-0020: load-bearing under copy. Does not rewrite tfdt/trun (those
         // stay segment-local at 0); it stamps title-absolute time into the
@@ -4319,6 +4393,88 @@ mod tests {
             throttle_action(false, 0),
             None,
             "a lead read as zero never suspends"
+        );
+    }
+
+    /// Every run shares one grid, whatever land it was snapped to.
+    ///
+    /// Without this each run is phased to its own cue. Measured at `c43b440`,
+    /// three runs of one session started at `0`, `3780110` and `590632`.
+    #[test]
+    fn snapping_puts_every_run_on_one_phase() {
+        let plan_for = |cue: u64| StartPlan {
+            input: std::ffi::OsString::from("/dev/null"),
+            window_start_ms: cue,
+            seek_input: false,
+            start_path: "mapped",
+            container_kind: "matroska",
+            fingerprint_cost_ms: 0,
+            drop_ms: 0,
+            virtual_input: None,
+        };
+
+        // The three cues measured on the N150, against the 2002 ms cadence
+        // that hardware actually produces.
+        for cue in [0u64, 3_780_110, 590_632] {
+            let mut plan = plan_for(cue);
+            snap_plan_to_grid(&mut plan, 2002);
+            assert_eq!(
+                plan.window_start_ms % 2002,
+                0,
+                "cue {cue} must land on the shared grid, not its own phase"
+            );
+            assert_eq!(
+                plan.window_start_ms - plan.drop_ms,
+                cue,
+                "the drop is exactly the media between the cue and the grid"
+            );
+            assert!(
+                plan.drop_ms < 2002,
+                "never drop a whole segment: {} at cue {cue}",
+                plan.drop_ms
+            );
+        }
+
+        // A cue already on the grid drops nothing.
+        let mut on_grid = plan_for(4004);
+        snap_plan_to_grid(&mut on_grid, 2002);
+        assert_eq!(on_grid.window_start_ms, 4004);
+        assert_eq!(on_grid.drop_ms, 0, "a cue on the grid has nothing to drop");
+    }
+
+    /// Copy never gets a grid: it re-encodes nothing, so it cannot drop the
+    /// media between the cue and the grid.
+    #[test]
+    fn only_transcode_gets_a_shared_grid() {
+        let film = VideoEncodePlan {
+            source_frame_rate: Some((24000, 1001)),
+            ..VideoEncodePlan::default()
+        };
+        let leg = crate::EncodeLeg::qsv_sysmem();
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Transcode, false, &leg, &film),
+            Some(2002)
+        );
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Copy, false, &leg, &film),
+            None,
+            "copy cannot drop to a grid and must keep its own phase"
+        );
+        // Burn-in re-encodes video whatever the mode says (ADR-0018).
+        assert_eq!(
+            grid_cadence_ms(SessionMode::Copy, true, &leg, &film),
+            Some(2002),
+            "burn-in is a transcode for this question"
+        );
+        // No honest cadence means no grid, even for transcode.
+        assert_eq!(
+            grid_cadence_ms(
+                SessionMode::Transcode,
+                false,
+                &leg,
+                &VideoEncodePlan::default()
+            ),
+            None
         );
     }
 
@@ -7935,6 +8091,17 @@ mod tests {
         assert_audio_decodes(joined);
     }
 
+    /// Where a transcode run whose splice landed on `cue_ms` now starts.
+    ///
+    /// Runs no longer keep the cue's own phase. `snap_plan_to_grid` moves the
+    /// output up to the grid every run shares and drops the media between, so
+    /// a full-title listing can name the entries in advance. The splice still
+    /// opens at the cue — that is what `map_binding.bound` and `!fell_back`
+    /// assert beside this.
+    fn grid_start(cue_ms: u64) -> u64 {
+        cue_ms.div_ceil(SEGMENT_MS) * SEGMENT_MS
+    }
+
     const MAPPED_FIXTURE_MS: u64 = 12_000;
 
     /// ADR-0023 §3a: the Matroska splice opens at the land Cluster with no
@@ -7977,12 +8144,14 @@ mod tests {
             );
             assert!(!session.map_binding.fell_back);
             assert_eq!(
-                session.start_ms, land_ms,
-                "encode window is the land Cluster PTS, not an -ss lead-in"
+                session.start_ms,
+                grid_start(land_ms),
+                "the splice opens at the land Cluster and the output starts on \
+                 the shared grid above it, not on an -ss lead-in"
             );
         }
         let joined = run_to_eof_and_join(&reg, &id, dir.path());
-        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+        assert_av_landed(&joined, grid_start(land_ms), MAPPED_FIXTURE_MS);
     }
 
     /// A seek re-splices at the new land: the session keeps the map, so the
@@ -8026,11 +8195,11 @@ mod tests {
             let sessions = reg.sessions.lock().unwrap();
             let session = sessions.get(&id).unwrap();
             assert!(session.map_binding.bound.is_some(), "seek re-splices");
-            assert_eq!(session.start_ms, land_ms);
+            assert_eq!(session.start_ms, grid_start(land_ms));
         }
         assert!(!reg.map_fallback(&id), "rebind must hold across a seek");
         let joined = run_to_eof_and_join(&reg, &id, dir.path());
-        assert_av_landed(&joined, land_ms, MAPPED_FIXTURE_MS);
+        assert_av_landed(&joined, grid_start(land_ms), MAPPED_FIXTURE_MS);
     }
 
     /// Copy leaves the source frames untouched, so a splice that lands
@@ -8470,8 +8639,10 @@ mod tests {
                 "seek must use the map the bounded wait produced"
             );
             assert_eq!(
-                session.start_ms, land_ms,
-                "encode window is the land Cluster PTS, not an -ss lead-in"
+                session.start_ms,
+                grid_start(land_ms),
+                "the splice opens at the land Cluster and the output starts on \
+                 the shared grid above it, not on an -ss lead-in"
             );
         }
         assert!(!reg.map_fallback(&id), "map landed; no §8 fallback");
@@ -8692,8 +8863,10 @@ mod tests {
                 "start must use the map the bounded wait produced"
             );
             assert_eq!(
-                session.start_ms, land_ms,
-                "encode window is the land Cluster PTS, not an -ss lead-in"
+                session.start_ms,
+                grid_start(land_ms),
+                "the splice opens at the land Cluster and the output starts on \
+                 the shared grid above it, not on an -ss lead-in"
             );
         }
         assert!(!reg.map_fallback(&id), "map landed; no §8 fallback");
