@@ -2558,6 +2558,46 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Milliseconds of media in one segment this leg will actually produce.
+///
+/// [`SEGMENT_MS`] is the interval the session *asks* for. A leg that honours
+/// `-force_key_frames` is given `expr:gte(t,n_forced*N)` and cuts on time, so
+/// it hits it. A leg that discards the expression is given `-g <frames>`, and
+/// a frame count only lands on `SEGMENT_MS` when the source rate divides it
+/// into whole frames.
+///
+/// At `24000/1001` it does not. 2000 ms is 47.952 frames,
+/// [`VideoEncodePlan::gop_frames`] rounds up to 48, and 48 frames is
+/// `48 x 1001 / 24000 = 2002 ms`. **Measured on the N150 at `c43b440`,
+/// `h264_qsv`, 1080p h264: 1061 of 1062 distinct segment starts were off the
+/// 2000 ms grid, with a modal consecutive delta of 2002 ms across 923 pairs.**
+/// A full-title listing built on `N x SEGMENT_MS` would have named a URI the
+/// producer never writes at every entry but the first.
+///
+/// `None` means there is no honest answer and the caller must not invent one:
+/// either the source rate is unknown, or the frame count does not divide into
+/// whole milliseconds, in which case no integer-ms grid exists at all.
+// Wired to the spawn path by the phase change and to the playlist by the
+// full-title listing; this commit lands the arithmetic and its controls alone,
+// because the comment it corrects is what hid the defect and should not arrive
+// buried in a behaviour change.
+#[allow(dead_code)]
+fn produced_segment_ms(leg: &crate::EncodeLeg, plan: &VideoEncodePlan) -> Option<u64> {
+    if leg.honours_force_key_frames {
+        return Some(SEGMENT_MS);
+    }
+    let frames = u64::from(plan.gop_frames(SEGMENT_MS)?);
+    let (num, den) = plan.source_frame_rate?;
+    let (num, den) = (u64::from(num), u64::from(den));
+    if num == 0 {
+        return None;
+    }
+    let ms_numerator = frames * den * 1000;
+    // A cadence that is not a whole number of milliseconds has no integer grid
+    // to list, so say so rather than rounding one into existence.
+    (ms_numerator % num == 0).then_some(ms_numerator / num)
+}
+
 fn align_to_segment(ms: u64) -> u64 {
     (ms / SEGMENT_MS) * SEGMENT_MS
 }
@@ -4282,14 +4322,80 @@ mod tests {
         );
     }
 
+    /// The cadence a leg will actually produce, which is not always the one
+    /// the session asked for.
+    #[test]
+    fn produced_segment_ms_follows_the_leg_not_the_constant() {
+        let plan_at = |num, den| VideoEncodePlan {
+            source_frame_rate: Some((num, den)),
+            ..VideoEncodePlan::default()
+        };
+        let film = plan_at(24000, 1001);
+
+        // A leg that cuts on time hits SEGMENT_MS at any rate.
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::software(), &film),
+            Some(2000),
+            "a leg that honours -force_key_frames cuts on time"
+        );
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::videotoolbox(), &film),
+            Some(2000)
+        );
+
+        // A leg that cuts on a frame count does not, and this is the case the
+        // full-title listing exists to survive.
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &film),
+            Some(2002),
+            "48 frames at 24000/1001 is 2002 ms, and the listing must say so"
+        );
+
+        // Rates that do divide evenly still land on the constant.
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(60, 1)),
+            Some(2000)
+        );
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(25, 1)),
+            Some(2000)
+        );
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(30000, 1001)),
+            Some(2002)
+        );
+
+        // No rate is no answer. The caller falls back to a per-run listing
+        // rather than listing a grid it cannot justify.
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &VideoEncodePlan::default()),
+            None,
+            "no source rate means no honest cadence"
+        );
+
+        // A cadence that is not whole milliseconds has no integer grid to
+        // list. 7/3 is constructed to exercise that guard, not a real rate:
+        // 5 frames at 7/3 fps is 15000/7 ms, which is not an integer.
+        assert_eq!(
+            produced_segment_ms(&crate::EncodeLeg::qsv_sysmem(), &plan_at(7, 3)),
+            None,
+            "a fractional-millisecond cadence has no grid, and must not be rounded into one"
+        );
+    }
+
     #[test]
     fn gop_frames_follow_the_source_rate() {
         let plan_at = |num, den| VideoEncodePlan {
             source_frame_rate: Some((num, den)),
             ..VideoEncodePlan::default()
         };
-        // 23.976 fps: 48 frames is exactly 2 s, which is why the constant
-        // looked right for years on one corpus.
+        // 23.976 fps: 48 frames is 2.002 s, not 2 s. 2000 ms is 47.952
+        // frames, so no frame count hits the grid at this rate, and this
+        // comment claimed the opposite until 2026-08-30. That claim is why
+        // nobody checked: measured on the N150 at c43b440, 1061 of 1062
+        // segment starts were off the 2000 ms grid, modal delta 2002 ms.
+        // `produced_segment_ms` is the honest cadence; `gop_frames` is only
+        // the frame count that produces it.
         assert_eq!(plan_at(24000, 1001).gop_frames(2000), Some(48));
         assert_eq!(plan_at(24, 1).gop_frames(2000), Some(48));
         // 60 fps needs 120. A hardcoded 48 would cut every 0.8 s here.
