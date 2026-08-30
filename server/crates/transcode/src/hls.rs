@@ -2258,6 +2258,41 @@ fn restart_at(
         fs::create_dir_all(&new_dir).map_err(|e| {
             PlaylistError::Failed(format!("create run dir {}: {e}", new_dir.display()))
         })?;
+        // Copy `src_run`'s init, not any run's: an init is not interchangeable.
+        //
+        // ADR-0054 decision 4 said inits are byte-identical across runs and
+        // this copy was written on that. **It is false**, and was overturned
+        // 2026-08-31: `-output_ts_offset` stamps the land into the init's
+        // `elst` empty-edit, so two runs at different lands differ there by
+        // construction. Measured on all four paths — QSV, libx264,
+        // VideoToolbox, copy — every one distinct. On libx264 the whole file
+        // differs by two bytes, one per track, both inside `elst`.
+        //
+        // **The copy is right for the segments this run will serve at its own
+        // land, and wrong for segments from any other run.** Joining one run's
+        // init to another run's segment **decodes cleanly** and reports the
+        // *init's* start time: a segment holding the first two seconds of the
+        // title, under a 60 s run's init, presents at 60 s. `elst` is a timing
+        // field, so a test that asked only whether it decodes passes all four
+        // pairings and calls this safe.
+        //
+        // **That pairing is reachable.** `EXT-X-MAP` names
+        // `session.current_run_id`'s init while a playlist lists segments from
+        // the session-global map, which holds whatever every live run wrote.
+        // It predates S3 — the window listing filtered on time, never on run —
+        // and S3 widened it from a window to the whole title.
+        //
+        // **What is not measured is the client.** The displacement above is
+        // FFmpeg's. A browser appends to a MediaSource with one init per
+        // track, but `tfdt` stays segment-local at 0 while `sidx` carries
+        // title time, and which of those a player uses for placement has never
+        // been measured here. **So this is not "the map-hit path is broken";
+        // it is that the reason it was believed safe is false and the failure
+        // mode is real in the one instrument used.** Do not restore the
+        // identity claim without a player.
+        //
+        // `nightjar-meta`: `notes/init-identity-across-runs-2026-08-31.md`,
+        // `notes/cross-run-init-decode-2026-08-31.md`.
         let init_src = session.dir.join(format!("run_{src_run}/init.mp4"));
         let init_dst = new_dir.join("init.mp4");
         if init_src.exists() {
