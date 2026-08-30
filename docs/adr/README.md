@@ -37,7 +37,7 @@ not here — this page is the reference, not the tour.
 | [0017](0017-desktop-safari-hlsjs.md) | Desktop Safari attaches with hls.js | Accepted | — | — |
 | [0018](0018-subtitle-burn-in.md) | Image and ASS subtitle burn-in | Partially superseded | — | §5 by [0019](0019-ass-burn-extract-at-scan.md) |
 | [0019](0019-ass-burn-extract-at-scan.md) | ASS burn-in extract at scan time | Partially superseded | [0018](0018-subtitle-burn-in.md) §5 | amendment §5 invalidation stamps by [0023](0023-cluster-map-byte-offset-start.md) §6 (migration `019`) |
-| [0020](0020-copy-mode-segment-boundaries.md) | Producer-owned segment boundaries (time-keyed) | Partially superseded | — | §4 window listing by [0054](0054-full-title-playlist-for-transcode.md) for transcode only; copy and remux unchanged |
+| [0020](0020-copy-mode-segment-boundaries.md) | Producer-owned segment boundaries (time-keyed) | Partially superseded | — | §4 window listing **in every mode**, and the **miss policy**, by [0054](0054-full-title-playlist-for-transcode.md) (corrected 2026-08-31: copy is superseded too, and the miss policy is overturned rather than untouched) |
 | [0021](0021-client-architecture.md) | Client architecture (Flutter UI, per-platform engines) | Accepted (Apple engine closed 2026-08-06) | [0001](0001-client-platforms.md); prior Rule 2.4 wording | — |
 | [0022](0022-capability-profiles.md) | Client capability profiles (bitrate, resolution, HDR) | Accepted | — | — |
 | [0023](0023-cluster-map-byte-offset-start.md) | Keyframe map and byte-offset session start | Accepted (amended 2026-08-06, 2026-08-07) | [0013](0013-subtitle-extraction-at-scan.md) §4 and [0019](0019-ass-burn-extract-at-scan.md) §5 invalidation stamps (§6) | — |
@@ -69,7 +69,7 @@ not here — this page is the reference, not the tour.
 | [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
 | [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
 | [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** (amended 2026-08-30 — `#171`/`#172` answered it in an unlisted shape; the seam stays unwired) | — | — |
-| [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** | [0020](0020-copy-mode-segment-boundaries.md) §4 for transcode only | — |
+| [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** (decisions 1, 2 and 3 corrected 2026-08-31 by measurement) | [0020](0020-copy-mode-segment-boundaries.md) §4 **in every mode**, and its miss policy | — |
 
 ## Why the numbers jump from 0043 to 0046
 
