@@ -18,6 +18,8 @@ pushes it covers.
 | 5 | push `api/session-asset-cache-headers`, open one pull request | merge |
 | 6 | merge **#184**, named by the maintainer | — |
 | 7 | push `docs/adr-0054-init-identity`, open one pull request | merge |
+| 8 | merge **#185**, named by the maintainer | — |
+| 9 | push `transcode/init-copy-comment`, open one pull request | merge |
 
 **This authorization does not carry forward.** A later session needs its own.
 
