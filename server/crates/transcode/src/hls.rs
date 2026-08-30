@@ -2101,6 +2101,7 @@ fn restart_at(
             session.pending_play_ms = None;
             session.pending_since = None;
         }
+        release_overtaken_superseded(session);
         maybe_evict_finished_runs(session);
         tracing::info!(
             play_start_ms,
@@ -2175,6 +2176,7 @@ fn restart_at(
         session.pending_play_ms = None;
         session.pending_since = None;
     }
+    release_overtaken_superseded(session);
     maybe_evict_finished_runs(session);
     tracing::info!(
         start_ms,
@@ -3384,6 +3386,54 @@ fn live_run_ids(session: &Session) -> Vec<u64> {
     ids
 }
 
+/// Release every superseded encoder the new one has already overtaken.
+///
+/// **Segments within a run are sequential.** So a held encoder whose frontier
+/// has reached [`Session::start_ms`] has already written everything behind
+/// that land, and [`restart_at`] has already ingested it. The new encoder
+/// covers from `start_ms` forward. The region only the held encoder serves is
+/// `[frontier, start_ms)`, and this condition fires exactly when that region
+/// is empty. **Nothing it could still produce is wanted by anyone**, so there
+/// is no memory-against-a-wanted-segment trade to weigh here.
+///
+/// The boundary is `start_ms`, never `play_start_ms`. `window_start_ms` is a
+/// lead-in at or before the land, so `play_start_ms >= start_ms`:
+/// `play_start_ms` is safe but late, and holds the encoder past the point it
+/// stopped being useful.
+///
+/// Called from **both** of [`restart_at`]'s exits, each after it assigns
+/// `start_ms`, because they assign it differently and the map-hit branch
+/// returns early — there is no common tail. [`restart_at`] refreshes the map
+/// for every run ([`sync_segment_map`], [`sync_all_run_indexes`]) moments
+/// before, so the frontier read here is freshly ingested, and this needs no
+/// new state and no new ingest. It is not on the throttle tick for the
+/// opposite reason: a held run's frontier there is only as fresh as the last
+/// poll-path ingest, and with nobody polling it is frozen at seek time.
+///
+/// [`frontier_ms`] answers **per run**. A held encoder that has produced
+/// nothing has no frontier and is left alone; reading it as zero would release
+/// it on any seek.
+///
+/// It moves `reap_at`; it does not kill. [`reap_superseded`] does `kill()` and
+/// `wait()`, and [`restart_at`] runs under the sessions mutex, so killing here
+/// would put a blocking `wait()` on a just-signalled process into the seek
+/// path. The next [`THROTTLE_TICK`] does the killing where it already lives.
+fn release_overtaken_superseded(session: &mut Session) {
+    let now = Instant::now();
+    let start_ms = session.start_ms;
+    // Disjoint fields: the map is read while the held set is walked mutably.
+    let map = &session.segment_map;
+    for held in session.superseded.iter_mut() {
+        let Some(frontier) = frontier_ms(map.iter_ordered(), held.run_id) else {
+            continue;
+        };
+        if frontier >= start_ms {
+            // Never later than it already was.
+            held.reap_at = held.reap_at.min(now);
+        }
+    }
+}
+
 /// Terminate superseded encoders whose delay has elapsed.
 fn reap_superseded(session: &mut Session) {
     let now = Instant::now();
@@ -3891,6 +3941,16 @@ mod tests {
             reap_at: Instant::now() + Duration::from_secs(30),
             run_id: 0,
         });
+        // Both changes touch the same held set, so check them together. The
+        // release condition must not fire here: run_0's frontier is 4000 and
+        // the new land is 20000, so the gap below is exactly the region only
+        // the held encoder serves.
+        let held_reap_at = session.superseded[0].reap_at;
+        release_overtaken_superseded(&mut session);
+        assert_eq!(
+            session.superseded[0].reap_at, held_reap_at,
+            "the release condition must not fire while the gap is still unserved"
+        );
         reg.sessions
             .lock()
             .unwrap()
@@ -3918,6 +3978,192 @@ mod tests {
         );
 
         reg.stop("s1");
+    }
+
+    /// A held encoder still short of the new land keeps its delay.
+    ///
+    /// This is the over-firing control. A forward seek past what the prior
+    /// encoder has produced leaves `[frontier, start_ms)` non-empty, and only
+    /// the held encoder will ever produce it, so releasing here would be the
+    /// trade condition 1 does not make.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_encoder_short_of_the_new_land_keeps_its_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // run_0 produced to a frontier of 4000; the seek lands at 20000.
+        write_producer_run(dir.path(), 0, 0, &[0, 2_000]);
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        let reap_at = Instant::now() + REAP_AFTER;
+        session.superseded.push(SupersededEncoder {
+            child,
+            reap_at,
+            run_id: 0,
+        });
+        sync_superseded_run_indexes(&mut session);
+        session.current_run_id = 1;
+        session.next_run_id = 2;
+        session.start_ms = 20_000;
+
+        release_overtaken_superseded(&mut session);
+        assert_eq!(
+            session.superseded[0].reap_at, reap_at,
+            "a held encoder short of the new land keeps its original delay"
+        );
+
+        reap_superseded(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "the next reap must leave it producing"
+        );
+
+        reap_all_superseded(&mut session);
+    }
+
+    /// A held encoder the new one has already overtaken is released early.
+    ///
+    /// Segments within a run are sequential, so a frontier at or past
+    /// `start_ms` means everything behind the new land is already written and
+    /// already mapped. Everything the held encoder goes on to write is media
+    /// the map has. This is the backward seek that hits the duplicate-write
+    /// stop: nothing replaces the prior encoder there, so without this it does
+    /// five seconds of entirely duplicate work.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_encoder_past_the_new_land_is_released_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // run_0 produced to a frontier of 6000; the seek lands back at 4000.
+        write_producer_run(dir.path(), 0, 0, &[0, 2_000, 4_000]);
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        session.superseded.push(SupersededEncoder {
+            child,
+            reap_at: Instant::now() + REAP_AFTER,
+            run_id: 0,
+        });
+        sync_superseded_run_indexes(&mut session);
+        session.current_run_id = 1;
+        session.next_run_id = 2;
+        session.start_ms = 4_000;
+
+        release_overtaken_superseded(&mut session);
+        assert!(
+            session.superseded[0].reap_at <= Instant::now(),
+            "a held encoder the new one has overtaken is due for reaping now"
+        );
+
+        // The tick that already does the killing takes it.
+        reap_superseded(&mut session);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Gone,
+            "the next reap releases the overtaken encoder"
+        );
+        assert!(session.superseded.is_empty());
+    }
+
+    /// A held encoder that produced nothing has no frontier, and is not
+    /// released.
+    ///
+    /// [`frontier_ms`] answers per run, and `None` is "has not started", not
+    /// "is at zero". Reading it as zero would release every encoder that never
+    /// wrote a segment on any seek, including a seek to the start of the
+    /// title. The map here holds another run's segments out past the land, so
+    /// this also fails if the frontier is read session-globally.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_encoder_that_produced_nothing_is_not_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+
+        // run_0 is mapped out to 6000. run_9 is the held encoder, and it has
+        // written nothing.
+        write_producer_run(dir.path(), 0, 0, &[0, 2_000, 4_000]);
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        let reap_at = Instant::now() + REAP_AFTER;
+        session.superseded.push(SupersededEncoder {
+            child,
+            reap_at,
+            run_id: 9,
+        });
+        session.current_run_id = 0;
+        sync_segment_map(&mut session);
+        session.current_run_id = 10;
+        session.next_run_id = 11;
+        session.start_ms = 0;
+
+        assert!(
+            frontier_ms(session.segment_map.iter_ordered(), 9).is_none(),
+            "the held run must have produced nothing, or the test proves nothing"
+        );
+        release_overtaken_superseded(&mut session);
+        assert_eq!(
+            session.superseded[0].reap_at, reap_at,
+            "an encoder that produced nothing has no frontier to compare"
+        );
+
+        reap_superseded(&mut session);
+        assert_eq!(child_state(pid), ChildState::Running);
+
+        reap_all_superseded(&mut session);
+    }
+
+    /// The seek path itself releases the encoder it overtook.
+    ///
+    /// A backward seek into mapped media takes `restart_at`'s map-hit exit:
+    /// it supersedes the prior encoder, sets `current_run_eof`, and **does not
+    /// spawn**. So the prior encoder is held with nothing replacing it, and
+    /// everything it goes on to write is already in the map. This asserts the
+    /// call site, not just the condition — the two exits assign `start_ms`
+    /// separately and the map-hit one returns early.
+    #[cfg(unix)]
+    #[test]
+    fn a_backward_seek_releases_the_encoder_it_overtook() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        // run_0 has produced out to 6000 and is the current producer.
+        write_producer_run(&session_dir, 0, 0, &[0, 2_000, 4_000]);
+
+        let mut session = make_test_session(&session_dir);
+        session.current_run_id = 0;
+        session.next_run_id = 1;
+        session.start_ms = 0;
+        session.play_start_ms = 0;
+        session.last_requested_ms = 4_000;
+        session.child = Some(spawn_stand_in_encoder());
+        let pid = session.child.as_ref().unwrap().id();
+
+        restart_at(&mut session, 2_000, &crate::EncodeLeg::software()).unwrap();
+
+        assert_eq!(
+            session.start_ms, 2_000,
+            "the map-hit exit lands on the mapped segment"
+        );
+        assert_eq!(
+            session.superseded.first().map(|s| s.run_id),
+            Some(0),
+            "the seek held the prior encoder"
+        );
+        assert!(
+            session.superseded[0].reap_at <= Instant::now(),
+            "a backward seek into mapped media releases the encoder it overtook"
+        );
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "the seek path moves reap_at; it does not kill under the lock"
+        );
+
+        reap_superseded(&mut session);
+        assert_eq!(child_state(pid), ChildState::Gone);
+        assert!(session.superseded.is_empty());
     }
 
     /// ADR-0052: the frame count for one segment comes from the source rate,
