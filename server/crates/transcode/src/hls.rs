@@ -2412,20 +2412,28 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
     }
 }
 
-/// Producer reached EOF: mark ENDLIST and record usable extent when the
-/// farthest mapped end (or 0 if nothing was written) is materially short of
-/// claimed duration. Empty map at a mid-title land is still damage — clients
-/// must see usableExtentMs instead of hanging on master 503.
+/// Producer reached EOF: mark ENDLIST and record usable extent when the run
+/// that ended got materially short of claimed duration. Empty map at a
+/// mid-title land is still damage — clients must see usableExtentMs instead of
+/// hanging on master 503.
+///
+/// **The extent is the ended run's frontier, not the session map's maximum.**
+/// This read `iter_ordered().next_back()` until 2026-08-30, which was a
+/// session-global maximum and correct while a session had one run at a time.
+/// Since #160 the map holds every live run, so the maximum can belong to a
+/// superseded run that landed past the point this one died at, and reading it
+/// reports a reachable extent for media that is not reachable from here. S3
+/// lists `0..usable_extent_ms`, so that is ADR-0020's failure mode: URIs that
+/// will never exist.
+///
+/// [`frontier_ms`] answers per run, which is the same primitive the release
+/// condition uses, and `None` — the run wrote nothing — is 0 rather than
+/// "no damage", which is what the empty mid-title EOF case turns on.
 fn apply_run_eof(session: &mut Session) {
     session.child = None;
     session.current_run_eof = true;
     sync_segment_map(session);
-    let end = session
-        .segment_map
-        .iter_ordered()
-        .next_back()
-        .map(|last| last.start_ms.saturating_add(last.duration_ms))
-        .unwrap_or(0);
+    let end = frontier_ms(session.segment_map.iter_ordered(), session.current_run_id).unwrap_or(0);
     if session.duration_ms.saturating_sub(end) > USABLE_SHORTFALL_MS {
         session.usable_extent_ms = Some(end);
         tracing::info!(
@@ -7344,6 +7352,100 @@ mod tests {
         assert!(
             !text.contains("seg_"),
             "no listed URIs when nothing is on disk"
+        );
+    }
+
+    /// A minimal session for the EOF-extent tests. Fields the extent does not
+    /// read are defaults; the ones it does — `duration_ms`, `current_run_id`,
+    /// `segment_map` — are set by the caller.
+    fn eof_test_session(dir: &Path, duration_ms: u64) -> Session {
+        Session {
+            item_id: 8519,
+            src: PathBuf::from("/dev/null"),
+            dir: dir.to_path_buf(),
+            mode: SessionMode::Copy,
+            audio: stereo(),
+            burn_in: None,
+            encode_plan: VideoEncodePlan::default(),
+            map_binding: MapBinding::default(),
+            encode_leg: crate::EncodeLeg::software(),
+            video_encoder: "copy".into(),
+            start_ms: 0,
+            play_start_ms: 0,
+            landed_ms: 0,
+            usable_extent_ms: None,
+            duration_ms,
+            current_run_id: 0,
+            next_run_id: 1,
+            segment_map: crate::hls_segment_map::SegmentMap::default(),
+            current_run_eof: false,
+            child: None,
+            last_access: Instant::now(),
+            last_restart: Instant::now(),
+            primed: false,
+            first_segment_ready: false,
+            pending_play_ms: None,
+            pending_since: None,
+            failed: None,
+            subtitle_tracks: vec![],
+            last_requested_ms: 0,
+            throttled: false,
+            superseded: Vec::new(),
+            piggyback: None,
+            subs: None,
+            db: None,
+            map_build_in_flight: None,
+        }
+    }
+
+    /// The extent at EOF is the run that reached EOF, not the session map.
+    ///
+    /// Since #160 the map holds more than one run, so the session-global
+    /// maximum can come from a superseded run that started later in the file
+    /// and produced past the point the current run died at. Reading it hides
+    /// the damage: S3 lists `0..usable_extent_ms`, and a listing built from
+    /// another run's frontier is ADR-0020's failure mode — URIs that will
+    /// never exist.
+    ///
+    /// The shape here is a source with a hole. An earlier run landed past it
+    /// and produced to the end; the current run started at title 0 and died
+    /// at the hole. Only the current run's frontier says where playback from
+    /// 0 actually stops.
+    #[test]
+    fn eof_extent_comes_from_the_run_that_ended_not_the_session_map() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("run_1")).unwrap();
+
+        let mut map = crate::hls_segment_map::SegmentMap::default();
+        // run 0: a forward seek landed past the hole and ran to the end.
+        map.insert(crate::hls_segment_map::MappedSegment {
+            start_ms: 880_000,
+            duration_ms: 20_000,
+            run_id: 0,
+            rel_path: PathBuf::from("run_0/seg_00000880000.m4s"),
+        });
+        // run 1: the current run, from title 0, stopped at the hole.
+        map.insert(crate::hls_segment_map::MappedSegment {
+            start_ms: 180_000,
+            duration_ms: 20_000,
+            run_id: 1,
+            rel_path: PathBuf::from("run_1/seg_00000180000.m4s"),
+        });
+
+        let mut session = eof_test_session(dir.path(), 900_000);
+        session.segment_map = map;
+        session.current_run_id = 1;
+        session.next_run_id = 2;
+        session.start_ms = 0;
+        session.play_start_ms = 0;
+
+        apply_run_eof(&mut session);
+
+        assert_eq!(
+            session.usable_extent_ms,
+            Some(200_000),
+            "the extent is the ended run's frontier; the session maximum of \
+             900000 belongs to a run that started past the damage"
         );
     }
 
