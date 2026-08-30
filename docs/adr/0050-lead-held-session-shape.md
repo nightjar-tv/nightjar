@@ -4,7 +4,8 @@
   2026-08-24: a superseded encoder runs until reap rather than being
   suspended; 2026-08-25: §5 separates what was measured from what is
   inferred, and Consequences reconciles its deletion list against the
-  eighteen items it named)
+  eighteen items it named; 2026-08-30: §5's waiter reason is corrected, the
+  decision stands, and the seek rate it recorded as uncaptured is measured)
 - Date: 2026-08-23
 - Supersedes: ADR-0007 §3 (the concurrency cap model) and §4 (seek as kill
   and restart)
@@ -143,6 +144,59 @@ run, and the bench now refuses a run where one would not.
    reader finding that suspension is required for correctness will not also
    have to trade it against speed; there is no trade to make.
 
+   **Corrected 2026-08-30 — the decision stands and the reason above does
+   not.** Not clarified: the waiter argument is the whole justification the
+   2026-08-24 amendment gave, and it is false in the shipped tree. It is kept
+   visible under this section's own convention.
+
+   Measured at `origin/main` = `c43b440`, on the N150 (Alder Lake-N, 6.9 GiB,
+   `h264_qsv`, 1080p h264 sources), instrumented by the server's own `INFO`
+   log and `/proc` with no change to product code.
+
+   **1. The waiter does not run to its timeout.** 19 trials: a segment GET in
+   flight on a land, then a `POST /seek` to a distinct land while it is in
+   flight. Five arms, three seek distances, two lead times, both container
+   kinds, plus a probe for a segment no encoder was near writing. **Every
+   trial returned in 794-1435 ms. `PlaylistError::AbandonedHoldEnded` fired
+   zero times.** The no-fill hold is entered on every superseded want and arms
+   for `IDLE_TIMEOUT`, then `no_fill_release_for_new_land` ends it in about a
+   second, once the new land is serviceable. **`IDLE_TIMEOUT` is a backstop
+   the new land pre-empts, not an outcome a client reaches.**
+
+   **2. On Matroska a running encoder does not finish the segment either.** A
+   superseded encoder there exits **0.30 s** after the seek (median, 35 seeks;
+   0 of 35 lived out `REAP_AFTER`), because `bind_matroska` reuses a bound
+   `VirtualInput` only when its `land_offset` matches. A distinct-land seek
+   cannot match, so it starts a new `RangeServer` and drops the old one — and
+   dropping it stops the server the held encoder is reading from. Its `-i` is
+   that URL. Controlled against a faststart MP4 on the same box, same arm,
+   same drive rate: **4.81 s** median there, 28 of 48 living the hold out, and
+   the listening-port table agrees six seeks of six each way. **So on Matroska
+   the amendment's premise fails whether or not the encoder is suspended.**
+
+   **3. What actually serves that waiter is a file, not a process.** #176
+   (`91d3899`) ingests the superseded run's index on the `asset_wait` poll
+   path. It reads what the encoder wrote; it does not need it alive. On
+   Matroska, with the process gone at 0.30 s, **9 of 12 seek trials were still
+   served bytes only the superseded run can have written** — the want was
+   behind the new land, so the new run never covers it.
+
+   **What survives, and it is enough.** Do not suspend, for the reasons this
+   section already carries: suspending frees encoder time and **not memory**
+   (1593 MB against 1586 MB), and a SIGSTOPped child does not act on SIGTERM
+   until continued, which decision 3 records as a 23-process leak. **The
+   decision needs no waiter argument to stand.**
+
+   **The scope the amendment should have had.** Its reasoning holds on sources
+   that get no per-land range server — faststart MP4, or the `-ss` fallback on
+   the real file — where a superseded encoder does keep producing for
+   `REAP_AFTER`. **It was stated unconditionally and is container-dependent.**
+
+   **The Matroska lifetime is recorded as a defect and is not fixed here.**
+   Keeping the old range server alive until its reader is reaped is a lifetime
+   change on the seek path, and it would restore the memory the held set was
+   thought to cost. That is a decision, not a cleanup.
+
    **Amended 2026-08-25 — that is an inference, and the shipped policy was
    never an arm.** The paragraph above is what this decision claimed, kept
    visible under the same convention as the amendment above it.
@@ -213,6 +267,29 @@ run, and the bench now refuses a run where one would not.
    than per drag position; the HTTP API does not. Nothing checks that the
    held set stays bounded, so the line above is currently an assertion rather
    than a guarantee.
+
+   **The seek rate is captured, 2026-08-30.** Same run as the correction
+   above; `c43b440` on the N150. The held set's length is
+   `held_encoders + superseding_encoder` from this file's own seek log line,
+   cross-read against the server process's FFmpeg children in `/proc`.
+
+   | driver | seeks | peak held, per session | median |
+   |---|---:|---:|---:|
+   | a person scrubbing, one session | 48 | **2** | 1 |
+   | a person scrubbing, three sessions | 93 | **3** | 1 |
+   | ten drag-releases at 500 ms — the top of what a hand does | 50 | **10** | 4 |
+
+   Per encoder: **222 MB** median across 350 encoders, which leaves 226 MB
+   above standing. Box-wide peak across three concurrent sessions: **7**
+   encoder processes, 1228 MB resident.
+
+   **The assertion now has evidence and still has no guarantee.** A cap was
+   specified against these numbers and **not built**: three sessions at the
+   proposed `N = 2` would permit nine encoders where three real sessions
+   produced seven, so it would not have fired. What the numbers do not cover
+   is a prefetching client on a full-title VOD listing, which is sustained
+   rather than bursty. **That case is still uncaptured, and it is the one that
+   would reopen this.**
 
 6. **Do not cap concurrent encoding below the live transcode-session count.**
    `slots = N`. Capping saves no work; it selects which session waits. At
