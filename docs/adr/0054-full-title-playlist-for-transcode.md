@@ -1,7 +1,8 @@
 # ADR-0054: The transcode playlist lists the whole title
 
-- Status: **proposed** (decisions 1 and 2 corrected 2026-08-31 by measurement,
-  and decision 3 now names what it overturns; see each in place)
+- Status: **proposed** (decisions 1 and 2 corrected 2026-08-31 by measurement;
+  decision 3 now names what it overturns; **decision 4 overturned 2026-08-31**,
+  which bounds decision 5; see each in place)
 - Date: 2026-08-23
 - Supersedes: [ADR-0020](0020-copy-mode-segment-boundaries.md) §4's per-run
   window listing, **in every mode** — corrected 2026-08-31; it read
@@ -153,9 +154,69 @@ and its own map. The 2 s grid holds on all three rungs.
    Measured identical across runs; the code already relies on this, since a
    seek that lands on mapped media copies the prior run's init.
 
+   > **Overturned 2026-08-31 — `init.mp4` is not identical across runs, on any
+   > path, including the one this was measured on.** Not clarified: the whole
+   > of this decision is the identity, and it is false.
+   >
+   > **The init carries the land.** `spawn_ffmpeg`'s own comment says so:
+   > `-output_ts_offset` *"stamps title-absolute time into init `elst`
+   > empty-edit and each fragment's `sidx.earliest_presentation_time`"*. So
+   > **two runs at different lands cannot have identical inits** — that is by
+   > construction, and the measurement below only confirms it.
+   >
+   > Measured through the product's own session path, runs counted only when
+   > they spawned:
+   >
+   > | path | where | runs | distinct inits |
+   > |---|---|---:|---:|
+   > | `h264_qsv` transcode | N150 | 3 | **3** |
+   > | `libx264` transcode | Mac | 2 | **2** |
+   > | `h264_videotoolbox` | Mac | 2 | **2** |
+   > | copy (`-c copy`) | N150 | 3 | **3** |
+   >
+   > On `libx264` the whole file differs by **two bytes, one per track, both
+   > inside `elst`**: `...00000050...` (80 ms) at land 0 against
+   > `...0000c350...` (50000) at land 50000. On QSV the values are the snapped
+   > lands, 44044 and 116116. On copy the size differs too, 1748 bytes against
+   > 1423, so there it is not only the edit list.
+   >
+   > **Why this measured identical in August is a hypothesis, not a finding.**
+   > The likely difference is the FFmpeg build: `sidx_title_offset_ms` exists
+   > in the tree because *"Ubuntu apt 6.1 still emits encode-relative sidx from
+   > 0 despite that flag"*, and a build that ignores `-output_ts_offset` writes
+   > no land into the init either. The N150 now runs FFmpeg 8.0.1, which
+   > honours it. **If that is right the claim was never a property of the
+   > format — it was a property of one FFmpeg version**, which is worse than
+   > being wrong, because the code was written against it.
+   >
+   > **What the code relies on is now resting on a different reason.** The
+   > map-hit path copies the prior run's init, and that is probably still
+   > correct — the new run serves the source run's segments, so an init
+   > describing the source run's timeline is the matching one. **It is not
+   > correct because the inits are identical.** Whether a copied init decodes
+   > the segments it is served with is **untested**.
+   >
+   > Measurement and method: `nightjar-meta`
+   > `notes/init-identity-across-runs-2026-08-31.md`.
+
 5. **One playlist URI per session for transcode**, replacing one per run. The
    session API stays the authority on land, and clients still do not construct
    segment URLs.
+
+   > **Bounded 2026-08-31 by decision 4's correction: the map cannot be
+   > session-scoped.** A session-scoped `EXT-X-MAP` names one `init.mp4` for
+   > runs that need different ones, and the init carries the land.
+   >
+   > **This does not block the rest of decision 5.** The master and media
+   > playlist URIs can still become session-scoped — the full-title listing
+   > removed the moving window that ADR-0020's probe rejected, which was the
+   > original objection. **What is off the table is one map per session**, so
+   > the playlist would carry a per-run `EXT-X-MAP` under a session-scoped URI.
+   >
+   > **Whether that shape is coherent is not settled here.** A stable playlist
+   > URI whose `EXT-X-MAP` changes between fetches is a different question from
+   > the one the probe answered, and nothing in this repository has measured a
+   > player against it.
 
 ## Consequences
 

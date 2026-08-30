@@ -16,6 +16,8 @@ pushes it covers.
 | 3 | push `docs/adr-s3-measured-corrections`, open one pull request | merge |
 | 4 | merge **#183**, named by the maintainer | — |
 | 5 | push `api/session-asset-cache-headers`, open one pull request | merge |
+| 6 | merge **#184**, named by the maintainer | — |
+| 7 | push `docs/adr-0054-init-identity`, open one pull request | merge |
 
 **This authorization does not carry forward.** A later session needs its own.
 

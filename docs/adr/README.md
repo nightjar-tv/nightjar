@@ -69,7 +69,7 @@ not here — this page is the reference, not the tour.
 | [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
 | [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
 | [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** (amended 2026-08-30 — `#171`/`#172` answered it in an unlisted shape; the seam stays unwired) | — | — |
-| [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** (decisions 1, 2 and 3 corrected 2026-08-31 by measurement) | [0020](0020-copy-mode-segment-boundaries.md) §4 **in every mode**, and its miss policy | — |
+| [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** (decisions 1, 2 and 3 corrected 2026-08-31 by measurement; **decision 4 overturned** the same day — init is not identical across runs — which bounds decision 5) | [0020](0020-copy-mode-segment-boundaries.md) §4 **in every mode**, and its miss policy | — |
 
 ## Why the numbers jump from 0043 to 0046
 
