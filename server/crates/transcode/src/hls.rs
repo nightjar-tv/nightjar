@@ -42,6 +42,24 @@ const USABLE_SHORTFALL_MS: u64 = 30_000;
 /// Locked HLS segment duration for **transcode** force-IDR / subtitle VTT
 /// grid (ADR-0008 / ADR-0010). Copy segment durations come from the producer.
 const SEGMENT_MS: u64 = 2000;
+/// One copy/remux window. **Its own constant, not a multiple of
+/// [`SEGMENT_MS`].**
+///
+/// They are different kinds of thing: `SEGMENT_MS` is an encoder IDR cadence,
+/// this is how much media one copy window holds. Deriving it would let a
+/// change to the IDR cadence silently move copy's scrub granularity.
+///
+/// **20 s is measured, not chosen.** `stay-ahead-vt-2026-08-20.md` §S8, a
+/// human trial on a real title through the spike origin: a 2 s grid gave one
+/// FFmpeg per skipped cue, a 4 s worst wait, short GOPs named as later URIs,
+/// and on the second seek a video stall with audio that went robotic and
+/// stayed robotic. One MPEG-TS per 20 s window was "stable" — 67 windows
+/// listed, 20 on disk, last first byte 574 ms. §S8b confirmed it on iPhone
+/// with `-c:a copy`.
+///
+/// **Scrub granularity is the window, not 2 s. Fine-grained seek stays
+/// transcode.**
+const COPY_WINDOW_MS: u64 = 20_000;
 /// How long a segment or init fetch may block before returning 503. Mid-title
 /// hardware transcodes on a NAS library can exceed 15s (dogfood: ~16s to
 /// seg1098 after a Chrome seek on Up 1080p).
@@ -885,6 +903,59 @@ fn first_current_run_start(session: &Session) -> Option<u64> {
         .map(|s| s.start_ms)
 }
 
+/// Copy's whole-title listing: the greedy [`COPY_WINDOW_MS`] walk of the
+/// keyframe map.
+///
+/// **Copy cuts at source keyframes and cannot hold a grid, but its cut points
+/// are known in advance** — the keyframe map already holds every one. Walk it
+/// from 0, taking the first entry at or after each window boundary, and that
+/// set is what a run will actually write: FFmpeg's `-hls_time` cuts at the
+/// first keyframe at or after each boundary, and a seek to a listed point
+/// lands exactly on it because the map entry is exact.
+///
+/// **The walk is run-independent** — it depends only on the map and on 0 —
+/// which is what makes it listable before anything has been written. A listing
+/// derived from where *this* run happened to start would differ per run.
+///
+/// `None` without a keyframe map: an `-ss` copy run's cut points are not
+/// knowable ahead of time, so that session keeps the per-run listing.
+///
+/// **Unverified against the product.** §S8 measured this shape through the
+/// spike origin, which never calls the session API. That `-hls_time` cuts
+/// where the walk says is FFmpeg's documented stream-copy behaviour, checked
+/// here against a fixture map and not against a real copy run.
+fn copy_window_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
+    let map = session.map_binding.map.as_ref()?;
+    let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
+    if end == 0 {
+        return None;
+    }
+    let mut starts: Vec<u64> = Vec::new();
+    let mut boundary = 0u64;
+    for entry in &map.entries {
+        if entry.pts_ms >= end {
+            break;
+        }
+        if entry.pts_ms >= boundary {
+            starts.push(entry.pts_ms);
+            boundary = entry.pts_ms.saturating_add(COPY_WINDOW_MS);
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    Some(
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let next = starts.get(i + 1).copied().unwrap_or(end);
+                (*start, next.saturating_sub(*start))
+            })
+            .collect(),
+    )
+}
+
 /// The whole title on the grid this session's runs share (ADR-0054 decision 1).
 ///
 /// `None` when there is no shared grid — copy and remux, or a leg with no
@@ -896,11 +967,16 @@ fn first_current_run_start(session: &Session) -> Option<u64> {
 /// reading is `0` when a run ends having produced nothing, and this would then
 /// list nothing at all.
 fn full_title_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
-    let step = grid_cadence_ms(
+    // Copy and remux list the same whole title on a different grid. That is
+    // the only difference between the modes: both are full-title VOD, and
+    // scrub granularity differs because copy cuts where the source does.
+    let Some(step) = grid_cadence_ms(
         session.mode,
         session.burn_in.is_some(),
         &session.encode_plan,
-    )?;
+    ) else {
+        return copy_window_entries(session);
+    };
     let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
     if end == 0 || step == 0 {
         return None;
@@ -3197,7 +3273,17 @@ fn spawn_ffmpeg(
     let start_number = (start_ms / SEGMENT_MS).to_string();
     let segment_secs = SEGMENT_MS as f64 / 1000.0;
     let force_kf = format!("expr:gte(t,n_forced*{segment_secs})");
-    let hls_time = format!("{segment_secs}");
+    // Copy cuts at source keyframes, so `-hls_time` is a target it rounds up
+    // to the next one. At 2 s that produced a segment per GOP — §S8 measured
+    // robotic audio and a video stall — and at COPY_WINDOW_MS it produces the
+    // windows the listing names. Transcode keeps SEGMENT_MS, where forced
+    // IDRs make the target exact.
+    let hls_time_ms = if mode == SessionMode::Copy {
+        COPY_WINDOW_MS
+    } else {
+        SEGMENT_MS
+    };
+    let hls_time = format!("{}", hls_time_ms as f64 / 1000.0);
     // Burn-in always re-encodes video (ADR-0018).
     let mode = if burn_in.is_some() {
         SessionMode::Transcode
@@ -4698,32 +4784,78 @@ mod tests {
         assert_eq!(listed, 678, "0..1354496 on a 2000 ms grid");
     }
 
-    /// Copy and remux keep the per-run listing, and still lose EVENT.
+    /// Copy lists the whole title too, on the greedy 20 s keyframe walk.
+    ///
+    /// Until this commit copy had no full-title listing and this test asserted
+    /// that. **That was a waypoint, not a decision** — the only difference
+    /// between the modes is the grid, and both are full-title VOD.
     #[test]
-    fn copy_keeps_the_per_run_listing_and_is_still_vod() {
+    fn copy_lists_the_whole_title_on_the_keyframe_walk() {
         let dir = tempfile::tempdir().unwrap();
-        let mut session = eof_test_session(dir.path(), 1_354_496);
-        session.encode_plan = plan_25fps();
-        // Stated, not inherited: transcode would list the whole title on this
-        // same plan, and the test would pass either way if the mode came from
-        // the helper.
-        session.mode = SessionMode::Transcode;
-        assert!(
-            full_title_entries(&session).is_some(),
-            "the plan is one transcode would list from"
-        );
+        let mut session = eof_test_session(dir.path(), 100_000);
         session.mode = SessionMode::Copy;
+        session.encode_plan = plan_25fps();
+        // Keyframes every 8 s, so a 20 s walk takes every third one.
+        session.map_binding.map = Some(KeyframeMap {
+            container_kind: MapContainerKind::Matroska,
+            content_id: "probe".into(),
+            entries: (0..13)
+                .map(|i| KeyframeEntry {
+                    pts_ms: i * 8_000,
+                    byte_offset: i * 1_000,
+                })
+                .collect(),
+        });
 
-        assert!(
-            full_title_entries(&session).is_none(),
-            "copy places no IDRs, so it has no grid to list"
+        let entries = copy_window_entries(&session).expect("copy lists from its map");
+        let starts: Vec<u64> = entries.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            starts,
+            vec![0, 24_000, 48_000, 72_000, 96_000],
+            "the first keyframe at or after each 20 s boundary, not the boundary"
         );
+        assert!(
+            starts.windows(2).all(|w| w[1] - w[0] >= COPY_WINDOW_MS),
+            "every window holds at least COPY_WINDOW_MS of media"
+        );
+        assert_eq!(
+            entries.last().map(|(s, d)| s + d),
+            Some(100_000),
+            "the last window runs to the extent, not past it"
+        );
+
+        // The walk depends only on the map and 0, which is what makes it
+        // listable before anything is written. Where this run started must not
+        // change it.
+        session.start_ms = 48_000;
+        session.play_start_ms = 48_000;
+        let after_seek: Vec<u64> = copy_window_entries(&session)
+            .expect("still lists")
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(starts, after_seek, "the listing is run-independent");
+
         let pl = build_run_media_playlist("s1", &session);
         let text = String::from_utf8_lossy(&pl);
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(!text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
+        assert!(text.contains("/api/v0/sessions/s1/seg_00000024000.m4s"));
+    }
+
+    /// Without a keyframe map, copy's cut points are not knowable ahead of
+    /// time, so that session keeps the per-run listing.
+    #[test]
+    fn copy_without_a_map_keeps_the_per_run_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 100_000);
+        session.mode = SessionMode::Copy;
+        session.encode_plan = plan_25fps();
+        assert!(session.map_binding.map.is_none());
         assert!(
-            !text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
-            "EVENT is gone in every mode, listing shape or not"
+            full_title_entries(&session).is_none(),
+            "an -ss copy run cannot say where it will cut"
         );
     }
 
