@@ -28,7 +28,7 @@ not here — this page is the reference, not the tour.
 | [0008](0008-abr-post-v1.md) | Adaptive bitrate is post-v1 | Partially superseded | — | §1 by [0051](0051-abr-is-v1.md) (ABR ships in v1; §2–§4 stand and are now load-bearing), §3 amended by [0052](0052-keyframe-cadence-per-encode-leg.md) |
 | [0009](0009-hw-accel-detection.md) | Hardware encode detection by verification | Accepted (amended 2026-08-03, 2026-08-11) | — | — |
 | [0010](0010-text-subs-webvtt.md) | Text subtitle tracks as WebVTT sidecars | Partially superseded | — | §7 by [0013](0013-subtitle-extraction-at-scan.md) |
-| [0011](0011-remux-session-convergence.md) | Remux converges onto the session model | Accepted (amended 2026-08-25, fix (a)'s mechanism replaced by [0050](0050-lead-held-session-shape.md) §4-§5) | [0006](0006-phase2-remux-decision.md) (delivery decisions) | — |
+| [0011](0011-remux-session-convergence.md) | Remux converges onto the session model | Accepted (amended 2026-08-25, fix (a)'s mechanism replaced by [0050](0050-lead-held-session-shape.md) §4-§5; corrected 2026-08-30, the race is answered but not by the superseded encoder still producing) | [0006](0006-phase2-remux-decision.md) (delivery decisions) | — |
 | [0012](0012-audio-downmix-and-track-selection.md) | Audio downmix and multi-track selection | Accepted | — | — |
 | [0013](0013-subtitle-extraction-at-scan.md) | Subtitle extraction at scan time | Partially superseded | [0010](0010-text-subs-webvtt.md) §7 | §1–§2 by [0041](0041-subtitle-classification-and-client-gated-extraction.md); §4 mtime/size stamps by [0023](0023-cluster-map-byte-offset-start.md) §6 (migration `019`) — rest of §3–§12 stand |
 | [0014](0014-library-availability.md) | Library availability and failure classification | Accepted | — | — |
@@ -65,7 +65,7 @@ not here — this page is the reference, not the tour.
 | [0047](0047-title-extension-admission-and-collision-evidence.md) | What may count as a title match, and what evidence may break a tie | **Proposed** | — | — |
 | [0048](0048-yearless-movie-collisions.md) | What may decide a yearless movie collision | **Accepted** (option B) | — | — |
 | [0049](0049-what-is-a-show-folder.md) | What counts as a show folder when the directory is per-episode | **Proposed** | — | — |
-| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap; 2026-08-25, §5 measured vs inferred and the deletion ledger reconciled) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
+| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap; 2026-08-25, §5 measured vs inferred and the deletion ledger reconciled; corrected 2026-08-30, §5's waiter reason falsified and the seek rate measured) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
 | [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
 | [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
 | [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** (amended 2026-08-30 — `#171`/`#172` answered it in an unlisted shape; the seam stays unwired) | — | — |

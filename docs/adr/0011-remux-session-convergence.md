@@ -2,6 +2,8 @@
 
 - Status: accepted
 - Date: 2026-07-26
+- Corrected: 2026-08-30 — the race is answered, but not by the superseded
+  encoder still producing. Measured at `c43b440`; see the fix (a) amendment.
 - Amended: 2026-08-25 — fix (a)'s mechanism is gone. ADR-0050 §4-§5 replaced
   kill-and-restart, so there is no kill to defer; the decision stands, the
   machinery named in it does not.
@@ -190,6 +192,28 @@ path iOS/tvOS need).
    >
    > This is a mechanism replaced, not a decision reversed. Fix (b) is
    > still not taken.
+   >
+   > **Corrected 2026-08-30 — the race is answered, and not by that.**
+   > *"The encoder that owns the land is still producing it"* is the same
+   > claim ADR-0050 §5's 2026-08-24 amendment made, and it is corrected
+   > there on the same measurement. Kept visible rather than replaced.
+   >
+   > On a Matroska source the encoder that owns the land **stops producing
+   > 0.30 s after the seek** (median, 35 seeks at `c43b440` on the N150):
+   > a distinct-land seek starts a new `RangeServer` and drops the old
+   > one, which is the input the superseded encoder is reading.
+   >
+   > **Fix (a)'s race is still answered, by two other mechanisms.** A
+   > waiter on the superseded land is released by
+   > `no_fill_release_for_new_land` once the new land is serviceable —
+   > 19 trials, every one returning in 794-1435 ms, no `204` — and what
+   > the old encoder already wrote is served from disk by the poll-path
+   > ingest added in `91d3899`, which needs the bytes and not the process.
+   > **9 of 12 seek trials were served from the superseded run.**
+   >
+   > So the conclusion holds and its stated mechanism does not. The
+   > **owed** measurement below is unchanged: none of this exercises
+   > mid-playback double-scrub under preempt-on.
 
 Fix (a) targets **mid-playback double-scrub under preempt-on** (kill
 before mid land). Scrub-before-play ablation under preempt-on passed
