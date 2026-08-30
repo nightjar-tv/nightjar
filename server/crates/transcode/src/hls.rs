@@ -216,15 +216,43 @@ pub enum SegmentMissAction {
     Restart,
 }
 
-/// Deliberate miss policy under ADR-0020 producer-truth playlists.
+/// What to do when a listed segment is not on disk.
 ///
-/// Segment GETs never move the encode window. Far scrub is
-/// `POST /sessions/{id}/seek`. A miss is always Wait: listed-but-not-ready
-/// cooks under fill-forward; unlisted URIs are 404'd by the asset path once
-/// unreachable. The old behind-play Restart band ([`ALIGN_BEHIND_SEGMENTS`])
-/// and ahead-of-frontier Restart past [`CATCH_UP_SEGMENTS`] fitted WebKit
-/// requesting URIs the synthetic full-title VOD listed but the producer
-/// never wrote — that playlist is gone.
+/// **Overturned 2026-08-30 — a cold listed URI starts an encoder.** ADR-0054
+/// decision 3: *"A listed URI is never 404 and never 503. … A cold URI is a
+/// seek: the session starts an encoder at that media time."*
+///
+/// This function returned `Wait` unconditionally, discarding all six of its
+/// arguments, and its comment stated that as policy. It is kept here because
+/// it is what is being reversed, not a detail being adjusted:
+///
+/// > *Deliberate miss policy under ADR-0020 producer-truth playlists.*
+/// >
+/// > *Segment GETs never move the encode window. Far scrub is
+/// > `POST /sessions/{id}/seek`. A miss is always Wait: listed-but-not-ready
+/// > cooks under fill-forward; unlisted URIs are 404'd by the asset path once
+/// > unreachable. The old behind-play Restart band ([`ALIGN_BEHIND_SEGMENTS`])
+/// > and ahead-of-frontier Restart past [`CATCH_UP_SEGMENTS`] fitted WebKit
+/// > requesting URIs the synthetic full-title VOD listed but the producer
+/// > never wrote — that playlist is gone.*
+///
+/// **That playlist is coming back**, and its last clause is why the policy has
+/// to go with it. Fill-forward reaches a want only while every listed URI sits
+/// near the running producer, which is true of a one-window listing and false
+/// of a full-title one. For a want no run is heading towards, `Wait` never
+/// ends: the hold runs to [`IDLE_TIMEOUT`] and returns an empty 204.
+///
+/// `Restart` for a want this run cannot reach:
+///
+/// - **behind the encode window** — this run produces forward from
+///   `window_start_ms` and never goes back;
+/// - **past the catch-up band** — further ahead of the producer's frontier
+///   than [`CATCH_UP_SEGMENTS`], so waiting is not a cook, it is a stall.
+///
+/// `Wait` otherwise, and `Wait` always while the run is still starting
+/// (`!primed`, where the frontier is not yet meaningful) or inside
+/// [`RESTART_MIN_INTERVAL`] of the last restart, which is what stops a
+/// prefetching client turning a listing into a restart storm.
 pub fn decide_segment_miss(
     want_ms: u64,
     window_start_ms: u64,
@@ -233,14 +261,23 @@ pub fn decide_segment_miss(
     primed: bool,
     since_last_restart: Duration,
 ) -> SegmentMissAction {
-    let _ = (
-        want_ms,
-        window_start_ms,
-        play_start_ms,
-        latest_on_disk_ms,
-        primed,
-        since_last_restart,
-    );
+    // A run that has served nothing yet has no honest frontier, and the want
+    // is usually its own land arriving. `play_start_ms` is what it is heading
+    // for, so a want at or after it is that case and not a miss to act on.
+    if !primed && want_ms >= align_to_segment(play_start_ms) {
+        return SegmentMissAction::Wait;
+    }
+    if since_last_restart < RESTART_MIN_INTERVAL {
+        return SegmentMissAction::Wait;
+    }
+    let want = align_to_segment(want_ms);
+    if want < align_to_segment(window_start_ms) {
+        return SegmentMissAction::Restart;
+    }
+    let frontier = latest_on_disk_ms.unwrap_or(window_start_ms);
+    if want.saturating_sub(frontier) > CATCH_UP_SEGMENTS * SEGMENT_MS {
+        return SegmentMissAction::Restart;
+    }
     SegmentMissAction::Wait
 }
 
@@ -1832,7 +1869,8 @@ impl HlsSessionRegistry {
                                     session.play_start_ms,
                                     session.pending_play_ms,
                                     want_ms,
-                                ) {
+                                ) && !want_is_listed(session, want_ms)
+                                {
                                     if pending_waiter_action(session.pending_play_ms, want_ms)
                                         == PendingWaiterAction::Release
                                     {
@@ -1861,11 +1899,11 @@ impl HlsSessionRegistry {
                             SegmentMissAction::Wait => {
                                 if scrub_shaped
                                     && !prefetch_advances_pending(session.pending_play_ms, want_ms)
-                                    && !digback_behind_committed(
+                                    && !(digback_behind_committed(
                                         session.play_start_ms,
                                         session.pending_play_ms,
                                         want_ms,
-                                    )
+                                    ) && !want_is_listed(session, want_ms))
                                 {
                                     desire_restart(session, want_ms);
                                     holding_for_land = true;
@@ -2629,6 +2667,34 @@ fn grid_cadence_ms(
     // it is transcode for this question.
     let transcode = mode == SessionMode::Transcode || has_burn_in;
     transcode.then(|| produced_segment_ms(leg, plan))?
+}
+
+/// Is this want one the session's own playlist offers?
+///
+/// **The narrowing that lets a cold URI spawn behind the committed land.**
+/// [`digback_behind_committed`] declines a behind-committed GET as dig-back,
+/// which was right while the only such GETs were WebKit asking for URIs the
+/// session never offered. **A URI the playlist lists is not junk, it is the
+/// contract** — and under ADR-0054 decision 3 it must be served, in either
+/// direction.
+///
+/// So the guard keeps declining what it was built for (an unlisted want) and
+/// stops declining what it never intended (our own listing). Off the grid or
+/// past the extent is still unlisted and still 404s.
+///
+/// `false` for a session with no full-title listing — copy and remux, or a leg
+/// with no honest cadence — which leaves the guard exactly as it was for them.
+fn want_is_listed(session: &Session, want_ms: u64) -> bool {
+    let Some(step) = grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_leg,
+        &session.encode_plan,
+    ) else {
+        return false;
+    };
+    let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
+    step > 0 && want_ms.is_multiple_of(step) && want_ms < end
 }
 
 fn snap_plan_to_grid(plan: &mut StartPlan, produced_ms: u64) {
@@ -4478,6 +4544,101 @@ mod tests {
         );
     }
 
+    /// The narrowing keeps what the dig-back guard was built for.
+    ///
+    /// `digback_behind_committed` declines a behind-committed GET as junk. A
+    /// URI the playlist lists is not junk, so the guard now yields to it — but
+    /// **an unlisted want must still decline**, or a prefetching client turns
+    /// a full-title listing into the restart storm the guard was measured to
+    /// stop.
+    #[test]
+    fn only_a_listed_want_escapes_the_digback_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 1_354_496);
+        session.mode = SessionMode::Transcode;
+        session.encode_leg = crate::EncodeLeg::software();
+        session.encode_plan = VideoEncodePlan {
+            source_frame_rate: Some((24000, 1001)),
+            ..VideoEncodePlan::default()
+        };
+        // software honours -force_key_frames, so the grid is SEGMENT_MS.
+        let step = SEGMENT_MS;
+
+        assert!(
+            want_is_listed(&session, 40 * step),
+            "on the grid and inside the title is listed"
+        );
+        assert!(
+            !want_is_listed(&session, 40 * step + 1),
+            "off the grid is not listed and must keep declining"
+        );
+        assert!(
+            !want_is_listed(&session, 2_000_000),
+            "past the extent is not listed and must keep declining"
+        );
+
+        // Copy has no full-title listing yet, so the guard is untouched for it.
+        session.mode = SessionMode::Copy;
+        assert!(
+            !want_is_listed(&session, 40 * step),
+            "a session with no full-title listing offers nothing to escape with"
+        );
+    }
+
+    /// A cold listed URI starts an encoder (ADR-0054 decision 3).
+    ///
+    /// Each arm is a want no run is heading towards. Under the policy this
+    /// reverses every one of them returned `Wait`, and a full-title listing
+    /// would have held them to `IDLE_TIMEOUT`.
+    #[test]
+    fn a_cold_listed_uri_restarts_rather_than_waiting_forever() {
+        let long_ago = RESTART_MIN_INTERVAL * 2;
+        let frontier = Some(40_000);
+
+        // Behind the encode window: this run produces forward and never
+        // returns to it.
+        assert_eq!(
+            decide_segment_miss(10_000, 30_000, 40_000, frontier, true, long_ago),
+            SegmentMissAction::Restart,
+            "a want behind the window is never produced by this run"
+        );
+
+        // Further ahead than the catch-up band: waiting is a stall, not a cook.
+        let far = 40_000 + (CATCH_UP_SEGMENTS + 3) * SEGMENT_MS;
+        assert_eq!(
+            decide_segment_miss(far, 30_000, 40_000, frontier, true, long_ago),
+            SegmentMissAction::Restart,
+            "a want past the catch-up band is not reachable by fill-forward"
+        );
+
+        // Inside the band is a cook, and still waits.
+        let near = 40_000 + CATCH_UP_SEGMENTS * SEGMENT_MS;
+        assert_eq!(
+            decide_segment_miss(near, 30_000, 40_000, frontier, true, long_ago),
+            SegmentMissAction::Wait,
+            "the producer is heading for this one"
+        );
+    }
+
+    /// The two guards that stop a prefetching client turning a full-title
+    /// listing into a restart storm.
+    #[test]
+    fn a_cold_uri_does_not_restart_while_starting_or_inside_the_interval() {
+        let far = 400_000;
+
+        assert_eq!(
+            decide_segment_miss(far, 30_000, 40_000, Some(40_000), true, Duration::ZERO),
+            SegmentMissAction::Wait,
+            "inside RESTART_MIN_INTERVAL nothing restarts, however cold the want"
+        );
+
+        assert_eq!(
+            decide_segment_miss(far, 30_000, 40_000, None, false, RESTART_MIN_INTERVAL * 2),
+            SegmentMissAction::Wait,
+            "a run that has served nothing has no frontier to be far from"
+        );
+    }
+
     /// The cadence a leg will actually produce, which is not always the one
     /// the session asked for.
     #[test]
@@ -4931,26 +5092,41 @@ mod tests {
     fn segment_miss_decision_table() {
         let cool = RESTART_MIN_INTERVAL;
         let hot = Duration::from_millis(0);
-        // ADR-0020: segment GETs never Restart. Far scrub is POST /seek.
+        // Overturned 2026-08-30. Every row said Wait under ADR-0020's "segment
+        // GETs never Restart". Three of them are now Restart, because a
+        // full-title listing names URIs fill-forward cannot reach and Wait on
+        // those never ends. The two that still Wait are the guards that keep
+        // a prefetching client from restart-storming.
         let cases = [
             (
-                "behind window waits (no dig-back restart)",
+                "behind window restarts: this run never produces it",
                 0,
                 600,
                 616,
                 None,
                 false,
                 cool,
+                SegmentMissAction::Restart,
             ),
-            ("near behind play waits", 0, 4, 4, Some(10), true, cool),
             (
-                "far ahead of frontier waits (seek API owns scrub)",
+                "just behind the window still restarts: direction, not distance",
+                0,
+                4,
+                4,
+                Some(10),
+                true,
+                cool,
+                SegmentMissAction::Restart,
+            ),
+            (
+                "far ahead of frontier restarts: waiting there is a stall",
                 20,
                 4,
                 4,
                 Some(10),
                 true,
                 cool,
+                SegmentMissAction::Restart,
             ),
             (
                 "near frontier waits (cooking)",
@@ -4960,6 +5136,7 @@ mod tests {
                 Some(10),
                 true,
                 cool,
+                SegmentMissAction::Wait,
             ),
             (
                 "hot restart interval still waits",
@@ -4969,9 +5146,10 @@ mod tests {
                 Some(10),
                 true,
                 hot,
+                SegmentMissAction::Wait,
             ),
         ];
-        for (name, idx, window, play, latest, primed, since) in cases {
+        for (name, idx, window, play, latest, primed, since, want) in cases {
             assert_eq!(
                 decide_segment_miss(
                     idx * SEGMENT_MS,
@@ -4981,14 +5159,18 @@ mod tests {
                     primed,
                     since,
                 ),
-                SegmentMissAction::Wait,
+                want,
                 "{name}"
             );
         }
     }
 
     #[test]
-    fn miss_never_restarts_encode_from_segment_get() {
+    fn miss_restarts_behind_the_window_and_keeps_the_seek_arithmetic() {
+        // These three were `Wait` under ADR-0020's miss policy. Each is a want
+        // behind its run's encode window, which that run never produces, so
+        // each is now a Restart. The `encode_start_ms` assertion below is what
+        // this test was also guarding and is unchanged.
         let cases = [(1040u64, 1052u64), (0u64, 4u64), (1610u64, 1614u64)];
         for (idx, window) in cases {
             let action = decide_segment_miss(
@@ -4999,7 +5181,7 @@ mod tests {
                 true,
                 RESTART_MIN_INTERVAL,
             );
-            assert_eq!(action, SegmentMissAction::Wait, "idx={idx}");
+            assert_eq!(action, SegmentMissAction::Restart, "idx={idx}");
             let want_ms = idx * SEGMENT_MS;
             let new_window = encode_start_ms(want_ms) / SEGMENT_MS;
             assert_eq!(
@@ -5452,11 +5634,12 @@ mod tests {
                 true,
                 RESTART_MIN_INTERVAL,
             ),
-            SegmentMissAction::Wait
+            SegmentMissAction::Restart,
+            "a dig-back want is behind the window, so the miss decision is Restart"
         );
         assert!(
             digback_behind_committed(cooking, None, dig),
-            "asset_wait must skip desire_restart for this miss"
+            "and the dig-back guard is what still decides, at the call site"
         );
     }
 
@@ -5594,7 +5777,7 @@ mod tests {
     /// Same-run fill-forward may eventually produce the bytes; that is not a
     /// scrub. What must not happen is a new `run_id` without POST /seek.
     #[test]
-    fn segment_miss_without_seek_cannot_cook_far_ahead() {
+    fn a_far_ahead_listed_want_cooks_and_the_seek_path_still_works() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -5633,16 +5816,20 @@ mod tests {
             !String::from_utf8_lossy(&playlist).contains(&land),
             "far-ahead segment must not already be listed"
         );
-        // Miss may Wait/404/abandon, or Ok via same-run fill-forward — never
-        // a new producer run.
+        // Overturned 2026-08-30: a listed want past the catch-up band is a
+        // cold URI, and ADR-0054 decision 3 makes it a seek. It used to be
+        // declined here, which a full-title listing turns into a hold that
+        // never ends.
         let _ = reg.asset(&id, &land, None);
-        let run_after_miss = {
+        let (run_after_miss, pending) = {
             let sessions = reg.sessions.lock().unwrap();
-            sessions.get(&id).unwrap().current_run_id
+            let session = sessions.get(&id).unwrap();
+            (session.current_run_id, session.pending_play_ms)
         };
-        assert_eq!(
-            run_after_miss, run_before,
-            "segment miss must not cook a far-ahead land"
+        assert!(
+            run_after_miss != run_before || pending == Some(land_ms),
+            "a far-ahead listed want must cook: run {run_before} -> \
+             {run_after_miss}, pending {pending:?}"
         );
 
         let view = reg.seek(&id, land_ms).expect("seek");
@@ -5861,10 +6048,14 @@ mod tests {
             !wait_asset(&reg, &switched, &land).is_empty(),
             "play-land segment servable"
         );
+        // Overturned 2026-08-30: a want behind the window is one this run
+        // never produces, so waiting on it never ends. Whether it actually
+        // cooks is decided at the call site by the dig-back guard, which now
+        // yields only to a want the playlist lists.
         assert_eq!(
             decide_segment_miss(0, 40_000, 40_000, None, false, RESTART_MIN_INTERVAL),
-            SegmentMissAction::Wait,
-            "seg at t=0 behind a 40s window must wait"
+            SegmentMissAction::Restart,
+            "seg at t=0 behind a 40s window is not reachable by fill-forward"
         );
 
         // Behind encode window: unlisted under producer-truth → 404, not a
