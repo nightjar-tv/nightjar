@@ -707,6 +707,55 @@ fn sync_segment_map(session: &mut Session) {
     }
 }
 
+/// Re-read the `index.m3u8` of every run a superseded encoder is still
+/// writing into.
+///
+/// A seek keeps the prior encoder for [`REAP_AFTER`] and it keeps producing
+/// into `run_<old>` (ADR-0050 §5). [`sync_segment_map`] reads the current run
+/// only, so without this nothing re-ingests that file until the next
+/// `restart_at`, and everything the held encoder writes after the seek is
+/// invisible to a waiting request. The new encoder starts at the new land and
+/// never produces behind it, so neither encoder can serve a want in the gap.
+///
+/// Reads [`SupersededEncoder::run_id`], never `read_dir`. The ids are already
+/// in memory, so the runs touched are bounded by how many encoders are held,
+/// not by how many seeks the session has made. [`sync_all_run_indexes`] walks
+/// the whole session dir instead, which grows with session history, and it
+/// stays where it is: once per seek.
+///
+/// **It is not one file read per held encoder.**
+/// [`crate::hls_segment_map::ingest_run_index`] reads the index, the
+/// `encode_start_ms`, and then **every segment file the index lists**, because
+/// the map key comes from each segment's `sidx`. The cost is `2 + K` reads per
+/// held run, measured 2026-08-30 at about 79 us per listed segment: 1.35 ms at
+/// K=5, 6.1 ms at K=30, 23.7 ms at K=150, held under the sessions mutex.
+///
+/// The `is_empty` gate at the call site is what keeps that off the steady
+/// state: with nothing held this costs one check, measured at 738 us against a
+/// 737 us baseline. [`sync_segment_map`] already pays the same `2 + K` shape
+/// for the current run, twice per poll iteration, which is the larger and
+/// older cost — the map is rebuilt from disk rather than maintained
+/// incrementally, and this function inherits that rather than introducing it.
+fn sync_superseded_run_indexes(session: &mut Session) {
+    let run_ids: Vec<u64> = session.superseded.iter().map(|s| s.run_id).collect();
+    for run_id in run_ids {
+        let run_path = session.dir.join(format!("run_{run_id}"));
+        let Ok(text) = fs::read_to_string(run_path.join("index.m3u8")) else {
+            continue;
+        };
+        let encode_start_ms = read_run_encode_start(&run_path);
+        if let Err(e) = crate::hls_segment_map::ingest_run_index(
+            &mut session.segment_map,
+            &session.dir,
+            run_id,
+            &text,
+            encode_start_ms,
+        ) {
+            tracing::warn!(run_id, error = %e, "hls map ingest failed (superseded run)");
+        }
+    }
+}
+
 /// Re-read every `run_*/index.m3u8` so scrub-back map hits see prior runs
 /// even if the current run's index is empty after stop_child.
 fn sync_all_run_indexes(session: &mut Session) {
@@ -1658,6 +1707,16 @@ impl HlsSessionRegistry {
                     fs::read(run_dir(session).join("init.mp4")).ok()
                 } else if let Some(ms) = requested_ms {
                     sync_segment_map(session);
+                    // The gate is what keeps this honest. Outside the
+                    // REAP_AFTER window after a seek the held set is empty and
+                    // this costs one `is_empty()`; inside it, one file read per
+                    // held encoder, on the only path where the ingest matters.
+                    // The throttle tick would do the same work every 250 ms
+                    // whether or not anyone is waiting, and would hand the
+                    // waiter its bytes up to a tick late.
+                    if !session.superseded.is_empty() {
+                        sync_superseded_run_indexes(session);
+                    }
                     match session.segment_map.get(ms) {
                         Some(seg) => {
                             let abs = session.dir.join(&seg.rel_path);
@@ -3752,6 +3811,113 @@ mod tests {
         assert!(dir.path().join("run_3").exists(), "the current run stays");
 
         reap_all_superseded(&mut session);
+    }
+
+    /// Write one producer run: the segment files, their `index.m3u8`, and the
+    /// `encode_start_ms` beside them. `starts_ms` are title-absolute.
+    fn write_producer_run(
+        session_dir: &Path,
+        run_id: u64,
+        encode_start_ms: u64,
+        starts_ms: &[u64],
+    ) {
+        let run = session_dir.join(format!("run_{run_id}"));
+        fs::create_dir_all(&run).unwrap();
+        let mut index = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:2\n");
+        for (i, start) in starts_ms.iter().enumerate() {
+            let file = format!("seg{i:03}.m4s");
+            fs::write(
+                run.join(&file),
+                crate::hls_segment_map::fake_sidx_seg(*start as u32),
+            )
+            .unwrap();
+            index.push_str(&format!("#EXTINF:2.000000,\n{file}\n"));
+        }
+        fs::write(run.join("index.m3u8"), index).unwrap();
+        write_run_encode_start(&run, encode_start_ms).unwrap();
+    }
+
+    /// A waiter can read what the superseded encoder wrote after the seek.
+    ///
+    /// The gap this covers is the one the hold exists for: the old encoder
+    /// keeps producing into `run_0` for `REAP_AFTER`, and the new encoder
+    /// starts at the new land and never produces behind it. Before the poll
+    /// path ingested the held runs, the only refresh was `sync_segment_map`
+    /// on the current run, so nothing that landed in `run_0` after the seek
+    /// was ever mapped and neither encoder could serve the want.
+    ///
+    /// `restart_at` is `sync_all_run_indexes`'s one caller, so a test that
+    /// seeks twice passes for the wrong reason. This one seeks once, by hand,
+    /// and asserts the gap is absent from the map before it asks for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiter_reads_what_the_superseded_encoder_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // run_0 produced to a frontier of 2000 (media ending at 4000) before
+        // the seek. The seek lands at 20000, where run_1 starts producing.
+        let land_ms = 20_000u64;
+        let gap_ms = 4_000u64;
+        write_producer_run(&session_dir, 0, 0, &[0, 2_000]);
+        write_producer_run(&session_dir, 1, land_ms, &[land_ms]);
+
+        let mut session = make_test_session(&session_dir);
+        session.duration_ms = 120_000;
+        // What `restart_at` leaves behind: run_0 held and still running,
+        // run_1 current at the new land.
+        crate::hls_segment_map::ingest_run_index(
+            &mut session.segment_map,
+            &session_dir,
+            0,
+            &fs::read_to_string(session_dir.join("run_0/index.m3u8")).unwrap(),
+            0,
+        )
+        .unwrap();
+        session.current_run_id = 1;
+        session.next_run_id = 2;
+        session.start_ms = land_ms;
+        session.play_start_ms = land_ms;
+        session.last_requested_ms = land_ms;
+        session.landed_ms = land_ms;
+        session.child = Some(spawn_stand_in_encoder());
+        session.superseded.push(SupersededEncoder {
+            child: spawn_stand_in_encoder(),
+            // The real delay is `REAP_AFTER`; parked out of reach so the
+            // throttle tick cannot reap run_0 out from under the assertion.
+            reap_at: Instant::now() + Duration::from_secs(30),
+            run_id: 0,
+        });
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        // The held encoder writes one more segment into its own run: past
+        // everything run_0 had produced at the seek, and behind the new land.
+        write_producer_run(&session_dir, 0, 0, &[0, 2_000, gap_ms]);
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get("s1").unwrap();
+            assert!(
+                session.segment_map.get(gap_ms).is_none(),
+                "the gap segment must be absent from the map before the request, \
+                 or the request proves nothing"
+            );
+        }
+
+        let name = crate::hls_segment_map::time_keyed_segment_name(gap_ms);
+        let served = reg.asset("s1", &name, None);
+        assert_eq!(
+            served.as_deref().map_err(|e| format!("{e:?}")),
+            Ok(crate::hls_segment_map::fake_sidx_seg(gap_ms as u32).as_slice()),
+            "a request in the gap must be served the bytes the held encoder wrote"
+        );
+
+        reg.stop("s1");
     }
 
     /// ADR-0052: the frame count for one segment comes from the source rate,

@@ -23,6 +23,25 @@ pub fn parse_time_keyed_segment_name(name: &str) -> Option<u64> {
     rest.parse().ok()
 }
 
+/// Minimal fMP4 with a video (ref_id=1) sidx v0; timescale 1000 → ms.
+///
+/// Lives here rather than in a test module so `hls.rs` can write producer
+/// files too: the gate [`ingest_run_index`] applies is a sidx read, so a test
+/// that writes an `index.m3u8` has to write bytes that carry one.
+#[cfg(test)]
+pub(crate) fn fake_sidx_seg(earliest_ms: u32) -> Vec<u8> {
+    let mut body = vec![0u8; 20];
+    body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    body[8..12].copy_from_slice(&1000u32.to_be_bytes());
+    body[12..16].copy_from_slice(&earliest_ms.to_be_bytes());
+    let size = (8 + body.len()) as u32;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(b"sidx");
+    out.extend_from_slice(&body);
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedSegment {
     pub start_ms: u64,
@@ -323,20 +342,6 @@ mod tests {
         assert_eq!(sidx_title_offset_ms(40_000, 40_000), 0);
         assert_eq!(sidx_title_offset_ms(40_000, 40_080), 0);
         assert_eq!(sidx_title_offset_ms(0, 0), 0);
-    }
-
-    /// Minimal fMP4 with a video (ref_id=1) sidx v0; timescale 1000 → ms.
-    fn fake_sidx_seg(earliest_ms: u32) -> Vec<u8> {
-        let mut body = vec![0u8; 20];
-        body[4..8].copy_from_slice(&1u32.to_be_bytes());
-        body[8..12].copy_from_slice(&1000u32.to_be_bytes());
-        body[12..16].copy_from_slice(&earliest_ms.to_be_bytes());
-        let size = (8 + body.len()) as u32;
-        let mut out = Vec::with_capacity(size as usize);
-        out.extend_from_slice(&size.to_be_bytes());
-        out.extend_from_slice(b"sidx");
-        out.extend_from_slice(&body);
-        out
     }
 
     #[test]
