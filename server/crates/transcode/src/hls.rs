@@ -2412,28 +2412,47 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
     }
 }
 
-/// Producer reached EOF: mark ENDLIST and record usable extent when the run
-/// that ended got materially short of claimed duration. Empty map at a
-/// mid-title land is still damage — clients must see usableExtentMs instead of
-/// hanging on master 503.
+/// Producer reached EOF: mark ENDLIST and record usable extent when the
+/// farthest mapped end (or 0 if nothing was written) is materially short of
+/// claimed duration. Empty map at a mid-title land is still damage — clients
+/// must see usableExtentMs instead of hanging on master 503.
 ///
-/// **The extent is the ended run's frontier, not the session map's maximum.**
-/// This read `iter_ordered().next_back()` until 2026-08-30, which was a
-/// session-global maximum and correct while a session had one run at a time.
-/// Since #160 the map holds every live run, so the maximum can belong to a
-/// superseded run that landed past the point this one died at, and reading it
-/// reports a reachable extent for media that is not reachable from here. S3
-/// lists `0..usable_extent_ms`, so that is ADR-0020's failure mode: URIs that
-/// will never exist.
+/// **The extent is the session map's maximum, deliberately, not the ended
+/// run's frontier.** #180 changed it to the per-run frontier on the reasoning
+/// that the map holds every live run since #160, so the maximum could come
+/// from a superseded run. That is true of the code and does not reach this
+/// function:
 ///
-/// [`frontier_ms`] answers per run, which is the same primitive the release
-/// condition uses, and `None` — the run wrote nothing — is 0 rather than
-/// "no damage", which is what the empty mid-title EOF case turns on.
+/// - **This runs only on a clean exit.** [`note_child_exit`] routes a non-zero
+///   status to `session.failed`. A run that exits cleanly read to the end of
+///   its input, so it covers `[its land, media end]`, and **every run that
+///   ends normally has the same frontier as every other**. A run that dies at
+///   a hole in the source exits non-zero and never arrives here.
+/// - **Eviction cannot shorten it.** [`live_run_ids`] includes
+///   `current_run_id`, so a live run's segments are never evicted.
+///
+/// So the two readings differ in exactly one reachable shape: **the current
+/// run exits clean having produced nothing**, which is a seek landing at or
+/// past the true media end of a title claiming more. There the per-run
+/// frontier is 0, `scrubRangeMs` returns it over `item.durationMs`, and
+/// **nothing ever clears this field** — so the scrub bar collapses to zero for
+/// the life of the session, surviving a seek back that plays fine. The
+/// session maximum reports the furthest point known reachable, which is what
+/// both the scrubber and a full-title listing want.
+///
+/// `usable_extent_zero_only_when_the_session_produced_nothing` pins that
+/// shape. Reverted 2026-08-30; the reasoning is kept here so the change is not
+/// made a second time from the same argument.
 fn apply_run_eof(session: &mut Session) {
     session.child = None;
     session.current_run_eof = true;
     sync_segment_map(session);
-    let end = frontier_ms(session.segment_map.iter_ordered(), session.current_run_id).unwrap_or(0);
+    let end = session
+        .segment_map
+        .iter_ordered()
+        .next_back()
+        .map(|last| last.start_ms.saturating_add(last.duration_ms))
+        .unwrap_or(0);
     if session.duration_ms.saturating_sub(end) > USABLE_SHORTFALL_MS {
         session.usable_extent_ms = Some(end);
         tracing::info!(
@@ -7398,54 +7417,48 @@ mod tests {
         }
     }
 
-    /// The extent at EOF is the run that reached EOF, not the session map.
+    /// The extent is 0 only when the session produced nothing.
     ///
-    /// Since #160 the map holds more than one run, so the session-global
-    /// maximum can come from a superseded run that started later in the file
-    /// and produced past the point the current run died at. Reading it hides
-    /// the damage: S3 lists `0..usable_extent_ms`, and a listing built from
-    /// another run's frontier is ADR-0020's failure mode — URIs that will
-    /// never exist.
+    /// The shape no test covered until 2026-08-30, and the one #180 regressed:
+    /// a session that has already played, then a seek landing at or past the
+    /// true media end of a title claiming more. The run exits clean having
+    /// written nothing.
     ///
-    /// The shape here is a source with a hole. An earlier run landed past it
-    /// and produced to the end; the current run started at title 0 and died
-    /// at the hole. Only the current run's frontier says where playback from
-    /// 0 actually stops.
+    /// Reading the ended run's frontier here gives 0, and `scrubRangeMs`
+    /// returns `usableExtentMs` over `item.durationMs` whenever it is set —
+    /// so the scrub bar would collapse to zero and stay there, because
+    /// nothing clears the field. The session maximum reports what is still
+    /// reachable.
     #[test]
-    fn eof_extent_comes_from_the_run_that_ended_not_the_session_map() {
+    fn usable_extent_zero_only_when_the_session_produced_nothing() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("run_1")).unwrap();
 
         let mut map = crate::hls_segment_map::SegmentMap::default();
-        // run 0: a forward seek landed past the hole and ran to the end.
+        // run 0 played the first 400 s of a title claiming 1354 s.
         map.insert(crate::hls_segment_map::MappedSegment {
-            start_ms: 880_000,
-            duration_ms: 20_000,
+            start_ms: 398_000,
+            duration_ms: 2_000,
             run_id: 0,
-            rel_path: PathBuf::from("run_0/seg_00000880000.m4s"),
-        });
-        // run 1: the current run, from title 0, stopped at the hole.
-        map.insert(crate::hls_segment_map::MappedSegment {
-            start_ms: 180_000,
-            duration_ms: 20_000,
-            run_id: 1,
-            rel_path: PathBuf::from("run_1/seg_00000180000.m4s"),
+            rel_path: PathBuf::from("run_0/seg_00000398000.m4s"),
         });
 
-        let mut session = eof_test_session(dir.path(), 900_000);
+        // run 1 landed past the real media end and exited clean, writing
+        // nothing of its own.
+        let mut session = eof_test_session(dir.path(), 1_354_496);
         session.segment_map = map;
         session.current_run_id = 1;
         session.next_run_id = 2;
-        session.start_ms = 0;
-        session.play_start_ms = 0;
+        session.start_ms = 1_014_000;
+        session.play_start_ms = 1_014_000;
 
         apply_run_eof(&mut session);
 
         assert_eq!(
             session.usable_extent_ms,
-            Some(200_000),
-            "the extent is the ended run's frontier; the session maximum of \
-             900000 belongs to a run that started past the damage"
+            Some(400_000),
+            "400 s is still reachable; reporting the empty run's own frontier \
+             would collapse the scrub bar to zero for the session's life"
         );
     }
 
