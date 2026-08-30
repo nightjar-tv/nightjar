@@ -885,23 +885,65 @@ fn first_current_run_start(session: &Session) -> Option<u64> {
         .map(|s| s.start_ms)
 }
 
+/// The whole title on the grid this session's runs share (ADR-0054 decision 1).
+///
+/// `None` when there is no shared grid — copy and remux, or a leg with no
+/// honest cadence — and the caller keeps the per-run listing.
+///
+/// The bound is `usable_extent_ms` when the producer reached EOF short of the
+/// claimed duration, and `duration_ms` otherwise. `usable_extent_ms` is the
+/// **session maximum**, the furthest point known reachable (#181). The per-run
+/// reading is `0` when a run ends having produced nothing, and this would then
+/// list nothing at all.
+fn full_title_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
+    let step = grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_plan,
+    )?;
+    let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
+    if end == 0 || step == 0 {
+        return None;
+    }
+    Some(
+        (0..end)
+            .step_by(step as usize)
+            .map(|start| (start, step.min(end - start)))
+            .collect(),
+    )
+}
+
 fn build_run_media_playlist(session_id: &str, session: &Session) -> Vec<u8> {
-    let window = session.start_ms;
-    // ADR-0020: never list a URI whose bytes are gone. Eviction updates the
-    // map, but defend in depth so a race cannot reintroduce listed-404.
-    let segs: Vec<&crate::hls_segment_map::MappedSegment> = session
-        .segment_map
-        .iter_ordered()
-        .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
-        .filter(|s| session.dir.join(&s.rel_path).is_file())
-        .collect();
     // Path-absolute URIs (ADR-0008): run-dir depth cannot break resolution.
     let init_uri = format!(
         "/api/v0/sessions/{session_id}/runs/{}/init.mp4",
         session.current_run_id
     );
-    let bytes =
-        crate::hls_segment_map::build_map_playlist(&segs, &init_uri, session.current_run_eof);
+    // A full-title listing starts at 0, so the attach point is the land and
+    // must be said. The per-run listing still begins at the land, where a zero
+    // offset already means it.
+    let mut start_offset_ms = 0;
+    let entries = match full_title_entries(session) {
+        Some(entries) => {
+            start_offset_ms = session.play_start_ms;
+            entries
+        }
+        None => {
+            // No shared grid: list what the map holds for this window, as
+            // before. ADR-0020: never list a URI whose bytes are gone.
+            // Eviction updates the map, but defend in depth so a race cannot
+            // reintroduce listed-404.
+            let window = session.start_ms;
+            session
+                .segment_map
+                .iter_ordered()
+                .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
+                .filter(|s| session.dir.join(&s.rel_path).is_file())
+                .map(|s| (s.start_ms, s.duration_ms))
+                .collect()
+        }
+    };
+    let bytes = crate::hls_segment_map::build_map_playlist(&entries, &init_uri, start_offset_ms);
     with_session_absolute_segment_uris(session_id, &bytes)
 }
 
@@ -1931,9 +1973,19 @@ impl HlsSessionRegistry {
                                     );
                                 } else if session.child.is_none() {
                                     return Err(PlaylistError::NotFound);
-                                } else if want_ms < window_start {
-                                    // Producer-truth: URI behind the cooking
-                                    // window was never listed for this run.
+                                } else if want_ms < window_start
+                                    && !want_is_listed(session, want_ms)
+                                {
+                                    // Producer-truth: a URI behind the cooking
+                                    // window was never listed *for this run*.
+                                    //
+                                    // The third site carrying ADR-0020's miss
+                                    // policy, narrowed the same way as the
+                                    // other two. With a full-title listing the
+                                    // session did list it, so a 404 here
+                                    // refuses a URI the playlist offers. An
+                                    // unlisted want behind the window still
+                                    // 404s, which is what this line was for.
                                     return Err(PlaylistError::NotFound);
                                 }
                             }
@@ -2713,15 +2765,15 @@ fn grid_cadence_ms(mode: SessionMode, has_burn_in: bool, plan: &VideoEncodePlan)
 /// `false` for a session with no full-title listing — copy and remux, or a leg
 /// with no honest cadence — which leaves the guard exactly as it was for them.
 fn want_is_listed(session: &Session, want_ms: u64) -> bool {
-    let Some(step) = grid_cadence_ms(
-        session.mode,
-        session.burn_in.is_some(),
-        &session.encode_plan,
-    ) else {
+    // Ask the listing, not the cadence. A predicate that answers "on the grid"
+    // claims wants the playlist does not offer, and every caller reads this as
+    // "the session listed it".
+    let Some(entries) = full_title_entries(session) else {
         return false;
     };
-    let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
-    step > 0 && want_ms.is_multiple_of(step) && want_ms < end
+    entries
+        .binary_search_by_key(&want_ms, |(start, _)| *start)
+        .is_ok()
 }
 
 fn snap_plan_to_grid(plan: &mut StartPlan, produced_ms: u64) {
@@ -4603,6 +4655,78 @@ mod tests {
         );
     }
 
+    /// The playlist lists the whole title, not the run's window.
+    ///
+    /// **This needs a declared source rate.** Without one there is no honest
+    /// cadence, so no grid, so no full-title listing — and 53 of this file's
+    /// sessions pass `VideoEncodePlan::default()`, which reaches the per-run
+    /// path instead. A green suite is not evidence for this listing; these
+    /// are.
+    #[test]
+    fn the_playlist_lists_the_whole_title_not_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 1_354_496);
+        // `eof_test_session` builds a Copy session; the full-title listing is
+        // transcode's, so say so rather than inheriting it.
+        session.mode = SessionMode::Transcode;
+        session.encode_plan = plan_25fps();
+        session.start_ms = 400_000;
+        session.play_start_ms = 400_000;
+
+        let pl = build_run_media_playlist("s1", &session);
+        let text = String::from_utf8_lossy(&pl);
+
+        assert!(
+            text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"),
+            "a run landed at 400 s still lists the title from 0: {text}"
+        );
+        assert!(
+            text.contains("/api/v0/sessions/s1/seg_00001354000.m4s"),
+            "and lists to the usable extent"
+        );
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(!text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(text.contains("#EXT-X-ENDLIST"));
+        assert!(
+            text.contains("#EXT-X-START:TIME-OFFSET=400.000,PRECISE=YES"),
+            "the attach point is the land, not the first entry: {text}"
+        );
+
+        // 1354496 / 2000 entries, and the last one is short rather than past
+        // the extent.
+        let listed = text.matches("seg_").count();
+        assert_eq!(listed, 678, "0..1354496 on a 2000 ms grid");
+    }
+
+    /// Copy and remux keep the per-run listing, and still lose EVENT.
+    #[test]
+    fn copy_keeps_the_per_run_listing_and_is_still_vod() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 1_354_496);
+        session.encode_plan = plan_25fps();
+        // Stated, not inherited: transcode would list the whole title on this
+        // same plan, and the test would pass either way if the mode came from
+        // the helper.
+        session.mode = SessionMode::Transcode;
+        assert!(
+            full_title_entries(&session).is_some(),
+            "the plan is one transcode would list from"
+        );
+        session.mode = SessionMode::Copy;
+
+        assert!(
+            full_title_entries(&session).is_none(),
+            "copy places no IDRs, so it has no grid to list"
+        );
+        let pl = build_run_media_playlist("s1", &session);
+        let text = String::from_utf8_lossy(&pl);
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(
+            !text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "EVENT is gone in every mode, listing shape or not"
+        );
+    }
+
     /// A cold listed URI starts an encoder (ADR-0054 decision 3).
     ///
     /// Each arm is a want no run is heading towards. Under the policy this
@@ -5026,13 +5150,18 @@ mod tests {
             .unwrap_or_else(|| panic!("no time-keyed segment in playlist"))
     }
 
-    /// Producer sidx land for a mid-start / seek window (may be tens of ms
-    /// off the aligned play ms — do not hardcode `seg_00000040000`).
+    /// Producer land for a mid-start / seek window (may be tens of ms off the
+    /// aligned play ms — do not hardcode `seg_00000040000`).
+    ///
+    /// **Read from the session view, not from the first listed URI.** The
+    /// first entry was the land while the playlist listed one window; a
+    /// full-title listing starts at 0 for every session, so the playlist no
+    /// longer says where a run landed. `landedMs` is what a client reads, and
+    /// after the grid snap it is exactly the first segment this run writes.
     fn wait_land_near(reg: &HlsSessionRegistry, id: &str, play_ms: u64) -> (String, u64) {
-        let playlist = wait_playlist(reg, id);
-        let name = first_listed_seg(&playlist);
-        let ms = crate::hls_segment_map::parse_time_keyed_segment_name(&name)
-            .expect("listed segment parses");
+        let _ = wait_playlist(reg, id);
+        let ms = reg.view(id).expect("session view").landed_ms;
+        let name = crate::hls_segment_map::time_keyed_segment_name(ms);
         let slack = SEGMENT_MS.saturating_mul(2);
         assert!(
             ms + slack >= play_ms && ms < play_ms.saturating_add(slack),
@@ -6167,7 +6296,11 @@ mod tests {
         );
         let playlist = wait_playlist(&reg, &id);
         let text = String::from_utf8_lossy(&playlist);
-        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{text}");
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{text}");
+        assert!(
+            !text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "EVENT is gone from every mode: {text}"
+        );
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=0.000"), "{text}");
         let land = first_listed_seg(&playlist);
         assert!(reg.asset(&id, &land, None).is_ok(), "land={land}");

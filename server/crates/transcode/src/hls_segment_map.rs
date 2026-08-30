@@ -344,12 +344,28 @@ pub fn ingest_run_index(
 /// Build an EVENT (or ENDLIST) media playlist from ordered map segments.
 ///
 /// `init_uri` is the EXT-X-MAP URI (run-relative or session-absolute).
-/// `#EXT-X-START` is window-relative (0) when `window_relative_start` is true.
-pub fn build_map_playlist(segments: &[&MappedSegment], init_uri: &str, endlist: bool) -> Vec<u8> {
+/// Media playlist for a set of `(start_ms, duration_ms)` entries.
+///
+/// **Always `VOD` with `ENDLIST`.** It was `EVENT` without one until
+/// 2026-08-30, because the listing grew between fetches: it named the segments
+/// that existed, so a client had to be told to expect more. A full-title
+/// listing names every entry from the first fetch and only the backing files
+/// arrive, so there is nothing left for `EVENT` to describe.
+///
+/// Entries are `(start_ms, duration_ms)` rather than [`MappedSegment`] because
+/// a full-title listing names URIs before any run has written them, and a
+/// mapped segment is by definition already on disk.
+///
+/// `start_offset_ms` is where a fresh attach begins, title-absolute. It was
+/// always `0` while the listing began at the land, because the window's start
+/// *was* the land. **A full-title listing begins at 0, so a zero offset would
+/// attach at the title start rather than where the session landed** — the two
+/// have to be said separately now that they differ.
+pub fn build_map_playlist(entries: &[(u64, u64)], init_uri: &str, start_offset_ms: u64) -> Vec<u8> {
     use std::fmt::Write;
-    let target = segments
+    let target = entries
         .iter()
-        .map(|s| ((s.duration_ms as f64) / 1000.0).ceil() as u64)
+        .map(|(_, duration_ms)| ((*duration_ms as f64) / 1000.0).ceil() as u64)
         .max()
         .unwrap_or(2)
         .max(1);
@@ -357,23 +373,22 @@ pub fn build_map_playlist(segments: &[&MappedSegment], init_uri: &str, endlist: 
         "#EXTM3U\n\
          #EXT-X-VERSION:7\n\
          #EXT-X-TARGETDURATION:{target}\n\
-         #EXT-X-PLAYLIST-TYPE:EVENT\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n\
          #EXT-X-MEDIA-SEQUENCE:0\n\
          #EXT-X-INDEPENDENT-SEGMENTS\n\
          #EXT-X-MAP:URI=\"{init_uri}\"\n\
-         #EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES\n"
+         #EXT-X-START:TIME-OFFSET={start_secs:.3},PRECISE=YES\n",
+        start_secs = start_offset_ms as f64 / 1000.0
     );
-    for s in segments {
-        let secs = s.duration_ms as f64 / 1000.0;
+    for (start_ms, duration_ms) in entries {
+        let secs = *duration_ms as f64 / 1000.0;
         let _ = writeln!(
             out,
             "#EXTINF:{secs:.6},\n{}",
-            time_keyed_segment_name(s.start_ms)
+            time_keyed_segment_name(*start_ms)
         );
     }
-    if endlist {
-        out.push_str("#EXT-X-ENDLIST\n");
-    }
+    out.push_str("#EXT-X-ENDLIST\n");
     out.into_bytes()
 }
 
@@ -540,19 +555,32 @@ seg006.m4s
                 rel_path: PathBuf::from("run_0/b.m4s"),
             },
         ];
-        let refs: Vec<&MappedSegment> = segs.iter().collect();
-        let bytes = build_map_playlist(&refs, "init.mp4", false);
+        let entries: Vec<(u64, u64)> = segs.iter().map(|s| (s.start_ms, s.duration_ms)).collect();
+        let bytes = build_map_playlist(&entries, "init.mp4", 0);
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(
+            text.contains("#EXT-X-PLAYLIST-TYPE:VOD"),
+            "every playlist is VOD; EVENT described a listing that grew"
+        );
+        assert!(
+            !text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "EVENT must not appear in any playlist: {text}"
+        );
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=0.000,PRECISE=YES"));
         assert!(text.contains("seg_00000008008.m4s"));
         assert!(text.contains("seg_00000012012.m4s"));
-        assert!(!text.contains("#EXT-X-ENDLIST"));
-        let with_end = build_map_playlist(&refs, "init.mp4", true);
         assert!(
-            String::from_utf8(with_end)
+            text.contains("#EXT-X-ENDLIST"),
+            "a complete listing always ends"
+        );
+        // A full-title listing begins at 0, so the attach point has to be
+        // stated rather than implied by where the listing starts.
+        let landed = build_map_playlist(&entries, "init.mp4", 8008);
+        assert!(
+            String::from_utf8(landed)
                 .unwrap()
-                .contains("#EXT-X-ENDLIST")
+                .contains("#EXT-X-START:TIME-OFFSET=8.008,PRECISE=YES"),
+            "the attach point is the land, not the first listed entry"
         );
     }
 }
