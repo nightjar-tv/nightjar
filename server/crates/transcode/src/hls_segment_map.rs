@@ -210,6 +210,38 @@ pub fn sidx_title_offset_ms(encode_start_ms: u64, first_sidx_ms: u64) -> u64 {
     }
 }
 
+/// Round a producer key onto the run's cadence, or refuse.
+///
+/// **The producer's first segment is not always where it was asked to start.**
+/// Measured through the transcode crate's own start path, at land 0 with no
+/// seek to discard the encoder's priming frames, the first sidx lands **two
+/// video frames late** and every later key inherits the same offset: 83 ms at
+/// `24000/1001` (keys 83, 2085, 4087), 80 ms at `25`, 33 ms at `60`. At any
+/// land above zero the `-ss` discards those frames and the keys are exact.
+///
+/// Nothing we pass ffmpeg moves it. Both candidate fixes were measured and
+/// refused to: passing `-output_ts_offset 0` at land 0, and passing a nominal
+/// `-ss 0`. So the wire key is snapped here instead of chased there.
+///
+/// **The bound is asserted, not assumed.** A correction beyond an eighth of a
+/// segment is not this offset — it is drift, or a cadence that does not match
+/// the producer — and this returns `None` so the caller keeps the producer's
+/// own key and says so. At `SEGMENT_MS` that bound is 250 ms, three times the
+/// largest offset measured, and far inside half a segment.
+pub fn snap_to_cadence(key_ms: u64, cadence_ms: u64) -> Option<u64> {
+    if cadence_ms == 0 {
+        return None;
+    }
+    let nearest = key_ms.div_ceil(cadence_ms) * cadence_ms;
+    let below = (key_ms / cadence_ms) * cadence_ms;
+    let nearest = if key_ms - below <= nearest - key_ms {
+        below
+    } else {
+        nearest
+    };
+    (key_ms.abs_diff(nearest) <= cadence_ms / 8).then_some(nearest)
+}
+
 /// Ingest one producer run's `index.m3u8` into `map`.
 ///
 /// For each EXTINF entry, reads the segment file, requires contiguous
@@ -225,6 +257,7 @@ pub fn ingest_run_index(
     run_id: u64,
     index_text: &str,
     encode_start_ms: u64,
+    cadence_ms: Option<u64>,
 ) -> Result<usize, String> {
     let entries = parse_ffmpeg_index(index_text)?;
     let run_rel = PathBuf::from(format!("run_{run_id}"));
@@ -256,7 +289,29 @@ pub fn ingest_run_index(
             }
             off
         });
-        let start_ms = sidx_ms.saturating_add(offset);
+        let raw_start_ms = sidx_ms.saturating_add(offset);
+        // Put the wire key on the run's cadence, so a full-title listing can
+        // name it before the producer has written it. Out of bound, keep the
+        // producer's key and say so: the listing will then hold on a URI it
+        // named, which is visible, rather than mapping content to a time it
+        // does not have.
+        let start_ms = match cadence_ms.and_then(|c| snap_to_cadence(raw_start_ms, c)) {
+            Some(snapped) => snapped,
+            None => {
+                if let Some(c) = cadence_ms {
+                    tracing::warn!(
+                        run_id,
+                        file = %entry.file_name,
+                        raw_start_ms,
+                        cadence_ms = c,
+                        bound_ms = c / 8,
+                        "producer key is further off the cadence than the \
+                         first-segment offset explains; keeping it unsnapped"
+                    );
+                }
+                raw_start_ms
+            }
+        };
         // Gate: after the first segment, wire starts should equal the previous
         // end within one millisecond (contiguous producer output).
         if let Some(expect) = prev_end_ms {
@@ -326,6 +381,46 @@ pub fn build_map_playlist(segments: &[&MappedSegment], init_uri: &str, endlist: 
 mod tests {
     use super::*;
 
+    /// The measured first-segment offset snaps; anything larger does not.
+    #[test]
+    fn snap_takes_the_first_segment_offset_and_refuses_drift() {
+        // Measured through the transcode start path at land 0: the producer's
+        // first sidx is two video frames late and every later key inherits it.
+        // 24000/1001, cadence 2002, keys 83 / 2085 / 4087.
+        assert_eq!(snap_to_cadence(83, 2002), Some(0));
+        assert_eq!(snap_to_cadence(2085, 2002), Some(2002));
+        assert_eq!(snap_to_cadence(4087, 2002), Some(4004));
+        // 25 fps, cadence 2000, offset 80. 60 fps, offset 33.
+        assert_eq!(snap_to_cadence(80, 2000), Some(0));
+        assert_eq!(snap_to_cadence(2080, 2000), Some(2000));
+        assert_eq!(snap_to_cadence(33, 2000), Some(0));
+        // A key already on the cadence is unchanged.
+        assert_eq!(snap_to_cadence(4004, 2002), Some(4004));
+        assert_eq!(snap_to_cadence(0, 2002), Some(0));
+
+        // The bound is an eighth of a segment, asserted on both sides so it
+        // fails loudly rather than absorbing real drift. At 2000 that is 250.
+        assert_eq!(
+            snap_to_cadence(250, 2000),
+            Some(0),
+            "exactly the bound snaps"
+        );
+        assert_eq!(
+            snap_to_cadence(251, 2000),
+            None,
+            "one past the bound is drift, not the first-segment offset"
+        );
+        assert_eq!(
+            snap_to_cadence(1750, 2000),
+            Some(2000),
+            "the bound is symmetric below the next multiple"
+        );
+        assert_eq!(snap_to_cadence(1749, 2000), None);
+        // Half a segment is never a snap.
+        assert_eq!(snap_to_cadence(1000, 2000), None);
+        assert_eq!(snap_to_cadence(5, 0), None, "no cadence, no snap");
+    }
+
     #[test]
     fn time_keyed_round_trip() {
         let name = time_keyed_segment_name(1_277_151);
@@ -360,7 +455,7 @@ seg021.m4s
 #EXT-X-ENDLIST
 ";
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000).unwrap();
+        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000, None).unwrap();
         assert_eq!(n, 2);
         assert_eq!(map.get(40_000).unwrap().duration_ms, 2000);
         assert_eq!(map.get(42_000).unwrap().duration_ms, 2000);
@@ -383,7 +478,7 @@ seg021.m4s
 #EXT-X-ENDLIST
 ";
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000).unwrap();
+        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000, None).unwrap();
         assert_eq!(n, 2);
         assert!(map.get(40_000).is_some());
         assert!(map.get(42_000).is_some());

@@ -729,12 +729,16 @@ fn sync_segment_map(session: &mut Session) {
         return;
     };
     let encode_start_ms = read_run_encode_start(&run);
+    let cadence = session_cadence_ms(session);
+    let run_id = session.current_run_id;
+    let session_dir = session.dir.clone();
     if let Err(e) = crate::hls_segment_map::ingest_run_index(
         &mut session.segment_map,
-        &session.dir,
-        session.current_run_id,
+        &session_dir,
+        run_id,
         &text,
         encode_start_ms,
+        cadence,
     ) {
         tracing::warn!(
             run_id = session.current_run_id,
@@ -774,6 +778,7 @@ fn sync_segment_map(session: &mut Session) {
 /// older cost — the map is rebuilt from disk rather than maintained
 /// incrementally, and this function inherits that rather than introducing it.
 fn sync_superseded_run_indexes(session: &mut Session) {
+    let cadence = session_cadence_ms(session);
     let run_ids: Vec<u64> = session.superseded.iter().map(|s| s.run_id).collect();
     for run_id in run_ids {
         let run_path = session.dir.join(format!("run_{run_id}"));
@@ -787,6 +792,7 @@ fn sync_superseded_run_indexes(session: &mut Session) {
             run_id,
             &text,
             encode_start_ms,
+            cadence,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (superseded run)");
         }
@@ -796,6 +802,7 @@ fn sync_superseded_run_indexes(session: &mut Session) {
 /// Re-read every `run_*/index.m3u8` so scrub-back map hits see prior runs
 /// even if the current run's index is empty after stop_child.
 fn sync_all_run_indexes(session: &mut Session) {
+    let cadence = session_cadence_ms(session);
     let Ok(entries) = fs::read_dir(&session.dir) else {
         return;
     };
@@ -822,6 +829,7 @@ fn sync_all_run_indexes(session: &mut Session) {
             run_id,
             &text,
             encode_start_ms,
+            cadence,
         ) {
             tracing::warn!(run_id, error = %e, "hls map ingest failed (all-runs sync)");
         }
@@ -2667,6 +2675,21 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
 /// `None` for copy and remux — they place no IDRs and cannot drop the
 /// `(cue, grid]` media — and for any session whose leg has no honest cadence,
 /// which keeps a per-run listing rather than inventing a grid.
+/// The cadence this session's producer writes at, for the map ingest.
+///
+/// Unlike [`grid_cadence_ms`] this is not gated on transcode: copy's keys are
+/// source keyframes and have no cadence to snap to, so it answers `None` there
+/// through [`produced_segment_ms`]'s own rate check only when a rate is
+/// absent. Copy is excluded by the mode test below for the same reason it is
+/// excluded from the grid — it places no IDRs.
+fn session_cadence_ms(session: &Session) -> Option<u64> {
+    grid_cadence_ms(
+        session.mode,
+        session.burn_in.is_some(),
+        &session.encode_plan,
+    )
+}
+
 fn grid_cadence_ms(mode: SessionMode, has_burn_in: bool, plan: &VideoEncodePlan) -> Option<u64> {
     // Burn-in re-encodes video whatever the session mode says (ADR-0018), so
     // it is transcode for this question.
@@ -4133,6 +4156,7 @@ mod tests {
             0,
             &fs::read_to_string(session_dir.join("run_0/index.m3u8")).unwrap(),
             0,
+            None,
         )
         .unwrap();
         session.current_run_id = 1;
