@@ -718,10 +718,24 @@ fn sync_segment_map(session: &mut Session) {
 /// never produces behind it, so neither encoder can serve a want in the gap.
 ///
 /// Reads [`SupersededEncoder::run_id`], never `read_dir`. The ids are already
-/// in memory, so the cost is one file read per held encoder — bounded by how
-/// many are held, not by how many seeks the session has made.
-/// [`sync_all_run_indexes`] walks the whole session dir instead, which grows
-/// with session history, and it stays where it is: once per seek.
+/// in memory, so the runs touched are bounded by how many encoders are held,
+/// not by how many seeks the session has made. [`sync_all_run_indexes`] walks
+/// the whole session dir instead, which grows with session history, and it
+/// stays where it is: once per seek.
+///
+/// **It is not one file read per held encoder.**
+/// [`crate::hls_segment_map::ingest_run_index`] reads the index, the
+/// `encode_start_ms`, and then **every segment file the index lists**, because
+/// the map key comes from each segment's `sidx`. The cost is `2 + K` reads per
+/// held run, measured 2026-08-30 at about 79 us per listed segment: 1.35 ms at
+/// K=5, 6.1 ms at K=30, 23.7 ms at K=150, held under the sessions mutex.
+///
+/// The `is_empty` gate at the call site is what keeps that off the steady
+/// state: with nothing held this costs one check, measured at 738 us against a
+/// 737 us baseline. [`sync_segment_map`] already pays the same `2 + K` shape
+/// for the current run, twice per poll iteration, which is the larger and
+/// older cost — the map is rebuilt from disk rather than maintained
+/// incrementally, and this function inherits that rather than introducing it.
 fn sync_superseded_run_indexes(session: &mut Session) {
     let run_ids: Vec<u64> = session.superseded.iter().map(|s| s.run_id).collect();
     for run_id in run_ids {
