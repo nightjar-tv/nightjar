@@ -853,6 +853,60 @@ fn map_playlist_err(session_id: &str, err: PlaylistError) -> ApiResult<Response>
     }
 }
 
+/// Response for one session asset, with the caching each kind can justify.
+///
+/// **The route set `Content-Type` and nothing else until 2026-08-31.** A
+/// response with no validator and no cache directive is subject to heuristic
+/// freshness: a browser or a proxy may keep it as long as it likes and reuse
+/// it without asking. The playlist route has said `no-cache` since it was
+/// written (`m3u8_ok`); the assets said nothing.
+///
+/// The route serves exactly two shapes, and `hls::is_safe_asset` is what
+/// closes that set: `init.mp4`, and `seg_<ms:011>.m4s`. There is no `.ts` —
+/// every mode muxes fMP4 (`-hls_segment_type fmp4`), copy included.
+///
+/// **Both get `no-cache`, and the reasons are different.** They are written
+/// out because "one header for the route" is the answer that would be reached
+/// by not asking, and one of these two reasons is about to change.
+///
+/// - **`init.mp4`.** Under today's per-run URI it is immutable, and the URI
+///   changing per run is the only thing that has been preventing a stale init
+///   being served. **ADR-0054 decision 5 makes the map session-scoped**, at
+///   which point the URI stops changing and the bytes it names become
+///   whatever the current run wrote. The header has to be right before that
+///   protection's job is removed, not after. **A wrong init is a decode
+///   failure, not a stale listing.**
+///
+/// - **A segment.** Its bytes for a given URI are **not** immutable, which is
+///   the surprise here. The session map is keyed on title-absolute start and
+///   `SegmentMap::insert` replaces: *"a newer run that produces a different
+///   packing at the same start replaces the prior entry"*. So one
+///   `seg_<ms>.m4s` can resolve to a different run's file within one session.
+///   Whether a cached older copy still decodes depends on init being
+///   interchangeable across runs, which is **measured for QSV transcode only**
+///   (ADR-0054 decision 4), recorded as false for VideoToolbox, and unmeasured
+///   for copy. `no-cache` is the choice that does not rest on that.
+///
+/// `no-cache` permits storing and requires revalidation. With no validator on
+/// this route a revalidation is a full re-fetch, which costs nothing a player
+/// was not already doing: players do not re-request what they have buffered.
+/// **An `ETag` would make revalidation cheap and is the obvious next step**;
+/// it is not this change, because it is an addition rather than a correction.
+fn asset_ok(asset: &str, bytes: Vec<u8>) -> Response {
+    let mime = if asset.ends_with(".mp4") {
+        "video/mp4"
+    } else {
+        "video/iso.segment"
+    };
+    let mut res = Response::new(Body::from(bytes));
+    *res.status_mut() = StatusCode::OK;
+    res.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    res
+}
+
 fn m3u8_ok(bytes: Vec<u8>) -> ApiResult<Response> {
     let mut res = Response::new(Body::from(bytes));
     *res.status_mut() = StatusCode::OK;
@@ -913,16 +967,7 @@ async fn asset(
     match result {
         Ok(bytes) => {
             log_hls_client_req(&session_id, &asset, None, 200, fetcher_ref);
-            let mime = if asset.ends_with(".mp4") {
-                "video/mp4"
-            } else {
-                "video/iso.segment"
-            };
-            let mut res = Response::new(Body::from(bytes));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
-            Ok(res)
+            Ok(asset_ok(&asset, bytes))
         }
         Err(PlaylistError::NotFound) => {
             log_hls_client_req(&session_id, &asset, None, 404, fetcher_ref);
@@ -975,6 +1020,48 @@ pub async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header is read off the response the route builds, not matched in
+    /// the source. A test that greps for a string proves nothing about what
+    /// a client receives.
+    fn cache_control_of(asset: &str) -> String {
+        let res = asset_ok(asset, vec![0u8; 8]);
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    }
+
+    /// `init.mp4` must revalidate.
+    ///
+    /// Its URI changes per run today, and that is the only thing stopping a
+    /// stale init being served. ADR-0054 decision 5 removes that by making the
+    /// map session-scoped, so the header has to be right before the accidental
+    /// protection's job goes. A wrong init is a decode failure.
+    #[test]
+    fn init_is_not_cacheable_without_revalidation() {
+        assert_eq!(cache_control_of("init.mp4"), "no-cache");
+        let res = asset_ok("init.mp4", vec![0u8; 8]);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4",
+            "the kind is still distinguished; only the caching was missing"
+        );
+    }
+
+    /// A segment must revalidate too, and for a different reason: its bytes
+    /// for a given URI are not immutable. See
+    /// `a_segment_uri_is_not_immutable_within_a_session` in the transcode
+    /// crate, which pins the property this rests on.
+    #[test]
+    fn a_segment_is_not_cacheable_without_revalidation() {
+        assert_eq!(cache_control_of("seg_00000042000.m4s"), "no-cache");
+        let res = asset_ok("seg_00000042000.m4s", vec![0u8; 8]);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/iso.segment"
+        );
+    }
 
     fn row(stream_index: i64, kind: &str) -> SubtitleTrackRow {
         SubtitleTrackRow {
