@@ -188,12 +188,20 @@ listing.
 
 12. **Retention and cache accounting are per-run.** Prior runs' segments stay
     on disk so the global map can serve scrub-back without restart. Eviction:
-    when the session's on-disk HLS bytes would exceed the configured HLS
-    session cache budget (or on session reap / idle teardown), drop the
+    when the session's on-disk HLS bytes would exceed the per-session HLS
+    cache budget (or on session reap / idle teardown), drop the
     **oldest finished run directories** first (never the current cooking run),
     remove their map entries, and recount. A long scrubbing session must not
     grow unbounded. Exact byte cap may share or sit beside existing session
     disk bounds; the owner is the session registry cleanup path.
+
+> **Corrected 2026-09-01: this said "the configured HLS session cache budget",
+> and "configured" is now plainly false.** The budget is a constant —
+> `SESSION_RUN_CACHE_BUDGET_BYTES`, 2 GiB, carried on the session and named by
+> every construction site. The environment override the word described was set
+> only by tests, appeared in no README, Dockerfile or ADR, and `#196` removed
+> it under Rule 4.12. **There is no setting.** A deployment that needs a
+> different cap needs a decision recorded here, not a knob added back.
 
 13. **Client source replacement.** A new playlist URI means `hls.js`
     `loadSource` and, on Safari native, a new `src` and re-attach. Buffered
