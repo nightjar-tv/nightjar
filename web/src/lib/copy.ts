@@ -16,6 +16,11 @@ export const copy = {
 	sessionsBusy:
 		'All playback sessions are in use. Close another player tab and try again.',
 	sessionFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
+	// Playback carries the session cookie, so a credential that has gone stale
+	// stops the video without touching the rest of the page. Say what to do,
+	// because retrying is exactly what does not help (OPEN-DEFECTS entry 16).
+	sessionUnauthorized:
+		'Your sign-in expired, so playback stopped. Sign in again to keep watching; your place is saved.',
 	badgeHint:
 		'Badges: browser plays directly, remux and transcode start a playback session when you open the item. Text subtitles (SRT and similar) use the Subtitles control. ASS and image (PGS) tracks burn into the video when you select them — that starts a session even on titles that otherwise play in the browser.',
 	subtitlesPreparing: 'Subtitles are being prepared.',

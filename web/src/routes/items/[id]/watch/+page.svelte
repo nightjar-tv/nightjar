@@ -16,6 +16,7 @@
 		type AttachMode
 	} from '$lib/latencyProbe';
 	import { rememberPositionMs, resumePositionMs } from '$lib/resumePosition';
+	import type { SessionGoneReason } from '$lib/playbackErrors';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItemDetail'];
@@ -115,8 +116,13 @@
 	 * an idle timeout; press play and continue is the whole requirement, and
 	 * within one page life the position needs no server to answer it.
 	 */
-	function onSessionGone() {
+	function onSessionGone(reason: SessionGoneReason = 'session-gone') {
 		if (!liveRef.alive) return;
+		// A stale credential is not an idle timeout. Press-play-and-continue
+		// cannot work, because the next session start carries the same dead
+		// cookie -- so say so instead of offering a button that fails the same
+		// way (OPEN-DEFECTS entry 16).
+		if (reason === 'unauthorized') error = copy.sessionUnauthorized;
 		const seconds = playerRef.handle?.positionSeconds() ?? scrubSec;
 		resumeMs = Math.max(0, Math.floor(seconds * 1000));
 		rememberPositionMs(itemId, resumeMs);
