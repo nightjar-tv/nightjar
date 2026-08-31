@@ -17,6 +17,7 @@
 	} from '$lib/latencyProbe';
 	import { rememberPositionMs, resumePositionMs } from '$lib/resumePosition';
 	import type { SessionGoneReason } from '$lib/playbackErrors';
+	import { beginPlayback } from '$lib/profileScope';
 	import type { components } from '$lib/api/schema';
 
 	type MediaItem = components['schemas']['MediaItemDetail'];
@@ -154,7 +155,21 @@
 	async function start() {
 		if (!playback || preparingSession) return;
 		error = null;
-		started = true;
+		// **Narrow before anything renders, not alongside it.** Direct play
+		// mounts `<video src={streamUrl}>` the moment `started` is true and the
+		// browser fetches it with the session cookie; `/items/{id}/stream` 403s
+		// an account-scope session. `beginPlayback` owns that order and
+		// `tests/profileScope.test.ts` fails if it is reversed.
+		try {
+			await beginPlayback({
+				ensureScope: api.ensureProfileScope,
+				markStarted: () => (started = true)
+			});
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			return;
+		}
+		if (!liveRef.alive) return;
 		if (playback.playbackMethod === 'directPlay') {
 			// No session to create; the element seeks itself once it can.
 			return;

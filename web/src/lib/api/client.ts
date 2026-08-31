@@ -148,5 +148,28 @@ export const api = {
 			method: 'POST',
 			body: JSON.stringify({ profileRef })
 		}),
+	/**
+	 * Narrow to a profile if the session is not already there.
+	 *
+	 * **ADR-0034 item 3**: the two byte routes need to know who is watching, so
+	 * they refuse account scope. Nothing else in the API does.
+	 *
+	 * **This ran in the root layout on every page load until 2026-08-31**, which
+	 * made account scope unreachable and every account-powers route answer
+	 * `insufficient_role` — including `POST /libraries`, so a fresh install
+	 * could not be given a library through its own interface. The narrowing was
+	 * right and its placement was not (`nightjar-meta`
+	 * `notes/OPEN-DEFECTS.md` entry 15).
+	 *
+	 * One profile, chosen without asking. Choosing between profiles is product
+	 * UI and belongs to Block 3.
+	 */
+	ensureProfileScope: async (): Promise<void> => {
+		const session = await api.getSession();
+		if (session.scope === 'profile') return;
+		const { profiles } = await api.listProfiles();
+		if (profiles.length === 0) throw new Error('account has no profile');
+		await api.selectProfile(profiles[0].profileRef);
+	},
 	logout: () => request<undefined>('/api/v0/auth/logout', { method: 'POST' })
 };

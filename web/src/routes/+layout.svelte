@@ -27,10 +27,12 @@
 			return;
 		}
 		try {
-			const session = await api.getSession();
-			// Account scope cannot play, so a session that never narrowed is
-			// not "logged in" as far as this client is concerned.
-			if (session.scope !== 'profile') await narrow();
+			// Any valid session is "logged in". **Narrowing to a profile happens
+			// at playback, not here** — see `api.ensureProfileScope`. Doing it
+			// on every load made account scope unreachable, and with it every
+			// account-powers route, so a fresh install could not add a library
+			// through the form on `/` (OPEN-DEFECTS entry 15).
+			await api.getSession();
 			gate = 'in';
 		} catch {
 			// Expired, revoked, or from a database that has since been
@@ -39,15 +41,6 @@
 			clearToken();
 			gate = 'login';
 		}
-	}
-
-	/// One profile, chosen without asking. Choosing between profiles is
-	/// product UI and belongs to Block 3; having *a* profile is what makes the
-	/// byte routes work at all.
-	async function narrow() {
-		const { profiles } = await api.listProfiles();
-		if (profiles.length === 0) throw new Error('account has no profile');
-		await api.selectProfile(profiles[0].profileRef);
 	}
 
 	async function submit(event: SubmitEvent) {
@@ -60,7 +53,9 @@
 				gate === 'bootstrap' ? await api.bootstrap(body) : await api.login(body);
 			storeToken(result.token);
 			password = '';
-			await narrow();
+			// Deliberately account scope. A fresh bootstrap lands here and the
+			// first thing it needs is `POST /libraries`, which profile scope
+			// refuses. Playback narrows itself (OPEN-DEFECTS entry 15).
 			gate = 'in';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
