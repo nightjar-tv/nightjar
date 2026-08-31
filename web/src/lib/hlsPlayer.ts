@@ -6,6 +6,7 @@ import {
 	type AttachBackend
 } from './hlsAttachBackend';
 import { probeEnabled } from './latencyProbe';
+import { loadFailureAction, type SessionGoneReason } from './playbackErrors';
 import { api } from './api/client';
 import {
 	mediaSecondsFromTitle,
@@ -244,7 +245,7 @@ export function attachHls(
 	 * then, so the surface can offer play again instead of the caller
 	 * discovering it from a stream of failures.
 	 */
-	onSessionGone?: () => void
+	onSessionGone?: (reason: SessionGoneReason) => void
 ): HlsHandle {
 	let hls: Hls | null = null;
 	let destroyed = false;
@@ -255,7 +256,7 @@ export function attachHls(
 	 * tab produced 5,012 `hls asset not found` at ~9/s for 9.5 minutes on
 	 * 2026-08-07. Stop loading and tell the surface once.
 	 */
-	function reportSessionGone() {
+	function reportSessionGone(reason: SessionGoneReason = 'session-gone') {
 		if (sessionGone || destroyed) return;
 		sessionGone = true;
 		try {
@@ -263,7 +264,7 @@ export function attachHls(
 		} catch {
 			// Already torn down.
 		}
-		onSessionGone?.();
+		onSessionGone?.(reason);
 	}
 	/**
 	 * Seek-notify suppress generation. Non-zero = ignore user scrub handlers.
@@ -948,7 +949,8 @@ export function attachHls(
 			if (destroyed || sessionGone) return;
 			void fetch(currentPlaylist.split('#')[0] ?? currentPlaylist)
 				.then((res) => {
-					if (res.status === 404) reportSessionGone();
+					const action = loadFailureAction(res.status);
+					if (action !== 'retry') reportSessionGone(action);
 				})
 				.catch(() => {
 					// Offline or aborted: not a dead session.
@@ -986,12 +988,12 @@ export function attachHls(
 			}
 			if (!data.fatal) return;
 			if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-				// 404 is the server saying the session is gone, not that the
-				// request failed. Restarting the load re-asks the same missing
-				// URL forever; every other network failure is still worth a
-				// retry, so only this code exits the loop.
-				if (data.response?.code === 404) {
-					reportSessionGone();
+				// Retry only what a later request could answer differently.
+				// `loadFailureAction` owns that call for both backends
+				// (Rule 2.4); see it for why 401 stopped being a retry.
+				const action = loadFailureAction(data.response?.code);
+				if (action !== 'retry') {
+					reportSessionGone(action);
 					return;
 				}
 				hls?.startLoad();
