@@ -40,7 +40,11 @@
 	let resumeMs = $state(0);
 	let sessionEncoder = $state<Pick<
 		TranscodeSession,
-		'videoEncoder' | 'encoderKind' | 'usableExtentMs' | 'landedMs'
+		| 'videoEncoder'
+		| 'encoderKind'
+		| 'usableExtentMs'
+		| 'landedMs'
+		| 'mediaOriginMs'
 	> | null>(null);
 	let preparingSession = $state(false);
 	let switchingAudio = $state(false);
@@ -61,6 +65,12 @@
 	const sessionRef: { id: string | null } = { id: null };
 	// Non-reactive so changing it does not re-run the attach effect on its own.
 	const resumeRef = { seconds: 0 };
+	/**
+	 * `mediaOriginMs` of the playlist about to be attached. Held beside
+	 * `resumeRef` rather than derived from it: the land and the origin differ
+	 * under a full-title listing (ADR-0054).
+	 */
+	const originRef = { ms: 0 };
 	// Current attach handle; its positionSeconds() is title-absolute (live
 	// landedMs + media currentTime — ADR-0020).
 	const playerRef: { handle: HlsHandle | null } = { handle: null };
@@ -152,8 +162,10 @@
 					session = await api.startTranscodeSession(itemId, resumeMs);
 					sessionRef.id = session.sessionId;
 					sessionEncoder = session;
-					// Session land is title-absolute; media element starts at 0.
+					// Session land is title-absolute; the element's own zero is
+					// mediaOriginMs, which the playlist decides.
 					resumeRef.seconds = (session.landedMs ?? resumeMs) / 1000;
+					originRef.ms = session.mediaOriginMs ?? 0;
 					break;
 				} catch (e) {
 					const msg = e instanceof Error ? e.message : String(e);
@@ -198,6 +210,7 @@
 							...(sessionEncoder ?? view),
 							usableExtentMs: view.usableExtentMs,
 							landedMs: view.landedMs,
+							mediaOriginMs: view.mediaOriginMs,
 							videoEncoder: view.videoEncoder,
 							encoderKind: view.encoderKind
 						};
@@ -314,6 +327,7 @@
 				return;
 			}
 			resumeRef.seconds = startMs / 1000;
+			originRef.ms = started.mediaOriginMs ?? 0;
 			sessionRef.id = started.sessionId;
 			sessionEncoder = started;
 			probe.mark('attach', started.playlistUrl);
@@ -427,7 +441,13 @@
 			return;
 		}
 		if (probeOn) console.warn('[nj-subs] player attaching HLS', url);
-		const handle = attachHls(video, url, resumeRef.seconds, onSessionGone);
+		const handle = attachHls(
+			video,
+			url,
+			resumeRef.seconds,
+			originRef.ms,
+			onSessionGone
+		);
 		playerRef.handle = handle;
 		const onTime = () => {
 			if (!scrubDragging && !scrubSeeking) {

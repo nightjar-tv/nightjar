@@ -205,11 +205,18 @@ function clearVideoSubtitleCues(video: HTMLVideoElement): void {
 }
 
 /**
- * Attach an HLS EVENT playlist (ADR-0020).
+ * Attach an HLS playlist (ADR-0020, ADR-0054).
  *
- * Media element time is window-relative: `currentTime` 0 is the run land, not
- * title 0. Title position is `landedMs/1000 + currentTime`. `landedMs` mutates
- * on every run swap — never cache it at first attach for position/scrub/subs.
+ * Media element time is zeroed at the first segment the playlist lists, and
+ * the server says where that is: title position is
+ * `mediaOriginMs/1000 + currentTime`. A per-run listing zeroes at the land, a
+ * full-title listing at 0, and a run can change shape mid-session. Both
+ * `mediaOriginMs` and `landedMs` mutate on every run swap — never cache
+ * either at first attach for position/scrub/subs.
+ *
+ * **The two are different questions.** The origin converts times. The land is
+ * where the producer started, and it is what decides whether a scrub must
+ * POST a seek rather than move the playhead.
  *
  * Far scrub: POST /sessions/{id}/seek → fresh playlistUri → source swap.
  * In-window scrub: set `currentTime` only. Title scrub UI calls
@@ -217,7 +224,7 @@ function clearVideoSubtitleCues(video: HTMLVideoElement): void {
  * POST.
  *
  * Subtitles: wire VTT is title-absolute; paint times are media-relative
- * (`title − land`). Segment index uses title seconds. After mid-title land,
+ * (`title − origin`). Segment index uses title seconds. After mid-title land,
  * cue inject covers both backends (hls.js media time would otherwise load
  * the wrong full-title subtitle frags).
  */
@@ -225,6 +232,12 @@ export function attachHls(
 	video: HTMLVideoElement,
 	playlistBase: string,
 	startAtSeconds = 0,
+	/**
+	 * `mediaOriginMs` of the playlist being attached — the title time element
+	 * `currentTime` 0 means. Read it from the session view; do not infer it
+	 * from the land, which is a different number under a full-title listing.
+	 */
+	mediaOriginAtAttachMs = 0,
 	/**
 	 * The session behind this attach no longer exists (idle reap, ADR-0007 §4,
 	 * or a server restart). Called once; the handle has stopped loading by
@@ -281,8 +294,14 @@ export function attachHls(
 	 * every seek response — do not close over attach-time only.
 	 */
 	let landedMs = Math.max(0, Math.floor(startAtSeconds * 1000));
+	/**
+	 * Title time that element `currentTime` 0 means for the **current**
+	 * playlist (`mediaOriginMs`). Not the land: a full-title listing reports 0
+	 * however far in the session landed. Updated on every seek response.
+	 */
+	let mediaOriginMs = Math.max(0, Math.floor(mediaOriginAtAttachMs));
 	let positionSeconds = (): number =>
-		titleSecondsFromMedia(video.currentTime, landedMs);
+		titleSecondsFromMedia(video.currentTime, mediaOriginMs);
 	/** Abort in-flight far-seek when a newer scrub arrives. */
 	let landEnsureAbort: AbortController | null = null;
 	/** startMs with an in-flight seek (blocks identical echoes). */
@@ -355,8 +374,13 @@ export function attachHls(
 	 * swap. Clients must not construct segment URLs. Track selections are
 	 * re-applied after the swap. New run media time starts at 0.
 	 */
-	const swapToPlaylist = (url: string, nextLandedMs: number) => {
+	const swapToPlaylist = (
+		url: string,
+		nextLandedMs: number,
+		nextMediaOriginMs: number
+	) => {
 		landedMs = Math.max(0, Math.floor(nextLandedMs));
+		mediaOriginMs = Math.max(0, Math.floor(nextMediaOriginMs));
 		currentPlaylist = url;
 		sessionBase = sessionBaseFromMaster(url);
 		nativeTrackIds = null;
@@ -386,10 +410,11 @@ export function attachHls(
 		if (destroyed) return Promise.resolve();
 		const startMs = Math.max(0, Math.floor(titleSeconds * 1000));
 		const landSec = Math.max(0, landedMs) / 1000;
-		const media = mediaSecondsFromTitle(titleSeconds, landedMs);
+		const media = mediaSecondsFromTitle(titleSeconds, mediaOriginMs);
 		// Fast path only inside the current run's produced media. A title
-		// before `landedMs` clamps media to 0 and must POST /seek — otherwise
-		// scrub-back stays stuck at the land (dogfood: 600 → 120).
+		// before the **land** must POST /seek whatever the origin says —
+		// otherwise scrub-back stays stuck at the land (dogfood: 600 → 120).
+		// The origin converts the time; the land decides the route.
 		const beforeLand = titleSeconds + 0.05 < landSec;
 		if (
 			!beforeLand &&
@@ -445,7 +470,7 @@ export function attachHls(
 				}
 				if (destroyed || parent.signal.aborted) return;
 				landEnsuredSegIdx = startMs;
-				swapToPlaylist(view.playlistUrl, view.landedMs);
+				swapToPlaylist(view.playlistUrl, view.landedMs, view.mediaOriginMs);
 			} catch {
 				// Network / abort: next scrub retries.
 			} finally {
@@ -621,12 +646,13 @@ export function attachHls(
 			return;
 		}
 
-		const landSec = Math.max(0, landedMs) / 1000;
+		// Wire VTT is title-absolute; the element paints at media time.
+		const originSec = Math.max(0, mediaOriginMs) / 1000;
 		let injected = 0;
 		for (const cue of cues) {
 			try {
-				const start = Math.max(0, cue.startSec - landSec);
-				const end = Math.max(start, cue.endSec - landSec);
+				const start = Math.max(0, cue.startSec - originSec);
+				const end = Math.max(start, cue.endSec - originSec);
 				const existing = track.cues;
 				if (existing) {
 					let dup = false;
@@ -686,7 +712,7 @@ export function attachHls(
 		}
 
 		const track = ensureInjectTrack(idx);
-		const titleSec = titleSecondsFromMedia(video.currentTime, landedMs);
+		const titleSec = titleSecondsFromMedia(video.currentTime, mediaOriginMs);
 		if (reset) {
 			clearInjectCues(track);
 			nativeLoadedSegs.clear();
@@ -898,7 +924,7 @@ export function attachHls(
 					// Offline or aborted: not a dead session.
 				});
 		});
-		// Window-relative: session already lands at landedMs; no title #t=.
+		// The playlist carries the attach point in EXT-X-START; no title #t=.
 		video.src = playlistBase;
 		video.addEventListener(
 			'loadedmetadata',
@@ -961,7 +987,7 @@ export function attachHls(
 					t.mode !== 'disabled'
 			);
 			if (!track) return;
-			const fixed = applyAbsoluteCueTimesFromVtt(track, text, landedMs);
+			const fixed = applyAbsoluteCueTimesFromVtt(track, text, mediaOriginMs);
 			if (subsProbeOn() && Date.now() <= fragProbeUntilMs) {
 				const parsed = parseWebVttCues(text);
 				const rawFirst = parsed[0]?.startSec;

@@ -59,6 +59,10 @@ pub struct TranscodeSessionDto {
     pub video_encoder: String,
     pub encoder_kind: &'static str,
     pub landed_ms: u64,
+    /// Title time that element `currentTime` 0 means. A full-title listing
+    /// zeroes at 0; a per-run listing zeroes at its first segment. Distinct
+    /// from `landed_ms`, which is where the producer started.
+    pub media_origin_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usable_extent_ms: Option<u64>,
 }
@@ -102,6 +106,7 @@ fn dto_from_view(view: nightjar_transcode::SessionView) -> TranscodeSessionDto {
         video_encoder: view.video_encoder,
         encoder_kind: view.encoder_kind.as_str(),
         landed_ms: view.landed_ms,
+        media_origin_ms: view.media_origin_ms,
         usable_extent_ms: view.usable_extent_ms,
     }
 }

@@ -853,9 +853,14 @@ export interface components {
             encoderKind: "hardware" | "software" | "copy";
             /**
              * Format: int64
-             * @description Producer-observed land (first mapped segment start for the current run), title-absolute milliseconds.
+             * @description Producer-observed land (first mapped segment start for the current run), title-absolute milliseconds. Where the producer started, not where the element's clock is zeroed — that is mediaOriginMs.
              */
             landedMs: number;
+            /**
+             * Format: int64
+             * @description Title-absolute milliseconds that media time 0 means for the current playlist, so a client can convert element currentTime to a title position. A full-title listing (ADR-0054) zeroes at 0; the per-run listing it kept from ADR-0020 §4 zeroes at its first listed segment. Which shape a run serves is a runtime property that can change mid-session, so a client must read this rather than derive it from encoderKind, duration or seekable.
+             */
+            mediaOriginMs: number;
             /**
              * Format: int64
              * @description When a producer reaches EOF materially short of the container's claimed duration, the usable media end in milliseconds. Absent when unknown or undamaged.

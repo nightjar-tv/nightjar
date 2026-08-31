@@ -448,10 +448,33 @@ pub fn no_fill_release_for_new_land(
     coalesce_preempt_before_land(want, play)
 }
 
-/// Missing segment that current policy will not [`desire_restart`] toward:
-/// behind the encode window (abandoned / superseded prior land), or otherwise
-/// never filled without a fresh `?startMs=`. Callers **hold** the connection
-/// instead of 503/404 while the session lives.
+/// Missing segment that current policy will not [`desire_restart`] toward.
+/// Callers **hold** the connection instead of 503/404 while the session lives.
+///
+/// **`want < window` early-returns `true` here, and that shadows
+/// [`decide_segment_miss`], which says `Restart` for the same predicate under
+/// ADR-0054 decision 3.** The escape hatch below (`cool == Restart` ⇒
+/// reachable) was written for this case and cannot be reached. That is
+/// `OPEN-DEFECTS` entry 13, and it stalls a live want below the window
+/// permanently — measured on Safari native and hls.js, and seen unprovoked on
+/// an iPhone.
+///
+/// **Removing the early return is not the fix, measured 2026-08-31.** With it
+/// gone, `held_segment_waiter_no_fill_when_pending_moves` fails 3/3 where it
+/// passes 3/3 with it (`NotFound` in ~2 ms, not the expected 503-or-200): the
+/// held waiter calls `desire_restart` toward its own land and fights the
+/// newer, committed one. **That test exists because an immediate 204 on
+/// supersede wedged Safari**, so this is a contract, not an expectation to
+/// edit.
+///
+/// **What the attempt located**: the supersede protection below is guarded by
+/// `!want_is_listed(...)`, and under ADR-0054's full-title listing every want
+/// is listed, so that guard is always false and the branch never protects
+/// anything. A fix has to keep a waiter from restarting toward a land the
+/// session has already moved off, without leaning on a listing test that S3
+/// made vacuous.
+///
+/// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 13.
 pub fn segment_miss_unreachable(
     want_ms: u64,
     cooking_play_ms: u64,
@@ -716,6 +739,9 @@ pub struct SessionView {
     pub video_encoder: String,
     pub encoder_kind: EncoderKind,
     pub landed_ms: u64,
+    /// Title time that element `currentTime` 0 means — see
+    /// [`RunListing::media_origin_ms`]. Not the land.
+    pub media_origin_ms: u64,
     pub usable_extent_ms: Option<u64>,
     pub run_id: u64,
 }
@@ -995,37 +1021,81 @@ fn full_title_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
     )
 }
 
-fn build_run_media_playlist(session_id: &str, session: &Session) -> Vec<u8> {
-    // Path-absolute URIs (ADR-0008): run-dir depth cannot break resolution.
-    let init_uri = format!(
-        "/api/v0/sessions/{session_id}/runs/{}/init.mp4",
-        session.current_run_id
-    );
-    // A full-title listing starts at 0, so the attach point is the land and
-    // must be said. The per-run listing still begins at the land, where a zero
-    // offset already means it.
-    let mut start_offset_ms = 0;
-    let entries = match full_title_entries(session) {
-        Some(entries) => {
-            start_offset_ms = session.play_start_ms;
-            entries
-        }
+/// What a run's media playlist lists, and where its timeline starts.
+struct RunListing {
+    entries: Vec<(u64, u64)>,
+    /// `EXT-X-START:TIME-OFFSET`, in milliseconds.
+    start_offset_ms: u64,
+    /// **The title time that element `currentTime` 0 means.**
+    ///
+    /// HLS media time runs from the first listed segment, so this is a
+    /// property of the listing and not of the session: a full-title listing
+    /// starts at 0 and a per-run listing starts at its first entry. The two
+    /// shapes coexist by ADR-0054, and **which one a run serves can change
+    /// mid-session** — copy's whole-title walk needs a keyframe map and the
+    /// map arrives asynchronously. A client cannot derive it from the mode,
+    /// from `duration` or from `seekable`, so the session view says it
+    /// (Rule 2.1).
+    ///
+    /// **This is not `landed_ms`.** The land is where the producer started,
+    /// title-absolute in both shapes; the origin is where the *element's*
+    /// clock is zeroed. They are equal only in the per-run shape, and reading
+    /// the land as the origin is what put `20:02` on a 15-minute title.
+    ///
+    /// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 12.
+    media_origin_ms: u64,
+}
+
+/// One owner for the branch, so the playlist bytes and the origin the session
+/// view reports cannot disagree (Rule 4.9).
+fn run_listing(session: &Session) -> RunListing {
+    match full_title_entries(session) {
+        // A full-title listing starts at 0, so the attach point is the land
+        // and must be said.
+        Some(entries) => RunListing {
+            entries,
+            start_offset_ms: session.play_start_ms,
+            media_origin_ms: 0,
+        },
         None => {
             // No shared grid: list what the map holds for this window, as
             // before. ADR-0020: never list a URI whose bytes are gone.
             // Eviction updates the map, but defend in depth so a race cannot
             // reintroduce listed-404.
             let window = session.start_ms;
-            session
+            let entries: Vec<(u64, u64)> = session
                 .segment_map
                 .iter_ordered()
                 .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
                 .filter(|s| session.dir.join(&s.rel_path).is_file())
                 .map(|s| (s.start_ms, s.duration_ms))
-                .collect()
+                .collect();
+            // The per-run listing still begins at the land, where a zero
+            // offset already means it — and where the first entry is the
+            // origin. Listing nothing, the window is the honest answer for
+            // the attach that follows.
+            let media_origin_ms = entries.first().map_or(window, |(start, _)| *start);
+            RunListing {
+                entries,
+                start_offset_ms: 0,
+                media_origin_ms,
+            }
         }
-    };
-    let bytes = crate::hls_segment_map::build_map_playlist(&entries, &init_uri, start_offset_ms);
+    }
+}
+
+fn build_run_media_playlist(session_id: &str, session: &Session) -> Vec<u8> {
+    // Path-absolute URIs (ADR-0008): run-dir depth cannot break resolution.
+    let init_uri = format!(
+        "/api/v0/sessions/{session_id}/runs/{}/init.mp4",
+        session.current_run_id
+    );
+    let listing = run_listing(session);
+    let bytes = crate::hls_segment_map::build_map_playlist(
+        &listing.entries,
+        &init_uri,
+        listing.start_offset_ms,
+    );
     with_session_absolute_segment_uris(session_id, &bytes)
 }
 
@@ -1200,6 +1270,7 @@ fn session_view(session_id: &str, session: &Session) -> SessionView {
         },
         encoder_kind,
         landed_ms: session.landed_ms,
+        media_origin_ms: run_listing(session).media_origin_ms,
         usable_extent_ms: session.usable_extent_ms,
         run_id: session.current_run_id,
     }
@@ -4849,6 +4920,101 @@ mod tests {
         // the extent.
         let listed = text.matches("seg_").count();
         assert_eq!(listed, 678, "0..1354496 on a 2000 ms grid");
+    }
+
+    /// The origin a client converts by is the **listing's**, not the land.
+    ///
+    /// Reading the land as the origin is what put `20:02` on a 15-minute
+    /// title: `?startMs=600000`, macOS Safari native, measured 2026-08-31 at
+    /// `4c0c20f` before this existed. Element time is zeroed at the first
+    /// segment the playlist lists, and a full-title listing lists from 0
+    /// however far in the run landed.
+    ///
+    /// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 12.
+    #[test]
+    fn a_full_title_listing_has_media_origin_zero_however_far_it_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 900_000);
+        session.mode = SessionMode::Transcode;
+        session.encode_plan = plan_25fps();
+        session.start_ms = 600_000;
+        session.play_start_ms = 600_000;
+        session.landed_ms = 600_000;
+
+        let listing = run_listing(&session);
+        assert_eq!(
+            listing.media_origin_ms, 0,
+            "the listing starts at 0, so element time is already title time"
+        );
+        assert_eq!(
+            listing.start_offset_ms, 600_000,
+            "the land is still said, in EXT-X-START, where it belongs"
+        );
+        assert_eq!(
+            session.landed_ms, 600_000,
+            "and the land is untouched: the two answer different questions"
+        );
+
+        // What the session view reports must be what the bytes did.
+        let text = String::from_utf8_lossy(&build_run_media_playlist("s1", &session)).to_string();
+        assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
+        assert!(text.contains("#EXT-X-START:TIME-OFFSET=600.000,PRECISE=YES"));
+    }
+
+    /// The per-run listing ADR-0020 kept begins at its first entry, so there
+    /// the origin **is** the land — which is why one field cannot serve both
+    /// and why the client cannot guess from the mode.
+    #[test]
+    fn a_per_run_listing_has_media_origin_at_its_first_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let run0 = dir.path().join("run_0");
+        fs::create_dir_all(&run0).unwrap();
+        let seg_rel = PathBuf::from("run_0/seg000.m4s");
+        fs::write(dir.path().join(&seg_rel), [0u8; 64]).unwrap();
+
+        let mut session = eof_test_session(dir.path(), 900_000);
+        // Copy with no keyframe map: cut points are unknowable, so no
+        // full-title listing exists to be had.
+        session.mode = SessionMode::Copy;
+        session.encode_plan = plan_25fps();
+        session.start_ms = 600_000;
+        session.play_start_ms = 600_000;
+        session.landed_ms = 600_000;
+        session
+            .segment_map
+            .insert(crate::hls_segment_map::MappedSegment {
+                start_ms: 600_000,
+                duration_ms: 2_000,
+                run_id: 0,
+                rel_path: seg_rel,
+            });
+        assert!(
+            full_title_entries(&session).is_none(),
+            "an -ss copy run cannot say where it will cut"
+        );
+
+        let listing = run_listing(&session);
+        assert_eq!(listing.media_origin_ms, 600_000);
+        assert_eq!(
+            listing.start_offset_ms, 0,
+            "a zero offset already means the land here"
+        );
+    }
+
+    /// Listing nothing, the window is the honest origin: the attach that
+    /// follows lands there, and a zero would claim title 0.
+    #[test]
+    fn an_empty_per_run_listing_falls_back_to_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 900_000);
+        session.mode = SessionMode::Copy;
+        session.encode_plan = plan_25fps();
+        session.start_ms = 600_000;
+        session.play_start_ms = 600_000;
+
+        let listing = run_listing(&session);
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.media_origin_ms, 600_000);
     }
 
     /// Copy lists the whole title too, on the greedy 20 s keyframe walk.
