@@ -451,30 +451,36 @@ pub fn no_fill_release_for_new_land(
 /// Missing segment that current policy will not [`desire_restart`] toward.
 /// Callers **hold** the connection instead of 503/404 while the session lives.
 ///
-/// **`want < window` early-returns `true` here, and that shadows
-/// [`decide_segment_miss`], which says `Restart` for the same predicate under
-/// ADR-0054 decision 3.** The escape hatch below (`cool == Restart` ⇒
-/// reachable) was written for this case and cannot be reached. That is
-/// `OPEN-DEFECTS` entry 13, and it stalls a live want below the window
-/// permanently — measured on Safari native and hls.js, and seen unprovoked on
-/// an iPhone.
+/// **Behind the window is decided by whether the playlist offered the URI**,
+/// not by position alone. Position alone shadowed [`decide_segment_miss`],
+/// which returns `Restart` for the same position under ADR-0054 decision 3 —
+/// *"a cold URI is a seek"* — so the escape hatch below could never be
+/// reached, and a want below the window was refused forever. Measured on
+/// Safari native (99 asks in a minute, each refused in ~142 ms), on hls.js,
+/// and arriving unprovoked on an iPhone.
 ///
-/// **Removing the early return is not the fix, measured 2026-08-31.** With it
-/// gone, `held_segment_waiter_no_fill_when_pending_moves` fails 3/3 where it
-/// passes 3/3 with it (`NotFound` in ~2 ms, not the expected 503-or-200): the
-/// held waiter calls `desire_restart` toward its own land and fights the
-/// newer, committed one. **That test exists because an immediate 204 on
-/// supersede wedged Safari**, so this is a contract, not an expectation to
-/// edit.
+/// **The two listings want opposite answers**, and `want_listed` is what
+/// separates them:
 ///
-/// **What the attempt located**: the supersede protection below is guarded by
-/// `!want_is_listed(...)`, and under ADR-0054's full-title listing every want
-/// is listed, so that guard is always false and the branch never protects
-/// anything. A fix has to keep a waiter from restarting toward a land the
-/// session has already moved off, without leaning on a listing test that S3
-/// made vacuous.
+/// - **ADR-0020's per-run listing** never offered a URI behind this run's
+///   window. Nothing promised it, so holding is right — and 404ing an
+///   unlisted want stays right, which is what
+///   `held_segment_waiter_no_fill_when_pending_moves` pins.
+/// - **ADR-0054's full-title listing does offer it.** Refusing a URI the
+///   playlist names is the defect, and decision 3 already says a seek is what
+///   should happen instead.
+///
+/// **Not a staleness detector, deliberately.** A live backward scrub and a
+/// want orphaned by a newer seek are indistinguishable from here: both retry
+/// while the client keeps filling its old buffer — 27 refusals against 9,
+/// with healthy traffic alongside each. The only difference is that the stale
+/// one eventually stops, and waiting to find out *is* the stall. So it is
+/// decided on the cost of being wrong: a restart nothing reads costs one
+/// encode start, bounded by [`RESTART_MIN_INTERVAL`] and `desire_restart`'s
+/// coalescing, while a hold costs the session.
 ///
 /// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 13.
+#[allow(clippy::too_many_arguments)]
 pub fn segment_miss_unreachable(
     want_ms: u64,
     cooking_play_ms: u64,
@@ -483,6 +489,8 @@ pub fn segment_miss_unreachable(
     play_start_ms: u64,
     latest_on_disk_ms: Option<u64>,
     primed: bool,
+    // Did this session's playlist list `want_ms`? See `want_is_listed`.
+    want_listed: bool,
 ) -> bool {
     let want = align_to_segment(want_ms);
     let window = align_to_segment(window_start_ms);
@@ -492,10 +500,11 @@ pub fn segment_miss_unreachable(
         return false;
     }
 
-    // Behind encode window: lead-in / fill-forward will not write this index.
-    // (Dig-back within ALIGN of a *new* play can still be behind that play's
-    // window — that is abandoned, not in-window dig-back.)
-    if want < window {
+    // Behind the encode window and never offered: lead-in / fill-forward will
+    // not write this index and no playlist promised it. (Dig-back within ALIGN
+    // of a *new* play can still be behind that play's window — that is
+    // abandoned, not in-window dig-back.)
+    if want < window && !want_listed {
         return true;
     }
 
@@ -2020,6 +2029,7 @@ impl HlsSessionRegistry {
                             session.play_start_ms,
                             latest,
                             session.primed,
+                            want_is_listed(session, want_ms),
                         )
                     {
                         if !holding_no_fill {
@@ -2068,6 +2078,20 @@ impl HlsSessionRegistry {
                                 if prefetch_advances_pending(session.pending_play_ms, want_ms) {
                                     return Err(PlaylistError::NotReady);
                                 }
+                                // `!want_is_listed` is the S3-vacuous half of
+                                // this guard: under a full-title listing every
+                                // want is listed, so this branch never runs
+                                // and the supersede handling inside it never
+                                // fires. **Left standing deliberately.** The
+                                // case it protected — an unlisted want behind
+                                // the window — is now answered earlier, by
+                                // `segment_miss_unreachable`, which holds it
+                                // before the match is reached. Deleting the
+                                // condition here would route a *listed* want
+                                // into supersede handling, which is the
+                                // opposite of entry 13's decision. It stays,
+                                // narrowed in meaning rather than silently
+                                // dead: unlisted, not behind-window.
                                 if digback_behind_committed(
                                     session.play_start_ms,
                                     session.pending_play_ms,
@@ -6159,30 +6183,181 @@ mod tests {
         let in_window = window_ms;
         let ahead = cooking + (CATCH_UP_SEGMENTS + 2) * SEGMENT_MS;
 
-        // lead=0 ⇒ window == cooking; any behind-window miss is unreachable.
-        let cases: &[(&str, u64, Option<u64>, bool, bool)] = &[
-            ("far behind no pending", far, None, true, true),
-            ("prior land after jump", prior, None, true, true),
-            ("attach-shaped seg000", 0, None, true, true),
-            ("behind land dig-back", dig, None, true, true),
-            ("pending exact land", prior, Some(prior), true, false),
-            ("in-window fill-forward", in_window, None, true, false),
+        // lead=0 ⇒ window == cooking, so every "behind" row here is behind the
+        // window. What decides them is the sixth column: **did the playlist
+        // list the want**.
+        //
+        // Unlisted rows are ADR-0020's per-run listing, where nothing ever
+        // offered a URI behind this run's window — those stay unreachable and
+        // are unchanged. Listed rows are ADR-0054's full-title listing, where
+        // the playlist does name it, and decision 3 says a cold listed URI is
+        // a seek: they became reachable on 2026-08-31, which is entry 13.
+        /// name, want, pending, primed, listed, expect_unreachable
+        type Case = (&'static str, u64, Option<u64>, bool, bool, bool);
+        let cases: &[Case] = &[
+            ("far behind, unlisted", far, None, true, false, true),
+            (
+                "prior land after jump, unlisted",
+                prior,
+                None,
+                true,
+                false,
+                true,
+            ),
+            ("attach-shaped seg000, unlisted", 0, None, true, false, true),
+            (
+                "behind land dig-back, unlisted",
+                dig,
+                None,
+                true,
+                false,
+                true,
+            ),
+            ("unprimed far, unlisted", far, None, false, false, true),
+            // The same four positions once the playlist lists them. This is
+            // the defect: a URI the session offered was refused forever.
+            ("far behind, LISTED", far, None, true, true, false),
+            (
+                "prior land after jump, LISTED",
+                prior,
+                None,
+                true,
+                true,
+                false,
+            ),
+            ("attach-shaped seg000, LISTED", 0, None, true, true, false),
+            ("behind land dig-back, LISTED", dig, None, true, true, false),
+            // Unprimed is still not a reason to hold a listed want: the run
+            // has no honest frontier yet, and `decide_segment_miss` owns that.
+            ("unprimed far, LISTED", far, None, false, true, false),
+            // Unchanged, and none of them turn on the listing.
+            ("pending exact land", prior, Some(prior), true, false, false),
+            (
+                "in-window fill-forward",
+                in_window,
+                None,
+                true,
+                false,
+                false,
+            ),
             (
                 "ahead of frontier (seek owns scrub)",
                 ahead,
                 None,
                 true,
                 false,
+                false,
             ),
-            ("unprimed far still unreachable", far, None, false, true),
         ];
-        for &(name, want, pending, primed, expect_unreachable) in cases {
+        for &(name, want, pending, primed, listed, expect_unreachable) in cases {
             assert_eq!(
-                segment_miss_unreachable(want, cooking, pending, window_ms, play, latest, primed),
+                segment_miss_unreachable(
+                    want, cooking, pending, window_ms, play, latest, primed, listed
+                ),
                 expect_unreachable,
                 "{name}"
             );
         }
+    }
+
+    /// The race entry 13 exists to survive: **a run's final segment, ingest
+    /// racing the reap, with the want landing precisely on it.**
+    ///
+    /// Observed once in three device runs and never reproduced synthetically,
+    /// so it is pinned here as a shape rather than as a field report. The
+    /// numbers are the ones measured on the iPhone: a run landed at 114 000
+    /// that stopped at `seg089` (178 000), a want of 180 000 that would have
+    /// been its next and last segment, and a session whose window had already
+    /// moved to 600 000.
+    ///
+    /// **A candidate that only handles a want beyond a dead run's coverage
+    /// does not address this.** The contested segment is the one the run was
+    /// in the middle of committing: it exists, or is about to, and the window
+    /// is already past it. A replay where the run stopped one segment *short*
+    /// restarts and serves in under a second — that path was never broken.
+    #[test]
+    fn a_want_on_a_dead_runs_final_segment_reaches_a_producer() {
+        let frontier = 178_000u64; // the last segment that run committed
+        let want = 180_000u64; // its next one, which it may or may not have
+        let window = 600_000u64; // the session has moved nine minutes on
+        let play = window;
+
+        // The playlist lists the whole title (ADR-0054), so it offers `want`.
+        assert!(
+            want < window,
+            "the shape under test is a want below the current window"
+        );
+
+        assert!(
+            !segment_miss_unreachable(
+                want,
+                play,
+                None,
+                window,
+                play,
+                Some(frontier),
+                true,
+                true, // listed
+            ),
+            "a listed want on a dead run's final segment must not be held:              nothing alive is producing it and the playlist named it"
+        );
+
+        assert_eq!(
+            decide_segment_miss(
+                want,
+                window,
+                play,
+                Some(frontier),
+                true,
+                RESTART_MIN_INTERVAL * 2,
+            ),
+            SegmentMissAction::Restart,
+            "and the miss policy that now owns the position says seek"
+        );
+
+        // The control that separates this from the old behaviour: the same
+        // position, unlisted, is ADR-0020's per-run listing and still holds.
+        assert!(
+            segment_miss_unreachable(
+                want,
+                play,
+                None,
+                window,
+                play,
+                Some(frontier),
+                true,
+                false, // not listed
+            ),
+            "an unlisted want behind the window is still unreachable"
+        );
+
+        // And the same-run control: an ordinary in-window fetch must not turn
+        // into a restart just because this changed.
+        assert!(
+            !segment_miss_unreachable(
+                window + SEGMENT_MS,
+                play,
+                None,
+                window,
+                play,
+                Some(window),
+                true,
+                true,
+            ),
+            "an in-window want is fill-forward, not a seek"
+        );
+        assert_eq!(
+            decide_segment_miss(
+                window + SEGMENT_MS,
+                window,
+                play,
+                Some(window),
+                true,
+                RESTART_MIN_INTERVAL * 2,
+            ),
+            SegmentMissAction::Wait,
+            "the (a,a) control: an ordinary fetch spawns nothing"
+        );
     }
 
     /// ADR-0020: far scrub is POST /seek, not a segment GET. Seek then hold
