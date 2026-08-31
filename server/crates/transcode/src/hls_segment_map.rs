@@ -271,6 +271,14 @@ pub fn snap_to_points(key_ms: u64, points: &[u64]) -> Option<u64> {
     (key_ms.abs_diff(nearest) <= COPY_KEY_TOLERANCE_MS).then_some(nearest)
 }
 
+/// A producer key may sit this fraction of a segment from the listed multiple.
+///
+/// **One divisor, two callers.** [`snap_to_cadence`] uses it to decide whether
+/// a key rounds onto the listing, and `produced_segment_ms` uses it to decide
+/// whether a rounded cadence is listable at all — the second spends the budget
+/// the first enforces, so they must not drift apart.
+pub const KEY_SNAP_DIVISOR: u64 = 8;
+
 /// Round a producer key onto the run's cadence, or refuse.
 ///
 /// **The producer's first segment is not always where it was asked to start.**
@@ -300,7 +308,7 @@ pub fn snap_to_cadence(key_ms: u64, cadence_ms: u64) -> Option<u64> {
     } else {
         nearest
     };
-    (key_ms.abs_diff(nearest) <= cadence_ms / 8).then_some(nearest)
+    (key_ms.abs_diff(nearest) <= cadence_ms / KEY_SNAP_DIVISOR).then_some(nearest)
 }
 
 /// Ingest one producer run's `index.m3u8` into `map`.
@@ -561,6 +569,28 @@ mod tests {
         // Half a segment is never a snap.
         assert_eq!(snap_to_cadence(1000, 2000), None);
         assert_eq!(snap_to_cadence(5, 0), None, "no cadence, no snap");
+
+        // **The far end of a rounded cadence, which is what entry 18's fix
+        // spends this budget on.** At 2997/125 the true cadence is 2002.002
+        // ms and the listing names multiples of 2002, so a producer key drifts
+        // ~0.002 ms per segment away from its listed multiple. At segment 5000
+        // of a long film that is 10 ms of drift on top of the 83 ms
+        // first-segment offset, and it still snaps.
+        let listed = 5000 * 2002;
+        assert_eq!(
+            snap_to_cadence(listed + 93, 2002),
+            Some(listed),
+            "83 ms offset plus 10 ms accumulated drift is inside the budget"
+        );
+        // And the budget is still the budget at that distance: 250 admits,
+        // 251 does not, exactly as at segment zero.
+        assert_eq!(snap_to_cadence(listed + 250, 2002), Some(listed));
+        assert_eq!(
+            snap_to_cadence(listed + 251, 2002),
+            None,
+            "past the bound a drifted key is not this rounding and must not \
+             resolve to a neighbour"
+        );
     }
 
     /// A segment URI's bytes are **not** immutable within a session.

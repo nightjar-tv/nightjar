@@ -1024,12 +1024,15 @@ fn full_title_entries(session: &Session) -> Option<Vec<(u64, u64)>> {
     // Copy and remux list the same whole title on a different grid. That is
     // the only difference between the modes: both are full-title VOD, and
     // scrub granularity differs because copy cuts where the source does.
-    let Some(step) = grid_cadence_ms(
-        session.mode,
-        session.burn_in.is_some(),
-        &session.encode_plan,
-    ) else {
-        return copy_window_entries(session);
+    let step = match session_grid_cadence(session) {
+        // Copy and remux: the keyframe walk is their listing, by design.
+        GridCadence::KeyframeWalk => return copy_window_entries(session),
+        // Transcode with no listable grid. **Not the walk** — a transcode
+        // encoder writes its own IDR grid and never lands on a source
+        // keyframe, so the walk would name URIs it cannot fill. `None` here
+        // drops `run_listing` into the run's own window listing.
+        GridCadence::NoHonestGrid => return None,
+        GridCadence::Cadence(step) => step,
     };
     let end = session.usable_extent_ms.unwrap_or(session.duration_ms);
     if end == 0 || step == 0 {
@@ -1448,7 +1451,14 @@ impl HlsSessionRegistry {
             map_binding.map =
                 wait_for_map_build(item_id, self.db.as_ref(), map_build_in_flight.as_ref());
         }
-        let grid = grid_cadence_ms(mode, burn_in.is_some(), &encode_plan);
+        let grid = grid_cadence_ms(
+            mode,
+            burn_in.is_some(),
+            &self.encode_leg,
+            &encode_plan,
+            duration_ms,
+        )
+        .cadence();
         let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
         let mut plan = map_binding.plan(src, want);
         if let Some(p) = grid {
@@ -2500,11 +2510,7 @@ fn restart_at(
     // Bind at the grid point at or before the land, not at the land, so the
     // cue this snaps to is at or before a grid point and the snap up can
     // never overshoot the play land.
-    let grid = grid_cadence_ms(
-        session.mode,
-        session.burn_in.is_some(),
-        &session.encode_plan,
-    );
+    let grid = session_grid_cadence(session).cadence();
     let want = grid.map_or(play_start_ms, |p| (play_start_ms / p) * p);
     let mut plan = session.map_binding.plan(&session.src, want);
     if let Some(p) = grid {
@@ -2986,10 +2992,17 @@ fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
 /// absent. Copy is excluded by the mode test below for the same reason it is
 /// excluded from the grid — it places no IDRs.
 fn session_cadence_ms(session: &Session) -> Option<u64> {
+    session_grid_cadence(session).cadence()
+}
+
+/// This session's grid answer, with the three cases kept apart.
+fn session_grid_cadence(session: &Session) -> GridCadence {
     grid_cadence_ms(
         session.mode,
         session.burn_in.is_some(),
+        &session.encode_leg,
         &session.encode_plan,
+        session.duration_ms,
     )
 }
 
@@ -3019,11 +3032,59 @@ fn session_key_snap<'a>(
     }
 }
 
-fn grid_cadence_ms(mode: SessionMode, has_burn_in: bool, plan: &VideoEncodePlan) -> Option<u64> {
+/// What grid a session's listing can name.
+///
+/// **Three answers, because there are three cases and one of them used to be
+/// invisible.** This was an `Option<u64>` whose `None` meant *"copy, no derived
+/// cadence by design"* and *"transcode, no honest grid"* at once.
+/// `full_title_entries` could only see the absence, so it gave a transcode
+/// session copy's keyframe walk: a playlist naming source keyframe times that
+/// a transcode encoder never writes. Every request held to `SEGMENT_WAIT` and
+/// **129 of 1814 items in a real library could not play**
+/// (`nightjar-meta` `OPEN-DEFECTS.md` entry 18).
+///
+/// Rule 4.11 asks which field distinguishes two cases rather than which branch.
+/// The field is session mode, and ADR-0054 decision 2 already says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridCadence {
+    /// Copy and remux. They place no IDRs, so their listing is the greedy walk
+    /// of the source keyframe map (ADR-0054 decision 2).
+    KeyframeWalk,
+    /// Transcode, on a grid the listing can name and the encoder will hit.
+    Cadence(u64),
+    /// Transcode with no listable grid: no source rate, or a rounding whose
+    /// drift outruns the key snap before the title ends. **Not copy's walk** —
+    /// the run's own window listing is the honest answer.
+    NoHonestGrid,
+}
+
+impl GridCadence {
+    /// The cadence when there is one. Callers that only need a grid point.
+    fn cadence(self) -> Option<u64> {
+        match self {
+            Self::Cadence(c) => Some(c),
+            Self::KeyframeWalk | Self::NoHonestGrid => None,
+        }
+    }
+}
+
+fn grid_cadence_ms(
+    mode: SessionMode,
+    has_burn_in: bool,
+    leg: &crate::EncodeLeg,
+    plan: &VideoEncodePlan,
+    title_ms: u64,
+) -> GridCadence {
     // Burn-in re-encodes video whatever the session mode says (ADR-0018), so
     // it is transcode for this question.
     let transcode = mode == SessionMode::Transcode || has_burn_in;
-    transcode.then(|| produced_segment_ms(plan))?
+    if !transcode {
+        return GridCadence::KeyframeWalk;
+    }
+    match produced_segment_ms(leg, plan, title_ms) {
+        Some(c) => GridCadence::Cadence(c),
+        None => GridCadence::NoHonestGrid,
+    }
 }
 
 /// Is this want one the session's own playlist offers?
@@ -3060,17 +3121,80 @@ fn snap_plan_to_grid(plan: &mut StartPlan, produced_ms: u64) {
     plan.window_start_ms = grid;
 }
 
-fn produced_segment_ms(plan: &VideoEncodePlan) -> Option<u64> {
-    let frames = u64::from(plan.gop_frames(SEGMENT_MS)?);
+/// The producer's own first key is late by a couple of frames at land 0, and
+/// every later key in that run inherits the offset. Measured through the
+/// transcode start path: 83 ms at `24000/1001`, 80 at `25`, 33 at `60`
+/// ([`crate::hls_segment_map::snap_to_cadence`] records the method). Runs at a
+/// land above zero discard those frames and are exact, so this is the worst
+/// case rather than the usual one.
+const FIRST_SEGMENT_OFFSET_MS: u64 = 83;
+
+/// Milliseconds of media in one produced segment, for the leg that will produce
+/// it, on the integer grid the listing can name.
+///
+/// **Two legs, two answers, and the branch was missing.** Which arguments a leg
+/// gets decides where its keys land, and this took no leg at all until
+/// 2026-08-31.
+///
+/// **A leg that honours `-force_key_frames` is given
+/// `expr:gte(t,n_forced*2.0)`, so its key is the first frame at or after
+/// `n × SEGMENT_MS`.** The grid is `SEGMENT_MS`, and the producer sits within
+/// one frame period of it for the life of the title — bounded, not
+/// accumulating. Measured 2026-08-31 on `libx264` and `h264_videotoolbox`,
+/// byte-identical starts on both, matching `ceil(n · 2.0 · fps) / fps` to three
+/// decimals out to segment 200.
+///
+/// **A leg that discards the flag is given `-g <frames>`**, so its cadence is
+/// the frame count in milliseconds. That is rational, the listing is integers,
+/// so it rounds and then checks the rounding survives the title.
+///
+/// The residual per segment is `|N - r·D| / D` for `N = frames · den · 1000`
+/// and `D = num`, so over a title it is `|N - r·D| · title / N` — integer
+/// throughout. Add [`FIRST_SEGMENT_OFFSET_MS`], which spends the same budget,
+/// and compare against the snap bound.
+///
+/// **`None` refuses rather than inventing a grid.** No source rate; a frame
+/// period that would not fit inside the snap bound on its own; or a rounding
+/// whose drift outruns that bound before the title ends. `22018000/918487` is
+/// the last of those: 23.972 rather than 23.976, `2002.3334 ms` for 48 frames,
+/// about 1199 ms of drift over two hours.
+///
+/// **The frame-count arm is inferred, not measured here.** Only `h264_qsv`
+/// takes it and the N150 was unreachable on 2026-08-31. What it rests on is
+/// the QSV measurement already in this file's history — 1061 of 1062 starts
+/// off the 2000 ms grid at `c43b440`, modal delta 2002 — which is consistent
+/// with `-g 48` at `24000/1001` and is not the same thing as having run it.
+fn produced_segment_ms(
+    leg: &crate::EncodeLeg,
+    plan: &VideoEncodePlan,
+    title_ms: u64,
+) -> Option<u64> {
     let (num, den) = plan.source_frame_rate?;
     let (num, den) = (u64::from(num), u64::from(den));
     if num == 0 {
         return None;
     }
+    let budget = |cadence: u64| cadence / crate::hls_segment_map::KEY_SNAP_DIVISOR;
+
+    if leg.honours_force_key_frames {
+        // One frame period is the whole error, and it never grows. Refuse only
+        // when a frame is itself wider than the snap allows.
+        let frame_ms = den.saturating_mul(1000) / num;
+        return (frame_ms <= budget(SEGMENT_MS)).then_some(SEGMENT_MS);
+    }
+
+    let frames = u64::from(plan.gop_frames(SEGMENT_MS)?);
     let ms_numerator = frames * den * 1000;
-    // A cadence that is not a whole number of milliseconds has no integer grid
-    // to list, so say so rather than rounding one into existence.
-    (ms_numerator % num == 0).then_some(ms_numerator / num)
+    let cadence = (ms_numerator + num / 2) / num;
+    if cadence == 0 {
+        return None;
+    }
+    let residual = ms_numerator.abs_diff(cadence * num);
+    if residual == 0 {
+        return Some(cadence);
+    }
+    let drift_ms = residual.saturating_mul(title_ms) / ms_numerator;
+    (drift_ms + FIRST_SEGMENT_OFFSET_MS <= budget(cadence)).then_some(cadence)
 }
 
 fn align_to_segment(ms: u64) -> u64 {
@@ -4880,25 +5004,49 @@ mod tests {
             source_frame_rate: Some((24000, 1001)),
             ..VideoEncodePlan::default()
         };
+        const FILM: u64 = 7_200_000;
+        // `libx264` honours `-force_key_frames`, so its grid is SEGMENT_MS.
+        let sw = crate::EncodeLeg::software();
         assert_eq!(
-            grid_cadence_ms(SessionMode::Transcode, false, &film),
-            Some(2002)
+            grid_cadence_ms(SessionMode::Transcode, false, &sw, &film, FILM),
+            GridCadence::Cadence(SEGMENT_MS)
         );
         assert_eq!(
-            grid_cadence_ms(SessionMode::Copy, false, &film),
-            None,
+            grid_cadence_ms(SessionMode::Copy, false, &sw, &film, FILM),
+            GridCadence::KeyframeWalk,
             "copy cannot drop to a grid and must keep its own phase"
         );
         // Burn-in re-encodes video whatever the mode says (ADR-0018).
         assert_eq!(
-            grid_cadence_ms(SessionMode::Copy, true, &film),
-            Some(2002),
+            grid_cadence_ms(SessionMode::Copy, true, &sw, &film, FILM),
+            GridCadence::Cadence(SEGMENT_MS),
             "burn-in is a transcode for this question"
         );
-        // No honest cadence means no grid, even for transcode.
+        // **The two absences are different answers and must stay apart.** A
+        // transcode with no listable grid used to arrive as the same `None`
+        // copy does, and `full_title_entries` then handed it copy's keyframe
+        // walk (entry 18). Copy's answer is a walk; this one is a per-run
+        // window listing.
         assert_eq!(
-            grid_cadence_ms(SessionMode::Transcode, false, &VideoEncodePlan::default()),
-            None
+            grid_cadence_ms(
+                SessionMode::Transcode,
+                false,
+                &sw,
+                &VideoEncodePlan::default(),
+                FILM
+            ),
+            GridCadence::NoHonestGrid
+        );
+        assert_ne!(
+            grid_cadence_ms(
+                SessionMode::Transcode,
+                false,
+                &sw,
+                &VideoEncodePlan::default(),
+                FILM
+            ),
+            grid_cadence_ms(SessionMode::Copy, false, &sw, &film, FILM),
+            "no-honest-grid must not be indistinguishable from copy"
         );
     }
 
@@ -4918,8 +5066,11 @@ mod tests {
             source_frame_rate: Some((24000, 1001)),
             ..VideoEncodePlan::default()
         };
-        // 48 frames at 24000/1001 is 2002 ms, whatever the leg is told.
-        let step = 2002;
+        // The fixture session runs on `libx264`, which honours
+        // `-force_key_frames`, so its grid is SEGMENT_MS. **This read 2002
+        // until 2026-08-31**, from the frame count, which is the arm only a
+        // leg that discards the flag takes (entry 20).
+        let step = SEGMENT_MS;
 
         assert!(
             want_is_listed(&session, 40 * step),
@@ -5022,6 +5173,140 @@ mod tests {
         let text = String::from_utf8_lossy(&build_run_media_playlist("s1", &session)).to_string();
         assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=600.000,PRECISE=YES"));
+    }
+
+    /// A transcode session at a rounded rate lists a grid, and the ingest snap
+    /// resolves the producer's drifted key onto it.
+    ///
+    /// **The two sites entry 18 turns on, asserted together.** The listing
+    /// names multiples of the derived cadence; the ingest snaps producer keys
+    /// onto the same multiples; the serve lookup is then an exact match on
+    /// keys the ingest already normalised, which is why it needs no tolerance
+    /// of its own. If the listing and the snap ever disagree the failure
+    /// appears at segment 500, not segment 1.
+    #[test]
+    fn a_rounded_rate_lists_a_grid_the_snap_can_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 7_200_000);
+        session.mode = SessionMode::Transcode;
+        session.encode_plan = VideoEncodePlan {
+            source_frame_rate: Some((2997, 125)),
+            ..VideoEncodePlan::default()
+        };
+
+        // Before entry 18's fix this was `NoHonestGrid` arriving as copy's
+        // `None`, and the listing was a keyframe walk on 20 s boundaries.
+        // The fixture leg honours `-force_key_frames`, so the grid is
+        // SEGMENT_MS and the rate does not enter into it (entry 20).
+        assert_eq!(
+            session_grid_cadence(&session),
+            GridCadence::Cadence(SEGMENT_MS)
+        );
+
+        let entries = full_title_entries(&session).expect("a rounded rate still lists");
+        assert!(entries.len() > 3000, "a full title, not a window");
+        for (i, (start, _)) in entries.iter().enumerate().take(2000) {
+            assert_eq!(*start, i as u64 * SEGMENT_MS, "listing is the derived grid");
+        }
+
+        // The producer's key for a late segment carries the first-segment
+        // offset plus the accumulated rounding drift, and snaps onto the key
+        // the listing named.
+        // The producer's key for a late segment is the first frame at or
+        // after the listed multiple, so it sits within one frame period.
+        let listed = 2000 * SEGMENT_MS;
+        let produced = listed + 42;
+        assert_eq!(
+            crate::hls_segment_map::snap_to_cadence(produced, SEGMENT_MS),
+            Some(listed),
+            "the ingest resolves what the listing promised"
+        );
+
+        // And the snap is what the session would actually be given.
+        let points = session_listed_points(&session);
+        assert!(points.is_empty(), "a cadence session lists no walk points");
+        assert!(matches!(
+            session_key_snap(session_cadence_ms(&session), &points),
+            Some(crate::hls_segment_map::KeySnap::Cadence(SEGMENT_MS))
+        ));
+    }
+
+    /// A transcode session with no listable grid gets the **per-run window
+    /// listing**, never copy's keyframe walk.
+    ///
+    /// **This is the defect itself, as a control.** Entry 18 was a transcode
+    /// session handed a walk of the source's keyframes on 20 s boundaries: the
+    /// listing named times the encoder never writes, every request held to
+    /// `SEGMENT_WAIT`, and 129 of 1814 items could not play. The keyframe map
+    /// below is populated deliberately, so `copy_window_entries` *would*
+    /// return a walk if this branch reached it.
+    #[test]
+    fn a_transcode_with_no_grid_is_not_given_copys_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two hours, so 7/3's residual actually outruns the budget. At 100 s
+        // it does not, which is the point of checking the title rather than
+        // the rate alone.
+        let mut session = eof_test_session(dir.path(), 7_200_000);
+        session.mode = SessionMode::Transcode;
+        // 7/3 rounds to 2143 ms and drifts past the budget: no listable grid.
+        session.encode_plan = VideoEncodePlan {
+            source_frame_rate: Some((7, 3)),
+            ..VideoEncodePlan::default()
+        };
+        session.map_binding.map = Some(KeyframeMap {
+            container_kind: MapContainerKind::Matroska,
+            content_id: "probe".into(),
+            entries: (0..13)
+                .map(|i| KeyframeEntry {
+                    pts_ms: i * 8_000,
+                    byte_offset: i * 1_000,
+                })
+                .collect(),
+        });
+
+        assert_eq!(session_grid_cadence(&session), GridCadence::NoHonestGrid);
+        // The walk is available and must not be taken.
+        assert!(
+            copy_window_entries(&session).is_some(),
+            "fixture check: the walk exists, so this control is not vacuous"
+        );
+        assert!(
+            full_title_entries(&session).is_none(),
+            "a transcode encoder never lands on a source keyframe: the walk \
+             would list URIs it cannot fill (entry 18)"
+        );
+    }
+
+    /// The rate that already worked is untouched. **The `(a, a)` control.**
+    #[test]
+    fn an_exact_rate_lists_exactly_what_it_did_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = eof_test_session(dir.path(), 7_200_000);
+        session.mode = SessionMode::Transcode;
+        session.encode_plan = VideoEncodePlan {
+            source_frame_rate: Some((24000, 1001)),
+            ..VideoEncodePlan::default()
+        };
+        assert_eq!(
+            session_grid_cadence(&session),
+            GridCadence::Cadence(SEGMENT_MS)
+        );
+
+        let exact = full_title_entries(&session).expect("24000/1001 listed before and lists now");
+
+        // Same rate written the other way must produce the identical listing,
+        // which is the whole claim: 2997/125 and 24000/1001 are one rate.
+        let mut other = eof_test_session(dir.path(), 7_200_000);
+        other.mode = SessionMode::Transcode;
+        other.encode_plan = VideoEncodePlan {
+            source_frame_rate: Some((2997, 125)),
+            ..VideoEncodePlan::default()
+        };
+        assert_eq!(
+            full_title_entries(&other),
+            Some(exact),
+            "the same 23.976 written two ways must list the same grid"
+        );
     }
 
     /// The per-run listing ADR-0020 kept begins at its first entry, so there
@@ -5210,53 +5495,151 @@ mod tests {
     }
 
     /// The cadence a leg will actually produce, which is not always the one
-    /// the session asked for.
+    /// the session asked for — and which leg it is decides the answer.
     #[test]
-    fn produced_segment_ms_follows_the_frames_not_the_constant() {
+    fn produced_segment_ms_follows_the_leg_then_the_frames() {
         let plan_at = |num, den| VideoEncodePlan {
             source_frame_rate: Some((num, den)),
             ..VideoEncodePlan::default()
         };
         let film = plan_at(24000, 1001);
+        const FILM: u64 = 7_200_000;
+        // libx264 and VideoToolbox honour `-force_key_frames`; QSV does not.
+        let sw = crate::EncodeLeg::software();
+        let vt = crate::EncodeLeg::videotoolbox();
+        let qsv = crate::EncodeLeg::qsv_sysmem();
 
-        // The cadence is the frame count, on every leg. An IDR lands on a
-        // frame, so a leg that honours -force_key_frames picks the nearest
-        // one rather than creating a frame at 2.000 s. Measured on libx264 —
-        // which honours it — at 24000/1001: keys 83, 2085, 4087, spacing 2002.
+        // **A leg that honours the flag cuts at the first frame at or after
+        // `n × SEGMENT_MS`, so the grid is SEGMENT_MS whatever the rate.**
+        // Measured 2026-08-31 on both such legs, byte-identical starts,
+        // matching `ceil(n · 2.0 · fps) / fps` to three decimals out to
+        // segment 200.
+        for leg in [&sw, &vt] {
+            assert_eq!(produced_segment_ms(leg, &film, FILM), Some(SEGMENT_MS));
+            // The rate does not move it. This is the whole point: the two
+            // spellings of 23.976 both list the same grid, and so does 25.
+            assert_eq!(
+                produced_segment_ms(leg, &plan_at(2997, 125), FILM),
+                Some(SEGMENT_MS)
+            );
+            assert_eq!(
+                produced_segment_ms(leg, &plan_at(25, 1), FILM),
+                Some(SEGMENT_MS)
+            );
+        }
+
+        // **A leg that discards the flag gets `-g <frames>`, so its cadence is
+        // the frame count.** 48 frames at 24000/1001 is 2002 ms.
         assert_eq!(
-            produced_segment_ms(&film),
+            produced_segment_ms(&qsv, &film, FILM),
             Some(2002),
-            "48 frames at 24000/1001 is 2002 ms, whatever the leg is told"
+            "48 frames at 24000/1001 is 2002 ms when the flag is discarded"
         );
-
-        // Rates where 2000 ms is a whole number of frames still land on it.
         assert_eq!(
-            produced_segment_ms(&plan_at(60, 1)),
+            produced_segment_ms(&qsv, &plan_at(60, 1), FILM),
             Some(2000),
             "120 frames"
         );
         assert_eq!(
-            produced_segment_ms(&plan_at(25, 1)),
+            produced_segment_ms(&qsv, &plan_at(25, 1), FILM),
             Some(2000),
             "50 frames"
         );
-        assert_eq!(produced_segment_ms(&plan_at(30000, 1001)), Some(2002));
 
-        // No rate is no answer. The caller falls back to a per-run listing
-        // rather than listing a grid it cannot justify.
+        // No rate is no answer on either arm: the frame period cannot be
+        // bounded, so the caller falls back to a per-run listing.
+        for leg in [&sw, &qsv] {
+            assert_eq!(
+                produced_segment_ms(leg, &VideoEncodePlan::default(), FILM),
+                None,
+                "no source rate means no honest cadence"
+            );
+        }
+
+        // A frame wider than the snap budget cannot be absorbed even by the
+        // flag-honouring arm, because the offset is a whole frame.
         assert_eq!(
-            produced_segment_ms(&VideoEncodePlan::default()),
+            produced_segment_ms(&sw, &plan_at(2, 1), FILM),
             None,
-            "no source rate means no honest cadence"
+            "at 2 fps one frame is 500 ms, twice the 250 ms budget"
         );
+    }
 
-        // A cadence that is not whole milliseconds has no integer grid to
-        // list. 7/3 is constructed to exercise that guard, not a real rate:
-        // 5 frames at 7/3 fps is 15000/7 ms, which is not an integer.
+    /// The rates a real 1814-item library holds, on the leg whose arithmetic
+    /// they exercise.
+    ///
+    /// **Pinned against the population that found entry 18, not two
+    /// examples.** Every rate below is within a thousandth of 23.976 and they
+    /// are written 72 different ways. **They only matter on the `-g` arm**:
+    /// a leg that honours `-force_key_frames` lists SEGMENT_MS for all of
+    /// them, which is asserted above.
+    ///
+    /// **That arm is inferred, not measured here.** Only `h264_qsv` takes it
+    /// and the N150 was unreachable on 2026-08-31.
+    #[test]
+    fn the_rate_corpus_derives_a_listable_cadence_on_the_frame_count_arm() {
+        let plan_at = |num, den| VideoEncodePlan {
+            source_frame_rate: Some((num, den)),
+            ..VideoEncodePlan::default()
+        };
+        let qsv = crate::EncodeLeg::qsv_sysmem();
+        const FILM: u64 = 7_200_000;
+
+        let corpus: &[(u32, u32, Option<u64>, &str)] = &[
+            (24000, 1001, Some(2002), "1419 items"),
+            (24, 1, Some(2000), "220 items"),
+            (25, 1, Some(2000), "32 items"),
+            (13978, 583, Some(2002), "26 items: 2002.0031"),
+            (
+                2997,
+                125,
+                Some(2002),
+                "17 items: 2002.0020, the one that found entry 18",
+            ),
+            (250000, 10427, Some(2002), "14 items: 2001.9840"),
+            (27021, 1127, Some(2002), "12 items: 2001.9984"),
+            (30000, 1001, Some(2002), "8 items"),
+            (30, 1, Some(2000), "3 items"),
+            (500, 21, Some(2016), "2 items: 23.8095"),
+            (2997, 100, Some(2002), "1 item: 29.97"),
+            (12060, 503, Some(2002), "1 item: 2001.9900"),
+            (14937, 623, Some(2002), "1 item: 2002.0084"),
+            (743630848, 30985109, Some(2000), "1 item: 2000.0317"),
+            (2146177256, 89512761, Some(2002), "the long-tail shape"),
+            // **Refused, and this is the finding rather than a gap.**
+            // 23.9720, not 23.976: 2002.3334 ms for 48 frames, about 1199 ms
+            // of drift over this title against a 250 ms budget.
+            (22018000, 918487, None, "the one rate rounding cannot carry"),
+        ];
+
+        for &(num, den, want, why) in corpus {
+            assert_eq!(
+                produced_segment_ms(&qsv, &plan_at(num, den), FILM),
+                want,
+                "{num}/{den} ({why})"
+            );
+        }
+    }
+
+    /// The drift budget, both sides, on the arm that spends it.
+    #[test]
+    fn the_drift_budget_admits_and_refuses_either_side_of_its_bound() {
+        let qsv = crate::EncodeLeg::qsv_sysmem();
+        let rate = VideoEncodePlan {
+            source_frame_rate: Some((2997, 125)),
+            ..VideoEncodePlan::default()
+        };
+        // 0.002 ms per segment against 250 ms of budget less the 83 ms
+        // first-segment offset: 167 ms spendable, so about 83_500 segments.
         assert_eq!(
-            produced_segment_ms(&plan_at(7, 3)),
+            produced_segment_ms(&qsv, &rate, 100_000_000),
+            Some(2002),
+            "a 27-hour title still fits the budget at this residual"
+        );
+        assert_eq!(
+            produced_segment_ms(&qsv, &rate, 200_000_000),
             None,
-            "a fractional-millisecond cadence has no grid, and must not be rounded into one"
+            "past the budget the rounding is refused, not stretched"
         );
     }
 
