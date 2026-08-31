@@ -177,6 +177,29 @@ and its own map. The 2 s grid holds on all three rungs.
    2.4 s worst case. 404 is reserved for a URI outside the title or off the
    grid.
 
+   > **Corrected 2026-08-31 — "never 503" is not what the code does, and the
+   > sentence is what changes.** The hold in `asset_wait` is bounded by
+   > `SEGMENT_WAIT` at 30 s; the promise above is not bounded at all. On expiry
+   > it answers **503**, which is deliberate and right: 503 is recoverable and
+   > the client retries, where 404 makes hls.js and Safari abandon the fragment.
+   > A bounded hold has to end somehow.
+   >
+   > **So the honest decision is: a listed URI is never 404.** It is held until
+   > the segment lands, released then rather than when its encoder finishes, and
+   > a hold that outlives `SEGMENT_WAIT` answers 503 for the client to retry.
+   > 404 stays reserved for a URI outside the title or off the grid.
+   >
+   > **What made the hold expire in practice was a different defect.** The
+   > map-build gate compared a snapped start against a raw duration and dropped
+   > **41,062 segments a session** from the map; a listed URI naming one of them
+   > had nothing to serve and ran to the bound. That is fixed in `9d4aff2`
+   > (`nightjar-meta` entry 21), and the two logs taken since carry **zero**
+   > holds against three on the build before it. **The bound still exists**, so
+   > a genuinely slow encode can still reach it, and the sentence has to say so
+   > rather than promise otherwise.
+   >
+   > `nightjar-meta` `notes/OPEN-DEFECTS.md` entry 17.
+
    > **Corrected 2026-08-31 — those figures are not this path's, and this path
    > has its own now.** The sentence above cites `976 to 1132 ms` for the
    > encoder a cold URI starts. Both numbers come from `s6_origin.py` under
@@ -198,10 +221,8 @@ and its own map. The 2 s grid holds on all three rungs.
    > [ADR-0055](0055-a-far-scrub-is-a-segment-miss.md) names that consequence
    > and decides it.
    >
-   > **This decision's first sentence is also not delivered.** A listed URI can
-   > 503: the hold in `asset_wait` is bounded by `SEGMENT_WAIT` at 30 s and the
-   > promise is not, observed twice on the shipped build. `nightjar-meta`
-   > `notes/OPEN-DEFECTS.md` entry 17.
+   > **This decision's first sentence is also not delivered, and is corrected
+   > below.**
 
    > **This overturns ADR-0020's miss policy, and did not say so until
    > 2026-08-31.** That policy is *"segment GETs never move the encode window;
