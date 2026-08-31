@@ -75,7 +75,16 @@ function pickBackend(video: HTMLVideoElement): AttachBackend {
 
 export interface HlsHandle {
 	destroy: () => void;
-	/** Title-absolute playback position in seconds (live `landedMs` + media). */
+	/**
+	 * Title-absolute playback position in seconds.
+	 *
+	 * **The offset is `mediaOriginMs`, not `landedMs`.** This read
+	 * "live `landedMs` + media" until 2026-08-31, describing the arithmetic
+	 * `#187` replaced: element time is already title-absolute under a full-title
+	 * listing, so adding the land was a second helping and the page read
+	 * `20:02 / 15:00` on a 15-minute title. The server states the origin and the
+	 * client reads it (`hlsTimeline.ts`); the land answers a different question.
+	 */
 	positionSeconds: () => number;
 	/**
 	 * Scrub to a title-absolute time. In-window → `currentTime`; otherwise
