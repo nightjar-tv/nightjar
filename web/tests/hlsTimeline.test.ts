@@ -14,13 +14,28 @@ describe('hlsTimeline', () => {
 		assert.equal(scrubRangeMs(null, undefined), 0);
 	});
 
-	it('title/media transform around a mid-title land', () => {
-		const land = 600_000;
-		assert.equal(titleSecondsFromMedia(2, land), 602);
-		assert.equal(mediaSecondsFromTitle(602, land), 2);
-		assert.equal(mediaSecondsFromTitle(600, land), 0);
-		assert.equal(mediaSecondsFromTitle(120, land), 0); // before land clamps
+	it('title/media transform around a per-run listing origin', () => {
+		// ADR-0020's per-run playlist begins at the land, so the origin is the
+		// land and element time is window-relative.
+		const origin = 600_000;
+		assert.equal(titleSecondsFromMedia(2, origin), 602);
+		assert.equal(mediaSecondsFromTitle(602, origin), 2);
+		assert.equal(mediaSecondsFromTitle(600, origin), 0);
+		assert.equal(mediaSecondsFromTitle(120, origin), 0); // before origin clamps
 		assert.equal(titleSecondsFromMedia(0, 0), 0);
+	});
+
+	it('a full-title listing has origin 0 however far in the session landed', () => {
+		// ADR-0054: the playlist starts at 0 and says the land in EXT-X-START,
+		// so element time is already title-absolute. Reading the land as the
+		// origin here is the defect: a session landed at 600 s showed 20:02 on
+		// a 15-minute title (OPEN-DEFECTS entry 12).
+		const origin = 0;
+		assert.equal(titleSecondsFromMedia(602.833, origin), 602.833);
+		assert.equal(titleSecondsFromMedia(620.578, origin), 620.578);
+		assert.equal(mediaSecondsFromTitle(640, origin), 640);
+		// And the scrub does not undershoot by the land.
+		assert.equal(mediaSecondsFromTitle(620, origin), 620);
 	});
 
 	it('produced window uses seekable end', () => {
