@@ -130,6 +130,32 @@ and its own map. The 2 s grid holds on all three rungs.
    2.4 s worst case. 404 is reserved for a URI outside the title or off the
    grid.
 
+   > **Corrected 2026-08-31 — those figures are not this path's, and this path
+   > has its own now.** The sentence above cites `976 to 1132 ms` for the
+   > encoder a cold URI starts. Both numbers come from `s6_origin.py` under
+   > `~/nightjar-spikes/2026-08-21-scheduler/`: ADR-0050 §4's table, and the
+   > reap-delay table in `nightjar-meta`'s
+   > `docs/plans/2026-08-23-hybrid-session-shape.md`. **That harness never calls
+   > the session API**, which this ADR's own decision 2 correction says of the
+   > same spike family. They are real measurements of a spike origin, cited for
+   > a product path they never ran.
+   >
+   > **Measured on the product 2026-08-31** at `95a7735`, six spawns during a
+   > human scrub, `h264_videotoolbox` on one Mac: client-visible waits **953,
+   > 1021, 1024, 1035, 1096 and 1328 ms**, with encoder `first_segment_ready`
+   > between 514 and 781 ms. One host, one encoder, n=6.
+   >
+   > **And the sentence understates what it decided.** "A cold URI is a seek"
+   > made the segment miss the far-scrub trigger and retired `POST /seek` from
+   > the ordinary path, which went untraced for eight days.
+   > [ADR-0055](0055-a-far-scrub-is-a-segment-miss.md) names that consequence
+   > and decides it.
+   >
+   > **This decision's first sentence is also not delivered.** A listed URI can
+   > 503: the hold in `asset_wait` is bounded by `SEGMENT_WAIT` at 30 s and the
+   > promise is not, observed twice on the shipped build. `nightjar-meta`
+   > `notes/OPEN-DEFECTS.md` entry 17.
+
    > **This overturns ADR-0020's miss policy, and did not say so until
    > 2026-08-31.** That policy is *"segment GETs never move the encode window;
    > far scrub is `POST /seek`"*, and it is the negation of the sentence above
