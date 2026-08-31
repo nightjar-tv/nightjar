@@ -755,8 +755,21 @@ pub struct SessionView {
     pub run_id: u64,
 }
 
-fn playlist_url_for(session_id: &str, run_id: u64) -> String {
-    format!("/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8")
+/// The session's master playlist URI (ADR-0054 decision 5).
+///
+/// One URI for the life of the session, where this used to mint a fresh one per
+/// run. What still changes per run is `EXT-X-MAP` inside the media playlist,
+/// because the init carries the land in its `elst` empty edit and decision 4's
+/// overturn measured that on all four paths.
+///
+/// **A client meets the changed map only through a re-attach.** Neither client
+/// reloads a `VOD` playlist in place: hls.js gates it on `details.live`, and the
+/// iPhone fetched one `index.m3u8` across four spawned runs. So the map is read
+/// once per attach, alongside the playlist that names it, and the pairing is
+/// always self-consistent. `nightjar-meta`:
+/// `notes/session-scoped-playlist-uri-2026-08-31.md`.
+fn playlist_url_for(session_id: &str) -> String {
+    format!("/api/v0/sessions/{session_id}/master.m3u8")
 }
 
 fn run_dir(session: &Session) -> PathBuf {
@@ -1057,6 +1070,24 @@ struct RunListing {
 
 /// One owner for the branch, so the playlist bytes and the origin the session
 /// view reports cannot disagree (Rule 4.9).
+/// What this run's media playlist lists, and where its timeline starts.
+///
+/// **Two shapes, and the choice is not stable for the life of a session.** A
+/// full-title listing starts at 0 and says the land in `EXT-X-START`. The
+/// fallback lists this run's window, with its own first entry as the origin,
+/// and `full_title_entries` picks it whenever there is no honest grid.
+///
+/// **That matters to ADR-0054 decision 5 and it bounds where the decision may
+/// go.** Under a session-scoped URI the playlist body is re-read only on a
+/// re-attach, and the map is the *small* thing that changes between two reads:
+/// the fallback changes the entire entry set and `media_origin_ms` with it.
+/// Transcode never reaches the fallback, because `grid_cadence_ms` answers for
+/// the leg, and decision 5 is transcode-only for exactly that reason.
+///
+/// **So do not widen the session-scoped URI to copy or remux on the strength of
+/// decision 5.** Copy's whole-title walk waits on a keyframe map that arrives
+/// asynchronously, which is the case where the shape flips mid-session, and
+/// nothing has measured a client against a body that changes that much.
 fn run_listing(session: &Session) -> RunListing {
     match full_title_entries(session) {
         // A full-title listing starts at 0, so the attach point is the land
@@ -1271,7 +1302,7 @@ fn session_view(session_id: &str, session: &Session) -> SessionView {
     SessionView {
         session_id: session_id.to_string(),
         item_id: session.item_id,
-        playlist_url: playlist_url_for(session_id, session.current_run_id),
+        playlist_url: playlist_url_for(session_id),
         video_encoder: if session.mode == SessionMode::Copy && session.burn_in.is_none() {
             "copy".into()
         } else {
@@ -1557,10 +1588,10 @@ impl HlsSessionRegistry {
         })
     }
 
-    /// Returns the media playlist for `run_id` (ADR-0020). `start_ms` on
-    /// this path is ignored for seek — use [`Self::seek`].
-    pub fn playlist(&self, session_id: &str, run_id: u64) -> Result<Vec<u8>, PlaylistError> {
-        self.with_ready_session(session_id, run_id, |session| {
+    /// Returns the session's media playlist (ADR-0020, ADR-0054 decision 5).
+    /// `start_ms` on this path is ignored for seek — use [`Self::seek`].
+    pub fn playlist(&self, session_id: &str) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, |session| {
             let bytes = build_run_media_playlist(session_id, session);
             log_playlist_serve(
                 session_id,
@@ -1574,11 +1605,11 @@ impl HlsSessionRegistry {
         })
     }
 
-    /// Returns the HLS master playlist for `run_id`. Media and subtitle URIs
-    /// are path-absolute under `/api/v0/sessions/…` (ADR-0008).
-    pub fn master(&self, session_id: &str, run_id: u64) -> Result<Vec<u8>, PlaylistError> {
-        self.with_ready_session(session_id, run_id, |session| {
-            let bytes = build_master(session_id, run_id, &session.subtitle_tracks);
+    /// Returns the session's HLS master playlist. Media and subtitle URIs are
+    /// path-absolute under `/api/v0/sessions/…` (ADR-0008).
+    pub fn master(&self, session_id: &str) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, |session| {
+            let bytes = build_master(session_id, &session.subtitle_tracks);
             log_playlist_serve(
                 session_id,
                 "master.m3u8",
@@ -1745,12 +1776,23 @@ impl HlsSessionRegistry {
         }
     }
 
-    fn with_ready_session<F>(
-        &self,
-        session_id: &str,
-        run_id: u64,
-        build: F,
-    ) -> Result<Vec<u8>, PlaylistError>
+    /// Serves a playlist once the current run has something to list.
+    ///
+    /// **This used to refuse a URI whose run was not current, and that check is
+    /// gone rather than relaxed.** It was not a choice: ADR-0054 decision 5 took
+    /// the run out of both playlist paths, so there is no longer a run id to
+    /// compare against `current_run_id`. Recorded here because a reader meeting
+    /// the absence later would otherwise have to guess whether it was decided.
+    ///
+    /// **Nothing consumed it, and both clients misread it.** A 404 on a playlist
+    /// URL is how each backend recognises a dead session and stops loading for
+    /// good, so a stale-URI refusal produced a false "session gone" rather than
+    /// a signal. `hlsPlayer.ts` had to stop the loader before teardown to keep
+    /// hls.js off the 404 it would otherwise treat as fatal.
+    ///
+    /// What gates readiness is [`current_run_has_mapped_segment`], below, which
+    /// is unaffected: a fetch before the new run produces still gets `NotReady`.
+    fn with_ready_session<F>(&self, session_id: &str, build: F) -> Result<Vec<u8>, PlaylistError>
     where
         F: FnOnce(&Session) -> Result<Vec<u8>, PlaylistError>,
     {
@@ -1765,9 +1807,6 @@ impl HlsSessionRegistry {
 
         if let Some(err) = session.failed.clone() {
             return Err(PlaylistError::Failed(err));
-        }
-        if run_id != session.current_run_id {
-            return Err(PlaylistError::NotFound);
         }
 
         if let Some(err) = note_child_exit(session) {
@@ -3103,7 +3142,7 @@ fn log_playlist_serve(
 /// Main@L3.1 while VideoToolbox emits High@L4.0) makes Safari native HLS
 /// refuse the variant outright. Better no hint than a lying one; the init
 /// segment carries the real codec string.
-fn build_master(session_id: &str, run_id: u64, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
+fn build_master(session_id: &str, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
     use std::fmt::Write;
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     if !tracks.is_empty() {
@@ -3130,10 +3169,10 @@ fn build_master(session_id: &str, run_id: u64, tracks: &[HlsSubtitleTrack]) -> V
     } else {
         out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000\n");
     }
-    let _ = writeln!(
-        out,
-        "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8"
-    );
+    // Session-scoped, like the master that carries it (ADR-0054 decision 5).
+    // The run survives in `EXT-X-MAP` inside this playlist and nowhere else on
+    // the wire.
+    let _ = writeln!(out, "/api/v0/sessions/{session_id}/index.m3u8");
     out.into_bytes()
 }
 
@@ -5469,14 +5508,17 @@ mod tests {
         }
     }
 
+    /// Polls the session's media playlist until it lists a time-keyed segment.
+    ///
+    /// **One helper, not two.** `wait_playlist_run` used to sit beside this to
+    /// poll one specific run, because the URI named a run and a stale one 404ed.
+    /// Under ADR-0054 decision 5 there is one URI, and `playlist` already holds
+    /// until the *current* run has a mapped segment, so waiting for "the new
+    /// run" and waiting for "the playlist" became the same wait (Rule 4.11).
     fn wait_playlist(reg: &HlsSessionRegistry, id: &str) -> Vec<u8> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
-            let run_id = {
-                let sessions = reg.sessions.lock().unwrap();
-                sessions.get(id).map(|s| s.current_run_id).unwrap_or(0)
-            };
-            match reg.playlist(id, run_id) {
+            match reg.playlist(id) {
                 Ok(bytes) => {
                     if first_listed_seg_opt(&bytes).is_some() {
                         return bytes;
@@ -5492,30 +5534,6 @@ mod tests {
                 Err(PlaylistError::NotReady) | Err(PlaylistError::NotFound)
                     if Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => panic!("playlist: {e:?}"),
-            }
-        }
-    }
-
-    fn wait_playlist_run(reg: &HlsSessionRegistry, id: &str, run_id: u64) -> Vec<u8> {
-        let deadline = Instant::now() + SEGMENT_WAIT;
-        loop {
-            match reg.playlist(id, run_id) {
-                Ok(bytes) => {
-                    if first_listed_seg_opt(&bytes).is_some() {
-                        return bytes;
-                    }
-                    if Instant::now() >= deadline {
-                        panic!(
-                            "playlist ready without time-keyed segments: {}",
-                            String::from_utf8_lossy(&bytes)
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(PlaylistError::NotReady) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => panic!("playlist: {e:?}"),
@@ -6511,7 +6529,7 @@ mod tests {
 
         let view = reg.seek(&id, land_ms).expect("seek");
         assert_ne!(view.run_id, run_before, "seek starts a new producer run");
-        let seek_playlist = wait_playlist_run(&reg, &id, view.run_id);
+        let seek_playlist = wait_playlist(&reg, &id);
         let seek_land = first_listed_seg(&seek_playlist);
         assert!(!wait_asset(&reg, &id, &seek_land).is_empty());
     }
@@ -6632,7 +6650,7 @@ mod tests {
         // Drive readiness: playlist/asset poll notices land and applies pending.
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let _ = reg.playlist(&id, reg.view(&id).map(|v| v.run_id).unwrap_or(0));
+            let _ = reg.playlist(&id);
             let sessions = reg.sessions.lock().unwrap();
             let s = sessions.get(&id).unwrap();
             if s.play_start_ms == 40_000 && s.first_segment_ready {
@@ -6845,7 +6863,7 @@ mod tests {
         let land = first_listed_seg(&playlist);
         assert!(reg.asset(&id, &land, None).is_ok(), "land={land}");
         assert!(reg.stop(&id));
-        assert!(matches!(reg.playlist(&id, 0), Err(PlaylistError::NotFound)));
+        assert!(matches!(reg.playlist(&id), Err(PlaylistError::NotFound)));
     }
 
     /// Session-inline demux with no scan-time extract: the video segment and
@@ -7048,8 +7066,7 @@ mod tests {
                     Instant::now() < deadline,
                     "piggyback never published; status={status}"
                 );
-                let run_id = reg.view(&id).map(|v| v.run_id).unwrap_or(0);
-                let _ = reg.playlist(&id, run_id);
+                let _ = reg.playlist(&id);
                 std::thread::sleep(Duration::from_millis(50));
             }
             let body = fs::read_to_string(subs.vtt_path(1, &track_id)).unwrap();
@@ -7060,6 +7077,108 @@ mod tests {
                 "complete piggyback run flips the item to ready"
             );
             reg.stop(&id);
+        }
+    }
+
+    /// Counts `trak` boxes in an fMP4 init: one per track in `moov`.
+    ///
+    /// `traf` lives in `moof` and never in an init, so a byte scan is honest
+    /// here without a box parser.
+    fn init_track_count(init: &[u8]) -> usize {
+        init.windows(4).filter(|w| *w == b"trak").count()
+    }
+
+    /// **ADR-0054 decision 5's one unmeasured assumption, pinned.**
+    ///
+    /// `session.piggyback` clears once the extract publishes, so a run spawned
+    /// after that asks FFmpeg for one fewer output than run 0 did: the
+    /// `-map 0:s? -c:s webvtt` pair is gone. Decision 5 rests on that not
+    /// reaching `init.mp4`. If it did, a client holding the first init it saw
+    /// would be holding one that describes a different track set.
+    ///
+    /// The HLS muxer is documented to write WebVTT to its own rendition, so the
+    /// fMP4 init should carry video and audio either way, and the two-byte
+    /// `libx264` diff in `init-identity-across-runs-2026-08-31.md` shows two
+    /// tracks and no third. **Nothing varied it deliberately until this test.**
+    ///
+    /// **Two sessions on one source at one land, alike but for the piggyback
+    /// request. Deliberately not a seek.** Once a run reaches EOF the whole
+    /// title is mapped, so every in-range seek is a map hit that copies an init
+    /// rather than spawning one, and a seek past the map produces no media to
+    /// have an init for. The publish that clears `piggyback` needs that EOF, so
+    /// the two cannot be staged in one session. What actually differs between
+    /// the runs is the FFmpeg invocation, and this compares exactly that.
+    #[test]
+    fn piggyback_does_not_change_the_init_track_layout() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        let track_id = streams[0].track_id();
+
+        for mode in [SessionMode::Copy, SessionMode::Transcode] {
+            let mut inits: Vec<Vec<u8>> = Vec::new();
+            for piggyback in [
+                Some(PiggybackExtract {
+                    track_id: track_id.clone(),
+                }),
+                None,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = item_db(dir.path(), "eligible");
+                let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+                let reg = HlsSessionRegistry::with_cap(
+                    dir.path().join("hls"),
+                    2,
+                    "libx264",
+                    Some(subs),
+                    Some(db),
+                )
+                .unwrap();
+                let id = reg
+                    .start(
+                        1,
+                        &corpus,
+                        0,
+                        4000,
+                        mode,
+                        stereo(),
+                        vec![],
+                        None,
+                        None,
+                        VideoEncodePlan::default(),
+                        piggyback,
+                    )
+                    .unwrap();
+                wait_playlist(&reg, &id);
+                inits.push(reg.run_asset(&id, 0, "init.mp4").expect("init.mp4 bytes"));
+                reg.stop(&id);
+            }
+
+            let (with_subs, without) = (&inits[0], &inits[1]);
+            assert!(
+                init_track_count(with_subs) > 0,
+                "{mode:?}: init must declare at least one track"
+            );
+            assert_eq!(
+                init_track_count(with_subs),
+                init_track_count(without),
+                "{mode:?}: the piggyback subtitle output must not add a track to init.mp4 \
+                 ({} bytes with, {} without)",
+                with_subs.len(),
+                without.len()
+            );
+            assert_eq!(
+                with_subs, without,
+                "{mode:?}: init.mp4 must not depend on the piggyback request at all"
+            );
         }
     }
 
@@ -7192,7 +7311,7 @@ mod tests {
             Err(StartSessionError::CapFull)
         ));
         assert!(reg.stop(&a));
-        assert!(matches!(reg.playlist(&a, 0), Err(PlaylistError::NotFound)));
+        assert!(matches!(reg.playlist(&a), Err(PlaylistError::NotFound)));
         wait_playlist(&reg, &b);
         reg.stop(&b);
     }
@@ -7279,7 +7398,7 @@ mod tests {
                 Err(e) => panic!("seek: {e:?}"),
             }
         }
-        let _ = wait_playlist_run(&reg, &id, 1);
+        let _ = wait_playlist(&reg, &id);
         let still = wait_asset(&reg, &id, &early_name);
         assert_eq!(early.len(), still.len());
         assert!(reg.asset(&id, &early_name, None).is_ok());
@@ -7553,12 +7672,12 @@ mod tests {
                 item_vtt_path: None,
             },
         ];
-        let text = String::from_utf8(build_master("s1", 0, &tracks)).unwrap();
+        let text = String::from_utf8(build_master("s1", &tracks)).unwrap();
         assert!(text.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"));
         assert!(text.contains("GROUP-ID=\"subs\""));
         assert!(text.contains("URI=\"/api/v0/sessions/s1/subs/e2.m3u8\""));
         assert!(text.contains("SUBTITLES=\"subs\""));
-        assert!(text.contains("\n/api/v0/sessions/s1/runs/0/index.m3u8\n"));
+        assert!(text.contains("\n/api/v0/sessions/s1/index.m3u8\n"));
         assert!(
             text.contains("CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog\"")
         );
@@ -7568,11 +7687,11 @@ mod tests {
 
     #[test]
     fn master_without_tracks_has_no_subtitles_attr() {
-        let text = String::from_utf8(build_master("s1", 0, &[])).unwrap();
+        let text = String::from_utf8(build_master("s1", &[])).unwrap();
         assert!(!text.contains("EXT-X-MEDIA"));
         assert!(!text.contains("SUBTITLES="));
         assert!(!text.contains("CODECS="), "{text}");
-        assert!(text.contains("\n/api/v0/sessions/s1/runs/0/index.m3u8\n"));
+        assert!(text.contains("\n/api/v0/sessions/s1/index.m3u8\n"));
     }
 
     #[test]
@@ -8307,10 +8426,18 @@ mod tests {
     /// Client-shaped link walk: master → media → MAP → first segment, each
     /// hop resolved the way a browser resolves relative HLS URIs, then served
     /// as real bytes (not string-only checks). Locks the relative-URI class
-    /// that produced three cutover defects (segment depth, sub climb, and the
-    /// mistaken "master points at session-root index" hypothesis — master is
-    /// per-run, so bare `index.m3u8` is correct; this walk fails if that ever
-    /// moves without updating the media URI).
+    /// that produced three cutover defects (segment depth, sub climb, and a
+    /// master that pointed at the wrong index).
+    ///
+    /// **Rewritten 2026-08-31 with ADR-0054 decision 5.** This read: *"the
+    /// mistaken `master points at session-root index` hypothesis — master is
+    /// per-run, so bare `index.m3u8` is correct"*. The premise was true and is
+    /// not any more. The master is the session's, and the session-root index is
+    /// exactly what it points at.
+    ///
+    /// The walk now runs twice, either side of a seek, and asserts the two
+    /// things decision 5 turns on: the URI does not change, and the
+    /// `EXT-X-MAP` inside it does.
     #[test]
     fn session_hls_link_walk_resolves_to_real_bytes() {
         if !ffmpeg_available() {
@@ -8340,15 +8467,30 @@ mod tests {
         wait_playlist(&reg, &id);
         let _ = wait_first_listed_asset(&reg, &id);
         let view = reg.view(&id).expect("view");
-        walk_run_playlist_chain(&reg, &id, view.run_id, &view.playlist_url);
+        let init_before = walk_run_playlist_chain(&reg, &id, view.run_id, &view.playlist_url);
 
         std::thread::sleep(RESTART_MIN_INTERVAL);
         let after = reg.seek(&id, 4_000).expect("seek");
         assert_ne!(after.run_id, view.run_id, "seek must mint a fresh run");
         // Hold until the new run's media playlist lists a segment, then walk.
-        let pl = wait_playlist_run(&reg, &id, after.run_id);
+        let pl = wait_playlist(&reg, &id);
         let _ = wait_asset(&reg, &id, &first_listed_seg(&pl));
-        walk_run_playlist_chain(&reg, &id, after.run_id, &after.playlist_url);
+        let init_after = walk_run_playlist_chain(&reg, &id, after.run_id, &after.playlist_url);
+
+        // **The shape ADR-0054 decision 5 was held back for, pinned.** One URI
+        // across a seek, and the `EXT-X-MAP` inside it naming a different init
+        // on either side. The ADR called this unmeasured and would not call it
+        // coherent; what settles it is that neither client re-reads a `VOD`
+        // playlist in place, so the changed map is only ever met through a
+        // re-attach that reads playlist and map together.
+        assert_eq!(
+            view.playlist_url, after.playlist_url,
+            "the playlist URI must not change across a seek"
+        );
+        assert_ne!(
+            init_before, init_after,
+            "EXT-X-MAP must name the new run's init after a seek"
+        );
         reg.stop(&id);
     }
 
@@ -8375,12 +8517,28 @@ mod tests {
         format!("/{}", parts.join("/"))
     }
 
-    fn walk_run_playlist_chain(reg: &HlsSessionRegistry, id: &str, run_id: u64, master_url: &str) {
-        assert!(
-            master_url.ends_with(&format!("/runs/{run_id}/master.m3u8")),
-            "playlistUrl must be per-run master, got {master_url}"
+    /// Walks master → media → `EXT-X-MAP` → init the way a client resolves it,
+    /// and returns the init URI the map named.
+    ///
+    /// `run_id` is what the *session* says the current run is, not something the
+    /// URL carries. The walk asserts the map still reaches that run's init after
+    /// the playlists stopped naming it (ADR-0054 decision 5).
+    fn walk_run_playlist_chain(
+        reg: &HlsSessionRegistry,
+        id: &str,
+        run_id: u64,
+        master_url: &str,
+    ) -> String {
+        assert_eq!(
+            master_url,
+            format!("/api/v0/sessions/{id}/master.m3u8"),
+            "playlistUrl must be the session master, with no run segment"
         );
-        let master = reg.master(id, run_id).expect("master bytes");
+        assert!(
+            !master_url.contains("/runs/"),
+            "dead class: the master URI is not per-run, got {master_url}"
+        );
+        let master = reg.master(id).expect("master bytes");
         let master_text = String::from_utf8_lossy(&master);
         assert!(master_text.starts_with("#EXTM3U"), "{master_text}");
         let media_rel = master_text
@@ -8398,17 +8556,19 @@ mod tests {
         let media_url = resolve_hls_uri(master_url, media_rel);
         assert_eq!(
             media_url,
-            format!("/api/v0/sessions/{id}/runs/{run_id}/index.m3u8"),
-            "master must emit path-absolute media playlist URI"
-        );
-        // Dead class: session-root index must not be what the master points at.
-        assert_ne!(
-            media_url,
             format!("/api/v0/sessions/{id}/index.m3u8"),
-            "session-root index is not on the wire"
+            "master must emit the path-absolute session-scoped media URI"
+        );
+        // Dead class, inverted 2026-08-31 by ADR-0054 decision 5. This
+        // previously asserted the opposite, that a session-root index "is not on
+        // the wire", and the doc comment above the calling test argued for it in
+        // prose. Both were correct while the master was per-run.
+        assert!(
+            !media_url.contains("/runs/"),
+            "the media URI is the session's, got {media_url}"
         );
 
-        let media = reg.playlist(id, run_id).expect("media playlist");
+        let media = reg.playlist(id).expect("media playlist");
         let media_text = String::from_utf8_lossy(&media);
         assert!(media_text.contains("#EXTINF:"), "{media_text}");
         let map_uri = media_text
@@ -8446,6 +8606,7 @@ mod tests {
         let seg_name = seg_url.rsplit('/').next().expect("seg name");
         let seg = reg.asset(id, seg_name, None).expect("segment bytes");
         assert!(!seg.is_empty(), "first listed segment must have bytes");
+        init_url
     }
 
     /// Empty mid-title EOF must record usable extent (even with an empty map)
@@ -8885,7 +9046,7 @@ mod tests {
                 panic!("session failed: {err}");
             }
             // Keeps last_access fresh so the reaper leaves the session alone.
-            let _ = reg.playlist(id, run_id);
+            let _ = reg.playlist(id);
             let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
             if fs::read_to_string(&index)
                 .map(|text| text.contains("#EXT-X-ENDLIST"))
@@ -10167,7 +10328,7 @@ mod tests {
             if let Some(err) = failed {
                 panic!("session failed: {err}");
             }
-            let _ = reg.playlist(id, run_id);
+            let _ = reg.playlist(id);
             let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
             let text = fs::read_to_string(&index).unwrap_or_default();
             let listed_secs: f64 = text

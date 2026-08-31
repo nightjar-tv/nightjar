@@ -349,7 +349,7 @@ export interface paths {
         put?: never;
         /**
          * Start an HLS playback session for an item
-         * @description ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl (per-run master under /runs/{runId}/master.m3u8). Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=, which returns a fresh playlistUrl. Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+         * @description ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl (the session master, /sessions/{sessionId}/master.m3u8). Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=, which returns the same playlistUrl (ADR-0054 decision 5). Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
          */
         post: operations["startTranscodeSession"];
         delete?: never;
@@ -358,7 +358,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/sessions/{sessionId}/runs/{runId}/master.m3u8": {
+    "/api/v0/sessions/{sessionId}/master.m3u8": {
         parameters: {
             query?: never;
             header?: never;
@@ -366,8 +366,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * HLS master playlist for a producer run
-         * @description ADR-0020. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start / seek points here. Far seek is POST /seek, not a startMs query on this URI.
+         * HLS master playlist for a session
+         * @description ADR-0020, ADR-0054 decision 5. Declares the single video rendition (index.m3u8) and optional SUBTITLES group. playlistUrl from session start and seek both point here, and it is the same URI for the life of the session. Far seek is POST /seek, not a startMs query on this URI. After a seek the client re-attaches to this URI; the run it is playing appears only in the media playlist's EXT-X-MAP.
          */
         get: operations["getSessionMasterPlaylist"];
         put?: never;
@@ -378,7 +378,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v0/sessions/{sessionId}/runs/{runId}/index.m3u8": {
+    "/api/v0/sessions/{sessionId}/index.m3u8": {
         parameters: {
             query?: never;
             header?: never;
@@ -386,8 +386,9 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * HLS media playlist for a producer run
-         * @description Assembled from the session-global time-keyed segment map (ADR-0020). Segment URIs are session-root relative (`../../seg_<ms>.m4s` from `/runs/{runId}/index.m3u8`). EVENT while cooking; ENDLIST at that run's EOF. EXT-X-START is window-relative.
+         * HLS media playlist for a session
+         * @description Assembled from the session-global time-keyed segment map (ADR-0020), listing the whole title on the grid the encode leg will produce (ADR-0054 decisions 1 and 2). Segment URIs are path-absolute under /api/v0/sessions/{sessionId}/. PLAYLIST-TYPE is VOD with ENDLIST in every mode; EXT-X-START carries the land, title-absolute.
+         *     EXT-X-MAP names the current run's init and is the one field that changes between two fetches of this URI: the init carries the land in its elst empty edit, so runs at different lands cannot share one (ADR-0054 decision 4, overturned 2026-08-31). Clients read it on attach, alongside the playlist that names it.
          */
         get: operations["getSessionPlaylist"];
         put?: never;
@@ -444,7 +445,7 @@ export interface paths {
         };
         /**
          * fMP4 init segment for a session
-         * @description The playlist points at the run-scoped `runs/{runId}/init.mp4`, so this is the shape a client holding an older URI asks for. It is a path of its own rather than one value of the asset capture below because that capture is cookie-accepted and the router cannot otherwise say which names it covers (issue #96).
+         * @description The playlist points at the run-scoped `runs/{runId}/init.mp4`, so this is the shape a client holding an older URI asks for. It is a path of its own rather than one value of the asset capture below because that capture is cookie-accepted and the router cannot otherwise say which names it covers (issue #96). Unlike the playlists, the init stayed run-scoped under ADR-0054 decision 5: it carries the land.
          */
         get: operations["getSessionInit"];
         put?: never;
@@ -482,8 +483,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Far scrub — new producer run and playlist URI
-         * @description ADR-0020. Applies startMs, starts a new run when needed, and returns the fresh playlistUrl. Clients must swap the player source to that URI (hls.js loadSource / Safari native re-attach). Track selections do not survive the swap; re-apply after attach.
+         * Far scrub — new producer run behind one playlist URI
+         * @description ADR-0020. Applies startMs and starts a new run when needed. playlistUrl is unchanged, because it is the session's (ADR-0054 decision 5).
+         *     Clients must still re-attach the player source to it (hls.js loadSource / Safari native, which needs an explicit load() since the string does not change). The re-attach is what picks up the new run's EXT-X-MAP; without it the client keeps the init it first saw. Track selections do not survive the swap; re-apply after attach.
          */
         post: operations["seekTranscodeSession"];
         delete?: never;
@@ -842,7 +844,7 @@ export interface components {
             sessionId: string;
             /** Format: int64 */
             itemId: number;
-            /** @description Path to the current run's HLS master playlist (/sessions/{id}/runs/{runId}/master.m3u8). Fresh URI per far seek (ADR-0020). */
+            /** @description Path to the session's HLS master playlist (/sessions/{id}/master.m3u8). One URI for the life of the session, unchanged by a far seek (ADR-0020, ADR-0054 decision 5). */
             playlistUrl: string;
             /** @description FFmpeg encoder currently used by this session, or "copy" when the session stream-copies video (remux). */
             videoEncoder: string;
@@ -2229,7 +2231,6 @@ export interface operations {
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];
-                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -2244,7 +2245,7 @@ export interface operations {
                     "application/vnd.apple.mpegurl": string;
                 };
             };
-            /** @description Session or run not found */
+            /** @description Session not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2270,7 +2271,6 @@ export interface operations {
             header?: never;
             path: {
                 sessionId: components["parameters"]["SessionId"];
-                runId: components["parameters"]["RunId"];
             };
             cookie?: never;
         };
@@ -2285,7 +2285,7 @@ export interface operations {
                     "application/vnd.apple.mpegurl": string;
                 };
             };
-            /** @description Session or run not found */
+            /** @description Session not found */
             404: {
                 headers: {
                     [name: string]: unknown;

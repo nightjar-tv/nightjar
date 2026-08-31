@@ -108,14 +108,19 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/items/{item_id}/stream",
             get(crate::stream::stream_item),
         )
+        // ADR-0054 decision 5: the playlists are the session's, the init is
+        // still the run's. Static segments, so they resolve ahead of the
+        // `/{asset}` capture below the same way `session_init` already does.
         .route(
-            "/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8",
+            "/api/v0/sessions/{session_id}/master.m3u8",
             get(sessions::master),
         )
         .route(
-            "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
+            "/api/v0/sessions/{session_id}/index.m3u8",
             get(sessions::playlist),
         )
+        // Stays run-scoped: `EXT-X-MAP` names this, and two runs at different
+        // lands cannot share an init (decision 4, overturned 2026-08-31).
         .route(
             "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
             get(sessions::run_init),
@@ -316,12 +321,12 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
     ),
     (
         "GET",
-        "/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8",
+        "/api/v0/sessions/{session_id}/master.m3u8",
         Authority::AnySession,
     ),
     (
         "GET",
-        "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
+        "/api/v0/sessions/{session_id}/index.m3u8",
         Authority::AnySession,
     ),
     (
