@@ -351,6 +351,48 @@ pub fn ingest_run_index(
             off
         });
         let raw_start_ms = sidx_ms.saturating_add(offset);
+
+        // Gate: after the first segment, the producer's own start should equal
+        // its own previous end within one millisecond.
+        //
+        // **Both sides are the producer's values, and that is the whole
+        // point.** The question is whether this segment's content follows the
+        // last one — "contiguous producer output", which is what ADR-0020's
+        // original implementation asked and what closes false-time mapping.
+        //
+        // **It asked it in two coordinate systems from #182 to 2026-08-31.**
+        // The key snap landed between the raw value and this check, so a
+        // *snapped* start was compared against a *raw* end. That requires the
+        // grid spacing to equal the produced duration, which nothing
+        // guarantees; it held only because 2002 is the modal `EXTINF` at
+        // `24000/1001`. **41,062 segments were skipped from the map on
+        // `a2d0d73` against a real library** — 1,322 triggers, every one of
+        // them 21, 40 or 42 ms, at or under one frame period, and 39,740
+        // cascade behind them because a skip does not advance the expected
+        // end. Not one was a genuine discontiguity
+        // (`nightjar-meta` `OPEN-DEFECTS.md` entry 21).
+        //
+        // **What the snap guarantees is a different thing and guards itself.**
+        // That a stored key is close enough to the listed key to be named by
+        // it is `snap_to_cadence`'s bound, which refuses and warns on its own.
+        // Two invariants, two guards, each in one coordinate system.
+        if let Some(expect) = prev_end_ms {
+            let delta = raw_start_ms.abs_diff(expect);
+            if delta > 1 {
+                tracing::warn!(
+                    run_id,
+                    file = %entry.file_name,
+                    sidx_ms,
+                    raw_start_ms,
+                    expect_ms = expect,
+                    delta_ms = delta,
+                    "hls map-build gate: sidx disagrees with EXTINF timeline; skipping"
+                );
+                continue;
+            }
+        }
+        prev_end_ms = Some(raw_start_ms.saturating_add(duration_ms));
+
         // Put the wire key on the run's cadence, so a full-title listing can
         // name it before the producer has written it. Out of bound, keep the
         // producer's key and say so: the listing will then hold on a URI it
@@ -376,30 +418,12 @@ pub fn ingest_run_index(
                 raw_start_ms
             }
         };
-        // Gate: after the first segment, wire starts should equal the previous
-        // end within one millisecond (contiguous producer output).
-        if let Some(expect) = prev_end_ms {
-            let delta = start_ms.abs_diff(expect);
-            if delta > 1 {
-                tracing::warn!(
-                    run_id,
-                    file = %entry.file_name,
-                    sidx_ms,
-                    start_ms,
-                    expect_ms = expect,
-                    delta_ms = delta,
-                    "hls map-build gate: sidx disagrees with EXTINF timeline; skipping"
-                );
-                continue;
-            }
-        }
         map.insert(MappedSegment {
             start_ms,
             duration_ms,
             run_id,
             rel_path: rel,
         });
-        prev_end_ms = Some(start_ms.saturating_add(duration_ms));
         inserted += 1;
     }
     Ok(inserted)
@@ -619,6 +643,147 @@ seg021.m4s
         assert_eq!(map.get(40_000).unwrap().duration_ms, 2000);
         assert_eq!(map.get(42_000).unwrap().duration_ms, 2000);
         assert!(map.get(0).is_none());
+    }
+
+    /// **The entry 21 case.** A run whose grid spacing differs from the
+    /// durations it writes must ingest every segment.
+    ///
+    /// The producer here cuts at `2002` ms (`24000/1001`, 48 frames) while the
+    /// listing names `2000` — which is what a leg honouring
+    /// `-force_key_frames` actually does (entry 20). Every start is contiguous
+    /// with the previous end in the producer's own values, so every segment
+    /// belongs in the map. Before 2026-08-31 the gate compared the *snapped*
+    /// start against the *raw* end and skipped all but the first.
+    #[test]
+    fn a_grid_that_differs_from_the_duration_still_ingests_every_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run_0");
+        fs::create_dir_all(&run).unwrap();
+        let mut index = String::from(
+            "#EXTM3U
+",
+        );
+        for n in 0..6u32 {
+            let name = format!("seg{n:03}.m4s");
+            fs::write(run.join(&name), fake_sidx_seg(n * 2002)).unwrap();
+            index.push_str(&format!(
+                "#EXTINF:2.002000,
+{name}
+"
+            ));
+        }
+        index.push_str(
+            "#EXT-X-ENDLIST
+",
+        );
+
+        let mut map = SegmentMap::default();
+        let n = ingest_run_index(
+            &mut map,
+            dir.path(),
+            0,
+            &index,
+            0,
+            Some(KeySnap::Cadence(2000)),
+        )
+        .unwrap();
+        assert_eq!(n, 6, "every segment ingests; the grid is not the duration");
+        // Stored on the listing's grid, which is what the playlist names.
+        for k in 0..6u64 {
+            assert!(
+                map.get(k * 2000).is_some(),
+                "segment {k} must be stored at its listed key {}",
+                k * 2000
+            );
+        }
+    }
+
+    /// **And a genuinely discontiguous run still skips.** Whatever the gate
+    /// protects against has to survive moving it back into one coordinate
+    /// system: segment 3's content does not follow segment 2's, so it must not
+    /// be mapped to a time it does not have (ADR-0020 §9).
+    #[test]
+    fn a_discontiguous_producer_run_is_still_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run_0");
+        fs::create_dir_all(&run).unwrap();
+        // 0, 2000, 4000, then a 500 ms hole, then contiguous again.
+        let starts = [0u32, 2000, 4000, 6500, 8500];
+        let mut index = String::from(
+            "#EXTM3U
+",
+        );
+        for (n, start) in starts.iter().enumerate() {
+            let name = format!("seg{n:03}.m4s");
+            fs::write(run.join(&name), fake_sidx_seg(*start)).unwrap();
+            index.push_str(&format!(
+                "#EXTINF:2.000000,
+{name}
+"
+            ));
+        }
+        index.push_str(
+            "#EXT-X-ENDLIST
+",
+        );
+
+        let mut map = SegmentMap::default();
+        let n = ingest_run_index(&mut map, dir.path(), 0, &index, 0, None).unwrap();
+        assert_eq!(n, 3, "everything up to the hole keeps");
+        assert!(
+            map.get(6500).is_none(),
+            "content that does not follow is not mapped"
+        );
+        // **And the run does not recover.** A skip does not advance the
+        // expected end, so every later segment is compared against the last
+        // *accepted* one and fails by a further segment length. That is
+        // unchanged by moving the gate, and it is what turned entry 21's 1,322
+        // coordinate triggers into 41,062 skips. **Left alone deliberately**:
+        // whether a genuine hole should drop the rest of a run is its own
+        // question, and this change is about which coordinate system the gate
+        // asks in, not about what it does once it refuses.
+        assert!(map.get(8500).is_none(), "the cascade is existing behaviour");
+    }
+
+    /// **The `(a, a)` control.** A run whose spacing and duration agree ingests
+    /// exactly as it did before the gate moved: same keys, same count.
+    #[test]
+    fn a_grid_that_matches_the_duration_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run_0");
+        fs::create_dir_all(&run).unwrap();
+        let mut index = String::from(
+            "#EXTM3U
+",
+        );
+        for n in 0..5u32 {
+            let name = format!("seg{n:03}.m4s");
+            fs::write(run.join(&name), fake_sidx_seg(n * 2000)).unwrap();
+            index.push_str(&format!(
+                "#EXTINF:2.000000,
+{name}
+"
+            ));
+        }
+        index.push_str(
+            "#EXT-X-ENDLIST
+",
+        );
+
+        let mut map = SegmentMap::default();
+        let n = ingest_run_index(
+            &mut map,
+            dir.path(),
+            0,
+            &index,
+            0,
+            Some(KeySnap::Cadence(2000)),
+        )
+        .unwrap();
+        assert_eq!(n, 5);
+        for k in 0..5u64 {
+            assert_eq!(map.get(k * 2000).unwrap().duration_ms, 2000);
+        }
     }
 
     #[test]
