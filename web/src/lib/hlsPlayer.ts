@@ -370,9 +370,14 @@ export function attachHls(
 	};
 
 	/**
-	 * Far scrub (ADR-0020): session seek API → fresh playlist URI → source
-	 * swap. Clients must not construct segment URLs. Track selections are
-	 * re-applied after the swap. New run media time starts at 0.
+	 * Far scrub (ADR-0020): session seek API → playlist URI → source swap.
+	 * Clients must not construct segment URLs. Track selections are re-applied
+	 * after the swap. New run media time starts at 0.
+	 *
+	 * **The URI is the session's, not the run's (ADR-0054 decision 5), so it is
+	 * the same string on every seek and the swap cannot rely on it changing.**
+	 * `EXT-X-MAP` names the current run's init and does change, which is the
+	 * whole reason a reload has to happen here.
 	 */
 	const swapToPlaylist = (
 		url: string,
@@ -396,6 +401,22 @@ export function attachHls(
 			armSeekSuppress();
 			landRetargetSeconds = 0;
 			video.src = url;
+			// Assigning `src` is specified to invoke the media element load
+			// algorithm whether or not the value changed, and both engines fire
+			// the attribute hooks without comparing. That is a reading of the
+			// spec; this repository has never measured a same-string assignment
+			// on iOS, and it is the only client behaviour ADR-0054 decision 5
+			// rests on that nobody has measured. `load()` invokes the algorithm
+			// by definition, so the question does not arise.
+			//
+			// It also carries the decision's one unmeasured server assumption.
+			// `session.piggyback` clears after the extract publishes, so a later
+			// run asks FFmpeg for one fewer output than run 0 did. The muxer
+			// writes that to a separate WebVTT rendition and `init.mp4` should be
+			// untouched, but nothing has varied it deliberately. A client that
+			// re-attaches fetches the init matching the run it is about to play,
+			// which is what makes the assumption not load-bearing.
+			video.load();
 			void video.play().catch(() => {});
 		}
 		wantedSubtitle = wanted;
@@ -446,8 +467,17 @@ export function attachHls(
 		landEnsureAbort = parent;
 		landEnsureSegIdx = startMs;
 		landRetargetSeconds = null;
-		// Stop the live run's reload timer before teardown so hls.js does not
-		// keep GETting runs/{old}/index.m3u8 into 404 (measured: exact URL).
+		// Stop loading before teardown. This used to be load-bearing against a
+		// specific bug: the playlist URI was per-run, a superseded run's URI
+		// 404ed, and hls.js kept GETting runs/{old}/index.m3u8 into that 404
+		// (measured: exact URL) until the fatal handler below read it as a dead
+		// session. **Neither half of that is reachable now** — the URI is the
+		// session's, so there is no stale URI to GET, and the run check that
+		// produced the 404 is gone with it (ADR-0054 decision 5).
+		//
+		// Kept because stopping a load before tearing it down is still right,
+		// and because a defence removed the day its stated reason expires is a
+		// defence nobody can reinstate later without rediscovering why.
 		if (hls) {
 			try {
 				hls.stopLoad();
