@@ -7080,6 +7080,108 @@ mod tests {
         }
     }
 
+    /// Counts `trak` boxes in an fMP4 init: one per track in `moov`.
+    ///
+    /// `traf` lives in `moof` and never in an init, so a byte scan is honest
+    /// here without a box parser.
+    fn init_track_count(init: &[u8]) -> usize {
+        init.windows(4).filter(|w| *w == b"trak").count()
+    }
+
+    /// **ADR-0054 decision 5's one unmeasured assumption, pinned.**
+    ///
+    /// `session.piggyback` clears once the extract publishes, so a run spawned
+    /// after that asks FFmpeg for one fewer output than run 0 did: the
+    /// `-map 0:s? -c:s webvtt` pair is gone. Decision 5 rests on that not
+    /// reaching `init.mp4`. If it did, a client holding the first init it saw
+    /// would be holding one that describes a different track set.
+    ///
+    /// The HLS muxer is documented to write WebVTT to its own rendition, so the
+    /// fMP4 init should carry video and audio either way, and the two-byte
+    /// `libx264` diff in `init-identity-across-runs-2026-08-31.md` shows two
+    /// tracks and no third. **Nothing varied it deliberately until this test.**
+    ///
+    /// **Two sessions on one source at one land, alike but for the piggyback
+    /// request. Deliberately not a seek.** Once a run reaches EOF the whole
+    /// title is mapped, so every in-range seek is a map hit that copies an init
+    /// rather than spawning one, and a seek past the map produces no media to
+    /// have an init for. The publish that clears `piggyback` needs that EOF, so
+    /// the two cannot be staged in one session. What actually differs between
+    /// the runs is the FFmpeg invocation, and this compares exactly that.
+    #[test]
+    fn piggyback_does_not_change_the_init_track_layout() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if !corpus.exists() {
+            eprintln!("skipping: missing {}", corpus.display());
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        let track_id = streams[0].track_id();
+
+        for mode in [SessionMode::Copy, SessionMode::Transcode] {
+            let mut inits: Vec<Vec<u8>> = Vec::new();
+            for piggyback in [
+                Some(PiggybackExtract {
+                    track_id: track_id.clone(),
+                }),
+                None,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = item_db(dir.path(), "eligible");
+                let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+                let reg = HlsSessionRegistry::with_cap(
+                    dir.path().join("hls"),
+                    2,
+                    "libx264",
+                    Some(subs),
+                    Some(db),
+                )
+                .unwrap();
+                let id = reg
+                    .start(
+                        1,
+                        &corpus,
+                        0,
+                        4000,
+                        mode,
+                        stereo(),
+                        vec![],
+                        None,
+                        None,
+                        VideoEncodePlan::default(),
+                        piggyback,
+                    )
+                    .unwrap();
+                wait_playlist(&reg, &id);
+                inits.push(reg.run_asset(&id, 0, "init.mp4").expect("init.mp4 bytes"));
+                reg.stop(&id);
+            }
+
+            let (with_subs, without) = (&inits[0], &inits[1]);
+            assert!(
+                init_track_count(with_subs) > 0,
+                "{mode:?}: init must declare at least one track"
+            );
+            assert_eq!(
+                init_track_count(with_subs),
+                init_track_count(without),
+                "{mode:?}: the piggyback subtitle output must not add a track to init.mp4 \
+                 ({} bytes with, {} without)",
+                with_subs.len(),
+                without.len()
+            );
+            assert_eq!(
+                with_subs, without,
+                "{mode:?}: init.mp4 must not depend on the piggyback request at all"
+            );
+        }
+    }
+
     /// ADR-0041 Decision 7 acceptance: a session killed mid-piggyback leaves
     /// the item `eligible`, never `ready`, and does not delete a
     /// previously-good track file for the item (Decision 8.5's invariant).
