@@ -2,7 +2,8 @@
 
 - Status: **proposed** (decisions 1 and 2 corrected 2026-08-31 by measurement;
   decision 3 now names what it overturns; **decision 4 overturned 2026-08-31**,
-  which bounds decision 5; see each in place)
+  which bounds decision 5; **decision 5 settled and shipped 2026-08-31** within
+  that bound; see each in place)
 - Date: 2026-08-23
 - Supersedes: [ADR-0020](0020-copy-mode-segment-boundaries.md) §4's per-run
   window listing, **in every mode** — corrected 2026-08-31; it read
@@ -218,6 +219,70 @@ and its own map. The 2 s grid holds on all three rungs.
    > the one the probe answered, and nothing in this repository has measured a
    > player against it.
 
+   > **Settled 2026-08-31, and shipped. The sentence above is answered rather
+   > than corrected.** It is the same question the cross-run measurements
+   > answered, and what makes it the same is a fact about both clients rather
+   > than a new trial.
+   >
+   > **Neither client re-reads a `VOD` playlist in place.** hls.js sets
+   > `live = false` on `ENDLIST` and gates every reload on it, so a media
+   > playlist with `details` is fetched once and the only thing that fetches it
+   > again is `loadSource`. Safari agrees on the device: the iPhone loaded one
+   > `index.m3u8` and three `runs/0/init.mp4` across **four** spawned runs.
+   >
+   > **So a client meets a changed map in one of two states, and both were
+   > already measured.** Either it keeps the first map while other runs'
+   > segments arrive, which is exactly the configuration measured on macOS
+   > Safari, Chrome/MSE and the iPhone; or it re-attaches, which tears the
+   > pipeline down and reads the playlist and the map together, as a cold
+   > attach does. **The middle case, a client swapping init in place under a
+   > held buffer, needs a reload neither client performs.**
+   >
+   > **What was genuinely new was smaller, and it was closed in code rather
+   > than on a device.** `loadSource` re-fetches with no equality guard, so the
+   > hls.js path never depended on the URI changing. The native path assigned
+   > `video.src` and relied on the specified behaviour that assigning `src`
+   > re-runs the load algorithm even when the value is unchanged. That is true
+   > and untested here, so `swapToPlaylist` now calls `video.load()`, which
+   > invokes the algorithm by definition. **The question is unreachable instead
+   > of measured**, which is the better trade on a path whose alternative was a
+   > device trip for behaviour nobody doubts.
+   >
+   > **The stale-URI 404 went with the run, and it was forced rather than
+   > chosen.** `with_ready_session` refused a URI whose run was not current.
+   > Once the run leaves the path there is nothing to compare, so the only
+   > choice was whether to record the removal. Nothing consumed it: both client
+   > backends read a playlist 404 as a dead session and stop loading for good,
+   > so the refusal produced a false "session gone" rather than a signal, and
+   > the client had to stop its loader before teardown to stay clear of it.
+   >
+   > **The one thing this rested on is now measured too.**
+   > `session.piggyback` clears after the extract publishes, so a later run asks
+   > FFmpeg for one fewer output than run 0 did. That was carried as an
+   > assumption when the slice was planned, on the muxer's documented behaviour
+   > and on the two-track `libx264` diff in the identity note.
+   >
+   > Measured on `h264_aac_srt_mkv.mkv`, two sessions at one land differing only
+   > in the piggyback request: `init.mp4` is **byte-identical**, two `trak`
+   > boxes either way, on copy (1335 bytes) and transcode (1374 bytes) alike.
+   > The subtitle side-output does not reach the init.
+   > `piggyback_does_not_change_the_init_track_layout` pins it.
+   >
+   > It was never load-bearing in any case, because a re-attaching client
+   > fetches the init matching the run it is about to play, and `video.load()`
+   > is what guarantees the re-attach.
+   >
+   > **This stays transcode-only, and `run_listing` says why in place.** Where
+   > there is no honest grid the listing falls back to a per-run window with a
+   > different entry set and a different `media_origin_ms`. Under a
+   > session-scoped URI that body changes far more than the map does. Transcode
+   > never reaches the fallback; copy can, mid-session, while its keyframe map
+   > is still arriving.
+   >
+   > Measurement and method: `nightjar-meta`
+   > `notes/session-scoped-playlist-uri-2026-08-31.md`; slice
+   > `docs/plans/2026-08-31-s3b-session-scoped-playlist-uri.md`.
+
 ## Consequences
 
 A rung change becomes a variant switch inside a stable listing rather than a
@@ -226,6 +291,12 @@ new playlist handshake, which is what makes ADR-0051's ladder switchable.
 The scrubber is the playlist again. Item duration and usable extent still
 populate the product timeline, but a client seeking inside the listed range no
 longer needs a new playlist URI to do it.
+
+A far seek no longer changes `playlistUrl` at all, so a client cannot use a
+change of URI as its cue to re-attach. It re-attaches because it posted the
+seek. On the native path that means an explicit `video.load()`, since assigning
+an unchanged `src` is the one step whose behaviour rests on the specification
+rather than on a measurement of this product.
 
 The segment map stays the serving authority. A listed URI is served only from
 bytes the map has validated against `sidx.earliest_presentation_time`
