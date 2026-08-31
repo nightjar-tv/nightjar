@@ -675,18 +675,28 @@ fn seek_blocking(
     }
 }
 
+/// The session's master playlist (ADR-0054 decision 5).
+///
+/// One URI for the life of the session. A far seek mints a new run and the
+/// client re-attaches to this same URI, where it re-reads the media playlist and
+/// the `EXT-X-MAP` that names the new run's init.
 pub async fn master(
     State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, u64)>,
+    Path(session_id): Path<String>,
 ) -> ApiResult<Response> {
-    wait_playlist(state, session_id, run_id, PlaylistKind::Master).await
+    wait_playlist(state, session_id, PlaylistKind::Master).await
 }
 
+/// The session's media playlist (ADR-0054 decision 5).
+///
+/// `EXT-X-MAP` inside it is per run, because the init carries the land in its
+/// `elst` empty edit (decision 4, overturned 2026-08-31). That is the one thing
+/// in this response that changes between two fetches of the same URI.
 pub async fn playlist(
     State(state): State<AppState>,
-    Path((session_id, run_id)): Path<(String, u64)>,
+    Path(session_id): Path<String>,
 ) -> ApiResult<Response> {
-    wait_playlist(state, session_id, run_id, PlaylistKind::Media).await
+    wait_playlist(state, session_id, PlaylistKind::Media).await
 }
 
 pub async fn run_init(
@@ -780,7 +790,6 @@ pub async fn subtitle_playlist(
 async fn wait_playlist(
     state: AppState,
     session_id: String,
-    run_id: u64,
     kind: PlaylistKind,
 ) -> ApiResult<Response> {
     let hls = Arc::clone(&state.hls);
@@ -794,8 +803,8 @@ async fn wait_playlist(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let outcome = match kind {
-                PlaylistKind::Master => hls.master(&sid, run_id),
-                PlaylistKind::Media => hls.playlist(&sid, run_id),
+                PlaylistKind::Master => hls.master(&sid),
+                PlaylistKind::Media => hls.playlist(&sid),
             };
             match outcome {
                 Err(PlaylistError::NotReady) if std::time::Instant::now() < deadline => {

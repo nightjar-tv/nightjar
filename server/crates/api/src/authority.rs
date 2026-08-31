@@ -120,8 +120,8 @@ pub const COOKIE_ACCEPTED_ROUTES: [&str; 9] = [
     "/api/v0/artwork/{item_key}/{kind}",
     "/api/v0/items/{item_id}/stream",
     "/api/v0/items/{item_id}/subtitles/{asset}",
-    "/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8",
-    "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
+    "/api/v0/sessions/{session_id}/master.m3u8",
+    "/api/v0/sessions/{session_id}/index.m3u8",
     "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
     "/api/v0/sessions/{session_id}/subs/{*asset}",
     "/api/v0/sessions/{session_id}/init.mp4",
@@ -385,8 +385,8 @@ mod tests {
             "/api/v0/artwork/{item_key}/{kind}",
             "/api/v0/items/{item_id}/stream",
             "/api/v0/items/{item_id}/subtitles/{asset}",
-            "/api/v0/sessions/{session_id}/runs/{run_id}/master.m3u8",
-            "/api/v0/sessions/{session_id}/runs/{run_id}/index.m3u8",
+            "/api/v0/sessions/{session_id}/master.m3u8",
+            "/api/v0/sessions/{session_id}/index.m3u8",
             "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
             "/api/v0/sessions/{session_id}/subs/{*asset}",
             "/api/v0/sessions/{session_id}/init.mp4",
@@ -585,7 +585,7 @@ mod routing_tests {
             call(
                 router(state.clone()),
                 "GET",
-                "/api/v0/sessions/s1/runs/0/index.m3u8",
+                "/api/v0/sessions/s1/index.m3u8",
                 cookie()
             )
             .await,

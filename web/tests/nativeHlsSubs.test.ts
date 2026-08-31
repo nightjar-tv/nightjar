@@ -15,7 +15,7 @@ describe('parseSubtitleTrackIdsFromMaster', () => {
 		const master = `#EXTM3U
 #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="/api/v0/sessions/s1/subs/e2.m3u8"
 #EXT-X-STREAM-INF:BANDWIDTH=5000000,SUBTITLES="subs"
-/api/v0/sessions/s1/runs/0/index.m3u8
+/api/v0/sessions/s1/index.m3u8
 `;
 		assert.deepEqual(parseSubtitleTrackIdsFromMaster(master), ['e2']);
 	});

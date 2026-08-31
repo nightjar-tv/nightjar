@@ -226,10 +226,17 @@ profile holds viewing identity and never holds authority.**
    list is `GET /api/v0/artwork/{itemKey}/{kind}`,
    `GET /api/v0/items/{itemId}/stream`,
    `GET /api/v0/items/{itemId}/subtitles/{trackId}.vtt`, and under
-   `/api/v0/sessions/{sessionId}/`: `runs/{runId}/master.m3u8`,
-   `runs/{runId}/index.m3u8`, `runs/{runId}/init.mp4`, `subs/{asset}`,
-   `init.mp4`, and `{asset}`. Nothing else, and adding a route to that list is a
-   decision, not a consequence of where a path happens to sit.
+   `/api/v0/sessions/{sessionId}/`: `master.m3u8`, `index.m3u8`,
+   `runs/{runId}/init.mp4`, `subs/{asset}`, `init.mp4`, and `{asset}`. Nothing
+   else, and adding a route to that list is a decision, not a consequence of
+   where a path happens to sit.
+
+   > **The two playlist entries read `runs/{runId}/master.m3u8` and
+   > `runs/{runId}/index.m3u8` until 2026-08-31.** ADR-0054 decision 5 made both
+   > session-scoped; the init stayed run-scoped because it carries the land. The
+   > set is the same size and this decision is unchanged. Recorded because the
+   > list is the control, so a reader has to be able to tell a rewrite from a
+   > widening.
 
    Prefix matching is how this control fails. `/api/v0/items/` as a prefix
    admits the whole item surface including the metadata fix endpoints B2-2 is

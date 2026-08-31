@@ -587,11 +587,11 @@ paths:
       summary: Start an HLS playback session for an item
       description: >
         ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl
-        (per-run master under /runs/{runId}/master.m3u8). Remux items get a
-        stream-copy session, transcode items a re-encoding one; the shape is
-        identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=,
-        which returns a fresh playlistUrl. Concurrent sessions are capped via
-        NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+        (the session master, /sessions/{sessionId}/master.m3u8). Remux items get
+        a stream-copy session, transcode items a re-encoding one; the shape is
+        identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=, which
+        returns the same playlistUrl (ADR-0054 decision 5). Concurrent sessions
+        are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: startMs
@@ -658,18 +658,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /api/v0/sessions/{sessionId}/runs/{runId}/master.m3u8:
+  /api/v0/sessions/{sessionId}/master.m3u8:
     get:
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionMasterPlaylist
-      summary: HLS master playlist for a producer run
+      summary: HLS master playlist for a session
       description: >
-        ADR-0020. Declares the single video rendition (index.m3u8) and optional
-        SUBTITLES group. playlistUrl from session start / seek points here.
-        Far seek is POST /seek, not a startMs query on this URI.
+        ADR-0020, ADR-0054 decision 5. Declares the single video rendition
+        (index.m3u8) and optional SUBTITLES group. playlistUrl from session
+        start and seek both point here, and it is the same URI for the life of
+        the session. Far seek is POST /seek, not a startMs query on this URI.
+        After a seek the client re-attaches to this URI; the run it is playing
+        appears only in the media playlist's EXT-X-MAP.
       parameters:
         - $ref: "#/components/parameters/SessionId"
-        - $ref: "#/components/parameters/RunId"
       responses:
         "200":
           description: HLS master playlist
@@ -678,7 +680,7 @@ paths:
               schema:
                 type: string
         "404":
-          description: Session or run not found
+          description: Session not found
           content:
             application/json:
               schema:
@@ -690,19 +692,25 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /api/v0/sessions/{sessionId}/runs/{runId}/index.m3u8:
+  /api/v0/sessions/{sessionId}/index.m3u8:
     get:
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSessionPlaylist
-      summary: HLS media playlist for a producer run
+      summary: HLS media playlist for a session
       description: >
-        Assembled from the session-global time-keyed segment map (ADR-0020).
-        Segment URIs are session-root relative (`../../seg_<ms>.m4s` from
-        `/runs/{runId}/index.m3u8`). EVENT while
-        cooking; ENDLIST at that run's EOF. EXT-X-START is window-relative.
+        Assembled from the session-global time-keyed segment map (ADR-0020),
+        listing the whole title on the grid the encode leg will produce
+        (ADR-0054 decisions 1 and 2). Segment URIs are path-absolute under
+        /api/v0/sessions/{sessionId}/. PLAYLIST-TYPE is VOD with ENDLIST in
+        every mode; EXT-X-START carries the land, title-absolute.
+
+        EXT-X-MAP names the current run's init and is the one field that
+        changes between two fetches of this URI: the init carries the land in
+        its elst empty edit, so runs at different lands cannot share one
+        (ADR-0054 decision 4, overturned 2026-08-31). Clients read it on
+        attach, alongside the playlist that names it.
       parameters:
         - $ref: "#/components/parameters/SessionId"
-        - $ref: "#/components/parameters/RunId"
       responses:
         "200":
           description: HLS media playlist
@@ -711,7 +719,7 @@ paths:
               schema:
                 type: string
         "404":
-          description: Session or run not found
+          description: Session not found
           content:
             application/json:
               schema:
@@ -807,7 +815,8 @@ paths:
         is the shape a client holding an older URI asks for. It is a path of
         its own rather than one value of the asset capture below because that
         capture is cookie-accepted and the router cannot otherwise say which
-        names it covers (issue #96).
+        names it covers (issue #96). Unlike the playlists, the init stayed
+        run-scoped under ADR-0054 decision 5: it carries the land.
       parameters:
         - $ref: "#/components/parameters/SessionId"
       responses:
@@ -894,12 +903,16 @@ paths:
   /api/v0/sessions/{sessionId}/seek:
     post:
       operationId: seekTranscodeSession
-      summary: Far scrub — new producer run and playlist URI
+      summary: Far scrub — new producer run behind one playlist URI
       description: >
-        ADR-0020. Applies startMs, starts a new run when needed, and returns
-        the fresh playlistUrl. Clients must swap the player source to that URI
-        (hls.js loadSource / Safari native re-attach). Track selections do not
-        survive the swap; re-apply after attach.
+        ADR-0020. Applies startMs and starts a new run when needed. playlistUrl
+        is unchanged, because it is the session's (ADR-0054 decision 5).
+
+        Clients must still re-attach the player source to it (hls.js
+        loadSource / Safari native, which needs an explicit load() since the
+        string does not change). The re-attach is what picks up the new run's
+        EXT-X-MAP; without it the client keeps the init it first saw. Track
+        selections do not survive the swap; re-apply after attach.
       parameters:
         - $ref: "#/components/parameters/SessionId"
         - name: startMs
@@ -1648,9 +1661,9 @@ components:
         playlistUrl:
           type: string
           description: >
-            Path to the current run's HLS master playlist
-            (/sessions/{id}/runs/{runId}/master.m3u8). Fresh URI per far seek
-            (ADR-0020).
+            Path to the session's HLS master playlist
+            (/sessions/{id}/master.m3u8). One URI for the life of the session,
+            unchanged by a far seek (ADR-0020, ADR-0054 decision 5).
         videoEncoder:
           type: string
           description: >
