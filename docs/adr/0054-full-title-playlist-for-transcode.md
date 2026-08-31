@@ -3,7 +3,8 @@
 - Status: **proposed** (decisions 1 and 2 corrected 2026-08-31 by measurement;
   decision 3 now names what it overturns; **decision 4 overturned 2026-08-31**,
   which bounds decision 5; **decision 5 settled and shipped 2026-08-31** within
-  that bound; see each in place)
+  that bound; **decision 1's correction corrected again 2026-08-31** — the
+  cadence is per encode leg; see each in place)
 - Date: 2026-08-23
 - Supersedes: [ADR-0020](0020-copy-mode-segment-boundaries.md) §4's per-run
   window listing, **in every mode** — corrected 2026-08-31; it read
@@ -87,6 +88,52 @@ and its own map. The 2 s grid holds on all three rungs.
    > rate, or a cadence that is not whole milliseconds — and the session then
    > keeps a per-run listing rather than naming a grid it cannot justify.
    > Shipped in #182.
+
+   > **Corrected again 2026-08-31, and the correction above is what is being
+   > corrected.** Two of its sentences are wrong.
+   >
+   > **"So this applies to every leg, not only the ones that ignore the
+   > flag."** It does not. A leg that honours `-force_key_frames` is given
+   > `expr:gte(t,n_forced*2.0)` and its key is **the first frame at or after
+   > `n × SEGMENT_MS`**, so its grid is `SEGMENT_MS` whatever the source
+   > rate. Measured through this crate's start path on **`libx264` and
+   > `h264_videotoolbox`**, byte-identical starts on both, matching
+   > `ceil(n · 2.0 · fps) / fps` to three decimals out to segment 200:
+   >
+   > | segment | produced | against `n × 2002` |
+   > |---|---:|---:|
+   > | 10 | 20020.000 | −0.000 |
+   > | 50 | 100016.584 | −83.4 |
+   > | 150 | 300008.044 | −292.0 |
+   > | 200 | 400024.628 | −375.4 |
+   >
+   > **The evidence for the wrong sentence was three points.** `keys 83, 2085,
+   > 4087` are n = 0, 1, 2, where `ceil` happens to give 48 frames each time.
+   > **By n = 50 the pattern has broken**, and it was extrapolated to every n.
+   > The QSV figures are not in question: that leg gets `-g <frames>` and 2002
+   > is right for it.
+   >
+   > **"Returns `None` when … a cadence that is not whole milliseconds."**
+   > That refusal listed copy's keyframe walk to transcode sessions and
+   > **129 of 1814 items in a real library could not play.** `2997/125` and
+   > `24000/1001` are the same 23.976 written differently, and only one of them
+   > worked. The cadence is now rounded, and refused only when the rounding's
+   > drift would outrun the key snap before the title ends.
+   >
+   > **The decision still stands and its arithmetic is now per leg.**
+   > `produced_segment_ms` takes the encode leg: `SEGMENT_MS` for a leg that
+   > honours the flag, the frame count for one that discards it.
+   > `grid_cadence_ms` returns three answers rather than two, so *"copy, by
+   > design"* and *"transcode, no honest grid"* stop arriving as the same
+   > `None` — the second gets a per-run listing, never copy's walk.
+   >
+   > **The frame-count arm is inferred, not measured.** Only `h264_qsv` takes
+   > it and the N150 was unreachable on 2026-08-31. It rests on the QSV figures
+   > above, which are consistent with `-g 48` at `24000/1001` and are not the
+   > same thing as having run it.
+   >
+   > Measurement and method: `nightjar-meta`
+   > `notes/OPEN-DEFECTS.md` entries 18 and 20.
 
 2. **Copy and remux keep the per-run map-assembled playlist** of ADR-0020 §4.
    Copy cuts at source keyframes and cannot hold a uniform grid: on a healthy
