@@ -34,8 +34,7 @@ const DEFAULT_MAX_SESSIONS: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
 /// Per-session on-disk budget for run dirs (ADR-0020 §12). Oldest finished
-/// (non-current) runs are evicted first when exceeded. Override with
-/// `NIGHTJAR_HLS_SESSION_CACHE_BYTES` for local experiments only.
+/// (non-current) runs are evicted first when exceeded.
 const SESSION_RUN_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// EOF this far short of probed duration → record usable extent (damaged).
 const USABLE_SHORTFALL_MS: u64 = 30_000;
@@ -129,13 +128,6 @@ fn encode_lead_segments() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(ENCODE_LEAD_SEGMENTS)
-}
-
-fn session_run_cache_budget_bytes() -> u64 {
-    std::env::var("NIGHTJAR_HLS_SESSION_CACHE_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(SESSION_RUN_CACHE_BUDGET_BYTES)
 }
 
 /// Sum of bytes under every `run_*` dir in a session cache directory.
@@ -658,6 +650,10 @@ struct Session {
     item_id: i64,
     src: PathBuf,
     dir: PathBuf,
+    /// On-disk budget for this session's run dirs (ADR-0020 §12). A field
+    /// rather than an environment read so a test names its own budget without
+    /// steering every other test in the binary (OPEN-DEFECTS entry 22).
+    run_cache_budget_bytes: u64,
     mode: SessionMode,
     audio: AudioSelection,
     /// Burn-in baked into this session's encode (ADR-0018). Seek restarts
@@ -1184,7 +1180,7 @@ fn dir_tree_bytes(path: &Path) -> u64 {
 /// - Zero-byte dirs are reaped quietly — not budget evictions.
 fn maybe_evict_finished_runs(session: &mut Session) {
     reap_empty_finished_run_dirs(session);
-    let budget = session_run_cache_budget_bytes();
+    let budget = session.run_cache_budget_bytes;
     let live = live_run_ids(session);
     loop {
         let total = session_disk_bytes(&session.dir);
@@ -1516,6 +1512,7 @@ impl HlsSessionRegistry {
                 item_id,
                 src: src.to_path_buf(),
                 dir: dir.clone(),
+                run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
                 mode,
                 audio,
                 burn_in,
@@ -4279,6 +4276,7 @@ mod tests {
             item_id: 1,
             src: PathBuf::from("/dev/null"),
             dir: dir.to_path_buf(),
+            run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
@@ -4540,9 +4538,8 @@ mod tests {
         });
 
         // A budget everything on disk exceeds, so eviction must pick a victim.
-        unsafe { std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "0") };
+        session.run_cache_budget_bytes = 0;
         maybe_evict_finished_runs(&mut session);
-        unsafe { std::env::remove_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES") };
 
         assert!(
             !dir.path().join("run_1").exists(),
@@ -6465,6 +6462,7 @@ mod tests {
             item_id: 1,
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
+            run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
             mode: SessionMode::Transcode,
             audio: stereo(),
             burn_in: None,
@@ -8757,6 +8755,7 @@ mod tests {
             item_id: 33,
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
+            run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
@@ -9003,6 +9002,7 @@ mod tests {
             item_id: 8519,
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
+            run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
@@ -9060,6 +9060,7 @@ mod tests {
             item_id: 8519,
             src: PathBuf::from("/dev/null"),
             dir: dir.to_path_buf(),
+            run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
             mode: SessionMode::Copy,
             audio: stereo(),
             burn_in: None,
@@ -9176,6 +9177,7 @@ mod tests {
             item_id: 1,
             src: PathBuf::from("/dev/null"),
             dir: session_dir.to_path_buf(),
+            run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
             mode: SessionMode::Transcode,
             audio: stereo(),
             burn_in: None,
@@ -9211,10 +9213,7 @@ mod tests {
         };
 
         // Budget between orphan (10k) and total (~60k): one eviction of orphan.
-        // SAFETY: single-threaded test; restore below.
-        unsafe {
-            std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "55000");
-        }
+        session.run_cache_budget_bytes = 55_000;
         maybe_evict_finished_runs(&mut session);
         assert!(!run1.exists(), "orphan run_1 must be evicted first");
         assert!(
@@ -9231,9 +9230,7 @@ mod tests {
         );
 
         // Force referenced eviction: budget below run_0 size.
-        unsafe {
-            std::env::set_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES", "1000");
-        }
+        session.run_cache_budget_bytes = 1_000;
         maybe_evict_finished_runs(&mut session);
         assert!(!run0.exists(), "referenced run evicted under hard pressure");
         assert!(
@@ -9245,9 +9242,6 @@ mod tests {
             !String::from_utf8_lossy(&pl).contains("seg_"),
             "playlist must not list URIs whose files are gone"
         );
-        unsafe {
-            std::env::remove_var("NIGHTJAR_HLS_SESSION_CACHE_BYTES");
-        }
     }
 
     /// Twelve seconds with a keyframe every second, so a keyframe map has
