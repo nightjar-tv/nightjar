@@ -1,5 +1,11 @@
 # The overnight loop — final report
 
+> **Re-baselined 2026-09-02 — see [`09-rebaselined.md`](09-rebaselined.md).**
+> Every corpus figure below is through `parse_filename`. Through `stored_parse`,
+> which is what the harness calls now, the branch reads **`608/734` → `617/734`
+> (82.8% → 84.1%)**. **Every per-iteration delta is identical**; the offset is
+> +10 at every point.
+
 **Base: `f527198`**, the tip of `origin/main` on 2026-09-01
 (`docs: ADR-0020 §12's cache budget is a constant, not a setting (#197)`).
 The primary checkout's local `main` ref is stale at `e3208cc`; nothing here was

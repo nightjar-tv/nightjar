@@ -1,5 +1,9 @@
 # Overnight loop — the baseline, read at `f527198`
 
+> **Read [`09-rebaselined.md`](09-rebaselined.md) first.** Every corpus figure in
+> this note is through `parse_filename`. The harness calls `stored_parse` as of
+> 2026-09-02, and the base is **`608/734` (82.8%)**, not `598/734`.
+
 **Base revision: `f527198`** — `docs: ADR-0020 §12's cache budget is a constant,
 not a setting (#197)`, the tip of `origin/main` on 2026-09-01. The local `main`
 ref in the primary checkout is stale at `e3208cc`; every number below is read at
