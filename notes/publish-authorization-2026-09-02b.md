@@ -12,11 +12,17 @@ it; this is separate because §7 authorization is per branch and never standing.
 
 | # | allowed | not allowed |
 |---|---|---|
-| 1 | push `loop/parser-board-overnight`, open one pull request | **merge** |
+| 1 | push `loop/parser-board-overnight`, open one pull request | — |
+| 2 | merge **#199**, named by the maintainer | anything else |
 
-**Merge is not authorized.** §7's 2026-08-17 amendment permits it only when named
-by pull request number, in session, and recorded before it runs. No number exists
-yet. **Rebase is outside the carve-out** and none was done — this branch is based
+**Entry 1 withheld merge**, because §7's 2026-08-17 amendment permits it only when
+named by pull request number, in session, and recorded before it runs, and no
+number existed yet. **Entry 2 is that naming**, added before the merge ran.
+
+**All four checks were green before the merge this time** — `gate1` 4m24s,
+`server` 4m30s, `web` 24s, `openapi` 11s, `mergeStateStatus: CLEAN`. #198 earlier
+today was merged on `UNSTABLE` with `web` in flight, which is recorded in
+[`loop-overnight/09-rebaselined.md`](loop-overnight/09-rebaselined.md). **Rebase is outside the carve-out** and none was done — this branch is based
 on `f527198` and `main` has moved to `24b0cea`, which is a clean base for a merge
 commit because the two touch different files.
 
