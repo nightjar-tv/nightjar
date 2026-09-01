@@ -21,7 +21,7 @@ merged. No commit was made to `main`.**
 | 4 | a run of leading groups is stripped down to the prose | **kept** `82e797a` |
 | 5 | a year does not outrank an episode marker behind it | **kept** `9196cf3` |
 | 6 | `ep` added to the spelled episode words; `Part N` refused | **kept** `89e6cd6` |
-| 7 | score the corpus through `stored_parse` — a measurement, no parser change | **kept** `f530a07` |
+| 7 | score the corpus through `stored_parse` — a measurement, no parser change | **kept** `f530a07`; its two harness files deleted 2026-09-02 once the board switched |
 
 No revert was needed, and the two consecutive-revert stop condition was never
 approached. Iteration 5 **did** produce a regression, caught by

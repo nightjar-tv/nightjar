@@ -25,16 +25,34 @@ as a table and calls it "one layer decides".
 So the residual has never been split into what the parser owes and what the
 harness invented.
 
-## What was added
+## What was added, and then removed
 
 `notes/loop-overnight/scripts/corpus_run_stored.rs` and
 `corpus_results_stored.sh` — **`corpus_run.rs`'s scoring, unchanged, against
 `stored_parse`**. The same cases, the same checks, the same soft-key title
-comparison. Only the call differs.
+comparison. Only the call differed.
 
-**`corpus_run.rs` is untouched, and every number reported tonight still comes
-from it.** This is a second measurement placed beside it, not a replacement. A
+**`corpus_run.rs` was untouched, and every number reported that night came from
+it.** This was a second measurement placed beside it, not a replacement. A
 harness that scores better is not a parser that parses better.
+
+> ### Both files are deleted — 2026-09-02
+>
+> The measurement below was taken to the board, and the board switched:
+> `corpus_run.rs` now calls `stored_parse` and `corpus_run_merge.rs` is deleted
+> beside it (`nightjar-spikes` `08fa226`). **These two files became a third copy
+> of a harness that already exists**, sitting on an unmerged branch until
+> someone ran it and got a different number.
+>
+> **That is exactly how the `590/734` and `600/734` pair survived** — both
+> binaries were kept, one of them called a projection, and the two were quoted
+> interchangeably for weeks. *A second number must never be produced without
+> deleting the first*, and "it is only on a branch" is not an exemption; it is
+> the hiding place.
+>
+> The measurement stands and is reproduced by the shipped harness. Everything
+> below is kept as the record of how the decision was reached, and the numbers
+> in it are read at the loop tip `f530a07` rather than at `main`.
 
 ## The result
 
