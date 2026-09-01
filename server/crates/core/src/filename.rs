@@ -222,21 +222,60 @@ fn cut_stem_at(stem: &str, i: usize) -> String {
 /// `[REC] (2007)` keeps everything. Without that guard the rule destroys a
 /// title to clean one, which is the trade the orthography measurement rejected.
 fn strip_leading_group(stem: &str) -> &str {
-    let t = stem.trim_start();
-    if !t.starts_with('[') {
-        return stem;
-    }
-    let Some(close) = t.find(']') else {
+    let Some(first) = strip_one_leading_group(stem) else {
         return stem;
     };
+    // **A second group is decoration; a run of them is the name.** Fansub
+    // releases stack tags — `[Jumonji-Giri]_[F-B]_Series_Title_Ep04_` carries
+    // two and the title is behind both. But a name that is *nothing but*
+    // groups has its title chosen from them by [`bracket_run_title`], and
+    // stripping until one is left destroys the stem every other rule reads:
+    // `[GRP][12 Angry Men][07][1080p][AVC][GB]` becomes `[GB]`, which is 4,664
+    // of the sweep's 74,624 generated names.
+    //
+    // **So the repeat asks for prose.** It continues only while a letter
+    // survives outside every bracket — the thing a run of groups does not
+    // have. Measured over all three instruments: 3 corpus names change,
+    // **0 of the 25,043 library basenames, 0 of the 74,624 generated names**.
+    let mut cur = first;
+    while let Some(rest) = strip_one_leading_group(cur)
+        && has_letter_outside_brackets(rest)
+    {
+        cur = rest;
+    }
+    cur
+}
+
+/// One leading `[group]`, or `None` when there is none or stripping it would
+/// leave nothing with a letter in it.
+fn strip_one_leading_group(stem: &str) -> Option<&str> {
+    let t = stem.trim_start();
+    if !t.starts_with('[') {
+        return None;
+    }
+    let close = t.find(']')?;
     let rest = t[close + 1..]
         .trim_start_matches([' ', '_', '.', '-'])
         .trim();
-    if rest.chars().any(|c| c.is_alphabetic()) {
-        rest
-    } else {
-        stem
+    rest.chars().any(|c| c.is_alphabetic()).then_some(rest)
+}
+
+/// A letter that sits outside every bracket group.
+///
+/// **Characters, not bytes, and no slicing.** `【` is three bytes and this walks
+/// CJK names; an offset-derived slice of a `str` has panicked on exactly that
+/// three times on this project.
+fn has_letter_outside_brackets(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '[' | '(' | '\u{3010}' => depth += 1,
+            ']' | ')' | '\u{3011}' => depth = (depth - 1).max(0),
+            c if depth == 0 && c.is_alphabetic() => return true,
+            _ => {}
+        }
     }
+    false
 }
 
 /// Cut a title at a separated absolute-episode number — `Show - 12 [Group]`.
@@ -3711,6 +3750,49 @@ mod tests {
             parse_filename("Series 1 2 3 S01E01.mkv").title,
             "Series 1 2 3"
         );
+    }
+
+    /// **Fansub releases stack tags, and only one was ever stripped.**
+    /// `[Jumonji-Giri]_[F-B]_Series_Title_Ep04_` carries two and the title is
+    /// behind both, so the parse kept `[F-B]` in it.
+    #[test]
+    fn a_run_of_leading_groups_is_stripped_down_to_the_prose() {
+        for name in [
+            "[Jumonji-Giri]_[F-B]_Series_Title_Ep04_(0b0e2c10).mkv",
+            "[Jumonji-Giri]_[F-B]_Series_Title_Ep08_(8246e542).mkv",
+        ] {
+            assert_eq!(parse_filename(name).title, "Series Title", "{name}");
+        }
+    }
+
+    /// **A name that is nothing but groups keeps them**, because
+    /// [`bracket_run_title`] chooses its title from the run and every other
+    /// rule reads the stem. Stripping until one group is left destroys both:
+    /// `[GRP][12 Angry Men][07][1080p][AVC][GB]` becomes `[GB]`, and that shape
+    /// is 4,664 of the sweep's 74,624 generated names.
+    ///
+    /// So the repeat continues only while a letter survives **outside** every
+    /// bracket. Both lines below are red when
+    /// [`has_letter_outside_brackets`] is dropped from the loop, and each has
+    /// a head of its own:
+    ///
+    /// * the Latin run loses its **year** — the stem becomes `[1080P]`, and
+    ///   nothing in it is 2019 any more;
+    /// * the CJK run loses its **title** — it becomes the literal `[MP4]`.
+    #[test]
+    fn a_name_that_is_only_groups_keeps_them() {
+        let p = parse_filename("[GRP][Sub][Anime Title][2019][234][AVC][GB][1080P]");
+        assert_eq!(p.title, "Anime Title");
+        assert_eq!(p.year, Some(2019), "the stem still holds the year");
+
+        // A real corpus name. Its title is still wrong — it wants the fourth
+        // group, not the second — and that is a different mechanism (D5).
+        // What this asserts is that it is not reduced to a codec tag.
+        let q = parse_filename(
+            "[愛戀&漫貓字幕组][10月新番][關於我轉生後成爲史萊姆那件事][18][720P][BIG5][MP4]",
+        );
+        assert_ne!(q.title, "[MP4]");
+        assert!(!q.title.starts_with('['), "got {:?}", q.title);
     }
 
     /// **A release name parses the same with or without its container.**
