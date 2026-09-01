@@ -2071,26 +2071,50 @@ fn parse_stem(whole: &str) -> ParsedName {
             episode_absolute: absolute.is_some(),
         };
     }
-    let title = match year {
-        Some(y) => {
-            let token = format!("({y})");
-            let cut = stem
-                .find(&token)
-                .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
-            match cut {
-                // **The terminator runs here too.** Cutting at the year
-                // removes what follows it and nothing else, so junk sitting
-                // *before* the year survived — `World.Movie.Z.EXTENDED.2013`
-                // kept `EXTENDED`. Only the fallback arms ever called this.
-                Some(i) if i > 0 => cut_at_title_junk(&cut_stem_at(stem, i)),
-                _ => cut_at_title_junk(&clean_title(stem)),
-            }
-        }
-        None => cut_at_title_junk(&clean_title(stem)),
+    let marker_cut = |t: &str| {
+        episode_marker_cut(&cut_at_absolute_episode(
+            &cut_at_date(&cut_at_trailing_bracket_run(t)).0,
+        ))
     };
-    let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(
-        &cut_at_date(&cut_at_trailing_bracket_run(&title)).0,
-    ));
+    let mut year = year;
+    let mut cut = marker_cut(&title_before_year(stem, year));
+    // **The year cut must not throw away an episode claim the name carries.**
+    //
+    // Cutting at the year removes everything behind it, and in
+    // `Series Show.2016.E04.Power…` the marker is behind it. The title came out
+    // as `Series Show`, the episode as `None`, and the file was filed as a 2016
+    // film — while the name says episode 4 as plainly as a name can.
+    //
+    // **So the claim decides, and it is asked twice.** When the year cut leaves
+    // no claim and the uncut stem does carry one, the run in front of the
+    // marker is the series' name rather than a release year: `Series Title 2018`
+    // is a show called that. `year` goes with it, which is what the episode arm
+    // does for every name it owns — a name that marks an episode is not a film
+    // and has no film year.
+    //
+    // **Asked twice, not reordered.** A name whose claim survives the year cut
+    // keeps both, so `Show Ep06 2018` is untouched.
+    //
+    // **And the marker must not claim the year itself.** The year cut was
+    // holding a real line here: in `The.Movie.from.U.N.C.L.E.2015.1080p…` the
+    // standalone `E` of `U.N.C.L.E.` is a marker at a separator, and the digits
+    // behind it are `2015`. Uncut, that reads as episode 2015 with the title
+    // `The Movie from U N C L` — a film turned into an episode, on a name that
+    // passed before. `--diff` reported it and the verdict count did not: the
+    // corpus went 604 to 605 while this case went from pass to fail.
+    //
+    // So a retry that claims the very number the year branch found is refused.
+    // It is not a second claim; it is the same four digits read twice.
+    if cut.1.is_none()
+        && year.is_some()
+        && let retry = marker_cut(&title_before_year(stem, None))
+        && retry.1.is_some()
+        && retry.1 != year
+    {
+        year = None;
+        cut = retry;
+    }
+    let (marked, absolute) = cut;
     let title = run_title.unwrap_or_else(|| cut_at_unmatched_close(&marked));
 
     ParsedName {
@@ -2105,6 +2129,27 @@ fn parse_stem(whole: &str) -> ParsedName {
         episode: absolute,
         episode_end: None,
         episode_absolute: absolute.is_some(),
+    }
+}
+
+/// The title a name has once it is cut at its year, or the whole stem cleaned
+/// when it states none.
+///
+/// **The terminator runs here too.** Cutting at the year removes what follows it
+/// and nothing else, so junk sitting *before* the year survived —
+/// `World.Movie.Z.EXTENDED.2013` kept `EXTENDED`. Only the fallback arms ever
+/// called this.
+fn title_before_year(stem: &str, year: Option<i32>) -> String {
+    let Some(y) = year else {
+        return cut_at_title_junk(&clean_title(stem));
+    };
+    let token = format!("({y})");
+    let cut = stem
+        .find(&token)
+        .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
+    match cut {
+        Some(i) if i > 0 => cut_at_title_junk(&cut_stem_at(stem, i)),
+        _ => cut_at_title_junk(&clean_title(stem)),
     }
 }
 
@@ -3752,6 +3797,70 @@ mod tests {
         );
     }
 
+    /// **The year cut used to throw away an episode claim the name carries.**
+    ///
+    /// `Series Show.2016.E04.Power…` cut at `2016`, which removed everything
+    /// behind it — including `E04`. The title came out as `Series Show`, the
+    /// episode as `None`, and a television episode was filed as a 2016 film.
+    ///
+    /// The run in front of the marker is the series' name: `Series Title 2018`
+    /// is a show called that. `year` goes with it, the way the episode arm sets
+    /// `year: None` for every name it owns.
+    #[test]
+    fn a_year_does_not_outrank_an_episode_marker_behind_it() {
+        let p = parse_filename("Series Title 2018 EP06 720p x265 AOZ.mp4");
+        assert_eq!(p.title, "Series Title 2018");
+        assert_eq!(p.episode, Some(6));
+        assert_eq!(p.year, None);
+        assert_eq!(p.kind, MediaKind::Episode);
+
+        let q = parse_filename("Series Show.2016.E04.Power.720p.WEB-DL.DD5.1.H.264-MARS");
+        assert_eq!(q.title, "Series Show 2016");
+        assert_eq!(q.episode, Some(4));
+        assert_eq!(q.season, None, "no season is ever synthesised");
+    }
+
+    /// **The year cut was holding a line, and this is it.**
+    ///
+    /// `The.Movie.from.U.N.C.L.E.2015.1080p.BluRay.x264-SPARKS` — the standalone
+    /// `E` of `U.N.C.L.E.` is an episode marker at a separator, and the digits
+    /// behind it are the year. Uncut, the name reads as episode 2015 titled
+    /// `The Movie from U N C L`.
+    ///
+    /// It passed before this rule and `classify.py --diff` caught it going red
+    /// while the corpus verdict count **rose**, 604 to 605. Red on deleting
+    /// `retry.1 != year`.
+    #[test]
+    fn a_marker_may_not_claim_the_year_as_its_episode() {
+        let p = parse_filename("The.Movie.from.U.N.C.L.E.2015.1080p.BluRay.x264-SPARKS");
+        assert_eq!(p.title, "The Movie from U N C L E");
+        assert_eq!(p.year, Some(2015));
+        assert_eq!(p.episode, None);
+        assert_eq!(p.kind, MediaKind::Movie);
+    }
+
+    /// **The claim is asked twice, and the order is not changed.** Both lines
+    /// are red when their own guard is dropped, and each has a head of its own.
+    ///
+    /// * `Show Ep06 2018` — the claim **survives** the year cut, so nothing is
+    ///   retried and the year stands. Drop `cut.1.is_none()` and the retry runs
+    ///   anyway, taking 2018 with it.
+    /// * `Some Anime Show (2011) Episode 99-100` — the uncut stem carries a
+    ///   *span*, which claims no number, so there is nothing better to take.
+    ///   Drop `retry.1.is_some()` and it loses its year and keeps `(2011)`.
+    #[test]
+    fn the_year_is_only_given_up_for_a_claim_that_is_better() {
+        let p = parse_filename("Show Ep06 2018 1080p.mkv");
+        assert_eq!(p.title, "Show");
+        assert_eq!(p.episode, Some(6));
+        assert_eq!(p.year, Some(2018), "the claim survived the year cut");
+
+        let q = parse_filename("Some Anime Show (2011) Episode 99-100 [1080p] [Dual.Audio]");
+        assert_eq!(q.title, "Some Anime Show");
+        assert_eq!(q.year, Some(2011), "a span claims no number");
+        assert_eq!(q.episode, None);
+    }
+
     /// **Fansub releases stack tags, and only one was ever stripped.**
     /// `[Jumonji-Giri]_[F-B]_Series_Title_Ep04_` carries two and the title is
     /// behind both, so the parse kept `[F-B]` in it.
@@ -4431,14 +4540,18 @@ mod tests {
             "Ep01 (D2201EC5)"
         );
 
-        // A year inside the show title is still lost, and this rule does not
-        // reach it: the year branch cuts at `2018` long before the marker is
-        // looked at, so `Anon Show 2018 EP06` yields `Anon Show`. That is the
-        // `Wonder Woman 1984` shape on the TV side; it needs the year branch,
-        // not this one.
+        // **A year inside the show title is no longer lost.** This block used
+        // to assert `Anon Show` and say so in its own words — *"the year branch
+        // cuts at `2018` long before the marker is looked at … it needs the
+        // year branch, not this one"*. It does, and the year branch now asks
+        // the marker before it cuts. The assertion is the same shape; what it
+        // records changed from a known gap to the fix.
+        let p = parse_filename("Anon Show 2018 EP06 720p x265 GROUP.mp4");
+        assert_eq!(p.title, "Anon Show 2018");
+        assert_eq!(p.episode, Some(6));
         assert_eq!(
-            parse_filename("Anon Show 2018 EP06 720p x265 GROUP.mp4").title,
-            "Anon Show"
+            p.year, None,
+            "a name that marks an episode has no film year"
         );
     }
 
