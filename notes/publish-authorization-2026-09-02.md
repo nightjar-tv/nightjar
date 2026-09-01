@@ -12,12 +12,16 @@ covers.
 
 | # | allowed | not allowed |
 |---|---|---|
-| 1 | push `corpus/entry-point-is-stored-parse`, open one pull request | **merge** |
+| 1 | push `corpus/entry-point-is-stored-parse`, open one pull request | — |
+| 2 | merge **#198**, named by the maintainer | anything else |
 
-**Merge is not authorized.** §7's 2026-08-17 amendment permits it on the same
-terms as push — named, in-session, recorded before it runs — and no pull request
-number has been named. This authorization does not carry forward; a later session
-needs its own.
+**Entry 1 was granted first and withheld merge**, because §7's 2026-08-17
+amendment permits merge only when it is named, in-session, and recorded before it
+runs — and no pull request number existed yet. **Entry 2 is that naming**, added
+before the merge ran and pushed to the branch ahead of it.
+
+Nothing else is authorized. This does not carry forward; a later session needs its
+own.
 
 ## What the branch is
 
