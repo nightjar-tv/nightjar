@@ -2106,8 +2106,38 @@ fn strip_extension(name: &str) -> &str {
     }
 }
 
+/// **A year is not a file extension**, and the rule above could not tell them
+/// apart: four characters, all alphanumeric, describes `1998` as well as it
+/// describes `webm`.
+///
+/// So one release name parsed two ways depending on whether it carried a
+/// container at all:
+///
+/// ```text
+/// Movie.The.Final.Chapter.2016       year None
+/// Movie.The.Final.Chapter.2016.mkv   year 2016
+/// ```
+///
+/// A dotted release name without an extension is an ordinary form —
+/// `Der.Movie.German.…scene.rules.1998` is one, and the corpus wants 1998 out of
+/// it. Nothing else about the parse should turn on a suffix the name may simply
+/// not have.
+///
+/// **1900–2100, the same range every other year guard in this file uses**, and
+/// it is doing real work rather than restating the width: `.264` is a genuine
+/// extension — a raw H.264 elementary stream — and `1080` is a resolution that
+/// lost its `p`. Both stay extensions because neither is a year. A width test
+/// would be a comment: no one-, two- or three-digit number reaches 1900.
 fn is_extension(suffix: &str) -> bool {
-    (1..=4).contains(&suffix.len()) && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+    (1..=4).contains(&suffix.len())
+        && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+        && !is_year_token(suffix)
+}
+
+/// A run of digits that is a year in 1900–2100.
+fn is_year_token(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+        && s.parse::<i32>().is_ok_and(|y| (1900..=2100).contains(&y))
 }
 
 fn clean_title(s: &str) -> String {
@@ -3680,6 +3710,52 @@ mod tests {
         assert_eq!(
             parse_filename("Series 1 2 3 S01E01.mkv").title,
             "Series 1 2 3"
+        );
+    }
+
+    /// **A release name parses the same with or without its container.**
+    ///
+    /// `is_extension` read four alphanumeric characters, which describes `1998`
+    /// as well as `webm`, so `Movie.The.Final.Chapter.2016` lost its year and
+    /// `Movie.The.Final.Chapter.2016.mkv` kept it. Same name, two answers, on a
+    /// suffix that says nothing about the release.
+    #[test]
+    fn a_year_is_not_a_file_extension() {
+        for name in [
+            "Movie.The.Final.Chapter.2016",
+            "Movie.The.Final.Chapter.2016.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, "Movie The Final Chapter", "{name}");
+            assert_eq!(p.year, Some(2016), "{name}");
+        }
+        // The corpus case this was measured on: a scene name with no container.
+        let p = parse_filename(
+            "Der.Movie.German.Bluray.FuckYou.Pso.Why.cant.you.follow.scene.rules.1998",
+        );
+        assert_eq!(p.year, Some(1998));
+    }
+
+    /// **The year range is the guard, and the width would be a comment.**
+    ///
+    /// Delete `is_year_token`'s `1900..=2100` and every all-digit suffix stops
+    /// being an extension — `.264` is a real one, a raw H.264 elementary
+    /// stream, and `[DRONE]Series.Title.100` starts keeping a number the
+    /// corpus does not want. A width test cannot go red on its own: no one-,
+    /// two- or three-digit number reaches 1900.
+    ///
+    /// Each name below has a head of its own, so neither line can be masked by
+    /// the other declining.
+    #[test]
+    fn a_number_that_is_not_a_year_is_still_an_extension() {
+        assert_eq!(
+            parse_filename("[DRONE]Series.Title.100").title,
+            "Series Title"
+        );
+        assert_eq!(
+            parse_filename("Another Show.264").title,
+            "Another Show",
+            "a raw H.264 elementary stream is a real extension"
         );
     }
 
