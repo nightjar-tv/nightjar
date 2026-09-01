@@ -340,7 +340,7 @@ fn cut_at_absolute_episode(s: &str) -> String {
 /// **ASCII digits only.** `is_ascii_digit` and not a Unicode digit class: an
 /// Arabic-Indic date in an Arabic title is not this form, and a prototype of
 /// this rule written in Python cut one because `str.isdigit()` said yes.
-fn cut_at_date(s: &str) -> String {
+fn cut_at_date(s: &str) -> (String, Option<i32>) {
     let bytes = s.as_bytes();
     let mut toks: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -371,10 +371,16 @@ fn cut_at_date(s: &str) -> String {
         }
         let head = s[..a.0].trim().trim_matches([' ', '-', '_', '.']).trim();
         if head.chars().any(char::is_alphabetic) {
-            return head.to_string();
+            // **Whichever end is the year is the year.** `is_year` has already
+            // held for exactly one of the outer two tokens, so this reads the
+            // one that passed rather than guessing an order.
+            return (
+                head.to_string(),
+                Some(if is_year(a) { value(a) } else { value(c) }),
+            );
         }
     }
-    s.to_string()
+    (s.to_string(), None)
 }
 
 /// Month names, three letters or spelled out. **A closed list, and the ordinal
@@ -1864,7 +1870,8 @@ fn parse_stem(whole: &str) -> ParsedName {
             cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
                 &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
                     &cut_stem_at(stem, before),
-                ))),
+                )))
+                .0,
             )))
         });
         // `None` is the declined-number case: the token said television and
@@ -1923,9 +1930,12 @@ fn parse_stem(whole: &str) -> ParsedName {
         let before = find_bare_season(&normalized)
             .map_or(chapter_at, |(season_at, _)| season_at.min(chapter_at));
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
-                &cut_at_trailing_bracket_run(&cut_at_title_junk(&cut_stem_at(stem, before))),
-            )))
+            cut_at_unmatched_close(&cut_at_episode_marker(
+                &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
+                    &cut_stem_at(stem, before),
+                )))
+                .0,
+            ))
         });
         return ParsedName {
             title: if title.is_empty() {
@@ -1944,9 +1954,12 @@ fn parse_stem(whole: &str) -> ParsedName {
 
     if let Some((before, season)) = find_bare_season(&normalized) {
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
-                &cut_at_trailing_bracket_run(&cut_at_title_junk(&cut_stem_at(stem, before))),
-            )))
+            cut_at_unmatched_close(&cut_at_episode_marker(
+                &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
+                    &cut_stem_at(stem, before),
+                )))
+                .0,
+            ))
         });
         return ParsedName {
             title: if title.is_empty() {
@@ -1978,10 +1991,28 @@ fn parse_stem(whole: &str) -> ParsedName {
     // when the name gave no year of its own — a name that states its year
     // states it, and the date must not overrule it.
     let (dated, date_year) = match cut_at_date(stem) {
-        cut if cut != stem => (cut, None),
+        (cut, dated_year) if cut != stem => (cut, dated_year),
         _ => cut_at_written_date(stem),
     };
-    let year = year.or(date_year);
+    // **A four-digit run at the front of the name is the title's first word,
+    // not a year the name states.** `find_year` takes the first bare run in
+    // range wherever it sits, so `2020 A Late Talk Show 2012 16 02` reported
+    // 2020 — while the cut above had already decided the same run belongs to
+    // the title. One name, two reads, and they disagreed.
+    //
+    // The date is what states the year in these names, and the title cut and
+    // the year now come from the same read. This is a precedence, not a new
+    // year: nothing here finds a year the parser could not already see.
+    //
+    // **A parenthesised year is untouched**, because `find_year` prefers it and
+    // it is then not the opening run — `(1955)` in `Series Title (1955) - 1954
+    // 01 23` still wins, and that case stays wrong for a different reason.
+    let year = match (year, date_year) {
+        (Some(found), Some(dated_year)) if opening_year(&normalized) == Some(found) => {
+            Some(dated_year)
+        }
+        (found, dated_year) => found.or(dated_year),
+    };
     if dated != stem {
         let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_title_junk(
             &clean_title(&dated),
@@ -2018,9 +2049,9 @@ fn parse_stem(whole: &str) -> ParsedName {
         }
         None => cut_at_title_junk(&clean_title(stem)),
     };
-    let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_date(
-        &cut_at_trailing_bracket_run(&title),
-    )));
+    let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(
+        &cut_at_date(&cut_at_trailing_bracket_run(&title)).0,
+    ));
     let title = run_title.unwrap_or_else(|| cut_at_unmatched_close(&marked));
 
     ParsedName {
@@ -2494,6 +2525,24 @@ fn read_repeated_season(bytes: &[u8], i: usize) -> Option<(i32, usize)> {
 /// parentheses, which is the dotted release form (`Movie.Name.2019.1080p`).
 fn find_year(s: &str) -> Option<i32> {
     find_parenthesised_year(s).or_else(|| find_bare_year(s))
+}
+
+/// The four-digit year-shaped run the name **opens** with, if it opens with one.
+///
+/// A whole run: `20201013 Show` is a date written as one token, not the year
+/// 2020, so a fifth digit refuses it. Bytes throughout — the run is ASCII by
+/// construction and a length-derived slice of a `str` has panicked on CJK here
+/// three times.
+fn opening_year(s: &str) -> Option<i32> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 || !bytes[..4].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.get(4).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let y = std::str::from_utf8(&bytes[..4]).ok()?.parse::<i32>().ok()?;
+    (1900..=2100).contains(&y).then_some(y)
 }
 
 /// `(YYYY)` anywhere in the name, first one wins.
@@ -3632,6 +3681,85 @@ mod tests {
             parse_filename("Series 1 2 3 S01E01.mkv").title,
             "Series 1 2 3"
         );
+    }
+
+    /// **The title cut and the year now come from one read of the date.**
+    ///
+    /// `find_year` takes the first whole four-digit run in range wherever it
+    /// sits, so a title that *opens* with one reported it as the year:
+    /// `2020 A Late Talk Show 2012 16 02` came out as the year 2020 while the
+    /// date cut — the same rule, on the same name — had already decided that
+    /// `2020` is the title's first word. The date states the year in these
+    /// names, and it is the year the corpus wants for all three of them.
+    ///
+    /// **Nothing here finds a year the parser could not already see.** It is a
+    /// precedence between two years the name carries.
+    #[test]
+    fn a_title_that_opens_with_a_year_takes_the_date_s_year() {
+        for (name, year) in [
+            ("2020.A.Late.Talk.Show.2012.16.02.PDTV.XviD-C4TV", 2012),
+            ("2020.A.Late.Talk.Show.2012.13.02.PDTV.XviD-C4TV", 2012),
+            ("2020.A.Late.Talk.Show.2011.12.02.PDTV.XviD-C4TV", 2011),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, "2020 A Late Talk Show", "{name}");
+            assert_eq!(p.year, Some(year), "the date states the year: {name}");
+        }
+    }
+
+    /// **What that precedence must not take**, one name per guard, each with a
+    /// head of its own so a single guard failing cannot be masked by an
+    /// earlier one declining.
+    ///
+    /// Every line is red when its own guard is deleted:
+    ///
+    /// * `Blade Runner 2049` — the opening word is not the year `find_year`
+    ///   chose, so the date's year must not replace it. Drop the
+    ///   `opening_year(..) == Some(found)` test and this reads 2017.
+    /// * `Series Title (1955)` — a parenthesised year is an explicit one and
+    ///   `find_year` already prefers it. The opening word is `Series`, so the
+    ///   same test declines. This case wants 1954 and stays wrong; it is
+    ///   recorded here as a decline, not as a pass.
+    #[test]
+    fn the_opening_year_precedence_declines_where_it_should() {
+        let p = parse_filename("Blade Runner 2049 2017 06 05 BluRay.mkv");
+        assert_eq!(p.title, "Blade Runner 2049");
+        assert_eq!(p.year, Some(2049), "the opening word is not the year found");
+
+        let q = parse_filename("Series Title (1955) - 1954 01 23 05 00 00 - Cottage.ts");
+        assert_eq!(
+            q.year,
+            Some(1955),
+            "a parenthesised year is an explicit one"
+        );
+    }
+
+    /// [`opening_year`]'s own guards, each on its own line.
+    ///
+    /// **A filename cannot isolate these.** `20201013 Show 2019 06 05` reads
+    /// 2019 whether the width refusal is there or not — the run and the year
+    /// found differ either way, so the precedence declines for the other
+    /// reason and the control cannot go red. A guard tested only through a
+    /// name that another guard already refuses is not tested at all, which
+    /// this file has recorded happening before. So the helper is called
+    /// directly and every line here is red on its own deletion.
+    #[test]
+    fn an_opening_year_is_a_whole_four_digit_run_in_range() {
+        assert_eq!(opening_year("2020 A Late Talk Show 2012 16 02"), Some(2020));
+        assert_eq!(opening_year("2020"), Some(2020), "four digits and no more");
+        // The width refusal: an eight-digit run is a date written as one token.
+        assert_eq!(opening_year("20201013 Show"), None);
+        // The range, the same 1900–2100 every other year guard in this file uses.
+        assert_eq!(opening_year("1899 Show"), None);
+        assert_eq!(opening_year("2101 Show"), None);
+        // Not at the front, and not a digit run at all.
+        assert_eq!(opening_year("Show 2020"), None);
+        assert_eq!(opening_year("202 Show"), None);
+        assert_eq!(opening_year(""), None);
+        // **Multi-byte, and the helper indexes bytes.** A CJK head must return
+        // `None` rather than panic; slicing a `str` by a computed offset has
+        // panicked three times on this project.
+        assert_eq!(opening_year("当我飞奔向你 2020"), None);
     }
 
     /// A head with no letter in it is not a title to keep, so the cut declines
