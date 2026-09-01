@@ -269,8 +269,12 @@ checkout (740 KB). Not a code defect, not committed.
   are wrong; it is the absence of evidence either way**, and no dogfood count was
   offered for any of them.
 
-* **CI.** It cannot run — billing stop — and nothing was pushed, so this is moot
-  rather than skipped. Local gates are the whole bar.
+* **CI.** Recorded here as *"it cannot run — billing stop"*, which was **wrong**.
+  It was carried from the session brief and never rechecked. CI ran on
+  2026-09-02 against #198: `openapi` 14s, `web` 27s, `server` 4m16s, all green.
+  Nothing was pushed from this branch that night, so the claim changed nothing —
+  but a stale fact repeated as a measurement is the thing this file exists to
+  catch, and it got through.
 
 ## What this does not claim
 

@@ -89,6 +89,18 @@ reported `0 rows of 50,086 changed` end to end. Unaffected.
 genuinely sensitive and zero; the rest narrow by population or insensitive by
 construction. None of those readings was about the corpus entry point.
 
+## How #198 was merged, recorded because the green arrived afterwards
+
+**It was merged on `mergeStateStatus: UNSTABLE`, with `web` still in flight.**
+`openapi` had passed in 14s; `web` (27s) and `server` (4m16s) went green after the
+merge, and `gate1` after that. **They were not waited for.**
+
+The change was two files under `notes/`, so nothing `server` or `web` covers could
+have broken — but that is a reason it was low risk, not a reason it was checked.
+**The merge records on this project are careful about this**, and a later reader
+seeing four green checks against `24b0cea` would otherwise conclude they were the
+gate. They were not; the authorization was.
+
 ## The one thing this closes
 
 Note 08's *what I would do next*, item 1, was **take the entry-point finding to
