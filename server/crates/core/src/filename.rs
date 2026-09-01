@@ -600,7 +600,23 @@ const CHAPTER_WORDS: &[&str] = &["cap", "capitulo"];
 /// claims them and this rule is never reached. **It runs only in the bare-season
 /// arm, where a season is known and no episode has been claimed** — which is
 /// exactly the shape the 1,248 are not.
-const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo"];
+///
+/// **`ep` is the abbreviation, and it is searched the way every word here is.**
+/// `221208 ABC123 Series Title Season 39 ep11` states its season in words and
+/// marks its episode with two letters. Followed by digits, `ep` appears **0
+/// times in the corpus's title expectations, 0 times in the 2,475 dogfood
+/// `db_title`s, 0 times in the 25,043 dogfood basenames** and **0 times in the
+/// sweep's 2,332-title pool**. As a bare word it appears **once** in the
+/// library — `Smiling Friends - 3x08 - The Glep Ep` — and no digits follow it,
+/// which is the same shape and the same reasoning as `cap` in `Dad's Red Cap`.
+///
+/// The sweep renders `{title} Ep01 1080p x264.mkv` for every title, so **2,332
+/// of its 74,624 names carry `ep` and a number**. None of them states a season,
+/// so none reaches this arm — and if that were wrong, all 2,332 would move.
+///
+/// **Last in the list, because the longer spellings must win.** `episode 5`
+/// must match `episode` and read 5, not match `ep` and find `isode`.
+const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo", "ep"];
 
 /// `Cap.101`, `Cap.1901`, `Cap. 408` — one run holding the season and the
 /// episode, behind a word that says so.
@@ -3795,6 +3811,34 @@ mod tests {
             parse_filename("Series 1 2 3 S01E01.mkv").title,
             "Series 1 2 3"
         );
+    }
+
+    /// **`ep` is the abbreviation of a word already in the list.**
+    ///
+    /// `Season 39 ep11` states the season in words and marks the episode with
+    /// two letters, and the season arm claimed 39 while the episode went
+    /// absent. Red on removing `"ep"` from [`SPELLED_EPISODE_WORDS`].
+    #[test]
+    fn a_spelled_season_reads_an_abbreviated_episode_marker() {
+        let p = parse_filename("221208 ABC123 Series Title Season 39 ep11.mp4");
+        assert_eq!(p.season, Some(39));
+        assert_eq!(p.episode, Some(11));
+        assert_eq!(p.title, "ABC123 Series Title");
+    }
+
+    /// **The one real name in the library that carries a bare `ep`.**
+    ///
+    /// `Smiling Friends - 3x08 - The Glep Ep` — an episode title ending in the
+    /// word, with no digits behind it. This locks the arm guard rather than the
+    /// word: the name carries `3x08`, so [`find_season_episode`] claims it and
+    /// the spelled list is never consulted. That is the same thing that keeps
+    /// the library's 1,248 `Episode N` episode titles out of it.
+    #[test]
+    fn a_bare_ep_in_an_episode_title_claims_nothing() {
+        let p = parse_filename("Smiling Friends - 3x08 - The Glep Ep - WEBDL-1080p.mkv");
+        assert_eq!(p.title, "Smiling Friends");
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(8));
     }
 
     /// **The year cut used to throw away an episode claim the name carries.**
