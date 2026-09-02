@@ -577,6 +577,30 @@ fn cut_at_written_date(s: &str) -> (String, Option<i32>) {
 /// a number after it, which is a measure of how ordinary it is inside a title.
 const SEASON_WORDS: &[&str] = &["season", "saison", "stagione", "temporada"];
 
+/// Season markers written as an abbreviation.
+///
+/// `Se` is the Dutch *seizoen*, and it comes with `afl` in
+/// [`SPELLED_EPISODE_WORDS`] — `Series T Se.3 afl.3` is one marker written in
+/// two Dutch words, and neither half is worth anything without the other.
+///
+/// **Two letters is the shortest marker in this file, so the counterexample
+/// search matters more here than anywhere else.** Followed by an optional
+/// separator and digits, `se` appears in **3 of the 844 corpus inputs**, **0 of
+/// the corpus's title expectations**, **0 of the 2,475 dogfood `db_title`s**,
+/// **1 of the 25,043 dogfood basenames** and **32 of the sweep's 74,624
+/// names** — and the one library name is the same title as all 32 sweep names,
+/// `Se7en`. As a bare word it appears in 2 more basenames, `The Tales of Ba
+/// Sing Se` and `Sí Se Puede`, with no digits behind either.
+///
+/// **`Se7en` is refused by the boundary check `find_bare_season` already
+/// carries**, not by anything added here: a letter follows the digits, so the
+/// run is not a whole number. A separator requirement was written as a second
+/// refusal, **measured, and removed** — its negative control came back green,
+/// because the boundary check gets there first. It would have cost the glued
+/// Dutch spelling `Se3` for nothing, and this file already records that a guard
+/// with a demonstrable cost and no demonstrable case is not one to keep.
+const SEASON_ABBREVIATIONS: &[&str] = &["se"];
+
 /// The Spanish chapter marker, and only this spelling.
 ///
 /// **`cap` is a real English word and this list is safe because the digits are
@@ -616,7 +640,14 @@ const CHAPTER_WORDS: &[&str] = &["cap", "capitulo"];
 ///
 /// **Last in the list, because the longer spellings must win.** `episode 5`
 /// must match `episode` and read 5, not match `ep` and find `isode`.
-const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo", "ep"];
+/// **`afl` is the Dutch *aflevering*, and it arrives with `se`.** Followed by
+/// digits it appears in **3 of the 844 corpus inputs** and nowhere else at all:
+/// **0 of the corpus's title expectations**, **0 of the 2,475 dogfood
+/// `db_title`s**, **0 of the 25,043 dogfood basenames**, **0 of the sweep's
+/// 74,624 names**. As a bare word it appears **0 times** in every one of those
+/// — it is not an English word, which is what makes it cheaper than `cap` and
+/// `ep`, both of which are.
+const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo", "afl", "ep"];
 
 /// `Cap.101`, `Cap.1901`, `Cap. 408` — one run holding the season and the
 /// episode, behind a word that says so.
@@ -809,7 +840,7 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
             if bytes[i] == b's' {
                 consider(i, 1, false);
             }
-            for w in SEASON_WORDS {
+            for w in SEASON_WORDS.iter().chain(SEASON_ABBREVIATIONS) {
                 if lower[i..].starts_with(w) {
                     consider(i, w.len(), true);
                 }
@@ -3856,6 +3887,69 @@ mod tests {
         assert_eq!(p.title, "Smiling Friends");
         assert_eq!(p.season, Some(3));
         assert_eq!(p.episode, Some(8));
+    }
+
+    /// **The Dutch marker, both halves at once.**
+    ///
+    /// `Se` is *seizoen* and `afl` is *aflevering*. Neither half is worth
+    /// anything alone: without `se` no season is known, and the spelled episode
+    /// arm runs only when one is; without `afl` the season is read and the
+    /// episode stays absent. So they are one mechanism and one commit, and this
+    /// is red on deleting either word from its list.
+    #[test]
+    fn a_dutch_season_and_episode_marker_is_one_marker() {
+        let p = parse_filename("Series T Se.3 afl.3");
+        assert_eq!(p.title, "Series T");
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(3));
+    }
+
+    /// **The input the two-letter marker wrongly accepts, constructed.**
+    ///
+    /// `Se7en` is a bound film in the 25,043-file dogfood library, the only
+    /// name in it where `se` meets digits, and the sweep renders that title 32
+    /// times. What refuses it is the boundary check `find_bare_season` already
+    /// had — `7` is followed by `e`, so the digit run is not a whole number.
+    /// **Red on deleting `bytes[j].is_ascii_alphabetic()` from that check.**
+    ///
+    /// The head is two words on purpose. At the front of a name `Se7en` is
+    /// refused twice over, because a title cut there would leave no letters,
+    /// and a control cannot go red through a guard that another guard already
+    /// declines for.
+    #[test]
+    fn se_glued_to_its_digits_is_not_a_season() {
+        let p = parse_filename("The Film Se7en.1995.1080p.BluRay.x264-GRP.mkv");
+        assert_eq!(p.title, "The Film Se7en");
+        assert_eq!(p.season, None);
+        assert_eq!(p.year, Some(1995));
+    }
+
+    /// **The longer word still wins where both match.**
+    ///
+    /// `season` opens with `se`, so every `Season N` offers the abbreviation a
+    /// match as well. It declines — an `a` follows, not a separator — and the
+    /// spelled word reads the number. A multi-word head, so a wrong claim shows
+    /// as a truncated title as well as a wrong season.
+    #[test]
+    fn the_abbreviation_does_not_eat_the_word_it_abbreviates() {
+        let p = parse_filename("Some Other Title Season 4 - Episode 6.mkv");
+        assert_eq!(p.title, "Some Other Title");
+        assert_eq!(p.season, Some(4));
+        assert_eq!(p.episode, Some(6));
+    }
+
+    /// **A bare `se` inside an episode title claims nothing.**
+    ///
+    /// The two names in the library that carry the word — `The Tales of Ba Sing
+    /// Se` and `Sí Se Puede` — are episode titles with no digits behind them.
+    /// This locks the word rather than the arm guard, and the head is four
+    /// words so a wrong claim cannot hide.
+    #[test]
+    fn a_bare_se_in_an_episode_title_claims_nothing() {
+        let p = parse_filename("Avatar - The Last Airbender - 2x15 - The Tales of Ba Sing Se.mkv");
+        assert_eq!(p.title, "Avatar - The Last Airbender");
+        assert_eq!(p.season, Some(2));
+        assert_eq!(p.episode, Some(15));
     }
 
     /// **The year cut used to throw away an episode claim the name carries.**
