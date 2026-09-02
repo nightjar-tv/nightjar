@@ -170,13 +170,25 @@ and its own map. The 2 s grid holds on all three rungs.
    > **scrub granularity is the window, not 2 s. Fine-grained seek stays
    > transcode.** Shipped in #182.
 
-3. **A listed URI is never 404 and never 503.** The request is held until that
-   segment lands in the store, and released then — not when the encoder that
-   produced it finishes. A cold URI is a seek: the session starts an encoder at
-   that media time (ADR-0050 §4), measured at a 976 to 1132 ms median and under
-   2.4 s worst case. 404 is reserved for a URI outside the title or off the
-   grid.
+3. **A listed URI is never 404. A hold that outlives `SEGMENT_WAIT` answers
+   503, for the client to retry.** The request is held until that segment lands
+   in the store, and released then — not when the encoder that produced it
+   finishes. A cold URI is a seek: the session starts an encoder at that media
+   time (ADR-0050 §4), measured at a 976 to 1132 ms median and under 2.4 s
+   worst case. 404 is reserved for a URI outside the title or off the grid.
 
+   > **Heading rewritten 2026-09-02. It read "A listed URI is never 404 and
+   > never 503."** That sentence was withdrawn on 2026-08-31 by the correction
+   > below and left standing above it, so the decision opened with the claim it
+   > had already retracted. A reader who skims the numbered sentence and stops
+   > — which is what a numbered decision is for — got the withdrawn version.
+   > **The correction is unchanged**; only the sentence it corrects has been
+   > brought into line with it.
+   >
+   > **This departs from the convention in decisions 1, 2 and 4**, whose
+   > headings still assert what their own blockquotes overturn. Those are the
+   > same defect and are not touched here.
+   >
    > **Corrected 2026-08-31 — "never 503" is not what the code does, and the
    > sentence is what changes.** The hold in `asset_wait` is bounded by
    > `SEGMENT_WAIT` at 30 s; the promise above is not bounded at all. On expiry

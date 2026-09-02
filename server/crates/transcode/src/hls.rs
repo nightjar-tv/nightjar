@@ -229,8 +229,16 @@ pub enum SegmentMissAction {
 /// What to do when a listed segment is not on disk.
 ///
 /// **Overturned 2026-08-30 — a cold listed URI starts an encoder.** ADR-0054
-/// decision 3: *"A listed URI is never 404 and never 503. … A cold URI is a
-/// seek: the session starts an encoder at that media time."*
+/// decision 3: *"A listed URI is never 404. … A cold URI is a seek: the
+/// session starts an encoder at that media time."*
+///
+/// The quotation used to read *"never 404 and never 503"*, which is the
+/// sentence ADR-0054 withdrew on 2026-08-31: the hold in [`asset_wait`] is
+/// bounded by `SEGMENT_WAIT` and answers 503 on expiry, deliberately, because
+/// 503 is recoverable where 404 makes hls.js and Safari abandon the fragment.
+/// **Nothing about this function changes** — it is the 404 half that bears on
+/// a miss — but a citation that outlives its source is how a withdrawn claim
+/// gets read as current.
 ///
 /// This function returned `Wait` unconditionally, discarding all six of its
 /// arguments, and its comment stated that as policy. It is kept here because
