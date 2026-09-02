@@ -736,11 +736,25 @@ fn find_chapter_season_episode(normalized: &str) -> Option<(usize, i32, i32)> {
 }
 
 /// `Season 1 - Episode 01` — the episode word, for a name that already states
-/// its season and claims no episode.
+/// its season and claims no episode. Returns `(episode, end)`, end inclusive
+/// and equal to the episode where the name spells no range.
 ///
 /// See [`SPELLED_EPISODE_WORDS`] for why this may only be called from the
 /// bare-season arm.
-fn find_spelled_episode(normalized: &str) -> Option<i32> {
+///
+/// **The range is [`extend_episode_span`]'s, not a second one.** `S01E05-06`
+/// and `Season 01 Episode 05-06` are one file holding two episodes written two
+/// ways, and only the marked spelling emitted the pair — so the item list
+/// showed episode 6 as missing media for the spelled one. Every guard that
+/// makes the extension safe comes with it unchanged: a padded separator needs a
+/// distinctive marker, an unseparated repetition must land on the next number
+/// exactly, and [`MAX_EPISODE_RANGE`] bounds the run.
+///
+/// **The padded-separator family cannot reach here at all**, which is worth
+/// saying because it means one of those guards is doing nothing on this path:
+/// [`find_bare_season`] declines any name carrying ` - N` anywhere, so a name
+/// that reaches this arm has no padded dash in it.
+fn find_spelled_episode(normalized: &str, season: i32) -> Option<(i32, i32)> {
     let lower = normalized.to_ascii_lowercase();
     let b = lower.as_bytes();
     for i in 0..b.len() {
@@ -760,7 +774,8 @@ fn find_spelled_episode(normalized: &str) -> Option<i32> {
                 j += 1;
             }
             if j > start && !(j < b.len() && b[j].is_ascii_alphanumeric()) {
-                return lower[start..j].parse::<i32>().ok();
+                let episode = lower[start..j].parse::<i32>().ok()?;
+                return Some((episode, extend_episode_span(b, j, season, episode)));
             }
         }
     }
@@ -2039,6 +2054,7 @@ fn parse_stem(whole: &str) -> ParsedName {
     }
 
     if let Some((before, season)) = find_bare_season(&normalized) {
+        let spelled = find_spelled_episode(&normalized, season);
         let title = run_title.clone().unwrap_or_else(|| {
             cut_at_unmatched_close(&cut_at_episode_marker(
                 &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
@@ -2058,8 +2074,8 @@ fn parse_stem(whole: &str) -> ParsedName {
             season: Some(season),
             // **The season is known and no episode has been claimed**, which is
             // the only place the spelled episode word is safe to read.
-            episode: find_spelled_episode(&normalized),
-            episode_end: None,
+            episode: spelled.map(|(e, _)| e),
+            episode_end: spelled.filter(|&(e, end)| end > e).map(|(_, end)| end),
             episode_absolute: false,
         };
     }
@@ -3950,6 +3966,51 @@ mod tests {
         assert_eq!(p.title, "Avatar - The Last Airbender");
         assert_eq!(p.season, Some(2));
         assert_eq!(p.episode, Some(15));
+    }
+
+    /// **A range spelled in words is the same file as a range spelled in
+    /// markers.**
+    ///
+    /// `S01E05-06` emitted episodes 5 and 6; `Season 01 Episode 05-06` emitted
+    /// only 5, so the item list showed 6 as missing media on one spelling and
+    /// not the other. Red on dropping the `extend_episode_span` call from
+    /// `find_spelled_episode`.
+    ///
+    /// The Dutch line is the same mechanism reached through a different word,
+    /// and it is a three-number run rather than a pair.
+    #[test]
+    fn a_spelled_episode_marker_carries_its_range() {
+        let p = parse_filename("Series Title Season 01 Episode 05-06 720p");
+        assert_eq!(p.season, Some(1));
+        assert_eq!(p.episode_numbers(), vec![5, 6]);
+
+        let q = parse_filename("13 Series Se.1 afl.2-3-4 [VTM]");
+        assert_eq!(q.title, "13 Series");
+        assert_eq!(q.season, Some(1));
+        assert_eq!(q.episode_numbers(), vec![2, 3, 4]);
+    }
+
+    /// **The inputs the range would wrongly accept, constructed.**
+    ///
+    /// Each is a name the spelled arm now reaches and must not read as a range,
+    /// and each has a head of its own so no line can be masked by another
+    /// declining. In order: a hyphenated episode title behind the number, an
+    /// unmarked repetition behind a space, the same behind a dot — which is a
+    /// space once the stem is normalised — a run wider than
+    /// [`MAX_EPISODE_RANGE`], and a second number below the first.
+    #[test]
+    fn a_spelled_episode_marker_declines_what_is_not_a_range() {
+        for (name, episode) in [
+            ("Show Season 1 Episode 3-D Printing.mkv", 3),
+            ("Another Show Season 4 Episode 5 06 Extra.mkv", 5),
+            ("A Third Show Season 2 Episode 4.05 Extra.mkv", 4),
+            ("Fourth Programme Season 3 Episode 07-99 Wide.mkv", 7),
+            ("Fifth Programme Season 5 Episode 08-07 Back.mkv", 8),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.episode, Some(episode), "{name}");
+            assert_eq!(p.episode_end, None, "{name}");
+        }
     }
 
     /// **The year cut used to throw away an episode claim the name carries.**
