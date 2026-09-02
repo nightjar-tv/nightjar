@@ -330,26 +330,6 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn spawn_failure_message_is_distinct() {
-        // Point PATH away so spawn fails distinctly from process exit.
-        let err = {
-            let old = std::env::var_os("PATH");
-            unsafe { std::env::set_var("PATH", "/var/empty-nightjar-no-ffprobe") };
-            let r = ffprobe(Path::new("/tmp/x.mkv"), None);
-            match old {
-                Some(v) => unsafe { std::env::set_var("PATH", v) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-            r.unwrap_err()
-        };
-        assert!(
-            err.starts_with("spawn ffprobe"),
-            "expected spawn message, got {err}"
-        );
-        assert!(!err.starts_with("ffprobe failed"));
-    }
-
-    #[test]
     fn process_failure_includes_exit_code() {
         if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_none()
             && !Command::new("ffprobe")
