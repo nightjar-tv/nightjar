@@ -99,14 +99,42 @@ fn with_fake_ffmpeg<T>(log: &Path, marker_path: &Path, f: impl FnOnce() -> T) ->
     let mut perms = fs::metadata(&fake).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&fake, perms).unwrap();
+
+    // **The injected directory holds exactly one entry, named `ffmpeg`.**
+    //
+    // `require_ffprobe` resolves `ffprobe` through `PATH` and it does so
+    // *outside* the lock below, so while this directory is on `PATH` a
+    // concurrent test's guard reads it. Today that is safe only because there
+    // is no `ffprobe` in here to find. Drop one in — the obvious next move for
+    // a test wanting a deterministic probe — and the guard resolves the fake
+    // instead of the real binary. It is entry 23's own failure mode, inside
+    // the file written to prevent it.
+    //
+    // The comment above used to be the whole defence, and a comment is not a
+    // guard. This is the assertion the slice plan deferred.
+    //
+    // **It checks the directory, not a name.** `bin.join("ffprobe").exists()`
+    // would pass for `ffprobe.exe`, for a `python3` someone added, for
+    // anything at all that is not literally called `ffprobe` — and every one
+    // of those is on `PATH` for the same window. What must hold is that this
+    // directory contributes one executable and no other, so that is what is
+    // read back.
+    let entries: Vec<String> = fs::read_dir(&bin)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        entries,
+        vec!["ffmpeg".to_string()],
+        "the fake bin goes on PATH while another test may resolve ffprobe \
+         through it, so it must hold exactly one entry named ffmpeg \
+         (OPEN-DEFECTS entry 23). Found: {entries:?}"
+    );
+
     // Held across the write, the closure and the restore. Complete rather than
     // a discipline: this helper is the only thing in the binary that *writes*
     // PATH, so there is no third party to forget the lock (OPEN-DEFECTS entry
-    // 23). Reads are a different matter — `require_ffprobe` resolves ffprobe
-    // through PATH outside this lock, and is safe only because the injected
-    // directory holds nothing but `ffmpeg`. Put an `ffprobe` in there and the
-    // guard resolves the fake, prints "skip", and the test passes without
-    // running. Which is entry 23, back inside the file built to prevent it.
+    // 23).
     let _guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let old = std::env::var_os("PATH");
     let new_path = match &old {
