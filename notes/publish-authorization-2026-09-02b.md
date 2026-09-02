@@ -22,7 +22,7 @@ number existed yet. **Entry 2 is that naming**, added before the merge ran.
 **All four checks were green before the merge this time** — `gate1` 4m24s,
 `server` 4m30s, `web` 24s, `openapi` 11s, `mergeStateStatus: CLEAN`. #198 earlier
 today was merged on `UNSTABLE` with `web` in flight, which is recorded in
-[`loop-overnight/09-rebaselined.md`](loop-overnight/09-rebaselined.md). **Rebase is outside the carve-out** and none was done — this branch is based
+the overnight loop's rebaselining note, now in the maintainer notes. **Rebase is outside the carve-out** and none was done — this branch is based
 on `f527198` and `main` has moved to `24b0cea`, which is a clean base for a merge
 commit because the two touch different files.
 
@@ -31,7 +31,7 @@ commit because the two touch different files.
 Fifteen commits: five parser changes in `nightjar-core`, nine notes, and one
 deletion of a duplicate harness. Nothing else in `server/` is touched.
 
-**Read [`notes/loop-overnight/09-rebaselined.md`](loop-overnight/09-rebaselined.md)
+**Read the overnight loop's rebaselining note, now in the maintainer notes,
 first.** Notes 00 to 08 were measured through `parse_filename`; the harness calls
 `stored_parse` as of #198, and the branch reads **`608/734` → `617/734`** rather
 than 598 → 607.
