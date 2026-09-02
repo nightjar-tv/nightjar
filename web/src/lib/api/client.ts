@@ -158,8 +158,7 @@ export const api = {
 	 * made account scope unreachable and every account-powers route answer
 	 * `insufficient_role` — including `POST /libraries`, so a fresh install
 	 * could not be given a library through its own interface. The narrowing was
-	 * right and its placement was not (`nightjar-meta`
-	 * `notes/OPEN-DEFECTS.md` entry 15).
+	 * right and its placement was not.
 	 *
 	 * One profile, chosen without asking. Choosing between profiles is product
 	 * UI and belongs to Block 3.

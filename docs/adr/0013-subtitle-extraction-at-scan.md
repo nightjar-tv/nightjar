@@ -404,7 +404,7 @@ longer runs.
   line can become near-immediate captions is still open (§11).
 - Add-file timings on the full household Movies library over SMB
   (2026-07-26), extracts paused during index, tiny probe MKV + sidecar,
-  ~1,750 titles on `/Users/gmacarthur/mnt-media/Movies`:
+  ~1,750 titles on the maintainer's household Movies library over SMB:
 
   | Path | Until listed | Until playable | Until subtitled | Discovering walk |
   |---|---|---|---|---|

@@ -6,8 +6,9 @@
   (the full-title listing) and decision 3 (a cold URI is a seek);
   [ADR-0050](0050-lead-held-session-shape.md) §4 (a seek spawns and does not
   kill)
-- Related: `nightjar-meta` `notes/decision-5-human-scrub-2026-08-31.md`
-  (the capture), `notes/OPEN-DEFECTS.md` entry 17
+- Measured 2026-08-31 against the shipped build at `95a7735`: a human scrub,
+  two sessions, both directions, restarted the encoder **nine times and posted
+  zero seeks**. Capture and method are maintainer-private
 
 ## Context
 
@@ -72,10 +73,9 @@ that is a property of the trigger rather than a feature one path forgot.
 
 **Path B: nothing, against this product.** ADR-0054 decision 3 cites *"a 976 to
 1132 ms median and under 2.4 s worst case"*. Those come from ADR-0050 §4's
-table and the reap-delay table in `nightjar-meta`'s
-`docs/plans/2026-08-23-hybrid-session-shape.md`, both produced by `s6_origin.py`
-under `~/nightjar-spikes/2026-08-21-scheduler/`. **That harness never calls the
-session API** — ADR-0054 decision 2's own correction says so of the same spike
+table and its reap-delay table, both produced by the 2026-08-21 scheduler
+spike origin — a standalone harness, not this product. **That harness never
+calls the session API** — ADR-0054 decision 2's own correction says so of the same spike
 family. The figures are real and they are not this path's.
 
 ## Decision

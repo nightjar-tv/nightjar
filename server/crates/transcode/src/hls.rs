@@ -478,8 +478,6 @@ pub fn no_fill_release_for_new_land(
 /// decided on the cost of being wrong: a restart nothing reads costs one
 /// encode start, bounded by [`RESTART_MIN_INTERVAL`] and `desire_restart`'s
 /// coalescing, while a hold costs the session.
-///
-/// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 13.
 #[allow(clippy::too_many_arguments)]
 pub fn segment_miss_unreachable(
     want_ms: u64,
@@ -770,8 +768,7 @@ pub struct SessionView {
 /// reloads a `VOD` playlist in place: hls.js gates it on `details.live`, and the
 /// iPhone fetched one `index.m3u8` across four spawned runs. So the map is read
 /// once per attach, alongside the playlist that names it, and the pairing is
-/// always self-consistent. `nightjar-meta`:
-/// `notes/session-scoped-playlist-uri-2026-08-31.md`.
+/// always self-consistent.
 fn playlist_url_for(session_id: &str) -> String {
     format!("/api/v0/sessions/{session_id}/master.m3u8")
 }
@@ -1070,8 +1067,6 @@ struct RunListing {
     /// title-absolute in both shapes; the origin is where the *element's*
     /// clock is zeroed. They are equal only in the per-run shape, and reading
     /// the land as the origin is what put `20:02` on a 15-minute title.
-    ///
-    /// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 12.
     media_origin_ms: u64,
 }
 
@@ -2438,10 +2433,8 @@ fn restart_at(
         // been measured here. **So this is not "the map-hit path is broken";
         // it is that the reason it was believed safe is false and the failure
         // mode is real in the one instrument used.** Do not restore the
-        // identity claim without a player.
-        //
-        // `nightjar-meta`: `notes/init-identity-across-runs-2026-08-31.md`,
-        // `notes/cross-run-init-decode-2026-08-31.md`.
+        // identity claim without a player. Measured 2026-08-31 on `d341cc9`,
+        // macOS Safari native and hls.js, across four spawned runs.
         let init_src = session.dir.join(format!("run_{src_run}/init.mp4"));
         let init_dst = new_dir.join("init.mp4");
         if init_src.exists() {
@@ -3045,8 +3038,7 @@ fn session_key_snap<'a>(
 /// `full_title_entries` could only see the absence, so it gave a transcode
 /// session copy's keyframe walk: a playlist naming source keyframe times that
 /// a transcode encoder never writes. Every request held to `SEGMENT_WAIT` and
-/// **129 of 1814 items in a real library could not play**
-/// (`nightjar-meta` `OPEN-DEFECTS.md` entry 18).
+/// **129 of 1814 items in a real library could not play.**
 ///
 /// Rule 4.11 asks which field distinguishes two cases rather than which branch.
 /// The field is session mode, and ADR-0054 decision 2 already says so.
@@ -5148,8 +5140,6 @@ mod tests {
     /// `4c0c20f` before this existed. Element time is zeroed at the first
     /// segment the playlist lists, and a full-title listing lists from 0
     /// however far in the run landed.
-    ///
-    /// `nightjar-meta`: `notes/OPEN-DEFECTS.md` entry 12.
     #[test]
     fn a_full_title_listing_has_media_origin_zero_however_far_it_landed() {
         let dir = tempfile::tempdir().unwrap();

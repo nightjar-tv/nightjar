@@ -8,8 +8,9 @@
   (the producer owns boundaries, and the map refuses entries whose media time
   disagrees)
 - Gate: Gate 2 — the corpus plays on hardware encoders
-- Related: `nightjar-meta/notes/hw/cook-scheduler-2026-08-22.md`
-  § `h264_qsv` ignores `-force_key_frames`
+- Measured 2026-08-22 on an Intel N150: `h264_qsv` ignores
+  `-force_key_frames`, and a 20 s window came out as 5 segments of 4.004 s.
+  Method and raw data are maintainer-private
 
 ## Context
 

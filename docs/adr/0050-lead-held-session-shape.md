@@ -14,8 +14,10 @@
   ADR-0052 (the 2 s IDR grid this shape assumes)
 - Gate: Gate 2 — the corpus plays, and a seek into untranscoded media starts
   under three seconds
-- Related: `nightjar-meta/docs/plans/2026-08-23-hybrid-session-shape.md`,
-  which carries the measurements and the raw data paths
+- Measured 2026-08-23 on an Intel N150 (QSV) and an Apple M1, offset 90:
+  Spike A (throttle mechanism, 12 steady-state runs plus 4 pause runs) and
+  Spike B (held encoders, seek latency and RSS). Method and raw data are
+  maintainer-private
 
 ## Context
 
