@@ -222,21 +222,60 @@ fn cut_stem_at(stem: &str, i: usize) -> String {
 /// `[REC] (2007)` keeps everything. Without that guard the rule destroys a
 /// title to clean one, which is the trade the orthography measurement rejected.
 fn strip_leading_group(stem: &str) -> &str {
-    let t = stem.trim_start();
-    if !t.starts_with('[') {
-        return stem;
-    }
-    let Some(close) = t.find(']') else {
+    let Some(first) = strip_one_leading_group(stem) else {
         return stem;
     };
+    // **A second group is decoration; a run of them is the name.** Fansub
+    // releases stack tags — `[Jumonji-Giri]_[F-B]_Series_Title_Ep04_` carries
+    // two and the title is behind both. But a name that is *nothing but*
+    // groups has its title chosen from them by [`bracket_run_title`], and
+    // stripping until one is left destroys the stem every other rule reads:
+    // `[GRP][12 Angry Men][07][1080p][AVC][GB]` becomes `[GB]`, which is 4,664
+    // of the sweep's 74,624 generated names.
+    //
+    // **So the repeat asks for prose.** It continues only while a letter
+    // survives outside every bracket — the thing a run of groups does not
+    // have. Measured over all three instruments: 3 corpus names change,
+    // **0 of the 25,043 library basenames, 0 of the 74,624 generated names**.
+    let mut cur = first;
+    while let Some(rest) = strip_one_leading_group(cur)
+        && has_letter_outside_brackets(rest)
+    {
+        cur = rest;
+    }
+    cur
+}
+
+/// One leading `[group]`, or `None` when there is none or stripping it would
+/// leave nothing with a letter in it.
+fn strip_one_leading_group(stem: &str) -> Option<&str> {
+    let t = stem.trim_start();
+    if !t.starts_with('[') {
+        return None;
+    }
+    let close = t.find(']')?;
     let rest = t[close + 1..]
         .trim_start_matches([' ', '_', '.', '-'])
         .trim();
-    if rest.chars().any(|c| c.is_alphabetic()) {
-        rest
-    } else {
-        stem
+    rest.chars().any(|c| c.is_alphabetic()).then_some(rest)
+}
+
+/// A letter that sits outside every bracket group.
+///
+/// **Characters, not bytes, and no slicing.** `【` is three bytes and this walks
+/// CJK names; an offset-derived slice of a `str` has panicked on exactly that
+/// three times on this project.
+fn has_letter_outside_brackets(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '[' | '(' | '\u{3010}' => depth += 1,
+            ']' | ')' | '\u{3011}' => depth = (depth - 1).max(0),
+            c if depth == 0 && c.is_alphabetic() => return true,
+            _ => {}
+        }
     }
+    false
 }
 
 /// Cut a title at a separated absolute-episode number — `Show - 12 [Group]`.
@@ -340,7 +379,7 @@ fn cut_at_absolute_episode(s: &str) -> String {
 /// **ASCII digits only.** `is_ascii_digit` and not a Unicode digit class: an
 /// Arabic-Indic date in an Arabic title is not this form, and a prototype of
 /// this rule written in Python cut one because `str.isdigit()` said yes.
-fn cut_at_date(s: &str) -> String {
+fn cut_at_date(s: &str) -> (String, Option<i32>) {
     let bytes = s.as_bytes();
     let mut toks: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -371,10 +410,16 @@ fn cut_at_date(s: &str) -> String {
         }
         let head = s[..a.0].trim().trim_matches([' ', '-', '_', '.']).trim();
         if head.chars().any(char::is_alphabetic) {
-            return head.to_string();
+            // **Whichever end is the year is the year.** `is_year` has already
+            // held for exactly one of the outer two tokens, so this reads the
+            // one that passed rather than guessing an order.
+            return (
+                head.to_string(),
+                Some(if is_year(a) { value(a) } else { value(c) }),
+            );
         }
     }
-    s.to_string()
+    (s.to_string(), None)
 }
 
 /// Month names, three letters or spelled out. **A closed list, and the ordinal
@@ -555,7 +600,23 @@ const CHAPTER_WORDS: &[&str] = &["cap", "capitulo"];
 /// claims them and this rule is never reached. **It runs only in the bare-season
 /// arm, where a season is known and no episode has been claimed** — which is
 /// exactly the shape the 1,248 are not.
-const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo"];
+///
+/// **`ep` is the abbreviation, and it is searched the way every word here is.**
+/// `221208 ABC123 Series Title Season 39 ep11` states its season in words and
+/// marks its episode with two letters. Followed by digits, `ep` appears **0
+/// times in the corpus's title expectations, 0 times in the 2,475 dogfood
+/// `db_title`s, 0 times in the 25,043 dogfood basenames** and **0 times in the
+/// sweep's 2,332-title pool**. As a bare word it appears **once** in the
+/// library — `Smiling Friends - 3x08 - The Glep Ep` — and no digits follow it,
+/// which is the same shape and the same reasoning as `cap` in `Dad's Red Cap`.
+///
+/// The sweep renders `{title} Ep01 1080p x264.mkv` for every title, so **2,332
+/// of its 74,624 names carry `ep` and a number**. None of them states a season,
+/// so none reaches this arm — and if that were wrong, all 2,332 would move.
+///
+/// **Last in the list, because the longer spellings must win.** `episode 5`
+/// must match `episode` and read 5, not match `ep` and find `isode`.
+const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo", "ep"];
 
 /// `Cap.101`, `Cap.1901`, `Cap. 408` — one run holding the season and the
 /// episode, behind a word that says so.
@@ -1864,7 +1925,8 @@ fn parse_stem(whole: &str) -> ParsedName {
             cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_absolute_episode(
                 &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
                     &cut_stem_at(stem, before),
-                ))),
+                )))
+                .0,
             )))
         });
         // `None` is the declined-number case: the token said television and
@@ -1923,9 +1985,12 @@ fn parse_stem(whole: &str) -> ParsedName {
         let before = find_bare_season(&normalized)
             .map_or(chapter_at, |(season_at, _)| season_at.min(chapter_at));
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
-                &cut_at_trailing_bracket_run(&cut_at_title_junk(&cut_stem_at(stem, before))),
-            )))
+            cut_at_unmatched_close(&cut_at_episode_marker(
+                &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
+                    &cut_stem_at(stem, before),
+                )))
+                .0,
+            ))
         });
         return ParsedName {
             title: if title.is_empty() {
@@ -1944,9 +2009,12 @@ fn parse_stem(whole: &str) -> ParsedName {
 
     if let Some((before, season)) = find_bare_season(&normalized) {
         let title = run_title.clone().unwrap_or_else(|| {
-            cut_at_unmatched_close(&cut_at_episode_marker(&cut_at_date(
-                &cut_at_trailing_bracket_run(&cut_at_title_junk(&cut_stem_at(stem, before))),
-            )))
+            cut_at_unmatched_close(&cut_at_episode_marker(
+                &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
+                    &cut_stem_at(stem, before),
+                )))
+                .0,
+            ))
         });
         return ParsedName {
             title: if title.is_empty() {
@@ -1978,10 +2046,28 @@ fn parse_stem(whole: &str) -> ParsedName {
     // when the name gave no year of its own — a name that states its year
     // states it, and the date must not overrule it.
     let (dated, date_year) = match cut_at_date(stem) {
-        cut if cut != stem => (cut, None),
+        (cut, dated_year) if cut != stem => (cut, dated_year),
         _ => cut_at_written_date(stem),
     };
-    let year = year.or(date_year);
+    // **A four-digit run at the front of the name is the title's first word,
+    // not a year the name states.** `find_year` takes the first bare run in
+    // range wherever it sits, so `2020 A Late Talk Show 2012 16 02` reported
+    // 2020 — while the cut above had already decided the same run belongs to
+    // the title. One name, two reads, and they disagreed.
+    //
+    // The date is what states the year in these names, and the title cut and
+    // the year now come from the same read. This is a precedence, not a new
+    // year: nothing here finds a year the parser could not already see.
+    //
+    // **A parenthesised year is untouched**, because `find_year` prefers it and
+    // it is then not the opening run — `(1955)` in `Series Title (1955) - 1954
+    // 01 23` still wins, and that case stays wrong for a different reason.
+    let year = match (year, date_year) {
+        (Some(found), Some(dated_year)) if opening_year(&normalized) == Some(found) => {
+            Some(dated_year)
+        }
+        (found, dated_year) => found.or(dated_year),
+    };
     if dated != stem {
         let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_title_junk(
             &clean_title(&dated),
@@ -2001,26 +2087,50 @@ fn parse_stem(whole: &str) -> ParsedName {
             episode_absolute: absolute.is_some(),
         };
     }
-    let title = match year {
-        Some(y) => {
-            let token = format!("({y})");
-            let cut = stem
-                .find(&token)
-                .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
-            match cut {
-                // **The terminator runs here too.** Cutting at the year
-                // removes what follows it and nothing else, so junk sitting
-                // *before* the year survived — `World.Movie.Z.EXTENDED.2013`
-                // kept `EXTENDED`. Only the fallback arms ever called this.
-                Some(i) if i > 0 => cut_at_title_junk(&cut_stem_at(stem, i)),
-                _ => cut_at_title_junk(&clean_title(stem)),
-            }
-        }
-        None => cut_at_title_junk(&clean_title(stem)),
+    let marker_cut = |t: &str| {
+        episode_marker_cut(&cut_at_absolute_episode(
+            &cut_at_date(&cut_at_trailing_bracket_run(t)).0,
+        ))
     };
-    let (marked, absolute) = episode_marker_cut(&cut_at_absolute_episode(&cut_at_date(
-        &cut_at_trailing_bracket_run(&title),
-    )));
+    let mut year = year;
+    let mut cut = marker_cut(&title_before_year(stem, year));
+    // **The year cut must not throw away an episode claim the name carries.**
+    //
+    // Cutting at the year removes everything behind it, and in
+    // `Series Show.2016.E04.Power…` the marker is behind it. The title came out
+    // as `Series Show`, the episode as `None`, and the file was filed as a 2016
+    // film — while the name says episode 4 as plainly as a name can.
+    //
+    // **So the claim decides, and it is asked twice.** When the year cut leaves
+    // no claim and the uncut stem does carry one, the run in front of the
+    // marker is the series' name rather than a release year: `Series Title 2018`
+    // is a show called that. `year` goes with it, which is what the episode arm
+    // does for every name it owns — a name that marks an episode is not a film
+    // and has no film year.
+    //
+    // **Asked twice, not reordered.** A name whose claim survives the year cut
+    // keeps both, so `Show Ep06 2018` is untouched.
+    //
+    // **And the marker must not claim the year itself.** The year cut was
+    // holding a real line here: in `The.Movie.from.U.N.C.L.E.2015.1080p…` the
+    // standalone `E` of `U.N.C.L.E.` is a marker at a separator, and the digits
+    // behind it are `2015`. Uncut, that reads as episode 2015 with the title
+    // `The Movie from U N C L` — a film turned into an episode, on a name that
+    // passed before. `--diff` reported it and the verdict count did not: the
+    // corpus went 604 to 605 while this case went from pass to fail.
+    //
+    // So a retry that claims the very number the year branch found is refused.
+    // It is not a second claim; it is the same four digits read twice.
+    if cut.1.is_none()
+        && year.is_some()
+        && let retry = marker_cut(&title_before_year(stem, None))
+        && retry.1.is_some()
+        && retry.1 != year
+    {
+        year = None;
+        cut = retry;
+    }
+    let (marked, absolute) = cut;
     let title = run_title.unwrap_or_else(|| cut_at_unmatched_close(&marked));
 
     ParsedName {
@@ -2035,6 +2145,27 @@ fn parse_stem(whole: &str) -> ParsedName {
         episode: absolute,
         episode_end: None,
         episode_absolute: absolute.is_some(),
+    }
+}
+
+/// The title a name has once it is cut at its year, or the whole stem cleaned
+/// when it states none.
+///
+/// **The terminator runs here too.** Cutting at the year removes what follows it
+/// and nothing else, so junk sitting *before* the year survived —
+/// `World.Movie.Z.EXTENDED.2013` kept `EXTENDED`. Only the fallback arms ever
+/// called this.
+fn title_before_year(stem: &str, year: Option<i32>) -> String {
+    let Some(y) = year else {
+        return cut_at_title_junk(&clean_title(stem));
+    };
+    let token = format!("({y})");
+    let cut = stem
+        .find(&token)
+        .or_else(|| stem.to_ascii_lowercase().find(&y.to_string()));
+    match cut {
+        Some(i) if i > 0 => cut_at_title_junk(&cut_stem_at(stem, i)),
+        _ => cut_at_title_junk(&clean_title(stem)),
     }
 }
 
@@ -2075,8 +2206,38 @@ fn strip_extension(name: &str) -> &str {
     }
 }
 
+/// **A year is not a file extension**, and the rule above could not tell them
+/// apart: four characters, all alphanumeric, describes `1998` as well as it
+/// describes `webm`.
+///
+/// So one release name parsed two ways depending on whether it carried a
+/// container at all:
+///
+/// ```text
+/// Movie.The.Final.Chapter.2016       year None
+/// Movie.The.Final.Chapter.2016.mkv   year 2016
+/// ```
+///
+/// A dotted release name without an extension is an ordinary form —
+/// `Der.Movie.German.…scene.rules.1998` is one, and the corpus wants 1998 out of
+/// it. Nothing else about the parse should turn on a suffix the name may simply
+/// not have.
+///
+/// **1900–2100, the same range every other year guard in this file uses**, and
+/// it is doing real work rather than restating the width: `.264` is a genuine
+/// extension — a raw H.264 elementary stream — and `1080` is a resolution that
+/// lost its `p`. Both stay extensions because neither is a year. A width test
+/// would be a comment: no one-, two- or three-digit number reaches 1900.
 fn is_extension(suffix: &str) -> bool {
-    (1..=4).contains(&suffix.len()) && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+    (1..=4).contains(&suffix.len())
+        && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+        && !is_year_token(suffix)
+}
+
+/// A run of digits that is a year in 1900–2100.
+fn is_year_token(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+        && s.parse::<i32>().is_ok_and(|y| (1900..=2100).contains(&y))
 }
 
 fn clean_title(s: &str) -> String {
@@ -2494,6 +2655,24 @@ fn read_repeated_season(bytes: &[u8], i: usize) -> Option<(i32, usize)> {
 /// parentheses, which is the dotted release form (`Movie.Name.2019.1080p`).
 fn find_year(s: &str) -> Option<i32> {
     find_parenthesised_year(s).or_else(|| find_bare_year(s))
+}
+
+/// The four-digit year-shaped run the name **opens** with, if it opens with one.
+///
+/// A whole run: `20201013 Show` is a date written as one token, not the year
+/// 2020, so a fifth digit refuses it. Bytes throughout — the run is ASCII by
+/// construction and a length-derived slice of a `str` has panicked on CJK here
+/// three times.
+fn opening_year(s: &str) -> Option<i32> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 || !bytes[..4].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.get(4).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let y = std::str::from_utf8(&bytes[..4]).ok()?.parse::<i32>().ok()?;
+    (1900..=2100).contains(&y).then_some(y)
 }
 
 /// `(YYYY)` anywhere in the name, first one wins.
@@ -3634,6 +3813,266 @@ mod tests {
         );
     }
 
+    /// **`ep` is the abbreviation of a word already in the list.**
+    ///
+    /// `Season 39 ep11` states the season in words and marks the episode with
+    /// two letters, and the season arm claimed 39 while the episode went
+    /// absent. Red on removing `"ep"` from [`SPELLED_EPISODE_WORDS`].
+    #[test]
+    fn a_spelled_season_reads_an_abbreviated_episode_marker() {
+        let p = parse_filename("221208 ABC123 Series Title Season 39 ep11.mp4");
+        assert_eq!(p.season, Some(39));
+        assert_eq!(p.episode, Some(11));
+        assert_eq!(p.title, "ABC123 Series Title");
+    }
+
+    /// **The one real name in the library that carries a bare `ep`.**
+    ///
+    /// `Smiling Friends - 3x08 - The Glep Ep` — an episode title ending in the
+    /// word, with no digits behind it. This locks the arm guard rather than the
+    /// word: the name carries `3x08`, so [`find_season_episode`] claims it and
+    /// the spelled list is never consulted. That is the same thing that keeps
+    /// the library's 1,248 `Episode N` episode titles out of it.
+    #[test]
+    fn a_bare_ep_in_an_episode_title_claims_nothing() {
+        let p = parse_filename("Smiling Friends - 3x08 - The Glep Ep - WEBDL-1080p.mkv");
+        assert_eq!(p.title, "Smiling Friends");
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(8));
+    }
+
+    /// **The year cut used to throw away an episode claim the name carries.**
+    ///
+    /// `Series Show.2016.E04.Power…` cut at `2016`, which removed everything
+    /// behind it — including `E04`. The title came out as `Series Show`, the
+    /// episode as `None`, and a television episode was filed as a 2016 film.
+    ///
+    /// The run in front of the marker is the series' name: `Series Title 2018`
+    /// is a show called that. `year` goes with it, the way the episode arm sets
+    /// `year: None` for every name it owns.
+    #[test]
+    fn a_year_does_not_outrank_an_episode_marker_behind_it() {
+        let p = parse_filename("Series Title 2018 EP06 720p x265 AOZ.mp4");
+        assert_eq!(p.title, "Series Title 2018");
+        assert_eq!(p.episode, Some(6));
+        assert_eq!(p.year, None);
+        assert_eq!(p.kind, MediaKind::Episode);
+
+        let q = parse_filename("Series Show.2016.E04.Power.720p.WEB-DL.DD5.1.H.264-MARS");
+        assert_eq!(q.title, "Series Show 2016");
+        assert_eq!(q.episode, Some(4));
+        assert_eq!(q.season, None, "no season is ever synthesised");
+    }
+
+    /// **The year cut was holding a line, and this is it.**
+    ///
+    /// `The.Movie.from.U.N.C.L.E.2015.1080p.BluRay.x264-SPARKS` — the standalone
+    /// `E` of `U.N.C.L.E.` is an episode marker at a separator, and the digits
+    /// behind it are the year. Uncut, the name reads as episode 2015 titled
+    /// `The Movie from U N C L`.
+    ///
+    /// It passed before this rule and `classify.py --diff` caught it going red
+    /// while the corpus verdict count **rose**, 604 to 605. Red on deleting
+    /// `retry.1 != year`.
+    #[test]
+    fn a_marker_may_not_claim_the_year_as_its_episode() {
+        let p = parse_filename("The.Movie.from.U.N.C.L.E.2015.1080p.BluRay.x264-SPARKS");
+        assert_eq!(p.title, "The Movie from U N C L E");
+        assert_eq!(p.year, Some(2015));
+        assert_eq!(p.episode, None);
+        assert_eq!(p.kind, MediaKind::Movie);
+    }
+
+    /// **The claim is asked twice, and the order is not changed.** Both lines
+    /// are red when their own guard is dropped, and each has a head of its own.
+    ///
+    /// * `Show Ep06 2018` — the claim **survives** the year cut, so nothing is
+    ///   retried and the year stands. Drop `cut.1.is_none()` and the retry runs
+    ///   anyway, taking 2018 with it.
+    /// * `Some Anime Show (2011) Episode 99-100` — the uncut stem carries a
+    ///   *span*, which claims no number, so there is nothing better to take.
+    ///   Drop `retry.1.is_some()` and it loses its year and keeps `(2011)`.
+    #[test]
+    fn the_year_is_only_given_up_for_a_claim_that_is_better() {
+        let p = parse_filename("Show Ep06 2018 1080p.mkv");
+        assert_eq!(p.title, "Show");
+        assert_eq!(p.episode, Some(6));
+        assert_eq!(p.year, Some(2018), "the claim survived the year cut");
+
+        let q = parse_filename("Some Anime Show (2011) Episode 99-100 [1080p] [Dual.Audio]");
+        assert_eq!(q.title, "Some Anime Show");
+        assert_eq!(q.year, Some(2011), "a span claims no number");
+        assert_eq!(q.episode, None);
+    }
+
+    /// **Fansub releases stack tags, and only one was ever stripped.**
+    /// `[Jumonji-Giri]_[F-B]_Series_Title_Ep04_` carries two and the title is
+    /// behind both, so the parse kept `[F-B]` in it.
+    #[test]
+    fn a_run_of_leading_groups_is_stripped_down_to_the_prose() {
+        for name in [
+            "[Jumonji-Giri]_[F-B]_Series_Title_Ep04_(0b0e2c10).mkv",
+            "[Jumonji-Giri]_[F-B]_Series_Title_Ep08_(8246e542).mkv",
+        ] {
+            assert_eq!(parse_filename(name).title, "Series Title", "{name}");
+        }
+    }
+
+    /// **A name that is nothing but groups keeps them**, because
+    /// [`bracket_run_title`] chooses its title from the run and every other
+    /// rule reads the stem. Stripping until one group is left destroys both:
+    /// `[GRP][12 Angry Men][07][1080p][AVC][GB]` becomes `[GB]`, and that shape
+    /// is 4,664 of the sweep's 74,624 generated names.
+    ///
+    /// So the repeat continues only while a letter survives **outside** every
+    /// bracket. Both lines below are red when
+    /// [`has_letter_outside_brackets`] is dropped from the loop, and each has
+    /// a head of its own:
+    ///
+    /// * the Latin run loses its **year** — the stem becomes `[1080P]`, and
+    ///   nothing in it is 2019 any more;
+    /// * the CJK run loses its **title** — it becomes the literal `[MP4]`.
+    #[test]
+    fn a_name_that_is_only_groups_keeps_them() {
+        let p = parse_filename("[GRP][Sub][Anime Title][2019][234][AVC][GB][1080P]");
+        assert_eq!(p.title, "Anime Title");
+        assert_eq!(p.year, Some(2019), "the stem still holds the year");
+
+        // A real corpus name. Its title is still wrong — it wants the fourth
+        // group, not the second — and that is a different mechanism (D5).
+        // What this asserts is that it is not reduced to a codec tag.
+        let q = parse_filename(
+            "[愛戀&漫貓字幕组][10月新番][關於我轉生後成爲史萊姆那件事][18][720P][BIG5][MP4]",
+        );
+        assert_ne!(q.title, "[MP4]");
+        assert!(!q.title.starts_with('['), "got {:?}", q.title);
+    }
+
+    /// **A release name parses the same with or without its container.**
+    ///
+    /// `is_extension` read four alphanumeric characters, which describes `1998`
+    /// as well as `webm`, so `Movie.The.Final.Chapter.2016` lost its year and
+    /// `Movie.The.Final.Chapter.2016.mkv` kept it. Same name, two answers, on a
+    /// suffix that says nothing about the release.
+    #[test]
+    fn a_year_is_not_a_file_extension() {
+        for name in [
+            "Movie.The.Final.Chapter.2016",
+            "Movie.The.Final.Chapter.2016.mkv",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, "Movie The Final Chapter", "{name}");
+            assert_eq!(p.year, Some(2016), "{name}");
+        }
+        // The corpus case this was measured on: a scene name with no container.
+        let p = parse_filename(
+            "Der.Movie.German.Bluray.FuckYou.Pso.Why.cant.you.follow.scene.rules.1998",
+        );
+        assert_eq!(p.year, Some(1998));
+    }
+
+    /// **The year range is the guard, and the width would be a comment.**
+    ///
+    /// Delete `is_year_token`'s `1900..=2100` and every all-digit suffix stops
+    /// being an extension — `.264` is a real one, a raw H.264 elementary
+    /// stream, and `[DRONE]Series.Title.100` starts keeping a number the
+    /// corpus does not want. A width test cannot go red on its own: no one-,
+    /// two- or three-digit number reaches 1900.
+    ///
+    /// Each name below has a head of its own, so neither line can be masked by
+    /// the other declining.
+    #[test]
+    fn a_number_that_is_not_a_year_is_still_an_extension() {
+        assert_eq!(
+            parse_filename("[DRONE]Series.Title.100").title,
+            "Series Title"
+        );
+        assert_eq!(
+            parse_filename("Another Show.264").title,
+            "Another Show",
+            "a raw H.264 elementary stream is a real extension"
+        );
+    }
+
+    /// **The title cut and the year now come from one read of the date.**
+    ///
+    /// `find_year` takes the first whole four-digit run in range wherever it
+    /// sits, so a title that *opens* with one reported it as the year:
+    /// `2020 A Late Talk Show 2012 16 02` came out as the year 2020 while the
+    /// date cut — the same rule, on the same name — had already decided that
+    /// `2020` is the title's first word. The date states the year in these
+    /// names, and it is the year the corpus wants for all three of them.
+    ///
+    /// **Nothing here finds a year the parser could not already see.** It is a
+    /// precedence between two years the name carries.
+    #[test]
+    fn a_title_that_opens_with_a_year_takes_the_date_s_year() {
+        for (name, year) in [
+            ("2020.A.Late.Talk.Show.2012.16.02.PDTV.XviD-C4TV", 2012),
+            ("2020.A.Late.Talk.Show.2012.13.02.PDTV.XviD-C4TV", 2012),
+            ("2020.A.Late.Talk.Show.2011.12.02.PDTV.XviD-C4TV", 2011),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.title, "2020 A Late Talk Show", "{name}");
+            assert_eq!(p.year, Some(year), "the date states the year: {name}");
+        }
+    }
+
+    /// **What that precedence must not take**, one name per guard, each with a
+    /// head of its own so a single guard failing cannot be masked by an
+    /// earlier one declining.
+    ///
+    /// Every line is red when its own guard is deleted:
+    ///
+    /// * `Blade Runner 2049` — the opening word is not the year `find_year`
+    ///   chose, so the date's year must not replace it. Drop the
+    ///   `opening_year(..) == Some(found)` test and this reads 2017.
+    /// * `Series Title (1955)` — a parenthesised year is an explicit one and
+    ///   `find_year` already prefers it. The opening word is `Series`, so the
+    ///   same test declines. This case wants 1954 and stays wrong; it is
+    ///   recorded here as a decline, not as a pass.
+    #[test]
+    fn the_opening_year_precedence_declines_where_it_should() {
+        let p = parse_filename("Blade Runner 2049 2017 06 05 BluRay.mkv");
+        assert_eq!(p.title, "Blade Runner 2049");
+        assert_eq!(p.year, Some(2049), "the opening word is not the year found");
+
+        let q = parse_filename("Series Title (1955) - 1954 01 23 05 00 00 - Cottage.ts");
+        assert_eq!(
+            q.year,
+            Some(1955),
+            "a parenthesised year is an explicit one"
+        );
+    }
+
+    /// [`opening_year`]'s own guards, each on its own line.
+    ///
+    /// **A filename cannot isolate these.** `20201013 Show 2019 06 05` reads
+    /// 2019 whether the width refusal is there or not — the run and the year
+    /// found differ either way, so the precedence declines for the other
+    /// reason and the control cannot go red. A guard tested only through a
+    /// name that another guard already refuses is not tested at all, which
+    /// this file has recorded happening before. So the helper is called
+    /// directly and every line here is red on its own deletion.
+    #[test]
+    fn an_opening_year_is_a_whole_four_digit_run_in_range() {
+        assert_eq!(opening_year("2020 A Late Talk Show 2012 16 02"), Some(2020));
+        assert_eq!(opening_year("2020"), Some(2020), "four digits and no more");
+        // The width refusal: an eight-digit run is a date written as one token.
+        assert_eq!(opening_year("20201013 Show"), None);
+        // The range, the same 1900–2100 every other year guard in this file uses.
+        assert_eq!(opening_year("1899 Show"), None);
+        assert_eq!(opening_year("2101 Show"), None);
+        // Not at the front, and not a digit run at all.
+        assert_eq!(opening_year("Show 2020"), None);
+        assert_eq!(opening_year("202 Show"), None);
+        assert_eq!(opening_year(""), None);
+        // **Multi-byte, and the helper indexes bytes.** A CJK head must return
+        // `None` rather than panic; slicing a `str` by a computed offset has
+        // panicked three times on this project.
+        assert_eq!(opening_year("当我飞奔向你 2020"), None);
+    }
+
     /// A head with no letter in it is not a title to keep, so the cut declines
     /// rather than leaving `9`. **This is the guard that carries `9-1-1`** — a
     /// real show whose name offers `1 1 2016` as a date — and the sweep's five
@@ -4145,14 +4584,18 @@ mod tests {
             "Ep01 (D2201EC5)"
         );
 
-        // A year inside the show title is still lost, and this rule does not
-        // reach it: the year branch cuts at `2018` long before the marker is
-        // looked at, so `Anon Show 2018 EP06` yields `Anon Show`. That is the
-        // `Wonder Woman 1984` shape on the TV side; it needs the year branch,
-        // not this one.
+        // **A year inside the show title is no longer lost.** This block used
+        // to assert `Anon Show` and say so in its own words — *"the year branch
+        // cuts at `2018` long before the marker is looked at … it needs the
+        // year branch, not this one"*. It does, and the year branch now asks
+        // the marker before it cuts. The assertion is the same shape; what it
+        // records changed from a known gap to the fix.
+        let p = parse_filename("Anon Show 2018 EP06 720p x265 GROUP.mp4");
+        assert_eq!(p.title, "Anon Show 2018");
+        assert_eq!(p.episode, Some(6));
         assert_eq!(
-            parse_filename("Anon Show 2018 EP06 720p x265 GROUP.mp4").title,
-            "Anon Show"
+            p.year, None,
+            "a name that marks an episode has no film year"
         );
     }
 
