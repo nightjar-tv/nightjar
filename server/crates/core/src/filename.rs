@@ -2407,30 +2407,32 @@ fn find_season_episode(lower: &str) -> Option<SeasonEpisodeHit> {
                 }
             }
         }
-        // 1x02 / 5x20-21 / 8x01-02-03
+        // 1x02 / 5x20-21 / 8x01-02-03 / 2009x09
         //
         // The season digits must be a **whole** run: bounded on the left by a
-        // non-digit, and no longer than two. Without both halves the scan
-        // starts mid-number and reads a resolution as an episode —
+        // non-digit, and no longer than two — or four in the year range, for
+        // which see [`bare_year_season_ok`]. Without the whole-run test the
+        // scan starts mid-number and reads a resolution as an episode —
         // `1080x1920` matched at the `8`, giving season 80 episode 192, which
         // turned any movie carrying a resolution into an episode. Codec and
         // bit-depth tokens are unaffected because they have no digits before
         // the `x` at all (`x264`, `x265`) or no `x` (`h.264`).
         if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_digit()) {
             let mut j = i;
-            let mut season = 0i32;
             let mut digits = 0;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                if digits < 2 {
-                    season = season * 10 + (bytes[j] - b'0') as i32;
-                }
                 j += 1;
                 digits += 1;
             }
-            if (1..=2).contains(&digits) && j < bytes.len() && bytes[j] == b'x' {
+            let season = lower[i..j].parse::<i32>().unwrap_or(0);
+            if (digits == 4 || (1..=2).contains(&digits)) && j < bytes.len() && bytes[j] == b'x' {
                 j += 1;
                 let (episode, edigits, whole) = read_episode_digits(bytes, &mut j);
-                if edigits > 0 && episode > 0 && whole {
+                if edigits > 0
+                    && episode > 0
+                    && whole
+                    && (digits <= 2 || bare_year_season_ok(season, edigits))
+                {
                     let end = extend_episode_span(bytes, j, season, episode);
                     return Some((i, season, Some((episode, end))));
                 }
@@ -2439,6 +2441,29 @@ fn find_season_episode(lower: &str) -> Option<SeasonEpisodeHit> {
         i += 1;
     }
     declined.map(|(at, season)| (at, season, None))
+}
+
+/// May a bare `NNNNxNN` claim a four-digit season?
+///
+/// **Only in the year range, and only in front of a run of at most two
+/// digits.** `2016x231` was refused wholesale with the reason written down —
+/// *"it is the shape of a resolution: `1920x804` puts a plausible year on the
+/// left and a whole three-digit run on the right"*. The right-hand half of
+/// that sentence is a rule, and it was never written as one.
+///
+/// **No resolution has a two-digit height.** Every `(19|20)NNxN…` in the
+/// evidence splits cleanly on the width of the run after the `x`: three or
+/// four digits are `1920x1080`, `1920x804`, `2016x231` — 8 occurrences across
+/// the corpus, and every one of them a resolution or the refused case. One or
+/// two digits are `2009x09`, `2010x15` and `2010x16` — 3 occurrences, in two
+/// names, both of which assert a year-season. **The dogfood library and the
+/// sweep hold none of either**, so this refuses nothing real and claims
+/// nothing real.
+///
+/// The marked spelling `S2016E231` is unaffected and still needs no width
+/// test: an `S` and an `E` are evidence a resolution does not carry.
+fn bare_year_season_ok(season: i32, episode_digits: usize) -> bool {
+    (1900..=2100).contains(&season) && episode_digits <= 2
 }
 
 /// The widest episode number an episode marker may carry.
@@ -2687,12 +2712,18 @@ fn read_repeated_season(bytes: &[u8], i: usize) -> Option<(i32, usize)> {
         let mut k = i;
         let mut n = 0i32;
         let mut digits = 0;
-        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 2 {
+        // **Four digits, for the same year-season the token scan now reads.**
+        // `2010x15 - 2010x16` repeats its season and a two-digit reader stopped
+        // at `20`, so the range died on the repetition even though the first
+        // token had been claimed. The guard here is not a width test but the
+        // caller's: a repeated season is only accepted when it **equals the
+        // season already claimed**, which a resolution cannot do.
+        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 4 {
             n = n * 10 + (bytes[k] - b'0') as i32;
             k += 1;
             digits += 1;
         }
-        if digits > 0 && k < bytes.len() && bytes[k] == b'x' {
+        if matches!(digits, 1 | 2 | 4) && k < bytes.len() && bytes[k] == b'x' {
             return Some((n, k));
         }
     }
@@ -4010,6 +4041,52 @@ mod tests {
             let p = parse_filename(name);
             assert_eq!(p.episode, Some(episode), "{name}");
             assert_eq!(p.episode_end, None, "{name}");
+        }
+    }
+
+    /// **A bare four-digit season, in the one shape a resolution cannot take.**
+    ///
+    /// `2016x231` stays refused and the reason is unchanged — a plausible year
+    /// on the left and a whole three-digit run on the right is what
+    /// `1920x804` looks like. **The width of the run after the `x` is what
+    /// separates them**, and it was in the prose without being in the code.
+    ///
+    /// Two lines, two names. The first is a whole filename that is only a
+    /// token, so its title is empty; the second repeats its season across a
+    /// padded dash, which is what makes it a range. Red on removing the
+    /// four-digit branch from `find_season_episode`, and the second line is
+    /// red on its own if `read_repeated_season` goes back to two digits.
+    #[test]
+    fn a_bare_year_season_reads_a_two_digit_episode() {
+        let p = parse_filename("2009x09 [SDTV].avi");
+        assert_eq!(p.title, "");
+        assert_eq!(p.season, Some(2009));
+        assert_eq!(p.episode, Some(9));
+
+        let q = parse_filename("World Series of Sonarr - 2010x15 - 2010x16 - HD TV.mkv");
+        assert_eq!(q.title, "World Series of Sonarr");
+        assert_eq!(q.season, Some(2010));
+        assert_eq!(q.episode_numbers(), vec![15, 16]);
+    }
+
+    /// **The resolutions this must not claim**, each with a head of its own.
+    ///
+    /// All three are real names from the corpus. `1920x1080` and `1920x804`
+    /// put a year on the left of an `x`; `2016x231` is the case the board
+    /// refused and it stays refused. **Red on deleting `episode_digits <= 2`
+    /// from [`bare_year_season_ok`]** — without it all three become episodes,
+    /// which is the worst class of error the parser can make.
+    #[test]
+    fn a_bare_year_season_declines_a_resolution() {
+        for name in [
+            "[Arid] 5 Centimeters per Second (BDRip 1920x1080 Hi10 FLAC) [FD8B6FF2].mkv",
+            "[Kulot] Violet Evergarden Gaiden (BDRip 1920x804 x264) [Dual-Audio].mkv",
+            "Series - 2016x231",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, None, "{name}");
+            assert_eq!(p.episode, None, "{name}");
+            assert_eq!(p.kind, MediaKind::Movie, "{name}");
         }
     }
 
