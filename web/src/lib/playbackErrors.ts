@@ -19,7 +19,7 @@ export type SessionGoneReason = Exclude<LoadFailureAction, 'retry'>;
  * amount of retrying mints a credential the browser does not have, and until
  * 2026-08-31 it fell through to the retry arm — measured at about 100 requests
  * in 25 seconds against `master.m3u8`, with nothing shown to the person
- * watching (`nightjar-meta` `notes/OPEN-DEFECTS.md` entry 16).
+ * watching.
  *
  * Everything else is a blip worth another go: a dropped connection, a 5xx while
  * FFmpeg catches up, a 503 from the segment hold.

@@ -20,9 +20,9 @@ Measured on a healthy WEBDL title (Elementary 3x05, mid-seek, Copy):
 
 > **Re-scoped 2026-08-31. This measures a 2 s grid, and was read as excluding
 > copy from any full-title listing.** ADR-0054 decision 2 cited it for that
-> exclusion. §S8 of `nightjar-meta`'s `stay-ahead-vt-2026-08-20.md` measured a
-> **20 s** window on a real title three days before that ADR was written and
-> found it stable, and it is now measured against the product: 8 of 8 listed
+> exclusion. A human trial on 2026-08-20 — three days before that ADR was
+> written — measured a **20 s** window on a real title and found it stable
+> (67 windows listed, 20 on disk; method and raw data maintainer-private), and it is now measured against the product: 8 of 8 listed
 > URIs served. **Copy cannot hold a 2 s grid — which is what the table below
 > says — and it can hold a full-title listing on a coarser one.** The figure is
 > correct; the conclusion drawn from it was wider than the measurement.

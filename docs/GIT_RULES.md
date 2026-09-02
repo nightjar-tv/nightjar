@@ -110,6 +110,22 @@ agent which sibling checkouts to read and what to do when they are absent. They
 address a machine that either has both trees or does not, they already say the
 repository is private, and they are not offered to a reader as evidence.
 
+**Authorization records are the other exception, and they are never amended.**
+The notes §7 requires are this repository's audit trail; they name what was
+authorized, for which repositories, and what was excluded. **A record is a
+statement about a moment, so editing one to satisfy a rule written later
+falsifies the thing it exists to prove.** They stay as written, private names
+and all. What they must not become is a substitute for provenance elsewhere: an
+ADR does not cite an authorization note to support a measurement.
+
+**Checking for breaches has a blind spot worth naming.** Grepping for the names
+of private repositories finds citations that point *outward*. It does not find a
+citation that is about to become unreachable because the file it names is
+moving. **After moving or deleting files, grep for the old paths as well as for
+the private names.** `docs/adr/0049` cited a census script by its in-repository
+path; the sweep matched no pattern against it, and deleting the script is what
+surfaced it. Nothing in the check would have.
+
 > **Added 2026-09-02, and this repository does not yet comply.** 47 files break
 > it at `4d370a3` — six of them source or shipped, including six sites in
 > `hls.rs` and three under `web/src/lib`. **The rule lands before the sweep on

@@ -12,8 +12,7 @@
  * **So the offset is `mediaOriginMs`, not `landedMs`.** The server states it
  * per playlist because which listing a run serves is a runtime property that
  * can change mid-session, and reading the land instead added it twice: a
- * session landed at 600 s showed `20:02` on a 15-minute title. See
- * `nightjar-meta` `notes/OPEN-DEFECTS.md` entry 12.
+ * session landed at 600 s showed `20:02` on a 15-minute title.
  *
  * `mediaOriginMs` is mutable (every run swap, and every listing change).
  * Callers must pass the **current** value, not one cached at first attach.

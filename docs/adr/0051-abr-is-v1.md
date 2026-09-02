@@ -9,8 +9,11 @@
   alignment across renditions); ADR-0022 (capability profiles, which pick the
   ceiling a ladder sits under)
 - Gate: Gate 2 — the corpus plays in the web player
-- Related: `nightjar-meta/notes/hw/stay-ahead-vt-2026-08-20.md` § Locked spike
-  decisions, which measured the three-rung shape
+- Measured 2026-08-20 on an Apple M1 (VideoToolbox): the three-rung shape,
+  human-stable, with a High-only native master measured and rejected. **That
+  spike ran cook-on-miss with 20 s windows and MPEG-TS**, a session shape this
+  ADR's own dependencies have since replaced, so the rungs are unverified
+  against the shipping shape. Method and raw data are maintainer-private
 
 ## Context
 

@@ -4,7 +4,6 @@
 # FFmpeg is Debian bookworm's package, invoked as an external process (not
 # linked). Intel VAAPI/QSV need the media drivers in the image and
 # --device=/dev/dri at run time. We do not vendor a competitor's FFmpeg build.
-# See nightjar-meta/notes/hw/packaging-ffmpeg-image.md.
 
 FROM node:22-bookworm AS web
 WORKDIR /src/web

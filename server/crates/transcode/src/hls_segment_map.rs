@@ -377,8 +377,7 @@ pub fn ingest_run_index(
         // `a2d0d73` against a real library** — 1,322 triggers, every one of
         // them 21, 40 or 42 ms, at or under one frame period, and 39,740
         // cascade behind them because a skip does not advance the expected
-        // end. Not one was a genuine discontiguity
-        // (`nightjar-meta` `OPEN-DEFECTS.md` entry 21).
+        // end. Not one was a genuine discontiguity.
         //
         // **What the snap guarantees is a different thing and guards itself.**
         // That a stored key is close enough to the listed key to be named by

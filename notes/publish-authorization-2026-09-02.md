@@ -25,7 +25,8 @@ own.
 
 ## What the branch is
 
-One change to `notes/loop3/scripts/corpus_results.sh`: the throwaway crate it
+One change to the corpus harness script then under `notes/loop3/scripts/`
+(moved to the maintainer notes since): the throwaway crate it
 writes now takes a `nightjar-scanner` path dependency, and passes `ROOT` through.
 
 **Because the corpus harness changed entry point.** `corpus_run.rs` — which lives

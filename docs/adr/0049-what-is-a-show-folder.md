@@ -8,8 +8,9 @@
   unit per folder); ADR-0047 (collision evidence, all of which is folder-shaped);
   ADR-0026 §8.6 (the Visible proxy, which keys on the same grouping)
 - Gate: Gate 3 — metadata auto-match ≥95% correct
-- Related: the matcher oracle's `tv.scene` shape;
-  `notes/loop3/scripts/group_census.py`, which produces the census below
+- Census below produced 2026-08-29 by a group-census script over the
+  dogfood library, alongside the matcher oracle's `tv.scene` shape. Script,
+  method and raw data are maintainer-private
 
 ## Context
 

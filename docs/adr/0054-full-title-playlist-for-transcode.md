@@ -17,8 +17,9 @@
   [ADR-0052](0052-keyframe-cadence-per-encode-leg.md) (the grid the listing
   asserts)
 - Gate: Gate 2 — a seek into untranscoded media starts under three seconds
-- Related: `nightjar-meta/notes/hw/stay-ahead-vt-2026-08-20.md` §S7, §S7b, §S7d
-  (the player evidence); `docs/plans/2026-08-23-hybrid-session-shape.md` slice S3
+- Player evidence measured 2026-08-20 on an Apple M1 (VideoToolbox) and
+  2026-08-31 against the shipped build; slice S3 of the 2026-08-23 session-shape
+  plan. Method and raw data are maintainer-private
 
 ## Context
 
@@ -132,8 +133,9 @@ and its own map. The 2 s grid holds on all three rungs.
    > above, which are consistent with `-g 48` at `24000/1001` and are not the
    > same thing as having run it.
    >
-   > Measurement and method: `nightjar-meta`
-   > `notes/OPEN-DEFECTS.md` entries 18 and 20.
+   > Measured 2026-08-31 against a real library: **129 of 1814 items** listed a
+   > grid the encoder could not fill, and zero keys were unsnapped after the fix
+   > across 455 written. Method and raw data are maintainer-private.
 
 2. **Copy and remux keep the per-run map-assembled playlist** of ADR-0020 §4.
    Copy cuts at source keyframes and cannot hold a uniform grid: on a healthy
@@ -148,9 +150,8 @@ and its own map. The 2 s grid holds on all three rungs.
    > not that it cannot have a full-title listing. That figure is ADR-0020's,
    > dated 2026-07-31, on a synthetic 2 s grid over Elementary 3x05.
    >
-   > **§S8 of `nightjar-meta`'s `stay-ahead-vt-2026-08-20.md` measured the
-   > 20 s shape three days before this ADR was written, and this decision
-   > cited the 77% instead.** A human trial on a real title: the 2 s grid gave
+   > **A human trial on 2026-08-20 measured the 20 s shape three days before
+   > this ADR was written, and this decision cited the 77% instead.** A human trial on a real title: the 2 s grid gave
    > one FFmpeg per skipped cue, a 4 s worst wait, and on the second seek a
    > video stall with audio that went robotic and stayed. One MPEG-TS per 20 s
    > window was **"stable"** — 67 windows listed, 20 on disk, last first byte
@@ -204,20 +205,17 @@ and its own map. The 2 s grid holds on all three rungs.
    > **What made the hold expire in practice was a different defect.** The
    > map-build gate compared a snapped start against a raw duration and dropped
    > **41,062 segments a session** from the map; a listed URI naming one of them
-   > had nothing to serve and ran to the bound. That is fixed in `9d4aff2`
-   > (`nightjar-meta` entry 21), and the two logs taken since carry **zero**
-   > holds against three on the build before it. **The bound still exists**, so
+   > had nothing to serve and ran to the bound. That is fixed in `9d4aff2`,
+   > and the two logs taken since carry **zero** holds against three on the
+   > build before it. **The bound still exists**, so
    > a genuinely slow encode can still reach it, and the sentence has to say so
    > rather than promise otherwise.
-   >
-   > `nightjar-meta` `notes/OPEN-DEFECTS.md` entry 17.
 
    > **Corrected 2026-08-31 — those figures are not this path's, and this path
    > has its own now.** The sentence above cites `976 to 1132 ms` for the
-   > encoder a cold URI starts. Both numbers come from `s6_origin.py` under
-   > `~/nightjar-spikes/2026-08-21-scheduler/`: ADR-0050 §4's table, and the
-   > reap-delay table in `nightjar-meta`'s
-   > `docs/plans/2026-08-23-hybrid-session-shape.md`. **That harness never calls
+   > encoder a cold URI starts. Both numbers come from the 2026-08-21
+   > scheduler spike origin — a standalone harness, not this product:
+   > ADR-0050 §4's table, and its reap-delay table. **That harness never calls
    > the session API**, which this ADR's own decision 2 correction says of the
    > same spike family. They are real measurements of a spike origin, cited for
    > a product path they never ran.
@@ -303,8 +301,8 @@ and its own map. The 2 s grid holds on all three rungs.
    > correct because the inits are identical.** Whether a copied init decodes
    > the segments it is served with is **untested**.
    >
-   > Measurement and method: `nightjar-meta`
-   > `notes/init-identity-across-runs-2026-08-31.md`.
+   > Measured 2026-08-31 across four spawned runs. Method and raw data are
+   > maintainer-private.
 
 5. **One playlist URI per session for transcode**, replacing one per run. The
    session API stays the authority on land, and clients still do not construct
@@ -385,9 +383,8 @@ and its own map. The 2 s grid holds on all three rungs.
    > never reaches the fallback; copy can, mid-session, while its keyframe map
    > is still arriving.
    >
-   > Measurement and method: `nightjar-meta`
-   > `notes/session-scoped-playlist-uri-2026-08-31.md`; slice
-   > `docs/plans/2026-08-31-s3b-session-scoped-playlist-uri.md`.
+   > Measured 2026-08-31; slice S3b, shipped in #189. Method and raw data are
+   > maintainer-private.
 
 ## Consequences
 
