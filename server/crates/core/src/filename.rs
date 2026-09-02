@@ -2228,10 +2228,27 @@ fn strip_extension(name: &str) -> &str {
 /// extension — a raw H.264 elementary stream — and `1080` is a resolution that
 /// lost its `p`. Both stay extensions because neither is a year. A width test
 /// would be a comment: no one-, two- or three-digit number reaches 1900.
+///
+/// **One or two digits is not an extension either, and no container is
+/// spelled that way.** The year rule covers four; three is `.264` and `.265`
+/// and stays. What was left was `Series T Se.3 afl.3`, where the marker's own
+/// number was cut off as a container and the name reported a season with no
+/// episode — the same defect the year rule was written for, one width down.
+///
+/// **The library cannot see this**: 0 of the 25,043 dogfood basenames end in a
+/// dot followed only by digits, so no real file changes shape. The corpus holds
+/// four such names, and the three that pass today keep passing — their claim
+/// comes from a marker or a date earlier in the name, not from the suffix.
 fn is_extension(suffix: &str) -> bool {
     (1..=4).contains(&suffix.len())
         && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+        && !is_short_digit_run(suffix)
         && !is_year_token(suffix)
+}
+
+/// A run of one or two digits and nothing else.
+fn is_short_digit_run(s: &str) -> bool {
+    (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A run of digits that is a year in 1900–2100.
@@ -3991,6 +4008,30 @@ mod tests {
             parse_filename("Another Show.264").title,
             "Another Show",
             "a raw H.264 elementary stream is a real extension"
+        );
+    }
+
+    /// **One width down, the same defect the year rule was written for.**
+    ///
+    /// `Series T Se.3 afl.3` had its last `3` cut off as a container, so the
+    /// number a marker introduces went missing. No container is spelled as one
+    /// or two digits, and **0 of the 25,043 dogfood basenames end in a dot
+    /// followed only by digits**, so nothing real changes shape.
+    ///
+    /// Red on deleting `is_short_digit_run` from [`is_extension`]. Each name
+    /// has a head of its own, and the last line is the boundary: three digits
+    /// is `.264`'s width and stays an extension.
+    #[test]
+    fn a_one_or_two_digit_suffix_is_not_a_file_extension() {
+        assert_eq!(parse_filename("Some Programme.3").title, "Some Programme 3");
+        assert_eq!(
+            parse_filename("Another Show Here.70").title,
+            "Another Show Here 70"
+        );
+        assert_eq!(
+            parse_filename("A Third Title.264").title,
+            "A Third Title",
+            "three digits is the raw H.264 width and stays an extension"
         );
     }
 
