@@ -169,13 +169,26 @@ pub fn library_exists(conn: &Connection) -> Result<bool, String> {
     Ok(n > 0)
 }
 
+/// Look an account up by name, without regard to case.
+///
+/// **`Root` and `root` are one account** (migration 025). The column's own
+/// comparison is byte-wise, so this said no to a correctly-typed password
+/// whose username differed in case — and ADR-0034 item 5 makes an unknown
+/// username and a wrong password deliberately indistinguishable, which is
+/// right for enumeration resistance and means a case slip is unreportable.
+/// The server cannot say *"wrong case"* without saying *"this user exists"*.
+///
+/// `COLLATE NOCASE` here matches `idx_accounts_username_nocase`, so the
+/// lookup still uses an index. **The stored spelling is returned unchanged**:
+/// the row carries whatever case the account was created with, and only the
+/// comparison is case-blind.
 pub fn account_by_username(
     conn: &Connection,
     username: &str,
 ) -> Result<Option<AccountRow>, String> {
     conn.query_row(
         "SELECT id, username, password_hash, role, max_concurrent_sessions
-         FROM accounts WHERE username = ?1",
+         FROM accounts WHERE username = ?1 COLLATE NOCASE",
         params![username],
         map_account,
     )
@@ -602,6 +615,61 @@ mod tests {
     }
 
     /// The account insert is first, so a duplicate username never reaches the
+    /// OPEN-DEFECTS entry 14, the uniqueness half. `Root` and `root` were two
+    /// accounts and the `UNIQUE` constraint did not stop it, because migration
+    /// 020 gave the column no collation.
+    #[test]
+    fn two_usernames_differing_only_in_case_cannot_both_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_account_with_profile(&conn, "Root", "hash", "owner", "Main", "ref0").unwrap();
+        for typed in ["root", "ROOT", "rOoT"] {
+            assert!(
+                create_account_with_profile(&conn, typed, "hash", "member", "Other", "ref1")
+                    .is_err(),
+                "{typed} must collide with the stored Root"
+            );
+        }
+        assert_eq!(list_accounts(&conn).unwrap().len(), 1);
+        let profiles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM profiles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(profiles, 1, "no orphan profile from the refused inserts");
+    }
+
+    /// The login half. A case slip used to be rejected with the same message a
+    /// wrong password gets (ADR-0034 item 5 makes the two indistinguishable on
+    /// purpose), so it was unreportable as well as wrong.
+    #[test]
+    fn a_login_finds_its_account_whatever_case_is_typed() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_account_with_profile(&conn, "Root", "hash", "owner", "Main", "ref0").unwrap();
+        for typed in ["Root", "root", "ROOT", "rOoT"] {
+            let found = account_by_username(&conn, typed)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{typed} must find the account"));
+            // **The stored spelling comes back, not the typed one.** Only the
+            // comparison is case-blind; the row is unchanged.
+            assert_eq!(found.username, "Root");
+        }
+        assert!(
+            account_by_username(&conn, "rooot").unwrap().is_none(),
+            "case-insensitive is not fuzzy"
+        );
+    }
+
+    /// A name that is not a collision must still be its own account, or the
+    /// index would be doing more than it was asked to.
+    #[test]
+    fn distinct_usernames_are_unaffected() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_account_with_profile(&conn, "Root", "hash", "owner", "Main", "ref0").unwrap();
+        create_account_with_profile(&conn, "rooter", "hash", "member", "Other", "ref1").unwrap();
+        assert_eq!(list_accounts(&conn).unwrap().len(), 2);
+    }
+
     /// profile insert. This asserts the ordering; `a_failed_profile_insert_
     /// rolls_back_the_account` is the one that exercises the rollback.
     #[test]
