@@ -5560,6 +5560,114 @@ mod tests {
         );
     }
 
+    /// **ADR-0051 decision 2: all three rungs transcode on the same 2 s IDR
+    /// grid.** A ladder is only switchable if a segment boundary in one
+    /// rendition is a segment boundary in every other, so this is the property
+    /// the whole ladder rests on — and S6 is not scoped yet, which is why the
+    /// assertion lands before the feature rather than after it.
+    ///
+    /// **It holds structurally, and this pins the reason.** The grid comes
+    /// from [`produced_segment_ms`] and [`VideoEncodePlan::gop_frames`], and
+    /// both read `source_frame_rate` and nothing else. **The three fields a
+    /// rung varies — `max_height`, `max_bitrate_bps` and `tone_map` — are
+    /// never consulted.** One session, one source, one rate, so one grid.
+    ///
+    /// **What this does not prove.** That two real encoder processes place
+    /// IDRs on identical frames. That is a property of FFmpeg and the driver,
+    /// not of this arithmetic, and it needs two legs run over one source and
+    /// their boundaries compared. `-sc_threshold 0` on the
+    /// `honours_force_key_frames` arm removes the obvious way it could differ
+    /// — a scene cut detected at 6 Mbps and not at 2 — and the frame-count arm
+    /// pins `keyint_min` to `-g`, but neither is the same as having measured
+    /// it.
+    ///
+    /// **Naming the guard's reach:** what fails here is a change that makes
+    /// the grid depend on a per-rung field. A change to how FFmpeg is invoked
+    /// per rung will not fail here and is not covered.
+    #[test]
+    fn every_rung_of_a_ladder_derives_one_grid() {
+        // ADR-0051 decision 2's rungs. One source, so one rate for all three.
+        let rate = Some((24000u32, 1001u32));
+        let rung = |max_height, max_bitrate_bps| VideoEncodePlan {
+            max_height,
+            max_bitrate_bps,
+            source_frame_rate: rate,
+            ..VideoEncodePlan::default()
+        };
+        let ladder = [
+            ("high 1080p @ 6M", rung(Some(1080), Some(6_000_000))),
+            ("mid  1080p @ 3M", rung(Some(1080), Some(3_000_000))),
+            ("low   720p @ 2M", rung(Some(720), Some(2_000_000))),
+        ];
+        const FILM: u64 = 7_200_000;
+
+        for leg in [
+            &crate::EncodeLeg::software(),
+            &crate::EncodeLeg::videotoolbox(),
+            &crate::EncodeLeg::qsv_sysmem(),
+        ] {
+            let mut grids = ladder.iter().map(|(name, p)| {
+                (
+                    *name,
+                    produced_segment_ms(leg, p, FILM),
+                    p.gop_frames(SEGMENT_MS),
+                )
+            });
+            let (first_name, first_ms, first_gop) = grids.next().expect("three rungs");
+            assert!(
+                first_ms.is_some(),
+                "{}: {first_name} has no grid",
+                leg.encoder
+            );
+            for (name, ms, gop) in grids {
+                assert_eq!(
+                    ms, first_ms,
+                    "{}: {name} lists a different segment cadence from {first_name}; \
+                     a boundary in one rung would not be a boundary in another",
+                    leg.encoder
+                );
+                assert_eq!(
+                    gop, first_gop,
+                    "{}: {name} derives a different -g from {first_name}",
+                    leg.encoder
+                );
+            }
+        }
+    }
+
+    /// The control for the test above, and the reason it is a separate one:
+    /// **an assertion that everything is equal passes just as well when the
+    /// function ignores its input entirely.**
+    ///
+    /// So this fails the same comparison on the one field a rung must never
+    /// change — the source rate — and does it on the frame-count arm, which is
+    /// the only arm where the rate moves the answer. On a leg that honours
+    /// `-force_key_frames` every rate lists `SEGMENT_MS`, so that arm cannot
+    /// tell an ignored input from an equal one.
+    #[test]
+    fn the_grid_does_move_when_the_source_rate_does() {
+        let plan_at = |num, den| VideoEncodePlan {
+            max_height: Some(1080),
+            max_bitrate_bps: Some(6_000_000),
+            source_frame_rate: Some((num, den)),
+            ..VideoEncodePlan::default()
+        };
+        let qsv = crate::EncodeLeg::qsv_sysmem();
+        const FILM: u64 = 7_200_000;
+
+        assert_ne!(
+            produced_segment_ms(&qsv, &plan_at(24000, 1001), FILM),
+            produced_segment_ms(&qsv, &plan_at(500, 21), FILM),
+            "23.976 and 23.8095 must not derive the same cadence, or the \
+             equality above proves nothing"
+        );
+        assert_ne!(
+            plan_at(24000, 1001).gop_frames(SEGMENT_MS),
+            plan_at(60, 1).gop_frames(SEGMENT_MS),
+            "24 and 60 fps must not derive the same -g"
+        );
+    }
+
     /// The rates a real 1814-item library holds, on the leg whose arithmetic
     /// they exercise.
     ///
