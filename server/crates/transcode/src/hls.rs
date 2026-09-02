@@ -6913,6 +6913,20 @@ mod tests {
         assert!(!wait_asset(&reg, &id, &seek_land).is_empty());
     }
 
+    // CONTROL ARM — OPEN-DEFECTS entry 27. This branch is a control and must
+    // never merge.
+    //
+    // This test failed once in CI, on `transcode/rungs-derive-one-grid`, run
+    // 33615038257. The commit under test added two pure-arithmetic tests and
+    // no production code, so it is an unlikely cause — but "unlikely cause" is
+    // an argument, not a control. The question a control answers is whether
+    // the test fails with the change absent.
+    //
+    // So: base `8eb7102`, the exact parent of the failing commit, with the two
+    // tests absent and only this comment added. Every other input is held
+    // still. A failure here says the flake lives on `main` and exonerates
+    // `4465a06`. A clean sweep bounds the rate rather than proving absence,
+    // and the bound is the honest result — see the branch's PR body.
     /// While a waiter holds for land A, a newer scrub moves pending to B.
     /// Once B's encode window is ready, a behind-window hold on A must 503
     /// (`no_fill_release_for_new_land`) so WebKit leaves dig-back — not sit
