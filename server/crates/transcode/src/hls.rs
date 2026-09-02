@@ -6914,7 +6914,7 @@ mod tests {
     }
 
     // CONTROL ARM — OPEN-DEFECTS entry 27. This branch is a control and must
-    // never merge. Run 2 of the sweep.
+    // never merge. Run 3 of the sweep.
     //
     // This test failed once in CI, on `transcode/rungs-derive-one-grid`, run
     // 33615038257. The commit under test added two pure-arithmetic tests and
