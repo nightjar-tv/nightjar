@@ -70,6 +70,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/023_confirmed_by_episode_title.sql"),
     ),
     (24, include_str!("../migrations/024_probe_frame_rate.sql")),
+    (
+        25,
+        include_str!("../migrations/025_accounts_username_case_insensitive.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -103,6 +107,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         } else {
             0
         };
+        // Migration 25 adds a case-insensitive unique index over `username`.
+        // If an install already holds two accounts differing only in case the
+        // index cannot be built, and SQLite would say so as
+        // `UNIQUE constraint failed: accounts.username`, which names neither
+        // row. Refuse first and name them.
+        if version == 25 {
+            refuse_colliding_usernames(conn)?;
+        }
 
         let tx = conn
             .unchecked_transaction()
@@ -288,6 +300,45 @@ fn derive_series_rows(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse migration 25 when an install already holds usernames that differ
+/// only in case, and say which ones (OPEN-DEFECTS entry 14).
+///
+/// **Merging or dropping one of them is not this migration's call.** The rows
+/// are two people's logins: `profiles`, watch state and `login_sessions` all
+/// hang off `accounts(id)`, so picking a winner moves one person's history
+/// onto the other's account, silently and without a way back. Boot stops
+/// instead, with both usernames and both ids in the message, and an operator
+/// decides.
+///
+/// **Nothing on disk today can hit this.** Every install these migrations have
+/// seen has one account. That is the reason to write the check rather than a
+/// reason to skip it: the case it guards is the one nobody will be ready for.
+fn refuse_colliding_usernames(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT group_concat(id || ' ' || quote(username), ', ')
+             FROM accounts
+             GROUP BY username COLLATE NOCASE
+             HAVING COUNT(*) > 1",
+        )
+        .map_err(|e| format!("prepare username collision check: {e}"))?;
+    let groups: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("username collision check: {e}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("username collision row: {e}"))?;
+    if groups.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "migration 25 refused: {} username(s) differ only in case, and this \
+         migration will not choose which account keeps the name. Rename one \
+         side of each group, then start again. Colliding rows (id username): {}",
+        groups.len(),
+        groups.join("; ")
+    ))
+}
+
 fn count_table(conn: &Connection, table: &str) -> Result<i64, String> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
         .map_err(|e| format!("count {table}: {e}"))
@@ -311,7 +362,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 24);
+        assert_eq!(v, 25);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -1839,5 +1890,78 @@ mod tests {
             err.to_string().to_lowercase().contains("foreign key"),
             "expected a foreign key violation, got: {err}"
         );
+    }
+
+    /// Rewind an already-migrated database to just before migration 25, the
+    /// way a real install upgrading into it looks.
+    fn rewind_to_24(conn: &Connection) {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_accounts_username_nocase;
+             DELETE FROM schema_migrations WHERE version = 25;",
+        )
+        .unwrap();
+    }
+
+    /// OPEN-DEFECTS entry 14. An install that already holds `Root` and `root`
+    /// cannot have the index built over it, and this migration will not pick a
+    /// winner: the rows are two people's logins, with profiles and watch state
+    /// hanging off each id.
+    #[test]
+    fn migration_25_refuses_an_install_whose_usernames_already_collide() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        rewind_to_24(&conn);
+        conn.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (1, 'Root', 'h', 'owner'), (2, 'root', 'h', 'member');",
+        )
+        .unwrap();
+
+        let err = migrate(&conn).expect_err("a colliding install must refuse");
+        assert!(err.contains("migration 25 refused"), "{err}");
+        // **Both rows named, with their ids.** An operator cannot act on
+        // "a collision exists".
+        assert!(err.contains("1 'Root'"), "{err}");
+        assert!(err.contains("2 'root'"), "{err}");
+        // Refused, not half-applied.
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 25",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 0, "the refused migration must not record itself");
+    }
+
+    /// The control for the check above: the same rewind, the same two
+    /// accounts, names that do not collide — and the migration applies.
+    /// Without this, a check that refused everything would read as correct.
+    #[test]
+    fn migration_25_applies_when_no_usernames_collide() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        rewind_to_24(&conn);
+        conn.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (1, 'Root', 'h', 'owner'), (2, 'rooter', 'h', 'member');",
+        )
+        .unwrap();
+
+        migrate(&conn).expect("no collision, so the migration applies");
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 25",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        // And the index it added is doing its job afterwards.
+        let dup = conn.execute_batch(
+            "INSERT INTO accounts (username, password_hash, role)
+                 VALUES ('ROOT', 'h', 'member');",
+        );
+        assert!(dup.is_err(), "the new index must refuse a case-variant");
     }
 }
