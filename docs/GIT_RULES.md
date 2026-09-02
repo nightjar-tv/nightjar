@@ -70,6 +70,56 @@ Commit messages and PR bodies follow the plain-prose register in
 - Vendored dependencies. Cargo/npm lockfiles yes; copied source trees no.
 - Working docs that do not bind contributors (plan, brand strategy, copy deck,
   writing checklist). Those live in a private maintainer repository.
+- **A reference a reader of this repository cannot follow.** Paths into the
+  private maintainer repositories, into a spike or measurement tree, or into
+  anyone's working checkout. See below.
+
+### Citations must resolve for the reader
+
+**This repository never cites a private one.** Not in source comments, not in
+ADRs, not in scripts. A path into a private tree resolves for the person who
+wrote it and for nobody else, and that is worse than no citation at all: **it
+reads as provenance and supplies none.** The reader cannot tell whether the
+claim was checked, or check it.
+
+That is why this section names no private repository either. A rule that
+listed them would publish the thing it exists to keep out, and §7 already says
+a rule should not reach into a repository it cannot name.
+
+The direction runs one way and never back:
+
+    this repository  <-  private maintainer notes  <-  spike and measurement trees
+
+A private repository may cite one further down. This one cites neither.
+
+**Keep the substance, drop the pointer.** The rule is about what a reference
+promises, not about deleting the reason a line exists:
+
+- **A comment explaining why code is the way it is** keeps its reason and loses
+  its reference. *"Entry 12"* means nothing here; the finding it names does.
+- **An ADR citing a measurement** states the figure, the date and the hardware
+  in the ADR itself, and says the raw data is maintainer-private. **Losing
+  provenance is worse than an unreachable path** — an ADR that names its
+  measurement and says where it is kept is honest; one that quietly drops the
+  citation is not.
+- **Absolute paths into a working tree or a media library** — `/Users/…`,
+  `/Volumes/…`, a scratch worktree — are never right in either.
+
+**Tooling instructions are the exception.** `CLAUDE.md` and `AGENTS.md` tell an
+agent which sibling checkouts to read and what to do when they are absent. They
+address a machine that either has both trees or does not, they already say the
+repository is private, and they are not offered to a reader as evidence.
+
+> **Added 2026-09-02, and this repository does not yet comply.** 47 files break
+> it at `4d370a3` — six of them source or shipped, including six sites in
+> `hls.rs` and three under `web/src/lib`. **The rule lands before the sweep on
+> purpose**, so the sweep has something to be measured against.
+>
+> **This is a backlog, not a leak.** This repository is private today. The rule
+> is about the state it is heading for, and nothing has reached a public reader.
+>
+> The count and the per-category treatment are recorded in the private
+> maintainer notes, dated the same day.
 
 ## 5. Tags & releases
 - Semantic versioning: `v1.2.3`. Tags are annotated and signed, created only
