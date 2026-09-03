@@ -2198,10 +2198,22 @@ impl HlsSessionRegistry {
                                         &mut deadline,
                                     );
                                 } else if session.child.is_none() {
+                                    eprintln!(
+                                        "ENTRY27-SITE-A child-none asset={} want_ms={} window_start={} behind={} listed={}",
+                                        file_name,
+                                        want_ms,
+                                        window_start,
+                                        want_ms < window_start,
+                                        want_is_listed(session, want_ms)
+                                    );
                                     return Err(PlaylistError::NotFound);
                                 } else if want_ms < window_start
                                     && !want_is_listed(session, want_ms)
                                 {
+                                    eprintln!(
+                                        "ENTRY27-SITE-B behind-window asset={} want_ms={} window_start={}",
+                                        file_name, want_ms, window_start
+                                    );
                                     // Producer-truth: a URI behind the cooking
                                     // window was never listed *for this run*.
                                     //
