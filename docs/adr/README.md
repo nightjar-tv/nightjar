@@ -65,9 +65,9 @@ not here — this page is the reference, not the tour.
 | [0047](0047-title-extension-admission-and-collision-evidence.md) | What may count as a title match, and what evidence may break a tie | **Proposed** | — | — |
 | [0048](0048-yearless-movie-collisions.md) | What may decide a yearless movie collision | **Accepted** (option B) | — | — |
 | [0049](0049-what-is-a-show-folder.md) | What counts as a show folder when the directory is per-episode | **Proposed** | — | — |
-| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | **Proposed** (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap; 2026-08-25, §5 measured vs inferred and the deletion ledger reconciled; corrected 2026-08-30, §5's waiter reason falsified and the seek rate measured) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
-| [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | **Proposed** | [0008](0008-abr-post-v1.md) §1 | — |
-| [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | **Proposed** | — | — |
+| [0050](0050-lead-held-session-shape.md) | A transcode session is one throttled encoder holding a lead | Accepted (amended 2026-08-23, §5 reap delay measured; 2026-08-24, §5 superseded encoder runs until reap; 2026-08-25, §5 measured vs inferred and the deletion ledger reconciled; corrected 2026-08-30, §5's waiter reason falsified and the seek rate measured) | [0007](0007-hls-transcode-sessions.md) §3, §4 | — |
+| [0051](0051-abr-is-v1.md) | Adaptive bitrate ships in v1 | Accepted | [0008](0008-abr-post-v1.md) §1 | — |
+| [0052](0052-keyframe-cadence-per-encode-leg.md) | The 2 s IDR grid is per encode leg, and derived from source fps | Accepted | — | — |
 | [0053](0053-which-layer-owns-the-kind.md) | Which layer decides a file's kind, once the parser can see its folder | **Proposed** (amended 2026-08-30 — `#171`/`#172` answered it in an unlisted shape; the seam stays unwired) | — | — |
 | [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** (decisions 1, 2 and 3 corrected 2026-08-31 by measurement; **decision 4 overturned** the same day — init is not identical across runs — which bounds decision 5; **decision 5 settled and shipped** in `#189`; decision 3's latency citation corrected and its trigger consequence named by [0055](0055-a-far-scrub-is-a-segment-miss.md)) | [0020](0020-copy-mode-segment-boundaries.md) §4 **in every mode**, and its miss policy | — |
 | [0055](0055-a-far-scrub-is-a-segment-miss.md) | A far scrub is a segment miss, not a POST | **Proposed** | — | — |
@@ -104,18 +104,22 @@ number, and reading it alone would say 0044 and 0045 are free. They are not.
 - **`—` in Supersedes/Superseded by** means exactly what it says: no
   relationship recorded either direction, not "not checked."
 - **`Proposed` means the decision is open, not that the code is absent.**
-  Ten entries carry it: 0002, 0042, 0046, 0047, 0049, 0050, 0051, 0052,
-  0053 and 0054. Count them in the table above rather than from this
+  Eight entries carry it: 0002, 0042, 0046, 0047, 0049, 0053, 0054 and
+  0055. **0050, 0051 and 0052 were accepted 2026-09-03** and left this
+  list. 0055 was on the table and missing from this paragraph before that
+  change, so it was wrong again in exactly the way it warns about.
+  Count them in the table above rather than from this
   paragraph — it said "ADR-0002 is the one `Proposed` entry" from 2026-08-07
   until 2026-08-30, and it was wrong about its own table for most of that
   time. It also pointed at a note in `CONTRIBUTING.md` that does not exist;
   that pointer is removed rather than replaced, because there is no
   documented rule for when a `proposed` ADR becomes `accepted`.
-- **Three of the ten have shipped in whole or in part**, which is why the
-  status cannot be read as "not built": ADR-0052 shipped in `#153`
-  (migration `024` names it), most of ADR-0050 shipped across `#158`–`#162`,
-  and ADR-0053's question was answered by `#171`/`#172` in a shape that
-  record did not list, now marked in its own file. ADR-0047's two collision
+- **A proposed entry may still have shipped**, which is why the status
+  cannot be read as "not built". ADR-0052 shipped in `#153` (migration `024`
+  names it) and most of ADR-0050 shipped across `#158`–`#162`; both are now
+  accepted. Among those still proposed, ADR-0053's question was answered by
+  `#171`/`#172` in a shape that record did not list, now marked in its own
+  file. ADR-0047's two collision
   classes are in the shipped scorer and are recorded nowhere accepted; see
   [ADR-0026](0026-metadata-pipeline.md) §2's 2026-08-30 amendment.
 - ADR-0002 in particular is not sign-off debt: it is an open decision every

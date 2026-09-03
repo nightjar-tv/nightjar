@@ -1,6 +1,6 @@
 # ADR-0051: Adaptive bitrate ships in v1
 
-- Status: **proposed**
+- Status: **accepted 2026-09-03**
 - Date: 2026-08-23
 - Supersedes: [ADR-0008](0008-abr-post-v1.md) §1. Sections 2, 3 and 4 of that
   ADR stand and are carried forward here as immediate obligations rather than
