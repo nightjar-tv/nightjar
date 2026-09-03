@@ -1,6 +1,6 @@
 # ADR-0050: A transcode session is one throttled encoder holding a lead
 
-- Status: **proposed** (§5 amended 2026-08-23 with the measured delay;
+- Status: **accepted 2026-09-03** (§5 amended 2026-08-23 with the measured delay;
   2026-08-24: a superseded encoder runs until reap rather than being
   suspended; 2026-08-25: §5 separates what was measured from what is
   inferred, and Consequences reconciles its deletion list against the

@@ -1,6 +1,6 @@
 # ADR-0052: The 2 s IDR grid is per encode leg, and derived from source fps
 
-- Status: **proposed**
+- Status: **accepted 2026-09-03**
 - Date: 2026-08-23
 - Amends: [ADR-0008](0008-abr-post-v1.md) §3, which assumed one recipe holds
   the grid on every encoder
