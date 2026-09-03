@@ -171,13 +171,43 @@ and its own map. The 2 s grid holds on all three rungs.
    > **scrub granularity is the window, not 2 s. Fine-grained seek stays
    > transcode.** Shipped in #182.
 
-3. **A listed URI is never 404. A hold that outlives `SEGMENT_WAIT` answers
-   503, for the client to retry.** The request is held until that segment lands
+3. **A listed URI is never 404, and neither is one this session accepted and
+   held for. A hold that outlives `SEGMENT_WAIT` answers 503, for the client to
+   retry.** The request is held until that segment lands
    in the store, and released then — not when the encoder that produced it
    finishes. A cold URI is a seek: the session starts an encoder at that media
    time (ADR-0050 §4), measured at a 976 to 1132 ms median and under 2.4 s
-   worst case. 404 is reserved for a URI outside the title or off the grid.
+   worst case. 404 is reserved for a URI outside the title or off the grid,
+   refused on the first look, before anyone waits on it.
 
+   > **Extended 2026-09-02 to a want the session accepted, and the heading
+   > changed with it. It read "A listed URI is never 404."** That guarantee
+   > keyed on the listing, and **the listing predicate is vacuous in the one
+   > regime where the protection matters.**
+   >
+   > `want_is_listed` returns `false` for every want when a session has no
+   > honest grid — `produced_segment_ms` returns `None` without a source frame
+   > rate, the cadence is `NoHonestGrid`, and `full_title_entries` is `None`.
+   > The `hls.rs` guard that reads `want_ms < window_start &&
+   > !want_is_listed(…)` then narrows nothing, and **a seek that moves the
+   > window turns a hold the session had already accepted into a 404.**
+   >
+   > **Not a corner.** `resolve_frame_rate` returns `None` on six paths — an
+   > unresolved library root, an ffprobe spawn failure, a non-zero exit, output
+   > with no `/`, an unparseable field, and a `0/0` rate from a
+   > variable-frame-rate source.
+   >
+   > **The client is the reason.** hls.js and Safari abandon a fragment on 404
+   > whatever the server's listing model says, and *"this session lists only its
+   > run window"* is a distinction the player never sees. **Decision 3 rests on
+   > a property of the client, not of the listing shape** — 404 is
+   > unrecoverable where 503 is retryable — so the guarantee follows the client
+   > and keys on acceptance. Once the session has looked at a want, decided the
+   > segment is still coming and made the client wait, it does not later answer
+   > the one code that tells the player to give up.
+   >
+   > Measured: `nightjar` #207, 4 of 20 CI runs, `OPEN-DEFECTS` entry 27.
+   >
    > **Heading rewritten 2026-09-02. It read "A listed URI is never 404 and
    > never 503."** That sentence was withdrawn on 2026-08-31 by the correction
    > below and left standing above it, so the decision opened with the claim it

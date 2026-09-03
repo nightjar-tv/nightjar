@@ -1925,6 +1925,16 @@ impl HlsSessionRegistry {
         let mut deadline = Instant::now() + SEGMENT_WAIT;
         let mut holding_for_land = false;
         let mut holding_no_fill = false;
+        // **Has this request already been held?** Set once the loop has slept a
+        // poll without answering, which is the moment the session accepted the
+        // want: it looked, decided the segment was still coming, and made the
+        // client wait for it.
+        //
+        // **A want the session accepted is never 404 afterwards**
+        // (ADR-0054 decision 3). 404 stays available on the *first* look, which
+        // is the case decision 3 reserves it for - a URI outside the title or
+        // off the grid, refused before anyone waits on it.
+        let mut accepted_hold = false;
         let enter_no_fill = |reason: &str,
                              session_id: &str,
                              file_name: &str,
@@ -2198,6 +2208,9 @@ impl HlsSessionRegistry {
                                         &mut deadline,
                                     );
                                 } else if session.child.is_none() {
+                                    if accepted_hold {
+                                        return Err(PlaylistError::NotReady);
+                                    }
                                     return Err(PlaylistError::NotFound);
                                 } else if want_ms < window_start
                                     && !want_is_listed(session, want_ms)
@@ -2212,6 +2225,21 @@ impl HlsSessionRegistry {
                                     // refuses a URI the playlist offers. An
                                     // unlisted want behind the window still
                                     // 404s, which is what this line was for.
+                                    //
+                                    // **`want_is_listed` is vacuously false
+                                    // when the session has no honest grid**, so
+                                    // the narrowing above protects nothing in
+                                    // exactly the regime that needs it: a seek
+                                    // moving the window turns a hold this
+                                    // session already accepted into a 404. The
+                                    // client cannot tell that session apart
+                                    // from any other - hls.js and Safari
+                                    // abandon the fragment on 404 whatever the
+                                    // server's listing model says - so
+                                    // acceptance decides here, not the listing.
+                                    if accepted_hold {
+                                        return Err(PlaylistError::NotReady);
+                                    }
                                     return Err(PlaylistError::NotFound);
                                 }
                             }
@@ -2225,6 +2253,7 @@ impl HlsSessionRegistry {
                 }
                 return Err(PlaylistError::NotReady);
             }
+            accepted_hold = true;
             std::thread::sleep(SEGMENT_POLL);
         }
     }
