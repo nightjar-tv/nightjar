@@ -2208,10 +2208,7 @@ impl HlsSessionRegistry {
                                         &mut deadline,
                                     );
                                 } else if session.child.is_none() {
-                                    if accepted_hold {
-                                        return Err(PlaylistError::NotReady);
-                                    }
-                                    return Err(PlaylistError::NotFound);
+                                    return Err(miss_refusal(accepted_hold));
                                 } else if want_ms < window_start
                                     && !want_is_listed(session, want_ms)
                                 {
@@ -2237,10 +2234,7 @@ impl HlsSessionRegistry {
                                     // abandon the fragment on 404 whatever the
                                     // server's listing model says - so
                                     // acceptance decides here, not the listing.
-                                    if accepted_hold {
-                                        return Err(PlaylistError::NotReady);
-                                    }
-                                    return Err(PlaylistError::NotFound);
+                                    return Err(miss_refusal(accepted_hold));
                                 }
                             }
                         }
@@ -3128,6 +3122,31 @@ fn grid_cadence_ms(
 ///
 /// `false` for a session with no full-title listing — copy and remux, or a leg
 /// with no honest cadence — which leaves the guard exactly as it was for them.
+/// The code a segment miss refuses with, once the session has looked at it.
+///
+/// **A want this session accepted is never 404 afterwards** (ADR-0054
+/// decision 3). `accepted_hold` is set once the wait loop has slept a poll
+/// without answering, which is the moment the session accepted the want: it
+/// looked, decided the segment was still coming, and made the client wait.
+///
+/// 404 stays available on the **first** look, which is the case decision 3
+/// reserves it for - a URI outside the title or off the grid, refused before
+/// anyone waits on it.
+///
+/// **This is a named function so the rule has one deterministic test.** Both
+/// refusal sites in `asset_wait`'s `Wait` arm go through it, and reaching
+/// either of them end to end depends on a seek landing inside one
+/// `SEGMENT_POLL` of a held request - measured at 2 runs in 20, which is not
+/// coverage. `a_want_this_session_accepted_is_never_404` pins the rule; the
+/// integration tests around it cannot.
+fn miss_refusal(accepted_hold: bool) -> PlaylistError {
+    if accepted_hold {
+        PlaylistError::NotReady
+    } else {
+        PlaylistError::NotFound
+    }
+}
+
 fn want_is_listed(session: &Session, want_ms: u64) -> bool {
     // Ask the listing, not the cadence. A predicate that answers "on the grid"
     // claims wants the playlist does not offer, and every caller reads this as
@@ -7050,6 +7069,166 @@ mod tests {
         assert!(!wait_asset(&reg, &id, &seek_land).is_empty());
     }
 
+    /// **The rule #208 added, pinned where it is deterministic.**
+    ///
+    /// Reaching either refusal site end to end needs a seek to land inside one
+    /// `SEGMENT_POLL` of a held request. Measured at **2 runs in 20** locally,
+    /// so an integration test named for this rule would look like coverage and
+    /// mostly not be it. The rule lives in [`miss_refusal`] for that reason.
+    #[test]
+    fn a_want_this_session_accepted_is_never_404() {
+        assert!(
+            matches!(miss_refusal(true), PlaylistError::NotReady),
+            "a want the session accepted must answer 503, which hls.js and \
+             Safari retry - not 404, which makes them abandon the fragment"
+        );
+        assert!(
+            matches!(miss_refusal(false), PlaylistError::NotFound),
+            "the first look keeps 404, which is the case ADR-0054 decision 3 \
+             reserves it for: a URI outside the title or off the grid"
+        );
+    }
+
+    /// **`want_is_listed` is vacuously false for a session with no honest
+    /// grid**, which is the regime #208's guard was written for.
+    ///
+    /// `nightjar` #211 measured the live CI failure arriving through the
+    /// behind-window branch, 20 of 20 times it fired - the branch whose
+    /// narrowing this vacuity removes. `OPEN-DEFECTS` entry 27.
+    ///
+    /// Every step is asserted, so a change to any one of them fails here by
+    /// name rather than silently moving a test onto the other regime - which is
+    /// what `VideoEncodePlan::default()` did to
+    /// `held_segment_waiter_no_fill_when_pending_moves`.
+    #[test]
+    fn no_source_rate_leaves_every_want_unlisted() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 60);
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                60_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                // No `source_frame_rate`. This is the regime, not an oversight.
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+
+        let sessions = reg.sessions.lock().unwrap();
+        let session = sessions.get(&id).unwrap();
+        assert!(
+            matches!(session_grid_cadence(session), GridCadence::NoHonestGrid),
+            "no source frame rate must mean no honest grid"
+        );
+        assert!(
+            full_title_entries(session).is_none(),
+            "no honest grid must mean no full-title listing"
+        );
+        // 40000 is on the 2 s grid and is still not listed. That is the whole
+        // point: the predicate is false because there is no listing at all,
+        // not because this want is off it.
+        assert!(
+            !want_is_listed(session, 40_000),
+            "want_is_listed must be vacuously false with no listing"
+        );
+        assert!(
+            !want_is_listed(session, 0),
+            "vacuously false means every want, including the first"
+        );
+        drop(sessions);
+        let _ = reg.stop(&id);
+    }
+
+    /// A held want is never answered 404, by whichever path releases it.
+    ///
+    /// **Named for what it guarantees on every run**, not for the branch it
+    /// sometimes reaches. The behind-window refusal is reached about 2 runs in
+    /// 20 - the rest release through `no_fill_release_for_new_land` - so this
+    /// is a smoke test over the whole hold, and
+    /// [`a_want_this_session_accepted_is_never_404`] is what pins the rule.
+    ///
+    /// It orders the hold ahead of the seek, which
+    /// `held_segment_waiter_no_fill_when_pending_moves` never did; that
+    /// omission is what made it load-dependent (`OPEN-DEFECTS` entry 27).
+    #[test]
+    fn a_held_want_is_never_answered_404() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 60);
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let id = reg
+            .start(
+                1,
+                &src,
+                0,
+                60_000,
+                SessionMode::Transcode,
+                stereo(),
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        wait_playlist(&reg, &id);
+        let _ = wait_first_listed_asset(&reg, &id);
+        std::thread::sleep(RESTART_MIN_INTERVAL);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reg_hold = Arc::clone(&reg);
+        let id_hold = id.clone();
+        // Ahead of the initial window, so the first look Waits rather than
+        // refusing: 40000 is not behind `window_start` until the seek moves it.
+        let hold_name = crate::hls_segment_map::time_keyed_segment_name(40_000);
+        std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let result = reg_hold.asset(&id_hold, &hold_name, None);
+            let _ = tx.send(result);
+        });
+
+        // The handshake takes thread-start latency out of the budget; the sleep
+        // then covers one poll, so the request has slept without answering and
+        // the session has accepted the want before the window moves.
+        ready_rx.recv().expect("hold thread started");
+        std::thread::sleep(SEGMENT_POLL + Duration::from_millis(40));
+        let _ = reg.seek(&id, 50_000);
+
+        let first = rx
+            .recv_timeout(SEGMENT_WAIT + Duration::from_secs(20))
+            .expect("held request returned");
+        assert!(
+            !matches!(first, Err(PlaylistError::NotFound)),
+            "a want this session accepted must not 404 afterwards; got {:?}",
+            first
+                .as_ref()
+                .map(|b| b.len())
+                .map_err(|e| format!("{e:?}"))
+        );
+        let _ = reg.stop(&id);
+    }
+
     /// While a waiter holds for land A, a newer scrub moves pending to B.
     /// Once B's encode window is ready, a behind-window hold on A must 503
     /// (`no_fill_release_for_new_land`) so WebKit leaves dig-back — not sit
@@ -7077,12 +7256,43 @@ mod tests {
                 vec![],
                 None,
                 None,
-                VideoEncodePlan::default(),
+                // **The rate is the point.** `make_fixture_secs` writes 25 fps,
+                // and this test used `VideoEncodePlan::default()`, whose
+                // `source_frame_rate` is `None`. That gave the session
+                // `NoHonestGrid`, so `full_title_entries` was `None` and
+                // `want_is_listed` was false for *every* want - and the
+                // contract below was being asserted in a regime it was never
+                // written for. See `accepted_hold_is_never_404_with_no_honest_grid`
+                // for that regime, tested on purpose and under its own name.
+                VideoEncodePlan {
+                    source_frame_rate: Some((25, 1)),
+                    ..VideoEncodePlan::default()
+                },
                 None,
             )
             .unwrap();
         wait_playlist(&reg, &id);
         let _ = wait_first_listed_asset(&reg, &id);
+
+        // **Pin the regime, do not assume it.** A future change to the plan or
+        // to `produced_segment_ms` that drops this session back to
+        // `NoHonestGrid` must fail here, not silently move the test onto the
+        // other path the way `VideoEncodePlan::default()` did.
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let session = sessions.get(&id).unwrap();
+            assert!(
+                matches!(session_grid_cadence(session), GridCadence::Cadence(_)),
+                "the contract this test is named for is a full-title one; \
+                 without an honest grid it exercises the other regime"
+            );
+            assert!(
+                want_is_listed(session, 40_000),
+                "segment 40000 must be listed for the supersede contract to be \
+                 the thing under test"
+            );
+        }
+
         std::thread::sleep(RESTART_MIN_INTERVAL);
 
         let (tx, rx) = std::sync::mpsc::channel();
