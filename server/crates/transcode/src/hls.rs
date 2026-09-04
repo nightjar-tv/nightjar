@@ -3917,6 +3917,20 @@ mod tests {
         ok
     }
 
+    fn skip_without_fixture(path: &Path) -> bool {
+        if path.is_file() {
+            return false;
+        }
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FIXTURES").is_some() {
+            panic!(
+                "fixture required (NIGHTJAR_TEST_REQUIRE_FIXTURES set) but missing: {}",
+                path.display()
+            );
+        }
+        eprintln!("skipping: missing {}", path.display());
+        true
+    }
+
     /// A minimal session for unit tests that only touch process bookkeeping.
     fn make_test_session(dir: &Path) -> Session {
         Session {
@@ -5451,8 +5465,7 @@ mod tests {
         }
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/hevc_hdr10_mp4.mp4");
-        if !src.exists() {
-            eprintln!("skipping: missing {}", src.display());
+        if skip_without_fixture(&src) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5512,6 +5525,12 @@ mod tests {
             if !src.exists() {
                 if required {
                     panic!("committed fixture missing: {}", src.display());
+                }
+                if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FIXTURES").is_some() {
+                    panic!(
+                        "fixture required (NIGHTJAR_TEST_REQUIRE_FIXTURES set) but missing: {}",
+                        src.display()
+                    );
                 }
                 eprintln!("skipping optional fixture (land via testdata/hevc-hlg-fixture): {name}");
                 continue;
@@ -6564,8 +6583,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = crate::list_text_subtitles(&corpus).expect("list");
@@ -6703,8 +6721,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = crate::list_text_subtitles(&corpus).expect("list");
@@ -6804,8 +6821,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = crate::list_text_subtitles(&corpus).expect("list");
@@ -7485,8 +7501,7 @@ mod tests {
         let cases: &[(&str, &Path)] = &[("60fps", fps60.as_path()), ("vfr", vfr.as_path())];
 
         for (name, src) in cases {
-            if !src.exists() {
-                eprintln!("skipping {name}: missing {}", src.display());
+            if skip_without_fixture(src) {
                 continue;
             }
             let enc = dir.path().join(name);
@@ -7748,8 +7763,7 @@ mod tests {
         }
         let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_ass_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = crate::list_burn_in_subtitles(&corpus).expect("list");
@@ -7816,8 +7830,7 @@ mod tests {
         }
         let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_ass_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = crate::list_burn_in_subtitles(&corpus).expect("list");
@@ -7954,8 +7967,7 @@ mod tests {
         }
         let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_pgs_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = crate::list_burn_in_subtitles(&corpus).expect("list");

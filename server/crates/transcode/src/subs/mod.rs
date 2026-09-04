@@ -1358,6 +1358,20 @@ mod tests {
         true
     }
 
+    fn skip_without_fixture(path: &Path) -> bool {
+        if path.is_file() {
+            return false;
+        }
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FIXTURES").is_some() {
+            panic!(
+                "fixture required (NIGHTJAR_TEST_REQUIRE_FIXTURES set) but missing: {}",
+                path.display()
+            );
+        }
+        eprintln!("skipping: missing {}", path.display());
+        true
+    }
+
     #[test]
     fn text_codec_allowlist() {
         assert!(is_text_subtitle_codec("subrip"));
@@ -1448,8 +1462,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = list_text_subtitles(&corpus).expect("list");
@@ -1930,8 +1943,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1975,8 +1987,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
@@ -2057,8 +2068,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let streams = list_text_subtitles(&corpus).expect("list");

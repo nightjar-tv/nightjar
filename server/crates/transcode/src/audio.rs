@@ -219,6 +219,20 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn skip_without_fixture(path: &Path) -> bool {
+        if path.is_file() {
+            return false;
+        }
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FIXTURES").is_some() {
+            panic!(
+                "fixture required (NIGHTJAR_TEST_REQUIRE_FIXTURES set) but missing: {}",
+                path.display()
+            );
+        }
+        eprintln!("skipping: missing {}", path.display());
+        true
+    }
+
     #[test]
     fn lists_every_track_with_language_and_one_default() {
         if !ffmpeg_available() {
@@ -227,8 +241,7 @@ mod tests {
         }
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_multilang_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let tracks = list_audio_tracks(&corpus).expect("list");

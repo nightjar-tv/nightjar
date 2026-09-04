@@ -32,9 +32,12 @@ fi
 # source under server/ or the embedded web/build. Set NIGHTJAR_SKIP_STALE_CHECK=1
 # to bypass (e.g. measuring an intentionally pinned build).
 if [[ "${NIGHTJAR_SKIP_STALE_CHECK:-0}" != "1" ]]; then
-  newer="$(find "$ROOT/server" "$ROOT/web/build" \
+  if ! newer="$(find "$ROOT/server" "$ROOT/web/build" \
     -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.html' -o -name '*.js' -o -name '*.css' \) \
-    -newer "$BIN" -print -quit 2>/dev/null || true)"
+    -newer "$BIN" -print -quit)"; then
+    echo "FAIL: stale-binary check could not inspect source files with find" >&2
+    exit 1
+  fi
   if [[ -n "$newer" ]]; then
     echo "FAIL: $BIN is older than $newer; rebuild before measuring (or set NIGHTJAR_SKIP_STALE_CHECK=1)" >&2
     exit 1
@@ -199,7 +202,9 @@ curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
   -d "{\"name\":\"during\",\"path\":\"${MEDIA2}\",\"kind\":\"movies\"}" >/dev/null
 LIB2=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print([l["id"] for l in json.load(sys.stdin)["libraries"] if l["name"]=="during"][0])')
 JOB2=$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/scan" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobId"])')
-# Give the index pass a moment to land rows, then kill during probe.
+# This is only a best-effort timing window, not proof that the process is
+# mid-probe; proving that would require a scan log line or progress endpoint,
+# neither of which this scan currently exposes.
 sleep 0.2
 kill -9 "$PID"
 wait "$PID" 2>/dev/null || true
@@ -220,6 +225,12 @@ echo "wal_after_midscan_kill9 lib1=${COUNT1} lib2=${COUNT2} (job ${JOB2} interru
 if [[ "$COUNT1" -lt 1 ]]; then
   echo "FAIL: prior library lost after mid-scan kill -9" >&2
   cat "$LOG" >&2 || true
+  exit 1
+fi
+# The timing does not prove how many rows landed, so only assert the honest
+# response invariant: valid JSON produced a non-negative integer item count.
+if ! [[ "$COUNT2" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: interrupted library returned an invalid item count: ${COUNT2}" >&2
   exit 1
 fi
 
