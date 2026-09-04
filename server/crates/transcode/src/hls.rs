@@ -294,7 +294,6 @@ struct Session {
     encoder_states: HashMap<VideoRung, EncoderState>,
     /// True after the current run's ffmpeg exited successfully (ENDLIST).
     current_run_eof: bool,
-    child: Option<Child>,
     last_access: Instant,
     /// Last encode-window restart (create counts as one) for the min-interval guard.
     last_restart: Instant,
@@ -905,7 +904,7 @@ fn maybe_evict_finished_runs(session: &mut Session) {
         let mut orphans: Vec<(VideoRung, u64, u64)> = Vec::new();
         let mut referenced_finished: Vec<(VideoRung, u64, u64)> = Vec::new();
         for rung in rungs {
-            let live = live_run_ids(session, rung);
+            let live = live_run_ids(session);
             let referenced = session.segment_map(rung).referenced_run_ids();
             let Ok(entries) = fs::read_dir(rung_dir(&session.dir, rung)) else {
                 continue;
@@ -981,7 +980,7 @@ fn maybe_evict_finished_runs(session: &mut Session) {
 fn reap_empty_finished_run_dirs(session: &mut Session) {
     let rungs: Vec<VideoRung> = session.segment_maps.keys().copied().collect();
     for rung in rungs {
-        let live = live_run_ids(session, rung);
+        let live = live_run_ids(session);
         let Ok(entries) = fs::read_dir(rung_dir(&session.dir, rung)) else {
             continue;
         };
@@ -1389,7 +1388,7 @@ impl HlsSessionRegistry {
         let leg = session.encode_leg.clone();
         // A seek always applies: nothing is destroyed, so nothing can be in
         // the way of destroying it (ADR-0050 §4).
-        restart_at(session, SINGLE_VIDEO_RUNG, aligned, &leg)?;
+        restart_at(session, aligned, &leg)?;
         maybe_evict_finished_runs(session);
         Ok(session_view(session_id, session, SINGLE_VIDEO_RUNG))
     }
@@ -1404,7 +1403,7 @@ impl HlsSessionRegistry {
             .get_mut(session_id)
             .ok_or(PlaylistError::NotFound)?;
         session.last_access = Instant::now();
-        let _ = note_child_exit(session, SINGLE_VIDEO_RUNG);
+        let _ = note_child_exit(session);
         sync_segment_map(session, SINGLE_VIDEO_RUNG);
         Ok(session_view(session_id, session, SINGLE_VIDEO_RUNG))
     }
@@ -1437,7 +1436,7 @@ impl HlsSessionRegistry {
                 if let Ok(bytes) = fs::read(&path) {
                     return Ok(bytes);
                 }
-                if let Some(err) = note_child_exit(session, SINGLE_VIDEO_RUNG) {
+                if let Some(err) = note_child_exit(session) {
                     return Err(PlaylistError::Failed(err));
                 }
             }
@@ -1472,7 +1471,7 @@ impl HlsSessionRegistry {
         // Hold until video is ready so clients attach media + subs together.
         sync_segment_map(session, SINGLE_VIDEO_RUNG);
         if !current_run_has_mapped_segment(session, SINGLE_VIDEO_RUNG) {
-            if let Some(err) = note_child_exit(session, SINGLE_VIDEO_RUNG) {
+            if let Some(err) = note_child_exit(session) {
                 return Err(PlaylistError::Failed(err));
             }
             return Err(PlaylistError::NotReady);
@@ -1555,7 +1554,7 @@ impl HlsSessionRegistry {
             return Err(PlaylistError::Failed(err));
         }
 
-        if let Some(err) = note_child_exit(session, SINGLE_VIDEO_RUNG) {
+        if let Some(err) = note_child_exit(session) {
             return Err(PlaylistError::Failed(err));
         }
 
@@ -1569,7 +1568,7 @@ impl HlsSessionRegistry {
             }
             return Err(PlaylistError::NotReady);
         }
-        note_first_segment_ready(session_id, session, SINGLE_VIDEO_RUNG);
+        note_first_segment_ready(session_id, session);
         maybe_apply_pending_restart(session)?;
         build(session)
     }
@@ -1712,7 +1711,7 @@ impl HlsSessionRegistry {
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
-                note_first_segment_ready(session_id, session, SINGLE_VIDEO_RUNG);
+                note_first_segment_ready(session_id, session);
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
@@ -1800,7 +1799,7 @@ impl HlsSessionRegistry {
                     {
                         session.primed = true;
                     }
-                    note_first_segment_ready(session_id, session, SINGLE_VIDEO_RUNG);
+                    note_first_segment_ready(session_id, session);
                     maybe_apply_pending_restart(session)?;
                     if !serve_ok_after_pending_apply(
                         play_before,
@@ -1811,7 +1810,7 @@ impl HlsSessionRegistry {
                     }
                     return Ok(bytes);
                 }
-                if let Some(err) = note_child_exit(session, SINGLE_VIDEO_RUNG) {
+                if let Some(err) = note_child_exit(session) {
                     return Err(PlaylistError::Failed(err));
                 }
                 maybe_apply_pending_restart(session)?;
@@ -2012,7 +2011,7 @@ impl HlsSessionRegistry {
         let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
         for rung in rungs {
             stop_child(&mut session.encoder_state_mut(rung).child);
-            reap_all_superseded(&mut session, rung);
+            reap_all_superseded(&mut session);
         }
         if let Err(e) = fs::remove_dir_all(&session.dir) {
             tracing::warn!(
@@ -2059,7 +2058,7 @@ impl HlsSessionRegistry {
                 // so the reap rides along rather than taking its own thread.
                 let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
                 for rung in rungs {
-                    reap_superseded(session, rung);
+                    reap_superseded(session);
                     let state = session.encoder_state(rung);
                     let Some(child) = state.child.as_ref() else {
                         // No producer: a finished run holds no lead, and a child
@@ -2067,7 +2066,7 @@ impl HlsSessionRegistry {
                         session.encoder_state_mut(rung).throttled = false;
                         continue;
                     };
-                    let Some(lead_ms) = session_lead_ms(session, rung) else {
+                    let Some(lead_ms) = session_lead_ms(session) else {
                         continue;
                     };
                     let Some(stop) = throttle_action(state.throttled, lead_ms) else {
@@ -2114,7 +2113,7 @@ impl HlsSessionRegistry {
         let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
         for rung in rungs {
             stop_child(&mut session.encoder_state_mut(rung).child);
-            reap_all_superseded(&mut session, rung);
+            reap_all_superseded(&mut session);
         }
         let _ = fs::remove_dir_all(&session.dir);
     }
@@ -2159,8 +2158,8 @@ fn restart_at(
     tracing::info!(
         prior_play_start_ms = prior_play,
         prior_first_segment_ready = prior_ready,
-        superseding_encoder = session.child.is_some(),
-        held_encoders = session.superseded.len(),
+        superseding_encoder = session.encoder_state(SINGLE_VIDEO_RUNG).child.is_some(),
+        held_encoders = session.encoder_state(SINGLE_VIDEO_RUNG).superseded.len(),
         new_play_start_ms = play_start_ms,
         "hls seek: supersede prior encode"
     );
@@ -2169,15 +2168,15 @@ fn restart_at(
     // new child, so leaving it set would make the next tick send a resume to
     // a child that was never suspended and skip the suspend it needs. The
     // other two `stop_child` callers remove the session outright.
-    session.throttled = false;
-    sync_segment_map(session);
+    session.encoder_state_mut(SINGLE_VIDEO_RUNG).throttled = false;
+    sync_segment_map(session, SINGLE_VIDEO_RUNG);
     sync_all_run_indexes(session);
     // Duplicate-write stop: scrub-back (or re-land) into media this rung's map
     // already holds — mint a fresh playlist URI, copy init, do not re-encode.
     if let Some(mapped) = map_segment_covering(session, play_start_ms) {
         let src_run = mapped.run_id;
-        let run_id = session.next_run_id;
-        session.next_run_id += 1;
+        let run_id = session.encoder_state(SINGLE_VIDEO_RUNG).next_run_id;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id += 1;
         let new_dir = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
         fs::create_dir_all(&new_dir).map_err(|e| {
             PlaylistError::Failed(format!("create run dir {}: {e}", new_dir.display()))
@@ -2226,7 +2225,7 @@ fn restart_at(
                 ))
             })?;
         }
-        session.current_run_id = run_id;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = run_id;
         session.current_run_eof = true;
         session.start_ms = play_start_ms;
         session.play_start_ms = play_start_ms;
@@ -2267,8 +2266,8 @@ fn restart_at(
     // Gate 2 / fill-forward: do not wipe prior run dirs. Scrub-back into
     // mapped media is a plain file serve (ADR-0020 per-rung map). New producer
     // output goes in a fresh run directory under the active rung.
-    let run_id = session.next_run_id;
-    session.next_run_id += 1;
+    let run_id = session.encoder_state(SINGLE_VIDEO_RUNG).next_run_id;
+    session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id += 1;
     let run_dir = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
     fs::create_dir_all(&run_dir)
         .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
@@ -2311,8 +2310,8 @@ fn restart_at(
     )
     .map_err(PlaylistError::Failed)?;
     session.map_binding.bound = plan.virtual_input.take();
-    session.child = Some(child);
-    session.current_run_id = run_id;
+    session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(child);
+    session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = run_id;
     session.current_run_eof = false;
     session.start_ms = start_ms;
     session.play_start_ms = play_start_ms;
@@ -2481,14 +2480,14 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
 /// the requested URI is the cooking land. Middle waiters may enter no-fill
 /// before a 200 on that URI; final land-ensure must still notice.
 fn note_first_segment_ready(session_id: &str, session: &mut Session) {
-    sync_segment_map(session);
+    sync_segment_map(session, SINGLE_VIDEO_RUNG);
     if session.first_segment_ready {
         return;
     }
-    if !current_run_has_mapped_segment(session) {
+    if !current_run_has_mapped_segment(session, SINGLE_VIDEO_RUNG) {
         return;
     }
-    if let Some(landed) = first_current_run_start(session) {
+    if let Some(landed) = first_current_run_start(session, SINGLE_VIDEO_RUNG) {
         session.landed_ms = landed;
     }
     session.first_segment_ready = true;
@@ -2525,7 +2524,10 @@ fn note_first_segment_ready(session_id: &str, session: &mut Session) {
 }
 
 fn note_child_exit(session: &mut Session) -> Option<String> {
-    let child = session.child.as_mut()?;
+    let child = session
+        .encoder_state_mut(SINGLE_VIDEO_RUNG)
+        .child
+        .as_mut()?;
     match child.try_wait() {
         Ok(Some(status)) if !status.success() => {
             let msg = format!("ffmpeg exited with {status}");
@@ -2577,9 +2579,9 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
 /// shape. Reverted 2026-08-30; the reasoning is kept here so the change is not
 /// made a second time from the same argument.
 fn apply_run_eof(session: &mut Session) {
-    session.child = None;
+    session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = None;
     session.current_run_eof = true;
-    sync_segment_map(session);
+    sync_segment_map(session, SINGLE_VIDEO_RUNG);
     let end = session
         .segment_map(SINGLE_VIDEO_RUNG)
         .iter_ordered()
@@ -2591,7 +2593,7 @@ fn apply_run_eof(session: &mut Session) {
         tracing::info!(
             usable_extent_ms = end,
             duration_ms = session.duration_ms,
-            run_id = session.current_run_id,
+            run_id = session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
             "hls usable extent recorded (EOF short of claimed duration)"
         );
     }
@@ -2614,7 +2616,7 @@ fn publish_piggyback_if_complete(session: &mut Session) {
     let (Some(subs), Some(db)) = (&session.subs, &session.db) else {
         return;
     };
-    let segments = vtt_segments_in(&run_dir(session));
+    let segments = vtt_segments_in(&run_dir(session, SINGLE_VIDEO_RUNG));
     if segments.is_empty() {
         return;
     }
@@ -2666,7 +2668,7 @@ fn publish_piggyback_if_complete(session: &mut Session) {
         track_id = %piggyback.track_id,
         segment_count = segments.len(),
         cue_bytes = body.len(),
-        run_id = session.current_run_id,
+        run_id = session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
         "piggyback extract published and item marked ready"
     );
     session.piggyback = None;
@@ -3651,25 +3653,26 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
 /// process for [`REAP_AFTER`] and then kill it — suspend-then-reap, the exact
 /// policy ADR-0050 §5 was amended to forbid.
 fn supersede_child(session: &mut Session) {
-    // Resume before setting it aside, while the child is still `session.child`
-    // and the only thing that can signal it is this call under this lock.
-    if session.throttled
-        && let Some(child) = session.child.as_ref()
+    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+    // Resume before setting it aside, while the child is still this state's
+    // live child and the only thing that can signal it is this call under this lock.
+    if state.throttled
+        && let Some(child) = state.child.as_ref()
     {
         signal_child(child, false);
     }
-    let Some(child) = session.child.take() else {
+    let Some(child) = state.child.take() else {
         return;
     };
     // The flag described the child that just left.
-    session.throttled = false;
-    session.superseded.push(SupersededEncoder {
+    state.throttled = false;
+    state.superseded.push(SupersededEncoder {
         child,
         reap_at: Instant::now() + REAP_AFTER,
         // `restart_at` calls this before it assigns the new run, so
         // `current_run_id` here is exactly the run being set aside. Read it,
         // do not infer it later.
-        run_id: session.current_run_id,
+        run_id: state.current_run_id,
     });
 }
 
@@ -3683,9 +3686,10 @@ fn supersede_child(session: &mut Session) {
 /// unlinking its directory would take away the media the whole policy exists
 /// to keep serving.
 fn live_run_ids(session: &Session) -> Vec<u64> {
-    let mut ids = Vec::with_capacity(session.superseded.len() + 1);
-    ids.push(session.current_run_id);
-    ids.extend(session.superseded.iter().map(|s| s.run_id));
+    let state = session.encoder_state(SINGLE_VIDEO_RUNG);
+    let mut ids = Vec::with_capacity(state.superseded.len() + 1);
+    ids.push(state.current_run_id);
+    ids.extend(state.superseded.iter().map(|s| s.run_id));
     ids
 }
 
@@ -3724,10 +3728,10 @@ fn live_run_ids(session: &Session) -> Vec<u64> {
 fn release_overtaken_superseded(session: &mut Session) {
     let now = Instant::now();
     let start_ms = session.start_ms;
-    // Disjoint fields: the map is read while the held set is walked mutably.
+    // Disjoint fields: the segment map is read while encoder state is walked mutably.
     let Session {
         segment_maps,
-        superseded,
+        encoder_states,
         ..
     } = session;
     let Some(map) = segment_maps.get(&SINGLE_VIDEO_RUNG) else {
@@ -3736,7 +3740,13 @@ fn release_overtaken_superseded(session: &mut Session) {
             SINGLE_VIDEO_RUNG.as_str()
         );
     };
-    for held in superseded.iter_mut() {
+    let Some(state) = encoder_states.get_mut(&SINGLE_VIDEO_RUNG) else {
+        panic!(
+            "session has no encoder state for rung {}",
+            SINGLE_VIDEO_RUNG.as_str()
+        );
+    };
+    for held in state.superseded.iter_mut() {
         let Some(frontier) = frontier_ms(map.iter_ordered(), held.run_id) else {
             continue;
         };
@@ -3750,24 +3760,28 @@ fn release_overtaken_superseded(session: &mut Session) {
 /// Terminate superseded encoders whose delay has elapsed.
 fn reap_superseded(session: &mut Session) {
     let now = Instant::now();
-    session.superseded.retain_mut(|s| {
-        if s.reap_at > now {
-            return true;
-        }
-        let _ = s.child.kill();
-        let _ = s.child.wait();
-        false
-    });
+    session
+        .encoder_state_mut(SINGLE_VIDEO_RUNG)
+        .superseded
+        .retain_mut(|s| {
+            if s.reap_at > now {
+                return true;
+            }
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+            false
+        });
 }
 
 /// Terminate every superseded encoder now, whatever their delay. Session
 /// teardown: nothing may outlive the session that spawned it.
 fn reap_all_superseded(session: &mut Session) {
-    for s in session.superseded.iter_mut() {
+    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+    for s in state.superseded.iter_mut() {
         let _ = s.child.kill();
         let _ = s.child.wait();
     }
-    session.superseded.clear();
+    state.superseded.clear();
 }
 
 fn stop_child(child: &mut Option<Child>) {
@@ -3794,12 +3808,12 @@ fn signal_child(child: &Child, stop: bool) -> bool {
     // the floor and never resumes it.
     let sig = if stop { libc::SIGSTOP } else { libc::SIGCONT };
     // SAFETY: `kill` with a pid we own and a valid signal number. The pid
-    // cannot have been recycled. This is only ever called on `session.child`,
-    // and the three paths that reap a child all run under the same lock as
-    // this call: `stop_child` takes the `Child` out of the session, and
-    // `reap_superseded` / `reap_all_superseded` only ever reap children
-    // `supersede_child` already moved out of `session.child`. So a `Child`
-    // this call can see is not one any of them can be waiting on.
+    // cannot have been recycled. This is only ever called on a rung's live
+    // encoder child, and the three paths that reap a child all run under the
+    // same lock as this call: `stop_child` takes the child out of encoder
+    // state, and `reap_superseded` / `reap_all_superseded` only ever reap
+    // children `supersede_child` already moved out of the rung's live state.
+    // So a `Child` this call can see is not one any of them can be waiting on.
     unsafe { libc::kill(child.id() as libc::pid_t, sig) == 0 }
 }
 
@@ -3847,7 +3861,7 @@ fn session_lead_ms(session: &Session) -> Option<u64> {
     // ADR-0050 §4 breaks that: see the note on `frontier_ms`.
     let produced_end = frontier_ms(
         session.segment_map(SINGLE_VIDEO_RUNG).iter_ordered(),
-        session.current_run_id,
+        session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
     );
     lead_ms(produced_end, session.last_requested_ms)
 }
@@ -3914,11 +3928,9 @@ mod tests {
             landed_ms: 0,
             usable_extent_ms: None,
             duration_ms: 60_000,
-            current_run_id: 0,
-            next_run_id: 1,
+            encoder_states: single_rung_encoder_states(0, 1, None),
             segment_maps: single_rung_segment_maps(Default::default()),
             current_run_eof: false,
-            child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
             primed: false,
@@ -3928,13 +3940,71 @@ mod tests {
             failed: None,
             subtitle_tracks: vec![],
             last_requested_ms: 0,
-            throttled: false,
-            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
             map_build_in_flight: None,
         }
+    }
+
+    /// A run advanced on one rung leaves every other rung's encoder alone.
+    ///
+    /// ADR-0051 amendment 4: encoder load is per rung, so run ids, the child
+    /// and the superseded set are per rung too. Without that, a hop would
+    /// renumber the rung it left. Collapse `encoder_state_mut` to one rung and
+    /// this fails on the second rung's `current_run_id`.
+    #[test]
+    fn advancing_one_rungs_run_leaves_the_other_rung_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.encoder_states = HashMap::from([
+            (
+                VideoRung::SingleVideo,
+                EncoderState {
+                    current_run_id: 0,
+                    next_run_id: 1,
+                    child: None,
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+            (
+                VideoRung::SecondVideo,
+                EncoderState {
+                    current_run_id: 0,
+                    next_run_id: 1,
+                    child: None,
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+        ]);
+
+        // Advance the *second* rung: a write that collapses to one rung lands
+        // on the first, so the second reads back unchanged and this fails.
+        {
+            let state = session.encoder_state_mut(VideoRung::SecondVideo);
+            state.current_run_id = state.next_run_id;
+            state.next_run_id += 1;
+            state.throttled = true;
+        }
+
+        let advanced = session.encoder_state(VideoRung::SecondVideo);
+        assert_eq!(
+            advanced.current_run_id, 1,
+            "the rung that was advanced must carry the new run id"
+        );
+        assert!(advanced.throttled, "the advanced rung is the throttled one");
+
+        let untouched = session.encoder_state(VideoRung::SingleVideo);
+        assert_eq!(
+            untouched.current_run_id, 0,
+            "advancing one rung must not renumber another"
+        );
+        assert!(
+            !untouched.throttled,
+            "throttle is per rung, not per session"
+        );
     }
 
     /// Equal title times remain distinct inside one session because every
@@ -4089,11 +4159,21 @@ mod tests {
 
         // Nothing held: reaping is a no-op rather than an error.
         reap_superseded(&mut session);
-        assert!(session.superseded.is_empty());
+        assert!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty()
+        );
 
-        session.current_run_id = 7;
-        session.child = Some(spawn_stand_in_encoder());
-        let pid = session.child.as_ref().unwrap().id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 7;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        let pid = session
+            .encoder_state(SINGLE_VIDEO_RUNG)
+            .child
+            .as_ref()
+            .unwrap()
+            .id();
         assert_eq!(child_state(pid), ChildState::Running);
 
         supersede_child(&mut session);
@@ -4103,7 +4183,11 @@ mod tests {
             "a seek supersedes the prior encoder, it does not kill it"
         );
         assert_eq!(
-            session.superseded.first().map(|s| s.run_id),
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .first()
+                .map(|s| s.run_id),
             Some(7),
             "the held encoder carries the run it is still writing into"
         );
@@ -4115,17 +4199,23 @@ mod tests {
             ChildState::Running,
             "not past REAP_AFTER, so still producing"
         );
-        assert_eq!(session.superseded.len(), 1);
+        assert_eq!(session.encoder_state(SINGLE_VIDEO_RUNG).superseded.len(), 1);
 
         // Due.
-        session.superseded[0].reap_at = Instant::now() - Duration::from_millis(1);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded[0].reap_at =
+            Instant::now() - Duration::from_millis(1);
         reap_superseded(&mut session);
         assert_eq!(
             child_state(pid),
             ChildState::Gone,
             "past its delay, so the process is gone"
         );
-        assert!(session.superseded.is_empty());
+        assert!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty()
+        );
     }
 
     /// A seek on a session the throttle had suspended resumes the encoder
@@ -4144,12 +4234,24 @@ mod tests {
     fn superseding_a_throttled_encoder_resumes_it_first() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = make_test_session(dir.path());
-        session.child = Some(spawn_stand_in_encoder());
-        let pid = session.child.as_ref().unwrap().id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        let pid = session
+            .encoder_state(SINGLE_VIDEO_RUNG)
+            .child
+            .as_ref()
+            .unwrap()
+            .id();
 
         // What the throttle does at the lead target.
-        assert!(signal_child(session.child.as_ref().unwrap(), true));
-        session.throttled = true;
+        assert!(signal_child(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .child
+                .as_ref()
+                .unwrap(),
+            true
+        ));
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).throttled = true;
         wait_for_state(pid, ChildState::Stopped);
 
         supersede_child(&mut session);
@@ -4159,7 +4261,7 @@ mod tests {
             "a superseded encoder has to keep producing until it is reaped"
         );
         assert!(
-            !session.throttled,
+            !session.encoder_state(SINGLE_VIDEO_RUNG).throttled,
             "the flag described the child that just left"
         );
 
@@ -4178,16 +4280,24 @@ mod tests {
         for run_id in 0..3u64 {
             let child = spawn_stand_in_encoder();
             pids.push(child.id());
-            session.superseded.push(SupersededEncoder {
-                child,
-                reap_at: Instant::now() + Duration::from_secs(30),
-                run_id,
-            });
+            session
+                .encoder_state_mut(SINGLE_VIDEO_RUNG)
+                .superseded
+                .push(SupersededEncoder {
+                    child,
+                    reap_at: Instant::now() + Duration::from_secs(30),
+                    run_id,
+                });
         }
         assert!(pids.iter().all(|p| child_state(*p) == ChildState::Running));
 
         reap_all_superseded(&mut session);
-        assert!(session.superseded.is_empty());
+        assert!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty()
+        );
         for pid in pids {
             assert_eq!(
                 child_state(pid),
@@ -4217,12 +4327,15 @@ mod tests {
             fs::create_dir_all(&run).unwrap();
             fs::write(run.join("seg.m4s"), vec![0u8; 4096]).unwrap();
         }
-        session.current_run_id = 3;
-        session.superseded.push(SupersededEncoder {
-            child: spawn_stand_in_encoder(),
-            reap_at: Instant::now() + Duration::from_secs(30),
-            run_id: 2,
-        });
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 3;
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(SupersededEncoder {
+                child: spawn_stand_in_encoder(),
+                reap_at: Instant::now() + Duration::from_secs(30),
+                run_id: 2,
+            });
 
         // A budget everything on disk exceeds, so eviction must pick a victim.
         session.run_cache_budget_bytes = 0;
@@ -4311,28 +4424,32 @@ mod tests {
             None,
         )
         .unwrap();
-        session.current_run_id = 1;
-        session.next_run_id = 2;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 1;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 2;
         session.start_ms = land_ms;
         session.play_start_ms = land_ms;
         session.last_requested_ms = land_ms;
         session.landed_ms = land_ms;
-        session.child = Some(spawn_stand_in_encoder());
-        session.superseded.push(SupersededEncoder {
-            child: spawn_stand_in_encoder(),
-            // The real delay is `REAP_AFTER`; parked out of reach so the
-            // throttle tick cannot reap run_0 out from under the assertion.
-            reap_at: Instant::now() + Duration::from_secs(30),
-            run_id: 0,
-        });
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(SupersededEncoder {
+                child: spawn_stand_in_encoder(),
+                // The real delay is `REAP_AFTER`; parked out of reach so the
+                // throttle tick cannot reap run_0 out from under the assertion.
+                reap_at: Instant::now() + Duration::from_secs(30),
+                run_id: 0,
+            });
         // Both changes touch the same held set, so check them together. The
         // release condition must not fire here: run_0's frontier is 4000 and
         // the new land is 20000, so the gap below is exactly the region only
         // the held encoder serves.
-        let held_reap_at = session.superseded[0].reap_at;
+        let held_reap_at = session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at;
         release_overtaken_superseded(&mut session);
         assert_eq!(
-            session.superseded[0].reap_at, held_reap_at,
+            session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at,
+            held_reap_at,
             "the release condition must not fire while the gap is still unserved"
         );
         reg.sessions
@@ -4381,19 +4498,23 @@ mod tests {
         let child = spawn_stand_in_encoder();
         let pid = child.id();
         let reap_at = Instant::now() + REAP_AFTER;
-        session.superseded.push(SupersededEncoder {
-            child,
-            reap_at,
-            run_id: 0,
-        });
-        sync_superseded_run_indexes(&mut session);
-        session.current_run_id = 1;
-        session.next_run_id = 2;
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(SupersededEncoder {
+                child,
+                reap_at,
+                run_id: 0,
+            });
+        sync_superseded_run_indexes(&mut session, SINGLE_VIDEO_RUNG);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 1;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 2;
         session.start_ms = 20_000;
 
         release_overtaken_superseded(&mut session);
         assert_eq!(
-            session.superseded[0].reap_at, reap_at,
+            session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at,
+            reap_at,
             "a held encoder short of the new land keeps its original delay"
         );
 
@@ -4425,19 +4546,22 @@ mod tests {
         write_producer_run(dir.path(), 0, 0, &[0, 2_000, 4_000]);
         let child = spawn_stand_in_encoder();
         let pid = child.id();
-        session.superseded.push(SupersededEncoder {
-            child,
-            reap_at: Instant::now() + REAP_AFTER,
-            run_id: 0,
-        });
-        sync_superseded_run_indexes(&mut session);
-        session.current_run_id = 1;
-        session.next_run_id = 2;
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(SupersededEncoder {
+                child,
+                reap_at: Instant::now() + REAP_AFTER,
+                run_id: 0,
+            });
+        sync_superseded_run_indexes(&mut session, SINGLE_VIDEO_RUNG);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 1;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 2;
         session.start_ms = 4_000;
 
         release_overtaken_superseded(&mut session);
         assert!(
-            session.superseded[0].reap_at <= Instant::now(),
+            session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at <= Instant::now(),
             "a held encoder the new one has overtaken is due for reaping now"
         );
 
@@ -4448,7 +4572,12 @@ mod tests {
             ChildState::Gone,
             "the next reap releases the overtaken encoder"
         );
-        assert!(session.superseded.is_empty());
+        assert!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty()
+        );
     }
 
     /// A held encoder that produced nothing has no frontier, and is not
@@ -4471,15 +4600,18 @@ mod tests {
         let child = spawn_stand_in_encoder();
         let pid = child.id();
         let reap_at = Instant::now() + REAP_AFTER;
-        session.superseded.push(SupersededEncoder {
-            child,
-            reap_at,
-            run_id: 9,
-        });
-        session.current_run_id = 0;
-        sync_segment_map(&mut session);
-        session.current_run_id = 10;
-        session.next_run_id = 11;
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(SupersededEncoder {
+                child,
+                reap_at,
+                run_id: 9,
+            });
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 0;
+        sync_segment_map(&mut session, SINGLE_VIDEO_RUNG);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 10;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 11;
         session.start_ms = 0;
 
         assert!(
@@ -4488,7 +4620,8 @@ mod tests {
         );
         release_overtaken_superseded(&mut session);
         assert_eq!(
-            session.superseded[0].reap_at, reap_at,
+            session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at,
+            reap_at,
             "an encoder that produced nothing has no frontier to compare"
         );
 
@@ -4516,13 +4649,18 @@ mod tests {
         write_producer_run(&session_dir, 0, 0, &[0, 2_000, 4_000]);
 
         let mut session = make_test_session(&session_dir);
-        session.current_run_id = 0;
-        session.next_run_id = 1;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 0;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 1;
         session.start_ms = 0;
         session.play_start_ms = 0;
         session.last_requested_ms = 4_000;
-        session.child = Some(spawn_stand_in_encoder());
-        let pid = session.child.as_ref().unwrap().id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        let pid = session
+            .encoder_state(SINGLE_VIDEO_RUNG)
+            .child
+            .as_ref()
+            .unwrap()
+            .id();
 
         restart_at(&mut session, 2_000, &crate::EncodeLeg::software()).unwrap();
 
@@ -4531,12 +4669,16 @@ mod tests {
             "the map-hit exit lands on the mapped segment"
         );
         assert_eq!(
-            session.superseded.first().map(|s| s.run_id),
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .first()
+                .map(|s| s.run_id),
             Some(0),
             "the seek held the prior encoder"
         );
         assert!(
-            session.superseded[0].reap_at <= Instant::now(),
+            session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at <= Instant::now(),
             "a backward seek into mapped media releases the encoder it overtook"
         );
         assert_eq!(
@@ -4547,7 +4689,12 @@ mod tests {
 
         reap_superseded(&mut session);
         assert_eq!(child_state(pid), ChildState::Gone);
-        assert!(session.superseded.is_empty());
+        assert!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty()
+        );
     }
 
     /// ADR-0052: the frame count for one segment comes from the source rate,
@@ -4801,7 +4948,7 @@ mod tests {
         session.start_ms = 400_000;
         session.play_start_ms = 400_000;
 
-        let pl = build_run_media_playlist("s1", &session);
+        let pl = build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG);
         let text = String::from_utf8_lossy(&pl);
 
         assert!(
@@ -4843,7 +4990,7 @@ mod tests {
         session.play_start_ms = 600_000;
         session.landed_ms = 600_000;
 
-        let listing = run_listing(&session);
+        let listing = run_listing(&session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             listing.media_origin_ms, 0,
             "the listing starts at 0, so element time is already title time"
@@ -4858,7 +5005,9 @@ mod tests {
         );
 
         // What the session view reports must be what the bytes did.
-        let text = String::from_utf8_lossy(&build_run_media_playlist("s1", &session)).to_string();
+        let text =
+            String::from_utf8_lossy(&build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG))
+                .to_string();
         assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=600.000,PRECISE=YES"));
     }
@@ -5029,7 +5178,7 @@ mod tests {
             "an -ss copy run cannot say where it will cut"
         );
 
-        let listing = run_listing(&session);
+        let listing = run_listing(&session, SINGLE_VIDEO_RUNG);
         assert_eq!(listing.media_origin_ms, 600_000);
         assert_eq!(
             listing.start_offset_ms, 0,
@@ -5048,7 +5197,7 @@ mod tests {
         session.start_ms = 600_000;
         session.play_start_ms = 600_000;
 
-        let listing = run_listing(&session);
+        let listing = run_listing(&session, SINGLE_VIDEO_RUNG);
         assert!(listing.entries.is_empty());
         assert_eq!(listing.media_origin_ms, 600_000);
     }
@@ -5105,7 +5254,7 @@ mod tests {
             .collect();
         assert_eq!(starts, after_seek, "the listing is run-independent");
 
-        let pl = build_run_media_playlist("s1", &session);
+        let pl = build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG);
         let text = String::from_utf8_lossy(&pl);
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(!text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
@@ -5516,11 +5665,9 @@ mod tests {
             landed_ms: 0,
             usable_extent_ms: None,
             duration_ms: 3_600_000,
-            current_run_id: 0,
-            next_run_id: 1,
+            encoder_states: single_rung_encoder_states(0, 1, None),
             segment_maps: single_rung_segment_maps(crate::hls_segment_map::SegmentMap::default()),
             current_run_eof: false,
-            child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
             primed: false,
@@ -5530,8 +5677,6 @@ mod tests {
             failed: None,
             subtitle_tracks: vec![],
             last_requested_ms: 0,
-            throttled: false,
-            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -5782,7 +5927,11 @@ mod tests {
 
         let run_before = {
             let sessions = reg.sessions.lock().unwrap();
-            sessions.get(&id).unwrap().current_run_id
+            sessions
+                .get(&id)
+                .unwrap()
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .current_run_id
         };
         let land_ms = 40_000;
         let land = crate::hls_segment_map::time_keyed_segment_name(land_ms);
@@ -5798,7 +5947,10 @@ mod tests {
         let (run_after_miss, pending) = {
             let sessions = reg.sessions.lock().unwrap();
             let session = sessions.get(&id).unwrap();
-            (session.current_run_id, session.pending_play_ms)
+            (
+                session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
+                session.pending_play_ms,
+            )
         };
         assert!(
             run_after_miss != run_before || pending == Some(land_ms),
@@ -6878,7 +7030,10 @@ mod tests {
             let sessions = reg.sessions.lock().unwrap();
             let s = sessions.get(&id).unwrap();
             assert!(s.first_segment_ready, "expected map-hit ready");
-            assert!(s.child.is_none(), "map hit must not spawn ffmpeg");
+            assert!(
+                s.encoder_state(SINGLE_VIDEO_RUNG).child.is_none(),
+                "map hit must not spawn ffmpeg"
+            );
             assert_eq!(s.play_start_ms, 0);
         }
         assert!(reg.asset(&id, &early_name, None).is_ok());
@@ -7806,11 +7961,9 @@ mod tests {
             landed_ms: 21,
             usable_extent_ms: None,
             duration_ms: 60_000,
-            current_run_id: 0,
-            next_run_id: 1,
+            encoder_states: single_rung_encoder_states(0, 1, None),
             segment_maps: single_rung_segment_maps(map),
             current_run_eof: false,
-            child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
             primed: false,
@@ -7820,14 +7973,12 @@ mod tests {
             failed: None,
             subtitle_tracks: vec![],
             last_requested_ms: 0,
-            throttled: false,
-            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
             map_build_in_flight: None,
         };
-        let pl = build_run_media_playlist("s1", &session);
+        let pl = build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG);
         let text = String::from_utf8_lossy(&pl);
         let uri = text
             .lines()
@@ -8053,11 +8204,9 @@ mod tests {
             landed_ms: 1_014_000,
             usable_extent_ms: None,
             duration_ms: 1_354_496,
-            current_run_id: 0,
-            next_run_id: 1,
+            encoder_states: single_rung_encoder_states(0, 1, None),
             segment_maps: single_rung_segment_maps(crate::hls_segment_map::SegmentMap::default()),
             current_run_eof: false,
-            child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
             primed: false,
@@ -8067,8 +8216,6 @@ mod tests {
             failed: None,
             subtitle_tracks: vec![],
             last_requested_ms: 0,
-            throttled: false,
-            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -8081,7 +8228,7 @@ mod tests {
             Some(0),
             "empty map + mid-title EOF → usableExtentMs=0"
         );
-        let pl = build_run_media_playlist("s1", &session);
+        let pl = build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG);
         let text = String::from_utf8_lossy(&pl);
         assert!(text.contains("#EXT-X-ENDLIST"), "empty ENDLIST for clients");
         assert!(
@@ -8111,11 +8258,9 @@ mod tests {
             landed_ms: 0,
             usable_extent_ms: None,
             duration_ms,
-            current_run_id: 0,
-            next_run_id: 1,
+            encoder_states: single_rung_encoder_states(0, 1, None),
             segment_maps: single_rung_segment_maps(crate::hls_segment_map::SegmentMap::default()),
             current_run_eof: false,
-            child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
             primed: false,
@@ -8125,8 +8270,6 @@ mod tests {
             failed: None,
             subtitle_tracks: vec![],
             last_requested_ms: 0,
-            throttled: false,
-            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -8165,8 +8308,8 @@ mod tests {
         // nothing of its own.
         let mut session = eof_test_session(dir.path(), 1_354_496);
         session.segment_maps = single_rung_segment_maps(map);
-        session.current_run_id = 1;
-        session.next_run_id = 2;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 1;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 2;
         session.start_ms = 1_014_000;
         session.play_start_ms = 1_014_000;
 
@@ -8229,11 +8372,9 @@ mod tests {
             landed_ms: 0,
             usable_extent_ms: None,
             duration_ms: 60_000,
-            current_run_id: 3,
-            next_run_id: 4,
+            encoder_states: single_rung_encoder_states(3, 4, None),
             segment_maps: single_rung_segment_maps(map),
             current_run_eof: true,
-            child: None,
             last_access: Instant::now(),
             last_restart: Instant::now(),
             primed: true,
@@ -8243,8 +8384,6 @@ mod tests {
             failed: None,
             subtitle_tracks: vec![],
             last_requested_ms: 0,
-            throttled: false,
-            superseded: Vec::new(),
             piggyback: None,
             subs: None,
             db: None,
@@ -8282,7 +8421,7 @@ mod tests {
             !session.segment_map(SINGLE_VIDEO_RUNG).run_is_referenced(0),
             "map must drop entries before/with delete"
         );
-        let pl = build_run_media_playlist("s1", &session);
+        let pl = build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG);
         assert!(
             !String::from_utf8_lossy(&pl).contains("seg_"),
             "playlist must not list URIs whose files are gone"
@@ -8459,7 +8598,7 @@ mod tests {
                 let sessions = reg.sessions.lock().unwrap();
                 let session = sessions.get(id).expect("session live");
                 (
-                    session.current_run_id,
+                    session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
                     session.dir.clone(),
                     session.failed.clone(),
                 )
@@ -9742,7 +9881,7 @@ mod tests {
                 let sessions = reg.sessions.lock().unwrap();
                 let session = sessions.get(id).expect("session live");
                 (
-                    session.current_run_id,
+                    session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
                     session.dir.clone(),
                     session.failed.clone(),
                 )
