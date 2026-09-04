@@ -6,8 +6,8 @@
 //! lock. That is what makes it separable, and it is why these are the functions
 //! the table tests can exercise exhaustively.
 //!
-//! The arithmetic they reason on stays in `hls.rs`, imported below, because it
-//! is shared with the machinery that acts on these verdicts.
+//! The HLS timing arithmetic they reason on stays in `hls.rs`, imported below,
+//! because it is shared with the machinery that acts on these verdicts.
 
 use std::time::Duration;
 
@@ -15,6 +15,37 @@ use crate::hls::{
     ALIGN_BEHIND_SEGMENTS, CATCH_UP_SEGMENTS, RESTART_COALESCE_QUIET, RESTART_MIN_INTERVAL,
     SEGMENT_MS, align_to_segment, encode_start_ms,
 };
+
+/// Encoder weights are carried in hundredths so admission stays integer
+/// arithmetic. A remux probably costs less than a transcode to run
+/// concurrently, but that has not been measured. The duration ratio in
+/// ADR-0050 §7 measures wall-clock time to finish a window, not concurrent
+/// resource cost, so it cannot justify a concurrency weight. Every encoder
+/// therefore weighs 1.0 until a real concurrency measurement supports a
+/// different value; do not restore 0.33 from that ADR section.
+pub(crate) const ENCODER_WEIGHT_SCALE: u32 = 100;
+
+/// Every encoder contributes 1.0 to admission load today. A remux probably
+/// costs less than a transcode to run concurrently, but that has not been
+/// measured. The duration ratio in ADR-0050 §7 measures wall-clock time to
+/// finish a window, not concurrent resource cost, so it cannot justify a
+/// concurrency weight. Do not restore 0.33 here: it was deliberately ruled
+/// out and needs a real concurrency measurement, not that ADR section.
+pub(crate) fn encoder_weight_centi(_re_encodes: bool) -> u32 {
+    ENCODER_WEIGHT_SCALE
+}
+
+/// Whether a newcomer of `newcomer_centi` weight is admitted on top of
+/// `existing_centi` already-live weight, against a cap expressed in whole
+/// encoders.
+pub(crate) fn admits_weighted_load(
+    existing_centi: u32,
+    newcomer_centi: u32,
+    cap_encoders: usize,
+) -> bool {
+    let cap_centi = cap_encoders.min(u32::MAX as usize) as u32;
+    existing_centi.saturating_add(newcomer_centi) <= cap_centi.saturating_mul(ENCODER_WEIGHT_SCALE)
+}
 
 /// Pure window-move decision for an explicit playlist `?startMs=` seek.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +476,27 @@ mod tests {
     use super::*;
     // Only the tables exercise the lead; production reads it in `hls.rs`.
     use crate::hls::ENCODE_LEAD_SEGMENTS;
+
+    #[test]
+    fn encoder_admission_weight_table() {
+        let weight_cases = [("transcode", true, 100), ("plain copy", false, 100)];
+        for (name, re_encodes, expected) in weight_cases {
+            assert_eq!(encoder_weight_centi(re_encodes), expected, "{name}");
+        }
+
+        let admission_cases = [
+            ("exactly at cap", 67, 33, 1, true),
+            ("one centi over cap", 68, 33, 1, false),
+            ("saturates huge existing load", u32::MAX, 1, 1, false),
+        ];
+        for (name, existing, newcomer, cap, expected) in admission_cases {
+            assert_eq!(
+                admits_weighted_load(existing, newcomer, cap),
+                expected,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn window_decision_table() {
