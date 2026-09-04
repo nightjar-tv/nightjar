@@ -766,6 +766,9 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
     if has_spaced_dash_number(normalized) {
         return None;
     }
+    if absolute_number_follows_marker(normalized) {
+        return None;
+    }
     let lower = normalized.to_ascii_lowercase();
     let bytes = lower.as_bytes();
 
@@ -882,6 +885,48 @@ fn year_follows(bytes: &[u8], mut j: usize) -> bool {
 }
 
 /// ` - 12` anywhere, with any run of spaces around the dash.
+/// EXPERIMENT (option 3, season-marker scoping 2026-09-04): a marker followed by
+/// a bare or bracketed number is part of the title, not a season.
+///
+/// `Anime Title S21 999` and `Series Title S2 [05]` are the anime absolute form:
+/// the number after the marker is an episode, so the marker belongs to the name.
+/// This is the loose sibling of [`has_spaced_dash_number`], which only catches
+/// the ` - NN` spelling.
+fn absolute_number_follows_marker(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b's' && b[i + 1].is_ascii_digit() && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+        {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            // Skip separators, then look for a number that is not a year.
+            let mut k = j;
+            while k < b.len() && matches!(b[k], b' ' | b'.' | b'_' | b'[' | b'(') {
+                k += 1;
+            }
+            let ds = k;
+            while k < b.len() && b[k].is_ascii_digit() {
+                k += 1;
+            }
+            let digits = k - ds;
+            // A resolution is not an episode: `S02 720p`, `S01 576p`.
+            let resolution = k < b.len() && matches!(b[k], b'p' | b'i');
+            if digits > 0
+                && !resolution
+                && !(digits == 4 && lower[ds..k].starts_with(['1', '2']))
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn has_spaced_dash_number(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
