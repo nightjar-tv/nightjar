@@ -23,6 +23,7 @@ use super::subs::{
 };
 use crate::hls_grid::{GridCadence, grid_cadence_ms};
 use crate::hls_master::VideoRung;
+use crate::hls_policy;
 use crate::hls_policy::{
     CoalesceDesire, PendingWaiterAction, SegmentMissAction, classify_restart_desire,
     coalesce_preempt_before_land, decide_segment_miss, digback_behind_committed, disable_preempt,
@@ -1038,12 +1039,42 @@ fn session_view(session_id: &str, session: &Session, rung: VideoRung) -> Session
     }
 }
 
-fn live_encoder_count(sessions: &HashMap<String, Session>) -> usize {
-    sessions
-        .values()
-        .flat_map(|session| session.encoder_states.values())
-        .map(|state| usize::from(state.child.is_some()) + state.superseded.len())
-        .sum()
+/// Whether a leg of this shape runs an encoder at all: every transcode, and a
+/// stream copy that burns in subtitles. Copy-only legs are a cheap remux.
+/// This distinction does not change today's equal weights, but a future
+/// measured weight will branch on it.
+fn re_encodes(mode: SessionMode, burn_in: Option<&BurnInSelection>) -> bool {
+    !(mode == SessionMode::Copy && burn_in.is_none())
+}
+
+/// Weighted live encoder load in hundredths of an encoder (ADR-0050 §7).
+fn live_encoder_load_centi(sessions: &HashMap<String, Session>) -> u32 {
+    sessions.values().fold(0u32, |total, session| {
+        let weight =
+            hls_policy::encoder_weight_centi(re_encodes(session.mode, session.burn_in.as_ref()));
+        let session_load = session.encoder_states.values().fold(0u32, |load, state| {
+            let encoder_count = u32::from(state.child.is_some())
+                .saturating_add(state.superseded.len().min(u32::MAX as usize) as u32);
+            load.saturating_add(weight.saturating_mul(encoder_count))
+        });
+        total.saturating_add(session_load)
+    })
+}
+
+/// Whether a newcomer of this shape is admitted against the live weighted
+/// load (ADR-0050 §7). Free-standing so admission is testable without
+/// spawning encoders. Every weight is currently 1.0, so this reads
+/// identically to a raw encoder-count check today — the seam exists for when
+/// a measured per-mode weight lands.
+fn admits_new_session(
+    sessions: &HashMap<String, Session>,
+    mode: SessionMode,
+    burn_in: Option<&BurnInSelection>,
+    max_encoders: usize,
+) -> bool {
+    let existing_centi = live_encoder_load_centi(sessions);
+    let newcomer_centi = hls_policy::encoder_weight_centi(re_encodes(mode, burn_in));
+    hls_policy::admits_weighted_load(existing_centi, newcomer_centi, max_encoders)
 }
 
 impl HlsSessionRegistry {
@@ -1156,7 +1187,7 @@ impl HlsSessionRegistry {
             .sessions
             .lock()
             .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
-        if live_encoder_count(&sessions) >= self.max_encoders {
+        if !admits_new_session(&sessions, mode, burn_in.as_ref(), self.max_encoders) {
             return Err(StartSessionError::CapFull);
         }
 
@@ -4182,7 +4213,7 @@ mod tests {
         });
         let mut sessions = HashMap::from([("s1".to_string(), session)]);
 
-        assert_eq!(live_encoder_count(&sessions), 2);
+        assert_eq!(live_encoder_load_centi(&sessions), 200);
 
         let session = sessions.get_mut("s1").unwrap();
         stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
@@ -4218,11 +4249,40 @@ mod tests {
         ]);
         let mut sessions = HashMap::from([("s1".to_string(), session)]);
 
-        assert_eq!(live_encoder_count(&sessions), 2);
+        assert_eq!(live_encoder_load_centi(&sessions), 200);
 
         let session = sessions.get_mut("s1").unwrap();
         for rung in [VideoRung::SingleVideo, VideoRung::SecondVideo] {
             stop_child(&mut session.encoder_state_mut(rung).child);
+        }
+    }
+
+    /// This is the boundary that M1's unit-mismatch mutation below breaks.
+    /// It is deliberately in centi/cap units so a future unit mismatch is
+    /// caught even though equal weights match a raw encoder count today.
+    #[cfg(unix)]
+    #[test]
+    fn weighted_admission_respects_centi_cap_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = HashMap::new();
+        for id in ["s1", "s2", "s3"] {
+            let mut session = make_test_session(dir.path());
+            session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+            sessions.insert(id.to_string(), session);
+        }
+
+        assert_eq!(live_encoder_load_centi(&sessions), 300);
+        assert_eq!(
+            u8::from(admits_new_session(&sessions, SessionMode::Copy, None, 3)),
+            0
+        );
+        assert_eq!(
+            u8::from(admits_new_session(&sessions, SessionMode::Copy, None, 4)),
+            1
+        );
+
+        for session in sessions.values_mut() {
+            stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
         }
     }
 
