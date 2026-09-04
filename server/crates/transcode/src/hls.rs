@@ -40,9 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Counts sessions, not the current and superseded encoders across their
-/// rungs. ADR-0051 amendment 4 leaves encoder-aware admission to a later slice.
-const DEFAULT_MAX_SESSIONS: usize = 3;
+/// Maximum live encoder processes admitted across every session and rung.
+const DEFAULT_MAX_ENCODERS: usize = 3;
 const SINGLE_VIDEO_RUNG: VideoRung = VideoRung::SingleVideo;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
@@ -156,6 +155,7 @@ fn session_disk_bytes(session: &Session) -> u64 {
 
 #[derive(Debug)]
 pub enum StartSessionError {
+    /// The registry's live-encoder cap is full.
     CapFull,
     Spawn(String),
 }
@@ -203,7 +203,7 @@ impl AudioSelection {
 
 pub struct HlsSessionRegistry {
     root: PathBuf,
-    max_sessions: usize,
+    max_encoders: usize,
     /// Session-shaped encode leg from ADR-0009 probe (shared with startup verify).
     encode_leg: crate::EncodeLeg,
     /// Library subtitle store for piggyback publish (ADR-0041 Decision 7).
@@ -1038,6 +1038,14 @@ fn session_view(session_id: &str, session: &Session, rung: VideoRung) -> Session
     }
 }
 
+fn live_encoder_count(sessions: &HashMap<String, Session>) -> usize {
+    sessions
+        .values()
+        .flat_map(|session| session.encoder_states.values())
+        .map(|state| usize::from(state.child.is_some()) + state.superseded.len())
+        .sum()
+}
+
 impl HlsSessionRegistry {
     /// Creates the HLS cache root, sweeps leftover session dirs from a prior
     /// process, and starts the idle reaper. `encode_leg` is the preferred
@@ -1046,7 +1054,7 @@ impl HlsSessionRegistry {
         root: PathBuf,
         encode_leg: impl Into<crate::EncodeLeg>,
     ) -> Result<Arc<Self>, String> {
-        Self::with_cap(root, DEFAULT_MAX_SESSIONS, encode_leg, None, None)
+        Self::with_cap(root, DEFAULT_MAX_ENCODERS, encode_leg, None, None)
     }
 
     /// Session directories are process-owned caches, not restart state. The
@@ -1056,7 +1064,7 @@ impl HlsSessionRegistry {
     /// count, so discarding an old-layout cache is explicit.
     pub fn with_cap(
         root: PathBuf,
-        max_sessions: usize,
+        max_encoders: usize,
         encode_leg: impl Into<crate::EncodeLeg>,
         subs: Option<Arc<SubsStore>>,
         db: Option<Arc<Db>>,
@@ -1090,7 +1098,7 @@ impl HlsSessionRegistry {
         let encode_leg = encode_leg.into();
         let registry = Arc::new(Self {
             root,
-            max_sessions,
+            max_encoders,
             encode_leg,
             subs,
             db,
@@ -1148,7 +1156,7 @@ impl HlsSessionRegistry {
             .sessions
             .lock()
             .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
-        if sessions.len() >= self.max_sessions {
+        if live_encoder_count(&sessions) >= self.max_encoders {
             return Err(StartSessionError::CapFull);
         }
 
@@ -4144,6 +4152,64 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_encoder_counts_against_live_encoder_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+        state.child = Some(spawn_stand_in_encoder());
+        state.superseded.push(SupersededEncoder {
+            child: spawn_stand_in_encoder(),
+            reap_at: Instant::now() + REAP_AFTER,
+            run_id: 1,
+        });
+        let mut sessions = HashMap::from([("s1".to_string(), session)]);
+
+        assert_eq!(live_encoder_count(&sessions), 2);
+
+        let session = sessions.get_mut("s1").unwrap();
+        stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
+        reap_all_superseded(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_live_rungs_count_as_two_encoders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.encoder_states = HashMap::from([
+            (
+                VideoRung::SingleVideo,
+                EncoderState {
+                    current_run_id: 0,
+                    next_run_id: 1,
+                    child: Some(spawn_stand_in_encoder()),
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+            (
+                VideoRung::SecondVideo,
+                EncoderState {
+                    current_run_id: 0,
+                    next_run_id: 1,
+                    child: Some(spawn_stand_in_encoder()),
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+        ]);
+        let mut sessions = HashMap::from([("s1".to_string(), session)]);
+
+        assert_eq!(live_encoder_count(&sessions), 2);
+
+        let session = sessions.get_mut("s1").unwrap();
+        for rung in [VideoRung::SingleVideo, VideoRung::SecondVideo] {
+            stop_child(&mut session.encoder_state_mut(rung).child);
+        }
     }
 
     /// A seek keeps the prior encoder alive and reaps it on its delay, not
