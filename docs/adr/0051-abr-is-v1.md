@@ -165,6 +165,16 @@ the same `SUBTITLES` group, or hls.js loses subtitles on a rung hop.
 
 ### 4. The session cap must count encoders before the ladder is enabled
 
+> **Discharged 2026-09-05 by [#224](https://github.com/nightjar-tv/nightjar/pull/224).**
+> The first option below shipped: the constant is now `DEFAULT_MAX_ENCODERS`,
+> it counts live encoding processes across every session and rung, and
+> superseded encoders count too. The undercount this section names is closed.
+>
+> **The text below is left as written.** It describes the tree before #224, and
+> its last paragraph is the part that still governs: this section never claimed
+> to settle admission. S7 does that, against ADR-0050 §7-§8, and removes the
+> fixed number entirely.
+
 `DEFAULT_MAX_SESSIONS = 3` counts entries in the session map. A rung is not a
 session, so three sessions each cooking three rungs is **nine encoders** against
 a cap that reads three — on hardware where this ADR's own rung measurements are
