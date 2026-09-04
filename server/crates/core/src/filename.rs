@@ -577,6 +577,30 @@ fn cut_at_written_date(s: &str) -> (String, Option<i32>) {
 /// a number after it, which is a measure of how ordinary it is inside a title.
 const SEASON_WORDS: &[&str] = &["season", "saison", "stagione", "temporada"];
 
+/// Season markers written as an abbreviation.
+///
+/// `Se` is the Dutch *seizoen*, and it comes with `afl` in
+/// [`SPELLED_EPISODE_WORDS`] — `Series T Se.3 afl.3` is one marker written in
+/// two Dutch words, and neither half is worth anything without the other.
+///
+/// **Two letters is the shortest marker in this file, so the counterexample
+/// search matters more here than anywhere else.** Followed by an optional
+/// separator and digits, `se` appears in **3 of the 844 corpus inputs**, **0 of
+/// the corpus's title expectations**, **0 of the 2,475 dogfood `db_title`s**,
+/// **1 of the 25,043 dogfood basenames** and **32 of the sweep's 74,624
+/// names** — and the one library name is the same title as all 32 sweep names,
+/// `Se7en`. As a bare word it appears in 2 more basenames, `The Tales of Ba
+/// Sing Se` and `Sí Se Puede`, with no digits behind either.
+///
+/// **`Se7en` is refused by the boundary check `find_bare_season` already
+/// carries**, not by anything added here: a letter follows the digits, so the
+/// run is not a whole number. A separator requirement was written as a second
+/// refusal, **measured, and removed** — its negative control came back green,
+/// because the boundary check gets there first. It would have cost the glued
+/// Dutch spelling `Se3` for nothing, and this file already records that a guard
+/// with a demonstrable cost and no demonstrable case is not one to keep.
+const SEASON_ABBREVIATIONS: &[&str] = &["se"];
+
 /// The Spanish chapter marker, and only this spelling.
 ///
 /// **`cap` is a real English word and this list is safe because the digits are
@@ -616,7 +640,14 @@ const CHAPTER_WORDS: &[&str] = &["cap", "capitulo"];
 ///
 /// **Last in the list, because the longer spellings must win.** `episode 5`
 /// must match `episode` and read 5, not match `ep` and find `isode`.
-const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo", "ep"];
+/// **`afl` is the Dutch *aflevering*, and it arrives with `se`.** Followed by
+/// digits it appears in **3 of the 844 corpus inputs** and nowhere else at all:
+/// **0 of the corpus's title expectations**, **0 of the 2,475 dogfood
+/// `db_title`s**, **0 of the 25,043 dogfood basenames**, **0 of the sweep's
+/// 74,624 names**. As a bare word it appears **0 times** in every one of those
+/// — it is not an English word, which is what makes it cheaper than `cap` and
+/// `ep`, both of which are.
+const SPELLED_EPISODE_WORDS: &[&str] = &["episode", "episodio", "capitulo", "afl", "ep"];
 
 /// `Cap.101`, `Cap.1901`, `Cap. 408` — one run holding the season and the
 /// episode, behind a word that says so.
@@ -705,11 +736,25 @@ fn find_chapter_season_episode(normalized: &str) -> Option<(usize, i32, i32)> {
 }
 
 /// `Season 1 - Episode 01` — the episode word, for a name that already states
-/// its season and claims no episode.
+/// its season and claims no episode. Returns `(episode, end)`, end inclusive
+/// and equal to the episode where the name spells no range.
 ///
 /// See [`SPELLED_EPISODE_WORDS`] for why this may only be called from the
 /// bare-season arm.
-fn find_spelled_episode(normalized: &str) -> Option<i32> {
+///
+/// **The range is [`extend_episode_span`]'s, not a second one.** `S01E05-06`
+/// and `Season 01 Episode 05-06` are one file holding two episodes written two
+/// ways, and only the marked spelling emitted the pair — so the item list
+/// showed episode 6 as missing media for the spelled one. Every guard that
+/// makes the extension safe comes with it unchanged: a padded separator needs a
+/// distinctive marker, an unseparated repetition must land on the next number
+/// exactly, and [`MAX_EPISODE_RANGE`] bounds the run.
+///
+/// **The padded-separator family cannot reach here at all**, which is worth
+/// saying because it means one of those guards is doing nothing on this path:
+/// [`find_bare_season`] declines any name carrying ` - N` anywhere, so a name
+/// that reaches this arm has no padded dash in it.
+fn find_spelled_episode(normalized: &str, season: i32) -> Option<(i32, i32)> {
     let lower = normalized.to_ascii_lowercase();
     let b = lower.as_bytes();
     for i in 0..b.len() {
@@ -729,7 +774,8 @@ fn find_spelled_episode(normalized: &str) -> Option<i32> {
                 j += 1;
             }
             if j > start && !(j < b.len() && b[j].is_ascii_alphanumeric()) {
-                return lower[start..j].parse::<i32>().ok();
+                let episode = lower[start..j].parse::<i32>().ok()?;
+                return Some((episode, extend_episode_span(b, j, season, episode)));
             }
         }
     }
@@ -809,7 +855,7 @@ fn find_bare_season(normalized: &str) -> Option<(usize, i32)> {
             if bytes[i] == b's' {
                 consider(i, 1, false);
             }
-            for w in SEASON_WORDS {
+            for w in SEASON_WORDS.iter().chain(SEASON_ABBREVIATIONS) {
                 if lower[i..].starts_with(w) {
                     consider(i, w.len(), true);
                 }
@@ -2008,6 +2054,7 @@ fn parse_stem(whole: &str) -> ParsedName {
     }
 
     if let Some((before, season)) = find_bare_season(&normalized) {
+        let spelled = find_spelled_episode(&normalized, season);
         let title = run_title.clone().unwrap_or_else(|| {
             cut_at_unmatched_close(&cut_at_episode_marker(
                 &cut_at_date(&cut_at_trailing_bracket_run(&cut_at_title_junk(
@@ -2027,8 +2074,8 @@ fn parse_stem(whole: &str) -> ParsedName {
             season: Some(season),
             // **The season is known and no episode has been claimed**, which is
             // the only place the spelled episode word is safe to read.
-            episode: find_spelled_episode(&normalized),
-            episode_end: None,
+            episode: spelled.map(|(e, _)| e),
+            episode_end: spelled.filter(|&(e, end)| end > e).map(|(_, end)| end),
             episode_absolute: false,
         };
     }
@@ -2228,10 +2275,27 @@ fn strip_extension(name: &str) -> &str {
 /// extension — a raw H.264 elementary stream — and `1080` is a resolution that
 /// lost its `p`. Both stay extensions because neither is a year. A width test
 /// would be a comment: no one-, two- or three-digit number reaches 1900.
+///
+/// **One or two digits is not an extension either, and no container is
+/// spelled that way.** The year rule covers four; three is `.264` and `.265`
+/// and stays. What was left was `Series T Se.3 afl.3`, where the marker's own
+/// number was cut off as a container and the name reported a season with no
+/// episode — the same defect the year rule was written for, one width down.
+///
+/// **The library cannot see this**: 0 of the 25,043 dogfood basenames end in a
+/// dot followed only by digits, so no real file changes shape. The corpus holds
+/// four such names, and the three that pass today keep passing — their claim
+/// comes from a marker or a date earlier in the name, not from the suffix.
 fn is_extension(suffix: &str) -> bool {
     (1..=4).contains(&suffix.len())
         && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+        && !is_short_digit_run(suffix)
         && !is_year_token(suffix)
+}
+
+/// A run of one or two digits and nothing else.
+fn is_short_digit_run(s: &str) -> bool {
+    (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A run of digits that is a year in 1900–2100.
@@ -2343,30 +2407,32 @@ fn find_season_episode(lower: &str) -> Option<SeasonEpisodeHit> {
                 }
             }
         }
-        // 1x02 / 5x20-21 / 8x01-02-03
+        // 1x02 / 5x20-21 / 8x01-02-03 / 2009x09
         //
         // The season digits must be a **whole** run: bounded on the left by a
-        // non-digit, and no longer than two. Without both halves the scan
-        // starts mid-number and reads a resolution as an episode —
+        // non-digit, and no longer than two — or four in the year range, for
+        // which see [`bare_year_season_ok`]. Without the whole-run test the
+        // scan starts mid-number and reads a resolution as an episode —
         // `1080x1920` matched at the `8`, giving season 80 episode 192, which
         // turned any movie carrying a resolution into an episode. Codec and
         // bit-depth tokens are unaffected because they have no digits before
         // the `x` at all (`x264`, `x265`) or no `x` (`h.264`).
         if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_digit()) {
             let mut j = i;
-            let mut season = 0i32;
             let mut digits = 0;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                if digits < 2 {
-                    season = season * 10 + (bytes[j] - b'0') as i32;
-                }
                 j += 1;
                 digits += 1;
             }
-            if (1..=2).contains(&digits) && j < bytes.len() && bytes[j] == b'x' {
+            let season = lower[i..j].parse::<i32>().unwrap_or(0);
+            if (digits == 4 || (1..=2).contains(&digits)) && j < bytes.len() && bytes[j] == b'x' {
                 j += 1;
                 let (episode, edigits, whole) = read_episode_digits(bytes, &mut j);
-                if edigits > 0 && episode > 0 && whole {
+                if edigits > 0
+                    && episode > 0
+                    && whole
+                    && (digits <= 2 || bare_year_season_ok(season, edigits))
+                {
                     let end = extend_episode_span(bytes, j, season, episode);
                     return Some((i, season, Some((episode, end))));
                 }
@@ -2375,6 +2441,29 @@ fn find_season_episode(lower: &str) -> Option<SeasonEpisodeHit> {
         i += 1;
     }
     declined.map(|(at, season)| (at, season, None))
+}
+
+/// May a bare `NNNNxNN` claim a four-digit season?
+///
+/// **Only in the year range, and only in front of a run of at most two
+/// digits.** `2016x231` was refused wholesale with the reason written down —
+/// *"it is the shape of a resolution: `1920x804` puts a plausible year on the
+/// left and a whole three-digit run on the right"*. The right-hand half of
+/// that sentence is a rule, and it was never written as one.
+///
+/// **No resolution has a two-digit height.** Every `(19|20)NNxN…` in the
+/// evidence splits cleanly on the width of the run after the `x`: three or
+/// four digits are `1920x1080`, `1920x804`, `2016x231` — 8 occurrences across
+/// the corpus, and every one of them a resolution or the refused case. One or
+/// two digits are `2009x09`, `2010x15` and `2010x16` — 3 occurrences, in two
+/// names, both of which assert a year-season. **The dogfood library and the
+/// sweep hold none of either**, so this refuses nothing real and claims
+/// nothing real.
+///
+/// The marked spelling `S2016E231` is unaffected and still needs no width
+/// test: an `S` and an `E` are evidence a resolution does not carry.
+fn bare_year_season_ok(season: i32, episode_digits: usize) -> bool {
+    (1900..=2100).contains(&season) && episode_digits <= 2
 }
 
 /// The widest episode number an episode marker may carry.
@@ -2623,12 +2712,18 @@ fn read_repeated_season(bytes: &[u8], i: usize) -> Option<(i32, usize)> {
         let mut k = i;
         let mut n = 0i32;
         let mut digits = 0;
-        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 2 {
+        // **Four digits, for the same year-season the token scan now reads.**
+        // `2010x15 - 2010x16` repeats its season and a two-digit reader stopped
+        // at `20`, so the range died on the repetition even though the first
+        // token had been claimed. The guard here is not a width test but the
+        // caller's: a repeated season is only accepted when it **equals the
+        // season already claimed**, which a resolution cannot do.
+        while k < bytes.len() && bytes[k].is_ascii_digit() && digits < 4 {
             n = n * 10 + (bytes[k] - b'0') as i32;
             k += 1;
             digits += 1;
         }
-        if digits > 0 && k < bytes.len() && bytes[k] == b'x' {
+        if matches!(digits, 1 | 2 | 4) && k < bytes.len() && bytes[k] == b'x' {
             return Some((n, k));
         }
     }
@@ -3841,6 +3936,160 @@ mod tests {
         assert_eq!(p.episode, Some(8));
     }
 
+    /// **The Dutch marker, both halves at once.**
+    ///
+    /// `Se` is *seizoen* and `afl` is *aflevering*. Neither half is worth
+    /// anything alone: without `se` no season is known, and the spelled episode
+    /// arm runs only when one is; without `afl` the season is read and the
+    /// episode stays absent. So they are one mechanism and one commit, and this
+    /// is red on deleting either word from its list.
+    #[test]
+    fn a_dutch_season_and_episode_marker_is_one_marker() {
+        let p = parse_filename("Series T Se.3 afl.3");
+        assert_eq!(p.title, "Series T");
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(3));
+    }
+
+    /// **The input the two-letter marker wrongly accepts, constructed.**
+    ///
+    /// `Se7en` is a bound film in the 25,043-file dogfood library, the only
+    /// name in it where `se` meets digits, and the sweep renders that title 32
+    /// times. What refuses it is the boundary check `find_bare_season` already
+    /// had — `7` is followed by `e`, so the digit run is not a whole number.
+    /// **Red on deleting `bytes[j].is_ascii_alphabetic()` from that check.**
+    ///
+    /// The head is two words on purpose. At the front of a name `Se7en` is
+    /// refused twice over, because a title cut there would leave no letters,
+    /// and a control cannot go red through a guard that another guard already
+    /// declines for.
+    #[test]
+    fn se_glued_to_its_digits_is_not_a_season() {
+        let p = parse_filename("The Film Se7en.1995.1080p.BluRay.x264-GRP.mkv");
+        assert_eq!(p.title, "The Film Se7en");
+        assert_eq!(p.season, None);
+        assert_eq!(p.year, Some(1995));
+    }
+
+    /// **The longer word still wins where both match.**
+    ///
+    /// `season` opens with `se`, so every `Season N` offers the abbreviation a
+    /// match as well. It declines — an `a` follows, not a separator — and the
+    /// spelled word reads the number. A multi-word head, so a wrong claim shows
+    /// as a truncated title as well as a wrong season.
+    #[test]
+    fn the_abbreviation_does_not_eat_the_word_it_abbreviates() {
+        let p = parse_filename("Some Other Title Season 4 - Episode 6.mkv");
+        assert_eq!(p.title, "Some Other Title");
+        assert_eq!(p.season, Some(4));
+        assert_eq!(p.episode, Some(6));
+    }
+
+    /// **A bare `se` inside an episode title claims nothing.**
+    ///
+    /// The two names in the library that carry the word — `The Tales of Ba Sing
+    /// Se` and `Sí Se Puede` — are episode titles with no digits behind them.
+    /// This locks the word rather than the arm guard, and the head is four
+    /// words so a wrong claim cannot hide.
+    #[test]
+    fn a_bare_se_in_an_episode_title_claims_nothing() {
+        let p = parse_filename("Avatar - The Last Airbender - 2x15 - The Tales of Ba Sing Se.mkv");
+        assert_eq!(p.title, "Avatar - The Last Airbender");
+        assert_eq!(p.season, Some(2));
+        assert_eq!(p.episode, Some(15));
+    }
+
+    /// **A range spelled in words is the same file as a range spelled in
+    /// markers.**
+    ///
+    /// `S01E05-06` emitted episodes 5 and 6; `Season 01 Episode 05-06` emitted
+    /// only 5, so the item list showed 6 as missing media on one spelling and
+    /// not the other. Red on dropping the `extend_episode_span` call from
+    /// `find_spelled_episode`.
+    ///
+    /// The Dutch line is the same mechanism reached through a different word,
+    /// and it is a three-number run rather than a pair.
+    #[test]
+    fn a_spelled_episode_marker_carries_its_range() {
+        let p = parse_filename("Series Title Season 01 Episode 05-06 720p");
+        assert_eq!(p.season, Some(1));
+        assert_eq!(p.episode_numbers(), vec![5, 6]);
+
+        let q = parse_filename("13 Series Se.1 afl.2-3-4 [VTM]");
+        assert_eq!(q.title, "13 Series");
+        assert_eq!(q.season, Some(1));
+        assert_eq!(q.episode_numbers(), vec![2, 3, 4]);
+    }
+
+    /// **The inputs the range would wrongly accept, constructed.**
+    ///
+    /// Each is a name the spelled arm now reaches and must not read as a range,
+    /// and each has a head of its own so no line can be masked by another
+    /// declining. In order: a hyphenated episode title behind the number, an
+    /// unmarked repetition behind a space, the same behind a dot — which is a
+    /// space once the stem is normalised — a run wider than
+    /// [`MAX_EPISODE_RANGE`], and a second number below the first.
+    #[test]
+    fn a_spelled_episode_marker_declines_what_is_not_a_range() {
+        for (name, episode) in [
+            ("Show Season 1 Episode 3-D Printing.mkv", 3),
+            ("Another Show Season 4 Episode 5 06 Extra.mkv", 5),
+            ("A Third Show Season 2 Episode 4.05 Extra.mkv", 4),
+            ("Fourth Programme Season 3 Episode 07-99 Wide.mkv", 7),
+            ("Fifth Programme Season 5 Episode 08-07 Back.mkv", 8),
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.episode, Some(episode), "{name}");
+            assert_eq!(p.episode_end, None, "{name}");
+        }
+    }
+
+    /// **A bare four-digit season, in the one shape a resolution cannot take.**
+    ///
+    /// `2016x231` stays refused and the reason is unchanged — a plausible year
+    /// on the left and a whole three-digit run on the right is what
+    /// `1920x804` looks like. **The width of the run after the `x` is what
+    /// separates them**, and it was in the prose without being in the code.
+    ///
+    /// Two lines, two names. The first is a whole filename that is only a
+    /// token, so its title is empty; the second repeats its season across a
+    /// padded dash, which is what makes it a range. Red on removing the
+    /// four-digit branch from `find_season_episode`, and the second line is
+    /// red on its own if `read_repeated_season` goes back to two digits.
+    #[test]
+    fn a_bare_year_season_reads_a_two_digit_episode() {
+        let p = parse_filename("2009x09 [SDTV].avi");
+        assert_eq!(p.title, "");
+        assert_eq!(p.season, Some(2009));
+        assert_eq!(p.episode, Some(9));
+
+        let q = parse_filename("World Series of Sonarr - 2010x15 - 2010x16 - HD TV.mkv");
+        assert_eq!(q.title, "World Series of Sonarr");
+        assert_eq!(q.season, Some(2010));
+        assert_eq!(q.episode_numbers(), vec![15, 16]);
+    }
+
+    /// **The resolutions this must not claim**, each with a head of its own.
+    ///
+    /// All three are real names from the corpus. `1920x1080` and `1920x804`
+    /// put a year on the left of an `x`; `2016x231` is the case the board
+    /// refused and it stays refused. **Red on deleting `episode_digits <= 2`
+    /// from [`bare_year_season_ok`]** — without it all three become episodes,
+    /// which is the worst class of error the parser can make.
+    #[test]
+    fn a_bare_year_season_declines_a_resolution() {
+        for name in [
+            "[Arid] 5 Centimeters per Second (BDRip 1920x1080 Hi10 FLAC) [FD8B6FF2].mkv",
+            "[Kulot] Violet Evergarden Gaiden (BDRip 1920x804 x264) [Dual-Audio].mkv",
+            "Series - 2016x231",
+        ] {
+            let p = parse_filename(name);
+            assert_eq!(p.season, None, "{name}");
+            assert_eq!(p.episode, None, "{name}");
+            assert_eq!(p.kind, MediaKind::Movie, "{name}");
+        }
+    }
+
     /// **The year cut used to throw away an episode claim the name carries.**
     ///
     /// `Series Show.2016.E04.Power…` cut at `2016`, which removed everything
@@ -3991,6 +4240,30 @@ mod tests {
             parse_filename("Another Show.264").title,
             "Another Show",
             "a raw H.264 elementary stream is a real extension"
+        );
+    }
+
+    /// **One width down, the same defect the year rule was written for.**
+    ///
+    /// `Series T Se.3 afl.3` had its last `3` cut off as a container, so the
+    /// number a marker introduces went missing. No container is spelled as one
+    /// or two digits, and **0 of the 25,043 dogfood basenames end in a dot
+    /// followed only by digits**, so nothing real changes shape.
+    ///
+    /// Red on deleting `is_short_digit_run` from [`is_extension`]. Each name
+    /// has a head of its own, and the last line is the boundary: three digits
+    /// is `.264`'s width and stays an extension.
+    #[test]
+    fn a_one_or_two_digit_suffix_is_not_a_file_extension() {
+        assert_eq!(parse_filename("Some Programme.3").title, "Some Programme 3");
+        assert_eq!(
+            parse_filename("Another Show Here.70").title,
+            "Another Show Here 70"
+        );
+        assert_eq!(
+            parse_filename("A Third Title.264").title,
+            "A Third Title",
+            "three digits is the raw H.264 width and stays an extension"
         );
     }
 
