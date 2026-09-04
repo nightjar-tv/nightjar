@@ -3303,7 +3303,27 @@ fn log_playlist_serve(
     );
 }
 
-/// Master playlist: one video variant + optional SUBTITLES group (ADR-0010).
+/// One video rendition in the master playlist (ADR-0051).
+pub(crate) struct MasterRendition {
+    /// Advertised peak bitrate, the BANDWIDTH attribute.
+    pub bandwidth: u64,
+    /// `(width, height)` for RESOLUTION, or `None` to omit the attribute.
+    pub resolution: Option<(u32, u32)>,
+    /// Media playlist URI, path-absolute.
+    pub uri: String,
+}
+
+impl MasterRendition {
+    fn single_video(session_id: &str) -> Self {
+        Self {
+            bandwidth: 5_000_000,
+            resolution: None,
+            uri: format!("/api/v0/sessions/{session_id}/index.m3u8"),
+        }
+    }
+}
+
+/// Master playlist for the supplied video renditions and optional SUBTITLES group (ADR-0010).
 /// Media and subtitle URIs are path-absolute under `/api/v0/sessions/…`
 /// so run-directory depth cannot break client resolution (ADR-0008).
 ///
@@ -3311,7 +3331,14 @@ fn log_playlist_serve(
 /// Main@L3.1 while VideoToolbox emits High@L4.0) makes Safari native HLS
 /// refuse the variant outright. Better no hint than a lying one; the init
 /// segment carries the real codec string.
-fn build_master(session_id: &str, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
+///
+/// An empty `renditions` slice emits no `#EXT-X-STREAM-INF` lines. Such a
+/// master is useless, so callers must guarantee a non-empty slice.
+fn build_master_with_renditions(
+    session_id: &str,
+    tracks: &[HlsSubtitleTrack],
+    renditions: &[MasterRendition],
+) -> Vec<u8> {
     use std::fmt::Write;
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     if !tracks.is_empty() {
@@ -3334,15 +3361,29 @@ fn build_master(session_id: &str, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
             }
             let _ = writeln!(out, "{line}");
         }
-        out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000,SUBTITLES=\"subs\"\n");
-    } else {
-        out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000\n");
     }
-    // Session-scoped, like the master that carries it (ADR-0054 decision 5).
-    // The run survives in `EXT-X-MAP` inside this playlist and nowhere else on
-    // the wire.
-    let _ = writeln!(out, "/api/v0/sessions/{session_id}/index.m3u8");
+    for rendition in renditions {
+        let mut line = format!("#EXT-X-STREAM-INF:BANDWIDTH={}", rendition.bandwidth);
+        if let Some((width, height)) = rendition.resolution {
+            let _ = write!(line, ",RESOLUTION={width}x{height}");
+        }
+        if !tracks.is_empty() {
+            line.push_str(",SUBTITLES=\"subs\"");
+        }
+        let _ = writeln!(out, "{line}");
+        // Session-scoped, like the master that carries it (ADR-0054 decision 5).
+        // The run survives in `EXT-X-MAP` inside this playlist and nowhere else on
+        // the wire.
+        let _ = writeln!(out, "{}", rendition.uri);
+    }
     out.into_bytes()
+}
+
+/// Builds today's single-rendition master playlist through the generalized
+/// rendition path.
+fn build_master(session_id: &str, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
+    let renditions = [MasterRendition::single_video(session_id)];
+    build_master_with_renditions(session_id, tracks, &renditions)
 }
 
 /// Subtitle media playlist for one snapshotted track.
@@ -8418,6 +8459,67 @@ mod tests {
         assert!(!text.contains("SUBTITLES="));
         assert!(!text.contains("CODECS="), "{text}");
         assert!(text.contains("\n/api/v0/sessions/s1/index.m3u8\n"));
+    }
+
+    #[test]
+    fn master_playlist_renders_three_renditions_with_subtitles() {
+        let tracks = [HlsSubtitleTrack {
+            track_id: "e2".into(),
+            language: Some("en".into()),
+            name: "English".into(),
+            is_default: true,
+            forced: false,
+            sdh: false,
+            item_id: 176,
+            stream_index: Some(2),
+            sidecar_path: None,
+            codec: "subrip".into(),
+            item_vtt_path: None,
+        }];
+        let renditions = [
+            MasterRendition {
+                bandwidth: 6_000_000,
+                resolution: Some((1920, 1080)),
+                uri: "/api/v0/sessions/s1/high.m3u8".into(),
+            },
+            MasterRendition {
+                bandwidth: 3_000_000,
+                resolution: Some((1920, 1080)),
+                uri: "/api/v0/sessions/s1/mid.m3u8".into(),
+            },
+            MasterRendition {
+                bandwidth: 2_000_000,
+                resolution: Some((1280, 720)),
+                uri: "/api/v0/sessions/s1/low.m3u8".into(),
+            },
+        ];
+        let text =
+            String::from_utf8(build_master_with_renditions("s1", &tracks, &renditions)).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        let stream_lines: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("#EXT-X-STREAM-INF:"))
+            .collect();
+
+        assert_eq!(stream_lines.len(), 3);
+        assert_eq!(
+            stream_lines,
+            [
+                "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,SUBTITLES=\"subs\"",
+                "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,SUBTITLES=\"subs\"",
+                "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,SUBTITLES=\"subs\"",
+            ]
+        );
+        assert!(!text.contains("CODECS="), "{text}");
+        for (stream_line, uri) in stream_lines.iter().zip([
+            "/api/v0/sessions/s1/high.m3u8",
+            "/api/v0/sessions/s1/mid.m3u8",
+            "/api/v0/sessions/s1/low.m3u8",
+        ]) {
+            let index = lines.iter().position(|line| line == stream_line).unwrap();
+            assert_eq!(lines[index + 1], uri);
+        }
     }
 
     #[test]
