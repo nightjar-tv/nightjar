@@ -6,6 +6,7 @@
 
 mod audio;
 mod hls;
+mod hls_master;
 mod hls_segment_map;
 mod hwaccel;
 mod subs;
@@ -15,8 +16,9 @@ pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
     AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PiggybackExtract,
     PlaylistError, SegmentMissAction, SessionEncoder, SessionMode, SessionView, StartSessionError,
-    VideoRung, WindowAction, decide_segment_miss, decide_window_action, host_tonemap_available,
+    WindowAction, decide_segment_miss, decide_window_action, host_tonemap_available,
 };
+pub use hls_master::VideoRung;
 pub use hls_segment_map::parse_time_keyed_segment_name;
 pub use hwaccel::{
     EncodeLeg, EncoderCandidate, EncoderStatus, TranscodeCapabilities, list_render_nodes,
