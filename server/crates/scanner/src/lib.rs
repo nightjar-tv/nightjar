@@ -2681,6 +2681,20 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn skip_without_fixture(path: &Path) -> bool {
+        if path.is_file() {
+            return false;
+        }
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FIXTURES").is_some() {
+            panic!(
+                "fixture required (NIGHTJAR_TEST_REQUIRE_FIXTURES set) but missing: {}",
+                path.display()
+            );
+        }
+        eprintln!("skipping: missing {}", path.display());
+        true
+    }
+
     /// ADR-0041 Decision 8.2 / 8.3 acceptance: a simulated I/O failure during
     /// extract lands `subtitle_status = unavailable` (never `error`) and
     /// records the first backoff attempt. The sidecar read fails with an
@@ -3161,8 +3175,7 @@ mod tests {
         fs::create_dir_all(&media).unwrap();
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
-        if !corpus.exists() {
-            eprintln!("skipping: missing {}", corpus.display());
+        if skip_without_fixture(&corpus) {
             return;
         }
         let stored = media.join("Subs.mkv");

@@ -286,6 +286,15 @@ fn ffprobe_missing() -> bool {
             .unwrap_or(true)
 }
 
+fn require_fixture(path: &Path) {
+    if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FIXTURES").is_some() {
+        panic!(
+            "fixture required (NIGHTJAR_TEST_REQUIRE_FIXTURES set) but missing: {}",
+            path.display()
+        );
+    }
+}
+
 fn decide_for(
     path: &Path,
     profile: &ClientCapabilityProfile,
@@ -422,6 +431,7 @@ fn hdr_axis_decide_table_browser_aether_no_hdr() {
         }
         let path = testdata.join(case.rel);
         if case.optional && !path.is_file() {
+            require_fixture(&path);
             eprintln!("skip {}: optional corpus file absent", case.rel);
             continue;
         }

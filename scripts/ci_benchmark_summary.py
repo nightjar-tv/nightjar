@@ -13,6 +13,21 @@ import re
 import sys
 
 
+class ParseError(ValueError):
+    def __init__(self, parser: str, expected_keys: list[str], text: str):
+        self.parser = parser
+        self.expected_keys = expected_keys
+        self.text = text
+        super().__init__(parser)
+
+    def __str__(self) -> str:
+        keys = ", ".join(self.expected_keys)
+        return (
+            f"{self.parser}: expected keys were not found: {keys}\n"
+            f"unparseable input:\n{self.text}"
+        )
+
+
 def parse_ci(text: str) -> dict:
     out: dict = {}
     m = re.search(r"startup_ms samples=.* median=(\d+)", text)
@@ -21,6 +36,13 @@ def parse_ci(text: str) -> dict:
     m = re.search(r"idle_rss_mb_with_library=(\d+)", text)
     if m:
         out["idleRssMbWithLibrary"] = int(m.group(1))
+    # Parsing is fatal: an empty or format-changed log is not benchmark evidence.
+    if not out:
+        raise ParseError(
+            "parse_ci",
+            ["startupMedianMs", "idleRssMbWithLibrary"],
+            text,
+        )
     return out
 
 
@@ -35,9 +57,17 @@ def parse_scan(text: str) -> dict:
     m = re.search(r"files_per_sec=([0-9.]+)", text)
     if m:
         out["probeFilesPerSec"] = float(m.group(1))
+    # Parsing is fatal: an empty or format-changed log is not benchmark evidence.
+    if not out:
+        raise ParseError(
+            "parse_scan",
+            ["index10kSeconds", "rescanSeconds", "probeFilesPerSec"],
+            text,
+        )
     return out
 
 
+# Comparison is advisory: parsed regressions are reported but never fail CI.
 def delta_line(key: str, cur, base) -> str:
     if cur is None:
         return f"| `{key}` | — | {base} | unknown |"
@@ -71,8 +101,12 @@ def main() -> int:
     scan_text = pathlib.Path(sys.argv[2]).read_text(errors="replace")
     baseline_path = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
 
-    metrics = parse_ci(ci_text)
-    metrics.update(parse_scan(scan_text))
+    try:
+        metrics = parse_ci(ci_text)
+        metrics.update(parse_scan(scan_text))
+    except ParseError as exc:
+        print(f"benchmark parse failed: {exc}", file=sys.stderr)
+        return 2
     bin_path = os.environ.get("NIGHTJAR_BIN")
     if bin_path and pathlib.Path(bin_path).is_file():
         metrics["releaseBinaryBytes"] = pathlib.Path(bin_path).stat().st_size
