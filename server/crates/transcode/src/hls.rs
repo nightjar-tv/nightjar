@@ -3303,6 +3303,36 @@ fn log_playlist_serve(
     );
 }
 
+/// Stable identity for a video rendition in the rung-scoped URI namespace.
+///
+/// This lives beside [`MasterRendition`] because the ladder will bind each
+/// name to rendition and encoder state here. `SingleVideo` describes today's
+/// sole 5 Mbps-advertised, resolution-unspecified rendition without claiming
+/// it is ADR-0051's future high rung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoRung {
+    SingleVideo,
+}
+
+impl VideoRung {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleVideo => "single",
+        }
+    }
+}
+
+impl std::str::FromStr for VideoRung {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "single" => Ok(Self::SingleVideo),
+            _ => Err(()),
+        }
+    }
+}
+
 /// One video rendition in the master playlist (ADR-0051).
 pub(crate) struct MasterRendition {
     /// Advertised peak bitrate, the BANDWIDTH attribute.
@@ -4357,6 +4387,15 @@ mod tests {
             panic!("NIGHTJAR_TEST_REQUIRE_FFMPEG is set but ffmpeg is not on PATH");
         }
         ok
+    }
+
+    #[test]
+    fn video_rung_accepts_only_the_named_single_rendition() {
+        assert_eq!(VideoRung::SingleVideo.as_str(), "single");
+        assert_eq!("single".parse(), Ok(VideoRung::SingleVideo));
+        for unknown in ["", "default", "high", "Single"] {
+            assert_eq!(unknown.parse::<VideoRung>(), Err(()), "{unknown}");
+        }
     }
 
     /// A minimal session for unit tests that only touch process bookkeeping.
