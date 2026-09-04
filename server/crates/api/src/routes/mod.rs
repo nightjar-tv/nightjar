@@ -119,6 +119,16 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/sessions/{session_id}/index.m3u8",
             get(sessions::playlist),
         )
+        // ADR-0051 amendment 1. The static playlist and closed asset capture
+        // are adjacent because together they are one rung namespace.
+        .route(
+            "/api/v0/sessions/{session_id}/v/{rung}/index.m3u8",
+            get(sessions::rung_playlist),
+        )
+        .route(
+            "/api/v0/sessions/{session_id}/v/{rung}/{asset}",
+            get(sessions::rung_segment),
+        )
         // Stays run-scoped: `EXT-X-MAP` names this, and two runs at different
         // lands cannot share an init (decision 4, overturned 2026-08-31).
         .route(
@@ -327,6 +337,16 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
     (
         "GET",
         "/api/v0/sessions/{session_id}/index.m3u8",
+        Authority::AnySession,
+    ),
+    (
+        "GET",
+        "/api/v0/sessions/{session_id}/v/{rung}/index.m3u8",
+        Authority::AnySession,
+    ),
+    (
+        "GET",
+        "/api/v0/sessions/{session_id}/v/{rung}/{asset}",
         Authority::AnySession,
     ),
     (
@@ -864,7 +884,7 @@ mod route_authority_tests {
     }
 }
 
-/// B2-2 step 4. The cookie reaches exactly nine routes on the real router.
+/// B2-2 step 4. The cookie reaches exactly eleven routes on the real router.
 #[cfg(test)]
 mod cookie_surface_tests {
     use super::*;
@@ -881,7 +901,7 @@ mod cookie_surface_tests {
     /// fix routes, the specific case an `/api/v0/items/` prefix would have
     /// admitted silently.
     #[tokio::test]
-    async fn only_the_nine_accept_a_cookie() {
+    async fn only_the_eleven_accept_a_cookie() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_support::state(dir.path());
 
@@ -1047,7 +1067,7 @@ mod openapi_security_tests {
         }
     }
 
-    /// And `cookieAuth` appears on exactly the nine the extractor accepts, so
+    /// And `cookieAuth` appears on exactly the eleven the extractor accepts, so
     /// a client reading the spec cannot conclude the cookie works on a route
     /// where it will be refused.
     #[test]

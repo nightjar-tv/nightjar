@@ -20,8 +20,8 @@ use nightjar_db::SubtitleTrackRow;
 use nightjar_db::resolve_media_path;
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeMap, PiggybackExtract,
-    PlaylistError, SessionMode, StartSessionError, burn_in_kind_for_codec, list_audio_tracks,
-    list_burn_in_subtitles,
+    PlaylistError, SessionMode, StartSessionError, VideoRung, burn_in_kind_for_codec,
+    list_audio_tracks, list_burn_in_subtitles, parse_time_keyed_segment_name,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -699,6 +699,19 @@ pub async fn playlist(
     wait_playlist(state, session_id, PlaylistKind::Media).await
 }
 
+/// The media playlist for a named video rung (ADR-0051 amendment 1).
+///
+/// The sole known rung delegates to [`playlist`] so this grammar slice cannot
+/// drift from the existing rendition. Validation happens first: an unknown
+/// name must never select that rendition implicitly.
+pub async fn rung_playlist(
+    state: State<AppState>,
+    Path((session_id, rung_name)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let _rung = require_known_rung(&rung_name)?;
+    playlist(state, Path(session_id)).await
+}
+
 pub async fn run_init(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, u64)>,
@@ -962,6 +975,32 @@ pub async fn segment(
     asset(state, session_id, asset_name, query).await
 }
 
+/// One media segment for a named video rung (ADR-0051 amendment 1).
+///
+/// This capture is narrower than the top-level session capture: the rung URI
+/// grammar contains only `seg_<ms:011>.m4s`, not `init.mp4`. Axum cannot mix
+/// the static segment spelling with a path parameter, so the handler closes
+/// the capture with the segment-name parser before delegating to [`segment`].
+pub async fn rung_segment(
+    state: State<AppState>,
+    Path((session_id, rung_name, asset_name)): Path<(String, String, String)>,
+    query: Query<AssetQuery>,
+) -> ApiResult<Response> {
+    let _rung = require_known_rung(&rung_name)?;
+    if parse_time_keyed_segment_name(&asset_name).is_none() {
+        return Err(ApiError::not_found(format!(
+            "asset {asset_name} for rung {rung_name} not found"
+        )));
+    }
+    segment(state, Path((session_id, asset_name)), query).await
+}
+
+fn require_known_rung(rung_name: &str) -> ApiResult<VideoRung> {
+    rung_name
+        .parse()
+        .map_err(|()| ApiError::not_found(format!("rung {rung_name} not found")))
+}
+
 async fn asset(
     State(state): State<AppState>,
     session_id: String,
@@ -1034,6 +1073,122 @@ pub async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_error(result: ApiResult<Response>) -> (StatusCode, String) {
+        match result {
+            Ok(response) => panic!("expected an error, got {}", response.status()),
+            Err(error) => (error.status, error.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn known_rung_playlist_delegates_to_the_session_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        let session_id = "missing".to_string();
+
+        let top_level =
+            response_error(playlist(State(state.clone()), Path(session_id.clone())).await);
+        let rung = response_error(
+            rung_playlist(
+                State(state),
+                Path((session_id, VideoRung::SingleVideo.as_str().to_string())),
+            )
+            .await,
+        );
+
+        assert_eq!(rung, top_level);
+    }
+
+    #[tokio::test]
+    async fn known_rung_segment_delegates_to_the_session_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        let session_id = "missing".to_string();
+        let asset_name = "seg_00000002000.m4s".to_string();
+        let query = || {
+            Query(AssetQuery {
+                nj_fetcher: Some("rung-test".to_string()),
+            })
+        };
+
+        let top_level = response_error(
+            segment(
+                State(state.clone()),
+                Path((session_id.clone(), asset_name.clone())),
+                query(),
+            )
+            .await,
+        );
+        let rung = response_error(
+            rung_segment(
+                State(state),
+                Path((
+                    session_id,
+                    VideoRung::SingleVideo.as_str().to_string(),
+                    asset_name,
+                )),
+                query(),
+            )
+            .await,
+        );
+
+        assert_eq!(rung, top_level);
+    }
+
+    #[tokio::test]
+    async fn unknown_rung_never_resolves_to_the_single_rendition() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        let unknown = "future-rung".to_string();
+
+        let playlist_error = response_error(
+            rung_playlist(
+                State(state.clone()),
+                Path(("missing".to_string(), unknown.clone())),
+            )
+            .await,
+        );
+        let segment_error = response_error(
+            rung_segment(
+                State(state),
+                Path((
+                    "missing".to_string(),
+                    unknown.clone(),
+                    "seg_00000002000.m4s".to_string(),
+                )),
+                Query(AssetQuery { nj_fetcher: None }),
+            )
+            .await,
+        );
+
+        for error in [playlist_error, segment_error] {
+            assert_eq!(error.0, StatusCode::NOT_FOUND);
+            assert_eq!(error.1, format!("rung {unknown} not found"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rung_segment_rejects_everything_but_a_time_keyed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+
+        for asset_name in ["init.mp4", "seg_2000.m4s", "anything"] {
+            let error = response_error(
+                rung_segment(
+                    State(state.clone()),
+                    Path((
+                        "missing".to_string(),
+                        VideoRung::SingleVideo.as_str().to_string(),
+                        asset_name.to_string(),
+                    )),
+                    Query(AssetQuery { nj_fetcher: None }),
+                )
+                .await,
+            );
+            assert_eq!(error.0, StatusCode::NOT_FOUND, "{asset_name}");
+        }
+    }
 
     /// The header is read off the response the route builds, not matched in
     /// the source. A test that greps for a string proves nothing about what
