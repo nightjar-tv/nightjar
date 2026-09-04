@@ -345,7 +345,6 @@ impl Session {
     /// branch. When more production rungs land, construction must populate a
     /// map for every rung the session offers.
     fn segment_map(&self, rung: VideoRung) -> &crate::hls_segment_map::SegmentMap {
-        let rung = VideoRung::SingleVideo; // MUTATION: collapse to one map
         let Some(map) = self.segment_maps.get(&rung) else {
             panic!("session has no segment map for rung {}", rung.as_str());
         };
