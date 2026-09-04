@@ -106,22 +106,20 @@ pub async fn require_session(
 /// Anything not in this list is refused a cookie by default, so a new route
 /// cannot gain cookie acceptance by being added.
 ///
-/// **Issue #96, narrowed on 2026-08-11 and not closed.** A session serves two
-/// asset shapes, `init.mp4` and `seg_<start_ms>.m4s`. The first is now its own
-/// static route, so it is out of the capture. The second cannot be a route:
-/// axum refuses a segment that mixes static text with a parameter, so
-/// `seg_{start_ms}.m4s` is not expressible and `{asset}` stays. What now
-/// guards the remainder is a test over `hls::is_safe_asset` — the function
-/// that decides what a session will serve — so a third shape fails a test
-/// rather than inheriting cookie acceptance quietly. That is a weaker
-/// guarantee than the router giving it, and it is the strongest one available
-/// without changing the segment URI on the wire.
-pub const COOKIE_ACCEPTED_ROUTES: [&str; 9] = [
+/// **Issue #96, narrowed on 2026-08-11 and not closed.** A session's top-level
+/// asset capture serves `init.mp4` and `seg_<start_ms>.m4s`, closed by
+/// `hls::is_safe_asset`. ADR-0051's rung capture is narrower: it serves only
+/// the time-keyed segment shape, closed by `parse_time_keyed_segment_name`.
+/// Axum cannot express a segment that mixes static text with a parameter, so
+/// both captures remain enumerated here and guarded in their handlers.
+pub const COOKIE_ACCEPTED_ROUTES: [&str; 11] = [
     "/api/v0/artwork/{item_key}/{kind}",
     "/api/v0/items/{item_id}/stream",
     "/api/v0/items/{item_id}/subtitles/{asset}",
     "/api/v0/sessions/{session_id}/master.m3u8",
     "/api/v0/sessions/{session_id}/index.m3u8",
+    "/api/v0/sessions/{session_id}/v/{rung}/index.m3u8",
+    "/api/v0/sessions/{session_id}/v/{rung}/{asset}",
     "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
     "/api/v0/sessions/{session_id}/subs/{*asset}",
     "/api/v0/sessions/{session_id}/init.mp4",
@@ -380,13 +378,15 @@ mod tests {
     /// touching the router, so widening the cookie surface is always a
     /// deliberate edit in two places.
     #[test]
-    fn the_cookie_accepted_set_is_exactly_these_nine() {
+    fn the_cookie_accepted_set_is_exactly_these_eleven() {
         let expected = [
             "/api/v0/artwork/{item_key}/{kind}",
             "/api/v0/items/{item_id}/stream",
             "/api/v0/items/{item_id}/subtitles/{asset}",
             "/api/v0/sessions/{session_id}/master.m3u8",
             "/api/v0/sessions/{session_id}/index.m3u8",
+            "/api/v0/sessions/{session_id}/v/{rung}/index.m3u8",
+            "/api/v0/sessions/{session_id}/v/{rung}/{asset}",
             "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
             "/api/v0/sessions/{session_id}/subs/{*asset}",
             "/api/v0/sessions/{session_id}/init.mp4",
@@ -394,8 +394,8 @@ mod tests {
         ];
         assert_eq!(
             COOKIE_ACCEPTED_ROUTES.len(),
-            9,
-            "item 9 names nine; changing the count is an ADR amendment"
+            11,
+            "item 9 plus ADR-0051's 2026-09-04 amendment name eleven; changing the count needs an ADR amendment"
         );
         assert_eq!(COOKIE_ACCEPTED_ROUTES, expected);
     }
@@ -404,12 +404,12 @@ mod tests {
     ///
     /// An entry ending in a capture accepts whatever its handler chooses to
     /// serve, so its cookie acceptance covers a set the router cannot see the
-    /// edges of (issue #96). Four such entries exist, each closed by a parser
+    /// edges of (issue #96). Five such entries exist, each closed by a parser
     /// in its own handler and none by the router, and this test exists so a
-    /// fifth is a deliberate edit rather than a side effect. Shortening this
+    /// sixth is a deliberate edit rather than a side effect. Shortening this
     /// list is progress; lengthening it needs a reason in the same commit.
     #[test]
-    fn the_open_captures_are_these_four_and_no_others() {
+    fn the_open_captures_are_these_five_and_no_others() {
         let open: Vec<&str> = COOKIE_ACCEPTED_ROUTES
             .iter()
             .copied()
@@ -425,6 +425,9 @@ mod tests {
                 "/api/v0/artwork/{item_key}/{kind}",
                 // `{asset}`: `is_valid_track_id` plus a `.vtt` suffix.
                 "/api/v0/items/{item_id}/subtitles/{asset}",
+                // `{rung}`: `VideoRung`; trailing `{asset}`:
+                // `parse_time_keyed_segment_name`, so `init.mp4` cannot enter.
+                "/api/v0/sessions/{session_id}/v/{rung}/{asset}",
                 // `{*asset}`: a sidecar tree the router would otherwise have
                 // to encode the layout of.
                 "/api/v0/sessions/{session_id}/subs/{*asset}",
@@ -507,7 +510,7 @@ mod routing_tests {
         StatusCode::OK
     }
 
-    /// The eight accepted patterns, plus two that are not on the list: one
+    /// The eleven accepted patterns, plus two that are not on the list: one
     /// sharing a prefix with an accepted route, and one write.
     fn router(state: AppState) -> Router {
         const STREAM: &str = "/api/v0/items/{item_id}/stream";

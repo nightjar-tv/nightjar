@@ -399,6 +399,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/sessions/{sessionId}/v/{rung}/index.m3u8": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * HLS media playlist for a named video rung
+         * @description ADR-0051 amendment 1. Today only the single rendition exists, so its bytes and response semantics are identical to the session-scoped index.m3u8 route. Unknown rung names return 404 rather than selecting that rendition implicitly.
+         */
+        get: operations["getSessionRungPlaylist"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v0/sessions/{sessionId}/v/{rung}/{asset}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * HLS media segment for a named video rung
+         * @description ADR-0051 amendment 1. The rung namespace contains time-keyed media segments only; init.mp4 remains outside it. Axum cannot express the mixed static and parameter segment name, so the handler validates the asset against the pattern below. Unknown rung names return 404.
+         */
+        get: operations["getSessionRungAsset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/sessions/{sessionId}/runs/{runId}/init.mp4": {
         parameters: {
             query?: never;
@@ -1440,6 +1480,8 @@ export interface components {
         ItemId: number;
         JobId: number;
         SessionId: string;
+        /** @description Named video rendition. This grammar slice exposes only today's single rendition; later ADR-0051 slices add the measured ladder rungs. */
+        VideoRung: "single";
         RunId: number;
         /** @description Client capability profile id (ADR-0022). Known ids: BROWSER_V0, MEDIA3_V0, MPV_V0, AETHER_V0. Omitted or unknown with no field bag falls back to BROWSER_V0. Optional maxBitrateBps / maxHeight / hdr override the named floor (unknown id + bag still decides). */
         ProfileId: string;
@@ -2295,6 +2337,102 @@ export interface operations {
                 };
             };
             /** @description Playlist not ready yet */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionRungPlaylist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                /** @description Named video rendition. This grammar slice exposes only today's single rendition; later ADR-0051 slices add the measured ladder rungs. */
+                rung: components["parameters"]["VideoRung"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description HLS media playlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.apple.mpegurl": string;
+                };
+            };
+            /** @description Session or rung not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Playlist not ready yet */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSessionRungAsset: {
+        parameters: {
+            query?: {
+                /** @description Log-only client marker, with the same semantics as the top-level session asset route. */
+                njFetcher?: string;
+            };
+            header?: never;
+            path: {
+                sessionId: components["parameters"]["SessionId"];
+                /** @description Named video rendition. This grammar slice exposes only today's single rendition; later ADR-0051 slices add the measured ladder rungs. */
+                rung: components["parameters"]["VideoRung"];
+                /** @description A time-keyed media segment name (ADR-0020). */
+                asset: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Segment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "video/iso.segment": string;
+                };
+            };
+            /** @description Abandoned or superseded segment GET held with no fill until the session idle ceiling while the session lived; empty body (ADR-0011). */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Session, rung, or asset not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Segment not on disk yet; retryable while encoding. */
             503: {
                 headers: {
                     [name: string]: unknown;
