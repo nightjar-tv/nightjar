@@ -1,9 +1,12 @@
-//! Session-global time-keyed HLS segment map (ADR-0020).
+//! Per-rung time-keyed HLS segment map (ADR-0020, ADR-0051).
 //!
-//! Producer runs write `segNNN.m4s` under `run_<n>/`. This module parses each
-//! run's honest `index.m3u8`, gates entries with `sidx.earliest_presentation_time`,
-//! and stores them under title-absolute start milliseconds. Served URIs are
-//! `seg_<ms:011>.m4s` (milliseconds, zero-padded).
+//! Producer runs write `segNNN.m4s` under `v<rung>/run_<n>/`. This module
+//! parses each run's honest `index.m3u8`, gates entries with
+//! `sidx.earliest_presentation_time`, and stores them under title-absolute
+//! start milliseconds. Served URIs are `seg_<ms:011>.m4s` (milliseconds,
+//! zero-padded).
+
+use crate::hls_master::VideoRung;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,6 +24,19 @@ pub fn parse_time_keyed_segment_name(name: &str) -> Option<u64> {
         return None;
     }
     rest.parse().ok()
+}
+
+/// On-disk rung directory relative to the session directory (ADR-0051).
+pub fn rung_rel_dir(rung: VideoRung) -> PathBuf {
+    PathBuf::from(format!("v{}", rung.as_str()))
+}
+
+/// On-disk producer run directory relative to the session directory.
+///
+/// Ingest and lifecycle code share this composer so a rung path cannot be
+/// written in one shape and later searched or evicted in another.
+pub fn run_rel_dir(rung: VideoRung, run_id: u64) -> PathBuf {
+    rung_rel_dir(rung).join(format!("run_{run_id}"))
 }
 
 /// Minimal fMP4 with a video (ref_id=1) sidx v0; timescale 1000 → ms.
@@ -47,7 +63,7 @@ pub struct MappedSegment {
     pub start_ms: u64,
     pub duration_ms: u64,
     pub run_id: u64,
-    /// Relative to the session dir, e.g. `run_0/seg042.m4s`.
+    /// Relative to the session dir, e.g. `vsingle/run_0/seg042.m4s`.
     pub rel_path: PathBuf,
 }
 
@@ -323,13 +339,14 @@ pub fn snap_to_cadence(key_ms: u64, cadence_ms: u64) -> Option<u64> {
 pub fn ingest_run_index(
     map: &mut SegmentMap,
     session_dir: &Path,
+    rung: VideoRung,
     run_id: u64,
     index_text: &str,
     encode_start_ms: u64,
     snap: Option<KeySnap<'_>>,
 ) -> Result<usize, String> {
     let entries = parse_ffmpeg_index(index_text)?;
-    let run_rel = PathBuf::from(format!("run_{run_id}"));
+    let run_rel = run_rel_dir(rung, run_id);
     let mut inserted = 0usize;
     // FFmpeg EXTINF starts are relative to the first packet after seek; with
     // a working `-output_ts_offset` the sidx carries title-absolute time. We
@@ -607,11 +624,11 @@ mod tests {
             start_ms: 42_000,
             duration_ms: 2_000,
             run_id: 0,
-            rel_path: PathBuf::from("run_0/seg000.m4s"),
+            rel_path: PathBuf::from("vsingle/run_0/seg000.m4s"),
         });
         assert_eq!(
             map.get(42_000).map(|s| s.rel_path.clone()),
-            Some(PathBuf::from("run_0/seg000.m4s"))
+            Some(PathBuf::from("vsingle/run_0/seg000.m4s"))
         );
 
         // A later run produces its own packing at the same title start.
@@ -619,14 +636,14 @@ mod tests {
             start_ms: 42_000,
             duration_ms: 2_000,
             run_id: 3,
-            rel_path: PathBuf::from("run_3/seg007.m4s"),
+            rel_path: PathBuf::from("vsingle/run_3/seg007.m4s"),
         });
 
         let now = map.get(42_000).expect("the key still resolves");
         assert_eq!(now.run_id, 3, "the newer run owns the URI");
         assert_eq!(
             now.rel_path,
-            PathBuf::from("run_3/seg007.m4s"),
+            PathBuf::from("vsingle/run_3/seg007.m4s"),
             "same URI, different bytes on disk — so no `immutable`, and no \
              max-age that outlives a replacement"
         );
@@ -654,7 +671,7 @@ mod tests {
     #[test]
     fn ingest_offsets_relative_sidx_onto_encode_start() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run_0");
+        let run = dir.path().join(run_rel_dir(VideoRung::SingleVideo, 0));
         fs::create_dir_all(&run).unwrap();
         fs::write(run.join("seg020.m4s"), fake_sidx_seg(0)).unwrap();
         fs::write(run.join("seg021.m4s"), fake_sidx_seg(2000)).unwrap();
@@ -667,7 +684,16 @@ seg021.m4s
 #EXT-X-ENDLIST
 ";
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000, None).unwrap();
+        let n = ingest_run_index(
+            &mut map,
+            dir.path(),
+            VideoRung::SingleVideo,
+            0,
+            index,
+            40_000,
+            None,
+        )
+        .unwrap();
         assert_eq!(n, 2);
         assert_eq!(map.get(40_000).unwrap().duration_ms, 2000);
         assert_eq!(map.get(42_000).unwrap().duration_ms, 2000);
@@ -686,7 +712,7 @@ seg021.m4s
     #[test]
     fn a_grid_that_differs_from_the_duration_still_ingests_every_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run_0");
+        let run = dir.path().join(run_rel_dir(VideoRung::SingleVideo, 0));
         fs::create_dir_all(&run).unwrap();
         let mut index = String::from(
             "#EXTM3U
@@ -710,6 +736,7 @@ seg021.m4s
         let n = ingest_run_index(
             &mut map,
             dir.path(),
+            VideoRung::SingleVideo,
             0,
             &index,
             0,
@@ -734,7 +761,7 @@ seg021.m4s
     #[test]
     fn a_discontiguous_producer_run_is_still_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run_0");
+        let run = dir.path().join(run_rel_dir(VideoRung::SingleVideo, 0));
         fs::create_dir_all(&run).unwrap();
         // 0, 2000, 4000, then a 500 ms hole, then contiguous again.
         let starts = [0u32, 2000, 4000, 6500, 8500];
@@ -757,7 +784,16 @@ seg021.m4s
         );
 
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, &index, 0, None).unwrap();
+        let n = ingest_run_index(
+            &mut map,
+            dir.path(),
+            VideoRung::SingleVideo,
+            0,
+            &index,
+            0,
+            None,
+        )
+        .unwrap();
         assert_eq!(n, 3, "everything up to the hole keeps");
         assert!(
             map.get(6500).is_none(),
@@ -779,7 +815,7 @@ seg021.m4s
     #[test]
     fn a_grid_that_matches_the_duration_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run_0");
+        let run = dir.path().join(run_rel_dir(VideoRung::SingleVideo, 0));
         fs::create_dir_all(&run).unwrap();
         let mut index = String::from(
             "#EXTM3U
@@ -803,6 +839,7 @@ seg021.m4s
         let n = ingest_run_index(
             &mut map,
             dir.path(),
+            VideoRung::SingleVideo,
             0,
             &index,
             0,
@@ -818,7 +855,7 @@ seg021.m4s
     #[test]
     fn ingest_keeps_absolute_sidx_unshifted() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run_0");
+        let run = dir.path().join(run_rel_dir(VideoRung::SingleVideo, 0));
         fs::create_dir_all(&run).unwrap();
         fs::write(run.join("seg020.m4s"), fake_sidx_seg(40_000)).unwrap();
         fs::write(run.join("seg021.m4s"), fake_sidx_seg(42_000)).unwrap();
@@ -831,7 +868,16 @@ seg021.m4s
 #EXT-X-ENDLIST
 ";
         let mut map = SegmentMap::default();
-        let n = ingest_run_index(&mut map, dir.path(), 0, index, 40_000, None).unwrap();
+        let n = ingest_run_index(
+            &mut map,
+            dir.path(),
+            VideoRung::SingleVideo,
+            0,
+            index,
+            40_000,
+            None,
+        )
+        .unwrap();
         assert_eq!(n, 2);
         assert!(map.get(40_000).is_some());
         assert!(map.get(42_000).is_some());
@@ -861,13 +907,13 @@ seg006.m4s
             start_ms: 1000,
             duration_ms: 1000,
             run_id: 0,
-            rel_path: PathBuf::from("run_0/seg000.m4s"),
+            rel_path: PathBuf::from("vsingle/run_0/seg000.m4s"),
         });
         map.insert(MappedSegment {
             start_ms: 5000,
             duration_ms: 1000,
             run_id: 1,
-            rel_path: PathBuf::from("run_1/seg000.m4s"),
+            rel_path: PathBuf::from("vsingle/run_1/seg000.m4s"),
         });
         assert_eq!(map.overlapping(0, 3000).len(), 1, "early window");
         assert_eq!(map.overlapping(4000, 7000).len(), 1, "late window");
@@ -884,13 +930,13 @@ seg006.m4s
                 start_ms: 8008,
                 duration_ms: 4004,
                 run_id: 0,
-                rel_path: PathBuf::from("run_0/a.m4s"),
+                rel_path: PathBuf::from("vsingle/run_0/a.m4s"),
             },
             MappedSegment {
                 start_ms: 12_012,
                 duration_ms: 4004,
                 run_id: 0,
-                rel_path: PathBuf::from("run_0/b.m4s"),
+                rel_path: PathBuf::from("vsingle/run_0/b.m4s"),
             },
         ];
         let entries: Vec<(u64, u64)> = segs.iter().map(|s| (s.start_ms, s.duration_ms)).collect();

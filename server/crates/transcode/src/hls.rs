@@ -3,9 +3,10 @@
 //! [`SessionMode`] and nothing else (ADR-0011).
 //!
 //! ADR-0020: producer-owned boundaries. Each encode/copy run writes into
-//! `run_<n>/`; a session-global time-keyed map (`seg_<ms:011>.m4s`) is the
-//! serve truth. Playlists are assembled from that map (EVENT while cooking,
-//! ENDLIST at run EOF) under a fresh URI per run. Clients seek via
+//! `v<rung>/run_<n>/`; each rung has a time-keyed map
+//! (`seg_<ms:011>.m4s`) as its serve truth. Playlists are assembled from that
+//! map (EVENT while cooking, ENDLIST at run EOF) under a fresh URI per run.
+//! Clients seek via
 //! `POST /sessions/{id}/seek?startMs=` → fresh `playlistUrl`, not by
 //! mutating one VOD or poking segment URIs.
 //!
@@ -21,6 +22,7 @@ use super::subs::{
     extract_embedded_ass, prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms,
 };
 use crate::hls_grid::{GridCadence, grid_cadence_ms};
+use crate::hls_master::VideoRung;
 use crate::hls_policy::{
     CoalesceDesire, PendingWaiterAction, SegmentMissAction, classify_restart_desire,
     coalesce_preempt_before_land, decide_segment_miss, digback_behind_committed, disable_preempt,
@@ -39,10 +41,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_SESSIONS: usize = 3;
+const SINGLE_VIDEO_RUNG: VideoRung = VideoRung::SingleVideo;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
-/// Per-session on-disk budget for run dirs (ADR-0020 §12). Oldest finished
-/// (non-current) runs are evicted first when exceeded.
+/// Per-session on-disk budget shared across every rung's run dirs (ADR-0020
+/// §12, ADR-0051 amendment 2). Oldest finished (non-current) runs are evicted
+/// first when exceeded.
 const SESSION_RUN_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// EOF this far short of probed duration → record usable extent (damaged).
 const USABLE_SHORTFALL_MS: u64 = 30_000;
@@ -138,20 +142,12 @@ fn encode_lead_segments() -> u64 {
         .unwrap_or(ENCODE_LEAD_SEGMENTS)
 }
 
-/// Sum of bytes under every `run_*` dir in a session cache directory.
-fn session_disk_bytes(session_dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(session_dir) else {
-        return 0;
-    };
+/// Sum of bytes under every rung directory in a session cache directory.
+fn session_disk_bytes(session: &Session) -> u64 {
     let mut total = 0u64;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with("run_") {
-            total = total.saturating_add(dir_tree_bytes(&entry.path()));
-        }
+    for rung in session.segment_maps.keys().copied() {
+        let rung_dir = session.dir.join(crate::hls_segment_map::rung_rel_dir(rung));
+        total = total.saturating_add(dir_tree_bytes(&rung_dir));
     }
     total
 }
@@ -292,8 +288,8 @@ struct Session {
     current_run_id: u64,
     /// Next run id to allocate on restart.
     next_run_id: u64,
-    /// Session-global time-keyed segment map (ADR-0020).
-    segment_map: crate::hls_segment_map::SegmentMap,
+    /// One title-time-keyed segment map per video rung (ADR-0051 amendment 2).
+    segment_maps: HashMap<VideoRung, crate::hls_segment_map::SegmentMap>,
     /// True after the current run's ffmpeg exited successfully (ENDLIST).
     current_run_eof: bool,
     child: Option<Child>,
@@ -333,6 +329,37 @@ struct Session {
     /// a segment of that land which has not finished writing, and a suspended
     /// encoder never finishes it.
     superseded: Vec<SupersededEncoder>,
+}
+
+fn single_rung_segment_maps(
+    map: crate::hls_segment_map::SegmentMap,
+) -> HashMap<VideoRung, crate::hls_segment_map::SegmentMap> {
+    HashMap::from([(SINGLE_VIDEO_RUNG, map)])
+}
+
+impl Session {
+    /// Returns the segment map for a rung known to belong to this session.
+    ///
+    /// A missing map is a session-construction bug, so this deliberately
+    /// panics instead of turning every production lookup into a recoverable
+    /// branch. When more production rungs land, construction must populate a
+    /// map for every rung the session offers.
+    fn segment_map(&self, rung: VideoRung) -> &crate::hls_segment_map::SegmentMap {
+        let rung = VideoRung::SingleVideo; // MUTATION: collapse to one map
+        let Some(map) = self.segment_maps.get(&rung) else {
+            panic!("session has no segment map for rung {}", rung.as_str());
+        };
+        map
+    }
+
+    /// Mutable form of [`Self::segment_map`], with the same construction
+    /// invariant and deliberate panic for a missing offered rung.
+    fn segment_map_mut(&mut self, rung: VideoRung) -> &mut crate::hls_segment_map::SegmentMap {
+        let Some(map) = self.segment_maps.get_mut(&rung) else {
+            panic!("session has no segment map for rung {}", rung.as_str());
+        };
+        map
+    }
 }
 
 /// An encoder a seek replaced, waiting out [`REAP_AFTER`].
@@ -379,7 +406,15 @@ fn playlist_url_for(session_id: &str) -> String {
 }
 
 fn run_dir(session: &Session) -> PathBuf {
-    session.dir.join(format!("run_{}", session.current_run_id))
+    run_path(&session.dir, SINGLE_VIDEO_RUNG, session.current_run_id)
+}
+
+fn rung_dir(session_dir: &Path, rung: VideoRung) -> PathBuf {
+    session_dir.join(crate::hls_segment_map::rung_rel_dir(rung))
+}
+
+fn run_path(session_dir: &Path, rung: VideoRung, run_id: u64) -> PathBuf {
+    session_dir.join(crate::hls_segment_map::run_rel_dir(rung, run_id))
 }
 
 fn write_run_encode_start(run_dir: &Path, start_ms: u64) -> Result<(), String> {
@@ -407,8 +442,9 @@ fn sync_segment_map(session: &mut Session) {
     let run_id = session.current_run_id;
     let session_dir = session.dir.clone();
     if let Err(e) = crate::hls_segment_map::ingest_run_index(
-        &mut session.segment_map,
+        session.segment_map_mut(SINGLE_VIDEO_RUNG),
         &session_dir,
+        SINGLE_VIDEO_RUNG,
         run_id,
         &text,
         encode_start_ms,
@@ -426,7 +462,7 @@ fn sync_segment_map(session: &mut Session) {
 /// writing into.
 ///
 /// A seek keeps the prior encoder for [`REAP_AFTER`] and it keeps producing
-/// into `run_<old>` (ADR-0050 §5). [`sync_segment_map`] reads the current run
+/// into its rung's `run_<old>` (ADR-0050 §5). [`sync_segment_map`] reads the current run
 /// only, so without this nothing re-ingests that file until the next
 /// `restart_at`, and everything the held encoder writes after the seek is
 /// invisible to a waiting request. The new encoder starts at the new land and
@@ -457,14 +493,16 @@ fn sync_superseded_run_indexes(session: &mut Session) {
     let snap = session_key_snap(cadence, &points);
     let run_ids: Vec<u64> = session.superseded.iter().map(|s| s.run_id).collect();
     for run_id in run_ids {
-        let run_path = session.dir.join(format!("run_{run_id}"));
+        let run_path = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
         let Ok(text) = fs::read_to_string(run_path.join("index.m3u8")) else {
             continue;
         };
         let encode_start_ms = read_run_encode_start(&run_path);
+        let session_dir = session.dir.clone();
         if let Err(e) = crate::hls_segment_map::ingest_run_index(
-            &mut session.segment_map,
-            &session.dir,
+            session.segment_map_mut(SINGLE_VIDEO_RUNG),
+            &session_dir,
+            SINGLE_VIDEO_RUNG,
             run_id,
             &text,
             encode_start_ms,
@@ -475,41 +513,51 @@ fn sync_superseded_run_indexes(session: &mut Session) {
     }
 }
 
-/// Re-read every `run_*/index.m3u8` so scrub-back map hits see prior runs
-/// even if the current run's index is empty after stop_child.
+/// Re-read every `v<rung>/run_*/index.m3u8` so scrub-back map hits see prior
+/// runs even if the current run's index is empty after stop_child.
 fn sync_all_run_indexes(session: &mut Session) {
     let cadence = session_cadence_ms(session);
     let points = session_listed_points(session);
     let snap = session_key_snap(cadence, &points);
-    let Ok(entries) = fs::read_dir(&session.dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    let session_dir = session.dir.clone();
+    let rungs: Vec<VideoRung> = session.segment_maps.keys().copied().collect();
+    for rung in rungs {
+        let Ok(entries) = fs::read_dir(rung_dir(&session_dir, rung)) else {
             continue;
         };
-        let Some(id_str) = name.strip_prefix("run_") else {
-            continue;
-        };
-        let Ok(run_id) = id_str.parse::<u64>() else {
-            continue;
-        };
-        let run_path = entry.path();
-        let index_path = run_path.join("index.m3u8");
-        let Ok(text) = fs::read_to_string(&index_path) else {
-            continue;
-        };
-        let encode_start_ms = read_run_encode_start(&run_path);
-        if let Err(e) = crate::hls_segment_map::ingest_run_index(
-            &mut session.segment_map,
-            &session.dir,
-            run_id,
-            &text,
-            encode_start_ms,
-            snap,
-        ) {
-            tracing::warn!(run_id, error = %e, "hls map ingest failed (all-runs sync)");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id_str) = name.strip_prefix("run_") else {
+                continue;
+            };
+            let Ok(run_id) = id_str.parse::<u64>() else {
+                continue;
+            };
+            let run_path = entry.path();
+            let index_path = run_path.join("index.m3u8");
+            let Ok(text) = fs::read_to_string(&index_path) else {
+                continue;
+            };
+            let encode_start_ms = read_run_encode_start(&run_path);
+            if let Err(e) = crate::hls_segment_map::ingest_run_index(
+                session.segment_map_mut(rung),
+                &session_dir,
+                rung,
+                run_id,
+                &text,
+                encode_start_ms,
+                snap,
+            ) {
+                tracing::warn!(
+                    rung = rung.as_str(),
+                    run_id,
+                    error = %e,
+                    "hls map ingest failed (all-runs sync)"
+                );
+            }
         }
     }
 }
@@ -532,15 +580,19 @@ fn current_run_has_mapped_segment(session: &Session) -> bool {
             && session.dir.join(&s.rel_path).is_file()
     };
     if session
-        .segment_map
+        .segment_map(SINGLE_VIDEO_RUNG)
         .iter_ordered()
         .any(|s| s.run_id == session.current_run_id && in_playlist_window(s))
     {
         return true;
     }
     // Duplicate-write stop: fresh run id with no new producer bytes; playlist
-    // is assembled from the global map (prior runs).
-    session.child.is_none() && session.segment_map.iter_ordered().any(in_playlist_window)
+    // is assembled from this rung's map (prior runs).
+    session.child.is_none()
+        && session
+            .segment_map(SINGLE_VIDEO_RUNG)
+            .iter_ordered()
+            .any(in_playlist_window)
 }
 
 fn first_current_run_start(session: &Session) -> Option<u64> {
@@ -549,7 +601,7 @@ fn first_current_run_start(session: &Session) -> Option<u64> {
             && session.dir.join(&s.rel_path).is_file()
     };
     if let Some(ms) = session
-        .segment_map
+        .segment_map(SINGLE_VIDEO_RUNG)
         .iter_ordered()
         .find(|s| s.run_id == session.current_run_id && in_playlist_window(s))
         .map(|s| s.start_ms)
@@ -557,7 +609,7 @@ fn first_current_run_start(session: &Session) -> Option<u64> {
         return Some(ms);
     }
     session
-        .segment_map
+        .segment_map(SINGLE_VIDEO_RUNG)
         .iter_ordered()
         .find(|s| in_playlist_window(s))
         .map(|s| s.start_ms)
@@ -711,7 +763,7 @@ fn run_listing(session: &Session) -> RunListing {
             // reintroduce listed-404.
             let window = session.start_ms;
             let entries: Vec<(u64, u64)> = session
-                .segment_map
+                .segment_map(SINGLE_VIDEO_RUNG)
                 .iter_ordered()
                 .filter(|s| s.start_ms.saturating_add(s.duration_ms) > window)
                 .filter(|s| session.dir.join(&s.rel_path).is_file())
@@ -782,6 +834,14 @@ fn dir_tree_bytes(path: &Path) -> u64 {
     total
 }
 
+fn run_is_live_on_rung(live_single_video_runs: &[u64], rung: VideoRung, run_id: u64) -> bool {
+    match rung {
+        VideoRung::SingleVideo => live_single_video_runs.contains(&run_id),
+        #[cfg(test)]
+        VideoRung::SecondVideo => false,
+    }
+}
+
 /// Per-run cache eviction (ADR-0020 §12). Map is authoritative:
 /// - Prefer orphan run dirs (no map refs) so scrub-back stays a file serve.
 /// - When a referenced run must go, `remove_run` before unlinking.
@@ -791,56 +851,61 @@ fn maybe_evict_finished_runs(session: &mut Session) {
     let budget = session.run_cache_budget_bytes;
     let live = live_run_ids(session);
     loop {
-        let total = session_disk_bytes(&session.dir);
+        let total = session_disk_bytes(session);
         if total <= budget {
             return;
         }
-        let referenced = session.segment_map.referenced_run_ids();
-        let mut orphans: Vec<(u64, u64)> = Vec::new();
-        let mut referenced_finished: Vec<(u64, u64)> = Vec::new();
-        let Ok(entries) = fs::read_dir(&session.dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
+        let rungs: Vec<VideoRung> = session.segment_maps.keys().copied().collect();
+        let mut orphans: Vec<(VideoRung, u64, u64)> = Vec::new();
+        let mut referenced_finished: Vec<(VideoRung, u64, u64)> = Vec::new();
+        for rung in rungs {
+            let referenced = session.segment_map(rung).referenced_run_ids();
+            let Ok(entries) = fs::read_dir(rung_dir(&session.dir, rung)) else {
                 continue;
             };
-            let Some(id_str) = name.strip_prefix("run_") else {
-                continue;
-            };
-            let Ok(id) = id_str.parse::<u64>() else {
-                continue;
-            };
-            // Not just the current run: a superseded encoder is still writing
-            // into its own run for up to `REAP_AFTER`.
-            if live.contains(&id) {
-                continue;
-            }
-            let bytes = dir_tree_bytes(&entry.path());
-            if bytes == 0 {
-                continue;
-            }
-            if referenced.contains(&id) {
-                referenced_finished.push((id, bytes));
-            } else {
-                orphans.push((id, bytes));
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Some(id_str) = name.strip_prefix("run_") else {
+                    continue;
+                };
+                let Ok(id) = id_str.parse::<u64>() else {
+                    continue;
+                };
+                // Not just the current run: a superseded encoder is still
+                // writing into its own run for up to `REAP_AFTER`.
+                if run_is_live_on_rung(&live, rung, id) {
+                    continue;
+                }
+                let bytes = dir_tree_bytes(&entry.path());
+                if bytes == 0 {
+                    continue;
+                }
+                if referenced.contains(&id) {
+                    referenced_finished.push((rung, id, bytes));
+                } else {
+                    orphans.push((rung, id, bytes));
+                }
             }
         }
-        orphans.sort_by_key(|(id, _)| *id);
-        referenced_finished.sort_by_key(|(id, _)| *id);
+        orphans.sort_by_key(|(rung, id, _)| (*id, rung.as_str()));
+        referenced_finished.sort_by_key(|(rung, id, _)| (*id, rung.as_str()));
         let victim = orphans
             .first()
             .copied()
             .or_else(|| referenced_finished.first().copied());
-        let Some((victim_id, victim_bytes)) = victim else {
+        let Some((victim_rung, victim_id, victim_bytes)) = victim else {
             return;
         };
-        let path = session.dir.join(format!("run_{victim_id}"));
-        let had_map_refs = session.segment_map.run_is_referenced(victim_id);
+        let path = run_path(&session.dir, victim_rung, victim_id);
+        let had_map_refs = session
+            .segment_map(victim_rung)
+            .run_is_referenced(victim_id);
         // Drop map entries before unlinking so serve never sees a mapped
         // path whose file is already gone.
-        session.segment_map.remove_run(victim_id);
+        session.segment_map_mut(victim_rung).remove_run(victim_id);
         if let Err(e) = fs::remove_dir_all(&path) {
             tracing::warn!(
                 path = %path.display(),
@@ -849,8 +914,9 @@ fn maybe_evict_finished_runs(session: &mut Session) {
             );
             return;
         }
-        let after = session_disk_bytes(&session.dir);
+        let after = session_disk_bytes(session);
         tracing::info!(
+            rung = victim_rung.as_str(),
             run_id = victim_id,
             evicted_bytes = victim_bytes,
             had_map_refs,
@@ -867,34 +933,37 @@ fn maybe_evict_finished_runs(session: &mut Session) {
 /// Remove finished run directories that hold no bytes. Not a budget eviction.
 fn reap_empty_finished_run_dirs(session: &mut Session) {
     let live = live_run_ids(session);
-    let Ok(entries) = fs::read_dir(&session.dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    let rungs: Vec<VideoRung> = session.segment_maps.keys().copied().collect();
+    for rung in rungs {
+        let Ok(entries) = fs::read_dir(rung_dir(&session.dir, rung)) else {
             continue;
         };
-        let Some(id_str) = name.strip_prefix("run_") else {
-            continue;
-        };
-        let Ok(id) = id_str.parse::<u64>() else {
-            continue;
-        };
-        // A live run is never empty today, because `write_run_encode_start`
-        // seeds every run dir before the spawn. That is a seeding detail in
-        // another function, not a property of this one, so exclude live runs
-        // here rather than depending on it.
-        if live.contains(&id) {
-            continue;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id_str) = name.strip_prefix("run_") else {
+                continue;
+            };
+            let Ok(id) = id_str.parse::<u64>() else {
+                continue;
+            };
+            // A live run is never empty today, because
+            // `write_run_encode_start` seeds every run dir before the spawn.
+            // That is a seeding detail in another function, not a property of
+            // this one, so exclude live runs here rather than depending on it.
+            if run_is_live_on_rung(&live, rung, id) {
+                continue;
+            }
+            if dir_tree_bytes(&entry.path()) > 0 {
+                continue;
+            }
+            if session.segment_map(rung).run_is_referenced(id) {
+                session.segment_map_mut(rung).remove_run(id);
+            }
+            let _ = fs::remove_dir_all(entry.path());
         }
-        if dir_tree_bytes(&entry.path()) > 0 {
-            continue;
-        }
-        if session.segment_map.run_is_referenced(id) {
-            session.segment_map.remove_run(id);
-        }
-        let _ = fs::remove_dir_all(entry.path());
     }
 }
 
@@ -934,6 +1003,11 @@ impl HlsSessionRegistry {
         Self::with_cap(root, DEFAULT_MAX_SESSIONS, encode_leg, None, None)
     }
 
+    /// Session directories are process-owned caches, not restart state. The
+    /// startup sweep deliberately removes both ADR-0051's rung layout and the
+    /// old flat `run_*` layout; migration would imply resume support that the
+    /// registry does not have. Removal is logged per directory with its byte
+    /// count, so discarding an old-layout cache is explicit.
     pub fn with_cap(
         root: PathBuf,
         max_sessions: usize,
@@ -949,10 +1023,20 @@ impl HlsSessionRegistry {
         {
             let path = entry.path();
             if path.is_dir() {
+                let discarded_bytes = dir_tree_bytes(&path);
                 if let Err(e) = fs::remove_dir_all(&path) {
-                    tracing::warn!(path = %path.display(), error = %e, "hls startup sweep failed");
+                    tracing::warn!(
+                        path = %path.display(),
+                        discarded_bytes,
+                        error = %e,
+                        "hls startup sweep failed"
+                    );
                 } else {
-                    tracing::info!(path = %path.display(), "swept orphaned hls session dir");
+                    tracing::info!(
+                        path = %path.display(),
+                        discarded_bytes,
+                        "swept orphaned hls session dir"
+                    );
                 }
             }
         }
@@ -1028,7 +1112,7 @@ impl HlsSessionRegistry {
             StartSessionError::Spawn(format!("create session dir {}: {e}", dir.display()))
         })?;
         let run_id = 0u64;
-        let run_dir = dir.join(format!("run_{run_id}"));
+        let run_dir = run_path(&dir, SINGLE_VIDEO_RUNG, run_id);
         fs::create_dir_all(&run_dir).map_err(|e| {
             StartSessionError::Spawn(format!("create run dir {}: {e}", run_dir.display()))
         })?;
@@ -1120,6 +1204,8 @@ impl HlsSessionRegistry {
                 item_id,
                 src: src.to_path_buf(),
                 dir: dir.clone(),
+                // One session budget is shared by every rung directory; it
+                // is not reset for each rendition (ADR-0051 amendment 2).
                 run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
                 mode,
                 audio,
@@ -1135,7 +1221,9 @@ impl HlsSessionRegistry {
                 duration_ms,
                 current_run_id: run_id,
                 next_run_id: 1,
-                segment_map: crate::hls_segment_map::SegmentMap::default(),
+                segment_maps: single_rung_segment_maps(
+                    crate::hls_segment_map::SegmentMap::default(),
+                ),
                 current_run_eof: false,
                 child: Some(child),
                 last_access: Instant::now(),
@@ -1278,7 +1366,7 @@ impl HlsSessionRegistry {
         Ok(session_view(session_id, session))
     }
 
-    /// Init (or other run-local file) under `run_<n>/`.
+    /// Init (or other run-local file) under the requested run's rung directory.
     pub fn run_asset(
         &self,
         session_id: &str,
@@ -1302,7 +1390,7 @@ impl HlsSessionRegistry {
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
-                let path = session.dir.join(format!("run_{run_id}")).join("init.mp4");
+                let path = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id).join("init.mp4");
                 if let Ok(bytes) = fs::read(&path) {
                     return Ok(bytes);
                 }
@@ -1635,15 +1723,19 @@ impl HlsSessionRegistry {
                     if !session.superseded.is_empty() {
                         sync_superseded_run_indexes(session);
                     }
-                    match session.segment_map.get(ms) {
-                        Some(seg) => {
-                            let abs = session.dir.join(&seg.rel_path);
+                    match session
+                        .segment_map(SINGLE_VIDEO_RUNG)
+                        .get(ms)
+                        .map(|seg| seg.rel_path.clone())
+                    {
+                        Some(rel_path) => {
+                            let abs = session.dir.join(rel_path);
                             match fs::read(&abs) {
                                 Ok(bytes) => Some(bytes),
                                 Err(_) => {
                                     // Map entry without bytes — drop this key
                                     // so we never keep advertising a dead URI.
-                                    session.segment_map.remove_start(ms);
+                                    session.segment_map_mut(SINGLE_VIDEO_RUNG).remove_start(ms);
                                     None
                                 }
                             }
@@ -1681,7 +1773,10 @@ impl HlsSessionRegistry {
                 } else if let Some(want_ms) = requested_ms {
                     let window_start = session.start_ms;
                     let play_start = session.play_start_ms;
-                    let latest = latest_segment_in_window(&session.segment_map, window_start);
+                    let latest = latest_segment_in_window(
+                        session.segment_map(SINGLE_VIDEO_RUNG),
+                        window_start,
+                    );
                     let since = session.last_restart.elapsed();
 
                     if holding_no_fill
@@ -2020,13 +2115,13 @@ fn restart_at(
     session.throttled = false;
     sync_segment_map(session);
     sync_all_run_indexes(session);
-    // Duplicate-write stop: scrub-back (or re-land) into media the global map
+    // Duplicate-write stop: scrub-back (or re-land) into media this rung's map
     // already holds — mint a fresh playlist URI, copy init, do not re-encode.
     if let Some(mapped) = map_segment_covering(session, play_start_ms) {
         let src_run = mapped.run_id;
         let run_id = session.next_run_id;
         session.next_run_id += 1;
-        let new_dir = session.dir.join(format!("run_{run_id}"));
+        let new_dir = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
         fs::create_dir_all(&new_dir).map_err(|e| {
             PlaylistError::Failed(format!("create run dir {}: {e}", new_dir.display()))
         })?;
@@ -2050,7 +2145,7 @@ fn restart_at(
         //
         // **That pairing is reachable.** `EXT-X-MAP` names
         // `session.current_run_id`'s init while a playlist lists segments from
-        // the session-global map, which holds whatever every live run wrote.
+        // this rung's map, which holds whatever every live run wrote.
         // It predates S3 — the window listing filtered on time, never on run —
         // and S3 widened it from a window to the whole title.
         //
@@ -2063,7 +2158,7 @@ fn restart_at(
         // mode is real in the one instrument used.** Do not restore the
         // identity claim without a player. Measured 2026-08-31 on `d341cc9`,
         // macOS Safari native and hls.js, across four spawned runs.
-        let init_src = session.dir.join(format!("run_{src_run}/init.mp4"));
+        let init_src = run_path(&session.dir, SINGLE_VIDEO_RUNG, src_run).join("init.mp4");
         let init_dst = new_dir.join("init.mp4");
         if init_src.exists() {
             fs::copy(&init_src, &init_dst).map_err(|e| {
@@ -2098,7 +2193,7 @@ fn restart_at(
             run_id,
             src_run_id = src_run,
             mapped_start_ms = mapped.start_ms,
-            session_disk_bytes = session_disk_bytes(&session.dir),
+            session_disk_bytes = session_disk_bytes(session),
             path = %session.src.display(),
             "hls session seek map hit (duplicate-write stop)"
         );
@@ -2113,11 +2208,11 @@ fn restart_at(
         std::thread::sleep(gap);
     }
     // Gate 2 / fill-forward: do not wipe prior run dirs. Scrub-back into
-    // mapped media is a plain file serve (ADR-0020 global map). New producer
-    // output goes in a fresh run_* directory.
+    // mapped media is a plain file serve (ADR-0020 per-rung map). New producer
+    // output goes in a fresh run directory under the active rung.
     let run_id = session.next_run_id;
     session.next_run_id += 1;
-    let run_dir = session.dir.join(format!("run_{run_id}"));
+    let run_dir = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
     fs::create_dir_all(&run_dir)
         .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
     // ADR-0023 §9.3: a seek that arrives before the keyframe map is ready
@@ -2180,7 +2275,7 @@ fn restart_at(
         start_ms,
         play_start_ms,
         run_id,
-        session_disk_bytes = session_disk_bytes(&session.dir),
+        session_disk_bytes = session_disk_bytes(session),
         encoder = %session.encode_leg.encoder,
         device = ?session.encode_leg.device,
         start_path = plan.start_path,
@@ -2202,18 +2297,22 @@ fn map_segment_covering(
     play_ms: u64,
 ) -> Option<crate::hls_segment_map::MappedSegment> {
     let play = align_to_segment(play_ms);
-    if let Some(exact) = session.segment_map.get(play) {
+    if let Some(exact) = session.segment_map(SINGLE_VIDEO_RUNG).get(play) {
         return Some(exact.clone());
     }
-    if let Some(s) = session.segment_map.iter_ordered().find(|s| {
-        let end = s.start_ms.saturating_add(s.duration_ms.max(1));
-        s.start_ms <= play && play < end
-    }) {
+    if let Some(s) = session
+        .segment_map(SINGLE_VIDEO_RUNG)
+        .iter_ordered()
+        .find(|s| {
+            let end = s.start_ms.saturating_add(s.duration_ms.max(1));
+            s.start_ms <= play && play < end
+        })
+    {
         return Some(s.clone());
     }
     let slack = SEGMENT_MS.saturating_mul(2);
     session
-        .segment_map
+        .segment_map(SINGLE_VIDEO_RUNG)
         .iter_ordered()
         .find(|s| s.start_ms >= play && s.start_ms < play.saturating_add(slack))
         .cloned()
@@ -2338,7 +2437,7 @@ fn note_first_segment_ready(session_id: &str, session: &mut Session) {
     session.first_segment_ready = true;
     let elapsed_ms = session.last_restart.elapsed().as_millis();
     let lead_ms = session.play_start_ms.saturating_sub(session.start_ms);
-    let disk_bytes = session_disk_bytes(&session.dir);
+    let disk_bytes = session_disk_bytes(session);
     tracing::info!(
         session_id,
         elapsed_ms,
@@ -2394,7 +2493,7 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
 /// claimed duration. Empty map at a mid-title land is still damage — clients
 /// must see usableExtentMs instead of hanging on master 503.
 ///
-/// **The extent is the session map's maximum, deliberately, not the ended
+/// **The extent is this rung's map maximum, deliberately, not the ended
 /// run's frontier.** #180 changed it to the per-run frontier on the reasoning
 /// that the map holds every live run since #160, so the maximum could come
 /// from a superseded run. That is true of the code and does not reach this
@@ -2425,7 +2524,7 @@ fn apply_run_eof(session: &mut Session) {
     session.current_run_eof = true;
     sync_segment_map(session);
     let end = session
-        .segment_map
+        .segment_map(SINGLE_VIDEO_RUNG)
         .iter_ordered()
         .next_back()
         .map(|last| last.start_ms.saturating_add(last.duration_ms))
@@ -3099,7 +3198,7 @@ fn spawn_ffmpeg(
         // ADR-0020: load-bearing under copy. Does not rewrite tfdt/trun (those
         // stay segment-local at 0); it stamps title-absolute time into the
         // init `elst` empty-edit and each fragment's `sidx.earliest_presentation_time`,
-        // which the session map uses as the wire key. Removing or moving this
+        // which the rung map uses as the wire key. Removing or moving this
         // flag silently reintroduces zero-based / mislabelled segment times.
         cmd.args(["-output_ts_offset", &start_secs]);
     }
@@ -3257,7 +3356,7 @@ fn spawn_ffmpeg(
         "seg%03d.m4s",
         "-start_number",
         &start_number,
-        // Muxer index is ingested into the session-global time-keyed map
+        // Muxer index is ingested into the rung's time-keyed map
         // (ADR-0020); clients never fetch this file.
         "index.m3u8",
     ]);
@@ -3569,8 +3668,18 @@ fn release_overtaken_superseded(session: &mut Session) {
     let now = Instant::now();
     let start_ms = session.start_ms;
     // Disjoint fields: the map is read while the held set is walked mutably.
-    let map = &session.segment_map;
-    for held in session.superseded.iter_mut() {
+    let Session {
+        segment_maps,
+        superseded,
+        ..
+    } = session;
+    let Some(map) = segment_maps.get(&SINGLE_VIDEO_RUNG) else {
+        panic!(
+            "session has no segment map for rung {}",
+            SINGLE_VIDEO_RUNG.as_str()
+        );
+    };
+    for held in superseded.iter_mut() {
         let Some(frontier) = frontier_ms(map.iter_ordered(), held.run_id) else {
             continue;
         };
@@ -3672,14 +3781,17 @@ fn lead_ms(produced_end_ms: Option<u64>, last_requested_ms: u64) -> Option<u64> 
 /// [`lead_ms`] for one session, reading the frontier from the run that is
 /// currently producing.
 ///
-/// The segment map is session-global and keeps prior runs' entries so scrub
-/// back stays a plain file serve (ADR-0020 §3). Its maximum is therefore a
-/// frontier the live encoder may be nowhere near after a backward seek, and
-/// using it would report no lead for the rest of the session.
+/// The rung map keeps prior runs' entries so scrub back stays a plain file
+/// serve (ADR-0020 §3). Its maximum is therefore a frontier the live encoder
+/// may be nowhere near after a backward seek, and using it would report no
+/// lead for the rest of the session.
 fn session_lead_ms(session: &Session) -> Option<u64> {
     // One live encoder per session, so the current run is the serving run.
     // ADR-0050 §4 breaks that: see the note on `frontier_ms`.
-    let produced_end = frontier_ms(session.segment_map.iter_ordered(), session.current_run_id);
+    let produced_end = frontier_ms(
+        session.segment_map(SINGLE_VIDEO_RUNG).iter_ordered(),
+        session.current_run_id,
+    );
     lead_ms(produced_end, session.last_requested_ms)
 }
 
@@ -3747,7 +3859,7 @@ mod tests {
             duration_ms: 60_000,
             current_run_id: 0,
             next_run_id: 1,
-            segment_map: Default::default(),
+            segment_maps: single_rung_segment_maps(Default::default()),
             current_run_eof: false,
             child: None,
             last_access: Instant::now(),
@@ -3766,6 +3878,68 @@ mod tests {
             db: None,
             map_build_in_flight: None,
         }
+    }
+
+    /// Equal title times remain distinct inside one session because every
+    /// rung owns its own segment map (ADR-0051 amendment 2).
+    #[test]
+    fn equal_start_segments_survive_in_one_sessions_rung_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.segment_maps = HashMap::from([
+            (VideoRung::SingleVideo, Default::default()),
+            (VideoRung::SecondVideo, Default::default()),
+        ]);
+
+        for (rung, file_name) in [
+            (VideoRung::SingleVideo, "single.m4s"),
+            (VideoRung::SecondVideo, "second.m4s"),
+        ] {
+            let run = crate::hls_segment_map::run_rel_dir(rung, 0);
+            fs::create_dir_all(dir.path().join(&run)).unwrap();
+            fs::write(
+                dir.path().join(&run).join(file_name),
+                crate::hls_segment_map::fake_sidx_seg(42_000),
+            )
+            .unwrap();
+            crate::hls_segment_map::ingest_run_index(
+                session.segment_map_mut(rung),
+                dir.path(),
+                rung,
+                0,
+                &format!("#EXTM3U\n#EXTINF:2.000000,\n{file_name}\n"),
+                42_000,
+                None,
+            )
+            .unwrap();
+        }
+
+        for (rung, rel_path) in [
+            (
+                VideoRung::SingleVideo,
+                PathBuf::from("vsingle/run_0/single.m4s"),
+            ),
+            (
+                VideoRung::SecondVideo,
+                PathBuf::from("vsecond/run_0/second.m4s"),
+            ),
+        ] {
+            let map = session.segment_map(rung);
+            assert_eq!(
+                map.get(42_000).map(|segment| &segment.rel_path),
+                Some(&rel_path)
+            );
+            assert_eq!(map.len(), 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "session has no segment map for rung second")]
+    fn missing_rung_map_is_a_session_construction_bug() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_test_session(dir.path());
+
+        let _ = session.segment_map(VideoRung::SecondVideo);
     }
 
     /// What a stand-in encoder is actually doing.
@@ -3982,7 +4156,7 @@ mod tests {
         // Three runs on disk. run_1 is finished, run_2 is the one the seek
         // set aside, run_3 is the new producer.
         for run_id in 1..=3u64 {
-            let run = dir.path().join(format!("run_{run_id}"));
+            let run = run_path(dir.path(), SINGLE_VIDEO_RUNG, run_id);
             fs::create_dir_all(&run).unwrap();
             fs::write(run.join("seg.m4s"), vec![0u8; 4096]).unwrap();
         }
@@ -3998,14 +4172,17 @@ mod tests {
         maybe_evict_finished_runs(&mut session);
 
         assert!(
-            !dir.path().join("run_1").exists(),
+            !run_path(dir.path(), SINGLE_VIDEO_RUNG, 1).exists(),
             "a finished run is still evictable"
         );
         assert!(
-            dir.path().join("run_2").exists(),
+            run_path(dir.path(), SINGLE_VIDEO_RUNG, 2).exists(),
             "a superseded encoder is still writing into run_2"
         );
-        assert!(dir.path().join("run_3").exists(), "the current run stays");
+        assert!(
+            run_path(dir.path(), SINGLE_VIDEO_RUNG, 3).exists(),
+            "the current run stays"
+        );
 
         reap_all_superseded(&mut session);
     }
@@ -4018,7 +4195,7 @@ mod tests {
         encode_start_ms: u64,
         starts_ms: &[u64],
     ) {
-        let run = session_dir.join(format!("run_{run_id}"));
+        let run = run_path(session_dir, SINGLE_VIDEO_RUNG, run_id);
         fs::create_dir_all(&run).unwrap();
         let mut index = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:2\n");
         for (i, start) in starts_ms.iter().enumerate() {
@@ -4066,11 +4243,13 @@ mod tests {
         session.duration_ms = 120_000;
         // What `restart_at` leaves behind: run_0 held and still running,
         // run_1 current at the new land.
+        let run0 = run_path(&session_dir, SINGLE_VIDEO_RUNG, 0);
         crate::hls_segment_map::ingest_run_index(
-            &mut session.segment_map,
+            session.segment_map_mut(SINGLE_VIDEO_RUNG),
             &session_dir,
+            SINGLE_VIDEO_RUNG,
             0,
-            &fs::read_to_string(session_dir.join("run_0/index.m3u8")).unwrap(),
+            &fs::read_to_string(run0.join("index.m3u8")).unwrap(),
             0,
             None,
         )
@@ -4111,7 +4290,7 @@ mod tests {
             let sessions = reg.sessions.lock().unwrap();
             let session = sessions.get("s1").unwrap();
             assert!(
-                session.segment_map.get(gap_ms).is_none(),
+                session.segment_map(SINGLE_VIDEO_RUNG).get(gap_ms).is_none(),
                 "the gap segment must be absent from the map before the request, \
                  or the request proves nothing"
             );
@@ -4222,7 +4401,7 @@ mod tests {
     /// "is at zero". Reading it as zero would release every encoder that never
     /// wrote a segment on any seek, including a seek to the start of the
     /// title. The map here holds another run's segments out past the land, so
-    /// this also fails if the frontier is read session-globally.
+    /// this also fails if the frontier is read across the whole rung map.
     #[cfg(unix)]
     #[test]
     fn a_held_encoder_that_produced_nothing_is_not_released() {
@@ -4247,7 +4426,7 @@ mod tests {
         session.start_ms = 0;
 
         assert!(
-            frontier_ms(session.segment_map.iter_ordered(), 9).is_none(),
+            frontier_ms(session.segment_map(SINGLE_VIDEO_RUNG).iter_ordered(), 9).is_none(),
             "the held run must have produced nothing, or the test proves nothing"
         );
         release_overtaken_superseded(&mut session);
@@ -4356,7 +4535,7 @@ mod tests {
         assert_eq!(lead_ms(Some(4000), 10_000), Some(0));
     }
 
-    /// The frontier is the producing run's, not the session map's maximum.
+    /// The frontier is the producing run's, not the rung map's maximum.
     ///
     /// The map keeps prior runs so scrub back is a plain file serve
     /// (ADR-0020 §3). After a seek back from 50 min to 10 min it still holds
@@ -4370,7 +4549,8 @@ mod tests {
             start_ms,
             duration_ms: 2000,
             run_id,
-            rel_path: PathBuf::from(format!("run_{run_id}/seg.m4s")),
+            rel_path: crate::hls_segment_map::run_rel_dir(SINGLE_VIDEO_RUNG, run_id)
+                .join("seg.m4s"),
         };
         // Run 0 reached 50 minutes before the seek; run 1 landed at 10 and has
         // produced 40 s past it. Map order is by start time, so run 0's entry
@@ -4766,9 +4946,9 @@ mod tests {
     #[test]
     fn a_per_run_listing_has_media_origin_at_its_first_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let run0 = dir.path().join("run_0");
+        let run0 = run_path(dir.path(), SINGLE_VIDEO_RUNG, 0);
         fs::create_dir_all(&run0).unwrap();
-        let seg_rel = PathBuf::from("run_0/seg000.m4s");
+        let seg_rel = crate::hls_segment_map::run_rel_dir(SINGLE_VIDEO_RUNG, 0).join("seg000.m4s");
         fs::write(dir.path().join(&seg_rel), [0u8; 64]).unwrap();
 
         let mut session = eof_test_session(dir.path(), 900_000);
@@ -4780,7 +4960,7 @@ mod tests {
         session.play_start_ms = 600_000;
         session.landed_ms = 600_000;
         session
-            .segment_map
+            .segment_map_mut(SINGLE_VIDEO_RUNG)
             .insert(crate::hls_segment_map::MappedSegment {
                 start_ms: 600_000,
                 duration_ms: 2_000,
@@ -5281,7 +5461,7 @@ mod tests {
             duration_ms: 3_600_000,
             current_run_id: 0,
             next_run_id: 1,
-            segment_map: crate::hls_segment_map::SegmentMap::default(),
+            segment_maps: single_rung_segment_maps(crate::hls_segment_map::SegmentMap::default()),
             current_run_eof: false,
             child: None,
             last_access: Instant::now(),
@@ -5301,15 +5481,17 @@ mod tests {
             map_build_in_flight: None,
         };
         session
-            .segment_map
+            .segment_map_mut(SINGLE_VIDEO_RUNG)
             .insert(crate::hls_segment_map::MappedSegment {
                 start_ms: play_ms,
                 duration_ms: SEGMENT_MS,
                 run_id: 0,
-                rel_path: PathBuf::from("run_0/seg000.m4s"),
+                rel_path: crate::hls_segment_map::run_rel_dir(SINGLE_VIDEO_RUNG, 0)
+                    .join("seg000.m4s"),
             });
-        fs::create_dir_all(dir.path().join("run_0")).unwrap();
-        fs::write(dir.path().join("run_0/seg000.m4s"), b"seg").unwrap();
+        let run0 = run_path(dir.path(), SINGLE_VIDEO_RUNG, 0);
+        fs::create_dir_all(&run0).unwrap();
+        fs::write(run0.join("seg000.m4s"), b"seg").unwrap();
         note_first_segment_ready("test", &mut session);
         assert!(session.first_segment_ready, "the play land is in the map");
         assert_eq!(
@@ -7538,9 +7720,10 @@ mod tests {
     #[test]
     fn media_playlist_segment_uris_are_session_absolute() {
         let dir = tempfile::tempdir().unwrap();
-        let run0 = dir.path().join("run_0");
+        let run0 = run_path(dir.path(), SINGLE_VIDEO_RUNG, 0);
         fs::create_dir_all(&run0).unwrap();
-        let seg_rel = PathBuf::from("run_0/seg_disk.m4s");
+        let seg_rel =
+            crate::hls_segment_map::run_rel_dir(SINGLE_VIDEO_RUNG, 0).join("seg_disk.m4s");
         fs::write(dir.path().join(&seg_rel), [0u8; 64]).unwrap();
         let mut map = crate::hls_segment_map::SegmentMap::default();
         map.insert(crate::hls_segment_map::MappedSegment {
@@ -7568,7 +7751,7 @@ mod tests {
             duration_ms: 60_000,
             current_run_id: 0,
             next_run_id: 1,
-            segment_map: map,
+            segment_maps: single_rung_segment_maps(map),
             current_run_eof: false,
             child: None,
             last_access: Instant::now(),
@@ -7794,7 +7977,7 @@ mod tests {
     #[test]
     fn empty_eof_records_usable_extent_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let run0 = dir.path().join("run_0");
+        let run0 = run_path(dir.path(), SINGLE_VIDEO_RUNG, 0);
         fs::create_dir_all(&run0).unwrap();
         let mut session = Session {
             item_id: 8519,
@@ -7815,7 +7998,7 @@ mod tests {
             duration_ms: 1_354_496,
             current_run_id: 0,
             next_run_id: 1,
-            segment_map: crate::hls_segment_map::SegmentMap::default(),
+            segment_maps: single_rung_segment_maps(crate::hls_segment_map::SegmentMap::default()),
             current_run_eof: false,
             child: None,
             last_access: Instant::now(),
@@ -7852,7 +8035,7 @@ mod tests {
 
     /// A minimal session for the EOF-extent tests. Fields the extent does not
     /// read are defaults; the ones it does — `duration_ms`, `current_run_id`,
-    /// `segment_map` — are set by the caller.
+    /// `segment_maps` — are set by the caller.
     fn eof_test_session(dir: &Path, duration_ms: u64) -> Session {
         Session {
             item_id: 8519,
@@ -7873,7 +8056,7 @@ mod tests {
             duration_ms,
             current_run_id: 0,
             next_run_id: 1,
-            segment_map: crate::hls_segment_map::SegmentMap::default(),
+            segment_maps: single_rung_segment_maps(crate::hls_segment_map::SegmentMap::default()),
             current_run_eof: false,
             child: None,
             last_access: Instant::now(),
@@ -7909,7 +8092,7 @@ mod tests {
     #[test]
     fn usable_extent_zero_only_when_the_session_produced_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("run_1")).unwrap();
+        fs::create_dir_all(run_path(dir.path(), SINGLE_VIDEO_RUNG, 1)).unwrap();
 
         let mut map = crate::hls_segment_map::SegmentMap::default();
         // run 0 played the first 400 s of a title claiming 1354 s.
@@ -7917,13 +8100,14 @@ mod tests {
             start_ms: 398_000,
             duration_ms: 2_000,
             run_id: 0,
-            rel_path: PathBuf::from("run_0/seg_00000398000.m4s"),
+            rel_path: crate::hls_segment_map::run_rel_dir(SINGLE_VIDEO_RUNG, 0)
+                .join("seg_00000398000.m4s"),
         });
 
         // run 1 landed past the real media end and exited clean, writing
         // nothing of its own.
         let mut session = eof_test_session(dir.path(), 1_354_496);
-        session.segment_map = map;
+        session.segment_maps = single_rung_segment_maps(map);
         session.current_run_id = 1;
         session.next_run_id = 2;
         session.start_ms = 1_014_000;
@@ -7947,19 +8131,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path();
         // run_0: referenced map bytes (large)
-        let run0 = session_dir.join("run_0");
+        let run0 = run_path(session_dir, SINGLE_VIDEO_RUNG, 0);
         fs::create_dir_all(&run0).unwrap();
         let seg_path = run0.join("seg.m4s");
         fs::write(&seg_path, vec![0u8; 50_000]).unwrap();
         // run_1: orphan (no map refs) with bytes
-        let run1 = session_dir.join("run_1");
+        let run1 = run_path(session_dir, SINGLE_VIDEO_RUNG, 1);
         fs::create_dir_all(&run1).unwrap();
         fs::write(run1.join("init.mp4"), vec![0u8; 10_000]).unwrap();
         // run_2: empty finished (noise)
-        let run2 = session_dir.join("run_2");
+        let run2 = run_path(session_dir, SINGLE_VIDEO_RUNG, 2);
         fs::create_dir_all(&run2).unwrap();
         // run_3: current (small)
-        let run3 = session_dir.join("run_3");
+        let run3 = run_path(session_dir, SINGLE_VIDEO_RUNG, 3);
         fs::create_dir_all(&run3).unwrap();
         fs::write(run3.join("init.mp4"), vec![0u8; 100]).unwrap();
 
@@ -7968,7 +8152,7 @@ mod tests {
             start_ms: 0,
             duration_ms: 2000,
             run_id: 0,
-            rel_path: PathBuf::from("run_0/seg.m4s"),
+            rel_path: crate::hls_segment_map::run_rel_dir(SINGLE_VIDEO_RUNG, 0).join("seg.m4s"),
         });
 
         let mut session = Session {
@@ -7990,7 +8174,7 @@ mod tests {
             duration_ms: 60_000,
             current_run_id: 3,
             next_run_id: 4,
-            segment_map: map,
+            segment_maps: single_rung_segment_maps(map),
             current_run_eof: true,
             child: None,
             last_access: Instant::now(),
@@ -8015,14 +8199,20 @@ mod tests {
         maybe_evict_finished_runs(&mut session);
         assert!(!run1.exists(), "orphan run_1 must be evicted first");
         assert!(
-            run0.exists() && session.segment_map.run_is_referenced(0),
+            run0.exists() && session.segment_map(SINGLE_VIDEO_RUNG).run_is_referenced(0),
             "map-referenced run_0 must survive while orphans remain"
         );
         assert!(!run2.exists(), "empty run_2 reaped quietly");
         assert!(
             session
                 .dir
-                .join(&session.segment_map.get(0).unwrap().rel_path)
+                .join(
+                    &session
+                        .segment_map(SINGLE_VIDEO_RUNG)
+                        .get(0)
+                        .unwrap()
+                        .rel_path,
+                )
                 .is_file(),
             "mapped file still on disk"
         );
@@ -8032,7 +8222,7 @@ mod tests {
         maybe_evict_finished_runs(&mut session);
         assert!(!run0.exists(), "referenced run evicted under hard pressure");
         assert!(
-            !session.segment_map.run_is_referenced(0),
+            !session.segment_map(SINGLE_VIDEO_RUNG).run_is_referenced(0),
             "map must drop entries before/with delete"
         );
         let pl = build_run_media_playlist("s1", &session);
@@ -8222,7 +8412,7 @@ mod tests {
             }
             // Keeps last_access fresh so the reaper leaves the session alone.
             let _ = reg.playlist(id);
-            let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
+            let index = run_path(&dir, SINGLE_VIDEO_RUNG, run_id).join("index.m3u8");
             if fs::read_to_string(&index)
                 .map(|text| text.contains("#EXT-X-ENDLIST"))
                 .unwrap_or(false)
@@ -9504,7 +9694,7 @@ mod tests {
                 panic!("session failed: {err}");
             }
             let _ = reg.playlist(id);
-            let index = dir.join(format!("run_{run_id}")).join("index.m3u8");
+            let index = run_path(&dir, SINGLE_VIDEO_RUNG, run_id).join("index.m3u8");
             let text = fs::read_to_string(&index).unwrap_or_default();
             let listed_secs: f64 = text
                 .lines()

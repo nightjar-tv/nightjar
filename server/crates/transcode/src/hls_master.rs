@@ -16,15 +16,22 @@ use crate::hls::HlsSubtitleTrack;
 /// name to rendition and encoder state here. `SingleVideo` describes today's
 /// sole 5 Mbps-advertised, resolution-unspecified rendition without claiming
 /// it is ADR-0051's future high rung.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoRung {
     SingleVideo,
+    #[cfg(test)]
+    /// A second rung exists only under test until the ladder lands, so the
+    /// per-rung isolation this slice introduces can be exercised at the
+    /// session level rather than asserted.
+    SecondVideo,
 }
 
 impl VideoRung {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SingleVideo => "single",
+            #[cfg(test)]
+            Self::SecondVideo => "second",
         }
     }
 }
@@ -35,6 +42,8 @@ impl std::str::FromStr for VideoRung {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "single" => Ok(Self::SingleVideo),
+            #[cfg(test)]
+            "second" => Ok(Self::SecondVideo),
             _ => Err(()),
         }
     }
@@ -132,9 +141,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn video_rung_accepts_only_the_named_single_rendition() {
+    fn video_rung_accepts_only_named_renditions() {
         assert_eq!(VideoRung::SingleVideo.as_str(), "single");
         assert_eq!("single".parse(), Ok(VideoRung::SingleVideo));
+        assert_eq!(VideoRung::SecondVideo.as_str(), "second");
+        assert_eq!("second".parse(), Ok(VideoRung::SecondVideo));
         for unknown in ["", "default", "high", "Single"] {
             assert_eq!(unknown.parse::<VideoRung>(), Err(()), "{unknown}");
         }
