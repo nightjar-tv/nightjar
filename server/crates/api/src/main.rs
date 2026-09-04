@@ -51,7 +51,7 @@ async fn main() {
     let transcode_caps = nightjar_transcode::probe_h264_encoders_arc(&data_dir.join("cache"));
     let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
         data_dir.join("cache").join("hls"),
-        hls_max_sessions(),
+        hls_max_encoders(),
         transcode_caps.preferred_encode_leg.clone(),
         Some(subs.clone()),
         Some(db.clone()),
@@ -194,10 +194,12 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("data"))
 }
 
-fn hls_max_sessions() -> usize {
+fn hls_max_encoders() -> usize {
     const DEFAULT: usize = 3;
-    std::env::var("NIGHTJAR_HLS_MAX_SESSIONS")
+    std::env::var("NIGHTJAR_HLS_MAX_ENCODERS")
         .ok()
+        // Existing deployments keep working; session and encoder counts are equal until the ladder ships.
+        .or_else(|| std::env::var("NIGHTJAR_HLS_MAX_SESSIONS").ok())
         .and_then(|v| v.parse().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT)

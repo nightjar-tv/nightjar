@@ -349,7 +349,7 @@ export interface paths {
         put?: never;
         /**
          * Start an HLS playback session for an item
-         * @description ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl (the session master, /sessions/{sessionId}/master.m3u8). Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=, which returns the same playlistUrl (ADR-0054 decision 5). Concurrent sessions are capped via NIGHTJAR_HLS_MAX_SESSIONS (default 3).
+         * @description ADR-0011 / ADR-0020. Returns 202 with sessionId and playlistUrl (the session master, /sessions/{sessionId}/master.m3u8). Remux items get a stream-copy session, transcode items a re-encoding one; the shape is identical. Far seek uses POST /sessions/{sessionId}/seek?startMs=, which returns the same playlistUrl (ADR-0054 decision 5). Live encoder processes are capped via NIGHTJAR_HLS_MAX_ENCODERS (default 3); NIGHTJAR_HLS_MAX_SESSIONS remains a backward-compatible fallback.
          */
         post: operations["startTranscodeSession"];
         delete?: never;
