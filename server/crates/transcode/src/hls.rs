@@ -2523,20 +2523,33 @@ impl HlsSessionRegistry {
     fn reaper_loop(&self) {
         loop {
             std::thread::sleep(REAPER_TICK);
-            let stale: Vec<String> = {
-                let Ok(sessions) = self.sessions.lock() else {
-                    continue;
-                };
-                sessions
-                    .iter()
-                    .filter(|(_, s)| s.last_access.elapsed() > IDLE_TIMEOUT || s.failed.is_some())
-                    .map(|(id, _)| id.clone())
-                    .collect()
+            self.reap_stale_sessions();
+        }
+    }
+
+    /// One reaper pass: force-stop every session whose idle clock has run past
+    /// [`IDLE_TIMEOUT`], or whose producer marked it failed.
+    ///
+    /// This is the body of [`Self::reaper_loop`], split out so a test can
+    /// drive the selection and the stop without waiting out the
+    /// [`REAPER_TICK`] the loop sleeps between passes. The predicate is the
+    /// load-bearing half: an idle or failed session that slips past it is
+    /// never reaped, because a crashed or sleeping tab never sends the DELETE
+    /// that would be.
+    fn reap_stale_sessions(&self) {
+        let stale: Vec<String> = {
+            let Ok(sessions) = self.sessions.lock() else {
+                return;
             };
-            for id in stale {
-                tracing::info!(session_id = %id, "hls session idle or failed force-reap");
-                self.force_stop(&id);
-            }
+            sessions
+                .iter()
+                .filter(|(_, s)| s.last_access.elapsed() > IDLE_TIMEOUT || s.failed.is_some())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in stale {
+            tracing::info!(session_id = %id, "hls session idle or failed force-reap");
+            self.force_stop(&id);
         }
     }
 
@@ -5409,6 +5422,99 @@ mod tests {
         // do to a reaper it shares the process with.
     }
 
+    /// The idle half of the reaper's selection, driven as a full pass.
+    ///
+    /// [`Self::reaper_loop`] sleeps [`REAPER_TICK`] between passes and never
+    /// exits, so a unit test cannot wait on it. [`Self::reap_stale_sessions`]
+    /// is the loop's body — the selection predicate and the `force_stop` it
+    /// names — and a test can drive one pass of it directly. Calling
+    /// `force_stop` by hand instead would skip the predicate this exists to
+    /// pin.
+    ///
+    /// A session whose last client contact is older than [`IDLE_TIMEOUT`] is
+    /// force-reaped (a tab that died without DELETE), and one inside the
+    /// timeout survives a pass.
+    #[cfg(unix)]
+    #[test]
+    fn reaper_force_stops_a_session_idle_past_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        let mut session = make_test_session(&session_dir);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(child);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        // Fresh idle clock: one pass must leave the session alone.
+        reg.reap_stale_sessions();
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "a session inside IDLE_TIMEOUT is not for the reaper"
+        );
+        assert!(reg.sessions.lock().unwrap().contains_key("s1"));
+
+        // Backdate the idle clock through the registry lock, the way a client
+        // that vanished mid-play leaves it.
+        {
+            let mut sessions = reg.sessions.lock().unwrap();
+            sessions.get_mut("s1").unwrap().last_access =
+                Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        }
+
+        reg.reap_stale_sessions();
+        assert!(
+            !reg.sessions.lock().unwrap().contains_key("s1"),
+            "the force-reap removes the session from the registry"
+        );
+        wait_for_state(pid, ChildState::Gone);
+    }
+
+    /// The failed half of the reaper's selection: a session whose producer
+    /// failed is force-reaped even while its idle clock is fresh.
+    ///
+    /// `last_access` is untouched here, so only the `failed.is_some()` half of
+    /// the predicate can select this session. Drop that half and this test
+    /// fails with the session still holding its child.
+    #[cfg(unix)]
+    #[test]
+    fn reaper_force_stops_a_failed_session_while_not_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        let mut session = make_test_session(&session_dir);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(child);
+        session.failed = Some("ffmpeg exited with exit status: 1".to_string());
+        assert!(
+            session.last_access.elapsed() < IDLE_TIMEOUT,
+            "the failed branch is only proven if the session is not idle"
+        );
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        reg.reap_stale_sessions();
+
+        assert!(
+            !reg.sessions.lock().unwrap().contains_key("s1"),
+            "a failed session is force-reaped even though it is not idle"
+        );
+        wait_for_state(pid, ChildState::Gone);
+    }
+
     /// The run a superseded encoder is still writing into is not evictable.
     ///
     /// Eviction excluded only `current_run_id`, which was safe while a seek
@@ -7598,6 +7704,63 @@ mod tests {
         assert!(reg.asset(&id, &land, None).is_ok(), "land={land}");
         assert!(reg.stop(&id));
         assert!(matches!(reg.playlist(&id), Err(PlaylistError::NotFound)));
+    }
+
+    /// A normal `DELETE` drives [`HlsSessionRegistry::stop`], so the process
+    /// reap must be asserted there, not only on the free helpers.
+    ///
+    /// The test above asserts only that the playlist becomes `NotFound` — a
+    /// map-entry assertion that would still pass if `stop` removed the session
+    /// without killing its children. This is the process half of the same
+    /// path: `stop` tears down the live child and every superseded child
+    /// (ADR-0050 §5: nothing may outlive the session that spawned it).
+    #[cfg(unix)]
+    #[test]
+    fn registry_stop_reaps_live_and_superseded_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let live = spawn_stand_in_encoder();
+        let live_pid = live.id();
+        let held = spawn_stand_in_encoder();
+        let held_pid = held.id();
+        let mut session = make_test_session(&session_dir);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(live);
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(SupersededEncoder {
+                child: held,
+                rss_bytes: None,
+                // Parked out of the throttle tick's reach, so only `stop` can end
+                // it inside this test.
+                reap_at: Instant::now() + Duration::from_secs(60),
+                run_id: 7,
+            });
+        assert_eq!(child_state(live_pid), ChildState::Running);
+        assert_eq!(child_state(held_pid), ChildState::Running);
+
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        assert!(
+            reg.stop("s1"),
+            "the DELETE names a session the registry holds"
+        );
+        assert!(
+            !reg.sessions.lock().unwrap().contains_key("s1"),
+            "a stopped session leaves the registry"
+        );
+
+        // The waits name the surviving pid: a `stop` that skipped either half
+        // of the teardown fails here, not on a bookkeeping line.
+        wait_for_state(live_pid, ChildState::Gone);
+        wait_for_state(held_pid, ChildState::Gone);
     }
 
     /// Session-inline demux with no scan-time extract: the video segment and
