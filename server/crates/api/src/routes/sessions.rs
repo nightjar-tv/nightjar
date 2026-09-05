@@ -263,11 +263,11 @@ fn start_blocking(
             log_hls_client_req(&session_id, "POST /sessions", Some(start_ms), 202, None);
             Ok((StatusCode::ACCEPTED, Json(dto_from_view(view))))
         }
-        Err(StartSessionError::CapFull) => {
+        Err(StartSessionError::AdmissionRefused) => {
             log_hls_client_req("-", "POST /sessions", Some(start_ms), 503, None);
             Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "all playback sessions are in use; retry shortly".into(),
+                message: "playback capacity is temporarily unavailable; retry shortly".into(),
             })
         }
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),

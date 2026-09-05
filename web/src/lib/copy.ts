@@ -14,7 +14,7 @@ export const copy = {
 	playResume: (fromSec: number) => `Resume from ${formatClock(fromSec)}`,
 	preparingSession: 'Starting playback session…',
 	sessionsBusy:
-		'All playback sessions are in use. Close another player tab and try again.',
+		'This server is out of capacity for another video right now. Try again in a moment.',
 	sessionFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
 	// Playback carries the session cookie, so a credential that has gone stale
 	// stops the video without touching the rest of the page. Say what to do,
