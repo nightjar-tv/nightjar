@@ -15,6 +15,7 @@ import {
 } from './hlsTimeline';
 import {
 	applyAbsoluteCueTimesFromVtt,
+	mediaPlaylistUrlFromMaster,
 	parseSubtitleTrackIdsFromMaster,
 	parseWebVttCues,
 	segmentIndexAtSeconds,
@@ -500,12 +501,32 @@ export function attachHls(
 				const view = await api.seekTranscodeSession(sid, startMs);
 				if (destroyed || parent.signal.aborted) return;
 				const deadline = Date.now() + LAND_SEGMENT_FETCH_MS;
-				const indexUrl = view.playlistUrl.replace(/master\.m3u8$/i, 'index.m3u8');
+				// The session view carries the session master, not a media
+				// playlist (ADR-0054 decision 5). Read that master and poll
+				// the rendition URI it advertises: that is the media playlist
+				// the player will fetch after the swap (ADR-0051 amendment 1).
+				// Rewriting the master's own filename to `index.m3u8` would
+				// poll the flat compatibility alias — a different URI the
+				// moment a second rendition exists. One master read per seek
+				// is the cost of knowing the rendition; the session view has
+				// no rung-scoped media URI to take instead.
+				let mediaUrl: string | null = null;
 				while (!destroyed && !parent.signal.aborted && Date.now() < deadline) {
-					// Wait for media playlist, not only master — master can 200
-					// while index is still NotReady after a run swap.
-					const res = await fetch(indexUrl, { signal: parent.signal });
-					if (res.ok) break;
+					// The master answers 200 while the media playlist is still
+					// NotReady after a run swap, so read it first, then poll
+					// the playlist it advertises.
+					if (mediaUrl === null) {
+						const masterRes = await fetch(view.playlistUrl, {
+							signal: parent.signal
+						});
+						if (masterRes.ok) {
+							mediaUrl = mediaPlaylistUrlFromMaster(await masterRes.text());
+						}
+					}
+					if (mediaUrl !== null) {
+						const res = await fetch(mediaUrl, { signal: parent.signal });
+						if (res.ok) break;
+					}
 					await new Promise((r) => setTimeout(r, LAND_ENSURE_BACKOFF_MS));
 				}
 				if (destroyed || parent.signal.aborted) return;
