@@ -2718,6 +2718,21 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// The ffmpeg sibling of [`require_ffprobe`]. The fixture builders below
+    /// must not skip under `NIGHTJAR_TEST_REQUIRE_FFMPEG` just because `ffmpeg`
+    /// is missing while `ffprobe` is present: an ad-hoc skip makes a missing
+    /// `ffmpeg` a pass when the env var has already demanded the test run.
+    fn require_ffmpeg() -> bool {
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_some() {
+            return true;
+        }
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn skip_without_fixture(path: &Path) -> bool {
         if path.is_file() {
             return false;
@@ -2824,6 +2839,13 @@ mod tests {
     fn probe_sidecar_only_classifies_eligible_and_converts_in_process() {
         if !require_ffprobe() {
             eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        // The sidecar extract spawns ffmpeg, so this needs the tool at run
+        // time and not merely to build a fixture. Without the guard it failed
+        // on a machine that simply has no ffmpeg, where it should skip.
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2933,6 +2955,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -2988,13 +3014,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the multi-track fixture: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg multi-sub mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the multi-track fixture failed with exit code {:?}",
+                status.code()
+            );
         }
         // ffprobe reports an unmapped CodecID as no codec_name; make the third
         // track unrecognised by patching its CodecID (same-length swap).
@@ -3007,8 +3035,7 @@ mod tests {
             }
         }
         let Some(pos) = last else {
-            eprintln!("skipping: no S_TEXT/UTF8 CodecID found to patch");
-            return;
+            panic!("no S_TEXT/UTF8 CodecID found in the muxed fixture to patch");
         };
         bytes[pos..pos + 11].copy_from_slice(b"S_TEXT/FOO!");
         fs::write(&mkv, &bytes).unwrap();
@@ -3198,12 +3225,7 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
-        let ffmpeg_ok = Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ffmpeg_ok {
+        if !require_ffmpeg() {
             eprintln!("skip: ffmpeg not on PATH");
             return;
         }
@@ -3275,6 +3297,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3310,13 +3336,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the slow-fixture mkv: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg slow-fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the slow-fixture mkv failed with exit code {:?}",
+                status.code()
+            );
         }
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
@@ -3397,12 +3425,7 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
-        let ffmpeg_ok = Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ffmpeg_ok {
+        if !require_ffmpeg() {
             eprintln!("skip: ffmpeg not on PATH");
             return;
         }
@@ -3447,13 +3470,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the slow-probe fixture: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg slow-probe fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the slow-probe fixture failed with exit code {:?}",
+                status.code()
+            );
         }
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
@@ -3539,6 +3564,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3561,13 +3590,15 @@ mod tests {
             ])
             .arg(&muxed)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the map-walk fixture: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the map-walk fixture failed with exit code {:?}",
+                status.code()
+            );
         }
         let data = fs::read(&muxed).unwrap();
         let cut = (data.len() as f64 * 0.80) as usize;
@@ -3713,6 +3744,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3735,13 +3770,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the demand-trigger clip: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the demand-trigger clip failed with exit code {:?}",
+                status.code()
+            );
         }
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
