@@ -50,6 +50,13 @@ fn log_hls_client_req(
     );
 }
 
+/// Wire code carried by the 503 admission-refusal body, for the client's
+/// session-create retry decision. The web watch page matches this code, not
+/// the sentence below it, and `web/tests/sessionRetry.test.ts` pins this
+/// declaration to the client's constant so changing one side without the
+/// other goes red (Rule 4.11).
+pub const ADMISSION_REFUSED_CODE: &str = "admission_refused";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeSessionDto {
@@ -146,6 +153,7 @@ fn start_blocking(
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: format!("item {item_id} is not ready to play: {}", decision.reason),
+            code: "unsupported_media_type",
         });
     }
 
@@ -155,6 +163,7 @@ fn start_blocking(
             message: format!(
                 "item {item_id} has no probed duration; cannot build a session playlist"
             ),
+            code: "unsupported_media_type",
         });
     };
 
@@ -175,6 +184,7 @@ fn start_blocking(
                     "item {item_id} does not need a session: {}",
                     decision.reason
                 ),
+                code: "unsupported_media_type",
             });
         }
     };
@@ -220,12 +230,14 @@ fn start_blocking(
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: decision.reason.clone(),
+            code: "unsupported_media_type",
         });
     }
     if encode_plan.tone_map && !state.tonemap_available {
         return Err(ApiError {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: decision.reason.clone(),
+            code: "unsupported_media_type",
         });
     }
     let piggyback = match state.db.list_item_subtitle_tracks(row.id) {
@@ -267,7 +279,11 @@ fn start_blocking(
             log_hls_client_req("-", "POST /sessions", Some(start_ms), 503, None);
             Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
+                // The sentence is for a person reading a log or a raw response.
+                // The client retries on ADMISSION_REFUSED_CODE, never on this
+                // wording (a user-facing sentence is not an API).
                 message: "playback capacity is temporarily unavailable; retry shortly".into(),
+                code: ADMISSION_REFUSED_CODE,
             })
         }
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),
@@ -762,6 +778,7 @@ pub async fn subtitle_playlist(
                 Err(PlaylistError::NotReady) => Err(ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     message: format!("subtitle playlist {asset} not ready"),
+                    code: "not_ready",
                 }),
                 Err(other) => map_playlist_err(&session_id, other),
             }
@@ -793,6 +810,7 @@ pub async fn subtitle_playlist(
                 Err(PlaylistError::NotReady) => Err(ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     message: format!("subtitle segment {asset} not ready"),
+                    code: "not_ready",
                 }),
                 Err(other) => map_playlist_err(&session_id, other),
             }
@@ -867,6 +885,7 @@ fn map_playlist_err(session_id: &str, err: PlaylistError) -> ApiResult<Response>
         PlaylistError::NotReady => Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!("playlist for session {session_id} not ready yet"),
+            code: "not_ready",
         }),
         // Asset-path hold ceiling (ADR-0011 §7); playlists should not hit this.
         PlaylistError::AbandonedHoldEnded => {
@@ -1035,6 +1054,7 @@ async fn asset(
             Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: format!("asset {asset} for session {session_id} not ready yet"),
+                code: "not_ready",
             })
         }
         // Abandoned / superseded hold ceiling: empty 204 (ADR-0011 §7).

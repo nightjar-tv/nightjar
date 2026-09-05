@@ -655,7 +655,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: Session cap full; retry shortly
+          description: >
+            Admission refused: no capacity for another encoder (ADR-0050).
+            Retryable. The body's `code` is `admission_refused`; a client
+            retries on that code, not on the sentence in `error`.
           content:
             application/json:
               schema:
@@ -1695,10 +1698,22 @@ components:
 
     Error:
       type: object
-      required: [error]
+      required: [error, code]
+      description: >
+        Every API error body carries `error`, the sentence for a person, and
+        `code`, a stable machine-readable class the client can branch on.
+        Match `code`, never the wording of `error`: the sentence is copy, not
+        an API (Rule 4.11).
       properties:
         error:
           type: string
+          description: Human sentence for a log or a raw response. Not an API.
+        code:
+          type: string
+          description: >
+            Stable machine-readable class of the error, independent of the
+            wording of `error`. `admission_refused` on the session-create
+            503 is the one a playback client branches on today.
 
     LibraryKind:
       type: string
