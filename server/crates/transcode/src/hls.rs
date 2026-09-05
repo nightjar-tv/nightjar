@@ -23,6 +23,9 @@ use super::subs::{
 };
 use crate::hls_grid::{GridCadence, grid_cadence_ms};
 use crate::hls_master::VideoRung;
+#[cfg(target_os = "linux")]
+use crate::hls_memory::read_child_rss;
+use crate::hls_memory::{EncoderMemory, encoder_memory_from_available, read_available_memory};
 use crate::hls_policy;
 use crate::hls_policy::{
     CoalesceDesire, PendingWaiterAction, SegmentMissAction, classify_restart_desire,
@@ -41,8 +44,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Maximum live encoder processes admitted across every session and rung.
-const DEFAULT_MAX_ENCODERS: usize = 3;
 const SINGLE_VIDEO_RUNG: VideoRung = VideoRung::SingleVideo;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
@@ -156,8 +157,9 @@ fn session_disk_bytes(session: &Session) -> u64 {
 
 #[derive(Debug)]
 pub enum StartSessionError {
-    /// The registry's live-encoder cap is full.
-    CapFull,
+    /// Measured memory reserve or the operator's explicit encoder cap refused
+    /// this newcomer.
+    AdmissionRefused,
     Spawn(String),
 }
 
@@ -204,7 +206,14 @@ impl AudioSelection {
 
 pub struct HlsSessionRegistry {
     root: PathBuf,
-    max_encoders: usize,
+    /// Explicit operator escape hatch. Normal admission has no configured cap
+    /// and is governed by measured memory (ADR-0050 §7-§8, Rule 4.12).
+    max_encoders: Option<usize>,
+    /// The registry's worker threads own it for the process lifetime, so this
+    /// high-water mark never falls until restart. One unusually large 4K
+    /// software encode can therefore over-project for the rest of the run;
+    /// that conservative cost is assigned to the newcomer (ADR-0050 §7).
+    encoder_rss_high_water_bytes: AtomicU64,
     /// Session-shaped encode leg from ADR-0009 probe (shared with startup verify).
     encode_leg: crate::EncodeLeg,
     /// Library subtitle store for piggyback publish (ADR-0041 Decision 7).
@@ -330,6 +339,9 @@ struct EncoderState {
     /// Next run id to allocate on restart.
     next_run_id: u64,
     child: Option<Child>,
+    /// Latest RSS sampled by the throttle worker without holding the sessions
+    /// lock. `None` is distinct from a measured zero.
+    child_rss_bytes: Option<u64>,
     /// True while this rung's encoder is SIGSTOPped by the throttle.
     throttled: bool,
     /// Encoders a seek replaced, kept until [`REAP_AFTER`] has put their
@@ -358,6 +370,7 @@ fn single_rung_encoder_states(
             current_run_id,
             next_run_id,
             child,
+            child_rss_bytes: None,
             throttled: false,
             superseded: Vec::new(),
         },
@@ -411,12 +424,66 @@ impl Session {
 /// An encoder a seek replaced, waiting out [`REAP_AFTER`].
 struct SupersededEncoder {
     child: Child,
+    /// Latest RSS sampled while this held child was still live.
+    rss_bytes: Option<u64>,
     reap_at: Instant,
     /// The run this encoder is still writing into. Its directory is not the
     /// current run's any more, and every per-run cleanup path in this file
     /// reads "not the current run" as "finished". It is not finished: the
     /// process is alive until [`reap_at`](Self::reap_at).
     run_id: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone)]
+struct EncoderProcess {
+    session_id: String,
+    rung: VideoRung,
+    pid: u32,
+    /// `None` is the rung's current child; a run id identifies a held child.
+    superseded_run_id: Option<u64>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn record_encoder_rss_sample(
+    sessions: &mut HashMap<String, Session>,
+    high_water_rss_bytes: &AtomicU64,
+    process: &EncoderProcess,
+    rss_bytes: Option<u64>,
+) -> bool {
+    let Some(session) = sessions.get_mut(&process.session_id) else {
+        return false;
+    };
+    let state = session.encoder_state_mut(process.rung);
+    let recorded = match process.superseded_run_id {
+        None => {
+            if state
+                .child
+                .as_ref()
+                .is_none_or(|child| child.id() != process.pid)
+            {
+                false
+            } else {
+                state.child_rss_bytes = rss_bytes;
+                true
+            }
+        }
+        Some(run_id) => {
+            let Some(held) = state
+                .superseded
+                .iter_mut()
+                .find(|held| held.run_id == run_id && held.child.id() == process.pid)
+            else {
+                return false;
+            };
+            held.rss_bytes = rss_bytes;
+            true
+        }
+    };
+    if let (true, Some(rss_bytes)) = (recorded, rss_bytes) {
+        high_water_rss_bytes.fetch_max(rss_bytes, Ordering::Relaxed);
+    }
+    recorded
 }
 
 /// Snapshot returned by start / seek / get (ADR-0020 wire fields).
@@ -1061,20 +1128,74 @@ fn live_encoder_load_centi(sessions: &HashMap<String, Session>) -> u32 {
     })
 }
 
-/// Whether a newcomer of this shape is admitted against the live weighted
-/// load (ADR-0050 §7). Free-standing so admission is testable without
-/// spawning encoders. Every weight is currently 1.0, so this reads
-/// identically to a raw encoder-count check today — the seam exists for when
-/// a measured per-mode weight lands.
+/// Sum the throttle worker's stored RSS samples. One unsampled child makes the
+/// reading unmeasured rather than silently contributing zero (Rule 4.15).
+fn live_encoder_rss(sessions: &HashMap<String, Session>) -> (Option<u64>, usize) {
+    let mut live_rss_bytes = Some(0u64);
+    let mut children = 0usize;
+    for state in sessions
+        .values()
+        .flat_map(|session| session.encoder_states.values())
+    {
+        if state.child.is_some() {
+            children = children.saturating_add(1);
+            live_rss_bytes = live_rss_bytes
+                .zip(state.child_rss_bytes)
+                .map(|(total, rss)| total.saturating_add(rss));
+        }
+        for held in &state.superseded {
+            children = children.saturating_add(1);
+            live_rss_bytes = live_rss_bytes
+                .zip(held.rss_bytes)
+                .map(|(total, rss)| total.saturating_add(rss));
+        }
+    }
+    (live_rss_bytes, children)
+}
+
+fn encoder_memory(
+    sessions: &HashMap<String, Session>,
+    available_bytes: &Result<u64, String>,
+) -> EncoderMemory {
+    let (live_rss_bytes, children) = live_encoder_rss(sessions);
+    encoder_memory_from_available(live_rss_bytes, children, available_bytes)
+}
+
+fn encoder_memory_reserve_bytes(high_water_rss_bytes: u64) -> u64 {
+    // ADR-0050 §4 spawns the seek encoder before reaping its predecessor, and
+    // §5 measured a peak held set of two for one person scrubbing one session.
+    high_water_rss_bytes.saturating_mul(2)
+}
+
+fn memory_admits_new_session(memory: EncoderMemory, high_water_rss_bytes: u64) -> bool {
+    match memory {
+        EncoderMemory::Unmeasured => true,
+        EncoderMemory::Measured { children: 0, .. } => true,
+        EncoderMemory::Measured { .. } if high_water_rss_bytes == 0 => true,
+        EncoderMemory::Measured {
+            available_bytes, ..
+        } => available_bytes >= encoder_memory_reserve_bytes(high_water_rss_bytes),
+    }
+}
+
+/// Whether a newcomer of this shape is admitted against measured memory and,
+/// when configured, the operator's explicit live-encoder override. Every
+/// weight is currently 1.0, so the override reads identically to a raw child
+/// count today.
 fn admits_new_session(
     sessions: &HashMap<String, Session>,
     mode: SessionMode,
     burn_in: Option<&BurnInSelection>,
-    max_encoders: usize,
+    max_encoders: Option<usize>,
+    memory: EncoderMemory,
+    high_water_rss_bytes: u64,
 ) -> bool {
     let existing_centi = live_encoder_load_centi(sessions);
     let newcomer_centi = hls_policy::encoder_weight_centi(re_encodes(mode, burn_in));
-    hls_policy::admits_weighted_load(existing_centi, newcomer_centi, max_encoders)
+    let cap_admits = max_encoders.is_none_or(|max_encoders| {
+        hls_policy::admits_weighted_load(existing_centi, newcomer_centi, max_encoders)
+    });
+    cap_admits && memory_admits_new_session(memory, high_water_rss_bytes)
 }
 
 impl HlsSessionRegistry {
@@ -1085,7 +1206,30 @@ impl HlsSessionRegistry {
         root: PathBuf,
         encode_leg: impl Into<crate::EncodeLeg>,
     ) -> Result<Arc<Self>, String> {
-        Self::with_cap(root, DEFAULT_MAX_ENCODERS, encode_leg, None, None)
+        Self::with_measured_admission(root, encode_leg, None, None)
+    }
+
+    /// Construct the normal registry: no configured concurrency cap, with
+    /// admission governed by the measured memory runaway guard.
+    pub fn with_measured_admission(
+        root: PathBuf,
+        encode_leg: impl Into<crate::EncodeLeg>,
+        subs: Option<Arc<SubsStore>>,
+        db: Option<Arc<Db>>,
+    ) -> Result<Arc<Self>, String> {
+        Self::build(root, None, encode_leg, subs, db)
+    }
+
+    /// Construct a registry with an explicit operator/test encoder cap in
+    /// addition to measured memory admission.
+    pub fn with_cap(
+        root: PathBuf,
+        max_encoders: usize,
+        encode_leg: impl Into<crate::EncodeLeg>,
+        subs: Option<Arc<SubsStore>>,
+        db: Option<Arc<Db>>,
+    ) -> Result<Arc<Self>, String> {
+        Self::build(root, Some(max_encoders), encode_leg, subs, db)
     }
 
     /// Session directories are process-owned caches, not restart state. The
@@ -1093,9 +1237,9 @@ impl HlsSessionRegistry {
     /// old flat `run_*` layout; migration would imply resume support that the
     /// registry does not have. Removal is logged per directory with its byte
     /// count, so discarding an old-layout cache is explicit.
-    pub fn with_cap(
+    fn build(
         root: PathBuf,
-        max_encoders: usize,
+        max_encoders: Option<usize>,
         encode_leg: impl Into<crate::EncodeLeg>,
         subs: Option<Arc<SubsStore>>,
         db: Option<Arc<Db>>,
@@ -1130,6 +1274,7 @@ impl HlsSessionRegistry {
         let registry = Arc::new(Self {
             root,
             max_encoders,
+            encoder_rss_high_water_bytes: AtomicU64::new(0),
             encode_leg,
             subs,
             db,
@@ -1183,12 +1328,84 @@ impl HlsSessionRegistry {
         piggyback: Option<PiggybackExtract>,
     ) -> Result<String, StartSessionError> {
         let play_start_ms = align_to_segment(start_ms);
+        // Read host and cgroup files before taking the sessions lock. The lock
+        // is shared with segment-serving hot paths, and serializing filesystem
+        // syscalls behind every session request would turn the guard into
+        // contention on the path it protects.
+        let available_memory = read_available_memory();
         let sessions = self
             .sessions
             .lock()
             .map_err(|_| StartSessionError::Spawn("hls registry lock poisoned".into()))?;
-        if !admits_new_session(&sessions, mode, burn_in.as_ref(), self.max_encoders) {
-            return Err(StartSessionError::CapFull);
+        let (sampled_rss_bytes, children) = live_encoder_rss(&sessions);
+        let memory = encoder_memory(&sessions, &available_memory);
+        let high_water_rss_bytes = self.encoder_rss_high_water_bytes.load(Ordering::Relaxed);
+        let reserve_bytes = encoder_memory_reserve_bytes(high_water_rss_bytes);
+        let existing_centi = live_encoder_load_centi(&sessions);
+        let newcomer_centi = hls_policy::encoder_weight_centi(re_encodes(mode, burn_in.as_ref()));
+        let cap_admits = self.max_encoders.is_none_or(|max_encoders| {
+            hls_policy::admits_weighted_load(existing_centi, newcomer_centi, max_encoders)
+        });
+        let memory_admits = memory_admits_new_session(memory, high_water_rss_bytes);
+        let admitted = admits_new_session(
+            &sessions,
+            mode,
+            burn_in.as_ref(),
+            self.max_encoders,
+            memory,
+            high_water_rss_bytes,
+        );
+        let reason = if !cap_admits {
+            "operator_override"
+        } else if !memory_admits {
+            "memory_reserve"
+        } else if children == 0 {
+            "no_live_children"
+        } else if high_water_rss_bytes == 0 {
+            "no_high_water_sample"
+        } else if memory == EncoderMemory::Unmeasured {
+            "unmeasured_admit"
+        } else {
+            "memory_available"
+        };
+        match memory {
+            EncoderMemory::Measured {
+                live_rss_bytes,
+                available_bytes,
+                children,
+            } => tracing::info!(
+                admitted,
+                reason,
+                live_rss_bytes,
+                available_bytes,
+                children,
+                high_water_rss_bytes,
+                reserve_bytes,
+                operator_max_encoders = ?self.max_encoders,
+                "hls session admission"
+            ),
+            EncoderMemory::Unmeasured => {
+                let measurement_error = available_memory
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("one or more live children have no positive RSS sample");
+                tracing::warn!(
+                    admitted,
+                    reason,
+                    live_rss_bytes = ?sampled_rss_bytes,
+                    available_bytes = "unmeasured",
+                    children,
+                    high_water_rss_bytes,
+                    reserve_bytes,
+                    operator_max_encoders = ?self.max_encoders,
+                    error = measurement_error,
+                    "hls session admission"
+                );
+            }
+        }
+        if !admitted {
+            return Err(StartSessionError::AdmissionRefused);
         }
 
         let id = format!("s{}", self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -2063,6 +2280,70 @@ impl HlsSessionRegistry {
         true
     }
 
+    /// Sample current and held encoder RSS without keeping the registry lock
+    /// across `/proc` reads. The 250 ms worker already visits every child, but
+    /// a procfs read is still a syscall; doing it inline would serialize that
+    /// I/O behind segment-serving paths that need the same lock.
+    #[cfg(target_os = "linux")]
+    fn sample_encoder_rss(&self) {
+        let processes = {
+            let Ok(sessions) = self.sessions.lock() else {
+                return;
+            };
+            let mut processes = Vec::new();
+            for (session_id, session) in sessions.iter() {
+                for (&rung, state) in &session.encoder_states {
+                    if let Some(child) = state.child.as_ref() {
+                        processes.push(EncoderProcess {
+                            session_id: session_id.clone(),
+                            rung,
+                            pid: child.id(),
+                            superseded_run_id: None,
+                        });
+                    }
+                    processes.extend(state.superseded.iter().map(|held| EncoderProcess {
+                        session_id: session_id.clone(),
+                        rung,
+                        pid: held.child.id(),
+                        superseded_run_id: Some(held.run_id),
+                    }));
+                }
+            }
+            processes
+        };
+
+        let mut samples = Vec::with_capacity(processes.len());
+        for process in processes {
+            match read_child_rss(process.pid) {
+                Ok(rss_bytes) => samples.push((process, Some(rss_bytes))),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %process.session_id,
+                        pid = process.pid,
+                        error = %error,
+                        "hls encoder RSS sample failed"
+                    );
+                    samples.push((process, None));
+                }
+            }
+        }
+
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return;
+        };
+        for (process, rss_bytes) in samples {
+            record_encoder_rss_sample(
+                &mut sessions,
+                &self.encoder_rss_high_water_bytes,
+                &process,
+                rss_bytes,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn sample_encoder_rss(&self) {}
+
     /// Idle and failed sessions are reaped without a DELETE. Crashed or
     /// sleeping tabs never send one; without this Gate 2's zero-orphan
     /// criterion fails 48 hours later.
@@ -2089,6 +2370,7 @@ impl HlsSessionRegistry {
     fn throttle_loop(&self) {
         loop {
             std::thread::sleep(THROTTLE_TICK);
+            self.sample_encoder_rss();
             let Ok(mut sessions) = self.sessions.lock() else {
                 continue;
             };
@@ -2349,7 +2631,9 @@ fn restart_at(
     )
     .map_err(PlaylistError::Failed)?;
     session.map_binding.bound = plan.virtual_input.take();
-    session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(child);
+    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+    state.child = Some(child);
+    state.child_rss_bytes = None;
     session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = run_id;
     session.current_run_eof = false;
     session.start_ms = start_ms;
@@ -2618,7 +2902,9 @@ fn note_child_exit(session: &mut Session) -> Option<String> {
 /// shape. Reverted 2026-08-30; the reasoning is kept here so the change is not
 /// made a second time from the same argument.
 fn apply_run_eof(session: &mut Session) {
-    session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = None;
+    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+    state.child = None;
+    state.child_rss_bytes = None;
     session.current_run_eof = true;
     sync_segment_map(session, SINGLE_VIDEO_RUNG);
     let end = session
@@ -3703,10 +3989,12 @@ fn supersede_child(session: &mut Session) {
     let Some(child) = state.child.take() else {
         return;
     };
+    let rss_bytes = state.child_rss_bytes.take();
     // The flag described the child that just left.
     state.throttled = false;
     state.superseded.push(SupersededEncoder {
         child,
+        rss_bytes,
         reap_at: Instant::now() + REAP_AFTER,
         // `restart_at` calls this before it assigns the new run, so
         // `current_run_id` here is exactly the run being set aside. Read it,
@@ -4003,6 +4291,7 @@ mod tests {
                     current_run_id: 0,
                     next_run_id: 1,
                     child: None,
+                    child_rss_bytes: None,
                     throttled: false,
                     superseded: Vec::new(),
                 },
@@ -4013,6 +4302,7 @@ mod tests {
                     current_run_id: 0,
                     next_run_id: 1,
                     child: None,
+                    child_rss_bytes: None,
                     throttled: false,
                     superseded: Vec::new(),
                 },
@@ -4194,6 +4484,7 @@ mod tests {
         state.child = Some(spawn_stand_in_encoder());
         state.superseded.push(SupersededEncoder {
             child: spawn_stand_in_encoder(),
+            rss_bytes: None,
             reap_at: Instant::now() + REAP_AFTER,
             run_id: 1,
         });
@@ -4218,6 +4509,7 @@ mod tests {
                     current_run_id: 0,
                     next_run_id: 1,
                     child: Some(spawn_stand_in_encoder()),
+                    child_rss_bytes: None,
                     throttled: false,
                     superseded: Vec::new(),
                 },
@@ -4228,6 +4520,7 @@ mod tests {
                     current_run_id: 0,
                     next_run_id: 1,
                     child: Some(spawn_stand_in_encoder()),
+                    child_rss_bytes: None,
                     throttled: false,
                     superseded: Vec::new(),
                 },
@@ -4259,17 +4552,160 @@ mod tests {
 
         assert_eq!(live_encoder_load_centi(&sessions), 300);
         assert_eq!(
-            u8::from(admits_new_session(&sessions, SessionMode::Copy, None, 3)),
+            u8::from(admits_new_session(
+                &sessions,
+                SessionMode::Copy,
+                None,
+                Some(3),
+                EncoderMemory::Unmeasured,
+                0,
+            )),
             0
         );
         assert_eq!(
-            u8::from(admits_new_session(&sessions, SessionMode::Copy, None, 4)),
+            u8::from(admits_new_session(
+                &sessions,
+                SessionMode::Copy,
+                None,
+                Some(4),
+                EncoderMemory::Unmeasured,
+                0,
+            )),
             1
         );
 
         for session in sessions.values_mut() {
             stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_configured_cap_admits_past_the_override_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        let mut sessions = HashMap::from([("s1".to_string(), session)]);
+
+        assert_eq!(
+            [
+                admits_new_session(
+                    &sessions,
+                    SessionMode::Copy,
+                    None,
+                    Some(1),
+                    EncoderMemory::Unmeasured,
+                    0,
+                ),
+                admits_new_session(
+                    &sessions,
+                    SessionMode::Copy,
+                    None,
+                    None,
+                    EncoderMemory::Unmeasured,
+                    0,
+                ),
+            ],
+            [false, true]
+        );
+
+        let session = sessions.get_mut("s1").unwrap();
+        stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
+    }
+
+    #[test]
+    fn unmeasured_memory_admits() {
+        assert!(memory_admits_new_session(EncoderMemory::Unmeasured, 1024));
+    }
+
+    #[test]
+    fn zero_live_children_admit() {
+        assert!(memory_admits_new_session(
+            EncoderMemory::Measured {
+                live_rss_bytes: 0,
+                available_bytes: 0,
+                children: 0,
+            },
+            1024,
+        ));
+    }
+
+    #[test]
+    fn no_high_water_sample_admits() {
+        assert!(memory_admits_new_session(
+            EncoderMemory::Measured {
+                live_rss_bytes: 1024,
+                available_bytes: 0,
+                children: 1,
+            },
+            0,
+        ));
+    }
+
+    #[test]
+    fn memory_guard_reserves_two_high_water_children() {
+        let memory = |available_bytes| EncoderMemory::Measured {
+            live_rss_bytes: 100,
+            available_bytes,
+            children: 1,
+        };
+
+        assert_eq!(
+            [
+                memory_admits_new_session(memory(199), 100),
+                memory_admits_new_session(memory(200), 100),
+            ],
+            [false, true]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rss_high_water_counts_superseded_children_and_never_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        let current = spawn_stand_in_encoder();
+        let current_pid = current.id();
+        let held = spawn_stand_in_encoder();
+        let held_pid = held.id();
+        let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+        state.child = Some(current);
+        state.superseded.push(SupersededEncoder {
+            child: held,
+            rss_bytes: None,
+            reap_at: Instant::now() + REAP_AFTER,
+            run_id: 7,
+        });
+        let mut sessions = HashMap::from([("s1".to_string(), session)]);
+        let high_water = AtomicU64::new(0);
+        let current_process = EncoderProcess {
+            session_id: "s1".into(),
+            rung: SINGLE_VIDEO_RUNG,
+            pid: current_pid,
+            superseded_run_id: None,
+        };
+        let held_process = EncoderProcess {
+            session_id: "s1".into(),
+            rung: SINGLE_VIDEO_RUNG,
+            pid: held_pid,
+            superseded_run_id: Some(7),
+        };
+        record_encoder_rss_sample(&mut sessions, &high_water, &current_process, Some(100));
+        record_encoder_rss_sample(&mut sessions, &high_water, &held_process, Some(300));
+        record_encoder_rss_sample(&mut sessions, &high_water, &current_process, Some(50));
+        record_encoder_rss_sample(&mut sessions, &high_water, &current_process, None);
+
+        assert_eq!(
+            (
+                high_water.load(Ordering::Relaxed),
+                live_encoder_rss(&sessions),
+            ),
+            (300, (None, 2))
+        );
+
+        let session = sessions.get_mut("s1").unwrap();
+        stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
+        reap_all_superseded(session);
     }
 
     /// A seek keeps the prior encoder alive and reaps it on its delay, not
@@ -4411,6 +4847,7 @@ mod tests {
                 .superseded
                 .push(SupersededEncoder {
                     child,
+                    rss_bytes: None,
                     reap_at: Instant::now() + Duration::from_secs(30),
                     run_id,
                 });
@@ -4459,6 +4896,7 @@ mod tests {
             .superseded
             .push(SupersededEncoder {
                 child: spawn_stand_in_encoder(),
+                rss_bytes: None,
                 reap_at: Instant::now() + Duration::from_secs(30),
                 run_id: 2,
             });
@@ -4562,6 +5000,7 @@ mod tests {
             .superseded
             .push(SupersededEncoder {
                 child: spawn_stand_in_encoder(),
+                rss_bytes: None,
                 // The real delay is `REAP_AFTER`; parked out of reach so the
                 // throttle tick cannot reap run_0 out from under the assertion.
                 reap_at: Instant::now() + Duration::from_secs(30),
@@ -4629,6 +5068,7 @@ mod tests {
             .superseded
             .push(SupersededEncoder {
                 child,
+                rss_bytes: None,
                 reap_at,
                 run_id: 0,
             });
@@ -4677,6 +5117,7 @@ mod tests {
             .superseded
             .push(SupersededEncoder {
                 child,
+                rss_bytes: None,
                 reap_at: Instant::now() + REAP_AFTER,
                 run_id: 0,
             });
@@ -4731,6 +5172,7 @@ mod tests {
             .superseded
             .push(SupersededEncoder {
                 child,
+                rss_bytes: None,
                 reap_at,
                 run_id: 9,
             });
@@ -7056,7 +7498,7 @@ mod tests {
                 VideoEncodePlan::default(),
                 None,
             ),
-            Err(StartSessionError::CapFull)
+            Err(StartSessionError::AdmissionRefused)
         ));
         assert!(reg.stop(&a));
         assert!(matches!(reg.playlist(&a), Err(PlaylistError::NotFound)));
