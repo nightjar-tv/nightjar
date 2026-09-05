@@ -356,6 +356,20 @@ fn assert_profile(
     );
 }
 
+/// Whether a manifest `expect` is a declared non-method claim (sidecar
+/// association, not-yet-sourced, Range-only fixture) rather than a broken one.
+///
+/// Mirrors the `None` cases of `nightjar_core::method_from_manifest_expect`
+/// (server/crates/core/src/playback.rs); keep the two lists in lockstep.
+fn is_non_method_manifest_expect(expect: &str) -> bool {
+    let e = expect.to_ascii_lowercase();
+    e.contains("not a media item")
+        || e.contains("once sourced")
+        || e.contains("open-ended range")
+        || e.contains("range past")
+        || e.contains("pending source")
+}
+
 #[test]
 fn corpus_manifest_expects_match_decide_playback() {
     if ffprobe_missing() {
@@ -369,47 +383,103 @@ fn corpus_manifest_expects_match_decide_playback() {
     let raw = std::fs::read_to_string(&manifest_path).expect("read manifest.json");
     let manifest: Manifest = serde_json::from_str(&raw).expect("parse manifest.json");
 
+    // The manifest is the population: every row is exercised unless it declares
+    // itself not-yet-sourced (`status: "pending source"`) or is a non-committed
+    // row whose file is absent (fetched / kit-local corpus). An `expect` that
+    // parses to neither a method nor a declared non-method claim is a broken
+    // manifest, not a skip.
+    let total = manifest.files.len();
     let mut checked = 0usize;
+    let mut pending_source = 0usize;
+    let mut non_committed_absent = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
     for row in &manifest.files {
-        let Some(rel) = row.path.as_deref() else {
-            assert_eq!(
-                method_from_manifest_expect(&row.expect),
-                None,
-                "pathless row must not claim a method: {}",
-                row.expect
-            );
-            continue;
-        };
         if row.status.as_deref() == Some("pending source") {
+            pending_source += 1;
             continue;
         }
-        let Some(want) = method_from_manifest_expect(&row.expect) else {
+
+        let Some(rel) = row.path.as_deref() else {
+            // Pathless row: an association entry, so it must not claim a method.
+            if method_from_manifest_expect(&row.expect).is_some() {
+                failures.push(format!(
+                    "pathless row must not claim a method: {}",
+                    row.expect
+                ));
+            } else {
+                checked += 1;
+            }
             continue;
         };
 
         let path = testdata.join(rel);
         // Non-committed rows (large-*, Dolby kit / MakeMKV): exercise when present.
         if row.commit == Some(false) && !path.is_file() {
+            non_committed_absent += 1;
             continue;
         }
-        assert!(
-            path.is_file(),
-            "corpus file missing (run testdata/generate.sh): {}",
-            path.display()
-        );
+
+        let Some(want) = method_from_manifest_expect(&row.expect) else {
+            if !is_non_method_manifest_expect(&row.expect) {
+                failures.push(format!(
+                    "row {}: manifest expect is not a playback method and not a \
+                     declared non-method claim: {:?}",
+                    rel, row.expect
+                ));
+                continue;
+            }
+            // Sidecar association row: claims no playback method, and must still
+            // point at a real file.
+            if !path.is_file() {
+                failures.push(format!(
+                    "row {}: associated corpus file missing (run testdata/generate.sh): {}",
+                    rel,
+                    path.display()
+                ));
+            } else {
+                checked += 1;
+            }
+            continue;
+        };
+
+        if !path.is_file() {
+            failures.push(format!(
+                "row {}: corpus file missing (run testdata/generate.sh): {}",
+                rel,
+                path.display()
+            ));
+            continue;
+        }
 
         let decision = decide_for(&path, &BROWSER_V0, true);
-        assert_eq!(
-            decision.method, want,
-            "{}: expect {:?} from {:?}, got {:?} ({})",
-            rel, want, row.expect, decision.method, decision.reason
-        );
+        if decision.method != want {
+            failures.push(format!(
+                "row {}: expect {:?} from {:?}, got {:?} ({})",
+                rel, want, row.expect, decision.method, decision.reason
+            ));
+            continue;
+        }
         checked += 1;
     }
 
-    assert!(
-        checked >= 20,
-        "expected to exercise most corpus media rows, checked {checked}"
+    let should_check = total - pending_source - non_committed_absent;
+    if !failures.is_empty() {
+        panic!(
+            "corpus manifest: {checked}/{should_check} rows checked, {total} total \
+             ({pending_source} pending source, {non_committed_absent} non-committed absent);\n  {}",
+            failures.join("\n  ")
+        );
+    }
+    assert_eq!(
+        checked, should_check,
+        "corpus manifest: checked {checked} of {should_check} expected ({total} total, \
+         {pending_source} pending source, {non_committed_absent} non-committed absent); \
+         every non-declared row must be exercised, so an unreported skip is a test bug"
+    );
+    eprintln!(
+        "corpus decide: {checked} rows checked of {total} in the manifest \
+         ({pending_source} pending source, {non_committed_absent} non-committed absent)"
     );
 }
 
