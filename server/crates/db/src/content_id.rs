@@ -15,6 +15,15 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Bytes hashed from the head and tail of the media file.
+///
+/// **GUESS — no stated origin.** ADR-0023 §6 locks the identity shape —
+/// `size_bytes` plus SHA-256 of the first and last 64 KiB — and §4 prices
+/// bind-time revalidation at "128 KiB per bind" as a consequence, but neither
+/// the ADR nor this crate's git history says where 64 KiB came from. No
+/// measurement and no derivation from corruption- or read-cost data was found;
+/// searched ADR-0023, the commit that landed it (`0261a10`), and the notes
+/// that preceded it. The constant governs file identity and dedup across the
+/// whole scanner; it is unsourced until measured.
 pub const CONTENT_ID_WINDOW: usize = 64 * 1024;
 
 /// Build a content_id from size and already-hex-encoded SHA-256 digests.

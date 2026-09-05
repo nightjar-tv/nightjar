@@ -102,6 +102,12 @@
 		<p class="error" role="alert">{error}</p>
 	{/if}
 
+	{#if !item && !error}
+		<!-- The page is only the breadcrumb until the item chain resolves, so
+		     say the fetch is in flight instead of drawing a silent blank. -->
+		<p class="preparing" role="status">Loading…</p>
+	{/if}
+
 	{#if item}
 		{#if backdrop}
 			<img class="backdrop" src={backdrop} alt="" />
@@ -220,7 +226,8 @@
 	}
 	.meta,
 	.facts,
-	.plot {
+	.plot,
+	.preparing {
 		font-family: 'Spline Sans Mono', ui-monospace, monospace;
 		font-size: 0.875rem;
 		color: var(--moth-dim);

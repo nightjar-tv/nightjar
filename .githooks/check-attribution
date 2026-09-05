@@ -1,0 +1,19 @@
+#!/bin/sh
+# The same rule for a pull request body, which a commit hook cannot see.
+#
+#   .githooks/check-attribution <file>     # or read from stdin
+set -eu
+text=$(cat "${1:-/dev/stdin}")
+bad=0
+report() { printf '  %s\n' "$1" >&2; bad=1; }
+printf '%s' "$text" | grep -qiE 'claude|anthropic|copilot|chatgpt|openai|gpt-[0-9]|deepseek|codex' \
+  && report "a model or vendor name appears"
+printf '%s' "$text" | grep -qiE 'generated (by|with)|written by an? (ai|assistant|model)|assisted by' \
+  && report "a generated-by or assisted-by claim appears"
+printf '%s' "$text" | grep -qiE '^[A-Za-z-]*-Session:|https?://[a-z.]*(claude|openai|anthropic)\.' \
+  && report "a session trailer or assistant URL appears"
+if [ "$bad" -ne 0 ]; then
+  printf '\nREJECTED — GIT_RULES section 7: no tooling attribution.\n\n' >&2
+  exit 1
+fi
+exit 0

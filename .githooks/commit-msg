@@ -1,0 +1,31 @@
+#!/bin/sh
+# GIT_RULES section 7: a commit message carries what the change does and why.
+# It never carries who or what typed it - no vendor or model name, no
+# generated-by claim, no session trailer.
+#
+# This is a guard rather than a reminder: the rule is enforceable only if
+# something refuses the commit.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+set -eu
+msg_file="$1"
+# Comment lines are git's own template, not the author's message.
+body=$(grep -v '^#' "$msg_file" || true)
+
+fail() {
+  printf '\nCOMMIT REJECTED — GIT_RULES section 7\n\n  %s\n\n' "$1" >&2
+  printf 'A commit message carries what the change does and why. It does not\n' >&2
+  printf 'carry who or what typed it. Remove the line and commit again.\n\n' >&2
+  exit 1
+}
+
+printf '%s' "$body" | grep -qiE 'claude|anthropic|copilot|chatgpt|openai|gpt-[0-9]|deepseek|codex|cursor\.so' \
+  && fail "a model or vendor name appears in the message"
+printf '%s' "$body" | grep -qiE 'co-authored-by:.*(bot|ai|assistant)' \
+  && fail "an assistant appears in a Co-authored-by trailer"
+printf '%s' "$body" | grep -qiE 'generated (by|with)|written by an? (ai|assistant|model)|assisted by' \
+  && fail "a generated-by or assisted-by claim appears in the message"
+printf '%s' "$body" | grep -qiE '^[A-Za-z-]*-Session:|https?://[a-z.]*(claude|openai|anthropic)\.' \
+  && fail "a session trailer or assistant URL appears in the message"
+
+exit 0

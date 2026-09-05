@@ -286,12 +286,47 @@ pub fn stored_kind(
 }
 
 /// ADR-0030 §3: refuse repoint if matched/current < this fraction.
+///
+/// **REASONED, not MEASURED.** ADR-0030 §3 says so in its own words: "a
+/// **default judgement**, not a measured floor. It was **not** run against the
+/// ~24 800-item dogfood library before acceptance; it was picked to catch
+/// wrong roots while allowing small tree churn." The ADR also records the
+/// revisit trigger: dogfood remount evidence that keep-relpath remounts
+/// routinely land under 0.90 without being a wrong root, or that 0.90 still
+/// admits destructive mis-points.
 pub const REPOINT_RETAIN_FRACTION: f64 = 0.90;
 
 /// After a repoint with deferred_remove > 0, poll skips full walks for this
 /// long so the operator can review before delete_missing runs (ADR-0030).
+///
+/// **GUESS — the hour itself has no stated origin.** ADR-0030 (amended
+/// 2026-08-04) supplies the mechanism — poll must not apply the deferred
+/// deletes before review, while manual scan stays allowed — and names the
+/// duration only as a "default **1 hour**". Nothing in ADR-0030, this file's
+/// git history, or any measurement derives why an hour rather than another
+/// review window. The value that gates a destructive `delete_missing` is
+/// unsourced, never derived.
 pub const REPOINT_DELETE_HOLDOFF: Duration = Duration::from_secs(3600);
 
+/// Flush size of the index upsert: the walk collects changed and new files
+/// and commits them as one transaction every `INDEX_BATCH` rows (plus a final
+/// partial flush; `upsert_items_indexed`). It is the commit granularity,
+/// which is what makes the scan counter move in bursts: the visible
+/// `added`/`updated` progress advances in 200-row steps, not continuously.
+///
+/// The reach is wider than the counter. Every flush also enqueues that
+/// batch's probes and runs their sidecar association, and the transaction is
+/// the batch-sized hold on the shared `Db` connection that concurrent API
+/// reads wait out during a cold walk (only the metadata drain holds its own
+/// connection — ADR-0026 §8).
+///
+/// **GUESS (Rule 4.14).** No derivation is recorded. It shipped bare with
+/// the Phase 1 scanner (#1); no ADR, git history entry, or note derives why
+/// 200. It is load-bearing for annotated constants elsewhere: the
+/// `scan_progress` route's own doc and the library page's progress poll
+/// (`web/src/routes/libraries/[id]/+page.svelte`) both justify their poll
+/// cadence with "commits 200 rows at a time", so two annotated comments rest
+/// on this unannotated server constant.
 const INDEX_BATCH: usize = 200;
 
 /// Who asked for a full-library walk (ADR-0015). Notify creates use
@@ -323,9 +358,14 @@ pub fn request_scan(
     let lib = db
         .get_library(library_id)?
         .ok_or_else(|| format!("library {library_id} not found"))?;
-    if matches!(check_root(Path::new(&lib.path)), Reachability::Unreachable) {
-        let _ = pool.set_library_reachability(library_id, &lib.path, false);
-        return Err(format!("library path is not reachable: {}", lib.path));
+    match check_root(Path::new(&lib.path)) {
+        Reachability::Unreachable => {
+            let _ = pool.set_library_reachability(library_id, &lib.path, false);
+            return Err(format!("library path is not reachable: {}", lib.path));
+        }
+        // Reachable, or the check instrument itself failed (Rule 4.15: not a
+        // finding — do not refuse the scan on it).
+        Reachability::Reachable | Reachability::CheckFailed => {}
     }
     if let Some(existing) = db.active_scan_job(library_id)? {
         match trigger {
@@ -641,8 +681,14 @@ fn run_repoint_job(
             .map(|p| nightjar_db::normalize_library_root(&p.to_string_lossy()))
             .unwrap_or_else(|_| nightjar_db::normalize_library_root(candidate_path));
         let root = Path::new(&candidate);
-        if !matches!(check_root(root), Reachability::Reachable) {
-            return Err(format!("repoint path is not reachable: {candidate}"));
+        match check_root(root) {
+            Reachability::Reachable => {}
+            Reachability::Unreachable => {
+                return Err(format!("repoint path is not reachable: {candidate}"));
+            }
+            // Check instrument failure is not a finding about the path
+            // (Rule 4.15); let the walk below report the truth.
+            Reachability::CheckFailed => {}
         }
         let current = db.count_items(library_id)?;
         let existing = db.list_item_paths(library_id)?;
@@ -781,9 +827,15 @@ fn run_index_pass(
         .unwrap_or_else(|_| nightjar_db::normalize_library_root(&lib.path));
     let root = Path::new(&library_root);
     let root_before = check_root(root);
-    if !matches!(root_before, Reachability::Reachable) {
-        let _ = pool.set_library_reachability(library_id, &library_root, false);
-        return Err(format!("library path is not reachable: {library_root}"));
+    match root_before {
+        Reachability::Reachable => {}
+        Reachability::Unreachable => {
+            let _ = pool.set_library_reachability(library_id, &library_root, false);
+            return Err(format!("library path is not reachable: {library_root}"));
+        }
+        // Check instrument failure is not a finding (Rule 4.15): do not pause
+        // or abort the scan on it.
+        Reachability::CheckFailed => {}
     }
 
     // Scan library (and poll) re-try availability failures; permanent error stays
@@ -1004,7 +1056,11 @@ fn run_index_pass(
         let _ = fold_collisions;
         let root_after = check_root(root);
         let root_ok_after = matches!(root_after, Reachability::Reachable);
-        if !root_ok_after {
+        // Pause only on a positive finding. A check instrument failure is not
+        // a finding (Rule 4.15): the walk still counts as doubtful below
+        // (root_ok_after false skips delete_missing) but must not pause a
+        // healthy library.
+        if matches!(root_after, Reachability::Unreachable) {
             let _ = pool.set_library_reachability(library_id, &lib.path, false);
         }
         // First index after a successful repoint: report unmatched rows but do
@@ -2681,6 +2737,21 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// The ffmpeg sibling of [`require_ffprobe`]. The fixture builders below
+    /// must not skip under `NIGHTJAR_TEST_REQUIRE_FFMPEG` just because `ffmpeg`
+    /// is missing while `ffprobe` is present: an ad-hoc skip makes a missing
+    /// `ffmpeg` a pass when the env var has already demanded the test run.
+    fn require_ffmpeg() -> bool {
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_some() {
+            return true;
+        }
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn skip_without_fixture(path: &Path) -> bool {
         if path.is_file() {
             return false;
@@ -2787,6 +2858,13 @@ mod tests {
     fn probe_sidecar_only_classifies_eligible_and_converts_in_process() {
         if !require_ffprobe() {
             eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        // The sidecar extract spawns ffmpeg, so this needs the tool at run
+        // time and not merely to build a fixture. Without the guard it failed
+        // on a machine that simply has no ffmpeg, where it should skip.
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2896,6 +2974,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -2951,13 +3033,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the multi-track fixture: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg multi-sub mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the multi-track fixture failed with exit code {:?}",
+                status.code()
+            );
         }
         // ffprobe reports an unmapped CodecID as no codec_name; make the third
         // track unrecognised by patching its CodecID (same-length swap).
@@ -2970,8 +3054,7 @@ mod tests {
             }
         }
         let Some(pos) = last else {
-            eprintln!("skipping: no S_TEXT/UTF8 CodecID found to patch");
-            return;
+            panic!("no S_TEXT/UTF8 CodecID found in the muxed fixture to patch");
         };
         bytes[pos..pos + 11].copy_from_slice(b"S_TEXT/FOO!");
         fs::write(&mkv, &bytes).unwrap();
@@ -3161,12 +3244,7 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
-        let ffmpeg_ok = Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ffmpeg_ok {
+        if !require_ffmpeg() {
             eprintln!("skip: ffmpeg not on PATH");
             return;
         }
@@ -3238,6 +3316,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3273,13 +3355,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the slow-fixture mkv: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg slow-fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the slow-fixture mkv failed with exit code {:?}",
+                status.code()
+            );
         }
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
@@ -3360,12 +3444,7 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
-        let ffmpeg_ok = Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ffmpeg_ok {
+        if !require_ffmpeg() {
             eprintln!("skip: ffmpeg not on PATH");
             return;
         }
@@ -3410,13 +3489,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the slow-probe fixture: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg slow-probe fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the slow-probe fixture failed with exit code {:?}",
+                status.code()
+            );
         }
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
@@ -3483,10 +3564,27 @@ mod tests {
     /// the item lands `unavailable`, never a ready map. The fixture is a
     /// tail-truncated MKV (Cues live at the end), so the index read cannot
     /// succeed and the build must take the packet-walk fallback.
+    ///
+    /// **The in-flight state is deterministic, not raced.** The old form
+    /// waited for `queued_maps == 0` and then flipped reachability — and
+    /// between "started" and "flipped" a fast runner could finish the whole
+    /// walk and store a ready map, which the assertion then reported as the
+    /// product's bug. It was a race in the test: the walk that finished had
+    /// already proved nothing about cancellation. This test arms the pool's
+    /// test-only hold ([`pool::LibraryPool::arm_map_walk_hold`]), so the map
+    /// worker reports that the build has entered and then parks until the
+    /// test releases it. The reachability flip therefore always lands while
+    /// the build is provably still running. A run where the hold never fires
+    /// proves nothing, so the wait is bounded and panics loudly instead of
+    /// passing.
     #[test]
     fn map_packet_walk_in_flight_is_cancelled_when_library_unreachable() {
         if !require_ffprobe() {
             eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -3511,13 +3609,15 @@ mod tests {
             ])
             .arg(&muxed)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the map-walk fixture: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the map-walk fixture failed with exit code {:?}",
+                status.code()
+            );
         }
         let data = fs::read(&muxed).unwrap();
         let cut = (data.len() as f64 * 0.80) as usize;
@@ -3552,21 +3652,27 @@ mod tests {
             .unwrap();
         let item_id = ids[0];
 
+        // Arm the hold, then enqueue: the worker reports the build has
+        // entered and parks until released. Flipping reachability while the
+        // worker is parked cannot race the walk, so the map below must be
+        // cancelled in flight — never a ready map.
+        let hold = pool.arm_map_walk_hold();
         pool.enqueue_map_rebuild(item_id, lib.id, mkv);
-        for _ in 0..400 {
-            if pool.background_progress().queued_maps == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            pool.background_progress().queued_maps,
-            0,
-            "map build never started"
-        );
+        let entered = hold
+            .entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "map build never entered the test hold; the walk was not held in flight: {e}"
+                )
+            });
+        assert_eq!(entered, item_id, "the held map build is a different item");
 
         pool.set_library_reachability(lib.id, &lib.path, false)
             .unwrap();
+        // Release the parked build: it must observe the flip and cancel.
+        let _ = hold.release_tx.send(());
+        drop(hold);
         for _ in 0..400 {
             let row = db.get_item(item_id).unwrap().unwrap();
             if row.map_status != "pending" {
@@ -3657,6 +3763,10 @@ mod tests {
             eprintln!("skip: ffprobe not on PATH");
             return;
         }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3679,13 +3789,15 @@ mod tests {
             ])
             .arg(&mkv)
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipping: could not spawn ffmpeg");
-            return;
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => panic!("could not spawn ffmpeg to build the demand-trigger clip: {e}"),
         };
         if !status.success() {
-            eprintln!("skipping: ffmpeg fixture mux failed");
-            return;
+            panic!(
+                "ffmpeg mux of the demand-trigger clip failed with exit code {:?}",
+                status.code()
+            );
         }
 
         let db = Arc::new(nightjar_db::open(dir.path()).unwrap());

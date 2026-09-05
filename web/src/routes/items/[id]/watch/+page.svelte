@@ -12,10 +12,11 @@
 	import {
 		attachModeFromSearch,
 		LatencyProbe,
-		probeEnabled,
-		type AttachMode
+		probeEnabled
 	} from '$lib/latencyProbe';
 	import { rememberPositionMs, resumePositionMs } from '$lib/resumePosition';
+	import { shouldRetrySessionStart } from '$lib/sessionRetry';
+	import { waitForSessionReady, type SessionWaitReason } from '$lib/sessionWait';
 	import type { SessionGoneReason } from '$lib/playbackErrors';
 	import { beginPlayback } from '$lib/profileScope';
 	import type { components } from '$lib/api/schema';
@@ -189,8 +190,10 @@
 					originRef.ms = session.mediaOriginMs ?? 0;
 					break;
 				} catch (e) {
-					const msg = e instanceof Error ? e.message : String(e);
-					if (msg.includes('retry shortly') || msg.includes('in use')) {
+					// Retry on the server's code, not on its sentence. The
+					// prose fallback for one release lives in
+					// sessionRetry.ts.
+					if (shouldRetrySessionStart(e)) {
 						await new Promise((r) => setTimeout(r, 1000));
 						continue;
 					}
@@ -209,11 +212,17 @@
 			error = copy.sessionsBusy;
 			return;
 		}
-		// Wait until init is ready so the VOD playlist is servable.
-		if (!(await waitForReady(session.playlistUrl))) {
+		// Wait until init is ready so the VOD playlist is servable. The wait
+		// deletes the session itself when it gives up, so a failed start does
+		// not sit orphaned until the idle reaper runs a minute later.
+		const outcome = await waitForSessionReady(session.playlistUrl, {
+			alive: () => liveRef.alive,
+			release: releaseSession
+		});
+		if (outcome.state !== 'ready') {
 			preparingSession = false;
 			started = false;
-			error = copy.sessionFailed;
+			error = sessionWaitMessage(outcome.reason);
 			return;
 		}
 		playlistUrl = session.playlistUrl;
@@ -245,6 +254,34 @@
 		})();
 	}
 
+	/** Map a failed ready-wait to the copy that names its actual cause. The three
+	 *  outcomes lead an operator somewhere different: a 404 means the session is
+	 *  really gone, giving up means FFmpeg is still working (the logs will show a
+	 *  healthy session), and a network error says nothing about the file. */
+	function sessionWaitMessage(reason: SessionWaitReason): string {
+		switch (reason) {
+			case 'gone':
+				return copy.sessionFailed;
+			case 'gave-up':
+				return copy.sessionStartTimeout;
+			case 'network':
+				return copy.sessionStartNetworkError;
+		}
+	}
+
+	/** Play button entry point. The auto-start path gets a `.catch` in onMount;
+	 *  the button gets the same guard, because a rejection thrown out of
+	 *  `start()` would otherwise leave the page on "Starting playback session…"
+	 *  with no way out but a reload. */
+	function onPlayClick() {
+		void start().catch((e: unknown) => {
+			releaseSession();
+			preparingSession = false;
+			started = false;
+			error = e instanceof Error ? e.message : String(e);
+		});
+	}
+
 	function audioTrackLabel(track: AudioTrack): string {
 		const name = track.label ?? track.language ?? track.trackId;
 		return track.channelLayout ? `${name} · ${track.channelLayout}` : name;
@@ -257,23 +294,6 @@
 	function selectSubtitle(index: number) {
 		selectedSubtitleIndex = index;
 		playerRef.handle?.setSubtitleTrack(index);
-	}
-
-	/** Poll until FFmpeg has written a servable response (playlist or segment). */
-	async function waitForReady(url: string): Promise<boolean> {
-		// Tag .m4s side-channel polls so dogfood logs can tell them from
-		// Safari's own native segment GETs (same URL, no query).
-		const fetchUrl = /\.m4s(?:\?|$)/i.test(url)
-			? `${url}${url.includes('?') ? '&' : '?'}njFetcher=attach-wait`
-			: url;
-		for (let i = 0; liveRef.alive && i < 100; i++) {
-			const res = await fetch(fetchUrl);
-			if (res.ok) return true;
-			// Gone for good (deleted / never created). 503 means still cooking.
-			if (res.status === 404) return false;
-			await new Promise((r) => setTimeout(r, 200));
-		}
-		return false;
 	}
 
 	function selectAudio(trackId: string) {
@@ -329,22 +349,24 @@
 			const started = await api.startTranscodeSession(itemId, startMs, trackId);
 			probe.mark('session_post_ok', started.sessionId);
 			probe.mark('wait_begin', attachMode);
-			const landIdx = Math.floor(startMs / 2000);
-			// Land wait only needs the play-land segment; encode lead-in (2)
-			// cooks behind it on the server without changing this gate.
-			const windowIdx = landIdx;
-			const ready = await waitForAttachReady(
-				started.playlistUrl,
-				windowIdx,
-				landIdx,
-				attachMode,
-				probe
-			);
-			// Never adopt a session the page no longer owns; leaving it for
-			// the idle reaper burns a cap slot for a minute.
-			if (!ready || !liveRef.alive) {
-				void api.deleteTranscodeSession(started.sessionId);
-				if (liveRef.alive) error = copy.sessionFailed;
+			// The wait releases the new session itself when it is not ready,
+			// so a failed switch cannot orphan it until the idle reaper runs.
+			const outcome = await waitForSessionReady(started.playlistUrl, {
+				alive: () => liveRef.alive,
+				// Delete only the new session: sessionRef.id still names the
+				// one that is playing while the new land cooks.
+				release: () => void api.deleteTranscodeSession(started.sessionId)
+			});
+			if (outcome.state === 'ready') probe.mark('master_ready');
+			if (!liveRef.alive) {
+				// Never adopt a session the page no longer owns. The wait only
+				// deletes on the not-ready path; a ready answer that lands
+				// after the page died still leaves this session to drop.
+				if (outcome.state === 'ready') void api.deleteTranscodeSession(started.sessionId);
+				return;
+			}
+			if (outcome.state !== 'ready') {
+				error = sessionWaitMessage(outcome.reason);
 				return;
 			}
 			resumeRef.seconds = startMs / 1000;
@@ -373,19 +395,6 @@
 			unspy();
 			switchingAudio = false;
 		}
-	}
-
-	/** Attach gate: wait until the run master is ready (map has segments). */
-	async function waitForAttachReady(
-		playlist: string,
-		_windowIdx: number,
-		_landIdx: number,
-		_mode: AttachMode,
-		probe: LatencyProbe
-	): Promise<boolean> {
-		const masterOk = await waitForReady(playlist);
-		if (masterOk) probe.mark('master_ready');
-		return masterOk;
 	}
 
 	const playable = $derived(
@@ -618,7 +627,7 @@
 			     landing here after one was reaped, offers play at the last
 			     known position instead of starting work nobody asked for. -->
 			<div class="affordance">
-				<button type="button" class="play" onclick={() => void start()}>
+				<button type="button" class="play" onclick={onPlayClick}>
 					{resumeMs > 0 ? copy.playResume(resumeMs / 1000) : copy.play}
 				</button>
 			</div>

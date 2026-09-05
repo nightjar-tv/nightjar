@@ -121,6 +121,16 @@ longer runs.
      log clearly) when the data volume cannot hold a conservative minimum
      headroom.
 
+     > **Amended 2026-09-05 — nothing was removed, because nothing was
+     > built.** The env var and LRU this bullet names never existed in
+     > code; they were a paper promise in
+     > [ADR-0010](0010-text-subs-webvtt.md) §7 (corrected in place there
+     > the same day). This bullet's "Remove" was satisfied by construction.
+     > What ships is the free-space refusal floor this bullet also names:
+     > `MIN_FREE_BYTES`, 256 MiB, in `transcode/src/subs/mod.rs`, refusing
+     > an extract (leaving `pending`) when the volume cannot hold the
+     > headroom.
+
 5. **Cleanup.** A pass after index removals deletes
    `{NIGHTJAR_DATA_DIR}/subs/{itemId}/` for items no longer in any library.
    Startup also sweeps directories under `subs/` whose `itemId` is absent from

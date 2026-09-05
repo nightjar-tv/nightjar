@@ -15,8 +15,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Idle poll when nothing is pending (or credentials missing).
+///
+/// This interval also sets how long after a scan finishes before metadata
+/// visibly starts moving: the drain sleeps the whole interval when its
+/// pending count is zero, so a scan that ends mid-sleep is not noticed until
+/// the next wake.
+///
+/// **GUESS (Rule 4.14).** No derivation is recorded. The constant shipped
+/// with the Block 1 metadata drain (#51); ADR-0026 §8.8 says only "idle when
+/// neither class has rows" and never names an interval, and no git history
+/// entry or note derives 30 s.
 const IDLE_SLEEP: Duration = Duration::from_secs(30);
 /// Brief pause after a non-empty drain before selecting more pending work.
+///
+/// **GUESS (Rule 4.14).** No derivation is recorded. It shipped with the
+/// Block 1 metadata drain (#51) alongside `IDLE_SLEEP`; ADR-0026 §8
+/// describes the loop ordering but no source in the ADRs, git history, or
+/// notes explains why one second between passes. TMDB request pacing is the
+/// `ApiRateLimiter`'s job (ADR-0026 §7), not this sleep's.
 const WORK_PAUSE: Duration = Duration::from_secs(1);
 
 /// Spawn the metadata drain thread. No-op-safe: missing TMDB key logs and retries.

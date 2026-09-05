@@ -86,6 +86,25 @@ pass (Rule 6.1 / 4.9).
    > unconditional there and (as of
    > [ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md))
    > probe-time-classified and client/method-gated instead.
+   >
+   > **Amended 2026-09-05 — the byte-capped LRU was never built.** The text
+   > above promises a "Byte-capped LRU from day one
+   > (`NIGHTJAR_SUBS_CACHE_BYTES`, default 512 MiB)". No version of
+   > `server/crates` ever read that env var, and
+   > `transcode/src/subs/mod.rs` never contained eviction. The LRU, the env
+   > var, and the `cache/subs/` directory existed only as this section's
+   > text and as the object of the ADR-0013 marker above; there was no LRU
+   > implementation for that marker to describe as replaced. ADR-0013
+   > superseded this section's design, not a shipped cache.
+   >
+   > What ships is the scan-time derived store at
+   > `{NIGHTJAR_DATA_DIR}/subs/{itemId}/{trackId}.vtt` (ADR-0013 §4), which
+   > is never byte-capped and never evicted. Directory growth is bounded by
+   > the orphan sweep (`SubsStore::cleanup_orphans`, run at startup and
+   > after each index pass; ADR-0013 §5) and by a free-space refusal floor
+   > before extraction (`MIN_FREE_BYTES`, 256 MiB, in
+   > `transcode/src/subs/mod.rs`). There is no byte cap, no eviction, and
+   > no `NIGHTJAR_SUBS_CACHE_BYTES` to set.
 
 8. **API.** `PlaybackInfo.subtitleTracks` is an array of
    `{ trackId, source, codec, language?, label?, forced, sdh, url?, streamIndex? }`.

@@ -192,6 +192,35 @@ impl ProbeBatch {
     }
 }
 
+/// Test-only hold that makes an in-flight keyframe-map walk deterministic
+/// (ADR-0041 Decision 8.7 cancellation test). `#[cfg(test)]` only: a release
+/// build has no field, no arming method and no park site.
+///
+/// The race it removes: the map worker could finish the whole packet walk
+/// between "the build has started" (`queued_maps == 0`) and "the library is
+/// unreachable", so a test that flips reachability in that window measured
+/// nothing. This hold makes the flip **always** land while the build is
+/// provably still running — the worker reports that it has entered the build
+/// and then parks until the test releases it. The worker-facing half lives on
+/// the pool; the test half is handed out by
+/// [`LibraryPool::arm_map_walk_hold`]. mpsc is the crate's existing
+/// ready/release rendezvous shape (see the pool's epoch-exclusivity test).
+#[cfg(test)]
+struct MapWalkHold {
+    /// Worker → test: "the map build for this item has entered and is held".
+    entered_tx: std::sync::mpsc::Sender<i64>,
+    /// Worker ← test: block here until the test sends the release.
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test half of [`MapWalkHold`]: the test waits on `entered_rx`, flips
+/// reachability, then sends on `release_tx` to let the parked walk run.
+#[cfg(test)]
+pub(crate) struct MapWalkHoldTest {
+    pub entered_rx: std::sync::mpsc::Receiver<i64>,
+    pub release_tx: std::sync::mpsc::Sender<()>,
+}
+
 pub struct LibraryPool {
     db: Arc<Db>,
     subs: Arc<SubsStore>,
@@ -225,6 +254,11 @@ pub struct LibraryPool {
     completed_background: AtomicU64,
     /// Completion timestamps within [`RATE_WINDOW`], for the rate estimate.
     completion_times: Mutex<VecDeque<Instant>>,
+    /// Test-only in-flight hold for a keyframe-map build ([`MapWalkHold`]).
+    /// `None` in ordinary runs; [`LibraryPool::arm_map_walk_hold`] arms it and
+    /// the map worker consumes it exactly once at the park site.
+    #[cfg(test)]
+    map_walk_hold: Mutex<Option<MapWalkHold>>,
     pub availability: Arc<Availability>,
 }
 
@@ -269,6 +303,8 @@ impl LibraryPool {
             bulk_reader: Mutex::new(()),
             completed_background: AtomicU64::new(0),
             completion_times: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            map_walk_hold: Mutex::new(None),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -493,8 +529,14 @@ impl LibraryPool {
     ) -> Result<(), String> {
         let was_paused = self.availability.pause.is_paused(library_id);
         let now_paused = !reachable;
+        // The write is load-bearing in both arms: `reachable` is the column the
+        // API and the library page serve (ADR-0014 §9), and this arm is what
+        // re-converges it when memory already holds the target state. The
+        // changed arm below propagates the same failure; so does this one
+        // (Rule 4.11). Discarding it silently would leave the column and the
+        // pause gate disagreeing with no trace.
         if was_paused == now_paused {
-            let _ = self.db.set_library_reachable(library_id, reachable);
+            self.db.set_library_reachable(library_id, reachable)?;
             return Ok(());
         }
         self.db.set_library_reachable(library_id, reachable)?;
@@ -591,6 +633,46 @@ impl LibraryPool {
         }
         let _ = self.db.mark_map_pending(item_id);
         self.enqueue(WorkItem::map(item_id, library_id, path));
+    }
+
+    /// Arm the test-only in-flight hold for the next map build on this pool
+    /// and return its test half ([`MapWalkHold`]). The test waits on
+    /// `entered_rx` for the build to report, flips reachability, then sends
+    /// on `release_tx`. Builds that start while no hold is armed pass through
+    /// untouched, so ordinary runs and every other test pay nothing.
+    #[cfg(test)]
+    pub(crate) fn arm_map_walk_hold(&self) -> MapWalkHoldTest {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.map_walk_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(MapWalkHold {
+            entered_tx,
+            release_rx,
+        });
+        MapWalkHoldTest {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    /// Park the map worker at the in-flight hold when one is armed. Consumes
+    /// the armed hold, so **exactly one** build per arm parks and every later
+    /// build passes through. A test that gave up before the build arrived
+    /// (dropped its half) unparks the worker immediately via the channel
+    /// error, so a park can never outlive the test that armed it.
+    #[cfg(test)]
+    fn hold_map_walk_if_armed(&self, item_id: i64) {
+        let handle = self
+            .map_walk_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if handle.entered_tx.send(item_id).is_err() {
+            return;
+        }
+        let _ = handle.release_rx.recv();
     }
 
     /// Move an item's extract to the front of the queue (first-play path).
@@ -776,9 +858,18 @@ impl LibraryPool {
         }
         let result = (|| {
             for lib in self.db.list_libraries()? {
-                let state = reachability::check_root(std::path::Path::new(&lib.path));
-                let reachable = matches!(state, Reachability::Reachable);
-                self.set_library_reachability(lib.id, &lib.path, reachable)?;
+                match reachability::check_root(std::path::Path::new(&lib.path)) {
+                    Reachability::Reachable => {
+                        self.set_library_reachability(lib.id, &lib.path, true)?;
+                    }
+                    Reachability::Unreachable => {
+                        self.set_library_reachability(lib.id, &lib.path, false)?;
+                    }
+                    // The check instrument itself failed; that is not a finding
+                    // about the root (Rule 4.15). Leave the stored state alone
+                    // so a thread-starved server cannot pause healthy mounts.
+                    Reachability::CheckFailed => {}
+                }
             }
             Ok(())
         })();
@@ -1290,6 +1381,8 @@ impl LibraryPool {
         // packet-walk fallback (ADR-0041 Decision 8.7); the index read is a
         // header-scale read and runs regardless.
         let should_cancel = || self.availability.pause.is_paused(item.library_id);
+        #[cfg(test)]
+        self.hold_map_walk_if_armed(item_id);
         match crate::keymap::build_keyframe_map(&media_path, row.duration_ms, Some(&should_cancel))
         {
             Ok(built) => {
@@ -1473,6 +1566,50 @@ mod tests {
         assert_eq!(batch.pushed(), 0, "a paused library must not be counted");
         assert_eq!(remaining_of(&batch), 0);
         batch.wait();
+    }
+
+    /// A write failure while the pause state is unchanged must not be silent.
+    /// The changed arm propagates the same failure with `?`; the unchanged arm
+    /// used to discard it with `let _ =`. A discarded failure would leave the
+    /// DB `reachable` column (what the API serves, ADR-0014 §9) disagreeing
+    /// with the in-memory pause gate and nothing would log it.
+    #[test]
+    fn unchanged_state_reachability_write_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let (db, pool) = test_pool(dir.path());
+        let library_id = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+
+        // Both memory and DB say reachable, so this call takes the unchanged arm.
+        assert!(pool.is_library_reachable(library_id));
+        assert!(db.get_library(library_id).unwrap().unwrap().reachable);
+
+        // Make every write on this connection fail from here on.
+        db.with_conn(|c| {
+            c.execute_batch("PRAGMA query_only = ON")
+                .map_err(|e| format!("query_only pragma: {e}"))
+        })
+        .unwrap();
+
+        let err = pool
+            .set_library_reachability(library_id, &media.to_string_lossy(), true)
+            .unwrap_err();
+        assert!(
+            err.contains("reachable"),
+            "the error must name the failed write, got: {err}"
+        );
+        // The failed write must not have half-applied: neither side moved, and
+        // the caller now holds the error instead of the write being dropped.
+        assert!(pool.is_library_reachable(library_id));
+        assert!(db.get_library(library_id).unwrap().unwrap().reachable);
     }
 
     /// `purge_queue_for_library` discards queued probes and decrements for
