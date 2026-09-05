@@ -66,6 +66,12 @@ async fn main() {
         ),
     }
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
+    // Plan 2026-09-05 decision 1: a SIGTERM/SIGINT handler reaps every
+    // encoder before exit. Reach: a clean exit — restart, `docker stop`,
+    // ctrl-c. It cannot cover `SIGKILL` or power loss; nothing in-process
+    // can. Without it a restart reparents every live child to init and the
+    // next startup sweep deletes the directory it is still writing into.
+    hls.reap_all_encoders_on_exit_signal();
     let pool = nightjar_scanner::LibraryPool::spawn(
         std::sync::Arc::clone(&db),
         std::sync::Arc::clone(&subs),
