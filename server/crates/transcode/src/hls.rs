@@ -6052,6 +6052,74 @@ mod tests {
         wait_for_state(pid, ChildState::Gone);
     }
 
+    /// The seek-supersede reap driven by the throttle loop's real tick, not
+    /// by a hand call to [`reap_superseded`].
+    ///
+    /// Every other death assertion in this file calls the free helper
+    /// directly on a hand-built session. In production the reap happens on
+    /// the throttle worker: [`HlsSessionRegistry::throttle_loop`] walks every
+    /// session's rungs each [`THROTTLE_TICK`] and calls [`reap_superseded`]
+    /// there. A registry spawns that loop at construction, so this test
+    /// inserts a superseded encoder whose delay has elapsed and waits for the
+    /// loop — not the test — to end it.
+    #[cfg(unix)]
+    #[test]
+    fn throttle_tick_reaps_a_superseded_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // What a seek leaves behind: the prior encoder set aside by
+        // `supersede_child`, left running until its delay is up.
+        let mut session = make_test_session(&session_dir);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 7;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        let pid = session
+            .encoder_state(SINGLE_VIDEO_RUNG)
+            .child
+            .as_ref()
+            .expect("stand-in encoder is set")
+            .id();
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
+        assert_eq!(
+            child_state(pid),
+            ChildState::Running,
+            "superseding sets the encoder aside, it does not kill it"
+        );
+        assert_eq!(
+            session.encoder_state(SINGLE_VIDEO_RUNG).superseded.len(),
+            1,
+            "the seek left exactly one held encoder"
+        );
+
+        // The seek is long over; only the delay kept the encoder alive. Put
+        // the session in the registry and let the throttle tick reap it.
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded[0].reap_at =
+            Instant::now() - Duration::from_millis(1);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        // wait_for_state polls up to five seconds; the loop ticks every 250
+        // ms, so the reap lands within a tick or two of the delay elapsing.
+        wait_for_state(pid, ChildState::Gone);
+
+        let sessions = reg.sessions.lock().unwrap();
+        assert!(
+            sessions
+                .get("s1")
+                .expect("the reaped session is still in the registry")
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty(),
+            "the tick's reap clears the superseded set, it does not only kill \
+             the process"
+        );
+    }
+
     /// The run a superseded encoder is still writing into is not evictable.
     ///
     /// Eviction excluded only `current_run_id`, which was safe while a seek
@@ -8158,6 +8226,115 @@ mod tests {
 
         assert!(reg.stop(&prior));
         assert!(reg.stop(&switched));
+    }
+
+    /// Case 4 of Gate 2 C5 — the audio-switch overlap, asserted on the
+    /// processes.
+    ///
+    /// ADR-0012 makes a track switch a new session, so for a moment the prior
+    /// session and the switched one exist together, each holding an encoder,
+    /// until the client's DELETE reaches the prior. Nothing pinned that
+    /// overlap: `switch_session_serves_first_requested_segment` starts both
+    /// sessions but asserts only which segments serve. Admission counts
+    /// encoders, so an overlap that never ends is a capacity bug, and a
+    /// switch that dropped the prior encoder before cutover would strand the
+    /// viewer still on the prior session. Both encoders must be live at once,
+    /// and stopping the prior one must leave the switched one running.
+    #[cfg(unix)]
+    #[test]
+    fn audio_switch_overlap_holds_both_encoders_until_the_prior_stops() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 120);
+        let duration_ms = 120_000;
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+
+        // The prior session is already live when the switch POST arrives. Its
+        // encoder is a stand-in: the process half is what this test pins, and
+        // `switch_session_serves_first_requested_segment` already covers that
+        // a real prior session serves segments.
+        let prior_dir = dir.path().join("hls").join("prior");
+        fs::create_dir_all(&prior_dir).unwrap();
+        let prior_encoder = spawn_stand_in_encoder();
+        let prior_pid = prior_encoder.id();
+        let mut prior = make_test_session(&prior_dir);
+        prior.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(prior_encoder);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("prior".to_string(), prior);
+        assert_eq!(
+            child_state(prior_pid),
+            ChildState::Running,
+            "the prior session holds a live encoder before the switch"
+        );
+
+        // The audio switch: a fresh session on the same item with a different
+        // audio selection. The prior session's encoder must survive this
+        // call; the client tears the prior session down after cutover.
+        let switched = reg
+            .start(
+                1,
+                &src,
+                40_000,
+                duration_ms,
+                SessionMode::Transcode,
+                AudioSelection {
+                    stream_index: Some(0),
+                    channels: 2,
+                    channel_layout: Some("stereo".into()),
+                    max_channels: 2,
+                },
+                vec![],
+                None,
+                None,
+                VideoEncodePlan::default(),
+                None,
+            )
+            .unwrap();
+        let switched_pid = {
+            let sessions = reg.sessions.lock().unwrap();
+            sessions
+                .get(&switched)
+                .expect("switched session is in the registry")
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .child
+                .as_ref()
+                .expect("switched session holds an encoder")
+                .id()
+        };
+
+        // The overlap: both encoders live at the same time. A switch that
+        // dropped the prior encoder would fail here naming its pid.
+        assert_eq!(
+            child_state(prior_pid),
+            ChildState::Running,
+            "starting the switched session must not drop the prior encoder"
+        );
+        assert_eq!(
+            child_state(switched_pid),
+            ChildState::Running,
+            "the switched session's encoder is live during the overlap"
+        );
+
+        // Cutover: the client tears the prior session down. The switched one
+        // must be unaffected — an over-broad teardown would strand the viewer
+        // who already switched.
+        assert!(reg.stop("prior"), "the DELETE names the prior session");
+        wait_for_state(prior_pid, ChildState::Gone);
+        assert_eq!(
+            child_state(switched_pid),
+            ChildState::Running,
+            "stopping the prior session leaves the switched one running"
+        );
+
+        assert!(reg.stop(&switched));
+        wait_for_state(switched_pid, ChildState::Gone);
     }
 
     /// Fresh mid-title session: encode-at-land cooks near play first.
