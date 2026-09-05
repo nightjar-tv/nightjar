@@ -159,6 +159,85 @@ fn encode_lead_segments() -> u64 {
         .unwrap_or(ENCODE_LEAD_SEGMENTS)
 }
 
+/// One step of ADR-0051 decision 2's ladder: a height ceiling and a target
+/// video bitrate.
+///
+/// Height is a ceiling, never a target: `transcode_video_filter_chain` emits
+/// `scale=-2:'min(H,ih)'`, so the server shrinks a taller source and never
+/// upscales a shorter one. The rungs are therefore distinguished by bitrate,
+/// and only by bitrate, when the source is under every ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdrRung {
+    /// Cap output height. `None` = keep source.
+    max_height: Option<u32>,
+    /// Target video bitrate. `None` = encoder default.
+    max_bitrate_bps: Option<u64>,
+}
+
+/// ADR-0051 decision 2's three rungs, top rung first.
+///
+/// These figures are the ADR's — 1080p at 6M, 1080p at 3M, 720p at 2M — not a
+/// measurement of this or any particular hardware (Rule 4.14). Do not retune
+/// them here against a local encode; that is a decision for the ADR.
+const ADR_0051_LADDER: [AdrRung; 3] = [
+    AdrRung {
+        max_height: Some(1080),
+        max_bitrate_bps: Some(6_000_000),
+    },
+    AdrRung {
+        max_height: Some(1080),
+        max_bitrate_bps: Some(3_000_000),
+    },
+    AdrRung {
+        max_height: Some(720),
+        max_bitrate_bps: Some(2_000_000),
+    },
+];
+
+/// The ladder rung a `VideoRung` serves.
+///
+/// Only `SingleVideo` is offered today, and it serves the ladder's top rung.
+/// The second rung exists only under test until a later slice switches one on;
+/// it binds the ladder's middle rung so two-rung sessions spawn distinct
+/// per-rung plans.
+fn adr_rung_for(rung: VideoRung) -> AdrRung {
+    match rung {
+        VideoRung::SingleVideo => ADR_0051_LADDER[0],
+        #[cfg(test)]
+        VideoRung::SecondVideo => ADR_0051_LADDER[1],
+    }
+}
+
+/// Per-rung encode plan: the session's client-shaped plan composed with the
+/// rung's ADR figures by taking the tighter of the two ceilings. A client
+/// ceiling wins where it is lower than the rung's figure; `None` — no ceiling
+/// — leaves the rung's figure. `tone_map` and the source frame rate are
+/// source properties and pass through unchanged.
+fn rung_encode_plan(rung: VideoRung, session_plan: VideoEncodePlan) -> VideoEncodePlan {
+    compose_rung_encode_plan(adr_rung_for(rung), session_plan)
+}
+
+/// Compose a session plan with one ladder rung's figures.
+fn compose_rung_encode_plan(rung: AdrRung, session_plan: VideoEncodePlan) -> VideoEncodePlan {
+    VideoEncodePlan {
+        max_height: tighter_ceiling(session_plan.max_height, rung.max_height),
+        max_bitrate_bps: tighter_ceiling(session_plan.max_bitrate_bps, rung.max_bitrate_bps),
+        tone_map: session_plan.tone_map,
+        source_frame_rate: session_plan.source_frame_rate,
+    }
+}
+
+/// The tighter of two optional ceilings: the smaller set value when both are
+/// set, and the set value when one is `None` (`None` = no ceiling).
+fn tighter_ceiling<T: Ord + Copy>(session_plan: Option<T>, rung: Option<T>) -> Option<T> {
+    match (session_plan, rung) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 /// Sum of bytes under every rung directory in a session cache directory.
 fn session_disk_bytes(session: &Session) -> u64 {
     let mut total = 0u64;
@@ -1586,6 +1665,9 @@ impl HlsSessionRegistry {
         write_run_encode_start(&run_dir, start_ms).map_err(StartSessionError::Spawn)?;
         let burn_in =
             prepare_ass_burn_file(src, &dir, burn_in).map_err(StartSessionError::Spawn)?;
+        // The argv is per rung: compose the session's client-shaped plan with
+        // the rung's ADR figures before spawn (ADR-0051 decision 2).
+        let rung_plan = rung_encode_plan(SINGLE_VIDEO_RUNG, encode_plan);
         let child = spawn_ffmpeg(
             &plan,
             &run_dir,
@@ -1593,7 +1675,7 @@ impl HlsSessionRegistry {
             audio.clone(),
             &self.encode_leg,
             burn_in.as_ref(),
-            encode_plan,
+            rung_plan,
             piggyback.is_some(),
         )
         .map_err(StartSessionError::Spawn)?;
@@ -1615,9 +1697,9 @@ impl HlsSessionRegistry {
             burn_in = burn_in.as_ref().map(|b| b.track_id.as_str()),
             encoder = %self.encode_leg.encoder,
             device = ?self.encode_leg.device,
-            max_height = encode_plan.max_height,
-            max_bitrate_bps = encode_plan.max_bitrate_bps,
-            tone_map = encode_plan.tone_map,
+            max_height = rung_plan.max_height,
+            max_bitrate_bps = rung_plan.max_bitrate_bps,
+            tone_map = rung_plan.tone_map,
             spawn_ms,
             start_path = plan.start_path,
             container_kind = plan.container_kind,
@@ -2946,7 +3028,7 @@ fn restart_at(
         session.audio.clone(),
         &session.encode_leg,
         session.burn_in.as_ref(),
-        session.encode_plan,
+        rung_encode_plan(rung, session.encode_plan),
         session.piggyback.is_some(),
     )
     .map_err(PlaylistError::Failed)?;
@@ -7129,6 +7211,122 @@ mod tests {
             let err = result.expect_err("no zscale");
             assert!(err.contains("libzimg"), "{err}");
         }
+    }
+
+    /// The low rung is 720p at 2M, and the two 1080p rungs share a height
+    /// ceiling and differ by bitrate (ADR-0051 decision 2). The figures are
+    /// the ADR's, so this pins the table to the ADR rather than to a local
+    /// measurement (Rule 4.14).
+    #[test]
+    fn the_ladder_table_holds_the_adr_0051_rungs() {
+        let low = ADR_0051_LADDER
+            .iter()
+            .find(|r| r.max_height == Some(720))
+            .expect("the 720p rung is in the table");
+        assert_eq!(low.max_height, Some(720));
+        assert_eq!(low.max_bitrate_bps, Some(2_000_000));
+
+        let eights: Vec<&AdrRung> = ADR_0051_LADDER
+            .iter()
+            .filter(|r| r.max_height == Some(1080))
+            .collect();
+        assert_eq!(eights.len(), 2, "two rungs share the 1080p ceiling");
+        assert_eq!(
+            eights[0].max_height, eights[1].max_height,
+            "the two 1080p rungs share a height ceiling"
+        );
+        assert_ne!(
+            eights[0].max_bitrate_bps, eights[1].max_bitrate_bps,
+            "the two 1080p rungs differ by bitrate, not by height"
+        );
+        assert_eq!(
+            ADR_0051_LADDER.len(),
+            3,
+            "ADR-0051 decision 2 names three rungs"
+        );
+    }
+
+    /// A session plan ceiling below the rung's figure wins (tighter of the
+    /// two): `max_height: Some(480)` beats the 1080p rung's 1080.
+    #[test]
+    fn a_session_plan_max_height_of_480_beats_the_rungs_1080() {
+        let rung = ADR_0051_LADDER[0]; // 1080p @ 6M
+        let session_plan = VideoEncodePlan {
+            max_height: Some(480),
+            ..VideoEncodePlan::default()
+        };
+        let plan = compose_rung_encode_plan(rung, session_plan);
+        assert_eq!(
+            plan.max_height,
+            Some(480),
+            "a client ceiling below the rung's figure must win"
+        );
+    }
+
+    /// `None` on the session plan leaves the rung's figure: the rung's value
+    /// is what distinguishes the ladder when no profile sets a ceiling.
+    #[test]
+    fn none_on_the_session_plan_leaves_the_rungs_figure() {
+        let rung = ADR_0051_LADDER[2]; // 720p @ 2M
+        let plan = compose_rung_encode_plan(rung, VideoEncodePlan::default());
+        assert_eq!(plan.max_height, Some(720));
+        assert_eq!(plan.max_bitrate_bps, Some(2_000_000));
+    }
+
+    /// The two 1080p rungs compose to the same height ceiling and different
+    /// bitrates, so the bitrate is what a client hops on (ADR-0051 decision 2).
+    #[test]
+    fn the_two_1080p_rungs_compose_to_bitrate_only_difference() {
+        let eights: Vec<&AdrRung> = ADR_0051_LADDER
+            .iter()
+            .filter(|r| r.max_height == Some(1080))
+            .collect();
+        let plans: Vec<VideoEncodePlan> = eights
+            .iter()
+            .map(|r| compose_rung_encode_plan(**r, VideoEncodePlan::default()))
+            .collect();
+        assert_eq!(
+            plans[0].max_height, plans[1].max_height,
+            "both 1080p rungs compose to the same height ceiling"
+        );
+        assert_ne!(
+            plans[0].max_bitrate_bps, plans[1].max_bitrate_bps,
+            "the composed 1080p rungs must differ in bitrate: got {:?} and {:?}",
+            plans[0].max_bitrate_bps, plans[1].max_bitrate_bps
+        );
+    }
+
+    /// `tone_map` and the source frame rate are source properties: they pass
+    /// through the rung composition unchanged, so per-rung argv never drifts
+    /// the IDR grid (ADR-0052) or drops a tonemap (ADR-0022).
+    #[test]
+    fn tone_map_and_source_frame_rate_pass_through_unchanged() {
+        let rung = ADR_0051_LADDER[0]; // 1080p @ 6M
+        let session_plan = VideoEncodePlan {
+            max_height: Some(480),
+            max_bitrate_bps: Some(2_500_000),
+            tone_map: true,
+            source_frame_rate: Some((25, 1)),
+        };
+        let plan = compose_rung_encode_plan(rung, session_plan);
+        assert_eq!(plan.max_height, Some(480));
+        assert_eq!(plan.max_bitrate_bps, Some(2_500_000));
+        assert!(plan.tone_map, "tone_map must pass through unchanged");
+        assert_eq!(plan.source_frame_rate, Some((25, 1)));
+    }
+
+    /// The single live rung serves the ladder's top rung through the same
+    /// composition the call sites use, so a session plan's tighter ceiling
+    /// still wins on the live path.
+    #[test]
+    fn the_live_rung_composes_with_the_session_plan() {
+        let session_plan = VideoEncodePlan {
+            max_height: Some(480),
+            ..VideoEncodePlan::default()
+        };
+        let plan = rung_encode_plan(VideoRung::SingleVideo, session_plan);
+        assert_eq!(plan.max_height, Some(480));
+        assert_eq!(plan.max_bitrate_bps, Some(6_000_000));
     }
 
     /// Proves tonemap changed pixels vs retag — not beauty.
