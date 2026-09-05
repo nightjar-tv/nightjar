@@ -921,6 +921,12 @@ fn run_listing(session: &Session, rung: VideoRung) -> RunListing {
 
 fn build_run_media_playlist(session_id: &str, session: &Session, rung: VideoRung) -> Vec<u8> {
     // Path-absolute URIs (ADR-0008): run-dir depth cannot break resolution.
+    //
+    // **The init URI stays flat and rung-less here on purpose.** Naming the
+    // init by run id leaves no room for the rung, and the rung-scoped init
+    // route versus session-global run ids is slice 3's decision — this slice
+    // deliberately does not settle it (plan 2026-09-05-the-ladder-s8, answer
+    // A). It is deferred rather than missed.
     let init_uri = format!(
         "/api/v0/sessions/{session_id}/runs/{}/init.mp4",
         session.encoder_state(rung).current_run_id
@@ -931,18 +937,25 @@ fn build_run_media_playlist(session_id: &str, session: &Session, rung: VideoRung
         &init_uri,
         listing.start_offset_ms,
     );
-    with_session_absolute_segment_uris(session_id, &bytes)
+    with_session_absolute_segment_uris(session_id, rung, &bytes)
 }
 
-/// Rewrite bare `seg_<ms>.m4s` lines to path-absolute session asset URLs.
-/// Relative `../` climbs were the cutover failure class under `/runs/{n}/`.
-fn with_session_absolute_segment_uris(session_id: &str, playlist: &[u8]) -> Vec<u8> {
+/// Rewrite bare `seg_<ms>.m4s` lines to path-absolute, rung-scoped asset URLs.
+/// Relative `../` climbs were the cutover failure class under `/runs/{n}/`, and
+/// the flat session-root form could not tell one rung's segments from another's
+/// (ADR-0051 amendment 1).
+fn with_session_absolute_segment_uris(
+    session_id: &str,
+    rung: VideoRung,
+    playlist: &[u8],
+) -> Vec<u8> {
     let text = String::from_utf8_lossy(playlist);
     let mut out = String::with_capacity(text.len() + 64);
     for line in text.lines() {
         if let Some(ms) = crate::hls_segment_map::parse_time_keyed_segment_name(line) {
             out.push_str(&format!(
-                "/api/v0/sessions/{session_id}/{}",
+                "/api/v0/sessions/{session_id}/v/{}/{}",
+                rung.as_str(),
                 crate::hls_segment_map::time_keyed_segment_name(ms)
             ));
             out.push('\n');
@@ -1686,11 +1699,29 @@ impl HlsSessionRegistry {
         })
     }
 
-    /// Returns the session's media playlist (ADR-0020, ADR-0054 decision 5).
-    /// `start_ms` on this path is ignored for seek — use [`Self::seek`].
+    /// Returns the session's media playlist for the single production rung
+    /// (ADR-0020, ADR-0054 decision 5). `start_ms` on this path is ignored for
+    /// seek — use [`Self::seek`].
+    ///
+    /// The flat `/index.m3u8` route keeps resolving to this so a client that
+    /// attached before the master advertised the rung namespace keeps playing.
     pub fn playlist(&self, session_id: &str) -> Result<Vec<u8>, PlaylistError> {
-        self.with_ready_session(session_id, |session| {
-            let bytes = build_run_media_playlist(session_id, session, SINGLE_VIDEO_RUNG);
+        self.rung_playlist(session_id, SINGLE_VIDEO_RUNG)
+    }
+
+    /// Returns the media playlist for one named rung (ADR-0051 amendment 1).
+    ///
+    /// The playlist is assembled from the rung's own segment map, and its
+    /// segment URIs live in the rung's namespace. The flat
+    /// [`Self::playlist`] and `/v/single/index.m3u8` are therefore the same
+    /// bytes for the single production rung.
+    pub fn rung_playlist(
+        &self,
+        session_id: &str,
+        rung: VideoRung,
+    ) -> Result<Vec<u8>, PlaylistError> {
+        self.with_ready_session(session_id, rung, |session| {
+            let bytes = build_run_media_playlist(session_id, session, rung);
             log_playlist_serve(
                 session_id,
                 "index.m3u8",
@@ -1704,9 +1735,10 @@ impl HlsSessionRegistry {
     }
 
     /// Returns the session's HLS master playlist. Media and subtitle URIs are
-    /// path-absolute under `/api/v0/sessions/…` (ADR-0008).
+    /// path-absolute under `/api/v0/sessions/…` (ADR-0008); the media URI is
+    /// rung-scoped under `v/{rung}/` (ADR-0051 amendment 1).
     pub fn master(&self, session_id: &str) -> Result<Vec<u8>, PlaylistError> {
-        self.with_ready_session(session_id, |session| {
+        self.with_ready_session(session_id, SINGLE_VIDEO_RUNG, |session| {
             let bytes = crate::hls_master::build_master(session_id, &session.subtitle_tracks);
             log_playlist_serve(
                 session_id,
@@ -1895,7 +1927,14 @@ impl HlsSessionRegistry {
     ///
     /// What gates readiness is [`current_run_has_mapped_segment`], below, which
     /// is unaffected: a fetch before the new run produces still gets `NotReady`.
-    fn with_ready_session<F>(&self, session_id: &str, build: F) -> Result<Vec<u8>, PlaylistError>
+    /// Readiness is per rung: a rung-scoped request waits on that rung's map,
+    /// and the master and flat routes pass [`SINGLE_VIDEO_RUNG`].
+    fn with_ready_session<F>(
+        &self,
+        session_id: &str,
+        rung: VideoRung,
+        build: F,
+    ) -> Result<Vec<u8>, PlaylistError>
     where
         F: FnOnce(&Session) -> Result<Vec<u8>, PlaylistError>,
     {
@@ -1916,8 +1955,8 @@ impl HlsSessionRegistry {
             return Err(PlaylistError::Failed(err));
         }
 
-        sync_segment_map(session, SINGLE_VIDEO_RUNG);
-        if !current_run_has_mapped_segment(session, SINGLE_VIDEO_RUNG) {
+        sync_segment_map(session, rung);
+        if !current_run_has_mapped_segment(session, rung) {
             // Producer EOF with nothing in-window (damaged mid-title land):
             // serve empty ENDLIST playlists so the client can read
             // usableExtentMs instead of hanging on master 503.
@@ -1931,28 +1970,46 @@ impl HlsSessionRegistry {
         build(session)
     }
 
-    /// Serves init/segment files. Retained segments from a previous encode
-    /// window stay readable. Missing segments in a cold region of the
-    /// full-title VOD return 503 while a guarded restart cooks them
-    /// (ADR-0011 amendment). Safari native scrub often hits this path only.
+    /// Serves init/segment files for the single production rung. Retained
+    /// segments from a previous encode window stay readable. Missing segments
+    /// in a cold region of the full-title VOD return 503 while a guarded
+    /// restart cooks them (ADR-0011 amendment). Safari native scrub often hits
+    /// this path only.
     ///
-    /// Logs terminal outcomes here (not only in the HTTP route after
-    /// `.await`) so a client-aborted long-poll that still finishes cooking
-    /// is visible as `hls asset ready` without a matching route 200.
-    ///
-    /// `fetcher` is log-only (optional `njFetcher` query): JS land-ensure /
-    /// attach-wait probes set it; Safari's native HLS engine does not. Used
-    /// to tell probe traffic from WebKit's own segment GETs in dogfood logs.
-    /// (Native instant-503 while cooking was tried and rejected: broke
-    /// fill-forward prefetch and double-scrub dig-back.)
+    /// The flat `/{asset}` route keeps resolving to this so a client that
+    /// attached before the master advertised the rung namespace keeps playing.
     pub fn asset(
         &self,
         session_id: &str,
         name: &str,
         fetcher: Option<&str>,
     ) -> Result<Vec<u8>, PlaylistError> {
+        self.rung_asset(session_id, SINGLE_VIDEO_RUNG, name, fetcher)
+    }
+
+    /// Serves init/segment files for one named rung (ADR-0051 amendment 1).
+    /// The segment map consulted is the rung's own: two rungs produce segments
+    /// at the same title time, and only the rung's map can say which run's file
+    /// that is.
+    ///
+    /// Logs terminal outcomes here (not only in the HTTP route after `.await`)
+    /// so a client-aborted long-poll that still finishes cooking is visible as
+    /// `hls asset ready` without a matching route 200.
+    ///
+    /// `fetcher` is log-only (optional `njFetcher` query): JS land-ensure /
+    /// attach-wait probes set it; Safari's native HLS engine does not. Used to
+    /// tell probe traffic from WebKit's own segment GETs in dogfood logs.
+    /// (Native instant-503 while cooking was tried and rejected: broke
+    /// fill-forward prefetch and double-scrub dig-back.)
+    pub fn rung_asset(
+        &self,
+        session_id: &str,
+        rung: VideoRung,
+        name: &str,
+        fetcher: Option<&str>,
+    ) -> Result<Vec<u8>, PlaylistError> {
         let t0 = Instant::now();
-        let result = self.asset_wait(session_id, name);
+        let result = self.asset_wait(session_id, rung, name);
         // Always log not-ready/fail. Log ready only when we waited (long-poll /
         // cook) so aborted holds show up even if the HTTP route never runs;
         // skip hot-path disk hits (route 200 is enough).
@@ -2009,7 +2066,12 @@ impl HlsSessionRegistry {
         result
     }
 
-    fn asset_wait(&self, session_id: &str, name: &str) -> Result<Vec<u8>, PlaylistError> {
+    fn asset_wait(
+        &self,
+        session_id: &str,
+        rung: VideoRung,
+        name: &str,
+    ) -> Result<Vec<u8>, PlaylistError> {
         if !is_safe_asset(name) {
             return Err(PlaylistError::NotFound);
         }
@@ -2130,9 +2192,9 @@ impl HlsSessionRegistry {
                 }
 
                 let resolved = if file_name == "init.mp4" {
-                    fs::read(run_dir(session, SINGLE_VIDEO_RUNG).join("init.mp4")).ok()
+                    fs::read(run_dir(session, rung).join("init.mp4")).ok()
                 } else if let Some(ms) = requested_ms {
-                    sync_segment_map(session, SINGLE_VIDEO_RUNG);
+                    sync_segment_map(session, rung);
                     // The gate is what keeps this honest. Outside the
                     // REAP_AFTER window after a seek the held set is empty and
                     // this costs one `is_empty()`; inside it, one file read per
@@ -2140,15 +2202,11 @@ impl HlsSessionRegistry {
                     // The throttle tick would do the same work every 250 ms
                     // whether or not anyone is waiting, and would hand the
                     // waiter its bytes up to a tick late.
-                    if !session
-                        .encoder_state(SINGLE_VIDEO_RUNG)
-                        .superseded
-                        .is_empty()
-                    {
-                        sync_superseded_run_indexes(session, SINGLE_VIDEO_RUNG);
+                    if !session.encoder_state(rung).superseded.is_empty() {
+                        sync_superseded_run_indexes(session, rung);
                     }
                     match session
-                        .segment_map(SINGLE_VIDEO_RUNG)
+                        .segment_map(rung)
                         .get(ms)
                         .map(|seg| seg.rel_path.clone())
                     {
@@ -2159,7 +2217,7 @@ impl HlsSessionRegistry {
                                 Err(_) => {
                                     // Map entry without bytes — drop this key
                                     // so we never keep advertising a dead URI.
-                                    session.segment_map_mut(SINGLE_VIDEO_RUNG).remove_start(ms);
+                                    session.segment_map_mut(rung).remove_start(ms);
                                     None
                                 }
                             }
@@ -2197,10 +2255,7 @@ impl HlsSessionRegistry {
                 } else if let Some(want_ms) = requested_ms {
                     let window_start = session.start_ms;
                     let play_start = session.play_start_ms;
-                    let latest = latest_segment_in_window(
-                        session.segment_map(SINGLE_VIDEO_RUNG),
-                        window_start,
-                    );
+                    let latest = latest_segment_in_window(session.segment_map(rung), window_start);
                     let since = session.last_restart.elapsed();
 
                     if holding_no_fill
@@ -2331,7 +2386,7 @@ impl HlsSessionRegistry {
                                         &mut holding_for_land,
                                         &mut deadline,
                                     );
-                                } else if session.encoder_state(SINGLE_VIDEO_RUNG).child.is_none() {
+                                } else if session.encoder_state(rung).child.is_none() {
                                     return Err(miss_refusal(accepted_hold));
                                 } else if want_ms < window_start
                                     && !want_is_listed(session, want_ms)
@@ -4918,6 +4973,121 @@ mod tests {
         );
     }
 
+    /// Seed one segment at the same title time into each rung's map and run
+    /// directory of a two-rung session. Both rungs write `seg_00000042000.m4s`;
+    /// only the requested rung's map can say which run's file that is
+    /// (ADR-0051 amendment 2).
+    fn seed_equal_start_segment(session_dir: &Path, session: &mut Session, start_ms: u64) {
+        for (rung, bytes) in [
+            (VideoRung::SingleVideo, b"rung-one-bytes".as_slice()),
+            (VideoRung::SecondVideo, b"rung-two-bytes".as_slice()),
+        ] {
+            let name = crate::hls_segment_map::time_keyed_segment_name(start_ms);
+            let run0 = session_dir.join(crate::hls_segment_map::run_rel_dir(rung, 0));
+            fs::create_dir_all(&run0).unwrap();
+            fs::write(run0.join(&name), bytes).unwrap();
+            session
+                .segment_map_mut(rung)
+                .insert(crate::hls_segment_map::MappedSegment {
+                    start_ms,
+                    duration_ms: SEGMENT_MS,
+                    run_id: 0,
+                    rel_path: crate::hls_segment_map::run_rel_dir(rung, 0).join(name),
+                });
+        }
+    }
+
+    /// A rung-scoped segment request resolves against that rung's map, not
+    /// rung one's.
+    ///
+    /// Both rungs hold a segment at the same title time with different bytes
+    /// (the ADR-0051 amendment 2 shape). A `rung_asset` that ignores its rung
+    /// and reads rung one's map serves rung one's bytes for a rung-two
+    /// request.
+    #[test]
+    fn a_rung_scoped_segment_request_resolves_that_rungs_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        let mut session = make_two_rung_test_session(&session_dir);
+        seed_equal_start_segment(&session_dir, &mut session, 42_000);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        let name = crate::hls_segment_map::time_keyed_segment_name(42_000);
+        let single = reg
+            .rung_asset("s1", VideoRung::SingleVideo, &name, None)
+            .expect("rung one's segment bytes");
+        assert_eq!(single, b"rung-one-bytes");
+        let second = reg
+            .rung_asset("s1", VideoRung::SecondVideo, &name, None)
+            .expect("rung two's segment bytes");
+        assert_eq!(
+            second, b"rung-two-bytes",
+            "the same title time on two rungs is two files; the rung must pick \
+             the file"
+        );
+
+        // The flat form is rung one under another name: the old URLs stay
+        // valid and resolve to the single rung.
+        let flat = reg.asset("s1", &name, None).expect("flat segment bytes");
+        assert_eq!(flat, b"rung-one-bytes");
+    }
+
+    /// The media playlist for a named rung lists that rung's segments in that
+    /// rung's URI namespace.
+    ///
+    /// Collapse the rung in `rung_playlist` and the rung-two playlist names
+    /// rung-one URIs.
+    #[test]
+    fn a_rung_scoped_media_playlist_lists_that_rungs_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        let mut session = make_two_rung_test_session(&session_dir);
+        seed_equal_start_segment(&session_dir, &mut session, 42_000);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        let single_text =
+            String::from_utf8(reg.rung_playlist("s1", VideoRung::SingleVideo).unwrap()).unwrap();
+        assert!(
+            single_text.contains("/api/v0/sessions/s1/v/single/seg_00000042000.m4s"),
+            "{single_text}"
+        );
+        assert!(
+            !single_text.contains("/v/second/"),
+            "rung one's playlist must not name rung two's namespace: {single_text}"
+        );
+
+        let second_text =
+            String::from_utf8(reg.rung_playlist("s1", VideoRung::SecondVideo).unwrap()).unwrap();
+        assert!(
+            second_text.contains("/api/v0/sessions/s1/v/second/seg_00000042000.m4s"),
+            "{second_text}"
+        );
+        assert!(
+            !second_text.contains("/v/single/"),
+            "rung two's playlist must not name rung one's namespace: {second_text}"
+        );
+
+        // The flat route and the single rung's route serve the same bytes, so
+        // a client holding either URL keeps playing through the same map.
+        assert_eq!(
+            reg.playlist("s1").unwrap(),
+            reg.rung_playlist("s1", VideoRung::SingleVideo).unwrap(),
+            "the flat /index.m3u8 form resolves to the single rung"
+        );
+    }
+
     /// What a stand-in encoder is actually doing.
     ///
     /// `Running` and `Stopped` have to be separable. `kill(pid, 0)` succeeds
@@ -6441,11 +6611,11 @@ mod tests {
         let text = String::from_utf8_lossy(&pl);
 
         assert!(
-            text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"),
+            text.contains("/api/v0/sessions/s1/v/single/seg_00000000000.m4s"),
             "a run landed at 400 s still lists the title from 0: {text}"
         );
         assert!(
-            text.contains("/api/v0/sessions/s1/seg_00001354000.m4s"),
+            text.contains("/api/v0/sessions/s1/v/single/seg_00001354000.m4s"),
             "and lists to the usable extent"
         );
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
@@ -6497,7 +6667,7 @@ mod tests {
         let text =
             String::from_utf8_lossy(&build_run_media_playlist("s1", &session, SINGLE_VIDEO_RUNG))
                 .to_string();
-        assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
+        assert!(text.contains("/api/v0/sessions/s1/v/single/seg_00000000000.m4s"));
         assert!(text.contains("#EXT-X-START:TIME-OFFSET=600.000,PRECISE=YES"));
     }
 
@@ -6747,8 +6917,8 @@ mod tests {
         let text = String::from_utf8_lossy(&pl);
         assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(!text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
-        assert!(text.contains("/api/v0/sessions/s1/seg_00000000000.m4s"));
-        assert!(text.contains("/api/v0/sessions/s1/seg_00000024000.m4s"));
+        assert!(text.contains("/api/v0/sessions/s1/v/single/seg_00000000000.m4s"));
+        assert!(text.contains("/api/v0/sessions/s1/v/single/seg_00000024000.m4s"));
     }
 
     /// Without a keyframe map, copy's cut points are not knowable ahead of
@@ -9475,9 +9645,12 @@ mod tests {
     }
 
     /// Segment URIs in the media playlist are path-absolute under the session
-    /// root so run-directory depth cannot break resolution (ADR-0008).
+    /// and rung-scoped under `v/{rung}/`, so run-directory depth cannot break
+    /// resolution and one rung's segments cannot be mistaken for another's
+    /// (ADR-0008, ADR-0051 amendment 1). `EXT-X-MAP` stays on the flat
+    /// run-scoped form: the rung-scoped init route is slice 3's decision.
     #[test]
-    fn media_playlist_segment_uris_are_session_absolute() {
+    fn media_playlist_segment_uris_are_rung_scoped_and_absolute() {
         let dir = tempfile::tempdir().unwrap();
         let run0 = run_path(dir.path(), SINGLE_VIDEO_RUNG, 0);
         fs::create_dir_all(&run0).unwrap();
@@ -9532,8 +9705,8 @@ mod tests {
             .find(|l| l.contains("seg_"))
             .expect("listed segment URI");
         assert_eq!(
-            uri, "/api/v0/sessions/s1/seg_00000000021.m4s",
-            "must be path-absolute under the session"
+            uri, "/api/v0/sessions/s1/v/single/seg_00000000021.m4s",
+            "must be path-absolute under the session and carry the rung"
         );
         assert!(
             text.contains("#EXT-X-MAP:URI=\"/api/v0/sessions/s1/runs/0/init.mp4\""),
@@ -9550,8 +9723,8 @@ mod tests {
     /// **Rewritten 2026-08-31 with ADR-0054 decision 5.** This read: *"the
     /// mistaken `master points at session-root index` hypothesis — master is
     /// per-run, so bare `index.m3u8` is correct"*. The premise was true and is
-    /// not any more. The master is the session's, and the session-root index is
-    /// exactly what it points at.
+    /// not any more. The master is the session's, and it points at the single
+    /// rung's media playlist under `v/single/` (ADR-0051 amendment 1).
     ///
     /// The walk now runs twice, either side of a seek, and asserts the two
     /// things decision 5 turns on: the URI does not change, and the
@@ -9641,6 +9814,10 @@ mod tests {
     /// `run_id` is what the *session* says the current run is, not something the
     /// URL carries. The walk asserts the map still reaches that run's init after
     /// the playlists stopped naming it (ADR-0054 decision 5).
+    ///
+    /// The media hop now crosses into the rung namespace: the master advertises
+    /// `/v/single/index.m3u8` (ADR-0051 amendment 1), and the segment hop lands
+    /// on `/v/single/seg_*` the same way.
     fn walk_run_playlist_chain(
         reg: &HlsSessionRegistry,
         id: &str,
@@ -9674,8 +9851,8 @@ mod tests {
         let media_url = resolve_hls_uri(master_url, media_rel);
         assert_eq!(
             media_url,
-            format!("/api/v0/sessions/{id}/index.m3u8"),
-            "master must emit the path-absolute session-scoped media URI"
+            format!("/api/v0/sessions/{id}/v/single/index.m3u8"),
+            "master must emit the single rung's path-absolute media URI"
         );
         // Dead class, inverted 2026-08-31 by ADR-0054 decision 5. This
         // previously asserted the opposite, that a session-root index "is not on
@@ -9686,7 +9863,9 @@ mod tests {
             "the media URI is the session's, got {media_url}"
         );
 
-        let media = reg.playlist(id).expect("media playlist");
+        let media = reg
+            .rung_playlist(id, SINGLE_VIDEO_RUNG)
+            .expect("media playlist");
         let media_text = String::from_utf8_lossy(&media);
         assert!(media_text.contains("#EXTINF:"), "{media_text}");
         let map_uri = media_text
@@ -9718,11 +9897,13 @@ mod tests {
             .to_string();
         let seg_url = resolve_hls_uri(&media_url, &seg_rel);
         assert!(
-            seg_url.starts_with(&format!("/api/v0/sessions/{id}/seg_")),
-            "segment must resolve to session-root asset route, got {seg_url} from {seg_rel}"
+            seg_url.starts_with(&format!("/api/v0/sessions/{id}/v/single/seg_")),
+            "segment must resolve to the rung-scoped asset route, got {seg_url} from {seg_rel}"
         );
         let seg_name = seg_url.rsplit('/').next().expect("seg name");
-        let seg = reg.asset(id, seg_name, None).expect("segment bytes");
+        let seg = reg
+            .rung_asset(id, SINGLE_VIDEO_RUNG, seg_name, None)
+            .expect("segment bytes");
         assert!(!seg.is_empty(), "first listed segment must have bytes");
         init_url
     }

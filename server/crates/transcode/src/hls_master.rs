@@ -51,20 +51,22 @@ impl std::str::FromStr for VideoRung {
 
 /// One video rendition in the master playlist (ADR-0051).
 pub(crate) struct MasterRendition {
+    /// The rung this rendition serves. The media playlist URI is derived from
+    /// it (ADR-0051 amendment 1), so a rendition cannot advertise a URI in
+    /// one rung's namespace while claiming another (Rule 4.9).
+    pub rung: VideoRung,
     /// Advertised peak bitrate, the BANDWIDTH attribute.
     pub bandwidth: u64,
     /// `(width, height)` for RESOLUTION, or `None` to omit the attribute.
     pub resolution: Option<(u32, u32)>,
-    /// Media playlist URI, path-absolute.
-    pub uri: String,
 }
 
 impl MasterRendition {
-    fn single_video(session_id: &str) -> Self {
+    fn single_video() -> Self {
         Self {
+            rung: VideoRung::SingleVideo,
             bandwidth: 5_000_000,
             resolution: None,
-            uri: format!("/api/v0/sessions/{session_id}/index.m3u8"),
         }
     }
 }
@@ -117,10 +119,15 @@ pub(crate) fn build_master_with_renditions(
             line.push_str(",SUBTITLES=\"subs\"");
         }
         let _ = writeln!(out, "{line}");
-        // Session-scoped, like the master that carries it (ADR-0054 decision 5).
-        // The run survives in `EXT-X-MAP` inside this playlist and nowhere else on
-        // the wire.
-        let _ = writeln!(out, "{}", rendition.uri);
+        // The master is the session's (ADR-0054 decision 5), and the media
+        // playlist it points at is the rendition's rung's (ADR-0051 amendment
+        // 1). The run survives in `EXT-X-MAP` inside that playlist and nowhere
+        // else on the wire.
+        let _ = writeln!(
+            out,
+            "/api/v0/sessions/{session_id}/v/{}/index.m3u8",
+            rendition.rung.as_str()
+        );
     }
     out.into_bytes()
 }
@@ -128,7 +135,7 @@ pub(crate) fn build_master_with_renditions(
 /// Builds today's single-rendition master playlist through the generalized
 /// rendition path.
 pub(crate) fn build_master(session_id: &str, tracks: &[HlsSubtitleTrack]) -> Vec<u8> {
-    let renditions = [MasterRendition::single_video(session_id)];
+    let renditions = [MasterRendition::single_video()];
     build_master_with_renditions(session_id, tracks, &renditions)
 }
 
@@ -185,7 +192,7 @@ mod tests {
         assert!(text.contains("GROUP-ID=\"subs\""));
         assert!(text.contains("URI=\"/api/v0/sessions/s1/subs/e2.m3u8\""));
         assert!(text.contains("SUBTITLES=\"subs\""));
-        assert!(text.contains("\n/api/v0/sessions/s1/index.m3u8\n"));
+        assert!(text.contains("\n/api/v0/sessions/s1/v/single/index.m3u8\n"));
         assert!(
             text.contains("CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog\"")
         );
@@ -198,10 +205,26 @@ mod tests {
         assert!(!text.contains("EXT-X-MEDIA"));
         assert!(!text.contains("SUBTITLES="));
         assert!(!text.contains("CODECS="), "{text}");
-        assert!(text.contains("\n/api/v0/sessions/s1/index.m3u8\n"));
+        assert!(text.contains("\n/api/v0/sessions/s1/v/single/index.m3u8\n"));
     }
+
+    /// A rendition advertises the media playlist of the rung it carries
+    /// (ADR-0051 amendment 1), never a flat session URI.
     #[test]
-    fn master_playlist_renders_three_renditions_with_subtitles() {
+    fn a_rendition_advertises_its_rungs_media_playlist() {
+        let text = String::from_utf8(build_master("s1", &[])).unwrap();
+        assert!(
+            text.contains("\n/api/v0/sessions/s1/v/single/index.m3u8\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("\n/api/v0/sessions/s1/index.m3u8\n"),
+            "the flat media URI must no longer be advertised: {text}"
+        );
+    }
+
+    #[test]
+    fn master_playlist_renders_a_rendition_per_rung_with_subtitles() {
         let tracks = [HlsSubtitleTrack {
             track_id: "e2".into(),
             language: Some("en".into()),
@@ -217,19 +240,14 @@ mod tests {
         }];
         let renditions = [
             MasterRendition {
+                rung: VideoRung::SingleVideo,
                 bandwidth: 6_000_000,
                 resolution: Some((1920, 1080)),
-                uri: "/api/v0/sessions/s1/high.m3u8".into(),
             },
             MasterRendition {
-                bandwidth: 3_000_000,
-                resolution: Some((1920, 1080)),
-                uri: "/api/v0/sessions/s1/mid.m3u8".into(),
-            },
-            MasterRendition {
+                rung: VideoRung::SecondVideo,
                 bandwidth: 2_000_000,
                 resolution: Some((1280, 720)),
-                uri: "/api/v0/sessions/s1/low.m3u8".into(),
             },
         ];
         let text =
@@ -241,23 +259,51 @@ mod tests {
             .filter(|line| line.starts_with("#EXT-X-STREAM-INF:"))
             .collect();
 
-        assert_eq!(stream_lines.len(), 3);
+        assert_eq!(stream_lines.len(), 2);
         assert_eq!(
             stream_lines,
             [
                 "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,SUBTITLES=\"subs\"",
-                "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,SUBTITLES=\"subs\"",
                 "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,SUBTITLES=\"subs\"",
             ]
         );
         assert!(!text.contains("CODECS="), "{text}");
         for (stream_line, uri) in stream_lines.iter().zip([
-            "/api/v0/sessions/s1/high.m3u8",
-            "/api/v0/sessions/s1/mid.m3u8",
-            "/api/v0/sessions/s1/low.m3u8",
+            "/api/v0/sessions/s1/v/single/index.m3u8",
+            "/api/v0/sessions/s1/v/second/index.m3u8",
         ]) {
             let index = lines.iter().position(|line| line == stream_line).unwrap();
             assert_eq!(lines[index + 1], uri);
         }
+    }
+
+    /// Two rungs on one session advertise two different media playlist URIs.
+    /// Collapse the rung in the writer and the second rendition advertises
+    /// rung one's playlist.
+    #[test]
+    fn each_rung_advertises_its_own_media_playlist_uri() {
+        let renditions = [
+            MasterRendition {
+                rung: VideoRung::SingleVideo,
+                bandwidth: 5_000_000,
+                resolution: None,
+            },
+            MasterRendition {
+                rung: VideoRung::SecondVideo,
+                bandwidth: 5_000_000,
+                resolution: None,
+            },
+        ];
+        let text = String::from_utf8(build_master_with_renditions("s1", &[], &renditions)).unwrap();
+        assert!(
+            text.contains("/api/v0/sessions/s1/v/single/index.m3u8"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/api/v0/sessions/s1/v/second/index.m3u8"),
+            "{text}"
+        );
+        assert_eq!(text.matches("/v/single/index.m3u8").count(), 1, "{text}");
+        assert_eq!(text.matches("/v/second/index.m3u8").count(), 1, "{text}");
     }
 }
