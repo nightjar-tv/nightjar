@@ -58,6 +58,11 @@ pub(crate) fn read_child_rss(pid: u32) -> Result<u64, String> {
     read_child_rss_at(Path::new("/"), pid)
 }
 
+/// Composes the two production pieces against a fixture root. Production
+/// composes them itself from `read_available_memory` and
+/// `encoder_memory_from_available`, so this exists only for the tests that
+/// need a root they can write.
+#[cfg(test)]
 pub(crate) fn measure_encoder_memory_at(
     root: &Path,
     live_rss_bytes: Option<u64>,
