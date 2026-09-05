@@ -852,9 +852,18 @@ impl LibraryPool {
         }
         let result = (|| {
             for lib in self.db.list_libraries()? {
-                let state = reachability::check_root(std::path::Path::new(&lib.path));
-                let reachable = matches!(state, Reachability::Reachable);
-                self.set_library_reachability(lib.id, &lib.path, reachable)?;
+                match reachability::check_root(std::path::Path::new(&lib.path)) {
+                    Reachability::Reachable => {
+                        self.set_library_reachability(lib.id, &lib.path, true)?;
+                    }
+                    Reachability::Unreachable => {
+                        self.set_library_reachability(lib.id, &lib.path, false)?;
+                    }
+                    // The check instrument itself failed; that is not a finding
+                    // about the root (Rule 4.15). Leave the stored state alone
+                    // so a thread-starved server cannot pause healthy mounts.
+                    Reachability::CheckFailed => {}
+                }
             }
             Ok(())
         })();
