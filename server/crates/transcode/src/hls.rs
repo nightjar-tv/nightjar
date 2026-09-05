@@ -1198,6 +1198,89 @@ fn admits_new_session(
     cap_admits && memory_admits_new_session(memory, high_water_rss_bytes)
 }
 
+/// Write end of the self-pipe that wakes the exit-reap thread. The SIGTERM /
+/// SIGINT handler writes one byte here and returns; the thread reading the
+/// other end does the reap under ordinary locking. Stored once, by
+/// [`HlsSessionRegistry::spawn_exit_reaper_thread`], from the api binary's
+/// startup.
+#[cfg(unix)]
+static EXIT_REAP_WAKE_FD: OnceLock<libc::c_int> = OnceLock::new();
+
+/// SIGTERM / SIGINT disposition installed by
+/// [`HlsSessionRegistry::reap_all_encoders_on_exit_signal`].
+///
+/// It writes one byte naming the signal to [`EXIT_REAP_WAKE_FD`] and returns,
+/// and it does nothing else — that emptiness is the point. The reap runs on
+/// the thread [`HlsSessionRegistry::spawn_exit_reaper_thread`] started,
+/// because this handler cannot safely do it:
+///
+/// * `kill_all_encoders` takes the sessions lock, and `throttle_loop` holds
+///   that same lock every [`THROTTLE_TICK`]. A handler that reaped inline
+///   when SIGTERM landed mid-tick would block on it forever (`Mutex::lock`
+///   does not time out), shutdown would hang until `docker stop`'s timeout
+///   SIGKILLed the process, and every encoder would be orphaned — the failure
+///   this reaper exists to prevent, now intermittent and timing-dependent.
+/// * `Mutex::lock`, a `Vec` allocation, and `waitpid` are none of them
+///   async-signal-safe. `write` of one byte to a pipe is.
+///
+/// A future reader will want to "simplify" this back into doing the reap
+/// here; that simplification is the defect this byte exists to prevent.
+///
+/// Reach: a clean exit — restart, `docker stop`, ctrl-c. It cannot cover
+/// `SIGKILL` or power loss; nothing in-process can (Rule 4.14).
+#[cfg(unix)]
+extern "C" fn wake_reaper_on_signal(sig: libc::c_int) {
+    let Some(fd) = EXIT_REAP_WAKE_FD.get() else {
+        return;
+    };
+    let byte = sig as u8;
+    // SAFETY: `write` of one byte to a pipe is async-signal-safe (POSIX).
+    // `spawn_exit_reaper_thread` created the pipe and its thread reads this
+    // end, so the write blocks only if 64 KiB of wake-ups are already queued —
+    // a signal storm, not a shutdown. SIGTERM and SIGINT both fit in a byte,
+    // which the reading thread turns back into the signal to re-raise.
+    unsafe {
+        libc::write(*fd, &byte as *const u8 as *const libc::c_void, 1);
+    }
+}
+
+/// Body of the thread [`HlsSessionRegistry::spawn_exit_reaper_thread`]
+/// starts: wait on the self-pipe, reap every encoder under ordinary locking,
+/// then die by the signal the handler named.
+///
+/// The `signal`/`raise` tail is the contract slice 1 gave the handler; it
+/// moves here so the handler stays async-signal-safe.
+#[cfg(unix)]
+fn exit_reaper_thread(registry: Arc<HlsSessionRegistry>, read_fd: libc::c_int) {
+    loop {
+        let mut byte = 0u8;
+        // SAFETY: `read` of one byte from a pipe end this thread owns, and
+        // this thread is the pipe's only reader. A return of -1 (EINTR) or 0
+        // (write end closed) is a condition to retry or stop, not an error.
+        let n = unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+        if n == -1 {
+            // A signal interrupted the read. None of the signals this process
+            // handles ends the thread, so try again.
+            continue;
+        }
+        if n == 0 {
+            // The write end closed: the process is already on its way out.
+            return;
+        }
+        let _killed = registry.kill_all_encoders();
+        // Restore the default disposition and re-raise, so the process still
+        // dies by the signal that asked.
+        // SAFETY: the same `signal` contract as the installer; SIG_DFL and
+        // `raise` are the platform's own. If this returns, the signal was
+        // blocked or ignored, and the loop waits for the next wake-up.
+        let sig = byte as libc::c_int;
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+}
+
 impl HlsSessionRegistry {
     /// Creates the HLS cache root, sweeps leftover session dirs from a prior
     /// process, and starts the idle reaper. `encode_leg` is the preferred
@@ -2267,7 +2350,7 @@ impl HlsSessionRegistry {
         let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
         for rung in rungs {
             stop_child(&mut session.encoder_state_mut(rung).child);
-            reap_all_superseded(&mut session);
+            reap_all_superseded(&mut session, rung);
         }
         if let Err(e) = fs::remove_dir_all(&session.dir) {
             tracing::warn!(
@@ -2379,7 +2462,7 @@ impl HlsSessionRegistry {
                 // so the reap rides along rather than taking its own thread.
                 let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
                 for rung in rungs {
-                    reap_superseded(session);
+                    reap_superseded(session, rung);
                     let state = session.encoder_state(rung);
                     let Some(child) = state.child.as_ref() else {
                         // No producer: a finished run holds no lead, and a child
@@ -2434,9 +2517,123 @@ impl HlsSessionRegistry {
         let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
         for rung in rungs {
             stop_child(&mut session.encoder_state_mut(rung).child);
-            reap_all_superseded(&mut session);
+            reap_all_superseded(&mut session, rung);
         }
         let _ = fs::remove_dir_all(&session.dir);
+    }
+
+    /// Terminate every encoder this registry holds — every session's live
+    /// child on every rung, plus every superseded child — and return how many
+    /// processes it killed.
+    ///
+    /// Clean server exit: a restart or `docker stop` must not reparent a live
+    /// encoder to init, where it keeps writing into a session directory the
+    /// next startup sweep (`build`) is about to delete.
+    ///
+    /// Its reach is stated, not implied: it covers a clean exit. It cannot
+    /// cover `SIGKILL` or power loss; nothing in-process can (Rule 4.14).
+    pub fn kill_all_encoders(&self) -> usize {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return 0;
+        };
+        let mut killed = 0usize;
+        for session in sessions.values_mut() {
+            // Walk the rungs this session actually holds, never by name: a
+            // session offering a second rung (ADR-0051) must have that rung's
+            // encoders reaped too. A loop over `SINGLE_VIDEO_RUNG` alone would
+            // leave a second rung's live and superseded children running.
+            let rungs: Vec<VideoRung> = session.encoder_states.keys().copied().collect();
+            for rung in rungs {
+                let state = session.encoder_state_mut(rung);
+                killed += u8::from(state.child.is_some()) as usize + state.superseded.len();
+                stop_child(&mut state.child);
+                reap_all_superseded(session, rung);
+            }
+        }
+        killed
+    }
+
+    /// Create the self-pipe and the thread that waits on it, and remember the
+    /// write end for the signal handler. This is the whole install except the
+    /// two `libc::signal` calls, which stay in
+    /// [`Self::reap_all_encoders_on_exit_signal`] so a test can drive the
+    /// reaper without installing a signal disposition in the test process.
+    ///
+    /// `None` means a reaper is already installed, or the pipe failed; the
+    /// caller then leaves the process's dispositions alone — a handler nothing
+    /// can wake would only replace the default death this code exists to
+    /// improve on.
+    #[cfg(unix)]
+    fn spawn_exit_reaper_thread(self: &Arc<Self>) -> Option<()> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` fills the array with two new fds. Called once, at
+        // startup, on an ordinary thread.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            tracing::warn!(
+                "exit-signal reaper: pipe() failed; a clean exit will orphan \
+                 live encoders"
+            );
+            return None;
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        // One reaper per process, like one registry. A second call finds the
+        // write end already stored and leaves the first reaper alone.
+        if EXIT_REAP_WAKE_FD.set(write_fd).is_err() {
+            // SAFETY: these fds were created just above and nothing else owns
+            // them yet.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return None;
+        }
+        // The thread inherits this thread's signal mask and blocks on the
+        // read end; the handler's one-byte write is what wakes it.
+        let registry = Arc::clone(self);
+        std::thread::spawn(move || exit_reaper_thread(registry, read_fd));
+        Some(())
+    }
+
+    /// Reap every encoder on SIGTERM / SIGINT, then let the signal end the
+    /// process.
+    ///
+    /// The handler records one byte on a self-pipe
+    /// ([`wake_reaper_on_signal`]); the thread
+    /// [`Self::spawn_exit_reaper_thread`] started does the reap, because the
+    /// handler runs in signal context and can neither take the sessions lock
+    /// (`throttle_loop` holds it every [`THROTTLE_TICK`]) nor do anything
+    /// that is not async-signal-safe.
+    ///
+    /// Reach: a clean exit — restart, `docker stop`, ctrl-c. It cannot cover
+    /// `SIGKILL` or power loss; nothing in-process can (Rule 4.14).
+    #[cfg(unix)]
+    pub fn reap_all_encoders_on_exit_signal(self: &Arc<Self>) {
+        if self.spawn_exit_reaper_thread().is_none() {
+            return;
+        }
+        // POSIX registers a handler as `sighandler_t`, an integer type, so
+        // this is the one place a fn pointer must cross into an integer.
+        #[allow(clippy::fn_to_numeric_cast)]
+        let handler = wake_reaper_on_signal as extern "C" fn(libc::c_int) as usize;
+        // SAFETY: `signal` only records the disposition for a static handler
+        // function; the handler itself runs later, on whatever thread the
+        // signal lands on, and only writes one byte (see
+        // `wake_reaper_on_signal`). SIG_ERR is not checked because there is
+        // no recovery from a failed install other than the orphan this call
+        // exists to prevent.
+        unsafe {
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGINT, handler);
+        }
+    }
+
+    /// Non-unix has no POSIX signal to hook and no build target (ADR-0050
+    /// §9), so there is nothing to install. Clean exit there leaves children
+    /// to the OS, exactly as an abrupt exit does.
+    #[cfg(not(unix))]
+    pub fn reap_all_encoders_on_exit_signal(self: &Arc<Self>) {
+        // Deliberately empty: see the doc comment above.
     }
 }
 
@@ -2484,7 +2681,7 @@ fn restart_at(
         new_play_start_ms = play_start_ms,
         "hls seek: supersede prior encode"
     );
-    supersede_child(session);
+    supersede_child(session, SINGLE_VIDEO_RUNG);
     // `throttled` describes a live process. This session keeps going with a
     // new child, so leaving it set would make the next tick send a resume to
     // a child that was never suspended and skip the suspend it needs. The
@@ -3977,8 +4174,8 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
 /// the rare one. Without the SIGCONT this function would set aside a stopped
 /// process for [`REAP_AFTER`] and then kill it — suspend-then-reap, the exact
 /// policy ADR-0050 §5 was amended to forbid.
-fn supersede_child(session: &mut Session) {
-    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+fn supersede_child(session: &mut Session, rung: VideoRung) {
+    let state = session.encoder_state_mut(rung);
     // Resume before setting it aside, while the child is still this state's
     // live child and the only thing that can signal it is this call under this lock.
     if state.throttled
@@ -4085,25 +4282,22 @@ fn release_overtaken_superseded(session: &mut Session) {
 }
 
 /// Terminate superseded encoders whose delay has elapsed.
-fn reap_superseded(session: &mut Session) {
+fn reap_superseded(session: &mut Session, rung: VideoRung) {
     let now = Instant::now();
-    session
-        .encoder_state_mut(SINGLE_VIDEO_RUNG)
-        .superseded
-        .retain_mut(|s| {
-            if s.reap_at > now {
-                return true;
-            }
-            let _ = s.child.kill();
-            let _ = s.child.wait();
-            false
-        });
+    session.encoder_state_mut(rung).superseded.retain_mut(|s| {
+        if s.reap_at > now {
+            return true;
+        }
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        false
+    });
 }
 
 /// Terminate every superseded encoder now, whatever their delay. Session
 /// teardown: nothing may outlive the session that spawned it.
-fn reap_all_superseded(session: &mut Session) {
-    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+fn reap_all_superseded(session: &mut Session, rung: VideoRung) {
+    let state = session.encoder_state_mut(rung);
     for s in state.superseded.iter_mut() {
         let _ = s.child.kill();
         let _ = s.child.wait();
@@ -4508,7 +4702,7 @@ mod tests {
 
         let session = sessions.get_mut("s1").unwrap();
         stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
-        reap_all_superseded(session);
+        reap_all_superseded(session, SINGLE_VIDEO_RUNG);
     }
 
     #[cfg(unix)]
@@ -4719,7 +4913,7 @@ mod tests {
 
         let session = sessions.get_mut("s1").unwrap();
         stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
-        reap_all_superseded(session);
+        reap_all_superseded(session, SINGLE_VIDEO_RUNG);
     }
 
     /// A seek keeps the prior encoder alive and reaps it on its delay, not
@@ -4734,7 +4928,7 @@ mod tests {
         let mut session = make_test_session(dir.path());
 
         // Nothing held: reaping is a no-op rather than an error.
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert!(
             session
                 .encoder_state(SINGLE_VIDEO_RUNG)
@@ -4752,7 +4946,7 @@ mod tests {
             .id();
         assert_eq!(child_state(pid), ChildState::Running);
 
-        supersede_child(&mut session);
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             child_state(pid),
             ChildState::Running,
@@ -4769,7 +4963,7 @@ mod tests {
         );
 
         // Not due yet.
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             child_state(pid),
             ChildState::Running,
@@ -4780,7 +4974,7 @@ mod tests {
         // Due.
         session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded[0].reap_at =
             Instant::now() - Duration::from_millis(1);
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             child_state(pid),
             ChildState::Gone,
@@ -4830,7 +5024,7 @@ mod tests {
         session.encoder_state_mut(SINGLE_VIDEO_RUNG).throttled = true;
         wait_for_state(pid, ChildState::Stopped);
 
-        supersede_child(&mut session);
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             child_state(pid),
             ChildState::Running,
@@ -4841,7 +5035,7 @@ mod tests {
             "the flag described the child that just left"
         );
 
-        reap_all_superseded(&mut session);
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(child_state(pid), ChildState::Gone);
     }
 
@@ -4868,7 +5062,7 @@ mod tests {
         }
         assert!(pids.iter().all(|p| child_state(*p) == ChildState::Running));
 
-        reap_all_superseded(&mut session);
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert!(
             session
                 .encoder_state(SINGLE_VIDEO_RUNG)
@@ -4882,6 +5076,186 @@ mod tests {
                 "teardown leaves no encoder behind"
             );
         }
+    }
+
+    /// Clean server exit reaps every encoder through the registry API — each
+    /// session's live child on every rung, plus its superseded children.
+    ///
+    /// Every other death assertion in this file calls the free helpers on a
+    /// hand-built session. This one drives the registry method the exit
+    /// handler invokes, so a regression in the method itself — collapsing it
+    /// back to [`SINGLE_VIDEO_RUNG`], or dropping the superseded set — fails
+    /// here rather than hiding behind the helpers.
+    #[cfg(unix)]
+    #[test]
+    fn registry_kill_all_encoders_reaps_live_and_superseded_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let live = spawn_stand_in_encoder();
+        let live_pid = live.id();
+        let held = spawn_stand_in_encoder();
+        let held_pid = held.id();
+        let second_rung = spawn_stand_in_encoder();
+        let second_pid = second_rung.id();
+        let mut session = make_test_session(&session_dir);
+        session.encoder_states = HashMap::from([
+            (
+                VideoRung::SingleVideo,
+                EncoderState {
+                    current_run_id: 0,
+                    next_run_id: 1,
+                    child: Some(live),
+                    child_rss_bytes: None,
+                    throttled: false,
+                    superseded: vec![SupersededEncoder {
+                        child: held,
+                        rss_bytes: None,
+                        // Parked out of the throttle tick's reach, so only
+                        // `kill_all_encoders` can end it inside this test.
+                        reap_at: Instant::now() + Duration::from_secs(60),
+                        run_id: 7,
+                    }],
+                },
+            ),
+            (
+                VideoRung::SecondVideo,
+                EncoderState {
+                    current_run_id: 0,
+                    next_run_id: 1,
+                    child: Some(second_rung),
+                    child_rss_bytes: None,
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+        ]);
+        assert_eq!(child_state(live_pid), ChildState::Running);
+        assert_eq!(child_state(held_pid), ChildState::Running);
+        assert_eq!(child_state(second_pid), ChildState::Running);
+
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        let killed = reg.kill_all_encoders();
+
+        // Waits before the count: a method that skipped half its children
+        // fails here naming the surviving pid, not on an arithmetic line.
+        wait_for_state(live_pid, ChildState::Gone);
+        wait_for_state(second_pid, ChildState::Gone);
+        wait_for_state(held_pid, ChildState::Gone);
+        assert_eq!(
+            killed, 3,
+            "the two live children and the superseded child are the three \
+             processes the registry held"
+        );
+    }
+
+    /// The SIGTERM/SIGINT handler must not do the reap itself.
+    ///
+    /// `kill_all_encoders` takes the sessions lock, which `throttle_loop`
+    /// holds every [`THROTTLE_TICK`]. Slice 1's first cut reaped inline in
+    /// the handler: a SIGTERM that landed mid-tick would block on that lock
+    /// forever, shutdown would hang until `docker stop`'s timeout SIGKILLed
+    /// the process, and every encoder would be orphaned — the failure the
+    /// reaper exists to prevent. The handler now writes one byte to a
+    /// self-pipe, and the thread reading it does the reap under ordinary
+    /// locking.
+    ///
+    /// This drives that whole path while the test thread holds the sessions
+    /// lock: the handler returns (its write cannot block on the lock it must
+    /// not take), the reap has not run while the lock is held, and the reap
+    /// completes once the lock is released.
+    ///
+    /// It stops short of installing the handler with `libc::signal` and
+    /// raising a real SIGTERM: that would replace the test process's signal
+    /// dispositions, which no test may do to its own process. Everything
+    /// before that last step is real — the handler function, the pipe, and
+    /// the reaper thread.
+    #[cfg(unix)]
+    #[test]
+    fn exit_signal_handler_only_wakes_the_reaper_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        let mut session = make_test_session(&session_dir);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(child);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        // The reaper thread finishes by restoring SIG_DFL and re-raising the
+        // signal that woke it. That must not end the test process, so block
+        // SIGTERM and SIGINT on this thread before the reaper spawns: a new
+        // thread inherits the creating thread's mask, the re-raise stays
+        // pending on the reaper thread, and process exit discards it.
+        let mut block: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            libc::sigaddset(&mut block, libc::SIGINT);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut previous),
+                0,
+                "block SIGTERM/SIGINT before spawning the reaper thread"
+            );
+        }
+        assert!(
+            reg.spawn_exit_reaper_thread().is_some(),
+            "the first reaper install must succeed"
+        );
+        unsafe {
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()),
+                0,
+                "restore the test thread's signal mask"
+            );
+        }
+
+        // Hold the sessions lock, as `throttle_loop` holds it when a SIGTERM
+        // arrives.
+        let guard = reg.sessions.lock().unwrap();
+
+        // Run the real handler on another thread with a bounded wait. A
+        // handler that reaped inline would block on the lock this thread
+        // holds; the timeout turns that deadlock into a failure instead of a
+        // hung test binary.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            wake_reaper_on_signal(libc::SIGTERM);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the handler must return while the sessions lock is held");
+
+        // The lock is still held, so the reaper thread cannot have run yet.
+        assert_ne!(
+            child_state(pid),
+            ChildState::Gone,
+            "the reap must wait for the sessions lock, not race it"
+        );
+
+        drop(guard);
+        wait_for_state(pid, ChildState::Gone);
+
+        // The reaper thread re-raised SIGTERM (pending, on the blocked
+        // thread) and is back waiting on the pipe. Leave it: it is this
+        // process's exit reaper now, exactly as in the server, and closing
+        // its pipe out from under it would be the one thing a test must not
+        // do to a reaper it shares the process with.
     }
 
     /// The run a superseded encoder is still writing into is not evictable.
@@ -4932,7 +5306,7 @@ mod tests {
             "the current run stays"
         );
 
-        reap_all_superseded(&mut session);
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
     }
 
     /// Write one producer run: the segment files, their `index.m3u8`, and the
@@ -5098,14 +5472,14 @@ mod tests {
             "a held encoder short of the new land keeps its original delay"
         );
 
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             child_state(pid),
             ChildState::Running,
             "the next reap must leave it producing"
         );
 
-        reap_all_superseded(&mut session);
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
     }
 
     /// A held encoder the new one has already overtaken is released early.
@@ -5147,7 +5521,7 @@ mod tests {
         );
 
         // The tick that already does the killing takes it.
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             child_state(pid),
             ChildState::Gone,
@@ -5207,10 +5581,10 @@ mod tests {
             "an encoder that produced nothing has no frontier to compare"
         );
 
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(child_state(pid), ChildState::Running);
 
-        reap_all_superseded(&mut session);
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
     }
 
     /// The seek path itself releases the encoder it overtook.
@@ -5269,7 +5643,7 @@ mod tests {
             "the seek path moves reap_at; it does not kill under the lock"
         );
 
-        reap_superseded(&mut session);
+        reap_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(child_state(pid), ChildState::Gone);
         assert!(
             session
