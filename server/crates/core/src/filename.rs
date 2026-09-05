@@ -1,7 +1,17 @@
 use crate::MediaKind;
 
-/// Inclusive max span for a multi-episode file (`1x01-02-03` → 3). Dogfood
-/// max is 3; cap rejects pathological `1x01-99` glued to a title numeral.
+/// Inclusive max span for a multi-episode file (`1x01-02-03` → 3).
+///
+/// **GUESS — 8 is not the measured figure.** The only measurement recorded is
+/// the one in the comment this cap has always carried: the dogfood library's
+/// widest multi-episode file spans 3 episodes. 8 does not equal that figure,
+/// and no derivation from 3 to 8 is recorded anywhere — the ADRs are silent,
+/// and the commit that introduced the cap (`b0e8c91`, "parse NxMM-NN ranges
+/// and bind multiple item keys") states only "cap 8". One household's library
+/// is not evidence about anyone else's (Rule 4.14's second clause), so the
+/// exact value is a guess, made to reject a pathological `1x01-99` glued to a
+/// title numeral. Re-measuring the span against a wider corpus is the open
+/// work.
 pub const MAX_EPISODE_RANGE: i32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
