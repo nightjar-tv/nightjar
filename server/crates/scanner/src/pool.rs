@@ -192,6 +192,35 @@ impl ProbeBatch {
     }
 }
 
+/// Test-only hold that makes an in-flight keyframe-map walk deterministic
+/// (ADR-0041 Decision 8.7 cancellation test). `#[cfg(test)]` only: a release
+/// build has no field, no arming method and no park site.
+///
+/// The race it removes: the map worker could finish the whole packet walk
+/// between "the build has started" (`queued_maps == 0`) and "the library is
+/// unreachable", so a test that flips reachability in that window measured
+/// nothing. This hold makes the flip **always** land while the build is
+/// provably still running — the worker reports that it has entered the build
+/// and then parks until the test releases it. The worker-facing half lives on
+/// the pool; the test half is handed out by
+/// [`LibraryPool::arm_map_walk_hold`]. mpsc is the crate's existing
+/// ready/release rendezvous shape (see the pool's epoch-exclusivity test).
+#[cfg(test)]
+struct MapWalkHold {
+    /// Worker → test: "the map build for this item has entered and is held".
+    entered_tx: std::sync::mpsc::Sender<i64>,
+    /// Worker ← test: block here until the test sends the release.
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test half of [`MapWalkHold`]: the test waits on `entered_rx`, flips
+/// reachability, then sends on `release_tx` to let the parked walk run.
+#[cfg(test)]
+pub(crate) struct MapWalkHoldTest {
+    pub entered_rx: std::sync::mpsc::Receiver<i64>,
+    pub release_tx: std::sync::mpsc::Sender<()>,
+}
+
 pub struct LibraryPool {
     db: Arc<Db>,
     subs: Arc<SubsStore>,
@@ -225,6 +254,11 @@ pub struct LibraryPool {
     completed_background: AtomicU64,
     /// Completion timestamps within [`RATE_WINDOW`], for the rate estimate.
     completion_times: Mutex<VecDeque<Instant>>,
+    /// Test-only in-flight hold for a keyframe-map build ([`MapWalkHold`]).
+    /// `None` in ordinary runs; [`LibraryPool::arm_map_walk_hold`] arms it and
+    /// the map worker consumes it exactly once at the park site.
+    #[cfg(test)]
+    map_walk_hold: Mutex<Option<MapWalkHold>>,
     pub availability: Arc<Availability>,
 }
 
@@ -269,6 +303,8 @@ impl LibraryPool {
             bulk_reader: Mutex::new(()),
             completed_background: AtomicU64::new(0),
             completion_times: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            map_walk_hold: Mutex::new(None),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -591,6 +627,46 @@ impl LibraryPool {
         }
         let _ = self.db.mark_map_pending(item_id);
         self.enqueue(WorkItem::map(item_id, library_id, path));
+    }
+
+    /// Arm the test-only in-flight hold for the next map build on this pool
+    /// and return its test half ([`MapWalkHold`]). The test waits on
+    /// `entered_rx` for the build to report, flips reachability, then sends
+    /// on `release_tx`. Builds that start while no hold is armed pass through
+    /// untouched, so ordinary runs and every other test pay nothing.
+    #[cfg(test)]
+    pub(crate) fn arm_map_walk_hold(&self) -> MapWalkHoldTest {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.map_walk_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(MapWalkHold {
+            entered_tx,
+            release_rx,
+        });
+        MapWalkHoldTest {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    /// Park the map worker at the in-flight hold when one is armed. Consumes
+    /// the armed hold, so **exactly one** build per arm parks and every later
+    /// build passes through. A test that gave up before the build arrived
+    /// (dropped its half) unparks the worker immediately via the channel
+    /// error, so a park can never outlive the test that armed it.
+    #[cfg(test)]
+    fn hold_map_walk_if_armed(&self, item_id: i64) {
+        let handle = self
+            .map_walk_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if handle.entered_tx.send(item_id).is_err() {
+            return;
+        }
+        let _ = handle.release_rx.recv();
     }
 
     /// Move an item's extract to the front of the queue (first-play path).
@@ -1290,6 +1366,8 @@ impl LibraryPool {
         // packet-walk fallback (ADR-0041 Decision 8.7); the index read is a
         // header-scale read and runs regardless.
         let should_cancel = || self.availability.pause.is_paused(item.library_id);
+        #[cfg(test)]
+        self.hold_map_walk_if_armed(item_id);
         match crate::keymap::build_keyframe_map(&media_path, row.duration_ms, Some(&should_cancel))
         {
             Ok(built) => {
