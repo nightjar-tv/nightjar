@@ -41,7 +41,10 @@ fn empty_population_exits_nonzero_and_prints_no_fraction() {
         // empty-population one. Without this the run exits 1 from
         // resolve_credentials instead, and the test passes whether or not the
         // behaviour under test exists at all.
-        .env("NIGHTJAR_TMDB_API_KEY", "test-key-not-used-no-request-is-made")
+        .env(
+            "NIGHTJAR_TMDB_API_KEY",
+            "test-key-not-used-no-request-is-made",
+        )
         .output()
         .unwrap();
 
