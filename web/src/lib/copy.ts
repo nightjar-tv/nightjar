@@ -16,6 +16,16 @@ export const copy = {
 	sessionsBusy:
 		'This server is out of capacity for another video right now. Try again in a moment.',
 	sessionFailed: "This file couldn't be prepared for playback. Check the logs for the file details.",
+	/** The client gave up waiting while FFmpeg was still working (the ~20 s
+	 *  poll budget in sessionWait.ts). Not a file defect: the logs will show a
+	 *  healthy session, so telling the operator to chase the file would send
+	 *  them after the wrong thing. */
+	sessionStartTimeout:
+		'Playback is taking longer than expected to start. If it does not start soon, press Play to try again.',
+	/** A fetch inside the ready-wait failed. Nothing is known about the file,
+	 *  so the copy says so instead of guessing at a cause. */
+	sessionStartNetworkError:
+		"Playback couldn't reach the server to confirm this file is ready. Check your connection, then press Play to try again.",
 	// Playback carries the session cookie, so a credential that has gone stale
 	// stops the video without touching the rest of the page. Say what to do,
 	// because retrying is exactly what does not help (OPEN-DEFECTS entry 16).
