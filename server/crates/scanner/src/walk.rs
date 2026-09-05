@@ -550,7 +550,20 @@ mod tests {
             "cold relisted count"
         );
         assert_eq!(paths(&serial_warm), paths(&par_warm), "warm file lists");
+        // Presence for the emptiness assertions below: each warm walk must have
+        // found the 24 files the tree holds before "relisted nothing" means
+        // anything (Rule 4.15). Twelve shows times two files each.
+        assert_eq!(
+            serial_warm.files.len(),
+            24,
+            "serial warm walk must still find every file"
+        );
         assert!(serial_warm.relisted_dirs.is_empty());
+        assert_eq!(
+            par_warm.files.len(),
+            24,
+            "parallel warm walk must still find every file"
+        );
         assert!(par_warm.relisted_dirs.is_empty());
 
         thread::sleep(Duration::from_millis(1100));
