@@ -185,16 +185,17 @@ pub fn classify_restart_desire(
 
 /// Whether a recorded pending play land is due to apply.
 ///
-/// When the cooking land is not ready yet, apply only if `allow_preempt`,
+/// When the cooking land is not ready yet, apply only if
 /// [`coalesce_preempt_before_land`] says the pending target is far outside
-/// the near-land band, and [`RESTART_MIN_INTERVAL`] has elapsed since the
+/// the near-land band and [`RESTART_MIN_INTERVAL`] has elapsed since the
 /// last restart (anti-thrash on the preempt path only — not a substitute
 /// for the land gate). Near pending must still wait for the cooking land
 /// (dogfood: seg415 after scrub to 1188 — yank before land left Safari
 /// retrying the prior URI).
 ///
-/// `allow_preempt` mirrors [`disable_preempt`]: unset leaves preempt **on**.
-/// Pass `!disable_preempt()` from production callers.
+/// Preempt before land is unconditional. `NIGHTJAR_DISABLE_PREEMPT` was a
+/// probe (retired 2026-09-05); the polarity it measured as scrub-before-play
+/// pass under Config D — preempt **on** — is what this pins.
 pub fn pending_restart_due(
     first_segment_ready: bool,
     pending_play_ms: Option<u64>,
@@ -202,12 +203,10 @@ pub fn pending_restart_due(
     apply_immediate: bool,
     cooking_play_ms: u64,
     since_last_restart: Duration,
-    allow_preempt: bool,
 ) -> Option<u64> {
     let pending = pending_play_ms?;
     if !first_segment_ready {
-        if allow_preempt
-            && coalesce_preempt_before_land(cooking_play_ms, pending)
+        if coalesce_preempt_before_land(cooking_play_ms, pending)
             && since_last_restart >= RESTART_MIN_INTERVAL
         {
             return Some(pending);
@@ -222,32 +221,6 @@ pub fn pending_restart_due(
         return None;
     }
     Some(pending)
-}
-
-/// `NIGHTJAR_DISABLE_PREEMPT=1` (or `true`/`yes`): never preempt before land.
-/// Unset (and any value other than an explicit disable) leaves preempt **on** —
-/// the polarity measured as scrub-before-play pass under Config D.
-pub(crate) fn disable_preempt() -> bool {
-    matches!(
-        std::env::var("NIGHTJAR_DISABLE_PREEMPT").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES")
-    )
-}
-
-/// Optional pause after kill before the next FFmpeg spawn (`restart_at`).
-/// `NIGHTJAR_RESTART_SPAWN_GAP_MS` — distinct from [`RESTART_MIN_INTERVAL`]
-/// (decision gate). Used to probe whether rapid dual-init boundaries wedge
-/// Safari while keeping preempt's fast target selection.
-pub(crate) fn restart_spawn_gap() -> Option<Duration> {
-    let ms: u64 = std::env::var("NIGHTJAR_RESTART_SPAWN_GAP_MS")
-        .ok()?
-        .parse()
-        .ok()?;
-    if ms == 0 {
-        None
-    } else {
-        Some(Duration::from_millis(ms))
-    }
 }
 
 /// Far pending may abandon an in-flight cook before its land exists.
@@ -661,7 +634,7 @@ mod tests {
         ready = true;
         play = 1_084_000;
         encode = encode_start_ms(play);
-        let due = pending_restart_due(ready, pending, None, true, play, RESTART_MIN_INTERVAL, true);
+        let due = pending_restart_due(ready, pending, None, true, play, RESTART_MIN_INTERVAL);
         assert_eq!(due, Some(2_454_000));
         // Apply once to the last intent.
         if let Some(p) = due {
@@ -693,7 +666,6 @@ mod tests {
                 false,
                 play,
                 RESTART_MIN_INTERVAL,
-                true
             ),
             None,
             "quiet not elapsed"
@@ -705,7 +677,6 @@ mod tests {
             false,
             play,
             RESTART_MIN_INTERVAL,
-            true,
         );
         assert_eq!(due2, Some(2_700_000));
     }
@@ -736,7 +707,6 @@ mod tests {
                 false,
                 cooking_play,
                 Duration::from_millis(0),
-                true
             ),
             None,
             "hot clock: no preempt"
@@ -749,7 +719,6 @@ mod tests {
                 true,
                 cooking_play,
                 RESTART_MIN_INTERVAL * 2,
-                true
             ),
             Some(near_fwd),
             "cool clock + far pending: preempt"
@@ -763,7 +732,6 @@ mod tests {
                 true,
                 cooking_play,
                 RESTART_MIN_INTERVAL,
-                true
             ),
             Some(near_fwd)
         );
@@ -789,12 +757,14 @@ mod tests {
                 false,
                 land_b,
                 Duration::from_millis(470),
-                true
             ),
             None,
             "preempt still gated by RESTART_MIN_INTERVAL"
         );
-        // Interval elapsed, B's land still missing: apply C.
+        // Interval elapsed, B's land still missing: apply C. Preempt before
+        // land is unconditional — the NIGHTJAR_DISABLE_PREEMPT probe that
+        // used to withhold this row (allow_preempt=false) was retired
+        // 2026-09-05.
         assert_eq!(
             pending_restart_due(
                 false,
@@ -803,24 +773,9 @@ mod tests {
                 false,
                 land_b,
                 RESTART_MIN_INTERVAL,
-                true
             ),
             Some(land_c),
             "far C applies before B land once interval cools"
-        );
-        // Product default (allow_preempt=false): far pending stays held until land.
-        assert_eq!(
-            pending_restart_due(
-                false,
-                Some(land_c),
-                Some(Duration::from_millis(470)),
-                false,
-                land_b,
-                RESTART_MIN_INTERVAL,
-                false,
-            ),
-            None,
-            "allow_preempt=false never preempts before cooking land"
         );
     }
 
@@ -870,7 +825,6 @@ mod tests {
                 false,
                 land_b,
                 RESTART_MIN_INTERVAL,
-                true,
             ),
             Some(land_c),
         );
