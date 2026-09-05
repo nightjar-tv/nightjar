@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api/client';
+	import { copy } from '$lib/copy';
 	import type { components } from '$lib/api/schema';
 
 	type Library = components['schemas']['Library'];
@@ -11,10 +12,14 @@
 	let path = $state('');
 	let kind = $state<'movies' | 'shows'>('movies');
 	let busy = $state(false);
+	// False until the first successful fetch: an empty list is a fact the
+	// server reported, not a guess made while the fetch is still in flight.
+	let loaded = $state(false);
 
 	async function refresh() {
 		const res = await api.listLibraries();
 		libraries = res.libraries;
+		loaded = true;
 	}
 
 	onMount(() => {
@@ -56,19 +61,21 @@
 
 	<section>
 		<h1>Libraries</h1>
-		{#if libraries.length === 0}
-			<p class="empty">Nothing roosting here yet. Add a media folder below.</p>
-		{:else}
-			<ul class="libs">
-				{#each libraries as lib (lib.id)}
-					<li>
-						<a href="/libraries/{lib.id}">
-							<span class="name">{lib.name}</span>
-							<span class="meta">{lib.kind} · {lib.itemCount} items</span>
-						</a>
-					</li>
-				{/each}
-			</ul>
+		{#if loaded}
+			{#if libraries.length === 0}
+				<p class="empty">{copy.emptyLibrary} {copy.emptyLibraryHint}</p>
+			{:else}
+				<ul class="libs">
+					{#each libraries as lib (lib.id)}
+						<li>
+							<a href="/libraries/{lib.id}">
+								<span class="name">{lib.name}</span>
+								<span class="meta">{lib.kind} · {lib.itemCount} items</span>
+							</a>
+						</li>
+					{/each}
+				</ul>
+			{/if}
 		{/if}
 	</section>
 
@@ -90,7 +97,7 @@
 					<option value="shows">shows</option>
 				</select>
 			</label>
-			<button type="submit" disabled={busy}>{busy ? 'Adding…' : 'Add folder'}</button>
+			<button type="submit" disabled={busy}>{busy ? 'Adding…' : copy.addFolder}</button>
 		</form>
 	</section>
 </main>

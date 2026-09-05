@@ -18,12 +18,26 @@
 	/// requests rather than ~21,600. Polling harder does not make the server
 	/// commit sooner.
 	const PROGRESS_POLL_MS = 5000;
+	/// One failed progress read is a blip worth retrying; a solid run of
+	/// failures is an outage worth saying so about, not something to poll
+	/// forever in silence.
+	const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
 	let library = $state<Library | null>(null);
 	let listed = $state<LibraryUnits | null>(null);
 	let progress = $state<ScanProgress | null>(null);
 	let error = $state<string | null>(null);
 	let scanning = $state(false);
+
+	/// Poll lifecycle, kept outside reactive state because nothing renders
+	/// from it. The onMount cleanup sets `disposed`, and every await in the
+	/// poll loop re-checks it before touching the network or the DOM, so
+	/// navigating away mid-scan cannot leave a poller hitting
+	/// `/scan-progress` every five seconds behind, and each revisit cannot
+	/// stack another one.
+	let disposed = false;
+	let pollTimer: ReturnType<typeof setTimeout> | undefined;
+	let pollActive = false;
 
 	const libraryId = $derived(Number(page.params.id));
 
@@ -38,21 +52,57 @@
 		);
 	}
 
+	function pause(ms: number): Promise<void> {
+		return new Promise((resolve) => {
+			pollTimer = setTimeout(resolve, ms);
+		});
+	}
+
+	/// Poll until the server reports no running scan, or the page goes away.
+	/// One transient failure is retried, not fatal: a scan's progress display
+	/// must not die on the first network blip.
 	async function pollProgress() {
-		progress = await api.getScanProgress(libraryId);
-		while (scanRunning(progress)) {
-			await new Promise((r) => setTimeout(r, PROGRESS_POLL_MS));
-			progress = await api.getScanProgress(libraryId);
+		if (pollActive || disposed) return;
+		pollActive = true;
+		let failures = 0;
+		try {
+			while (!disposed) {
+				let p: ScanProgress;
+				try {
+					p = await api.getScanProgress(libraryId);
+				} catch (err) {
+					if (disposed) return;
+					failures += 1;
+					if (failures >= MAX_CONSECUTIVE_POLL_FAILURES) throw err;
+					await pause(PROGRESS_POLL_MS);
+					continue;
+				}
+				if (disposed) return;
+				failures = 0;
+				progress = p;
+				// The button mirrors the server's actual scan state, not just
+				// a scan this page started: arriving at a library with a scan
+				// already running must not offer an enabled second one.
+				scanning = scanRunning(p);
+				if (!scanning) break;
+				await pause(PROGRESS_POLL_MS);
+			}
+			if (!disposed) await load();
+		} finally {
+			pollActive = false;
 		}
-		await load();
 	}
 
 	onMount(() => {
 		load()
 			.then(pollProgress)
 			.catch((e: Error) => {
-				error = e.message;
+				if (!disposed) error = e.message;
 			});
+		return () => {
+			disposed = true;
+			if (pollTimer) clearTimeout(pollTimer);
+		};
 	});
 
 	async function scan() {
@@ -115,20 +165,24 @@
 			<!-- Two lines, never one figure over both: probe and metadata finish
 			     at different times. The server says which display each supports. -->
 			{#if progress.probe.display === 'bar' && progress.probe.total}
-				<p class="scan">{copy.probingOf(progress.probe.done, progress.probe.total)}</p>
-				<progress value={progress.probe.done} max={progress.probe.total}></progress>
+				<p class="scan" role="status">{copy.probingOf(progress.probe.done, progress.probe.total)}</p>
+				<progress
+					aria-label="Probe progress"
+					value={progress.probe.done}
+					max={progress.probe.total}
+				></progress>
 			{:else if progress.probe.display === 'count'}
-				<p class="scan">
+				<p class="scan" role="status">
 					{progress.indexPassComplete
 						? copy.probing(progress.probe.done, progress.probe.queued)
 						: copy.scanFound(progress.found)}
 				</p>
 			{/if}
 			{#if progress.probe.errors > 0}
-				<p class="scan">{copy.probeErrors(progress.probe.errors)}</p>
+				<p class="scan" role="status">{copy.probeErrors(progress.probe.errors)}</p>
 			{/if}
 			{#if progress.metadata.display === 'count'}
-				<p class="scan">{copy.metadataDraining(progress.metadata.pending)}</p>
+				<p class="scan" role="status">{copy.metadataDraining(progress.metadata.pending)}</p>
 			{/if}
 		{/if}
 
