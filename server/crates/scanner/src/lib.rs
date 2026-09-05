@@ -339,9 +339,14 @@ pub fn request_scan(
     let lib = db
         .get_library(library_id)?
         .ok_or_else(|| format!("library {library_id} not found"))?;
-    if matches!(check_root(Path::new(&lib.path)), Reachability::Unreachable) {
-        let _ = pool.set_library_reachability(library_id, &lib.path, false);
-        return Err(format!("library path is not reachable: {}", lib.path));
+    match check_root(Path::new(&lib.path)) {
+        Reachability::Unreachable => {
+            let _ = pool.set_library_reachability(library_id, &lib.path, false);
+            return Err(format!("library path is not reachable: {}", lib.path));
+        }
+        // Reachable, or the check instrument itself failed (Rule 4.15: not a
+        // finding — do not refuse the scan on it).
+        Reachability::Reachable | Reachability::CheckFailed => {}
     }
     if let Some(existing) = db.active_scan_job(library_id)? {
         match trigger {
@@ -657,8 +662,14 @@ fn run_repoint_job(
             .map(|p| nightjar_db::normalize_library_root(&p.to_string_lossy()))
             .unwrap_or_else(|_| nightjar_db::normalize_library_root(candidate_path));
         let root = Path::new(&candidate);
-        if !matches!(check_root(root), Reachability::Reachable) {
-            return Err(format!("repoint path is not reachable: {candidate}"));
+        match check_root(root) {
+            Reachability::Reachable => {}
+            Reachability::Unreachable => {
+                return Err(format!("repoint path is not reachable: {candidate}"));
+            }
+            // Check instrument failure is not a finding about the path
+            // (Rule 4.15); let the walk below report the truth.
+            Reachability::CheckFailed => {}
         }
         let current = db.count_items(library_id)?;
         let existing = db.list_item_paths(library_id)?;
@@ -797,9 +808,15 @@ fn run_index_pass(
         .unwrap_or_else(|_| nightjar_db::normalize_library_root(&lib.path));
     let root = Path::new(&library_root);
     let root_before = check_root(root);
-    if !matches!(root_before, Reachability::Reachable) {
-        let _ = pool.set_library_reachability(library_id, &library_root, false);
-        return Err(format!("library path is not reachable: {library_root}"));
+    match root_before {
+        Reachability::Reachable => {}
+        Reachability::Unreachable => {
+            let _ = pool.set_library_reachability(library_id, &library_root, false);
+            return Err(format!("library path is not reachable: {library_root}"));
+        }
+        // Check instrument failure is not a finding (Rule 4.15): do not pause
+        // or abort the scan on it.
+        Reachability::CheckFailed => {}
     }
 
     // Scan library (and poll) re-try availability failures; permanent error stays
@@ -1020,7 +1037,11 @@ fn run_index_pass(
         let _ = fold_collisions;
         let root_after = check_root(root);
         let root_ok_after = matches!(root_after, Reachability::Reachable);
-        if !root_ok_after {
+        // Pause only on a positive finding. A check instrument failure is not
+        // a finding (Rule 4.15): the walk still counts as doubtful below
+        // (root_ok_after false skips delete_missing) but must not pause a
+        // healthy library.
+        if matches!(root_after, Reachability::Unreachable) {
             let _ = pool.set_library_reachability(library_id, &lib.path, false);
         }
         // First index after a successful repoint: report unmatched rows but do
