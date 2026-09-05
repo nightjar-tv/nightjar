@@ -31,13 +31,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	});
 	if (!res.ok) {
 		let message = res.statusText;
+		let code: string | undefined;
 		try {
-			const body = (await res.json()) as { error?: string };
+			const body = (await res.json()) as { error?: string; code?: string };
 			if (body.error) message = body.error;
+			code = body.code;
 		} catch {
 			/* ignore */
 		}
-		throw new Error(message);
+		// Carry the server's machine code beside the sentence: the watch
+		// page's retry decision matches `code`, never the wording of
+		// `message`. Plain Error keeps one thrown-error path.
+		const error = new Error(message) as Error & { code?: string };
+		if (code) error.code = code;
+		throw error;
 	}
 	if (res.status === 204) return undefined as T;
 	return (await res.json()) as T;

@@ -8,12 +8,17 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct ErrorBody {
     pub error: String,
+    /// Stable machine-readable class of the error. A client branches on this,
+    /// never on the human sentence in `error` (that sentence is a person's
+    /// copy, not an API).
+    pub code: &'static str,
 }
 
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    pub code: &'static str,
 }
 
 impl ApiError {
@@ -21,6 +26,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            code: "bad_request",
         }
     }
 
@@ -30,6 +36,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: msg.into(),
+            code: "unauthorized",
         }
     }
 
@@ -39,6 +46,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: msg.into(),
+            code: "forbidden",
         }
     }
 
@@ -46,6 +54,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: msg.into(),
+            code: "conflict",
         }
     }
 
@@ -53,6 +62,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
+            code: "not_found",
         }
     }
 
@@ -60,6 +70,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
+            code: "internal",
         }
     }
 }
@@ -70,6 +81,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(ErrorBody {
                 error: self.message,
+                code: self.code,
             }),
         )
             .into_response()

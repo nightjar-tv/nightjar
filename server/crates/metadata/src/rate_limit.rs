@@ -13,9 +13,24 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Politeness rate for metadata API calls (not a setting).
+///
+/// **GUESS between two anchors, deriving from neither.** The module header and
+/// ADR-0026 §7 record a **measured** rate and a **published** ceiling: a
+/// full-library search pass of ~2,500 queries ran at roughly **3 req/s**
+/// without 429s, and `api.themoviedb.org` is CDN-limited to **~50 req/s** per
+/// IP. 10 sits between those two numbers with no stated argument from either —
+/// it is not the measured rate, and no source derives it as a fraction of the
+/// ceiling. Unsourced, never derived.
 pub const DEFAULT_REQUESTS_PER_SEC: u32 = 10;
 
 /// Small concurrency cap for in-flight API calls (not a setting).
+///
+/// **GUESS — no stated origin.** No ADR or measurement names a concurrency for
+/// this API host; 4 shipped with `DEFAULT_REQUESTS_PER_SEC` as part of the
+/// same undocumented budget (commit `de68d2f`, "metadata: queue, Visible
+/// first-screen gate, measure excludes"). The two-tier grid measure ran at
+/// ~3.7 effective req/s under it without 429s, which bounds it from below but
+/// does not derive it.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 4;
 
 /// Acquire guard: holds one in-flight permit until drop.

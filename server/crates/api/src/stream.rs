@@ -47,6 +47,7 @@ pub async fn stream_item(
                 "item {item_id} needs an HLS session; POST /api/v0/items/{item_id}/sessions: {}",
                 decision.reason
             ),
+            code: "unsupported_media_type",
         }),
     }
 }
@@ -73,6 +74,7 @@ async fn serve_file(
                 return Err(ApiError {
                     status: StatusCode::RANGE_NOT_SATISFIABLE,
                     message: "invalid range".into(),
+                    code: "range_not_satisfiable",
                 });
             }
             let len = end - start + 1;
@@ -103,6 +105,7 @@ async fn serve_file(
         Some(_) => Err(ApiError {
             status: StatusCode::RANGE_NOT_SATISFIABLE,
             message: format!("range not satisfiable; size {file_size}"),
+            code: "range_not_satisfiable",
         }),
         None => {
             let file = File::open(&path)
