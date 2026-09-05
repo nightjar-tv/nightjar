@@ -35,9 +35,9 @@ pub(crate) fn encoder_weight_centi(_re_encodes: bool) -> u32 {
     ENCODER_WEIGHT_SCALE
 }
 
-/// Whether a newcomer of `newcomer_centi` weight is admitted on top of
-/// `existing_centi` already-live weight, against a cap expressed in whole
-/// encoders.
+/// Whether a newcomer of `newcomer_centi` weight fits an operator override
+/// expressed in whole encoders. Normal admission has no numeric cap
+/// (ADR-0050 §7-§8).
 pub(crate) fn admits_weighted_load(
     existing_centi: u32,
     newcomer_centi: u32,
