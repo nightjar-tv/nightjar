@@ -52,12 +52,22 @@ pub fn extract_timeout_budget(src_bytes: u64) -> Duration {
 
 /// Kill a runaway ASS burn demux rather than leave ffmpeg reading the NAS
 /// forever. Fixed: ADR-0018's session-start path, not the size-scaled budget.
+///
+/// **The half hour is unsourced (Rule 4.14).** ADR-0018 explains why this is a
+/// fixed ceiling rather than a size-scaled one; nothing records why 1800
+/// seconds. Landed in #10. A long ASS demux over a slow share is the case it
+/// exists for, and no measurement of that case is recorded, so the value is a
+/// guess that has not yet been wrong.
 const ASS_BURN_EXTRACT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// How often to publish a growing WebVTT while FFmpeg demuxes (ADR-0013 §11).
 const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
 /// Refuse extract when the data volume has less free space than this.
+///
+/// **Unsourced (Rule 4.14).** No recorded derivation, and it is not a measured
+/// worst-case extract size. It reads as a round number chosen to leave the
+/// volume some room rather than as a bound on what an extract needs.
 const MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// IO kinds that usually mean the mount/share is gone, not a bad subtitle file.
