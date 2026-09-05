@@ -9,6 +9,16 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How long one encoder candidate gets to prove itself at startup before it is
+/// declared unusable.
+///
+/// **Unsourced (Rule 4.14).** Landed in #7 with the Phase 2 HLS stack and no
+/// stated derivation; nothing in `docs/adr/` or the git history records why 20
+/// seconds. It is not a measurement, and it decides which backends
+/// `docs/HW_ACCEL.md` can claim at tier 1, so a box whose first probe is slow
+/// under load could be reported "software only" on a timeout rather than on a
+/// real capability. Worth deriving from a measured probe distribution before it
+/// is trusted further.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Outcome of one encoder candidate after startup probe.
