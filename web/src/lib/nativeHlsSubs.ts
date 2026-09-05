@@ -56,6 +56,29 @@ export function sessionIdFromPlaylist(playlistBase: string): string | null {
 	return m?.[1] ?? null;
 }
 
+/**
+ * Media playlist URI the session master advertises for its first video
+ * rendition: the URI line that follows the first `#EXT-X-STREAM-INF:`
+ * (ADR-0051 amendment 1 names the rung-scoped form). The post-seek readiness
+ * probe polls this URI because it is the media playlist the player will
+ * fetch. It must not rebuild the URI by rewriting the master's own filename:
+ * `master.m3u8` rewritten to `index.m3u8` names the session's flat
+ * compatibility alias, which is not the rendition the player resumes.
+ * `null` when the master names no video rendition.
+ */
+export function mediaPlaylistUrlFromMaster(masterBody: string): string | null {
+	let afterStreamInf = false;
+	for (const raw of masterBody.split(/\r?\n/)) {
+		const line = raw.trim();
+		if (afterStreamInf) {
+			if (!line || line.startsWith('#')) continue;
+			return line;
+		}
+		if (line.startsWith('#EXT-X-STREAM-INF:')) afterStreamInf = true;
+	}
+	return null;
+}
+
 export function subtitleSegmentUrl(
 	sessionBase: string,
 	trackId: string,
