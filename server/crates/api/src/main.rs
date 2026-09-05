@@ -49,13 +49,22 @@ async fn main() {
     let db = std::sync::Arc::new(db_raw);
     // ADR-0009: verify encoders once at startup; sessions reuse this Arc.
     let transcode_caps = nightjar_transcode::probe_h264_encoders_arc(&data_dir.join("cache"));
-    let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
-        data_dir.join("cache").join("hls"),
-        hls_max_encoders(),
-        transcode_caps.preferred_encode_leg.clone(),
-        Some(subs.clone()),
-        Some(db.clone()),
-    )
+    let hls_root = data_dir.join("cache").join("hls");
+    let hls = match hls_max_encoders() {
+        Some(max_encoders) => nightjar_transcode::HlsSessionRegistry::with_cap(
+            hls_root,
+            max_encoders,
+            transcode_caps.preferred_encode_leg.clone(),
+            Some(subs.clone()),
+            Some(db.clone()),
+        ),
+        None => nightjar_transcode::HlsSessionRegistry::with_measured_admission(
+            hls_root,
+            transcode_caps.preferred_encode_leg.clone(),
+            Some(subs.clone()),
+            Some(db.clone()),
+        ),
+    }
     .unwrap_or_else(|e| panic!("hls cache: {e}"));
     let pool = nightjar_scanner::LibraryPool::spawn(
         std::sync::Arc::clone(&db),
@@ -194,15 +203,22 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("data"))
 }
 
-fn hls_max_encoders() -> usize {
-    const DEFAULT: usize = 3;
-    std::env::var("NIGHTJAR_HLS_MAX_ENCODERS")
-        .ok()
-        // Existing deployments keep working; session and encoder counts are equal until the ladder ships.
-        .or_else(|| std::env::var("NIGHTJAR_HLS_MAX_SESSIONS").ok())
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT)
+fn hls_max_encoders() -> Option<usize> {
+    let raw = match std::env::var("NIGHTJAR_HLS_MAX_ENCODERS") {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "NIGHTJAR_HLS_MAX_ENCODERS is not valid Unicode; ignoring override");
+            return None;
+        }
+    };
+    match raw.parse::<usize>() {
+        Ok(value) if value >= 1 => Some(value),
+        _ => {
+            tracing::warn!(value = %raw, "NIGHTJAR_HLS_MAX_ENCODERS must be a positive integer; ignoring override");
+            None
+        }
+    }
 }
 
 fn listen_addr() -> SocketAddr {

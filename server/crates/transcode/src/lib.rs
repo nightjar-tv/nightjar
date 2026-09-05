@@ -8,6 +8,7 @@ mod audio;
 mod hls;
 mod hls_grid;
 mod hls_master;
+mod hls_memory;
 mod hls_policy;
 mod hls_segment_map;
 mod hwaccel;
