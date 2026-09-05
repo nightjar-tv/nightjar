@@ -1,7 +1,6 @@
 /** User-visible product strings. Keep plain; no marketing voice. */
 
 export const copy = {
-	scanInProgress: 'Scanning your library. You can start watching as items appear.',
 	emptyLibrary: 'Nothing roosting here yet.',
 	emptyLibraryHint: 'Add a media folder and Nightjar will take care of the rest.',
 	addFolder: 'Add folder',
@@ -31,11 +30,8 @@ export const copy = {
 	// because retrying is exactly what does not help (OPEN-DEFECTS entry 16).
 	sessionUnauthorized:
 		'Your sign-in expired, so playback stopped. Sign in again to keep watching; your place is saved.',
-	badgeHint:
-		'Badges: browser plays directly, remux and transcode start a playback session when you open the item. Text subtitles (SRT and similar) use the Subtitles control. ASS and image (PGS) tracks burn into the video when you select them — that starts a session even on titles that otherwise play in the browser.',
 	subtitlesPreparing: 'Subtitles are being prepared.',
 	subtitlesFoundNotRendered: 'Subtitle files found but not rendered yet:',
-	burnInNeedsSession: 'This subtitle track is burned into the video and needs a playback session.',
 	audioTrack: 'Audio track',
 	subtitleTrack: 'Subtitles',
 	subtitleOff: 'Off',

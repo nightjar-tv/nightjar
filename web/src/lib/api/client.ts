@@ -30,7 +30,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		}
 	});
 	if (!res.ok) {
-		let message = res.statusText;
+		// `statusText` is the empty string over HTTP/2 and in several fetch
+		// implementations, so alone it renders a blank error paragraph for
+		// any error whose body is not our JSON envelope (a reverse-proxy
+		// 502, a 413, an HTML error page). Say the status when the reason
+		// phrase is absent; the envelope's own sentence still wins.
+		let message = res.statusText || `HTTP ${res.status}`;
 		let code: string | undefined;
 		try {
 			const body = (await res.json()) as { error?: string; code?: string };
