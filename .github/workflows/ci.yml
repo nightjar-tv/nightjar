@@ -9,7 +9,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A docs-only pull request needs no Rust build, no node build and no 10k-item
+  # scan. Those cost roughly eight minutes of runner time between them and
+  # cannot fail on a change that touches no code.
+  #
+  # Only openapi is gated: web needs openapi, server needs web, gate1 needs
+  # server, and a skipped dependency skips the chain. One condition, one place.
+  #
+  # The filter is wrong in the safe direction on purpose. Any push to main runs
+  # everything, and any unrecognised path counts as code, so a pull request that
+  # touches docs AND code still runs the full suite.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "not a pull request; running everything"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only '${{ github.event.pull_request.base.sha }}' '${{ github.event.pull_request.head.sha }}')"
+          echo "changed files:"
+          echo "$changed"
+          if printf '%s\n' "$changed" | grep -qvE '(^docs/|\.md$)'; then
+            echo "non-docs changes present; running everything"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs only; skipping build and test jobs"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   openapi:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
