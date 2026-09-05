@@ -308,6 +308,25 @@ pub const REPOINT_RETAIN_FRACTION: f64 = 0.90;
 /// unsourced, never derived.
 pub const REPOINT_DELETE_HOLDOFF: Duration = Duration::from_secs(3600);
 
+/// Flush size of the index upsert: the walk collects changed and new files
+/// and commits them as one transaction every `INDEX_BATCH` rows (plus a final
+/// partial flush; `upsert_items_indexed`). It is the commit granularity,
+/// which is what makes the scan counter move in bursts: the visible
+/// `added`/`updated` progress advances in 200-row steps, not continuously.
+///
+/// The reach is wider than the counter. Every flush also enqueues that
+/// batch's probes and runs their sidecar association, and the transaction is
+/// the batch-sized hold on the shared `Db` connection that concurrent API
+/// reads wait out during a cold walk (only the metadata drain holds its own
+/// connection — ADR-0026 §8).
+///
+/// **GUESS (Rule 4.14).** No derivation is recorded. It shipped bare with
+/// the Phase 1 scanner (#1); no ADR, git history entry, or note derives why
+/// 200. It is load-bearing for annotated constants elsewhere: the
+/// `scan_progress` route's own doc and the library page's progress poll
+/// (`web/src/routes/libraries/[id]/+page.svelte`) both justify their poll
+/// cadence with "commits 200 rows at a time", so two annotated comments rest
+/// on this unannotated server constant.
 const INDEX_BATCH: usize = 200;
 
 /// Who asked for a full-library walk (ADR-0015). Notify creates use
