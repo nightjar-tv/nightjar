@@ -44,6 +44,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SINGLE_VIDEO_RUNG: VideoRung = VideoRung::SingleVideo;
+/// How long a session may sit without a client request before the reaper
+/// force-stops it. **Must stay above [`SEGMENT_WAIT`] (30 s < 60 s).** A
+/// request refreshes `last_access` once, on arrival, and may then hold for up
+/// to a full [`SEGMENT_WAIT`]; if the hold budget ever reached the idle clock
+/// a healthy waiting session would become reapable mid-wait. The ordering is
+/// load-bearing and pinned by
+/// `a_legitimate_hold_cannot_outlive_the_idle_clock`.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAPER_TICK: Duration = Duration::from_secs(5);
 /// Per-session on-disk budget shared across every rung's run dirs (ADR-0020
@@ -76,6 +83,14 @@ const COPY_WINDOW_MS: u64 = 20_000;
 /// How long a segment or init fetch may block before returning 503. Mid-title
 /// hardware transcodes on a NAS library can exceed 15s (dogfood: ~16s to
 /// seg1098 after a Chrome seek on Up 1080p).
+///
+/// **Must stay below [`IDLE_TIMEOUT`] (30 s < 60 s).** A request refreshes
+/// `last_access` once on arrival and a hold may wait out a full `SEGMENT_WAIT`
+/// (the no-fill hold is bounded by this too); the idle reaper then must not
+/// fire before the longest legitimate hold ends. Raise `SEGMENT_WAIT` above
+/// [`IDLE_TIMEOUT`] and a healthy waiting session becomes reapable mid-wait.
+/// The ordering is load-bearing and pinned by
+/// `a_legitimate_hold_cannot_outlive_the_idle_clock`.
 const SEGMENT_WAIT: Duration = Duration::from_secs(30);
 const SEGMENT_POLL: Duration = Duration::from_millis(100);
 /// Media seconds a session's encoder may run ahead of the playhead before it
@@ -166,7 +181,7 @@ pub enum StartSessionError {
 pub enum PlaylistError {
     NotFound,
     NotReady,
-    /// Abandoned / superseded miss hold reached [`IDLE_TIMEOUT`] while the
+    /// Abandoned / superseded miss hold reached [`SEGMENT_WAIT`] while the
     /// session still exists. Mapped to empty HTTP 204 (ADR-0011 §7): not
     /// 4xx/5xx so Safari does not see an application-level media failure
     /// after a long hold. Session teardown uses [`NotFound`].
@@ -2008,6 +2023,15 @@ impl HlsSessionRegistry {
         // is the case decision 3 reserves it for - a URI outside the title or
         // off the grid, refused before anyone waits on it.
         let mut accepted_hold = false;
+        // **A request refreshes the idle clock once, when it arrives — not on
+        // every poll below.** The client that walks away mid-hold leaves this
+        // loop polling for up to its deadline, and a per-poll refresh would
+        // keep `last_access` younger than [`IDLE_TIMEOUT`] for the life of the
+        // hold, so the reaper could never reap the abandoned session. One
+        // refresh per request is safe because [`SEGMENT_WAIT`] <
+        // [`IDLE_TIMEOUT`]: the longest legitimate hold still ends before the
+        // idle clock runs out (see both constants).
+        let mut first_poll = true;
         let enter_no_fill = |reason: &str,
                              session_id: &str,
                              file_name: &str,
@@ -2018,13 +2042,19 @@ impl HlsSessionRegistry {
             if !*holding_no_fill {
                 *holding_no_fill = true;
                 *holding_for_land = false;
-                *deadline = Instant::now() + IDLE_TIMEOUT;
+                // Bound the no-fill wait by what a hold is allowed to take,
+                // not by the idle clock. Extending it to IDLE_TIMEOUT lets a
+                // superseded/abandoned request hold its encoder for the life
+                // of the hold while the idle reaper stands down; SEGMENT_WAIT
+                // keeps every legitimate hold inside the idle clock
+                // (SEGMENT_WAIT < IDLE_TIMEOUT, see both constants).
+                *deadline = Instant::now() + SEGMENT_WAIT;
                 tracing::info!(
                     session_id,
                     asset = %file_name,
                     play_start_ms = session.play_start_ms,
                     pending_play_ms = session.pending_play_ms,
-                    hold_ms = IDLE_TIMEOUT.as_millis(),
+                    hold_ms = SEGMENT_WAIT.as_millis(),
                     reason,
                     "hls asset no-fill hold"
                 );
@@ -2039,7 +2069,12 @@ impl HlsSessionRegistry {
                 let session = sessions
                     .get_mut(session_id)
                     .ok_or(PlaylistError::NotFound)?;
-                session.last_access = Instant::now();
+                if first_poll {
+                    // Once per request: refresh on arrival, then let the idle
+                    // clock run while the hold polls below (see above).
+                    session.last_access = Instant::now();
+                    first_poll = false;
+                }
                 if let Some(ms) = requested_ms {
                     // Monotonic: a prefetch that runs ahead moves the
                     // playhead, a scrub back does not rewind it. A seek
@@ -4736,6 +4771,128 @@ mod tests {
         for rung in [VideoRung::SingleVideo, VideoRung::SecondVideo] {
             stop_child(&mut session.encoder_state_mut(rung).child);
         }
+    }
+
+    /// The ordering that makes the once-per-request idle refresh safe, pinned
+    /// as a test so an inversion fails by name.
+    ///
+    /// A request refreshes `last_access` once, on arrival, and a hold may then
+    /// wait out a full [`SEGMENT_WAIT`] (the no-fill hold is bounded by it
+    /// too). The idle reaper force-stops a session whose `last_access` is
+    /// older than [`IDLE_TIMEOUT`]. If the longest legitimate hold could reach
+    /// or pass the idle clock, a healthy waiting session would be reaped
+    /// mid-wait. 30 < 60 is what makes the hold-safe reaping safe.
+    #[test]
+    fn a_legitimate_hold_cannot_outlive_the_idle_clock() {
+        assert!(
+            SEGMENT_WAIT < IDLE_TIMEOUT,
+            "SEGMENT_WAIT ({SEGMENT_WAIT:?}) must stay below IDLE_TIMEOUT \
+             ({IDLE_TIMEOUT:?}): the idle reaper force-stops a session whose \
+             last request is older than IDLE_TIMEOUT, and a legitimate hold \
+             may wait a full SEGMENT_WAIT. Raise SEGMENT_WAIT above \
+             IDLE_TIMEOUT and a healthy waiting session becomes reapable \
+             mid-wait."
+        );
+    }
+
+    /// A hold that is polling must not advance `last_access`.
+    ///
+    /// The asset hold loop used to refresh `last_access` on every poll, so a
+    /// client that left mid-hold kept its session's idle clock fresh for the
+    /// life of the hold and the reaper never fired. `last_access` is now
+    /// refreshed once per request, when it arrives; the polls below must leave
+    /// the timestamp alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_polling_hold_does_not_advance_last_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let mut session = make_test_session(&session_dir);
+        session.duration_ms = 60_000;
+        // A stand-in child keeps the miss policy Waiting instead of refusing:
+        // without a producer the Wait branch answers immediately.
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        session.primed = true;
+        // Backdate the clock so the arrival refresh below is observable: the
+        // request must move last_access off this sentinel before we measure.
+        session.last_access = Instant::now() - Duration::from_secs(10);
+        // Play at 0, want at SEGMENT_MS: in-window fill-forward just past the
+        // (empty) frontier. The loop holds and polls — it never resolves (the
+        // segment is never written) and never enters the no-fill hold.
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reg_hold = Arc::clone(&reg);
+        let hold_name = crate::hls_segment_map::time_keyed_segment_name(SEGMENT_MS);
+        std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let result = reg_hold.asset("s1", &hold_name, None);
+            let _ = done_tx.send(result);
+        });
+        started_rx.recv().expect("hold thread started");
+
+        // Wait until the request has arrived and refreshed the clock once,
+        // then let it poll a few times. Reading before the arrival refresh
+        // would compare against the backdated sentinel and prove nothing.
+        let refresh_deadline = Instant::now() + Duration::from_secs(5);
+        let t_arrival = loop {
+            let t = {
+                let sessions = reg.sessions.lock().unwrap();
+                sessions.get("s1").unwrap().last_access
+            };
+            if t.elapsed() < Duration::from_secs(5) {
+                break t;
+            }
+            assert!(
+                Instant::now() < refresh_deadline,
+                "the held request never refreshed last_access on arrival"
+            );
+            std::thread::sleep(SEGMENT_POLL);
+        };
+
+        // Several more polls: under the old per-poll refresh each one moved
+        // the timestamp forward, which is exactly the bug under test.
+        std::thread::sleep(SEGMENT_POLL * 3);
+        let t_after = {
+            let sessions = reg.sessions.lock().unwrap();
+            sessions.get("s1").unwrap().last_access
+        };
+        assert_eq!(
+            t_after, t_arrival,
+            "polling must not advance last_access: the request refreshed it on \
+             arrival and the hold is waiting under the idle clock; per-poll \
+             refreshes would keep an abandoned session alive for the life of \
+             its hold"
+        );
+
+        // The request is still holding — it cannot resolve and its SEGMENT_WAIT
+        // deadline is far off. If it had already returned, the assertions above
+        // would prove nothing about polling.
+        assert!(
+            matches!(
+                done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the held request must still be polling while the clock assertions run"
+        );
+
+        // End the hold deterministically, then check how it ended.
+        reg.stop("s1");
+        let result = done_rx
+            .recv_timeout(SEGMENT_WAIT)
+            .expect("held request returned after the session stopped");
+        assert!(
+            matches!(result, Err(PlaylistError::NotFound)),
+            "a request whose session was stopped ends NotFound; got {result:?}"
+        );
     }
 
     /// This is the boundary that M1's unit-mismatch mutation below breaks.
