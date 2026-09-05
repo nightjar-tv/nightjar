@@ -529,8 +529,14 @@ impl LibraryPool {
     ) -> Result<(), String> {
         let was_paused = self.availability.pause.is_paused(library_id);
         let now_paused = !reachable;
+        // The write is load-bearing in both arms: `reachable` is the column the
+        // API and the library page serve (ADR-0014 §9), and this arm is what
+        // re-converges it when memory already holds the target state. The
+        // changed arm below propagates the same failure; so does this one
+        // (Rule 4.11). Discarding it silently would leave the column and the
+        // pause gate disagreeing with no trace.
         if was_paused == now_paused {
-            let _ = self.db.set_library_reachable(library_id, reachable);
+            self.db.set_library_reachable(library_id, reachable)?;
             return Ok(());
         }
         self.db.set_library_reachable(library_id, reachable)?;
@@ -1560,6 +1566,50 @@ mod tests {
         assert_eq!(batch.pushed(), 0, "a paused library must not be counted");
         assert_eq!(remaining_of(&batch), 0);
         batch.wait();
+    }
+
+    /// A write failure while the pause state is unchanged must not be silent.
+    /// The changed arm propagates the same failure with `?`; the unchanged arm
+    /// used to discard it with `let _ =`. A discarded failure would leave the
+    /// DB `reachable` column (what the API serves, ADR-0014 §9) disagreeing
+    /// with the in-memory pause gate and nothing would log it.
+    #[test]
+    fn unchanged_state_reachability_write_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let (db, pool) = test_pool(dir.path());
+        let library_id = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+
+        // Both memory and DB say reachable, so this call takes the unchanged arm.
+        assert!(pool.is_library_reachable(library_id));
+        assert!(db.get_library(library_id).unwrap().unwrap().reachable);
+
+        // Make every write on this connection fail from here on.
+        db.with_conn(|c| {
+            c.execute_batch("PRAGMA query_only = ON")
+                .map_err(|e| format!("query_only pragma: {e}"))
+        })
+        .unwrap();
+
+        let err = pool
+            .set_library_reachability(library_id, &media.to_string_lossy(), true)
+            .unwrap_err();
+        assert!(
+            err.contains("reachable"),
+            "the error must name the failed write, got: {err}"
+        );
+        // The failed write must not have half-applied: neither side moved, and
+        // the caller now holds the error instead of the write being dropped.
+        assert!(pool.is_library_reachable(library_id));
+        assert!(db.get_library(library_id).unwrap().unwrap().reachable);
     }
 
     /// `purge_queue_for_library` discards queued probes and decrements for
