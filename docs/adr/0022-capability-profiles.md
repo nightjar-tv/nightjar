@@ -157,8 +157,10 @@ directly.
 Before calling Gate 2 sized, measure how many concurrent 1080p transcodes an
 Intel N100 sustains at the Auto target this profile ADR implies, reading
 source media from **local disk** (or another path whose read bandwidth is not
-the bottleneck). Record the number next to the Gate 2 checklist; do not guess
-from `NIGHTJAR_HLS_MAX_SESSIONS`. Concurrent encodes against an SMB or other
+the bottleneck). Record the number next to the Gate 2 checklist. **Do not guess
+from a cap: as of #230 there is none, and `NIGHTJAR_HLS_MAX_SESSIONS` is
+retired.** This figure is a floor a small box must clear, never a limit the
+server imposes. Concurrent encodes against an SMB or other
 remote share are a storage-admission observation, not this encoder-ceiling
 number.
 

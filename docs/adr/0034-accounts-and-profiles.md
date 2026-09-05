@@ -202,7 +202,10 @@ profile holds viewing identity and never holds authority.**
    paying for the bandwidth and three profiles must not buy three times the
    share. It is a nullable integer on the account where null means no
    per-account limit, which is the shipped default. The effective limit is the
-   tighter of the global `NIGHTJAR_HLS_MAX_SESSIONS` and the per-account value,
+   tighter of the per-account value and what admission measures. **Amended
+   2026-09-05:** this read "the global `NIGHTJAR_HLS_MAX_SESSIONS`", which no
+   longer exists (#230). A per-account limit now composes against measured
+   admission, not against a global constant. The composition rule is unchanged,
    composing the same way ADR-0022 §5 composes client capability against server
    policy, and a refusal carries a ceiling reason that names which of the two
    bound. Enforcement is at playback session start and nowhere else.
@@ -373,8 +376,9 @@ several times.
   blocker. Accounts do not decide it, and they do add a reason to.
 - Every item-returning query gains a scope parameter, so B2-D's filter has
   somewhere to attach and a Block 3 route inherits it by construction.
-- ADR-0007's global `NIGHTJAR_HLS_MAX_SESSIONS` stays global after this slice.
-  The per-user half of that cap model waits for B2-9, so accounts exist for a
-  slice or two before they constrain anything.
+- **Amended 2026-09-05.** This said ADR-0007's global
+  `NIGHTJAR_HLS_MAX_SESSIONS` stays global after this slice. It is gone (#230),
+  replaced by measured admission. The per-user half still waits for B2-9, so
+  accounts exist for a slice or two before they constrain anything.
 - `watch_state` and `playback_events` do not exist yet. This ADR fixes the
   identity they reference and nothing else; their own shapes are B2-B and B2-C.

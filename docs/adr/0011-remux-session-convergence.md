@@ -102,6 +102,13 @@ boundaries (time-keyed URIs, playlist from muxer truth). ABR alignment
 
 **No session sharing.** Session reuse by `(itemId, startMs)` is removed with
 fork-on-scrub (§3), so two viewers of the same title get two FFmpeg processes.
+> **Superseded 2026-09-05 by ADR-0050 §7-§8, shipped in #230.** There is no
+> global session cap. `NIGHTJAR_HLS_MAX_SESSIONS` is retired and
+> `NIGHTJAR_HLS_MAX_ENCODERS` is an operator override, not a default. Admission
+> is measured: a session is admitted unless the box has too little memory to
+> hold another encoder. The text below describes the model that was live when
+> this was written.
+
 With `-c copy` that is cheap CPU, but both count against the global session cap
 (`NIGHTJAR_HLS_MAX_SESSIONS`, default 3): a household watching the same film on
 two devices holds two of three slots. That is the accepted trade — sharing was
