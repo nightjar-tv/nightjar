@@ -3499,6 +3499,19 @@ mod tests {
     /// the item lands `unavailable`, never a ready map. The fixture is a
     /// tail-truncated MKV (Cues live at the end), so the index read cannot
     /// succeed and the build must take the packet-walk fallback.
+    ///
+    /// **The in-flight state is deterministic, not raced.** The old form
+    /// waited for `queued_maps == 0` and then flipped reachability — and
+    /// between "started" and "flipped" a fast runner could finish the whole
+    /// walk and store a ready map, which the assertion then reported as the
+    /// product's bug. It was a race in the test: the walk that finished had
+    /// already proved nothing about cancellation. This test arms the pool's
+    /// test-only hold ([`pool::LibraryPool::arm_map_walk_hold`]), so the map
+    /// worker reports that the build has entered and then parks until the
+    /// test releases it. The reachability flip therefore always lands while
+    /// the build is provably still running. A run where the hold never fires
+    /// proves nothing, so the wait is bounded and panics loudly instead of
+    /// passing.
     #[test]
     fn map_packet_walk_in_flight_is_cancelled_when_library_unreachable() {
         if !require_ffprobe() {
@@ -3568,21 +3581,27 @@ mod tests {
             .unwrap();
         let item_id = ids[0];
 
+        // Arm the hold, then enqueue: the worker reports the build has
+        // entered and parks until released. Flipping reachability while the
+        // worker is parked cannot race the walk, so the map below must be
+        // cancelled in flight — never a ready map.
+        let hold = pool.arm_map_walk_hold();
         pool.enqueue_map_rebuild(item_id, lib.id, mkv);
-        for _ in 0..400 {
-            if pool.background_progress().queued_maps == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            pool.background_progress().queued_maps,
-            0,
-            "map build never started"
-        );
+        let entered = hold
+            .entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "map build never entered the test hold; the walk was not held in flight: {e}"
+                )
+            });
+        assert_eq!(entered, item_id, "the held map build is a different item");
 
         pool.set_library_reachability(lib.id, &lib.path, false)
             .unwrap();
+        // Release the parked build: it must observe the flip and cancel.
+        let _ = hold.release_tx.send(());
+        drop(hold);
         for _ in 0..400 {
             let row = db.get_item(item_id).unwrap().unwrap();
             if row.map_status != "pending" {
