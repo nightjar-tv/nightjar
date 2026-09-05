@@ -102,7 +102,10 @@ pub struct AssetQuery {
 #[derive(Clone, Copy)]
 enum PlaylistKind {
     Master,
+    /// The flat `/index.m3u8` route: the single production rung.
     Media,
+    /// The rung-scoped `/v/{rung}/index.m3u8` route, with the parsed rung.
+    RungMedia(VideoRung),
 }
 
 fn dto_from_view(view: nightjar_transcode::SessionView) -> TranscodeSessionDto {
@@ -703,11 +706,16 @@ pub async fn master(
     wait_playlist(state, session_id, PlaylistKind::Master).await
 }
 
-/// The session's media playlist (ADR-0054 decision 5).
+/// The session's media playlist for the single production rung
+/// (ADR-0054 decision 5).
 ///
 /// `EXT-X-MAP` inside it is per run, because the init carries the land in its
 /// `elst` empty edit (decision 4, overturned 2026-08-31). That is the one thing
 /// in this response that changes between two fetches of the same URI.
+///
+/// This flat route stays served so a client that attached before the master
+/// advertised the rung namespace keeps playing; it resolves to the single
+/// rung, byte-identical to `/v/single/index.m3u8`.
 pub async fn playlist(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -715,17 +723,18 @@ pub async fn playlist(
     wait_playlist(state, session_id, PlaylistKind::Media).await
 }
 
-/// The media playlist for a named video rung (ADR-0051 amendment 1).
+/// The session's media playlist for a named video rung (ADR-0051 amendment 1).
 ///
-/// The sole known rung delegates to [`playlist`] so this grammar slice cannot
-/// drift from the existing rendition. Validation happens first: an unknown
-/// name must never select that rendition implicitly.
+/// The parsed rung is used, not just validated: the bytes come from that
+/// rung's segment map and name that rung's segment URIs, so a rung-scoped URL
+/// cannot silently resolve to the single rendition. Validation happens first:
+/// an unknown name must never select a rendition implicitly.
 pub async fn rung_playlist(
-    state: State<AppState>,
+    State(state): State<AppState>,
     Path((session_id, rung_name)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    let _rung = require_known_rung(&rung_name)?;
-    playlist(state, Path(session_id)).await
+    let rung = require_known_rung(&rung_name)?;
+    wait_playlist(state, session_id, PlaylistKind::RungMedia(rung)).await
 }
 
 pub async fn run_init(
@@ -841,6 +850,7 @@ async fn wait_playlist(
             let outcome = match kind {
                 PlaylistKind::Master => hls.master(&sid),
                 PlaylistKind::Media => hls.playlist(&sid),
+                PlaylistKind::RungMedia(rung) => hls.rung_playlist(&sid, rung),
             };
             match outcome {
                 Err(PlaylistError::NotReady) if std::time::Instant::now() < deadline => {
@@ -856,16 +866,22 @@ async fn wait_playlist(
     match result {
         Ok(bytes) => {
             let resource = match kind {
-                PlaylistKind::Master => "master.m3u8",
-                PlaylistKind::Media => "index.m3u8",
+                PlaylistKind::Master => "master.m3u8".to_string(),
+                PlaylistKind::Media => "index.m3u8".to_string(),
+                PlaylistKind::RungMedia(rung) => {
+                    format!("v/{}/index.m3u8", rung.as_str())
+                }
             };
-            log_hls_client_req(&session_id, resource, None, 200, None);
+            log_hls_client_req(&session_id, &resource, None, 200, None);
             m3u8_ok(bytes)
         }
         Err(e) => {
             let resource = match kind {
-                PlaylistKind::Master => "master.m3u8",
-                PlaylistKind::Media => "index.m3u8",
+                PlaylistKind::Master => "master.m3u8".to_string(),
+                PlaylistKind::Media => "index.m3u8".to_string(),
+                PlaylistKind::RungMedia(rung) => {
+                    format!("v/{}/index.m3u8", rung.as_str())
+                }
             };
             let status = match &e {
                 PlaylistError::NotFound => 404,
@@ -873,7 +889,7 @@ async fn wait_playlist(
                 PlaylistError::AbandonedHoldEnded => 204,
                 PlaylistError::Failed(_) => 500,
             };
-            log_hls_client_req(&session_id, resource, None, status, None);
+            log_hls_client_req(&session_id, &resource, None, status, None);
             map_playlist_err(&session_id, e)
         }
     }
@@ -1001,22 +1017,25 @@ pub async fn segment(
 
 /// One media segment for a named video rung (ADR-0051 amendment 1).
 ///
-/// This capture is narrower than the top-level session capture: the rung URI
-/// grammar contains only `seg_<ms:011>.m4s`, not `init.mp4`. Axum cannot mix
-/// the static segment spelling with a path parameter, so the handler closes
-/// the capture with the segment-name parser before delegating to [`segment`].
+/// The parsed rung is used, not just validated: the bytes are resolved against
+/// that rung's segment map, so a rung-scoped segment URL cannot silently serve
+/// the single rendition's file at the same title time. This capture is
+/// narrower than the top-level session capture: the rung URI grammar contains
+/// only `seg_<ms:011>.m4s`, not `init.mp4`. Axum cannot mix the static segment
+/// spelling with a path parameter, so the handler closes the capture with the
+/// segment-name parser before serving.
 pub async fn rung_segment(
     state: State<AppState>,
     Path((session_id, rung_name, asset_name)): Path<(String, String, String)>,
     query: Query<AssetQuery>,
 ) -> ApiResult<Response> {
-    let _rung = require_known_rung(&rung_name)?;
+    let rung = require_known_rung(&rung_name)?;
     if parse_time_keyed_segment_name(&asset_name).is_none() {
         return Err(ApiError::not_found(format!(
             "asset {asset_name} for rung {rung_name} not found"
         )));
     }
-    segment(state, Path((session_id, asset_name)), query).await
+    rung_asset(state, session_id, rung, asset_name, query).await
 }
 
 fn require_known_rung(rung_name: &str) -> ApiResult<VideoRung> {
@@ -1039,15 +1058,46 @@ async fn asset(
     let result = tokio::task::spawn_blocking(move || hls.asset(&sid, &name, fetcher.as_deref()))
         .await
         .map_err(|e| ApiError::internal(format!("hls asset task: {e}")))?;
+    map_asset_outcome(&session_id, &asset, fetcher_for_log.as_deref(), result)
+}
 
-    let fetcher_ref = fetcher_for_log.as_deref();
+/// The rung-scoped twin of [`asset`]: resolves against the named rung's map
+/// instead of the single production rung's. Error handling is shared with the
+/// flat path — one response policy for both namespaces (Rule 4.11).
+async fn rung_asset(
+    state: State<AppState>,
+    session_id: String,
+    rung: VideoRung,
+    asset: String,
+    query: Query<AssetQuery>,
+) -> ApiResult<Response> {
+    let hls = Arc::clone(&state.hls);
+    let sid = session_id.clone();
+    let name = asset.clone();
+    let fetcher = query.nj_fetcher.clone();
+    let fetcher_for_log = fetcher.clone();
+    let result =
+        tokio::task::spawn_blocking(move || hls.rung_asset(&sid, rung, &name, fetcher.as_deref()))
+            .await
+            .map_err(|e| ApiError::internal(format!("hls rung asset task: {e}")))?;
+    map_asset_outcome(&session_id, &asset, fetcher_for_log.as_deref(), result)
+}
+
+/// Maps a transcode asset outcome to an HTTP response and logs it. Shared by
+/// the flat and rung-scoped asset routes so the two namespaces cannot drift.
+fn map_asset_outcome(
+    session_id: &str,
+    asset: &str,
+    fetcher_ref: Option<&str>,
+    result: Result<Vec<u8>, PlaylistError>,
+) -> ApiResult<Response> {
     match result {
         Ok(bytes) => {
-            log_hls_client_req(&session_id, &asset, None, 200, fetcher_ref);
-            Ok(asset_ok(&asset, bytes))
+            log_hls_client_req(session_id, asset, None, 200, fetcher_ref);
+            Ok(asset_ok(asset, bytes))
         }
         Err(PlaylistError::NotFound) => {
-            log_hls_client_req(&session_id, &asset, None, 404, fetcher_ref);
+            log_hls_client_req(session_id, asset, None, 404, fetcher_ref);
             Err(ApiError::not_found(format!(
                 "asset {asset} for session {session_id} not found"
             )))
@@ -1055,7 +1105,7 @@ async fn asset(
         // Not yet on disk: ask the player to retry. 404 makes hls.js / Safari
         // give up on the fragment; 503 is recoverable while FFmpeg catches up.
         Err(PlaylistError::NotReady) => {
-            log_hls_client_req(&session_id, &asset, None, 503, fetcher_ref);
+            log_hls_client_req(session_id, asset, None, 503, fetcher_ref);
             Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: format!("asset {asset} for session {session_id} not ready yet"),
@@ -1064,13 +1114,13 @@ async fn asset(
         }
         // Abandoned / superseded hold ceiling: empty 204 (ADR-0011 §7).
         Err(PlaylistError::AbandonedHoldEnded) => {
-            log_hls_client_req(&session_id, &asset, None, 204, fetcher_ref);
+            log_hls_client_req(session_id, asset, None, 204, fetcher_ref);
             let mut res = Response::new(Body::empty());
             *res.status_mut() = StatusCode::NO_CONTENT;
             Ok(res)
         }
         Err(PlaylistError::Failed(e)) => {
-            log_hls_client_req(&session_id, &asset, None, 500, fetcher_ref);
+            log_hls_client_req(session_id, asset, None, 500, fetcher_ref);
             Err(ApiError::internal(e))
         }
     }
@@ -1106,8 +1156,17 @@ mod tests {
         }
     }
 
+    /// The single rung's playlist route and the flat route answer a missing
+    /// session identically, because both resolve to the same rung's map.
+    ///
+    /// This is the compat half of the rung namespace (the old URLs keep
+    /// working). The half that proves the parsed rung is *used* — a rung-scoped
+    /// request resolving against that rung's map rather than rung one's — needs
+    /// a live two-rung session and lives in the transcode crate, where the
+    /// existing `#[cfg(test)]` `SecondVideo` can build one without widening
+    /// production visibility (plan 2026-09-05-the-ladder-s8, answer B).
     #[tokio::test]
-    async fn known_rung_playlist_delegates_to_the_session_playlist() {
+    async fn single_rung_and_flat_playlist_answer_a_missing_session_identically() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::state::test_support::state(dir.path());
         let session_id = "missing".to_string();
@@ -1125,8 +1184,11 @@ mod tests {
         assert_eq!(rung, top_level);
     }
 
+    /// The single rung's segment route and the flat route answer a missing
+    /// session identically. The rung-resolution behaviour itself is pinned in
+    /// the transcode crate, against a live two-rung session.
     #[tokio::test]
-    async fn known_rung_segment_delegates_to_the_session_asset() {
+    async fn single_rung_and_flat_segment_answer_a_missing_session_identically() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::state::test_support::state(dir.path());
         let session_id = "missing".to_string();
