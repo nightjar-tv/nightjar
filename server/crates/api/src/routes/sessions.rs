@@ -734,9 +734,14 @@ pub async fn run_init(
 ) -> ApiResult<Response> {
     let hls = Arc::clone(&state.hls);
     let sid = session_id.clone();
-    let result = tokio::task::spawn_blocking(move || hls.run_asset(&sid, run_id, "init.mp4"))
-        .await
-        .map_err(|e| ApiError::internal(format!("hls run init task: {e}")))?;
+    // The flat `runs/{run_id}/init.mp4` URI carries no rung, and the run ids
+    // it names are the sole production rung's per-rung counters. `run_asset`
+    // needs the rung explicitly because two rungs each have a run 3.
+    let result = tokio::task::spawn_blocking(move || {
+        hls.run_asset(&sid, VideoRung::SingleVideo, run_id, "init.mp4")
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("hls run init task: {e}")))?;
     match result {
         Ok(bytes) => {
             log_hls_client_req(&session_id, "init.mp4", None, 200, None);

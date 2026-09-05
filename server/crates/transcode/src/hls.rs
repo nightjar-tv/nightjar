@@ -986,7 +986,7 @@ fn maybe_evict_finished_runs(session: &mut Session) {
         let mut orphans: Vec<(VideoRung, u64, u64)> = Vec::new();
         let mut referenced_finished: Vec<(VideoRung, u64, u64)> = Vec::new();
         for rung in rungs {
-            let live = live_run_ids(session);
+            let live = live_run_ids(session, rung);
             let referenced = session.segment_map(rung).referenced_run_ids();
             let Ok(entries) = fs::read_dir(rung_dir(&session.dir, rung)) else {
                 continue;
@@ -1062,7 +1062,7 @@ fn maybe_evict_finished_runs(session: &mut Session) {
 fn reap_empty_finished_run_dirs(session: &mut Session) {
     let rungs: Vec<VideoRung> = session.segment_maps.keys().copied().collect();
     for rung in rungs {
-        let live = live_run_ids(session);
+        let live = live_run_ids(session, rung);
         let Ok(entries) = fs::read_dir(rung_dir(&session.dir, rung)) else {
             continue;
         };
@@ -1741,7 +1741,7 @@ impl HlsSessionRegistry {
         let leg = session.encode_leg.clone();
         // A seek always applies: nothing is destroyed, so nothing can be in
         // the way of destroying it (ADR-0050 §4).
-        restart_at(session, aligned, &leg)?;
+        restart_at(session, SINGLE_VIDEO_RUNG, aligned, &leg)?;
         maybe_evict_finished_runs(session);
         Ok(session_view(session_id, session, SINGLE_VIDEO_RUNG))
     }
@@ -1762,9 +1762,14 @@ impl HlsSessionRegistry {
     }
 
     /// Init (or other run-local file) under the requested run's rung directory.
+    ///
+    /// Run ids are **per-rung** counters, so the caller names the rung whose
+    /// run it wants. Two rungs each have a run 3; resolving `run_id` against
+    /// the wrong rung serves one rung's init for another's playlist.
     pub fn run_asset(
         &self,
         session_id: &str,
+        rung: VideoRung,
         run_id: u64,
         name: &str,
     ) -> Result<Vec<u8>, PlaylistError> {
@@ -1785,7 +1790,7 @@ impl HlsSessionRegistry {
                 if let Some(err) = session.failed.clone() {
                     return Err(PlaylistError::Failed(err));
                 }
-                let path = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id).join("init.mp4");
+                let path = run_path(&session.dir, rung, run_id).join("init.mp4");
                 if let Ok(bytes) = fs::read(&path) {
                     return Ok(bytes);
                 }
@@ -2504,7 +2509,7 @@ impl HlsSessionRegistry {
                         session.encoder_state_mut(rung).throttled = false;
                         continue;
                     };
-                    let Some(lead_ms) = session_lead_ms(session) else {
+                    let Some(lead_ms) = session_lead_ms(session, rung) else {
                         continue;
                     };
                     let Some(stop) = throttle_action(state.throttled, lead_ms) else {
@@ -2709,6 +2714,7 @@ impl EncoderKind {
 
 fn restart_at(
     session: &mut Session,
+    rung: VideoRung,
     play_ms: u64,
     _encode_leg: &crate::EncodeLeg,
 ) -> Result<(), PlaylistError> {
@@ -2723,26 +2729,26 @@ fn restart_at(
     tracing::info!(
         prior_play_start_ms = prior_play,
         prior_first_segment_ready = prior_ready,
-        superseding_encoder = session.encoder_state(SINGLE_VIDEO_RUNG).child.is_some(),
-        held_encoders = session.encoder_state(SINGLE_VIDEO_RUNG).superseded.len(),
+        superseding_encoder = session.encoder_state(rung).child.is_some(),
+        held_encoders = session.encoder_state(rung).superseded.len(),
         new_play_start_ms = play_start_ms,
         "hls seek: supersede prior encode"
     );
-    supersede_child(session, SINGLE_VIDEO_RUNG);
+    supersede_child(session, rung);
     // `throttled` describes a live process. This session keeps going with a
     // new child, so leaving it set would make the next tick send a resume to
     // a child that was never suspended and skip the suspend it needs. The
     // other two `stop_child` callers remove the session outright.
-    session.encoder_state_mut(SINGLE_VIDEO_RUNG).throttled = false;
-    sync_segment_map(session, SINGLE_VIDEO_RUNG);
+    session.encoder_state_mut(rung).throttled = false;
+    sync_segment_map(session, rung);
     sync_all_run_indexes(session);
     // Duplicate-write stop: scrub-back (or re-land) into media this rung's map
     // already holds — mint a fresh playlist URI, copy init, do not re-encode.
-    if let Some(mapped) = map_segment_covering(session, play_start_ms) {
+    if let Some(mapped) = map_segment_covering(session, rung, play_start_ms) {
         let src_run = mapped.run_id;
-        let run_id = session.encoder_state(SINGLE_VIDEO_RUNG).next_run_id;
-        session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id += 1;
-        let new_dir = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
+        let run_id = session.encoder_state(rung).next_run_id;
+        session.encoder_state_mut(rung).next_run_id += 1;
+        let new_dir = run_path(&session.dir, rung, run_id);
         fs::create_dir_all(&new_dir).map_err(|e| {
             PlaylistError::Failed(format!("create run dir {}: {e}", new_dir.display()))
         })?;
@@ -2779,7 +2785,7 @@ fn restart_at(
         // mode is real in the one instrument used.** Do not restore the
         // identity claim without a player. Measured 2026-08-31 on `d341cc9`,
         // macOS Safari native and hls.js, across four spawned runs.
-        let init_src = run_path(&session.dir, SINGLE_VIDEO_RUNG, src_run).join("init.mp4");
+        let init_src = run_path(&session.dir, rung, src_run).join("init.mp4");
         let init_dst = new_dir.join("init.mp4");
         if init_src.exists() {
             fs::copy(&init_src, &init_dst).map_err(|e| {
@@ -2790,7 +2796,7 @@ fn restart_at(
                 ))
             })?;
         }
-        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = run_id;
+        session.encoder_state_mut(rung).current_run_id = run_id;
         session.current_run_eof = true;
         session.start_ms = play_start_ms;
         session.play_start_ms = play_start_ms;
@@ -2807,7 +2813,7 @@ fn restart_at(
             session.pending_play_ms = None;
             session.pending_since = None;
         }
-        release_overtaken_superseded(session);
+        release_overtaken_superseded(session, rung);
         maybe_evict_finished_runs(session);
         tracing::info!(
             play_start_ms,
@@ -2826,9 +2832,9 @@ fn restart_at(
     // Gate 2 / fill-forward: do not wipe prior run dirs. Scrub-back into
     // mapped media is a plain file serve (ADR-0020 per-rung map). New producer
     // output goes in a fresh run directory under the active rung.
-    let run_id = session.encoder_state(SINGLE_VIDEO_RUNG).next_run_id;
-    session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id += 1;
-    let run_dir = run_path(&session.dir, SINGLE_VIDEO_RUNG, run_id);
+    let run_id = session.encoder_state(rung).next_run_id;
+    session.encoder_state_mut(rung).next_run_id += 1;
+    let run_dir = run_path(&session.dir, rung, run_id);
     fs::create_dir_all(&run_dir)
         .map_err(|e| PlaylistError::Failed(format!("create run dir {}: {e}", run_dir.display())))?;
     // ADR-0023 §9.3: a seek that arrives before the keyframe map is ready
@@ -2870,10 +2876,10 @@ fn restart_at(
     )
     .map_err(PlaylistError::Failed)?;
     session.map_binding.bound = plan.virtual_input.take();
-    let state = session.encoder_state_mut(SINGLE_VIDEO_RUNG);
+    let state = session.encoder_state_mut(rung);
     state.child = Some(child);
     state.child_rss_bytes = None;
-    session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = run_id;
+    session.encoder_state_mut(rung).current_run_id = run_id;
     session.current_run_eof = false;
     session.start_ms = start_ms;
     session.play_start_ms = play_start_ms;
@@ -2887,7 +2893,7 @@ fn restart_at(
         session.pending_play_ms = None;
         session.pending_since = None;
     }
-    release_overtaken_superseded(session);
+    release_overtaken_superseded(session, rung);
     maybe_evict_finished_runs(session);
     tracing::info!(
         start_ms,
@@ -2905,32 +2911,34 @@ fn restart_at(
     Ok(())
 }
 
-/// Mapped segment that already covers title-absolute `play_ms`.
+/// Mapped segment that already covers title-absolute `play_ms` in `rung`'s
+/// map.
 ///
 /// Producer sidx can land a few tens of ms after `-ss` (dogfood: start 80 for
 /// play 0). Treat the first mapped segment at or after `play` that starts
 /// before `play + 2*SEGMENT_MS` as a hit so scrub-back does not re-encode.
+///
+/// Maps are per rung (ADR-0051 amendment 2), so the caller passes the rung it
+/// is about to restart; each rung's run ids are its own, and the map-hit
+/// branch of [`restart_at`] must copy the init from the same rung's run.
 fn map_segment_covering(
     session: &Session,
+    rung: VideoRung,
     play_ms: u64,
 ) -> Option<crate::hls_segment_map::MappedSegment> {
     let play = align_to_segment(play_ms);
-    if let Some(exact) = session.segment_map(SINGLE_VIDEO_RUNG).get(play) {
+    if let Some(exact) = session.segment_map(rung).get(play) {
         return Some(exact.clone());
     }
-    if let Some(s) = session
-        .segment_map(SINGLE_VIDEO_RUNG)
-        .iter_ordered()
-        .find(|s| {
-            let end = s.start_ms.saturating_add(s.duration_ms.max(1));
-            s.start_ms <= play && play < end
-        })
-    {
+    if let Some(s) = session.segment_map(rung).iter_ordered().find(|s| {
+        let end = s.start_ms.saturating_add(s.duration_ms.max(1));
+        s.start_ms <= play && play < end
+    }) {
         return Some(s.clone());
     }
     let slack = SEGMENT_MS.saturating_mul(2);
     session
-        .segment_map(SINGLE_VIDEO_RUNG)
+        .segment_map(rung)
         .iter_ordered()
         .find(|s| s.start_ms >= play && s.start_ms < play.saturating_add(slack))
         .cloned()
@@ -3013,7 +3021,7 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
     let preempt_before_land =
         !ready && coalesce_preempt_before_land(cooking, pending) && since >= RESTART_MIN_INTERVAL;
     let leg = session.encode_leg.clone();
-    restart_at(session, pending, &leg)?;
+    restart_at(session, SINGLE_VIDEO_RUNG, pending, &leg)?;
     if preempt_before_land {
         tracing::info!(
             pending_play_ms = pending,
@@ -4251,8 +4259,13 @@ fn supersede_child(session: &mut Session, rung: VideoRung) {
 /// ADR-0050 §4-§5 the prior encoder outlives the seek by [`REAP_AFTER`], and
 /// unlinking its directory would take away the media the whole policy exists
 /// to keep serving.
-fn live_run_ids(session: &Session) -> Vec<u64> {
-    let state = session.encoder_state(SINGLE_VIDEO_RUNG);
+///
+/// Run ids are **per-rung** counters ([`EncoderState::next_run_id`]), so the
+/// caller passes the rung whose runs are being judged. Two rungs each have a
+/// run 3; judging one by the other's run 3 would reap a directory an encoder
+/// is still writing into.
+fn live_run_ids(session: &Session, rung: VideoRung) -> Vec<u64> {
+    let state = session.encoder_state(rung);
     let mut ids = Vec::with_capacity(state.superseded.len() + 1);
     ids.push(state.current_run_id);
     ids.extend(state.superseded.iter().map(|s| s.run_id));
@@ -4291,7 +4304,11 @@ fn live_run_ids(session: &Session) -> Vec<u64> {
 /// `wait()`, and [`restart_at`] runs under the sessions mutex, so killing here
 /// would put a blocking `wait()` on a just-signalled process into the seek
 /// path. The next [`THROTTLE_TICK`] does the killing where it already lives.
-fn release_overtaken_superseded(session: &mut Session) {
+///
+/// `rung` is the rung [`restart_at`] superseded; its held encoders are the
+/// ones the new run can have overtaken. Another rung's held encoders answer
+/// to the hop that superseded them, not to this restart.
+fn release_overtaken_superseded(session: &mut Session, rung: VideoRung) {
     let now = Instant::now();
     let start_ms = session.start_ms;
     // Disjoint fields: the segment map is read while encoder state is walked mutably.
@@ -4300,17 +4317,11 @@ fn release_overtaken_superseded(session: &mut Session) {
         encoder_states,
         ..
     } = session;
-    let Some(map) = segment_maps.get(&SINGLE_VIDEO_RUNG) else {
-        panic!(
-            "session has no segment map for rung {}",
-            SINGLE_VIDEO_RUNG.as_str()
-        );
+    let Some(map) = segment_maps.get(&rung) else {
+        panic!("session has no segment map for rung {}", rung.as_str());
     };
-    let Some(state) = encoder_states.get_mut(&SINGLE_VIDEO_RUNG) else {
-        panic!(
-            "session has no encoder state for rung {}",
-            SINGLE_VIDEO_RUNG.as_str()
-        );
+    let Some(state) = encoder_states.get_mut(&rung) else {
+        panic!("session has no encoder state for rung {}", rung.as_str());
     };
     for held in state.superseded.iter_mut() {
         let Some(frontier) = frontier_ms(map.iter_ordered(), held.run_id) else {
@@ -4419,12 +4430,17 @@ fn lead_ms(produced_end_ms: Option<u64>, last_requested_ms: u64) -> Option<u64> 
 /// serve (ADR-0020 §3). Its maximum is therefore a frontier the live encoder
 /// may be nowhere near after a backward seek, and using it would report no
 /// lead for the rest of the session.
-fn session_lead_ms(session: &Session) -> Option<u64> {
+///
+/// `rung` is the rung whose lead is being measured. The throttle applies its
+/// verdict per rung ([`HlsSessionRegistry::throttle_loop`] walks each rung's
+/// encoder), so reading one rung's frontier and applying it to every rung
+/// would throttle the whole session on a single rung's lead.
+fn session_lead_ms(session: &Session, rung: VideoRung) -> Option<u64> {
     // One live encoder per session, so the current run is the serving run.
     // ADR-0050 §4 breaks that: see the note on `frontier_ms`.
     let produced_end = frontier_ms(
-        session.segment_map(SINGLE_VIDEO_RUNG).iter_ordered(),
-        session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
+        session.segment_map(rung).iter_ordered(),
+        session.encoder_state(rung).current_run_id,
     );
     lead_ms(produced_end, session.last_requested_ms)
 }
@@ -4646,6 +4662,260 @@ mod tests {
         let session = make_test_session(dir.path());
 
         let _ = session.segment_map(VideoRung::SecondVideo);
+    }
+
+    /// `make_test_session` with both `VideoRung`s populated.
+    ///
+    /// A session that offers a second rung under test is the shape every
+    /// per-rung isolation test here needs (ADR-0051): each rung has its own
+    /// segment map and its own encoder state, so one rung's runs and frontiers
+    /// must never be read for the other.
+    fn make_two_rung_test_session(dir: &Path) -> Session {
+        let mut session = make_test_session(dir);
+        session.encoder_states = HashMap::from([
+            (VideoRung::SingleVideo, empty_encoder_state(0, 1)),
+            (VideoRung::SecondVideo, empty_encoder_state(0, 1)),
+        ]);
+        session.segment_maps = HashMap::from([
+            (VideoRung::SingleVideo, Default::default()),
+            (VideoRung::SecondVideo, Default::default()),
+        ]);
+        session
+    }
+
+    fn empty_encoder_state(current_run_id: u64, next_run_id: u64) -> EncoderState {
+        EncoderState {
+            current_run_id,
+            next_run_id,
+            child: None,
+            child_rss_bytes: None,
+            throttled: false,
+            superseded: Vec::new(),
+        }
+    }
+
+    /// `live_run_ids` reads the rung it is given, never the session's first
+    /// rung.
+    ///
+    /// Run ids are per-rung counters (ADR-0051 amendment 1): rung one's run 3
+    /// is not rung two's run 3. The eviction walks call this once per rung, so
+    /// a version that hardcodes `SINGLE_VIDEO_RUNG` judges rung two's run
+    /// directories by rung one's run ids and can reap a directory an encoder
+    /// is still writing into.
+    #[cfg(unix)]
+    #[test]
+    fn live_run_ids_reads_only_the_given_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_two_rung_test_session(dir.path());
+        let now = Instant::now();
+        session.encoder_states = HashMap::from([
+            (
+                VideoRung::SingleVideo,
+                EncoderState {
+                    current_run_id: 2,
+                    next_run_id: 3,
+                    child: None,
+                    child_rss_bytes: None,
+                    throttled: false,
+                    superseded: vec![SupersededEncoder {
+                        child: spawn_stand_in_encoder(),
+                        rss_bytes: None,
+                        reap_at: now + REAP_AFTER,
+                        run_id: 5,
+                    }],
+                },
+            ),
+            (
+                VideoRung::SecondVideo,
+                EncoderState {
+                    current_run_id: 7,
+                    next_run_id: 8,
+                    child: None,
+                    child_rss_bytes: None,
+                    throttled: false,
+                    superseded: vec![SupersededEncoder {
+                        child: spawn_stand_in_encoder(),
+                        rss_bytes: None,
+                        reap_at: now + REAP_AFTER,
+                        run_id: 9,
+                    }],
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            live_run_ids(&session, VideoRung::SingleVideo),
+            vec![2, 5],
+            "rung one's live runs are its own current and held runs"
+        );
+        assert_eq!(
+            live_run_ids(&session, VideoRung::SecondVideo),
+            vec![7, 9],
+            "rung two's live runs must not be rung one's: both rungs hold a \
+             run 5 / run 9 pair of their own"
+        );
+
+        for rung in [VideoRung::SingleVideo, VideoRung::SecondVideo] {
+            reap_all_superseded(&mut session, rung);
+        }
+    }
+
+    /// `session_lead_ms` measures the rung it is given, never the first rung's
+    /// frontier.
+    ///
+    /// The throttle applies its verdict per rung
+    /// ([`HlsSessionRegistry::throttle_loop`] walks each rung's encoder).
+    /// Hardcoding the rung throttles every rung on one rung's lead. Here rung
+    /// one's current run is far ahead of the playhead while rung two's current
+    /// run has produced nothing, so the second rung's lead must be `None`.
+    #[test]
+    fn session_lead_ms_reads_only_the_given_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_two_rung_test_session(dir.path());
+        session.encoder_states = HashMap::from([
+            (VideoRung::SingleVideo, empty_encoder_state(3, 4)),
+            (VideoRung::SecondVideo, empty_encoder_state(7, 8)),
+        ]);
+        session.last_requested_ms = 0;
+        // Rung one's current run 3 has produced out to 100_000 + SEGMENT_MS.
+        session.segment_map_mut(VideoRung::SingleVideo).insert(
+            crate::hls_segment_map::MappedSegment {
+                start_ms: 100_000,
+                duration_ms: SEGMENT_MS,
+                run_id: 3,
+                rel_path: PathBuf::from("vsingle/run_3/seg100000.m4s"),
+            },
+        );
+        // Rung two's map holds only run 99's media, so its current run 7 has
+        // no frontier: an empty current run is a session that has not started,
+        // and the throttle must leave it alone.
+        session.segment_map_mut(VideoRung::SecondVideo).insert(
+            crate::hls_segment_map::MappedSegment {
+                start_ms: 10_000,
+                duration_ms: SEGMENT_MS,
+                run_id: 99,
+                rel_path: PathBuf::from("vsecond/run_99/seg010000.m4s"),
+            },
+        );
+
+        assert_eq!(
+            session_lead_ms(&session, VideoRung::SingleVideo),
+            Some(100_000 + SEGMENT_MS),
+            "rung one's lead reads its own current run's frontier"
+        );
+        assert_eq!(
+            session_lead_ms(&session, VideoRung::SecondVideo),
+            None,
+            "rung two's lead is not rung one's lead: its current run has \
+             produced nothing"
+        );
+    }
+
+    /// `restart_at` mints and fills the new run under the rung it is given.
+    ///
+    /// The map-hit exit of `restart_at` (a restart into already-mapped media)
+    /// takes the fresh run id from the given rung's counter, creates the run
+    /// directory under that rung, and copies the init from the mapped run of
+    /// that same rung. Two rungs each have a run 0; hardcoding the rung in
+    /// `run_path` would create rung one's `run_1` while the rest of the
+    /// function believes it restarted rung two — and the init it served for
+    /// rung two would be rung one's.
+    #[test]
+    fn restart_at_writes_the_new_run_under_the_given_rungs_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        let mut session = make_two_rung_test_session(&session_dir);
+
+        // run_0 of each rung exists on disk with a distinct init. Rung two's
+        // run_0 is mapped at title time 0, so restarting rung two at 0 takes
+        // the map-hit exit and copies rung two's run_0 init into a fresh
+        // run_1.
+        for (rung, init_bytes) in [
+            (VideoRung::SingleVideo, b"single-init".as_slice()),
+            (VideoRung::SecondVideo, b"second-init".as_slice()),
+        ] {
+            let run0 = session_dir.join(crate::hls_segment_map::run_rel_dir(rung, 0));
+            fs::create_dir_all(&run0).unwrap();
+            fs::write(run0.join("init.mp4"), init_bytes).unwrap();
+        }
+        session.segment_map_mut(VideoRung::SecondVideo).insert(
+            crate::hls_segment_map::MappedSegment {
+                start_ms: 0,
+                duration_ms: SEGMENT_MS,
+                run_id: 0,
+                rel_path: PathBuf::from("vsecond/run_0/seg000000.m4s"),
+            },
+        );
+
+        restart_at(
+            &mut session,
+            VideoRung::SecondVideo,
+            0,
+            &crate::EncodeLeg::software(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.encoder_state(VideoRung::SecondVideo).current_run_id,
+            1,
+            "the restarted rung carries the fresh run id"
+        );
+        assert_eq!(
+            session.encoder_state(VideoRung::SingleVideo).current_run_id,
+            0,
+            "restarting rung two must not renumber rung one"
+        );
+        assert_eq!(
+            fs::read(session_dir.join("vsecond/run_1/init.mp4")).unwrap(),
+            b"second-init",
+            "the new run must be rung two's, carrying rung two's init"
+        );
+        assert!(
+            !session_dir.join("vsingle/run_1").exists(),
+            "restarting rung two must not create rung one's run_1"
+        );
+    }
+
+    /// `run_asset` serves the init of the rung it is given, never the first
+    /// rung's run with the same id.
+    ///
+    /// Run ids are per-rung counters, so run 3 of the second rung and run 3 of
+    /// the first rung are different directories. Hardcoding the rung serves
+    /// rung one's init for rung two's playlist; a wrong init is a decode
+    /// failure, not a stale listing.
+    #[test]
+    fn run_asset_serves_the_init_of_the_rung_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session = make_two_rung_test_session(&session_dir);
+        for (rung, init_bytes) in [
+            (VideoRung::SingleVideo, b"single-init".as_slice()),
+            (VideoRung::SecondVideo, b"second-init".as_slice()),
+        ] {
+            let run3 = session_dir.join(crate::hls_segment_map::run_rel_dir(rung, 3));
+            fs::create_dir_all(&run3).unwrap();
+            fs::write(run3.join("init.mp4"), init_bytes).unwrap();
+        }
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        let single = reg
+            .run_asset("s1", VideoRung::SingleVideo, 3, "init.mp4")
+            .expect("rung one's init bytes");
+        assert_eq!(single, b"single-init");
+        let second = reg
+            .run_asset("s1", VideoRung::SecondVideo, 3, "init.mp4")
+            .expect("rung two's init bytes");
+        assert_eq!(
+            second, b"second-init",
+            "run 3 of the second rung is not run 3 of the first rung"
+        );
     }
 
     /// What a stand-in encoder is actually doing.
@@ -5656,7 +5926,7 @@ mod tests {
         // the new land is 20000, so the gap below is exactly the region only
         // the held encoder serves.
         let held_reap_at = session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at;
-        release_overtaken_superseded(&mut session);
+        release_overtaken_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at,
             held_reap_at,
@@ -5722,7 +5992,7 @@ mod tests {
         session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 2;
         session.start_ms = 20_000;
 
-        release_overtaken_superseded(&mut session);
+        release_overtaken_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at,
             reap_at,
@@ -5771,7 +6041,7 @@ mod tests {
         session.encoder_state_mut(SINGLE_VIDEO_RUNG).next_run_id = 2;
         session.start_ms = 4_000;
 
-        release_overtaken_superseded(&mut session);
+        release_overtaken_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert!(
             session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at <= Instant::now(),
             "a held encoder the new one has overtaken is due for reaping now"
@@ -5831,7 +6101,7 @@ mod tests {
             frontier_ms(session.segment_map(SINGLE_VIDEO_RUNG).iter_ordered(), 9).is_none(),
             "the held run must have produced nothing, or the test proves nothing"
         );
-        release_overtaken_superseded(&mut session);
+        release_overtaken_superseded(&mut session, SINGLE_VIDEO_RUNG);
         assert_eq!(
             session.encoder_state(SINGLE_VIDEO_RUNG).superseded[0].reap_at,
             reap_at,
@@ -5875,7 +6145,13 @@ mod tests {
             .unwrap()
             .id();
 
-        restart_at(&mut session, 2_000, &crate::EncodeLeg::software()).unwrap();
+        restart_at(
+            &mut session,
+            SINGLE_VIDEO_RUNG,
+            2_000,
+            &crate::EncodeLeg::software(),
+        )
+        .unwrap();
 
         assert_eq!(
             session.start_ms, 2_000,
@@ -8052,7 +8328,10 @@ mod tests {
                     )
                     .unwrap();
                 wait_playlist(&reg, &id);
-                inits.push(reg.run_asset(&id, 0, "init.mp4").expect("init.mp4 bytes"));
+                inits.push(
+                    reg.run_asset(&id, SINGLE_VIDEO_RUNG, 0, "init.mp4")
+                        .expect("init.mp4 bytes"),
+                );
                 reg.stop(&id);
             }
 
@@ -9424,7 +9703,7 @@ mod tests {
             format!("/api/v0/sessions/{id}/runs/{run_id}/init.mp4")
         );
         let init = reg
-            .run_asset(id, run_id, "init.mp4")
+            .run_asset(id, SINGLE_VIDEO_RUNG, run_id, "init.mp4")
             .expect("init.mp4 bytes");
         assert!(
             init.len() > 8 && &init[4..8] == b"ftyp",
