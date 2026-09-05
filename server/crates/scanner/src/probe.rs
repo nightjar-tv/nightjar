@@ -92,7 +92,30 @@ struct FfSideData {
     dv_profile: Option<u64>,
 }
 
+/// How much of ffprobe's stderr survives into the failure string for a broken
+/// file. The error reaches the UI as `scanError`, so this is the
+/// operator-facing size bound on the diagnostic an operator sees.
+///
+/// **GUESS (Rule 4.14).** ADR-0014 item 7 says why a truncated tail exists —
+/// so `ffprobe failed for path:` cannot end with nothing after the colon —
+/// but nothing in that ADR, the git history, or any note derives the length.
+/// It landed with the Phase 2 stack (#7) and is copied verbatim into
+/// `keymap::packet_walk`. No measurement of real ffprobe stderr length
+/// produced it.
 const STDERR_TAIL: usize = 512;
+
+/// How often the probe wait loop re-checks child exit and the cancellation
+/// signal. Bounds how quickly an unmounted library stops probing: once the
+/// library is paused, the running ffprobe child is killed within one tick
+/// (ADR-0041 Decision 8.7).
+///
+/// **GUESS (Rule 4.14).** No derivation exists. The value was added in the
+/// scanner audit (#77) as a direct copy of the identical constant in
+/// `keymap::packet_walk` (added there in #74). That same 50 ms is the
+/// standing wait-loop tick across the tree — the extract-wait loop in
+/// `transcode/src/subs/mod.rs` has slept 50 ms inline since the Phase 2
+/// stack (#7) — and nothing records why the tick is 50 ms rather than
+/// another interval.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Probe a media file with ffprobe. `should_cancel` is the library
