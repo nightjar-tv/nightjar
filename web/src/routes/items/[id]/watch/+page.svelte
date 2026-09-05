@@ -16,6 +16,7 @@
 		type AttachMode
 	} from '$lib/latencyProbe';
 	import { rememberPositionMs, resumePositionMs } from '$lib/resumePosition';
+	import { shouldRetrySessionStart } from '$lib/sessionRetry';
 	import type { SessionGoneReason } from '$lib/playbackErrors';
 	import { beginPlayback } from '$lib/profileScope';
 	import type { components } from '$lib/api/schema';
@@ -189,8 +190,10 @@
 					originRef.ms = session.mediaOriginMs ?? 0;
 					break;
 				} catch (e) {
-					const msg = e instanceof Error ? e.message : String(e);
-					if (msg.includes('retry shortly') || msg.includes('in use')) {
+					// Retry on the server's code, not on its sentence. The
+					// prose fallback for one release lives in
+					// sessionRetry.ts.
+					if (shouldRetrySessionStart(e)) {
 						await new Promise((r) => setTimeout(r, 1000));
 						continue;
 					}

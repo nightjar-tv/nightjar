@@ -851,8 +851,12 @@ export interface components {
             version: string;
             core?: string;
         };
+        /** @description Every API error body carries `error`, the sentence for a person, and `code`, a stable machine-readable class the client can branch on. Match `code`, never the wording of `error`: the sentence is copy, not an API (Rule 4.11). */
         Error: {
+            /** @description Human sentence for a log or a raw response. Not an API. */
             error: string;
+            /** @description Stable machine-readable class of the error, independent of the wording of `error`. `admission_refused` on the session-create 503 is the one a playback client branches on today. */
+            code: string;
         };
         /** @enum {string} */
         LibraryKind: "movies" | "shows";
@@ -2256,7 +2260,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Session cap full; retry shortly */
+            /** @description Admission refused: no capacity for another encoder (ADR-0050). Retryable. The body's `code` is `admission_refused`; a client retries on that code, not on the sentence in `error`. */
             503: {
                 headers: {
                     [name: string]: unknown;
