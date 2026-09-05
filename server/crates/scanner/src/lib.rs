@@ -286,10 +286,26 @@ pub fn stored_kind(
 }
 
 /// ADR-0030 §3: refuse repoint if matched/current < this fraction.
+///
+/// **REASONED, not MEASURED.** ADR-0030 §3 says so in its own words: "a
+/// **default judgement**, not a measured floor. It was **not** run against the
+/// ~24 800-item dogfood library before acceptance; it was picked to catch
+/// wrong roots while allowing small tree churn." The ADR also records the
+/// revisit trigger: dogfood remount evidence that keep-relpath remounts
+/// routinely land under 0.90 without being a wrong root, or that 0.90 still
+/// admits destructive mis-points.
 pub const REPOINT_RETAIN_FRACTION: f64 = 0.90;
 
 /// After a repoint with deferred_remove > 0, poll skips full walks for this
 /// long so the operator can review before delete_missing runs (ADR-0030).
+///
+/// **GUESS — the hour itself has no stated origin.** ADR-0030 (amended
+/// 2026-08-04) supplies the mechanism — poll must not apply the deferred
+/// deletes before review, while manual scan stays allowed — and names the
+/// duration only as a "default **1 hour**". Nothing in ADR-0030, this file's
+/// git history, or any measurement derives why an hour rather than another
+/// review window. The value that gates a destructive `delete_missing` is
+/// unsourced, never derived.
 pub const REPOINT_DELETE_HOLDOFF: Duration = Duration::from_secs(3600);
 
 const INDEX_BATCH: usize = 200;
