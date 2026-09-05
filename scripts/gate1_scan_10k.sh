@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gate 1: 10k index-pass harness (ADR-0004). Gates on indexDurationMs; reports probe throughput.
+# Gate 1: 10k index-pass harness (ADR-0004). Gates on indexDurationMs and on the probe phase having measured something cleanly.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,7 +45,10 @@ LIB=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import 
 
 echo "scanning library ${LIB} (index budget ${BUDGET_S}s)…"
 python3 - <<PY
-import json, time, urllib.request, sys
+import json, sys, time, urllib.request
+
+sys.path.insert(0, "${ROOT}/scripts")
+import gate1_probe_gate
 
 port = "${PORT}"
 lib = "${LIB}"
@@ -111,14 +114,10 @@ while job["state"] not in ("completed", "failed"):
     job = get(f"http://127.0.0.1:{port}/api/v0/scan-jobs/{job_id}")
 if job["state"] == "failed":
     raise SystemExit(f"FAIL: probe phase failed: {job.get('error')}")
-probe_ms = job.get("probeDurationMs") or 0
-probed = job.get("probed") or 0
-errors = job.get("errors") or 0
-probe_s = max(probe_ms / 1000.0, 0.001)
-fps = probed / probe_s
-print(f"probe_metric probed={probed} errors={errors} probe_s={probe_s:.1f} files_per_sec={fps:.1f} floor={probe_floor}")
-if probed > 0 and fps < probe_floor:
-    raise SystemExit(f"FAIL: probe throughput {fps:.1f} files/sec < floor {probe_floor} (ADR-0004)")
+report, fail_reason = gate1_probe_gate.probe_report(job, probe_floor)
+print(report)
+if fail_reason:
+    raise SystemExit(fail_reason)
 
 # Unchanged rescan: index pass <5s
 req2 = urllib.request.Request(
@@ -137,7 +136,12 @@ while True:
     if time.perf_counter() - t1 > 30:
         raise SystemExit(f"FAIL: rescan index timeout: {job2}")
     time.sleep(0.05)
-rescan_s = (job2.get("indexDurationMs") or 0) / 1000.0
+if job2["state"] == "failed":
+    raise SystemExit(f"FAIL: rescan job failed: {job2.get('error')}")
+rescan_ms = job2.get("indexDurationMs")
+if rescan_ms is None:
+    raise SystemExit(f"FAIL: rescan indexDurationMs missing: {job2}")
+rescan_s = rescan_ms / 1000.0
 print(f"rescan_index_s={rescan_s:.3f} unchanged={job2.get('unchanged')}")
 if rescan_s > 5:
     raise SystemExit(f"FAIL: rescan index {rescan_s:.1f}s > 5s")
