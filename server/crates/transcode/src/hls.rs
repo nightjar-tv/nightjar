@@ -29,10 +29,9 @@ use crate::hls_memory::{EncoderMemory, encoder_memory_from_available, read_avail
 use crate::hls_policy;
 use crate::hls_policy::{
     CoalesceDesire, PendingWaiterAction, SegmentMissAction, classify_restart_desire,
-    coalesce_preempt_before_land, decide_segment_miss, digback_behind_committed, disable_preempt,
+    coalesce_preempt_before_land, decide_segment_miss, digback_behind_committed,
     no_fill_release_for_new_land, pending_restart_due, pending_waiter_action,
-    prefetch_advances_pending, restart_spawn_gap, segment_miss_unreachable,
-    serve_ok_after_pending_apply,
+    prefetch_advances_pending, segment_miss_unreachable, serve_ok_after_pending_apply,
 };
 use nightjar_core::VideoEncodePlan;
 use nightjar_db::Db;
@@ -2576,14 +2575,9 @@ fn restart_at(
         );
         return Ok(());
     }
-    if let Some(gap) = restart_spawn_gap() {
-        tracing::info!(
-            gap_ms = gap.as_millis(),
-            play_start_ms,
-            "hls restart spawn gap (NIGHTJAR_RESTART_SPAWN_GAP_MS)"
-        );
-        std::thread::sleep(gap);
-    }
+    // No pause between kill and spawn. NIGHTJAR_RESTART_SPAWN_GAP_MS probed
+    // whether rapid dual-init boundaries wedge Safari; the probe was retired
+    // 2026-09-05 and the measured behaviour spawns immediately.
     // Gate 2 / fill-forward: do not wipe prior run dirs. Scrub-back into
     // mapped media is a plain file serve (ADR-0020 per-rung map). New producer
     // output goes in a fresh run directory under the active rung.
@@ -2750,7 +2744,10 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
     let ready = session.first_segment_ready;
     let cooking = session.play_start_ms;
     let since = session.last_restart.elapsed();
-    let allow_preempt = !disable_preempt();
+    // Preempt before land is unconditional: NIGHTJAR_DISABLE_PREEMPT probed
+    // holding a far pending until the cooking land lands, and the polarity
+    // measured as scrub-before-play pass under Config D is preempt on (probe
+    // retired 2026-09-05).
     let Some(pending) = pending_restart_due(
         ready,
         session.pending_play_ms,
@@ -2758,7 +2755,6 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
         apply_immediate,
         cooking,
         since,
-        allow_preempt,
     ) else {
         return Ok(());
     };
@@ -2769,10 +2765,8 @@ fn maybe_apply_pending_restart(session: &mut Session) -> Result<(), PlaylistErro
         session.pending_since = None;
         return Ok(());
     }
-    let preempt_before_land = !ready
-        && allow_preempt
-        && coalesce_preempt_before_land(cooking, pending)
-        && since >= RESTART_MIN_INTERVAL;
+    let preempt_before_land =
+        !ready && coalesce_preempt_before_land(cooking, pending) && since >= RESTART_MIN_INTERVAL;
     let leg = session.encode_leg.clone();
     restart_at(session, pending, &leg)?;
     if preempt_before_land {
