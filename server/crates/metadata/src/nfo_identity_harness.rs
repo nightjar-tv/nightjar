@@ -60,6 +60,28 @@ fn load_manifest() -> Value {
     serde_json::from_slice(&fixture_bytes("manifest.json")).expect("manifest.json is valid JSON")
 }
 
+/// Read one case's verbatim `media_path` from the canonical manifest. The
+/// frozen fixture contract requires every case, and every phase, to declare
+/// one; `manifest_declares_media_path_for_every_case_and_phase` enforces it.
+fn case_media_path(case_id: &str) -> String {
+    load_manifest()
+        .get("cases")
+        .and_then(|c| c.get(case_id))
+        .and_then(|c| c.get("media_path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or_else(|| panic!("manifest case {case_id} must declare media_path"))
+        .to_string()
+}
+
+/// The library-relative media folder is the parent of the case's `media_path`.
+fn case_folder(case_id: &str) -> String {
+    Path::new(&case_media_path(case_id))
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or_else(|| panic!("manifest case {case_id} media_path has a folder"))
+        .to_string()
+}
+
 /// Register every manifest route for `case_id` under the exact request the
 /// real `TmdbClient` builds. Search routes declare `query` plus `language` in
 /// the manifest while the client sends only `query`; strip `language` for
@@ -267,6 +289,58 @@ fn query_pairs(entry: &LogEntry) -> Vec<(String, String)> {
     entry.query.clone()
 }
 
+// --- manifest contract ------------------------------------------------------
+
+/// The frozen fixture contract: the manifest declares exactly eight cases and
+/// a nonempty `media_path` for every case and for every NFO-08 phase. The
+/// scenario setup below reads those paths, so a missing path is a hard failure.
+#[test]
+fn manifest_declares_media_path_for_every_case_and_phase() {
+    let manifest = load_manifest();
+    let cases = manifest
+        .get("cases")
+        .and_then(|c| c.as_object())
+        .expect("manifest.cases object");
+    assert_eq!(cases.len(), 8, "the fixture declares exactly eight cases");
+    let mut ids: Vec<&str> = cases.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![
+            "NFO-01", "NFO-02", "NFO-03", "NFO-04", "NFO-05", "NFO-06", "NFO-07", "NFO-08",
+        ]
+    );
+    for (case_id, case) in cases {
+        let media_path = case
+            .get("media_path")
+            .and_then(|p| p.as_str())
+            .unwrap_or_else(|| panic!("case {case_id} must declare media_path"));
+        assert!(
+            !media_path.trim().is_empty(),
+            "case {case_id} media_path must be nonempty"
+        );
+        let phases = case
+            .get("phases")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for phase in phases {
+            let phase_id = phase
+                .get("phase")
+                .and_then(|p| p.as_str())
+                .unwrap_or("<unnamed>");
+            let phase_media = phase
+                .get("media_path")
+                .and_then(|p| p.as_str())
+                .unwrap_or_else(|| panic!("{case_id} phase {phase_id} must declare media_path"));
+            assert!(
+                !phase_media.trim().is_empty(),
+                "{case_id} phase {phase_id} media_path must be nonempty"
+            );
+        }
+    }
+}
+
 // --- product scenarios ------------------------------------------------------
 
 #[test]
@@ -282,8 +356,8 @@ fn nfo_01_complete_movie_binds_without_provider() {
         &lib,
         "The Meridian Job",
         Some(2017),
-        "The Meridian Job (2017)",
-        "The Meridian Job (2017)/The Meridian Job.mkv",
+        &case_folder("NFO-01"),
+        &case_media_path("NFO-01"),
         Some("xml/NFO-01/complete.nfo"),
     );
 
@@ -322,8 +396,8 @@ fn nfo_02_partial_movie_enriches_content_without_search() {
         &lib,
         "Salt Harbor",
         Some(2015),
-        "Salt Harbor (2015)",
-        "Salt Harbor (2015)/Salt Harbor.mkv",
+        &case_folder("NFO-02"),
+        &case_media_path("NFO-02"),
         Some("xml/NFO-02/partial.nfo"),
     );
 
@@ -364,8 +438,8 @@ fn nfo_03_content_only_searches_then_preserves_nfo_fields() {
         &lib,
         "Keeper of the Lantern",
         Some(2011),
-        "Keeper of the Lantern (2011)",
-        "Keeper of the Lantern (2011)/Keeper of the Lantern.mkv",
+        &case_folder("NFO-03"),
+        &case_media_path("NFO-03"),
         Some("xml/NFO-03/content-only.nfo"),
     );
 
@@ -451,8 +525,8 @@ fn nfo_04_conflicting_claims_short_circuit_tmdb() {
         &lib,
         "The Cobalt Divide",
         Some(2018),
-        "The Cobalt Divide (2018)",
-        "The Cobalt Divide (2018)/The Cobalt Divide.mkv",
+        &case_folder("NFO-04"),
+        &case_media_path("NFO-04"),
         Some("xml/NFO-04/conflict.nfo"),
     );
 
@@ -512,7 +586,7 @@ fn nfo_05_show_find_cross_check_binds() {
     let item = seed_show(
         &conn,
         &lib,
-        "Cinder Street (2019)",
+        &case_folder("NFO-05"),
         "Cinder Street",
         "xml/NFO-05/tvshow.nfo",
     );
@@ -554,7 +628,7 @@ fn nfo_06_show_find_mismatch_falls_through_to_search() {
     let item = seed_show(
         &conn,
         &lib,
-        "Gravelmere (2021)",
+        &case_folder("NFO-06"),
         "Gravelmere",
         "xml/NFO-06/tvshow.nfo",
     );
@@ -628,9 +702,6 @@ fn nfo_07_absent_body_is_not_identity_evidence() {
 
 // --- NFO-08: malformed, corrected, manual-assign ----------------------------
 
-const NFO08_MEDIA: &str = "Secondhand Orbit (2013)/Secondhand Orbit.mkv";
-const NFO08_FOLDER: &str = "Secondhand Orbit (2013)";
-
 fn create_watch_tables(conn: &Connection) {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS watch_state (
@@ -696,11 +767,11 @@ fn seed_nfo08(conn: &Connection, lib: &Path) -> (i64, String) {
         lib,
         "Secondhand Orbit",
         Some(2013),
-        NFO08_FOLDER,
-        NFO08_MEDIA,
+        &case_folder("NFO-08"),
+        &case_media_path("NFO-08"),
         Some("xml/NFO-08/initial-malformed.nfo"),
     );
-    let old_key = path_item_key(1, NFO08_MEDIA);
+    let old_key = path_item_key(1, &case_media_path("NFO-08"));
     create_watch_tables(conn);
     seed_watch_rows(conn, &old_key);
     (item, old_key)
@@ -751,8 +822,8 @@ fn nfo_08_corrected_body_auto_retries_to_ready() {
     // Phase 2: the corrected body is retried, then the drain binds it.
     write_sidecar(
         &lib,
-        NFO08_FOLDER,
-        NFO08_MEDIA,
+        &case_folder("NFO-08"),
+        &case_media_path("NFO-08"),
         &fixture_bytes("xml/NFO-08/corrected-body.nfo"),
     );
     retry_unmatched(&conn, item).expect("retry_unmatched must not error");
@@ -769,7 +840,52 @@ fn nfo_08_corrected_body_auto_retries_to_ready() {
         )
         .expect("link row");
     assert_eq!(manually, 0, "automatic retry is never manually_matched");
-    let _ = old_key;
+    // The automatic NFO-ready path migrates watch state and playback events
+    // from the path key to the bound key, preserving every non-key value.
+    assert_eq!(watch_row_count(&conn, &old_key), 0);
+    assert_eq!(event_row_count(&conn, &old_key), 0);
+    let migrated: (i64, i64, Option<i64>, i64, String) = conn
+        .query_row(
+            "SELECT profile_id, position_ms, duration_ms, played, last_played_at
+             FROM watch_state WHERE item_key = 'tmdb:movie:9200008'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("migrated watch row");
+    assert_eq!(
+        migrated,
+        (1, 3412000, Some(6100000), 1, "2026-01-05T21:14:00Z".into())
+    );
+    assert_eq!(event_row_count(&conn, "tmdb:movie:9200008"), 2);
+    let events: Vec<(i64, String, String, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT profile_id, played_at, event, position_ms FROM playback_events
+                 WHERE item_key = 'tmdb:movie:9200008' ORDER BY played_at",
+            )
+            .expect("prepare migrated events");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query migrated events");
+        rows.map(|r| r.expect("migrated event row")).collect()
+    };
+    assert_eq!(
+        events,
+        vec![
+            (
+                1,
+                "2026-01-05T21:00:00Z".to_string(),
+                "resume".to_string(),
+                20000
+            ),
+            (
+                1,
+                "2026-01-05T21:14:00Z".to_string(),
+                "pause".to_string(),
+                3412000
+            ),
+        ]
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -824,19 +940,48 @@ fn nfo_08_manual_assign_records_manually_matched_and_migrates_watch() {
     // watch key, preserving every non-key value.
     assert_eq!(watch_row_count(&conn, &old_key), 0);
     assert_eq!(event_row_count(&conn, &old_key), 0);
-    let migrated: (i64, Option<i64>, i64, String) = conn
+    let migrated: (i64, i64, Option<i64>, i64, String) = conn
         .query_row(
-            "SELECT position_ms, duration_ms, played, last_played_at
+            "SELECT profile_id, position_ms, duration_ms, played, last_played_at
              FROM watch_state WHERE item_key = 'tmdb:movie:9200008'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .expect("migrated watch row");
     assert_eq!(
         migrated,
-        (3412000, Some(6100000), 1, "2026-01-05T21:14:00Z".into())
+        (1, 3412000, Some(6100000), 1, "2026-01-05T21:14:00Z".into())
     );
     assert_eq!(event_row_count(&conn, "tmdb:movie:9200008"), 2);
+    let events: Vec<(i64, String, String, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT profile_id, played_at, event, position_ms FROM playback_events
+                 WHERE item_key = 'tmdb:movie:9200008' ORDER BY played_at",
+            )
+            .expect("prepare migrated events");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query migrated events");
+        rows.map(|r| r.expect("migrated event row")).collect()
+    };
+    assert_eq!(
+        events,
+        vec![
+            (
+                1,
+                "2026-01-05T21:00:00Z".to_string(),
+                "resume".to_string(),
+                20000
+            ),
+            (
+                1,
+                "2026-01-05T21:14:00Z".to_string(),
+                "pause".to_string(),
+                3412000
+            ),
+        ]
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

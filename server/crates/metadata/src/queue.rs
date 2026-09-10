@@ -18,6 +18,7 @@ use crate::clean::{
 };
 use crate::item_links;
 use crate::match_score::{SeasonRangeMapping, UnplacedFile, map_unplaced_to_candidate_seasons};
+use crate::migrator;
 use crate::model::{ArtworkKind, CanonicalMetadata, MetadataKind, item_key_for_metadata};
 use crate::negative_cache::{PROVIDER_TMDB, query_key};
 use crate::resolve::MetadataSource;
@@ -2309,10 +2310,30 @@ fn persist_nfo_ready_and_link(
         .unchecked_transaction()
         .map_err(|e| format!("begin nfo ready tx: {e}"))?;
     canonical::upsert_canonical(&tx, PROVIDER_TMDB, metadata)?;
+    let new_key = item_key_for_metadata(metadata);
     for id in item_ids {
-        if let Some(key) = item_key_for_metadata(metadata) {
-            item_links::replace_auto_link(&tx, *id, &key)?;
+        let Some(key) = new_key.as_ref() else {
+            continue;
+        };
+        // ADR-0025 §5: identity-keyed watch state and playback events follow
+        // the item across a rebind. Collect every key the item answers to now
+        // — its stored links plus its effective/path key — *before* the
+        // automatic links are replaced, then migrate to the new canonical key
+        // in this transaction. Same order and helpers as `fix::assign`.
+        let mut old_for_migrate = item_links::link_keys_for_item(&tx, *id)?;
+        let (library_id, path): (i64, String) = tx
+            .query_row(
+                "SELECT library_id, path FROM media_items WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("nfo ready item {id}: {e}"))?;
+        let old_effective = item_links::effective_item_key(&tx, *id, library_id, &path)?;
+        if !old_for_migrate.contains(&old_effective) {
+            old_for_migrate.push(old_effective);
         }
+        item_links::replace_auto_link(&tx, *id, key)?;
+        migrator::migrate_item_keys(&tx, &old_for_migrate, key)?;
     }
     {
         // A third status-write site, and it records its route like the other

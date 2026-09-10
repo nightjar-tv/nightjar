@@ -218,6 +218,7 @@
       "label": "complete movie",
       "kind": "movie",
       "title": "The Meridian Job",
+      "media_path": "The Meridian Job (2017)/The Meridian Job.mkv",
       "xml": [
         { "path": "xml/NFO-01/complete.nfo", "role": "identity-complete", "sha256": "d17ec5c2526cc8321da850805371c99b5734782ab1d95c00561c2a4428d06624", "bytes": 1451 }
       ],
@@ -236,6 +237,7 @@
       "label": "partial movie",
       "kind": "movie",
       "title": "Salt Harbor",
+      "media_path": "Salt Harbor (2015)/Salt Harbor.mkv",
       "xml": [
         { "path": "xml/NFO-02/partial.nfo", "role": "identity-title-plus-tmdb", "sha256": "31104cbc0fd5dbf5047ef890a83afb0bdf6cf90ff938ca62e109e2d138355bd9", "bytes": 317 }
       ],
@@ -254,6 +256,7 @@
       "label": "partial movie, no usable provider id",
       "kind": "movie",
       "title": "Keeper of the Lantern",
+      "media_path": "Keeper of the Lantern (2011)/Keeper of the Lantern.mkv",
       "xml": [
         { "path": "xml/NFO-03/content-only.nfo", "role": "identity-title-and-content-only", "sha256": "2e90ddb1101ce2f6a80990e67cd61ae4abc261e31589954c604a0282363f4d18", "bytes": 840 }
       ],
@@ -272,6 +275,7 @@
       "label": "conflicting movie",
       "kind": "movie",
       "title": "The Cobalt Divide",
+      "media_path": "The Cobalt Divide (2018)/The Cobalt Divide.mkv",
       "xml": [
         { "path": "xml/NFO-04/conflict.nfo", "role": "identity-conflicting-ids", "sha256": "d5ab12742142b8c0c37916834839fe47e0ffb73a7c530a301a11c022b4c549e9", "bytes": 1036 }
       ],
@@ -291,6 +295,7 @@
       "label": "show-root, external id only, matching title/year",
       "kind": "show-root",
       "title": "Cinder Street",
+      "media_path": "Cinder Street (2019)/Cinder Street.S01E01.mkv",
       "xml": [
         { "path": "xml/NFO-05/tvshow.nfo", "role": "identity-show-root-external-id", "sha256": "16d21a8e430f4e73f8db321fa86aa834c6b6a93f999660aef699dc8643b50920", "bytes": 666 }
       ],
@@ -309,6 +314,7 @@
       "label": "show-root, external id only, title/year mismatch",
       "kind": "show-root",
       "title": "Gravelmere",
+      "media_path": "Gravelmere (2021)/Gravelmere.S01E01.mkv",
       "xml": [
         { "path": "xml/NFO-06/tvshow.nfo", "role": "identity-show-root-external-id-mismatch", "sha256": "83873d465620a4a0903902a5df59cb78d7ea0ef75f5d4f988a3d37a9d4ae7ba8", "bytes": 658 }
       ],
@@ -327,6 +333,7 @@
       "label": "explicit zero-byte NFO; absent body",
       "kind": "movie",
       "title": "(none from NFO)",
+      "media_path": "Kestrel Road (2009)/Kestrel Road.mkv",
       "xml": [
         { "path": "xml/NFO-07/absent.nfo", "role": "identity-absent-body", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "bytes": 0 }
       ],
@@ -345,6 +352,7 @@
       "label": "movie family across malformed, corrected, and manual-assign phases",
       "kind": "movie",
       "title": "Secondhand Orbit",
+      "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
       "xml": [
         { "path": "xml/NFO-08/initial-malformed.nfo", "role": "phase-initial-malformed", "sha256": "0d33e4987d73453a537c77eeefda1df751fab05b6a1335f71c4d6c7ec9da4d86", "bytes": 353 },
         { "path": "xml/NFO-08/corrected-body.nfo", "role": "phase-corrected-body", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 },
@@ -363,16 +371,19 @@
         {
           "phase": "initial-malformed",
           "file": "xml/NFO-08/initial-malformed.nfo",
+          "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
           "description": "Malformed body: the movie root and several elements never close their tags. A corrupt body is not trusted identity evidence. If the identity stage searches on the derived title, the shipped search response returns zero results, which is the provider-miss/unmatched route input for this phase."
         },
         {
           "phase": "corrected-body",
           "file": "xml/NFO-08/corrected-body.nfo",
+          "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
           "description": "Well-formed body with usable tmdb claim 9200008 (plus matching imdb/tvdb claims and full content). A corrected-body retry can bind identity straight from the NFO; the movie-detail response ships as class content for the bound entity."
         },
         {
           "phase": "manual-assign",
           "file": "xml/NFO-08/manual-assign.nfo",
+          "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
           "description": "Byte-identical to corrected-body.nfo (same sha256 f9e518f7...). Manual Assign is a user/pipeline action that records a manually_matched state on the item; it is not caused by any byte difference in the NFO. Because the two files are byte-equivalent, any state difference between corrected-body retry and manual-assign must come from pipeline state, never from the file."
         }
       ],

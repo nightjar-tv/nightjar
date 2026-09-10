@@ -22,8 +22,8 @@
   "integrity": {
     "note": "Read-only snapshot taken at adjudication time. Hashes below were observed, not authored by the corpus author, and are recorded here for change detection only. XML and provider byte hashes are not repeated here; the author manifest.json and PROVENANCE.md already record them, and each record below references those recorded hashes as expected values.",
     "observed_read_only": [
-      { "path": "manifest.json", "sha256": "6f2c777a0fd0b011a6439f3a766307acf83f3af8d34e29bad8afbf048d5b975f", "bytes": 26294 },
-      { "path": "README.md", "sha256": "3ee06002eb1bed504ecfb7429ae9ee240c35c0a2ebe617d2cd35ff19c0c7bd0a", "bytes": 5812 },
+      { "path": "manifest.json", "sha256": "14cb6698df0a330f0679e9e437ad7cec396971eec4940b7975fcd17aa2be7510", "bytes": 27044 },
+      { "path": "README.md", "sha256": "ca0b36d73e2ba777c77b85d4474b62ed3adade966569281ca8fadcdedf3754c6", "bytes": 6007 },
       { "path": "PROVENANCE.md", "sha256": "a6262beac4c5480458f99a51386ff65e553bf2cf79bdf9cc00dce7aa762cd8ba", "bytes": 5256 }
     ]
   },

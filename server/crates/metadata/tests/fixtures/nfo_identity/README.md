@@ -120,7 +120,7 @@ TVDB identifiers are synthetic-universe attributes only; the shipped
 | XML bytes | 128 KiB | 7543 |
 | provider JSON files | 24 | 15 |
 | provider bytes | 512 KiB | 21407 |
-| manifest | 64 KiB | 25874 |
+| manifest | 64 KiB | 27044 |
 | README | 64 KiB | see bytes |
 | PROVENANCE | 64 KiB | see bytes |
 | root total | 1 MiB | far below |
@@ -133,6 +133,9 @@ Each `.nfo` is under 16 KiB. Each provider JSON is under 64 KiB.
 - `hashing_rule` - hashes cover XML and provider bytes only
 - `route_semantics` - what each route class means
 - `cases` - evidence, location context, route inputs, notes per case
+- `cases[].media_path` - the repository-native, library-relative media
+  path the harness seeds for that case. Every case declares one; the
+  NFO-08 phases repeat the same Secondhand Orbit path.
 - `budgets` - allowed limits and measured actuals
 
 ## License
