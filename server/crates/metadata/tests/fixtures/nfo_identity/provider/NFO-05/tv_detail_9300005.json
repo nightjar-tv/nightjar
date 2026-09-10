@@ -1,0 +1,82 @@
+{
+  "adult": false,
+  "backdrop_path": "/nj_cinder_street_2019_backdrop.jpg",
+  "created_by": [],
+  "episode_run_time": [48],
+  "first_air_date": "2019-04-12",
+  "genres": [
+    { "id": 18, "name": "Drama" },
+    { "id": 9648, "name": "Mystery" }
+  ],
+  "homepage": "",
+  "id": 9300005,
+  "in_production": false,
+  "languages": ["en"],
+  "last_air_date": "2021-06-04",
+  "name": "Cinder Street",
+  "number_of_episodes": 18,
+  "number_of_seasons": 3,
+  "origin_country": ["GB"],
+  "original_language": "en",
+  "original_name": "Cinder Street",
+  "overview": "A demolition crew in a shrinking port town keeps finding sealed basements under buildings that were never supposed to have them. Each basement holds a different decade of the city's bargained-away past.",
+  "popularity": 12.4,
+  "poster_path": "/nj_cinder_street_2019_poster.jpg",
+  "status": "Ended",
+  "tagline": "Demolish the block, not the truth.",
+  "type": "Scripted",
+  "vote_average": 7.6,
+  "vote_count": 1288,
+  "external_ids": {
+    "id": 9300005,
+    "imdb_id": "tt9300005",
+    "freebase_mid": null,
+    "freebase_id": null,
+    "tvdb_id": 8300005,
+    "tvrage_id": null,
+    "wikidata_id": null
+  },
+  "aggregate_credits": {
+    "cast": [
+      {
+        "adult": false,
+        "gender": 2,
+        "id": 888001,
+        "known_for_department": "Acting",
+        "name": "Ellery Voss",
+        "original_name": "Ellery Voss",
+        "popularity": 8.8,
+        "profile_path": "/nj_ellery_voss_profile.jpg",
+        "roles": [
+          {
+            "credit_id": "nj80011",
+            "character": "Foreman Adey Bird",
+            "episode_count": 18
+          }
+        ],
+        "total_episode_count": 18,
+        "order": 0
+      },
+      {
+        "adult": false,
+        "gender": 1,
+        "id": 888002,
+        "known_for_department": "Acting",
+        "name": "Doria Kell",
+        "original_name": "Doria Kell",
+        "popularity": 7.7,
+        "profile_path": "/nj_doria_kell_profile.jpg",
+        "roles": [
+          {
+            "credit_id": "nj80012",
+            "character": "Archivist Morva Lint",
+            "episode_count": 18
+          }
+        ],
+        "total_episode_count": 18,
+        "order": 1
+      }
+    ],
+    "crew": []
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "adult": false,
+  "backdrop_path": "/nj_keeper_of_the_lantern_2011_backdrop.jpg",
+  "belongs_to_collection": null,
+  "budget": 3100000,
+  "genres": [
+    { "id": 18, "name": "Drama" },
+    { "id": 9648, "name": "Mystery" }
+  ],
+  "homepage": "",
+  "id": 9200003,
+  "imdb_id": "tt9200003",
+  "original_language": "en",
+  "original_title": "Keeper of the Lantern",
+  "overview": "Two rival lighthouse keepers on a crumbling island must cooperate to guide a stranded cargo ship to shore during a storm that knocks out every beacon but theirs. Their feud costs them more than sleep by morning.",
+  "popularity": 8.9,
+  "poster_path": "/nj_keeper_of_the_lantern_2011_poster.jpg",
+  "release_date": "2011-06-17",
+  "revenue": 5200000,
+  "runtime": 94,
+  "status": "Released",
+  "tagline": "One light, two keepers, no truce.",
+  "title": "Keeper of the Lantern",
+  "video": false,
+  "vote_average": 6.6,
+  "vote_count": 902,
+  "external_ids": {
+    "id": 9200003,
+    "imdb_id": "tt9200003",
+    "freebase_mid": null,
+    "freebase_id": null,
+    "tvdb_id": null,
+    "tvrage_id": null,
+    "wikidata_id": null
+  },
+  "credits": {
+    "cast": [
+      {
+        "adult": false,
+        "gender": 2,
+        "id": 884001,
+        "known_for_department": "Acting",
+        "name": "Wilfred Moxley",
+        "original_name": "Wilfred Moxley",
+        "popularity": 7.2,
+        "profile_path": "/nj_wilfred_moxley_profile.jpg",
+        "cast_id": 6,
+        "character": "Otis Brenner",
+        "credit_id": "nj80003",
+        "order": 0
+      },
+      {
+        "adult": false,
+        "gender": 1,
+        "id": 884002,
+        "known_for_department": "Acting",
+        "name": "Cassia Delucca",
+        "original_name": "Cassia Delucca",
+        "popularity": 6.8,
+        "profile_path": "/nj_cassia_delucca_profile.jpg",
+        "cast_id": 7,
+        "character": "Pearl Bittner",
+        "credit_id": "nj80004",
+        "order": 1
+      }
+    ],
+    "crew": []
+  }
+}

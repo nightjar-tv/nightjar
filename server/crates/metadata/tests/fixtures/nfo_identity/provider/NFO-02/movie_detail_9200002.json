@@ -1,0 +1,68 @@
+{
+  "adult": false,
+  "backdrop_path": "/nj_salt_harbor_2015_bay_backdrop.jpg",
+  "belongs_to_collection": null,
+  "budget": 6200000,
+  "genres": [
+    { "id": 18, "name": "Drama" }
+  ],
+  "homepage": "",
+  "id": 9200002,
+  "imdb_id": "tt9200002",
+  "original_language": "en",
+  "original_title": "Salt Harbor",
+  "overview": "The harbormaster's daughter returns after the fishing fleet collapses to find the port's debts were quietly bought by a salvage company that plans to dredge the bay into a shipping lane. Dredging would drown the town's last reef and the families who still fish it, so she fights the permit one tide at a time.",
+  "popularity": 11.7,
+  "poster_path": "/nj_salt_harbor_2015_poster.jpg",
+  "release_date": "2015-03-06",
+  "revenue": 4100000,
+  "runtime": 101,
+  "status": "Released",
+  "tagline": "Some ports are worth sinking for.",
+  "title": "Salt Harbor",
+  "video": false,
+  "vote_average": 6.9,
+  "vote_count": 1430,
+  "external_ids": {
+    "id": 9200002,
+    "imdb_id": "tt9200002",
+    "freebase_mid": null,
+    "freebase_id": null,
+    "tvdb_id": null,
+    "tvrage_id": null,
+    "wikidata_id": null
+  },
+  "credits": {
+    "cast": [
+      {
+        "adult": false,
+        "gender": 2,
+        "id": 883001,
+        "known_for_department": "Acting",
+        "name": "Rollo Vane",
+        "original_name": "Rollo Vane",
+        "popularity": 6.1,
+        "profile_path": "/nj_rollo_vane_profile.jpg",
+        "cast_id": 4,
+        "character": "Ilsa Brandt",
+        "credit_id": "nj80001",
+        "order": 0
+      },
+      {
+        "adult": false,
+        "gender": 1,
+        "id": 883002,
+        "known_for_department": "Acting",
+        "name": "Tamsin Grig",
+        "original_name": "Tamsin Grig",
+        "popularity": 5.4,
+        "profile_path": "/nj_tamsin_grig_profile.jpg",
+        "cast_id": 5,
+        "character": "Merrick Vale",
+        "credit_id": "nj80002",
+        "order": 1
+      }
+    ],
+    "crew": []
+  }
+}

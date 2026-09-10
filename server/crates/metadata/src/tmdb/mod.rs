@@ -99,6 +99,7 @@ const TV_APPEND: &str = "images,credits,videos,content_ratings,external_ids,aggr
 const SEASON_APPEND: &str = "images,credits,videos,external_ids";
 
 #[derive(Debug)]
+#[cfg_attr(test, allow(dead_code))]
 pub struct TmdbClient {
     creds: TmdbCredentials,
     agent: ureq::Agent,
@@ -151,51 +152,61 @@ impl TmdbClient {
     ) -> Result<Option<Value>, ResolveError> {
         let _permit = self.limiter.acquire();
         self.http_requests.fetch_add(1, Ordering::Relaxed);
-        let mut url = format!("https://api.themoviedb.org/3{path}");
-        let mut first = true;
-        let push = |url: &mut String, first: &mut bool, k: &str, v: &str| {
-            url.push(if *first { '?' } else { '&' });
-            *first = false;
-            url.push_str(k);
-            url.push('=');
-            url.push_str(&urlencoding_encode(v));
-        };
-        for (k, v) in query {
-            push(&mut url, &mut first, k, v);
+        // Test builds answer every request from the in-process fixture route
+        // table; an unregistered route is a deterministic provider error, so
+        // no test request can reach the live network.
+        #[cfg(test)]
+        {
+            test_fixture::intercept("GET", path, query)
         }
-        push(&mut url, &mut first, "api_key", &self.creds.api_key);
+        #[cfg(not(test))]
+        {
+            let mut url = format!("https://api.themoviedb.org/3{path}");
+            let mut first = true;
+            let push = |url: &mut String, first: &mut bool, k: &str, v: &str| {
+                url.push(if *first { '?' } else { '&' });
+                *first = false;
+                url.push_str(k);
+                url.push('=');
+                url.push_str(&urlencoding_encode(v));
+            };
+            for (k, v) in query {
+                push(&mut url, &mut first, k, v);
+            }
+            push(&mut url, &mut first, "api_key", &self.creds.api_key);
 
-        let resp = match self.agent.get(&url).call() {
-            Ok(r) => r,
-            Err(ureq::Error::Status(404, _)) => return Ok(None),
-            Err(e) => {
-                return Err(ResolveError::Provider(scrub_tmdb_url_secret(
-                    &e.to_string(),
+            let resp = match self.agent.get(&url).call() {
+                Ok(r) => r,
+                Err(ureq::Error::Status(404, _)) => return Ok(None),
+                Err(e) => {
+                    return Err(ResolveError::Provider(scrub_tmdb_url_secret(
+                        &e.to_string(),
+                    )));
+                }
+            };
+            let status = resp.status();
+            let body = resp
+                .into_string()
+                .map_err(|e| ResolveError::Provider(e.to_string()))?;
+            if status == 429 {
+                self.http_429.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(err) = auth_rejected_error(status, &self.creds) {
+                return Err(err);
+            }
+            if status == 404 {
+                return Ok(None);
+            }
+            if !(200..300).contains(&status) {
+                return Err(ResolveError::Provider(format!(
+                    "TMDB {status}: {}",
+                    body.chars().take(200).collect::<String>()
                 )));
             }
-        };
-        let status = resp.status();
-        let body = resp
-            .into_string()
-            .map_err(|e| ResolveError::Provider(e.to_string()))?;
-        if status == 429 {
-            self.http_429.fetch_add(1, Ordering::Relaxed);
+            serde_json::from_str(&body)
+                .map(Some)
+                .map_err(|e| ResolveError::Provider(e.to_string()))
         }
-        if let Some(err) = auth_rejected_error(status, &self.creds) {
-            return Err(err);
-        }
-        if status == 404 {
-            return Ok(None);
-        }
-        if !(200..300).contains(&status) {
-            return Err(ResolveError::Provider(format!(
-                "TMDB {status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-        serde_json::from_str(&body)
-            .map(Some)
-            .map_err(|e| ResolveError::Provider(e.to_string()))
     }
 
     /// Title search, deliberately **not** narrowed by the folder's year.
@@ -843,6 +854,7 @@ fn auth_rejected_error(status: u16, creds: &TmdbCredentials) -> Option<ResolveEr
     }
 }
 
+#[cfg(not(test))]
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -855,6 +867,170 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// `cfg(test)`-only deterministic provider transport.
+///
+/// Ordinary tests install a thread-local route table with
+/// [`test_fixture::reset`] and register exact `method + path + query` routes.
+/// A test-build request that matches no route is a deterministic provider
+/// error: it can never reach `ureq`. The live route is compiled out of test
+/// builds entirely (see `TmdbClient::get_json_status`).
+#[cfg(test)]
+pub(crate) mod test_fixture {
+    use super::ResolveError;
+    use serde_json::Value;
+    use std::cell::RefCell;
+
+    /// Response a registered route serves.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RouteOutcome {
+        /// HTTP 200 with the exact JSON body bytes.
+        Hit(Vec<u8>),
+    }
+
+    /// What one logged provider call produced.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum LogOutcome {
+        Hit { status: u16 },
+        Error(String),
+    }
+
+    /// One ordered provider call, exactly as observed.
+    #[derive(Debug, Clone)]
+    pub(crate) struct LogEntry {
+        pub method: String,
+        pub path: String,
+        /// Query pairs exactly as the caller passed them.
+        pub query: Vec<(String, String)>,
+        pub outcome: LogOutcome,
+    }
+
+    struct Route {
+        method: String,
+        path: String,
+        query: Vec<(String, String)>,
+        outcome: RouteOutcome,
+    }
+
+    #[derive(Default)]
+    struct State {
+        routes: Vec<Route>,
+        log: Vec<LogEntry>,
+    }
+
+    thread_local! {
+        /// `None` until a test installs a table, which is a route miss for
+        /// every request. Thread-local so parallel tests never share a route
+        /// table or a request log.
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    /// Install an empty active route table, clearing any previous routes and
+    /// request log. Call this at the start of every test that uses the
+    /// transport.
+    pub(crate) fn reset() {
+        STATE.with(|s| *s.borrow_mut() = Some(State::default()));
+    }
+
+    /// Register one route under its exact `method + path + query` identity.
+    pub(crate) fn register_route(
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        outcome: RouteOutcome,
+    ) {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let state = guard.get_or_insert_with(State::default);
+            state.routes.push(Route {
+                method: method.to_string(),
+                path: path.to_string(),
+                query: query.to_vec(),
+                outcome,
+            });
+        });
+    }
+
+    /// The calls the active transport has observed, in order.
+    pub(crate) fn request_log() -> Vec<LogEntry> {
+        STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|state| state.log.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    fn exact_pairs_equal(declared: &[(String, String)], actual: &[(String, String)]) -> bool {
+        if declared.len() != actual.len() {
+            return false;
+        }
+        let mut left = declared.to_vec();
+        let mut right = actual.to_vec();
+        left.sort();
+        right.sort();
+        left == right
+    }
+
+    fn lookup_route(method: &str, path: &str, query: &[(String, String)]) -> Option<RouteOutcome> {
+        STATE.with(|s| {
+            let guard = s.borrow();
+            let state = guard.as_ref()?;
+            state
+                .routes
+                .iter()
+                .find(|r| {
+                    r.method == method && r.path == path && exact_pairs_equal(&r.query, query)
+                })
+                .map(|r| r.outcome.clone())
+        })
+    }
+
+    fn log_request(method: &str, path: &str, query: Vec<(String, String)>, outcome: LogOutcome) {
+        STATE.with(|s| {
+            let mut guard = s.borrow_mut();
+            let state = guard.get_or_insert_with(State::default);
+            state.log.push(LogEntry {
+                method: method.to_string(),
+                path: path.to_string(),
+                query,
+                outcome,
+            });
+        });
+    }
+
+    /// Answer one provider call from the active route table. A call that
+    /// matches no route is a deterministic provider error, never a live
+    /// request.
+    pub(crate) fn intercept(
+        method: &'static str,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<Value>, ResolveError> {
+        let query_owned: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        match lookup_route(method, path, &query_owned) {
+            Some(RouteOutcome::Hit(body)) => match serde_json::from_slice::<Value>(&body) {
+                Ok(v) => {
+                    log_request(method, path, query_owned, LogOutcome::Hit { status: 200 });
+                    Ok(Some(v))
+                }
+                Err(e) => {
+                    let msg = format!("fixture body for {path} is not JSON: {e}");
+                    log_request(method, path, query_owned, LogOutcome::Error(msg.clone()));
+                    Err(ResolveError::Provider(msg))
+                }
+            },
+            None => {
+                let msg = format!("fixture route missing: {method} {path}");
+                log_request(method, path, query_owned, LogOutcome::Error(msg.clone()));
+                Err(ResolveError::Provider(msg))
+            }
+        }
+    }
 }
 
 /// ureq Status errors embed the request URL; strip the query api_key.

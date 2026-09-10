@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<movie>
+  <title>Salt Harbor</title>
+  <originaltitle>Salt Harbor</originaltitle>
+  <year>2015</year>
+  <uniqueid type="tmdb" default="true">9200002</uniqueid>
+  <uniqueid type="imdb">tt9200002</uniqueid>
+</movie>

@@ -1,0 +1,23 @@
+{
+  "page": 1,
+  "results": [
+    {
+      "adult": false,
+      "backdrop_path": "/nj_keeper_of_the_lantern_2011_backdrop.jpg",
+      "genre_ids": [18, 9648],
+      "id": 9200003,
+      "original_language": "en",
+      "original_title": "Keeper of the Lantern",
+      "overview": "Two rival lighthouse keepers on a crumbling island must cooperate to guide a stranded cargo ship to shore during a storm that knocks out every beacon but theirs. Their feud costs them more than sleep by morning.",
+      "popularity": 8.9,
+      "poster_path": "/nj_keeper_of_the_lantern_2011_poster.jpg",
+      "release_date": "2011-06-17",
+      "title": "Keeper of the Lantern",
+      "video": false,
+      "vote_average": 6.6,
+      "vote_count": 902
+    }
+  ],
+  "total_pages": 1,
+  "total_results": 1
+}

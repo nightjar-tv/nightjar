@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<movie>
+  <title>The Meridian Job</title>
+  <originaltitle>The Meridian Job</originaltitle>
+  <sorttitle>Meridian Job, The</sorttitle>
+  <year>2017</year>
+  <premiered>2017-09-22</premiered>
+  <plot>A retired cartographer is pulled back into the world of clandestine mapmaking when a rival guild steals the only chart that shows the way to a sunken relay station. She must cross three hostile cities before the equinox or the chart is lost forever.</plot>
+  <outline>A retired cartographer races rival mapmakers to recover a stolen chart before the equinox.</outline>
+  <runtime>118</runtime>
+  <genre>Thriller</genre>
+  <genre>Adventure</genre>
+  <uniqueid type="tmdb" default="true">9200001</uniqueid>
+  <uniqueid type="imdb">tt9200001</uniqueid>
+  <uniqueid type="tvdb">8200001</uniqueid>
+  <tmdbid>9200001</tmdbid>
+  <ratings>
+    <rating name="imdb" max="10" default="true">
+      <value>7.4</value>
+      <votes>48211</votes>
+    </rating>
+  </ratings>
+  <actor>
+    <name>Marlene Quist</name>
+    <role>Ingrid Kale</role>
+    <order>0</order>
+  </actor>
+  <actor>
+    <name>Devran Okonkwo</name>
+    <role>Amos Fetter</role>
+    <order>1</order>
+  </actor>
+  <actor>
+    <name>Luella Pemberton</name>
+    <role>Nadia Rook</role>
+    <order>2</order>
+  </actor>
+  <director>Henrik Andorran</director>
+  <credits>Wylie Baum</credits>
+</movie>
