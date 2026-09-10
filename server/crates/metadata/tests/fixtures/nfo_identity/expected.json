@@ -1,0 +1,615 @@
+{
+  "schema_version": 1,
+  "file_role": "expected.json",
+  "adjudicator_owned": {
+    "adjudication_id": "nfo-adjudicator-20260909-01",
+    "role": "separate bounded adjudicator for the nfo_identity canonical fixture",
+    "product_checkout_only": "Authoring performed only inside the current product checkout. No path outside the checkout was read or written.",
+    "no_execution": "No tests, cargo, builds, corpus runs, provider calls, network calls, or git operations were performed. This file declares required predicates and expected values; it records no observation as having been observed.",
+    "owner": "This file is adjudicator-owned. It is not an author artifact and never preclaims that any run already passed.",
+    "authored_at_utc": "2026-09-09T00:00:00Z",
+    "declaration": "Every required predicate below is derived only from the author-owned input bytes, the author manifest (route model, identity-claim topology, hashes), and product source symbols consulted read-only. Author inputs were used as read-only and were not invented, rewritten, or extended."
+  },
+  "scope": {
+    "fixture_root": "server/crates/metadata/tests/fixtures/nfo_identity/",
+    "manifest": "server/crates/metadata/tests/fixtures/nfo_identity/manifest.json",
+    "readme": "server/crates/metadata/tests/fixtures/nfo_identity/README.md",
+    "provenance": "server/crates/metadata/tests/fixtures/nfo_identity/PROVENANCE.md",
+    "license": "GPL-3.0-only",
+    "synthetic_notice": "All corpus content is original synthetic GPL-3.0-only material. Identifier blocks (TMDB 9200001-9200008/9300005-9300006, IMDb tt9200001-tt9200008/tt9300005-tt9300006, TVDB 8200001-8200008/8300005-8300006) are fictional reserved blocks, not real provider records.",
+    "author_separation": "Author-owned artifacts are xml/*, provider/*, manifest.json, README.md, PROVENANCE.md. The author withheld expected.json and all verdicts. This file supplies the withheld verdict contract and touches no author artifact."
+  },
+  "integrity": {
+    "note": "Read-only snapshot taken at adjudication time. Hashes below were observed, not authored by the corpus author, and are recorded here for change detection only. XML and provider byte hashes are not repeated here; the author manifest.json and PROVENANCE.md already record them, and each record below references those recorded hashes as expected values.",
+    "observed_read_only": [
+      { "path": "manifest.json", "sha256": "14cb6698df0a330f0679e9e437ad7cec396971eec4940b7975fcd17aa2be7510", "bytes": 27044 },
+      { "path": "README.md", "sha256": "ca0b36d73e2ba777c77b85d4474b62ed3adade966569281ca8fadcdedf3754c6", "bytes": 6007 },
+      { "path": "PROVENANCE.md", "sha256": "a6262beac4c5480458f99a51386ff65e553bf2cf79bdf9cc00dce7aa762cd8ba", "bytes": 5256 }
+    ]
+  },
+  "record_contract": {
+    "exactly_eight_records": true,
+    "denominator": "8/8",
+    "record_ids": ["NFO-01", "NFO-02", "NFO-03", "NFO-04", "NFO-05", "NFO-06", "NFO-07", "NFO-08"],
+    "record_counting_rule": "The harness MUST report exactly the eight records above. NFO-08 is ONE movie family recorded as one record whose phases (initial-malformed, corrected-body, manual-assign) are states inside that single record. Phases are never extra records.",
+    "harness_verdict_levels": {
+      "required": "must_observe: the referenced observation slot must exist and satisfy the predicate, else FAIL.",
+      "prohibited": "must_not_observe: the referenced observation must be absent/false, else FAIL.",
+      "blocked_or_inconclusive": "stop condition: if the referenced state is observed (or cannot be produced), the harness MUST return BLOCKED or INCONCLUSIVE for the case, never PASS. A PASS requires every required predicate to hold, every prohibited predicate to be false, and no stop condition to fire."
+    }
+  },
+  "predicate_semantics": {
+    "op": {
+      "eq": "field equals expected",
+      "neq": "field differs from expected",
+      "true": "field is boolean true",
+      "false": "field is boolean false",
+      "present": "field is present and not null",
+      "absent": "field is null or missing",
+      "in": "field is one of the expected array values",
+      "not_in": "field is none of the expected array values",
+      "ge": "field >= expected",
+      "gt": "field > expected",
+      "count_eq": "array length == expected",
+      "count_ge": "array length >= expected",
+      "count_gt": "array length > expected",
+      "length_gt": "string length > expected",
+      "includes": "string or array includes the expected value",
+      "includes_all": "array includes every member of the expected array",
+      "all_in": "every element of the field array is a member of the expected array",
+      "empty_array": "array length == 0",
+      "starts_with": "string starts with the expected prefix"
+    },
+    "field_prefixes": {
+      "input": "per-file NFO input facts: bytes, sha256, body_state, parse outcome, parsed identity fields",
+      "item": "per-item pipeline state after the stage: metadata status, reason, links, keys, binding",
+      "trace": "provider request trace with one entry per request, each mapped to a manifest route_id",
+      "capability": "recorded capability/abstention state of the identity stage for the case",
+      "find": "show /find cross-check observations (NFO-05, NFO-06)",
+      "conflict": "conflict topology observations (NFO-04)",
+      "merge": "field-preservation observations for search-merge paths (NFO-03)",
+      "watch": "watch_state/playback_events migration observations (NFO-08)",
+      "repair": "repair/retry/assign action observations (NFO-08)"
+    }
+  },
+  "glossary": {
+    "body_state": "Classification of the NFO byte payload. Values: present (well-formed XML root with content), malformed (bytes fail parse), absent (zero bytes). A zero-byte file is absent, never parsed.",
+    "body_sha256": "SHA-256 of the exact NFO input bytes; must equal the hash the author recorded for that file.",
+    "origin": "Source of a parsed claim. Values: nfo (claim came from the NFO bytes), location (derived from folder/media path only), provider, none.",
+    "parsed.ids": "{ tmdb, imdb, tvdb } parsed from the NFO. null when the NFO carries no such id.",
+    "parsed.content": "{ plot_present, genre_present, cast_present, plot, genres[], cast_names[] }. Meaningful means non-empty beyond structure, not a stub.",
+    "metadata_status": "Observed item status string. Values follow product MetadataStatus: pending, matched, ready, unmatched.",
+    "manually_matched": "0 = automatic binding; 1 = manual Assign binding. Observed per item.",
+    "item_key": "ADR-0025 watch-shaped key. item_links::path_item_key(library_id, relpath) == format!(\"path:{library_id}:{relpath}\"). item_links::is_watch_item_key(key) is true for tmdb:movie:, tmdb:episode:, path:, tvdb: prefixes; tmdb:show: is NOT a watch key.",
+    "route_id_term": "Manifest route identifier. Every traced request must map to a manifest route_id or be recorded as an unmapped simulated provider miss.",
+    "request_class": "Manifest route class: identity, content, observability. identity = request the identity stage may issue; content = enrichment after identity binds; observability = inspection only, never an identity request.",
+    "provider_miss": "A request with no mapped response file simulates a provider miss (product-equivalent of 404/Ok(None)). A real empty-results search body is NOT a miss file; it is a hit that returns zero results.",
+    "capability.state": "Identity-stage capability/abstention for the case. Must be recorded with a machine reason, never replaced by prose.",
+    "find_crosscheck": "/find external-id lookup plus /tv detail cross-check (product find_hit_reject_reason: name and folder-year must agree or the id is discarded and search runs instead).",
+    "trace_scoped_response": "Response facts for one traced request are read under trace.request_with_route_id.<route_id>.response.* so a record with several provider responses keeps each route's facts distinct.",
+    "watch": "Block-2 watch_state and playback_events tables. watch_state rows carry item_key and non-key values (position_ms, duration_ms, played, last_played_at). playback_events rows carry item_key and per-event non-key values. Migration rewrites item_key old -> destination and must preserve every non-key value.",
+    "harness_booleans": "Harness-computed booleans. Each is true only when its row-level/derived condition holds: trace.any_identity_class_request, trace.identity_class_detail_request, find.find_route_observed, find.detail_route_observed, find.correct_binding_observed, find.reject_reason_recorded, item.bound_identity_wrong_key, merge.merge_observation_recorded, merge.merge_field_preserving, watch.seed.*, watch.before_snapshot_complete, watch.after_snapshot_complete, watch.snapshot_evidence, watch.destination_is_watch_key, watch.destination_rows_present, watch.old_key_present_after, watch.non_key_values_preserved, input.byte_identical_to_corrected_body, input.file_byte_difference_from_manual_assign."
+  },
+  "global_mandatory_observations": {
+    "note": "Every record MUST carry observations for each of these, either as required predicates with case-specific expected values or as explicit blocked_or_inconclusive stop conditions. They are field-level predicates, never broad prose.",
+    "items": [
+      "body_state for every NFO byte payload the case consumes",
+      "body raw hash (sha256 of the NFO bytes) equal to the author-recorded hash",
+      "NFO origin attribution for every parsed identity claim",
+      "all parsed ids recorded exactly (each id present in the NFO or null when absent)",
+      "method / status / reason triple for every traced provider request and for the item outcome",
+      "abstention or capability state with a machine reason",
+      "request trace with manifest route ids (identity, content, observability separated)",
+      "observed provider request count and every request mapped to a manifest route or a simulated miss"
+    ]
+  },
+  "records": [
+    {
+      "record_id": "NFO-01",
+      "label": "complete movie",
+      "kind": "movie",
+      "input_refs": [
+        { "path": "xml/NFO-01/complete.nfo", "role": "identity-complete", "sha256": "d17ec5c2526cc8321da850805371c99b5734782ab1d95c00561c2a4428d06624", "bytes": 1451 }
+      ],
+      "route_inputs": [],
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present", "why": "NFO-01 ships one well-formed complete.nfo" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "d17ec5c2526cc8321da850805371c99b5734782ab1d95c00561c2a4428d06624", "why": "raw body hash must equal the author-recorded hash" },
+        { "group": "body", "field": "input.parse.well_formed", "op": "true" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "The Meridian Job" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2017 },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "eq", "expected": 9200001, "why": "usable TMDB claim required" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "eq", "expected": "tt9200001" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "eq", "expected": 8200001 },
+        { "group": "origin", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo", "why": "global mandatory NFO-origin observation; every claim originates from the NFO body" },
+        { "group": "content", "field": "input.parse.parsed.content.plot_present", "op": "true", "why": "meaningful plot required" },
+        { "group": "content", "field": "input.parse.parsed.content.plot", "op": "includes", "expected": "retired cartographer", "why": "field-level meaningful-plot predicate, not presence-only prose" },
+        { "group": "content", "field": "input.parse.parsed.content.genre_present", "op": "true" },
+        { "group": "content", "field": "input.parse.parsed.content.genres", "op": "includes_all", "expected": ["Thriller", "Adventure"] },
+        { "group": "content", "field": "input.parse.parsed.content.cast_present", "op": "true" },
+        { "group": "content", "field": "input.parse.parsed.content.cast_names", "op": "includes_all", "expected": ["Marlene Quist", "Devran Okonkwo", "Luella Pemberton"] },
+        { "group": "trace", "field": "trace.total_request_count", "op": "eq", "expected": 0, "why": "NFO-01 expects zero provider requests; no route input is shipped" },
+        { "group": "trace", "field": "trace.identity_request_count", "op": "eq", "expected": 0 },
+        { "group": "trace", "field": "trace.nfo_origin_request_count", "op": "eq", "expected": 0 },
+        { "group": "trace", "field": "trace.method_status_reason_recorded", "op": "true", "why": "global mandatory method/status/reason observation (vacuous when zero requests, but must still be recorded)" },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "nfo_sufficient", "why": "global mandatory capability-state observation; identity evidence is complete in the NFO" },
+        { "group": "capability", "field": "capability.content_sufficiency", "op": "eq", "expected": "complete" },
+        { "group": "capability", "field": "capability.reason", "op": "present", "why": "machine reason required" }
+      ],
+      "prohibited": [],
+      "stop_conditions": [
+        { "group": "status", "field": "item.status_observed", "op": "false", "blocked_reason": "A final status was claimed without an observation. ready/matched/unmatched must be observed, never assumed (do not assume a final ready status without observation)." },
+        { "group": "trace", "field": "trace.total_request_count", "op": "gt", "expected": 0, "blocked_reason": "Any provider request for NFO-01 contradicts the zero-request design and is not a pass." },
+        { "group": "status", "field": "item.bound_identity_wrong_key", "op": "true", "blocked_reason": "A bound identity is allowed only as the observed NFO-derived key tmdb:movie:9200001; any other bound key is BLOCKED. Absence of a binding is permitted because the manifest asserts nothing about a bound record." }
+      ]
+    },
+    {
+      "record_id": "NFO-02",
+      "label": "partial movie",
+      "kind": "movie",
+      "input_refs": [
+        { "path": "xml/NFO-02/partial.nfo", "role": "identity-title-plus-tmdb", "sha256": "31104cbc0fd5dbf5047ef890a83afb0bdf6cf90ff938ca62e109e2d138355bd9", "bytes": 317 }
+      ],
+      "route_inputs": ["nfo-02.movie-detail.9200002"],
+      "route_refs": [
+        { "route_id": "nfo-02.movie-detail.9200002", "class": "content", "method": "GET", "path": "/movie/9200002", "response": "provider/NFO-02/movie_detail_9200002.json", "response_sha256": "62191902c0ceb7041ccd08306bfffa783965f880fa4df02225525408742e5529", "why": "shipped /movie detail is content/enrichment evidence, never an identity request" }
+      ],
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "31104cbc0fd5dbf5047ef890a83afb0bdf6cf90ff938ca62e109e2d138355bd9" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "Salt Harbor" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2015 },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "eq", "expected": 9200002, "why": "usable TMDB claim; this is the ID short-circuit asserted separately from NFO-01" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "eq", "expected": "tt9200002" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "absent", "why": "no tvdb id in this NFO" },
+        { "group": "parsed", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo" },
+        { "group": "content", "field": "input.parse.parsed.content.plot_present", "op": "false", "why": "no meaningful content in this NFO" },
+        { "group": "content", "field": "input.parse.parsed.content.genre_present", "op": "false" },
+        { "group": "content", "field": "input.parse.parsed.content.cast_present", "op": "false" },
+        { "group": "content", "field": "capability.enrichment_need", "op": "true", "why": "empty body content drives the enrichment need; this is what separates the NFO-02 short-circuit from NFO-01" },
+        { "group": "trace", "field": "trace.identity_request_count", "op": "eq", "expected": 0, "why": "identity binds from the NFO tmdb claim alone with no provider call" },
+        { "group": "trace", "field": "trace.nfo_origin_request_count", "op": "eq", "expected": 0 },
+        { "group": "trace", "field": "trace.any_identity_class_request", "op": "false", "why": "the shipped detail route is class content, never an identity request" },
+        { "group": "trace", "field": "trace.content_request_route_ids", "op": "all_in", "expected": ["nfo-02.movie-detail.9200002"], "why": "any enrichment request must be the shipped content detail route" },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "nfo_tmdb_short_circuit", "why": "the NFO tmdb claim short-circuits identity with no provider call" },
+        { "group": "capability", "field": "capability.content_sufficiency", "op": "eq", "expected": "partial" },
+        { "group": "capability", "field": "capability.reason", "op": "present" },
+        { "group": "status", "field": "item.status", "op": "in", "expected": ["matched", "pending", "ready"], "why": "terminal state must be observed; ready is only acceptable with observed enrichment evidence (stop condition below)" },
+        { "group": "status", "field": "item.status_observed", "op": "true" },
+        { "group": "status", "field": "item.reason", "op": "present", "why": "global mandatory method/status/reason triple" }
+      ],
+      "prohibited": [
+        { "group": "trace", "field": "trace.any_identity_class_request", "op": "true", "why": "no request may be an identity request for NFO-02" }
+      ],
+      "stop_conditions": [
+        { "group": "status", "field": "item.status_observed", "op": "false", "blocked_reason": "A final status was claimed without observation." },
+        { "group": "status", "field": "item.status", "op": "eq", "expected": "ready", "blocked_reason": "ready for NFO-02 requires observed enrichment from the content detail route; a ready claim without that observation is INCONCLUSIVE, not a pass.", "requires": "item.enrichment_observed_from_route == nfo-02.movie-detail.9200002" },
+        { "group": "status", "field": "item.bound_identity_wrong_key", "op": "true", "blocked_reason": "A bound identity is allowed only as the NFO-derived key tmdb:movie:9200002." }
+      ]
+    },
+    {
+      "record_id": "NFO-03",
+      "label": "partial movie, no usable provider id",
+      "kind": "movie",
+      "input_refs": [
+        { "path": "xml/NFO-03/content-only.nfo", "role": "identity-title-and-content-only", "sha256": "2e90ddb1101ce2f6a80990e67cd61ae4abc261e31589954c604a0282363f4d18", "bytes": 840 }
+      ],
+      "route_inputs": ["nfo-03.search-movie.keeper-of-the-lantern", "nfo-03.movie-detail.9200003"],
+      "route_refs": [
+        { "route_id": "nfo-03.search-movie.keeper-of-the-lantern", "class": "identity", "method": "GET", "path": "/search/movie", "query": { "query": "Keeper of the Lantern", "language": "en-US" }, "response": "provider/NFO-03/search_movie_keeper_of_the_lantern.json", "response_sha256": "b0da8fa4d015249791a74a71813281818da03fbbe1123cc2a1b46afd3f56f285", "response_bytes": 789 },
+        { "route_id": "nfo-03.movie-detail.9200003", "class": "content", "method": "GET", "path": "/movie/9200003", "response": "provider/NFO-03/movie_detail_9200003.json", "response_sha256": "27775707d3db51fcfc8ae13e3015c79a1097c8e4c02f7513c2026d6533037602", "response_bytes": 1966 }
+      ],
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "2e90ddb1101ce2f6a80990e67cd61ae4abc261e31589954c604a0282363f4d18" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "Keeper of the Lantern" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2011 },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "absent", "why": "no usable provider id of any kind" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "absent" },
+        { "group": "origin", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo" },
+        { "group": "content", "field": "input.parse.parsed.content.plot_present", "op": "true", "why": "title and content are present; only the provider id is missing" },
+        { "group": "content", "field": "input.parse.parsed.content.genre_present", "op": "true" },
+        { "group": "content", "field": "input.parse.parsed.content.cast_present", "op": "true" },
+        { "group": "trace", "field": "trace.identity_request_count", "op": "ge", "expected": 1, "why": "no usable provider id forces a real /search/movie request" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.present", "op": "true", "why": "the identity request must be the real search route, never a detail stub" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.method", "op": "eq", "expected": "GET" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.result", "op": "eq", "expected": "hit" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.response_sha256", "op": "eq", "expected": "b0da8fa4d015249791a74a71813281818da03fbbe1123cc2a1b46afd3f56f285" },
+        { "group": "search", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.response.total_results", "op": "eq", "expected": 1, "why": "real search response ships exactly one candidate" },
+        { "group": "search", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.response.candidate_id", "op": "eq", "expected": 9200003 },
+        { "group": "search", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.response.candidate_title", "op": "eq", "expected": "Keeper of the Lantern" },
+        { "group": "search", "field": "trace.request_with_route_id.nfo-03.search-movie.keeper-of-the-lantern.response.candidate_year", "op": "eq", "expected": 2011, "why": "candidate title/year match the location title/year so a title-scoring path has a genuine candidate" },
+        { "group": "merge", "field": "merge.merge_observation_recorded", "op": "true", "why": "field-preserving merge must be observed with before/after fields" },
+        { "group": "merge", "field": "merge.merge_field_preserving", "op": "true" },
+        { "group": "merge", "field": "merge.fields_preserved", "op": "includes_all", "expected": ["plot", "genres", "cast", "title", "year"], "why": "NFO-sourced content fields must survive the search merge un-overwritten" },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "search_resolution" },
+        { "group": "capability", "field": "capability.reason", "op": "present" }
+      ],
+      "prohibited": [
+        { "group": "trace", "field": "item.binding_stub_from_detail_only", "op": "true", "why": "a detail response must never stand in for the search; the detail route is class content only" },
+        { "group": "merge", "field": "merge.fields_overwritten", "op": "includes", "expected": "plot", "why": "NFO plot must not be overwritten by a provider stub" }
+      ],
+      "stop_conditions": [
+        { "group": "trace", "field": "trace.identity_request_count", "op": "eq", "expected": 0, "blocked_reason": "A provider-id-free movie that issues no real /search/movie cannot pass NFO-03; a detail-only stub is not a search." },
+        { "group": "merge", "field": "merge.merge_observation_recorded", "op": "false", "blocked_reason": "Field preservation must be observed, not asserted; without before/after merge fields the case is INCONCLUSIVE." },
+        { "group": "status", "field": "item.status_observed", "op": "false", "blocked_reason": "Final status must be observed, never assumed." },
+        { "group": "status", "field": "item.bound_identity_wrong_key", "op": "true", "blocked_reason": "A bound identity is allowed only as the search-selected candidate tmdb:movie:9200003." }
+      ]
+    },
+    {
+      "record_id": "NFO-04",
+      "label": "conflicting movie",
+      "kind": "movie",
+      "input_refs": [
+        { "path": "xml/NFO-04/conflict.nfo", "role": "identity-conflicting-ids", "sha256": "d5ab12742142b8c0c37916834839fe47e0ffb73a7c530a301a11c022b4c549e9", "bytes": 1036 }
+      ],
+      "route_inputs": ["nfo-04.movie-detail.9200041", "nfo-04.movie-detail.9200042", "nfo-04.movie-detail.9200043"],
+      "route_refs": [
+        { "route_id": "nfo-04.movie-detail.9200041", "class": "observability", "response": "provider/NFO-04/movie_detail_9200041.json", "response_sha256": "b9ec0590bd2a9c5e46d7988ea8b7b195f4aa22351e1bfcd5d300bdd6eb95c52e", "why": "detail of entity A; external_ids.imdb is tt9200041, diverging from the NFO imdb claim tt9200042" },
+        { "route_id": "nfo-04.movie-detail.9200042", "class": "observability", "response": "provider/NFO-04/movie_detail_9200042.json", "response_sha256": "8e09d869ac8f04838939de6e06384e241015e814c27980b30ac21f1d16921897", "why": "detail of entity B (Split Tides), named by the NFO imdb claim tt9200042" },
+        { "route_id": "nfo-04.movie-detail.9200043", "class": "observability", "response": "provider/NFO-04/movie_detail_9200043.json", "response_sha256": "cc06e2b233d5463b62decc6656ba709707a4c693818ed83f682b57401e95c511", "why": "detail of entity C (Lavender Cut), named by the NFO tvdb claim 8200043" }
+      ],
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "d5ab12742142b8c0c37916834839fe47e0ffb73a7c530a301a11c022b4c549e9" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "The Cobalt Divide" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2018 },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "eq", "expected": 9200041, "why": "parsed TMDB claim required" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "eq", "expected": "tt9200042", "why": "parsed IMDb claim required; it names entity B, not entity A" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "eq", "expected": 8200043, "why": "parsed TVDB claim required; it names entity C" },
+        { "group": "origin", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo" },
+        { "group": "content", "field": "input.parse.parsed.content.plot_present", "op": "true" },
+        { "group": "content", "field": "input.parse.parsed.content.genre_present", "op": "true" },
+        { "group": "content", "field": "input.parse.parsed.content.cast_present", "op": "true" },
+        { "group": "conflict", "field": "conflict.declared", "op": "true", "why": "the three id claims name three distinct synthetic entities" },
+        { "group": "conflict", "field": "conflict.entities_distinct", "op": "true", "why": "tmdb 9200041 names entity A; imdb tt9200042 names entity B; tvdb 8200043 names entity C. No entity satisfies all three claims." },
+        { "group": "conflict", "field": "conflict.claims.entity_A.tmdb", "op": "eq", "expected": 9200041 },
+        { "group": "conflict", "field": "conflict.claims.entity_A.title", "op": "eq", "expected": "The Cobalt Divide", "why": "only entity A matches the NFO title/year" },
+        { "group": "conflict", "field": "conflict.claims.entity_B.imdb", "op": "eq", "expected": "tt9200042" },
+        { "group": "conflict", "field": "conflict.claims.entity_B.title", "op": "eq", "expected": "Split Tides" },
+        { "group": "conflict", "field": "conflict.claims.entity_C.tvdb", "op": "eq", "expected": 8200043 },
+        { "group": "conflict", "field": "conflict.claims.entity_C.title", "op": "eq", "expected": "Lavender Cut" },
+        { "group": "conflict", "field": "conflict.all_ids_retained", "op": "true", "why": "every parsed id is retained; none is dropped to force a single entity" },
+        { "group": "conflict", "field": "conflict.retained_ids", "op": "includes_all", "expected": [9200041, "tt9200042", 8200043] },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "nfo_tmdb_short_circuit", "why": "ADR-0026: a usable movie TMDB id short-circuits identity; the conflicting imdb/tvdb claims do not block the tmdb claim" },
+        { "group": "capability", "field": "capability.reason", "op": "present" },
+        { "group": "trace", "field": "trace.identity_request_count", "op": "eq", "expected": 0, "why": "the NFO tmdb claim short-circuits identity with no provider call" },
+        { "group": "trace", "field": "trace.nfo_origin_request_count", "op": "eq", "expected": 0 },
+        { "group": "trace", "field": "trace.total_request_count", "op": "eq", "expected": 0, "why": "the short-circuit issues zero provider requests" },
+        { "group": "trace", "field": "trace.identity_class_detail_request", "op": "false", "why": "any walked detail route must be class observability, never identity" },
+        { "group": "status", "field": "item.resolver_method", "op": "eq", "expected": "nfo_item_tmdb_id", "why": "resolver method for the usable TMDB id short-circuit" },
+        { "group": "status", "field": "item.match_method", "op": "eq", "expected": "nfo_complete", "why": "persisted method after the queue rewrites the resolve token" },
+        { "group": "status", "field": "item.bound_identity", "op": "eq", "expected": "tmdb:movie:9200041", "why": "ADR-0026 usable movie TMDB id short-circuit binds tmdb:movie:9200041" }
+      ],
+      "prohibited": [
+        { "group": "trace", "field": "trace.identity_class_detail_request", "op": "true", "why": "a detail request must never be identity class" }
+      ],
+      "stop_conditions": [
+        { "group": "status", "field": "item.status_observed", "op": "false", "blocked_reason": "Final status must be observed." }
+      ]
+    },
+    {
+      "record_id": "NFO-05",
+      "label": "show-root, external id only, matching title/year",
+      "kind": "show-root",
+      "input_refs": [
+        { "path": "xml/NFO-05/tvshow.nfo", "role": "identity-show-root-external-id", "sha256": "16d21a8e430f4e73f8db321fa86aa834c6b6a93f999660aef699dc8643b50920", "bytes": 666 }
+      ],
+      "route_inputs": ["nfo-05.find.imdb.tt9300005", "nfo-05.tv-detail.9300005"],
+      "route_refs": [
+        { "route_id": "nfo-05.find.imdb.tt9300005", "class": "identity", "method": "GET", "path": "/find/tt9300005", "query": { "external_source": "imdb_id" }, "response": "provider/NFO-05/find_imdb_tt9300005.json", "response_sha256": "56944d7f8c06b0b09dfb740c946a4305e44ff8a920196a3b87b3848a920d3cad", "response_bytes": 810, "why": "real external-id lookup for the tvshow.nfo IMDb-only claim" },
+        { "route_id": "nfo-05.tv-detail.9300005", "class": "identity", "method": "GET", "path": "/tv/9300005", "response": "provider/NFO-05/tv_detail_9300005.json", "response_sha256": "4012cee9812475d2583fd95301f55e3158df8085a8ee1d75e8273ee2c0103123", "response_bytes": 2240, "why": "find/detail cross-check detail for the /find tv candidate" }
+      ],
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "16d21a8e430f4e73f8db321fa86aa834c6b6a93f999660aef699dc8643b50920" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "Cinder Street" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2019 },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "eq", "expected": "tt9300005", "why": "IMDb-only external id claim" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "absent" },
+        { "group": "origin", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-05.find.imdb.tt9300005.present", "op": "true", "why": "a real GET /find/tt9300005 is required" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-05.find.imdb.tt9300005.method", "op": "eq", "expected": "GET" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-05.find.imdb.tt9300005.query.external_source", "op": "eq", "expected": "imdb_id" },
+        { "group": "find", "field": "find.find_route_observed", "op": "true" },
+        { "group": "find", "field": "find.find_entity_id", "op": "eq", "expected": 9300005, "why": "find tv_results entity is 9300005" },
+        { "group": "find", "field": "find.find_name", "op": "eq", "expected": "Cinder Street" },
+        { "group": "find", "field": "find.find_year", "op": "eq", "expected": 2019 },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-05.tv-detail.9300005.present", "op": "true", "why": "the tv detail cross-check read is required; /find alone is not enough and /find is never stub-equated with detail" },
+        { "group": "find", "field": "find.detail_route_observed", "op": "true" },
+        { "group": "find", "field": "find.detail_id", "op": "eq", "expected": 9300005 },
+        { "group": "find", "field": "find.detail_name", "op": "eq", "expected": "Cinder Street" },
+        { "group": "find", "field": "find.detail_year", "op": "eq", "expected": 2019, "why": "first_air_date 2019-04-12" },
+        { "group": "find", "field": "find.cross_check_pass", "op": "true", "why": "name and year agree with the location title/year (product find_hit_reject_reason returns None)" },
+        { "group": "find", "field": "find.reject_reason_present", "op": "false" },
+        { "group": "find", "field": "find.correct_binding_observed", "op": "true", "why": "correct-binding observation is required: the stage binds the find/detail candidate" },
+        { "group": "find", "field": "find.bound_entity_id", "op": "eq", "expected": 9300005 },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "bind_consistent_find" }
+      ],
+      "prohibited": [],
+      "stop_conditions": [
+        { "group": "find", "field": "find.find_route_observed", "op": "false", "blocked_reason": "The real /find route must be observed; a detail stub is not a /find." },
+        { "group": "find", "field": "find.detail_route_observed", "op": "false", "blocked_reason": "The tv detail cross-check must be observed; /find alone does not establish the correct binding." },
+        { "group": "find", "field": "find.cross_check_pass", "op": "false", "blocked_reason": "A rejected find candidate cannot produce the required correct binding." },
+        { "group": "find", "field": "find.correct_binding_observed", "op": "false", "blocked_reason": "Correct-binding observation is required. A stage that binds must bind tv 9300005; no observed binding is INCONCLUSIVE, not a pass." },
+        { "group": "find", "field": "find.bound_entity_id", "op": "neq", "expected": 9300005, "blocked_reason": "Binding to any entity other than the cross-check-passing candidate 9300005 is BLOCKED." }
+      ]
+    },
+    {
+      "record_id": "NFO-06",
+      "label": "show-root, external id only, title/year mismatch",
+      "kind": "show-root",
+      "input_refs": [
+        { "path": "xml/NFO-06/tvshow.nfo", "role": "identity-show-root-external-id-mismatch", "sha256": "83873d465620a4a0903902a5df59cb78d7ea0ef75f5d4f988a3d37a9d4ae7ba8", "bytes": 658 }
+      ],
+      "route_inputs": ["nfo-06.find.imdb.tt9300006", "nfo-06.tv-detail.9300006", "nfo-06.search-tv.gravelmere"],
+      "route_refs": [
+        { "route_id": "nfo-06.find.imdb.tt9300006", "class": "identity", "method": "GET", "path": "/find/tt9300006", "query": { "external_source": "imdb_id" }, "response": "provider/NFO-06/find_imdb_tt9300006.json", "response_sha256": "8de91486f6954e2cdd37753b926f86a3250ae076704a831cf55d13bb8972b112", "response_bytes": 753 },
+        { "route_id": "nfo-06.tv-detail.9300006", "class": "identity", "method": "GET", "path": "/tv/9300006", "response": "provider/NFO-06/tv_detail_9300006.json", "response_sha256": "82b86a4bdd514250be800aaead89e4945ac68b348c344e5dd493dd8e5f8b3cf0", "response_bytes": 2198, "why": "find/detail cross-check detail; name/year mismatch with the owning library item is the point" },
+        { "route_id": "nfo-06.search-tv.gravelmere", "class": "identity", "method": "GET", "path": "/search/tv", "query": { "query": "Gravelmere", "language": "en-US" }, "response": "provider/NFO-06/search_tv_gravelmere.json", "response_sha256": "56e343c83c1fbf27b81db2aad28c78c61010698a050b42e564edc7486a19bcad", "response_bytes": 75, "why": "fallback title search after the /find name/year gate rejects the tv candidate; returns zero results. The show group title is folded to lowercase by the product's clean_show_title before the request, so the wire query is gravelmere, not the manifest's author-declared Gravelmere." }
+      ],
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "83873d465620a4a0903902a5df59cb78d7ea0ef75f5d4f988a3d37a9d4ae7ba8" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "Gravelmere" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2021 },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "eq", "expected": "tt9300006" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "absent" },
+        { "group": "origin", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-06.find.imdb.tt9300006.present", "op": "true", "why": "the real /find route is required; no expected-ID shortcut" },
+        { "group": "find", "field": "find.find_route_observed", "op": "true" },
+        { "group": "find", "field": "find.find_entity_id", "op": "eq", "expected": 9300006 },
+        { "group": "find", "field": "find.find_name", "op": "eq", "expected": "Ashcroft House", "why": "the external id names a different work than the location identity Gravelmere" },
+        { "group": "find", "field": "find.find_year", "op": "eq", "expected": 2016 },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-06.tv-detail.9300006.present", "op": "true", "why": "the tv detail must confirm the same mismatch; the find mismatch is distinct from the search fallback" },
+        { "group": "find", "field": "find.detail_name", "op": "eq", "expected": "Ashcroft House" },
+        { "group": "find", "field": "find.detail_year", "op": "eq", "expected": 2016 },
+        { "group": "find", "field": "find.cross_check_pass", "op": "false", "why": "name 'Ashcroft House' does not match folder title 'Gravelmere'; year 2016 does not match 2021" },
+        { "group": "find", "field": "find.reject_reason_present", "op": "true" },
+        { "group": "find", "field": "find.reject_reason", "op": "present", "why": "a machine reject reason must be recorded" },
+        { "group": "find", "field": "find.reject_reason_recorded", "op": "true" },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-06.search-tv.gravelmere.present", "op": "true", "why": "the search-tv fallback is a distinct route and must be observed separately from the /find mismatch" },
+        { "group": "search", "field": "trace.request_with_route_id.nfo-06.search-tv.gravelmere.response.total_results", "op": "eq", "expected": 0, "why": "fallback search returns zero results" },
+        { "group": "search", "field": "trace.request_with_route_id.nfo-06.search-tv.gravelmere.response.results", "op": "empty_array" },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "abstention_no_safe_binding", "why": "no wrong binding; explicit abstention with a reason" },
+        { "group": "capability", "field": "capability.reason", "op": "present", "why": "reason must distinguish the /find mismatch from the empty search fallback" },
+        { "group": "status", "field": "item.bound_identity", "op": "absent" },
+        { "group": "status", "field": "item.status", "op": "in", "expected": ["unmatched", "pending"], "why": "rejection/fallback/abstention terminal states; observed, not assumed" }
+      ],
+      "prohibited": [
+        { "group": "status", "field": "item.bound_identity", "op": "present", "why": "binding to the mismatched entity 9300006 is a wrong binding and is prohibited" },
+        { "group": "find", "field": "find.bound_entity_id", "op": "eq", "expected": 9300006, "why": "no binding may resolve to Ashcroft House" }
+      ],
+      "stop_conditions": [
+        { "group": "find", "field": "find.find_route_observed", "op": "false", "blocked_reason": "The /find route must be observed; skipping straight to search would be an expected-ID shortcut and is BLOCKED." },
+        { "group": "find", "field": "find.reject_reason_recorded", "op": "false", "blocked_reason": "Mismatch without a recorded reason is INCONCLUSIVE." },
+        { "group": "trace", "field": "trace.request_with_route_id.nfo-06.search-tv.gravelmere.present", "op": "false", "blocked_reason": "The search fallback after rejection must be walked and observed; its zero results are the abstention evidence." }
+      ]
+    },
+    {
+      "record_id": "NFO-07",
+      "label": "explicit zero-byte NFO; absent body",
+      "kind": "movie",
+      "scoping_note": "location_context records the folder-derived title Kestrel Road (2009) because the fixture cannot store folder bytes. The manifest ships route nfo-07.search-movie.kestrel-road as author control bytes for a fuller pipeline; that search is driven by the media/folder-derived title, never by the NFO body, and it is outside this record's verdict scope. This record is a path-only/adapter control: the verdict stands on absent-body detection, not on the derived-title search.",
+      "input_refs": [
+        { "path": "xml/NFO-07/absent.nfo", "role": "identity-absent-body", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "bytes": 0 }
+      ],
+      "route_inputs": [],
+      "route_inventory_from_manifest": {
+        "note": "Manifest route_inputs for NFO-07 are nfo-07.search-movie.kestrel-road and nfo-07.movie-detail.9200007. They are author control bytes for a fuller pipeline driven by the folder-derived title. They are recorded here for fidelity but are outside this record's verdict scope, so route_inputs is empty.",
+        "routes": [
+          { "route_id": "nfo-07.search-movie.kestrel-road", "class": "identity", "response": "provider/NFO-07/search_movie_kestrel_road.json", "why": "search driven purely by the media/folder-derived title; the NFO body is empty and issues nothing" },
+          { "route_id": "nfo-07.movie-detail.9200007", "class": "content", "response": "provider/NFO-07/movie_detail_9200007.json", "why": "content enrichment for a search-selected candidate in a fuller run; not NFO identity evidence" }
+        ]
+      },
+      "required": [
+        { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "absent", "why": "zero-byte explicit absent sentinel" },
+        { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "why": "SHA-256 of the empty string" },
+        { "group": "body", "field": "input.parse.well_formed", "op": "false", "why": "absent bytes are not parsed XML" },
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "absent", "why": "absent body is not identity evidence: no title, no year, no ids, no content" },
+        { "group": "parsed", "field": "input.parse.parsed.year", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "absent" },
+        { "group": "parsed", "field": "input.parse.parsed.content.plot_present", "op": "false" },
+        { "group": "parsed", "field": "input.parse.parsed.content.genre_present", "op": "false" },
+        { "group": "parsed", "field": "input.parse.parsed.content.cast_present", "op": "false" },
+        { "group": "origin", "field": "input.parse.parsed.origin", "op": "absent", "why": "no NFO-origin claim exists for an absent body" },
+        { "group": "capability", "field": "capability.state", "op": "eq", "expected": "absent_body_control", "why": "path-only/adapter control" },
+        { "group": "capability", "field": "capability.identity_evidence", "op": "false" },
+        { "group": "trace", "field": "trace.nfo_origin_request_count", "op": "eq", "expected": 0, "why": "the absent body issues no NFO-origin identity request" },
+        { "group": "status", "field": "item.bound_identity", "op": "absent", "why": "no provider identity binding sourced from the NFO" }
+      ],
+      "prohibited": [
+        { "group": "parsed", "field": "input.parse.parsed.title", "op": "present", "why": "fabricating identity from zero bytes is prohibited" },
+        { "group": "status", "field": "item.bound_identity", "op": "present", "why": "no binding may be attributed to an absent NFO" }
+      ],
+      "stop_conditions": [
+        { "group": "trace", "field": "trace.nfo_origin_request_count", "op": "gt", "expected": 0, "blocked_reason": "An NFO-origin provider request from an absent body is BLOCKED, not a pass." },
+        { "group": "parsed", "field": "input.parse.body_state", "op": "eq", "expected": "present", "blocked_reason": "If the harness classified zero bytes as parsed XML, the adapter control fails." }
+      ]
+    },
+    {
+      "record_id": "NFO-08",
+      "label": "movie family across malformed, corrected, and manual-assign phases",
+      "kind": "movie",
+      "input_refs": [
+        { "path": "xml/NFO-08/initial-malformed.nfo", "role": "phase-initial-malformed", "sha256": "0d33e4987d73453a537c77eeefda1df751fab05b6a1335f71c4d6c7ec9da4d86", "bytes": 353 },
+        { "path": "xml/NFO-08/corrected-body.nfo", "role": "phase-corrected-body", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 },
+        { "path": "xml/NFO-08/manual-assign.nfo", "role": "phase-manual-assign", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 }
+      ],
+      "record_rule": "One movie family, one record. The three phase states below are states inside this single record and never increment the record count. manual-assign.nfo is byte-identical to corrected-body.nfo (same sha256), so any state difference between the corrected-body retry and manual Assign comes from pipeline state, never from the file.",
+      "route_inputs": ["nfo-08.search-movie.secondhand-orbit", "nfo-08.movie-detail.9200008"],
+      "route_refs": [
+        { "route_id": "nfo-08.search-movie.secondhand-orbit", "class": "identity", "method": "GET", "path": "/search/movie", "query": { "query": "Secondhand Orbit", "language": "en-US" }, "response": "provider/NFO-08/search_movie_secondhand_orbit_miss.json", "response_sha256": "56e343c83c1fbf27b81db2aad28c78c61010698a050b42e564edc7486a19bcad", "response_bytes": 75, "why": "provider-miss search for the initial-malformed phase: zero results" },
+        { "route_id": "nfo-08.movie-detail.9200008", "class": "content", "method": "GET", "path": "/movie/9200008", "response": "provider/NFO-08/movie_detail_9200008.json", "response_sha256": "a48c41a25db11bb60971c5b23105040be1ed2af39b4b0fe7a4d5e0e3ecf0e2b9", "response_bytes": 2026, "why": "content enrichment for the corrected-body and manual-assign phases; the manual Assign fetch uses this detail as part of the assign flow" }
+      ],
+      "watch_contract": {
+        "note": "Applied per binding phase below (corrected-body and manual-assign), each with its own seeded before/after snapshots. Field names follow product symbols: item_links::path_item_key(library_id, relpath) == path:{library_id}:{relpath}; item_links::is_watch_item_key; migrator MigrateReport { tables_present, watch_rewrites, event_rewrites }. watch_state rows carry non-key values position_ms, duration_ms, played, last_played_at; playback_events rows carry per-event non-key values. All non-key values must survive the item_key rewrite.",
+        "seed_old_key_rule": "The seeded watch_state and playback_events rows live under the exact old key computed as item_links::path_item_key(library_id, relpath), never a path-key fallback guess and never a provider key.",
+        "row_rules": [
+          "watch_state seeded non-empty under the old key",
+          "playback_events seeded non-empty under the old key",
+          "watch row position_ms > 0",
+          "watch row duration_ms > 0",
+          "watch row played recorded",
+          "watch row last_played_at non-empty timestamp",
+          "every playback event row has a timestamp and event value",
+          "complete before snapshot (full rows for old key and destination on both tables)",
+          "complete after snapshot (full rows on both tables)"
+        ],
+        "required_outcomes": [
+          "destination == tmdb:movie:9200008",
+          "item_links::is_watch_item_key(destination) == true",
+          "tables_present == true",
+          "watch_rewrites >= 1",
+          "event_rewrites >= 1",
+          "old key rows removed after migration",
+          "destination rows present after migration",
+          "every non-key value preserved exactly"
+        ],
+        "blocked_conditions": [
+          "empty seeded watch_state or playback_events",
+          "count-only claims of rewrites without full before/after snapshots",
+          "destination resolving to the path key (path-key fallback)",
+          "destination not equal to tmdb:movie:9200008 or is_watch_item_key(destination) == false",
+          "tables_present == false (watch/playback repair unavailable)"
+        ]
+      },
+      "phases": [
+        {
+          "phase": "initial-malformed",
+          "input_ref": { "path": "xml/NFO-08/initial-malformed.nfo", "role": "phase-initial-malformed", "sha256": "0d33e4987d73453a537c77eeefda1df751fab05b6a1335f71c4d6c7ec9da4d86", "bytes": 353 },
+          "required": [
+            { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "malformed", "why": "the movie root and several elements never close their tags" },
+            { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "0d33e4987d73453a537c77eeefda1df751fab05b6a1335f71c4d6c7ec9da4d86" },
+            { "group": "body", "field": "input.parse.parse_ok", "op": "false", "why": "malformed parse failure" },
+            { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "absent", "why": "a corrupt body is not trusted identity evidence" },
+            { "group": "parsed", "field": "input.parse.parsed.origin", "op": "absent" },
+            { "group": "trace", "field": "trace.request_with_route_id.nfo-08.search-movie.secondhand-orbit.present", "op": "true", "why": "search on the derived title returns zero results: provider miss/unmatched" },
+            { "group": "search", "field": "trace.request_with_route_id.nfo-08.search-movie.secondhand-orbit.response.total_results", "op": "eq", "expected": 0 },
+            { "group": "search", "field": "trace.request_with_route_id.nfo-08.search-movie.secondhand-orbit.response.results", "op": "empty_array" },
+            { "group": "status", "field": "item.status", "op": "eq", "expected": "unmatched", "why": "provider-miss/unmatched phase outcome" },
+            { "group": "status", "field": "item.status_observed", "op": "true" },
+            { "group": "status", "field": "item.reason", "op": "eq", "expected": "provider_miss_no_results", "why": "reason recorded for the miss/unmatched state" },
+            { "group": "status", "field": "item.manually_matched", "op": "eq", "expected": 0 },
+            { "group": "capability", "field": "capability.state", "op": "eq", "expected": "unmatched_provider_miss" },
+            { "group": "repair", "field": "repair.action", "op": "eq", "expected": "none" }
+          ],
+          "prohibited": [
+            { "group": "status", "field": "item.bound_identity", "op": "present", "why": "no binding exists in the initial-malformed phase" }
+          ],
+          "stop_conditions": []
+        },
+        {
+          "phase": "corrected-body",
+          "input_ref": { "path": "xml/NFO-08/corrected-body.nfo", "role": "phase-corrected-body", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 },
+          "required": [
+            { "group": "repair", "field": "repair.action", "op": "eq", "expected": "retry_unmatched", "why": "the corrected body is retried through retry_unmatched followed by the automatic drain" },
+            { "group": "repair", "field": "repair.trigger", "op": "eq", "expected": "body_corrected" },
+            { "group": "repair", "field": "repair.manual", "op": "false", "why": "this phase is the automatic retry, never a manual Assign" },
+            { "group": "body", "field": "input.parse.body_state", "op": "eq", "expected": "present" },
+            { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d" },
+            { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "Secondhand Orbit" },
+            { "group": "parsed", "field": "input.parse.parsed.year", "op": "eq", "expected": 2013 },
+            { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "eq", "expected": 9200008, "why": "usable tmdb claim 9200008 plus matching imdb/tvdb claims" },
+            { "group": "parsed", "field": "input.parse.parsed.ids.imdb", "op": "eq", "expected": "tt9200008" },
+            { "group": "parsed", "field": "input.parse.parsed.ids.tvdb", "op": "eq", "expected": 8200008 },
+            { "group": "origin", "field": "input.parse.parsed.origin", "op": "eq", "expected": "nfo" },
+            { "group": "parsed", "field": "input.parse.parsed.content.plot_present", "op": "true" },
+            { "group": "parsed", "field": "input.parse.parsed.content.genre_present", "op": "true" },
+            { "group": "parsed", "field": "input.parse.parsed.content.cast_present", "op": "true" },
+            { "group": "trace", "field": "trace.identity_request_count", "op": "eq", "expected": 0, "why": "the corrected body binds straight from the NFO tmdb claim; the automatic drain needs no identity provider request" },
+            { "group": "status", "field": "item.manually_matched", "op": "eq", "expected": 0, "why": "automatic drain binding, never manual; no conflation with manual Assign" },
+            { "group": "status", "field": "item.effective_key", "op": "eq", "expected": "tmdb:movie:9200008", "why": "item_links::item_key_for_metadata for movie tmdb 9200008" },
+            { "group": "status", "field": "item.status_observed", "op": "true" },
+            { "group": "capability", "field": "capability.state", "op": "eq", "expected": "auto_bound_retry" },
+            { "group": "watch", "field": "watch.seed.nonempty_watch_state", "op": "true" },
+            { "group": "watch", "field": "watch.seed.nonempty_playback_events", "op": "true" },
+            { "group": "watch", "field": "watch.seed.old_key_matches_path_item_key", "op": "true", "why": "exact old key under item_links::path_item_key(library_id, relpath)" },
+            { "group": "watch", "field": "watch.seed.nonzero_position", "op": "true" },
+            { "group": "watch", "field": "watch.seed.nonzero_duration", "op": "true" },
+            { "group": "watch", "field": "watch.seed.played_recorded", "op": "true" },
+            { "group": "watch", "field": "watch.seed.timestamps_nonempty", "op": "true" },
+            { "group": "watch", "field": "watch.seed.event_values_recorded", "op": "true" },
+            { "group": "watch", "field": "watch.before_snapshot_complete", "op": "true", "why": "complete before snapshot required" },
+            { "group": "watch", "field": "watch.destination", "op": "eq", "expected": "tmdb:movie:9200008" },
+            { "group": "watch", "field": "watch.destination_is_watch_key", "op": "true", "why": "item_links::is_watch_item_key(tmdb:movie:9200008) == true" },
+            { "group": "watch", "field": "watch.tables_present", "op": "true" },
+            { "group": "watch", "field": "watch.watch_rewrites", "op": "ge", "expected": 1, "why": "strictly positive watch_rewrites required" },
+            { "group": "watch", "field": "watch.event_rewrites", "op": "ge", "expected": 1, "why": "strictly positive event_rewrites required" },
+            { "group": "watch", "field": "watch.old_key_present_after", "op": "false", "why": "old-key removal required" },
+            { "group": "watch", "field": "watch.destination_rows_present", "op": "true" },
+            { "group": "watch", "field": "watch.non_key_values_preserved", "op": "true", "why": "every non-key value of watch_state and playback_events is preserved" },
+            { "group": "watch", "field": "watch.after_snapshot_complete", "op": "true" }
+          ],
+          "prohibited": [
+            { "group": "repair", "field": "repair.manual", "op": "true", "why": "the corrected-body retry must never be conflated with a manual Assign" },
+            { "group": "status", "field": "item.manually_matched", "op": "eq", "expected": 1, "why": "the automatic drain binds with manually_matched = 0 only" },
+            { "group": "parsed", "field": "input.file_byte_difference_from_manual_assign", "op": "true", "why": "the file is byte-identical to manual-assign.nfo; the state difference is pipeline state, not the file" }
+          ],
+          "stop_conditions": [
+            { "group": "watch", "field": "watch.tables_present", "op": "false", "blocked_reason": "Automatic retry that cannot rewrite watch/playback rows (unavailable repair) is BLOCKED/INCONCLUSIVE, never a pass." },
+            { "group": "watch", "field": "watch.watch_rewrites", "op": "eq", "expected": 0, "blocked_reason": "Binding that abandons or drops watch rows (zero rewrites with a seeded old key) is BLOCKED, not a pass." },
+            { "group": "watch", "field": "watch.destination", "op": "neq", "expected": "tmdb:movie:9200008", "blocked_reason": "Unknown destination or path-key fallback is BLOCKED." },
+            { "group": "watch", "field": "watch.old_key_present_after", "op": "true", "blocked_reason": "Old-key rows surviving the rewrite contradict old-key removal." }
+          ]
+        },
+        {
+          "phase": "manual-assign",
+          "input_ref": { "path": "xml/NFO-08/manual-assign.nfo", "role": "phase-manual-assign", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 },
+          "required": [
+            { "group": "repair", "field": "repair.action", "op": "eq", "expected": "assign", "why": "manual Assign is a user/pipeline action recording manually_matched; it is not caused by a byte difference in the NFO" },
+            { "group": "repair", "field": "repair.manual", "op": "true" },
+            { "group": "repair", "field": "repair.assign_kind", "op": "eq", "expected": "movie" },
+            { "group": "repair", "field": "repair.assign_tmdb_id", "op": "eq", "expected": 9200008 },
+            { "group": "body", "field": "input.body_sha256", "op": "eq", "expected": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d" },
+            { "group": "body", "field": "input.byte_identical_to_corrected_body", "op": "true", "why": "manual-assign.nfo shares the sha256 of corrected-body.nfo by design; any state difference comes from pipeline state" },
+            { "group": "parsed", "field": "input.parse.parsed.title", "op": "eq", "expected": "Secondhand Orbit" },
+            { "group": "parsed", "field": "input.parse.parsed.ids.tmdb", "op": "eq", "expected": 9200008 },
+            { "group": "status", "field": "item.manually_matched", "op": "eq", "expected": 1, "why": "manual Assign records manually_matched = 1; distinct from the corrected-body automatic retry (0)" },
+            { "group": "status", "field": "item.effective_key", "op": "eq", "expected": "tmdb:movie:9200008" },
+            { "group": "status", "field": "item.status_observed", "op": "true" },
+            { "group": "capability", "field": "capability.state", "op": "eq", "expected": "manual_assigned" },
+            { "group": "watch", "field": "watch.seed.nonempty_watch_state", "op": "true", "why": "manual Assign runs from the restored initial snapshot under the old path-derived key" },
+            { "group": "watch", "field": "watch.seed.nonempty_playback_events", "op": "true" },
+            { "group": "watch", "field": "watch.seed.old_key_matches_path_item_key", "op": "true", "why": "exact old key under item_links::path_item_key(library_id, relpath)" },
+            { "group": "watch", "field": "watch.seed.nonzero_position", "op": "true" },
+            { "group": "watch", "field": "watch.seed.nonzero_duration", "op": "true" },
+            { "group": "watch", "field": "watch.seed.played_recorded", "op": "true" },
+            { "group": "watch", "field": "watch.seed.timestamps_nonempty", "op": "true" },
+            { "group": "watch", "field": "watch.seed.event_values_recorded", "op": "true" },
+            { "group": "watch", "field": "watch.before_snapshot_complete", "op": "true", "why": "complete before snapshot from the restored initial state" },
+            { "group": "watch", "field": "watch.destination", "op": "eq", "expected": "tmdb:movie:9200008" },
+            { "group": "watch", "field": "watch.destination_is_watch_key", "op": "true" },
+            { "group": "watch", "field": "watch.tables_present", "op": "true" },
+            { "group": "watch", "field": "watch.watch_rewrites", "op": "ge", "expected": 1 },
+            { "group": "watch", "field": "watch.event_rewrites", "op": "ge", "expected": 1 },
+            { "group": "watch", "field": "watch.old_key_present_after", "op": "false", "why": "old-key removal required" },
+            { "group": "watch", "field": "watch.destination_rows_present", "op": "true" },
+            { "group": "watch", "field": "watch.non_key_values_preserved", "op": "true", "why": "every non-key value preserved exactly" },
+            { "group": "watch", "field": "watch.after_snapshot_complete", "op": "true" },
+            { "group": "trace", "field": "trace.content_request_route_ids", "op": "all_in", "expected": ["nfo-08.movie-detail.9200008"], "why": "manual Assign fetches the movie detail (class content) to persist the mapped hit; never an identity request" },
+            { "group": "trace", "field": "trace.identity_request_count", "op": "eq", "expected": 0 }
+          ],
+          "prohibited": [
+            { "group": "repair", "field": "repair.action", "op": "eq", "expected": "retry_unmatched", "why": "manual Assign must not be reported as a corrected-body automatic retry" },
+            { "group": "status", "field": "item.manually_matched", "op": "eq", "expected": 0, "why": "manual Assign must record manually_matched = 1" },
+            { "group": "watch", "field": "watch.destination", "op": "starts_with", "expected": "path:", "why": "a path-key destination is fallback and is prohibited" }
+          ],
+          "stop_conditions": [
+            { "group": "watch", "field": "watch.seed.nonempty_watch_state", "op": "false", "blocked_reason": "Empty seeded tables are BLOCKED/INCONCLUSIVE, never a pass." },
+            { "group": "watch", "field": "watch.tables_present", "op": "false", "blocked_reason": "Unavailable watch/playback repair is BLOCKED/INCONCLUSIVE, never a pass." },
+            { "group": "watch", "field": "watch.watch_rewrites", "op": "eq", "expected": 0, "blocked_reason": "Zero rewrites with a seeded old key is BLOCKED, not a pass." },
+            { "group": "watch", "field": "watch.snapshot_evidence", "op": "eq", "expected": "count_only", "blocked_reason": "A count-only claim of rewrites without full before/after snapshots is BLOCKED/INCONCLUSIVE." },
+            { "group": "watch", "field": "watch.destination", "op": "neq", "expected": "tmdb:movie:9200008", "blocked_reason": "Unknown destination or path-key fallback is BLOCKED." },
+            { "group": "status", "field": "item.status_observed", "op": "false", "blocked_reason": "Final status must be observed, never assumed." }
+          ]
+        }
+      ]
+    }
+  ]
+}

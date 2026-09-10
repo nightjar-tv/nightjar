@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "fixture": {
+    "name": "nfo_identity",
+    "license": "GPL-3.0-only",
+    "root": "server/crates/metadata/tests/fixtures/nfo_identity/",
+    "base_url": "https://api.themoviedb.org/3",
+    "summary": "Eight synthetic NFO identity cases for the metadata identity/resolution stage. Each case ships the NFO input bytes it needs, plus the offline TMDB response bytes for every provider route that the identity stage may legitimately issue for that case. Cases NFO-01 and NFO-02 are expected to bind from the NFO alone and therefore ship no identity-route responses.",
+    "authoring_scope": "Author-owned artifacts only: xml/*, provider/*, manifest.json, README.md, PROVENANCE.md. The author stage wrote no expected.json and no assertions, and ran no tests, source changes, or commits. A separate adjudicator later added the checked-in expected.json.",
+    "withholding": "The historical author stage withheld expected.json and every pass/fail assertion. A separate adjudicator owns verdicts; the checked-in expected.json is that later independent adjudication artifact. This manifest records evidence, identity-claim topology, and route inputs only; it never predeclares a winner, a bound identity, or a final state.",
+    "content_licence_note": "All titles, names, plots, cast, identifiers, dates, ratings, image paths, and provider JSON payloads are original synthetic content authored for this fixture under GPL-3.0-only. None are copied or adapted from a real provider response, real catalogue entry, or any external corpus. Identifiers use reserved fictional blocks (TMDB 9200001-9200008/9300005-9300006, IMDb tt9200001-tt9200008/tt9300005-tt9300006, TVDB 8200001-8200008/8300005-8300006) that are not real provider records."
+  },
+  "hashing_rule": "SHA-256 hashes recorded here and in PROVENANCE.md cover only the input bytes of xml/* and provider/*. Manifest.json, README.md, and PROVENANCE.md never record their own hashes.",
+  "route_semantics": {
+    "class_identity": "Response answers a provider request the identity/resolution stage may issue for the owning case. Absence of a response file for an identity request means the offline harness simulates a provider miss (product-equivalent of a 404/Ok(None)).",
+    "class_content": "Response serves enrichment after identity is already bound. The identity stage never issues it; it exists so a fuller pipeline run has real bytes.",
+    "class_observability": "No product request is expected for the owning case kind. The response lets an adjudicator inspect which synthetic entity a non-binding claim names.",
+    "no_fake_search": "A case that genuinely routes through /search ships a real search response (results array). A case that routes through /find ships a real /find response plus the /tv detail the find/detail cross-check reads. No case fakes a search by supplying only a detail response.",
+    "not_found": "A request with no mapped response file yields a simulated provider miss. Genuine 404 bodies are not shipped; the empty-file/missing-file convention stands in for them."
+  },
+  "synthetic_universe": [
+    { "key": "E9200001", "kind": "movie", "title": "The Meridian Job", "year": 2017, "tmdb": 9200001, "imdb": "tt9200001", "tvdb": 8200001, "case": "NFO-01" },
+    { "key": "E9200002", "kind": "movie", "title": "Salt Harbor", "year": 2015, "tmdb": 9200002, "imdb": "tt9200002", "tvdb": null, "case": "NFO-02" },
+    { "key": "E9200003", "kind": "movie", "title": "Keeper of the Lantern", "year": 2011, "tmdb": 9200003, "imdb": "tt9200003", "tvdb": null, "case": "NFO-03" },
+    { "key": "E9200041", "kind": "movie", "title": "The Cobalt Divide", "year": 2018, "tmdb": 9200041, "imdb": "tt9200041", "tvdb": 8200041, "case": "NFO-04" },
+    { "key": "E9200042", "kind": "movie", "title": "Split Tides", "year": 2016, "tmdb": 9200042, "imdb": "tt9200042", "tvdb": 8200042, "case": "NFO-04" },
+    { "key": "E9200043", "kind": "movie", "title": "Lavender Cut", "year": 2014, "tmdb": 9200043, "imdb": "tt9200043", "tvdb": 8200043, "case": "NFO-04" },
+    { "key": "E9200007", "kind": "movie", "title": "Kestrel Road", "year": 2009, "tmdb": 9200007, "imdb": "tt9200007", "tvdb": null, "case": "NFO-07" },
+    { "key": "E9200008", "kind": "movie", "title": "Secondhand Orbit", "year": 2013, "tmdb": 9200008, "imdb": "tt9200008", "tvdb": 8200008, "case": "NFO-08" },
+    { "key": "E9300005", "kind": "show", "title": "Cinder Street", "year": 2019, "tmdb": 9300005, "imdb": "tt9300005", "tvdb": 8300005, "case": "NFO-05" },
+    { "key": "E9300006", "kind": "show", "title": "Ashcroft House", "year": 2016, "tmdb": 9300006, "imdb": "tt9300006", "tvdb": 8300006, "case": "NFO-06" }
+  ],
+  "universe_notes": "Movie TVDB identifiers are synthetic-universe attributes. TMDB /movie detail external_ids does not surface a tvdb_id for these movies (the field is null in the shipped payloads), so a movie-level TVDB claim is resolvable only through this universe table, never through a movie /find route.",
+  "routes": [
+    {
+      "route_id": "nfo-02.movie-detail.9200002",
+      "case_id": "NFO-02",
+      "class": "content",
+      "method": "GET",
+      "path": "/movie/9200002",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-02/movie_detail_9200002.json",
+      "response_sha256": "62191902c0ceb7041ccd08306bfffa783965f880fa4df02225525408742e5529",
+      "response_bytes": 1969,
+      "serves": "Content enrichment after identity binds on NFO tmdb claim 9200002."
+    },
+    {
+      "route_id": "nfo-03.search-movie.keeper-of-the-lantern",
+      "case_id": "NFO-03",
+      "class": "identity",
+      "method": "GET",
+      "path": "/search/movie",
+      "query": { "query": "Keeper of the Lantern", "language": "en-US" },
+      "response": "provider/NFO-03/search_movie_keeper_of_the_lantern.json",
+      "response_sha256": "b0da8fa4d015249791a74a71813281818da03fbbe1123cc2a1b46afd3f56f285",
+      "response_bytes": 789,
+      "serves": "Title search for a movie NFO that carries no usable provider id."
+    },
+    {
+      "route_id": "nfo-03.movie-detail.9200003",
+      "case_id": "NFO-03",
+      "class": "content",
+      "method": "GET",
+      "path": "/movie/9200003",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-03/movie_detail_9200003.json",
+      "response_sha256": "27775707d3db51fcfc8ae13e3015c79a1097c8e4c02f7513c2026d6533037602",
+      "response_bytes": 1966,
+      "serves": "Content enrichment for the search-selected candidate."
+    },
+    {
+      "route_id": "nfo-04.movie-detail.9200041",
+      "case_id": "NFO-04",
+      "class": "observability",
+      "method": "GET",
+      "path": "/movie/9200041",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-04/movie_detail_9200041.json",
+      "response_sha256": "b9ec0590bd2a9c5e46d7988ea8b7b195f4aa22351e1bfcd5d300bdd6eb95c52e",
+      "response_bytes": 2005,
+      "serves": "Detail of entity A, the synthetic entity named by the NFO tmdb claim. Lets an adjudicator compare the NFO imdb/tvdb claims against entity A external_ids."
+    },
+    {
+      "route_id": "nfo-04.movie-detail.9200042",
+      "case_id": "NFO-04",
+      "class": "observability",
+      "method": "GET",
+      "path": "/movie/9200042",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-04/movie_detail_9200042.json",
+      "response_sha256": "8e09d869ac8f04838939de6e06384e241015e814c27980b30ac21f1d16921897",
+      "response_bytes": 1932,
+      "serves": "Detail of entity B (Split Tides), the synthetic entity named by the NFO imdb claim tt9200042."
+    },
+    {
+      "route_id": "nfo-04.movie-detail.9200043",
+      "case_id": "NFO-04",
+      "class": "observability",
+      "method": "GET",
+      "path": "/movie/9200043",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-04/movie_detail_9200043.json",
+      "response_sha256": "cc06e2b233d5463b62decc6656ba709707a4c693818ed83f682b57401e95c511",
+      "response_bytes": 1920,
+      "serves": "Detail of entity C (Lavender Cut), the synthetic entity named by the NFO tvdb claim 8200043."
+    },
+    {
+      "route_id": "nfo-05.find.imdb.tt9300005",
+      "case_id": "NFO-05",
+      "class": "identity",
+      "method": "GET",
+      "path": "/find/tt9300005",
+      "query": { "external_source": "imdb_id" },
+      "response": "provider/NFO-05/find_imdb_tt9300005.json",
+      "response_sha256": "56944d7f8c06b0b09dfb740c946a4305e44ff8a920196a3b87b3848a920d3cad",
+      "response_bytes": 810,
+      "serves": "External-id lookup for the tvshow.nfo IMDb-only claim."
+    },
+    {
+      "route_id": "nfo-05.tv-detail.9300005",
+      "case_id": "NFO-05",
+      "class": "identity",
+      "method": "GET",
+      "path": "/tv/9300005",
+      "query": { "append_to_response": "images,credits,videos,content_ratings,external_ids,aggregate_credits", "language": "en-US" },
+      "response": "provider/NFO-05/tv_detail_9300005.json",
+      "response_sha256": "4012cee9812475d2583fd95301f55e3158df8085a8ee1d75e8273ee2c0103123",
+      "response_bytes": 2240,
+      "serves": "Find/detail cross-check detail for the /find tv candidate."
+    },
+    {
+      "route_id": "nfo-06.find.imdb.tt9300006",
+      "case_id": "NFO-06",
+      "class": "identity",
+      "method": "GET",
+      "path": "/find/tt9300006",
+      "query": { "external_source": "imdb_id" },
+      "response": "provider/NFO-06/find_imdb_tt9300006.json",
+      "response_sha256": "8de91486f6954e2cdd37753b926f86a3250ae076704a831cf55d13bb8972b112",
+      "response_bytes": 753,
+      "serves": "External-id lookup for the tvshow.nfo IMDb-only claim."
+    },
+    {
+      "route_id": "nfo-06.tv-detail.9300006",
+      "case_id": "NFO-06",
+      "class": "identity",
+      "method": "GET",
+      "path": "/tv/9300006",
+      "query": { "append_to_response": "images,credits,videos,content_ratings,external_ids,aggregate_credits", "language": "en-US" },
+      "response": "provider/NFO-06/tv_detail_9300006.json",
+      "response_sha256": "82b86a4bdd514250be800aaead89e4945ac68b348c344e5dd493dd8e5f8b3cf0",
+      "response_bytes": 2198,
+      "serves": "Find/detail cross-check detail. Name/year mismatch with the owning library item is the point of the case."
+    },
+    {
+      "route_id": "nfo-06.search-tv.gravelmere",
+      "case_id": "NFO-06",
+      "class": "identity",
+      "method": "GET",
+      "path": "/search/tv",
+      "query": { "query": "Gravelmere", "language": "en-US" },
+      "response": "provider/NFO-06/search_tv_gravelmere.json",
+      "response_sha256": "56e343c83c1fbf27b81db2aad28c78c61010698a050b42e564edc7486a19bcad",
+      "response_bytes": 75,
+      "serves": "Fallback title search after the /find name/year gate rejects the tv candidate. Returns zero results."
+    },
+    {
+      "route_id": "nfo-07.search-movie.kestrel-road",
+      "case_id": "NFO-07",
+      "class": "identity",
+      "method": "GET",
+      "path": "/search/movie",
+      "query": { "query": "Kestrel Road", "language": "en-US" },
+      "response": "provider/NFO-07/search_movie_kestrel_road.json",
+      "response_sha256": "06e81fd34c5f7a06ea4370d88f52061721f522fed22ce4c37059c1381d1e37f3",
+      "response_bytes": 736,
+      "serves": "Title search driven purely by the media/folder-derived title; the NFO body is empty."
+    },
+    {
+      "route_id": "nfo-07.movie-detail.9200007",
+      "case_id": "NFO-07",
+      "class": "content",
+      "method": "GET",
+      "path": "/movie/9200007",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-07/movie_detail_9200007.json",
+      "response_sha256": "67be016f552d5b3364e37d3817d28836ce2aea3df9a37d9645e1aae546c30434",
+      "response_bytes": 1913,
+      "serves": "Content enrichment for the search-selected candidate."
+    },
+    {
+      "route_id": "nfo-08.search-movie.secondhand-orbit",
+      "case_id": "NFO-08",
+      "class": "identity",
+      "method": "GET",
+      "path": "/search/movie",
+      "query": { "query": "Secondhand Orbit", "language": "en-US" },
+      "response": "provider/NFO-08/search_movie_secondhand_orbit_miss.json",
+      "response_sha256": "56e343c83c1fbf27b81db2aad28c78c61010698a050b42e564edc7486a19bcad",
+      "response_bytes": 75,
+      "serves": "Provider-miss search for the initial-malformed phase: zero results so the phase is a provider-miss/unmatched candidate."
+    },
+    {
+      "route_id": "nfo-08.movie-detail.9200008",
+      "case_id": "NFO-08",
+      "class": "content",
+      "method": "GET",
+      "path": "/movie/9200008",
+      "query": { "append_to_response": "images,credits,videos,release_dates,external_ids", "language": "en-US" },
+      "response": "provider/NFO-08/movie_detail_9200008.json",
+      "response_sha256": "a48c41a25db11bb60971c5b23105040be1ed2af39b4b0fe7a4d5e0e3ecf0e2b9",
+      "response_bytes": 2026,
+      "serves": "Content enrichment for the corrected-body and manual-assign phases, whose tmdb claim is 9200008."
+    }
+  ],
+  "cases": {
+    "NFO-01": {
+      "label": "complete movie",
+      "kind": "movie",
+      "title": "The Meridian Job",
+      "media_path": "The Meridian Job (2017)/The Meridian Job.mkv",
+      "xml": [
+        { "path": "xml/NFO-01/complete.nfo", "role": "identity-complete", "sha256": "d17ec5c2526cc8321da850805371c99b5734782ab1d95c00561c2a4428d06624", "bytes": 1451 }
+      ],
+      "identity_evidence": {
+        "title": "The Meridian Job",
+        "year": 2017,
+        "ids": { "tmdb": 9200001, "imdb": "tt9200001", "tvdb": 8200001 },
+        "usable_provider_id": true,
+        "content_present": { "plot": true, "genre": true, "cast": true }
+      },
+      "location_context": { "folder_name": "The Meridian Job (2017)", "derived_title": "The Meridian Job", "derived_year": 2017 },
+      "route_inputs": [],
+      "notes": "Usable tmdb claim plus meaningful plot/genre/cast. The NFO alone is sufficient identity and content evidence, so the identity stage expects zero provider requests and no route input is shipped. Nothing here is asserted about a bound record; the case simply has no route dependency."
+    },
+    "NFO-02": {
+      "label": "partial movie",
+      "kind": "movie",
+      "title": "Salt Harbor",
+      "media_path": "Salt Harbor (2015)/Salt Harbor.mkv",
+      "xml": [
+        { "path": "xml/NFO-02/partial.nfo", "role": "identity-title-plus-tmdb", "sha256": "31104cbc0fd5dbf5047ef890a83afb0bdf6cf90ff938ca62e109e2d138355bd9", "bytes": 317 }
+      ],
+      "identity_evidence": {
+        "title": "Salt Harbor",
+        "year": 2015,
+        "ids": { "tmdb": 9200002, "imdb": "tt9200002", "tvdb": null },
+        "usable_provider_id": true,
+        "content_present": { "plot": false, "genre": false, "cast": false }
+      },
+      "location_context": { "folder_name": "Salt Harbor (2015)", "derived_title": "Salt Harbor", "derived_year": 2015 },
+      "route_inputs": ["nfo-02.movie-detail.9200002"],
+      "notes": "Usable tmdb claim, no meaningful plot/genre/cast. Identity binds on the NFO with no provider call; the shipped movie-detail response is class content, needed only when a fuller run enriches the empty body. Route input is content class, not identity class."
+    },
+    "NFO-03": {
+      "label": "partial movie, no usable provider id",
+      "kind": "movie",
+      "title": "Keeper of the Lantern",
+      "media_path": "Keeper of the Lantern (2011)/Keeper of the Lantern.mkv",
+      "xml": [
+        { "path": "xml/NFO-03/content-only.nfo", "role": "identity-title-and-content-only", "sha256": "2e90ddb1101ce2f6a80990e67cd61ae4abc261e31589954c604a0282363f4d18", "bytes": 840 }
+      ],
+      "identity_evidence": {
+        "title": "Keeper of the Lantern",
+        "year": 2011,
+        "ids": { "tmdb": null, "imdb": null, "tvdb": null },
+        "usable_provider_id": false,
+        "content_present": { "plot": true, "genre": true, "cast": true }
+      },
+      "location_context": { "folder_name": "Keeper of the Lantern (2011)", "derived_title": "Keeper of the Lantern", "derived_year": 2011 },
+      "route_inputs": ["nfo-03.search-movie.keeper-of-the-lantern", "nfo-03.movie-detail.9200003"],
+      "notes": "Title and content but no provider id of any kind. The identity stage must route through a real /search/movie call, not a detail response masquerading as one. The shipped search response returns one candidate, entity 9200003, whose title/year match the location title/year so a title-scoring path has a genuine candidate to select; the detail response is class content for the selected candidate."
+    },
+    "NFO-04": {
+      "label": "conflicting movie",
+      "kind": "movie",
+      "title": "The Cobalt Divide",
+      "media_path": "The Cobalt Divide (2018)/The Cobalt Divide.mkv",
+      "xml": [
+        { "path": "xml/NFO-04/conflict.nfo", "role": "identity-conflicting-ids", "sha256": "d5ab12742142b8c0c37916834839fe47e0ffb73a7c530a301a11c022b4c549e9", "bytes": 1036 }
+      ],
+      "identity_evidence": {
+        "title": "The Cobalt Divide",
+        "year": 2018,
+        "ids": { "tmdb": 9200041, "imdb": "tt9200042", "tvdb": 8200043 },
+        "usable_provider_id": true,
+        "content_present": { "plot": true, "genre": true, "cast": true }
+      },
+      "location_context": { "folder_name": "The Cobalt Divide (2018)", "derived_title": "The Cobalt Divide", "derived_year": 2018 },
+      "route_inputs": ["nfo-04.movie-detail.9200041", "nfo-04.movie-detail.9200042", "nfo-04.movie-detail.9200043"],
+      "conflict_topology": "The three id claims name three distinct synthetic entities: tmdb 9200041 names entity A (The Cobalt Divide, imdb tt9200041, tvdb 8200041); imdb tt9200042 names entity B (Split Tides, tmdb 9200042, tvdb 8200042); tvdb 8200043 names entity C (Lavender Cut, tmdb 9200043, imdb tt9200043). No entity satisfies all three claims. The NFO title/year match only entity A.",
+      "notes": "This fixture records the conflict and the bytes needed to observe it; it does not predeclare a winner. Movie identity keys on the usable tmdb claim, and movie resolution has no /find route in the product, so all three detail responses are class observability. An adjudicator that inspects entity A's external_ids.imdb (tt9200041) against the NFO imdb claim (tt9200042) can see the divergence; entities B and C are provided so the imdb/tvdb claims are not dead ends. Whether the pipeline binds, reconciles, or abstains is the adjudicator's verdict, not this manifest's. The checked-in expected.json is that later adjudicator artifact: it requires the ADR-0026 usable TMDB id short-circuit, binding tmdb:movie:9200041 with zero provider requests."
+    },
+    "NFO-05": {
+      "label": "show-root, external id only, matching title/year",
+      "kind": "show-root",
+      "title": "Cinder Street",
+      "media_path": "Cinder Street (2019)/Cinder Street.S01E01.mkv",
+      "xml": [
+        { "path": "xml/NFO-05/tvshow.nfo", "role": "identity-show-root-external-id", "sha256": "16d21a8e430f4e73f8db321fa86aa834c6b6a93f999660aef699dc8643b50920", "bytes": 666 }
+      ],
+      "identity_evidence": {
+        "title": "Cinder Street",
+        "year": 2019,
+        "ids": { "tmdb": null, "imdb": "tt9300005", "tvdb": null },
+        "usable_provider_id": false,
+        "content_present": { "plot": true, "genre": true, "cast": false }
+      },
+      "location_context": { "folder_name": "Cinder Street (2019)", "derived_title": "Cinder Street", "derived_year": 2019 },
+      "route_inputs": ["nfo-05.find.imdb.tt9300005", "nfo-05.tv-detail.9300005"],
+      "notes": "tvshow.nfo at the show root carries IMDb only. Binding must go through a real /find route (external_source imdb_id) and the find/detail cross-check. The /find tv candidate is entity 9300005 whose name/first_air_date (Cinder Street, 2019) match the location title/year, so a name/year cross-check has a consistent route that can bind. Matching is described; the bind itself is not asserted here."
+    },
+    "NFO-06": {
+      "label": "show-root, external id only, title/year mismatch",
+      "kind": "show-root",
+      "title": "Gravelmere",
+      "media_path": "Gravelmere (2021)/Gravelmere.S01E01.mkv",
+      "xml": [
+        { "path": "xml/NFO-06/tvshow.nfo", "role": "identity-show-root-external-id-mismatch", "sha256": "83873d465620a4a0903902a5df59cb78d7ea0ef75f5d4f988a3d37a9d4ae7ba8", "bytes": 658 }
+      ],
+      "identity_evidence": {
+        "title": "Gravelmere",
+        "year": 2021,
+        "ids": { "tmdb": null, "imdb": "tt9300006", "tvdb": null },
+        "usable_provider_id": false,
+        "content_present": { "plot": true, "genre": true, "cast": false }
+      },
+      "location_context": { "folder_name": "Gravelmere (2021)", "derived_title": "Gravelmere", "derived_year": 2021 },
+      "route_inputs": ["nfo-06.find.imdb.tt9300006", "nfo-06.tv-detail.9300006", "nfo-06.search-tv.gravelmere"],
+      "notes": "tvshow.nfo at the show root carries IMDb only, but the id names a different work. /find tt9300006 returns entity 9300006 named Ashcroft House with first_air_date 2016, which fails a name/year cross-check against the location identity Gravelmere (2021); the tv detail confirms the same mismatch. The fallback /search/tv for Gravelmere returns zero results. This is the rejection/fallback/abstention route fixture: every route the identity stage may walk after rejection has real bytes. Which terminal state the pipeline reaches is not asserted here."
+    },
+    "NFO-07": {
+      "label": "explicit zero-byte NFO; absent body",
+      "kind": "movie",
+      "title": "(none from NFO)",
+      "media_path": "Kestrel Road (2009)/Kestrel Road.mkv",
+      "xml": [
+        { "path": "xml/NFO-07/absent.nfo", "role": "identity-absent-body", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "bytes": 0 }
+      ],
+      "identity_evidence": {
+        "title": null,
+        "year": null,
+        "ids": { "tmdb": null, "imdb": null, "tvdb": null },
+        "usable_provider_id": false,
+        "content_present": { "plot": false, "genre": false, "cast": false }
+      },
+      "location_context": { "folder_name": "Kestrel Road (2009)", "derived_title": "Kestrel Road", "derived_year": 2009 },
+      "route_inputs": ["nfo-07.search-movie.kestrel-road", "nfo-07.movie-detail.9200007"],
+      "notes": "absent.nfo is explicitly zero bytes (sha256 of the empty string). An absent body is not identity evidence: it yields no title, no year, no ids, and no content. The only identity signal is the media/folder-derived title, which the fixture cannot store as bytes and therefore records in location_context. The search route is driven by that derived title; the search response is real, and the detail response is class content for the selected candidate."
+    },
+    "NFO-08": {
+      "label": "movie family across malformed, corrected, and manual-assign phases",
+      "kind": "movie",
+      "title": "Secondhand Orbit",
+      "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
+      "xml": [
+        { "path": "xml/NFO-08/initial-malformed.nfo", "role": "phase-initial-malformed", "sha256": "0d33e4987d73453a537c77eeefda1df751fab05b6a1335f71c4d6c7ec9da4d86", "bytes": 353 },
+        { "path": "xml/NFO-08/corrected-body.nfo", "role": "phase-corrected-body", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 },
+        { "path": "xml/NFO-08/manual-assign.nfo", "role": "phase-manual-assign", "sha256": "f9e518f709d07a529cc6a36f5e3e0a543c7f03c16d4bd54cc24315835a27be9d", "bytes": 1111 }
+      ],
+      "identity_evidence": {
+        "title": "Secondhand Orbit (corrected-body and manual-assign only)",
+        "year": 2013,
+        "ids": { "tmdb": 9200008, "imdb": "tt9200008", "tvdb": 8200008 },
+        "usable_provider_id": true,
+        "content_present": { "plot": true, "genre": true, "cast": true }
+      },
+      "location_context": { "folder_name": "Secondhand Orbit (2013)", "derived_title": "Secondhand Orbit", "derived_year": 2013 },
+      "route_inputs": ["nfo-08.search-movie.secondhand-orbit", "nfo-08.movie-detail.9200008"],
+      "phases": [
+        {
+          "phase": "initial-malformed",
+          "file": "xml/NFO-08/initial-malformed.nfo",
+          "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
+          "description": "Malformed body: the movie root and several elements never close their tags. A corrupt body is not trusted identity evidence. If the identity stage searches on the derived title, the shipped search response returns zero results, which is the provider-miss/unmatched route input for this phase."
+        },
+        {
+          "phase": "corrected-body",
+          "file": "xml/NFO-08/corrected-body.nfo",
+          "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
+          "description": "Well-formed body with usable tmdb claim 9200008 (plus matching imdb/tvdb claims and full content). A corrected-body retry can bind identity straight from the NFO; the movie-detail response ships as class content for the bound entity."
+        },
+        {
+          "phase": "manual-assign",
+          "file": "xml/NFO-08/manual-assign.nfo",
+          "media_path": "Secondhand Orbit (2013)/Secondhand Orbit.mkv",
+          "description": "Byte-identical to corrected-body.nfo (same sha256 f9e518f7...). Manual Assign is a user/pipeline action that records a manually_matched state on the item; it is not caused by any byte difference in the NFO. Because the two files are byte-equivalent, any state difference between corrected-body retry and manual-assign must come from pipeline state, never from the file."
+        }
+      ],
+      "notes": "This fixture describes and supplies route inputs for the three phases (provider-miss/unmatched on the malformed body, corrected-body retry, and manual Assign/manually_matched) but does not assert final outcomes. The checked-in expected.json is the adjudicator's later artifact, not an author claim. /find is not shipped for this movie case because movie resolution has no /find route; the only applicable provider routes are /search/movie and /movie/{id}."
+    }
+  },
+  "budgets": {
+    "nfo_files": { "allowed_max": 10, "actual": 10 },
+    "xml_bytes_total": { "allowed_max_bytes": 131072, "actual_bytes": 7543 },
+    "provider_files": { "allowed_max": 24, "actual": 15 },
+    "provider_bytes_total": { "allowed_max_bytes": 524288, "actual_bytes": 21407 },
+    "manifest_max_bytes": 65536,
+    "readme_max_bytes": 65536,
+    "provenance_max_bytes": 65536,
+    "root_max_bytes": 1048576,
+    "note": "Actuals are the sizes recorded at authoring time; a read-only size recheck is expected before release."
+  }
+}

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<tvshow>
+  <title>Cinder Street</title>
+  <sorttitle>Cinder Street</sorttitle>
+  <year>2019</year>
+  <premiered>2019-04-12</premiered>
+  <plot>A demolition crew in a shrinking port town keeps finding sealed basements under buildings that were never supposed to have them. Each basement holds a different decade of the city's bargained-away past.</plot>
+  <outline>A demolition crew uncovers sealed basements that hold the city's bargained-away past.</outline>
+  <genre>Drama</genre>
+  <genre>Mystery</genre>
+  <uniqueid type="imdb">tt9300005</uniqueid>
+</tvshow>

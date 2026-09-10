@@ -1,0 +1,24 @@
+{
+  "movie_results": [],
+  "person_results": [],
+  "tv_episode_results": [],
+  "tv_results": [
+    {
+      "adult": false,
+      "backdrop_path": "/nj_ashcroft_house_2016_backdrop.jpg",
+      "genre_ids": [18, 36],
+      "id": 9300006,
+      "origin_country": ["GB"],
+      "original_language": "en",
+      "original_name": "Ashcroft House",
+      "overview": "A land agent sent to value a bankrupt estate finds the manor is still legally occupied by a family whose claim predates the deed registry itself.",
+      "popularity": 9.1,
+      "poster_path": "/nj_ashcroft_house_2016_poster.jpg",
+      "first_air_date": "2016-01-15",
+      "name": "Ashcroft House",
+      "vote_average": 6.4,
+      "vote_count": 566
+    }
+  ],
+  "tv_season_results": []
+}

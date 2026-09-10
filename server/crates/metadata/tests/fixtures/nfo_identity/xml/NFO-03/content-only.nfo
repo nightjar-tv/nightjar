@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<movie>
+  <title>Keeper of the Lantern</title>
+  <originaltitle>Keeper of the Lantern</originaltitle>
+  <year>2011</year>
+  <plot>Two rival lighthouse keepers on a crumbling island must cooperate to guide a stranded cargo ship to shore during a storm that knocks out every beacon but theirs. Their feud costs them more than sleep by morning.</plot>
+  <outline>Rival lighthouse keepers must cooperate to save a cargo ship during a storm.</outline>
+  <runtime>94</runtime>
+  <genre>Drama</genre>
+  <genre>Mystery</genre>
+  <actor>
+    <name>Wilfred Moxley</name>
+    <role>Otis Brenner</role>
+    <order>0</order>
+  </actor>
+  <actor>
+    <name>Cassia Delucca</name>
+    <role>Pearl Bittner</role>
+    <order>1</order>
+  </actor>
+</movie>

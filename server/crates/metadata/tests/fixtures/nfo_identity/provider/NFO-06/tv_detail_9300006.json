@@ -1,0 +1,82 @@
+{
+  "adult": false,
+  "backdrop_path": "/nj_ashcroft_house_2016_backdrop.jpg",
+  "created_by": [],
+  "episode_run_time": [55],
+  "first_air_date": "2016-01-15",
+  "genres": [
+    { "id": 18, "name": "Drama" },
+    { "id": 36, "name": "History" }
+  ],
+  "homepage": "",
+  "id": 9300006,
+  "in_production": false,
+  "languages": ["en"],
+  "last_air_date": "2018-03-30",
+  "name": "Ashcroft House",
+  "number_of_episodes": 12,
+  "number_of_seasons": 2,
+  "origin_country": ["GB"],
+  "original_language": "en",
+  "original_name": "Ashcroft House",
+  "overview": "A land agent sent to value a bankrupt estate finds the manor is still legally occupied by a family whose claim predates the deed registry itself.",
+  "popularity": 9.1,
+  "poster_path": "/nj_ashcroft_house_2016_poster.jpg",
+  "status": "Ended",
+  "tagline": "The deed is older than the registry.",
+  "type": "Scripted",
+  "vote_average": 6.4,
+  "vote_count": 566,
+  "external_ids": {
+    "id": 9300006,
+    "imdb_id": "tt9300006",
+    "freebase_mid": null,
+    "freebase_id": null,
+    "tvdb_id": 8300006,
+    "tvrage_id": null,
+    "wikidata_id": null
+  },
+  "aggregate_credits": {
+    "cast": [
+      {
+        "adult": false,
+        "gender": 2,
+        "id": 889001,
+        "known_for_department": "Acting",
+        "name": "Hollis Strand",
+        "original_name": "Hollis Strand",
+        "popularity": 6.6,
+        "profile_path": "/nj_hollis_strand_profile.jpg",
+        "roles": [
+          {
+            "credit_id": "nj80013",
+            "character": "Duncan Pike",
+            "episode_count": 12
+          }
+        ],
+        "total_episode_count": 12,
+        "order": 0
+      },
+      {
+        "adult": false,
+        "gender": 1,
+        "id": 889002,
+        "known_for_department": "Acting",
+        "name": "Aveline Croft",
+        "original_name": "Aveline Croft",
+        "popularity": 6.2,
+        "profile_path": "/nj_aveline_croft_profile.jpg",
+        "roles": [
+          {
+            "credit_id": "nj80014",
+            "character": "Mistress Ingrid Ashcroft",
+            "episode_count": 12
+          }
+        ],
+        "total_episode_count": 12,
+        "order": 1
+      }
+    ],
+    "crew": []
+  }
+}

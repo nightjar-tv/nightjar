@@ -1,0 +1,24 @@
+{
+  "movie_results": [],
+  "person_results": [],
+  "tv_episode_results": [],
+  "tv_results": [
+    {
+      "adult": false,
+      "backdrop_path": "/nj_cinder_street_2019_backdrop.jpg",
+      "genre_ids": [18, 9648],
+      "id": 9300005,
+      "origin_country": ["GB"],
+      "original_language": "en",
+      "original_name": "Cinder Street",
+      "overview": "A demolition crew in a shrinking port town keeps finding sealed basements under buildings that were never supposed to have them. Each basement holds a different decade of the city's bargained-away past.",
+      "popularity": 12.4,
+      "poster_path": "/nj_cinder_street_2019_poster.jpg",
+      "first_air_date": "2019-04-12",
+      "name": "Cinder Street",
+      "vote_average": 7.6,
+      "vote_count": 1288
+    }
+  ],
+  "tv_season_results": []
+}

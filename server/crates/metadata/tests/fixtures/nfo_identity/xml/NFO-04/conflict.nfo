@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<movie>
+  <title>The Cobalt Divide</title>
+  <originaltitle>The Cobalt Divide</originaltitle>
+  <year>2018</year>
+  <plot>An electrical engineer discovers that the city grid she maintains reroutes power around a neighborhood that does not appear on any permit map. Following the current leads her to a sealed district where the residents were never told the war ended.</plot>
+  <outline>An engineer follows unexplained power reroutes to a sealed district hidden from city records.</outline>
+  <runtime>127</runtime>
+  <genre>Sci-Fi</genre>
+  <genre>Thriller</genre>
+  <uniqueid type="tmdb" default="true">9200041</uniqueid>
+  <uniqueid type="imdb">tt9200042</uniqueid>
+  <uniqueid type="tvdb">8200043</uniqueid>
+  <actor>
+    <name>Benedict Claymore</name>
+    <role>Ellis Tarn</role>
+    <order>0</order>
+  </actor>
+  <actor>
+    <name>Yasmin Okello</name>
+    <role>Dr. Wren Kaspian</role>
+    <order>1</order>
+  </actor>
+</movie>

@@ -23,6 +23,10 @@ mod resolve;
 mod series_bindings;
 mod tmdb;
 
+#[cfg(test)]
+#[path = "nfo_identity_harness.rs"]
+mod nfo_identity;
+
 pub use artwork::{
     ArtworkStore, IMAGE_CDN_MAX_IN_FLIGHT, THUMB_WIDTHS, artwork_path_for_item_key,
     artwork_refs_for_item_key, resolve_artwork_key,
