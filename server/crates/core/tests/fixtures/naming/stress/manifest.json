@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "generator": "filename_stress",
+  "generator_version": 2,
+  "seed": "0x6e696768746a6172",
+  "total_cases": 334,
+  "families": {
+    "numeric_title_year": 30,
+    "scene_film": 30,
+    "unicode_title": 24,
+    "missing_year": 24,
+    "sxxeyy_nxnn": 40,
+    "season_folder": 24,
+    "seasonless_date_absolute": 36,
+    "multi_episode": 32,
+    "season_zero": 20,
+    "extras_editions": 28,
+    "misleading_tokens": 30,
+    "malformed_size": 16
+  },
+  "max_input_bytes": 4096,
+  "local_case_budget": 1024,
+  "local_byte_budget": 1048576,
+  "fingerprint_fnv1a64": "0x7d9347a33fa80b78"
+}
