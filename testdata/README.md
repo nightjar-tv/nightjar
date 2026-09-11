@@ -24,8 +24,17 @@ committed fixture in place.
 ## HDR / Dolby Vision axis
 
 Controls (committed when generated): SDR BT.709, HDR10, HDR10+, plain HLG,
-synthetic DV P8.4 HLG, and a short P8.1 mkv/mp4 pair (same content; Matroska
-block additions vs MP4 `dvvC` / `hvc1`).
+and synthetic DV P8.4 HLG.
+
+### Committed-fixture coverage gap: P8.1 container pair
+
+A short P8.1 mkv/mp4 pair (same content; Matroska block additions vs MP4
+`dvvC` / `hvc1`) is **not** in this corpus. It was a 2 s derivative of Dolby
+Browser Kit / MakeMKV P8.1 media, removed 2026-09-11 for licence reasons
+(Rule 4.3). The gap is declared in `manifest.json` under `coverage_gaps`. The
+scanner corpus test asserts the gap is real instead of skipping it, and no
+test counts the absent pair as exercised. Local-only, gitignored Browser Kit /
+MakeMKV P8.1 rows still exercise the profile when the files are present.
 
 ### MakeMKV Dolby Vision test clips (local only)
 
@@ -45,7 +54,7 @@ authenticity against an upstream digest — there was nothing to cross-check.
 Dolby’s Patterns of Nature MP4s live under
 `files/dolby-vision-browser-kit/` (gitignored: kit license + ~1 GB). Manifest
 rows use `"commit": false` and are exercised by `corpus_decide` when the files
-are present. The P8.1 pair prefers this kit as its source when available.
+are present.
 
 Refresh by placing the kit’s `24fps/` and `30fps/` trees there:
 

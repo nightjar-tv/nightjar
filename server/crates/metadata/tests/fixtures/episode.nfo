@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <episodedetails>
-  <title>Pilot</title>
-  <showtitle>Breaking Bad</showtitle>
+  <title>The First Light</title>
+  <showtitle>Harbour Nocturne</showtitle>
   <season>1</season>
   <episode>1</episode>
-  <aired>2008-01-20</aired>
-  <plot>Walter White's life changes forever.</plot>
-  <runtime>58</runtime>
-  <uniqueid type="tmdb" default="true">62085</uniqueid>
-  <uniqueid type="tvdb">349232</uniqueid>
+  <aired>2011-03-06</aired>
+  <plot>A keeper takes the night watch and learns the fog has a memory.</plot>
+  <runtime>47</runtime>
+  <uniqueid type="tmdb" default="true">9500001</uniqueid>
+  <uniqueid type="tvdb">8500001</uniqueid>
 </episodedetails>

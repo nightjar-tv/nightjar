@@ -335,35 +335,6 @@ else
   echo "skip hevc_dv_p84_hlg_*: need dovi_tool + mkvmerge + assets/dovi_p84_gen.json"
 fi
 
-# 22f. P8.1 mkv/mp4 pair (same content; Matroska vs MP4 DV signalling)
-# Prefer local Browser Kit; else MakeMKV P8.1 after fetch. ffmpeg -c copy drops dvvC
-# on MP4, so graft the kit/source dvvC (compat id 1 for HDR10 BL).
-DVVC_P81_HEX="00000020647676430100101d1000000000000000000000000000000000000000"
-P81_KIT="$OUT/dolby-vision-browser-kit/24fps/FHD/Patterns_Of_Nature_HDR10-P8.1_FHD_24_H265-4Mbps_DD+JOC-768Kbps.mp4"
-P81_MAKEMKV="$OUT/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv"
-P81_SRC=""
-if [[ -f "$P81_KIT" ]]; then
-  P81_SRC="$P81_KIT"
-elif [[ -f "$P81_MAKEMKV" ]]; then
-  P81_SRC="$P81_MAKEMKV"
-fi
-if [[ -n "$P81_SRC" ]]; then
-  echo "→ hevc_dv_p81_pair.{mkv,mp4} from $(basename "$P81_SRC")"
-  TMP_P81="$(mktemp -d)"
-  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy \
-    "$OUT/hevc_dv_p81_pair.mkv"
-  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy -tag:v hvc1 \
-    "$TMP_P81/pair.mp4"
-  if python3 "$ROOT/inject_dvvc.py" "$TMP_P81/pair.mp4" "$DVVC_P81_HEX"; then
-    cp "$TMP_P81/pair.mp4" "$OUT/hevc_dv_p81_pair.mp4"
-  else
-    echo "skip hevc_dv_p81_pair.mp4: dvvC graft failed (MKV still written)"
-  fi
-  rm -rf "$TMP_P81"
-else
-  echo "skip hevc_dv_p81_pair.*: need Browser Kit P8.1 or fetched MakeMKV P81"
-fi
-
 # 23. Two AAC stereo tracks tagged eng/spa (ADR-0012 multi-track switch)
 gen h264_aac_multilang_mkv.mkv \
   -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
@@ -680,22 +651,6 @@ fetch_makemkv_dvtest() {
 }
 
 fetch_makemkv_dvtest
-
-# Rebuild P8.1 pair if MakeMKV P81 arrived after the earlier synth pass.
-if [[ ! -f "$OUT/hevc_dv_p81_pair.mkv" ]] \
-  && [[ -f "$OUT/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv" ]]; then
-  echo "→ hevc_dv_p81_pair.* (retry from MakeMKV P81)"
-  P81_SRC="$OUT/dolby-vision-makemkv/P81_GlassBlowing2_3840x2160@59_94fps_15200kbps.mkv"
-  TMP_P81="$(mktemp -d)"
-  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy \
-    "$OUT/hevc_dv_p81_pair.mkv"
-  "$FFMPEG" -y -hide_banner -loglevel error -i "$P81_SRC" -t 2 -c copy -tag:v hvc1 \
-    "$TMP_P81/pair.mp4"
-  python3 "$ROOT/inject_dvvc.py" "$TMP_P81/pair.mp4" "$DVVC_P81_HEX" \
-    && cp "$TMP_P81/pair.mp4" "$OUT/hevc_dv_p81_pair.mp4" \
-    || echo "skip hevc_dv_p81_pair.mp4: dvvC graft failed"
-  rm -rf "$TMP_P81"
-fi
 
 touch "$OUT/.generated"
 echo "Done. Files in $OUT"
