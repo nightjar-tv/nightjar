@@ -55,6 +55,16 @@ RUN for pkg in ca-certificates ffmpeg intel-media-va-driver mesa-va-drivers i965
 		mkdir -p "/usr/share/doc/nightjar/debian/$pkg"; \
 		cp -a "/usr/share/doc/$pkg/copyright" "/usr/share/doc/nightjar/debian/$pkg/copyright"; \
 	done
+# Record every installed binary package with its source package and version, so
+# the notice set covers the complete set apt installs, not only the five named
+# above. The record is produced from dpkg-query and sorted, so the same pinned
+# inputs produce the same record. Each package keeps its copyright file at the
+# standard /usr/share/doc/<package>/copyright path; the image does not
+# duplicate the transitive copyright files.
+RUN dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Version}\t${source:Package}\t${source:Version}\t${Architecture}\n' \
+	| grep -E '^installed[[:space:]]' \
+	| cut -f2- \
+	| LC_ALL=C sort > /usr/share/doc/nightjar/debian/installed-packages.txt
 RUN mkdir -p /etc/nightjar-release-inputs
 COPY --from=web /nightjar-toolchain-web.txt /etc/nightjar-release-inputs/toolchains-web.txt
 COPY --from=server /nightjar-toolchain-server.txt /etc/nightjar-release-inputs/toolchains-server.txt
