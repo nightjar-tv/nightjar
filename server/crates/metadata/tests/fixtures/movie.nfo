@@ -1,34 +1,34 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
-  <title>Fight Club</title>
-  <originaltitle>Fight Club</originaltitle>
-  <year>1999</year>
-  <plot>An insomniac office worker and a devil-may-care soap maker form an underground fight club.</plot>
-  <runtime>139</runtime>
+  <title>The Lantern Keeper</title>
+  <originaltitle>The Lantern Keeper</originaltitle>
+  <year>2001</year>
+  <plot>A night archivist guards a coastal lighthouse and the stories it keeps.</plot>
+  <runtime>112</runtime>
   <genre>Drama</genre>
-  <genre>Thriller</genre>
-  <uniqueid type="tmdb" default="true">550</uniqueid>
-  <uniqueid type="imdb">tt0137523</uniqueid>
-  <tmdbid>550</tmdbid>
+  <genre>Mystery</genre>
+  <uniqueid type="tmdb" default="true">9400001</uniqueid>
+  <uniqueid type="imdb">tt9400001</uniqueid>
+  <tmdbid>9400001</tmdbid>
   <actor>
-    <name>Brad Pitt</name>
-    <role>Tyler Durden</role>
+    <name>Marin Vale</name>
+    <role>Elias Thorn</role>
     <order>0</order>
   </actor>
   <actor>
-    <name>Edward Norton</name>
-    <role>The Narrator</role>
+    <name>Perrin Ash</name>
+    <role>Nora Quill</role>
     <order>1</order>
   </actor>
   <ratings>
     <rating name="imdb" max="10" default="true">
-      <value>8.8</value>
-      <votes>2000000</votes>
+      <value>7.4</value>
+      <votes>12345</votes>
     </rating>
   </ratings>
   <set>
-    <name>Fight Club Collection</name>
-    <tmdb>100000</tmdb>
+    <name>The Lantern Keeper Collection</name>
+    <tmdb>9400100</tmdb>
   </set>
   <thumb aspect="poster">poster.jpg</thumb>
   <fanart>fanart.jpg</fanart>

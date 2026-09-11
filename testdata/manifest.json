@@ -2,6 +2,16 @@
   "version": 1,
   "license_policy": "FFmpeg-generated or explicitly licensed only (ENGINEERING_RULES Rule 4.3). Never commercial media.",
   "generate": "testdata/generate.sh",
+  "coverage_gaps": [
+    {
+      "axis": "Dolby Vision P8.1 container pair",
+      "paths": [
+        "files/hevc_dv_p81_pair.mkv",
+        "files/hevc_dv_p81_pair.mp4"
+      ],
+      "reason": "Committed derivative of Dolby Browser Kit / MakeMKV P8.1 media removed 2026-09-11 for licence reasons (ENGINEERING_RULES Rule 4.3). No committed fixture exercises P8.1 Matroska-vs-MP4 signalling. This is a declared committed-fixture coverage gap, not a skipped test and not passing evidence. Local-only gitignored Browser Kit / MakeMKV P8.1 rows (commit:false) still exercise the profile when present."
+    }
+  ],
   "files": [
     {
       "path": "files/h264_aac_mp4.mp4",
@@ -513,102 +523,6 @@
         }
       },
       "note": "Same RPU as the MKV; MP4 carries dvvC (compat id 4) grafted after remux."
-    },
-    {
-      "path": "files/hevc_dv_p81_pair.mkv",
-      "tags": [
-        "hevc",
-        "dolby-vision",
-        "profile-8.1",
-        "mkv",
-        "container-pair"
-      ],
-      "container": "matroska",
-      "codec": "hevc",
-      "bit_depth": 10,
-      "transfer": "smpte2084",
-      "dv_profile": 8,
-      "dovi_configuration_record": {
-        "side_data_type": "DOVI configuration record",
-        "dv_version_major": 1,
-        "dv_version_minor": 0,
-        "dv_profile": 8,
-        "dv_level": 3,
-        "rpu_present_flag": 1,
-        "el_present_flag": 0,
-        "bl_present_flag": 1,
-        "dv_bl_signal_compatibility_id": 1,
-        "dv_md_compression": "none"
-      },
-      "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
-      "expect_by_profile": {
-        "BROWSER_V0": {
-          "method": "transcode",
-          "provisional": false,
-          "rendered": "tonemappedSdr"
-        },
-        "AETHER_V0": {
-          "method": "directPlay",
-          "provisional": true,
-          "rendered": "dolbyVision",
-          "rendered_note": "P8.1 DV support varies by device generation / tvOS",
-          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
-        },
-        "NO_HDR_WIDE": {
-          "method": "transcode",
-          "provisional": false,
-          "rendered": "tonemappedSdr"
-        }
-      },
-      "note": "2s truncate of Browser Kit P8.1; Matroska DV signalling."
-    },
-    {
-      "path": "files/hevc_dv_p81_pair.mp4",
-      "tags": [
-        "hevc",
-        "dolby-vision",
-        "profile-8.1",
-        "mp4",
-        "container-pair"
-      ],
-      "container": "mp4",
-      "codec": "hevc",
-      "bit_depth": 10,
-      "transfer": "smpte2084",
-      "dv_profile": 8,
-      "dovi_configuration_record": {
-        "side_data_type": "DOVI configuration record",
-        "dv_version_major": 1,
-        "dv_version_minor": 0,
-        "dv_profile": 8,
-        "dv_level": 3,
-        "rpu_present_flag": 1,
-        "el_present_flag": 0,
-        "bl_present_flag": 1,
-        "dv_bl_signal_compatibility_id": 1,
-        "dv_md_compression": "none"
-      },
-      "expect": "needs transcode (Dolby Vision P8.1 / HEVC)",
-      "expect_by_profile": {
-        "BROWSER_V0": {
-          "method": "transcode",
-          "provisional": false,
-          "rendered": "tonemappedSdr"
-        },
-        "AETHER_V0": {
-          "method": "directPlay",
-          "provisional": true,
-          "rendered": "dolbyVision",
-          "rendered_note": "P8.1 DV support varies by device generation / tvOS",
-          "provisional_reason": "provisional means unmeasured, not probably fine (Rule 4.8): AETHER_V0 method/render not device-proven; t1_profile_counts.py scores codec/container set against decide_playback only (no AetherEngine load); ADR-0021 / ADR-0022"
-        },
-        "NO_HDR_WIDE": {
-          "method": "transcode",
-          "provisional": false,
-          "rendered": "tonemappedSdr"
-        }
-      },
-      "note": "Same 2s content as the MKV pair; MP4 dvhe/dvh1 sample-entry signalling (dvvC). ffmpeg -c copy alone drops dvvC."
     },
     {
       "path": "files/dolby-vision-makemkv/P4_LG_Dolby_Trailer_4K_Demo.mkv",

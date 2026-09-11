@@ -31,6 +31,17 @@ use std::process::Command;
 #[derive(Debug, Deserialize)]
 struct Manifest {
     files: Vec<ManifestFile>,
+    #[serde(default)]
+    coverage_gaps: Vec<CoverageGap>,
+}
+
+/// A declared committed-fixture coverage gap: media the corpus does not ship.
+/// It is neither a skipped test nor passing evidence. See `testdata/README.md`.
+#[derive(Debug, Deserialize)]
+struct CoverageGap {
+    axis: String,
+    paths: Vec<String>,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,26 +224,6 @@ const HDR_AXIS: &[HdrCase] = &[
         browser: verified(PlaybackMethod::Transcode, TM),
         // Real DV when the device generation / tvOS allow; otherwise HDR10 BL.
         // Listed as dolbyVision provisionally — support varies.
-        aether: aether_prov(PlaybackMethod::DirectPlay, DV),
-        no_hdr: verified(PlaybackMethod::Transcode, TM),
-        hdr_source: true,
-        ignore: None,
-    },
-    HdrCase {
-        label: "P8.1 pair mkv",
-        rel: "files/hevc_dv_p81_pair.mkv",
-        optional: false,
-        browser: verified(PlaybackMethod::Transcode, TM),
-        aether: aether_prov(PlaybackMethod::DirectPlay, DV),
-        no_hdr: verified(PlaybackMethod::Transcode, TM),
-        hdr_source: true,
-        ignore: None,
-    },
-    HdrCase {
-        label: "P8.1 pair mp4",
-        rel: "files/hevc_dv_p81_pair.mp4",
-        optional: false,
-        browser: verified(PlaybackMethod::Transcode, TM),
         aether: aether_prov(PlaybackMethod::DirectPlay, DV),
         no_hdr: verified(PlaybackMethod::Transcode, TM),
         hdr_source: true,
@@ -481,6 +472,66 @@ fn corpus_manifest_expects_match_decide_playback() {
         "corpus decide: {checked} rows checked of {total} in the manifest \
          ({pending_source} pending source, {non_committed_absent} non-committed absent)"
     );
+}
+
+/// Declared committed-fixture coverage gaps are real, and no test counts them
+/// as exercised. A gap is not a skip and not passing evidence (Rule 4.15):
+/// this test fails if a gap path appears on disk, if a gap path also appears as
+/// a `files` row, or if `HDR_AXIS` carries a case for it. The gap therefore
+/// cannot be silently filled, silently dropped, or reported as coverage.
+#[test]
+fn committed_fixture_coverage_gaps_are_declared_and_absent() {
+    let testdata = repo_testdata();
+    let raw = std::fs::read_to_string(testdata.join("manifest.json")).expect("read manifest.json");
+    let manifest: Manifest = serde_json::from_str(&raw).expect("parse manifest.json");
+
+    assert!(
+        !manifest.coverage_gaps.is_empty(),
+        "manifest must declare the removed P8.1 pair as a coverage gap"
+    );
+
+    for gap in &manifest.coverage_gaps {
+        assert!(!gap.axis.trim().is_empty(), "coverage gap needs an axis");
+        assert!(
+            !gap.reason.trim().is_empty(),
+            "coverage gap {} needs a reason",
+            gap.axis
+        );
+        assert!(
+            !gap.paths.is_empty(),
+            "coverage gap {} needs at least one path",
+            gap.axis
+        );
+        for rel in &gap.paths {
+            let path = testdata.join(rel);
+            assert!(
+                !path.is_file(),
+                "coverage gap {}: {} is present; remove the gap declaration or the file",
+                gap.axis,
+                rel
+            );
+            assert!(
+                !manifest
+                    .files
+                    .iter()
+                    .any(|row| row.path.as_deref() == Some(rel.as_str())),
+                "coverage gap {}: {} must not also be a files row (that counts it as exercised)",
+                gap.axis,
+                rel
+            );
+            assert!(
+                !HDR_AXIS.iter().any(|case| case.rel == rel),
+                "coverage gap {}: HDR_AXIS must not carry a case for absent {}",
+                gap.axis,
+                rel
+            );
+        }
+        eprintln!(
+            "coverage gap (not a skip, not exercised): {} — {}",
+            gap.axis,
+            gap.paths.join(", ")
+        );
+    }
 }
 
 #[test]

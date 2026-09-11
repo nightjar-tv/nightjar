@@ -480,21 +480,21 @@ mod tests {
     fn parses_movie_nfo() {
         let meta = parse_nfo(&fixture("movie.nfo")).unwrap();
         assert_eq!(meta.kind, MetadataKind::Movie);
-        assert_eq!(meta.title, "Fight Club");
-        assert_eq!(meta.original_title.as_deref(), Some("Fight Club"));
-        assert_eq!(meta.year, Some(1999));
-        assert_eq!(meta.runtime_minutes, Some(139));
+        assert_eq!(meta.title, "The Lantern Keeper");
+        assert_eq!(meta.original_title.as_deref(), Some("The Lantern Keeper"));
+        assert_eq!(meta.year, Some(2001));
+        assert_eq!(meta.runtime_minutes, Some(112));
         assert!(meta.genres.iter().any(|g| g == "Drama"));
-        assert_eq!(meta.ids.tmdb, Some(550));
-        assert_eq!(meta.ids.imdb.as_deref(), Some("tt0137523"));
+        assert_eq!(meta.ids.tmdb, Some(9400001));
+        assert_eq!(meta.ids.imdb.as_deref(), Some("tt9400001"));
         assert_eq!(
             item_key_for_metadata(&meta).as_deref(),
-            Some("tmdb:movie:550")
+            Some("tmdb:movie:9400001")
         );
-        assert!(meta.cast.iter().any(|c| c.name == "Brad Pitt"));
+        assert!(meta.cast.iter().any(|c| c.name == "Marin Vale"));
         assert_eq!(
             meta.collection.as_ref().and_then(|c| c.name.as_deref()),
-            Some("Fight Club Collection")
+            Some("The Lantern Keeper Collection")
         );
     }
 
@@ -502,13 +502,13 @@ mod tests {
     fn parses_episode_nfo() {
         let meta = parse_nfo(&fixture("episode.nfo")).unwrap();
         assert_eq!(meta.kind, MetadataKind::Episode);
-        assert_eq!(meta.title, "Pilot");
+        assert_eq!(meta.title, "The First Light");
         assert_eq!(meta.season, Some(1));
         assert_eq!(meta.episode, Some(1));
-        assert_eq!(meta.ids.tmdb, Some(62085));
+        assert_eq!(meta.ids.tmdb, Some(9500001));
         assert_eq!(
             item_key_for_metadata(&meta).as_deref(),
-            Some("tmdb:episode:62085")
+            Some("tmdb:episode:9500001")
         );
     }
 

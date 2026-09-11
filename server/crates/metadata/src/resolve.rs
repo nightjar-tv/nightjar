@@ -790,7 +790,7 @@ mod tests {
                 confirmed: _,
             } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
-                assert_eq!(metadata.title, "Fight Club");
+                assert_eq!(metadata.title, "The Lantern Keeper");
                 assert_eq!(match_method.as_deref(), Some("nfo_item_tmdb_id"));
             }
             ResolveOutcome::Unresolved { .. } => panic!("expected NFO resolve"),
@@ -828,8 +828,8 @@ mod tests {
         let outcome = Resolver { tmdb: src }
             .resolve(&ResolveInput {
                 nfo_xml: Some(fixture("malformed.nfo")),
-                title: Some("Fight Club".into()),
-                year: Some(1999),
+                title: Some("The Lantern Keeper".into()),
+                year: Some(2001),
                 kind: Some(MetadataKind::Movie),
                 ..Default::default()
             })
@@ -848,8 +848,8 @@ mod tests {
     fn malformed_nfo_is_the_reported_reason_when_search_also_fails() {
         let outcome = resolve(&ResolveInput {
             nfo_xml: Some(fixture("malformed.nfo")),
-            title: Some("Fight Club".into()),
-            year: Some(1999),
+            title: Some("The Lantern Keeper".into()),
+            year: Some(2001),
             kind: Some(MetadataKind::Movie),
             ..Default::default()
         })
@@ -1107,8 +1107,8 @@ mod tests {
         let outcome = resolver
             .resolve(&ResolveInput {
                 nfo_xml: Some(fixture("movie.nfo")),
-                title: Some("Fight Club".into()),
-                year: Some(1999),
+                title: Some("The Lantern Keeper".into()),
+                year: Some(2001),
                 kind: Some(MetadataKind::Movie),
                 ..Default::default()
             })
@@ -1121,7 +1121,7 @@ mod tests {
                 confirmed: _,
             } => {
                 assert_eq!(source, MetadataOrigin::Nfo);
-                assert_eq!(metadata.ids.tmdb, Some(550));
+                assert_eq!(metadata.ids.tmdb, Some(9400001));
                 // Was `None` until 2026-08-15. The NFO's own id *is* how the
                 // entity was chosen, and reporting nothing left the diagnostic
                 // column blank for most of a Sonarr-managed library — 22,096 of
