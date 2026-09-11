@@ -5,14 +5,16 @@ belongs to exactly one root.
 
 | Root | Purpose | State |
 |------|---------|-------|
-| `regression/` | Cases promoted from inline tests, to keep a fixed regression set | reserved |
+| `regression/` | Cases promoted from inline tests, to keep a fixed regression set | reserved (empty) |
 | `development/` | Pinned upstream parser evidence used while developing the parser | populated |
-| `heldout/` | Cases held out of tuning so a later slice can measure without fitting | reserved |
-| `stress/` | Generated adversarial and size-boundary cases | reserved |
+| `heldout/` | Cases held out of tuning so a later slice can measure without fitting | reserved (empty) |
+| `stress/` | Generated adversarial and size-boundary cases | populated (334 generated cases) |
 
-`regression/`, `heldout/` and `stress/` carry no cases yet. Do not fabricate
-held-out cases. Promotion into `regression/` happens only when a case is already
-covered by an inline test; a case is never copied into two roots.
+`regression/` and `heldout/` carry no cases yet. Do not fabricate held-out
+cases. The `stress/` set is populated by the deterministic harness in
+`server/crates/core/tests/filename_stress.rs`. Promotion into `regression/`
+happens only when a case is already covered by an inline test; a case is never
+copied into two roots.
 
 ## What this set can establish
 
@@ -31,8 +33,8 @@ The current regression set is the inline `#[test]` cases in
 `server/crates/core/src/filename.rs`. This tree does not replace them.
 
 Before any later R3 slice tunes the parser or reports parse quality, that slice
-must independently author the held-out and generated stress sets. This
-development set must not be used to report parse quality on its own.
+must independently author the held-out set. This development set must not be
+used to report parse quality on its own.
 
 ## Development counts
 
