@@ -75,6 +75,41 @@ mapping, including `aarch64-apple-darwin` to `macos/arm64` and
 `x86_64-apple-darwin` to `macos/amd64`. The `release-inputs` CI job runs this
 check beside the two-build comparison.
 
+## Corresponding source and notices
+
+Nightjar ships the notice set inside the runtime image at
+`/usr/share/doc/nightjar/`. The root `NOTICE` names the shipped runtime
+components; `notices/THIRD-PARTY.md` carries the Rust and web dependency
+notices; `notices/Apache-2.0.txt` and `notices/hls.js-1.6.16.txt` carry the
+bundled `hls.js` 1.6.16 notice; `SOURCE.md` is this document; and
+`debian/<package>/copyright` is the installed Debian copyright file for each
+redistributed package.
+
+The Nightjar source for a release is the repository at the release tag. The
+Nightjar release/tag URL is supplied at publication.
+
+No Nightjar release or tag exists yet, and this document does not claim that
+one does.
+
+The runtime image redistributes these Debian binary packages. Their
+corresponding source is retrievable from the same Debian Snapshot archive the
+image installs from:
+
+| Binary package | Source package | Version | Snapshot source route |
+|---|---|---|---|
+| `ca-certificates` | `ca-certificates` | `20250419~deb12u1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/c/ca-certificates/` |
+| `ffmpeg` | `ffmpeg` | `7:5.1.9-0+deb12u1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/f/ffmpeg/` |
+| `intel-media-va-driver` | `intel-media-driver` | `23.1.1+dfsg1-1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/i/intel-media-driver/` |
+| `mesa-va-drivers` | `mesa` | `22.3.6-1+deb12u2` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/m/mesa/` |
+| `i965-va-driver` | `intel-vaapi-driver` | `2.4.1+dfsg1-1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/i/intel-vaapi-driver/` |
+
+The Debian archive is pinned at
+`snapshot.debian.org/archive/debian/20260901T000000Z` and the security archive
+at `snapshot.debian.org/archive/debian-security/20260901T000000Z`. A `deb-src`
+line with the same timestamp, followed by `apt-get source <source package>`,
+fetches the exact source. `scripts/check_notices.py check` fails if this route
+drifts from the `Dockerfile` pins.
+
 ## Refreshing a pin
 
 A refresh is an explicit release-maintenance action, not a calendar cadence.

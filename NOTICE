@@ -1,0 +1,41 @@
+Nightjar release notices
+========================
+
+Nightjar is one server binary. This notice names the runtime components that
+Nightjar ships and points to the full license and notice material. It records
+publisher-declared license metadata. It is not legal advice and not an audit of
+file-level copyright notices.
+
+Shipped in the Nightjar server binary and image
+-----------------------------------------------
+
+- Nightjar server binary and embedded web UI, project version 0.0.1, licensed
+  GPL-3.0-only. The full license text is in LICENSE. The source is the Nightjar
+  repository; the release/tag URL is supplied at publication (docs/RELEASE.md).
+- Rust dependencies locked in server/Cargo.lock. Their publisher-declared
+  license expressions and the generated notice are in notices/THIRD-PARTY.md;
+  the committed expression map is notices/rust-licenses.json. The lockfile
+  coverage includes target-specific and build dependencies, whether or not a
+  particular release binary contains their code.
+- Bundled SQLite (public domain), compiled by libsqlite3-sys with the bundled
+  feature.
+- hls.js 1.6.16 (Apache-2.0), bundled into the embedded web assets. The notice
+  is notices/hls.js-1.6.16.txt and the license text is notices/Apache-2.0.txt.
+
+Shipped in the Nightjar Linux image as external Debian packages
+---------------------------------------------------------------
+
+These are separate executables and shared libraries, not linked into the server
+binary. The image keeps their installed Debian copyright files under
+/usr/share/doc/nightjar/debian/.
+
+- ffmpeg and ffprobe, Debian package ffmpeg 7:5.1.9-0+deb12u1, GPL-2+.
+- ca-certificates 20250419~deb12u1, GPL-2+ packaging and MPL-2.0 CA data.
+- intel-media-va-driver 23.1.1+dfsg1-1, Expat and BSD-3-clause components.
+- mesa-va-drivers 22.3.6-1+deb12u2, MIT, Apache-2.0, BSD, SGI and Khronos
+  components.
+- i965-va-driver 2.4.1+dfsg1-1, Expat, Apache-2.0, EPL-1.0 and GPL-2+
+  components.
+
+The exact Debian source package, version and the Debian Snapshot retrieval
+route are in docs/RELEASE.md.

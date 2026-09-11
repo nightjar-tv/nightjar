@@ -44,6 +44,17 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 		mesa-va-drivers=22.3.6-1+deb12u2 \
 		i965-va-driver=2.4.1+dfsg1-1 \
 	&& rm -rf /var/lib/apt/lists/*
+# Ship the notice set, the corresponding-source route and the installed Debian
+# copyright files for the packages this image redistributes. This adds files
+# only; it changes no runtime behaviour and vendors no third-party binary.
+RUN mkdir -p /usr/share/doc/nightjar/debian
+COPY NOTICE /usr/share/doc/nightjar/NOTICE
+COPY notices/ /usr/share/doc/nightjar/notices/
+COPY docs/RELEASE.md /usr/share/doc/nightjar/SOURCE.md
+RUN for pkg in ca-certificates ffmpeg intel-media-va-driver mesa-va-drivers i965-va-driver; do \
+		mkdir -p "/usr/share/doc/nightjar/debian/$pkg"; \
+		cp -a "/usr/share/doc/$pkg/copyright" "/usr/share/doc/nightjar/debian/$pkg/copyright"; \
+	done
 RUN mkdir -p /etc/nightjar-release-inputs
 COPY --from=web /nightjar-toolchain-web.txt /etc/nightjar-release-inputs/toolchains-web.txt
 COPY --from=server /nightjar-toolchain-server.txt /etc/nightjar-release-inputs/toolchains-server.txt

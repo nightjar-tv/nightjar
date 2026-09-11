@@ -46,6 +46,18 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # The release notice set is deterministic from the committed lockfiles and
+  # notices/ material. This job needs no build and no Docker, so it runs on
+  # every change, including docs-only changes that can break the notice route.
+  notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the release notice set
+        run: python3 scripts/check_notices.py check
+      - name: Prove the notice checker can fail
+        run: python3 scripts/check_notices.py selftest
+
   openapi:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -204,6 +216,21 @@ jobs:
           }
           capture nightjar:repro-a "$dir/probe-a.txt"
           capture nightjar:repro-b "$dir/probe-b.txt"
+      - name: Verify the notice set inside the built linux/amd64 image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh nightjar:repro-a -c '
+            set -e
+            test -f /usr/share/doc/nightjar/NOTICE
+            test -f /usr/share/doc/nightjar/SOURCE.md
+            test -f /usr/share/doc/nightjar/notices/THIRD-PARTY.md
+            test -f /usr/share/doc/nightjar/notices/Apache-2.0.txt
+            test -f /usr/share/doc/nightjar/notices/hls.js-1.6.16.txt
+            for pkg in ca-certificates ffmpeg intel-media-va-driver mesa-va-drivers i965-va-driver; do
+              test -f "/usr/share/doc/nightjar/debian/$pkg/copyright"
+            done
+            grep -q "hls.js 1.6.16" /usr/share/doc/nightjar/NOTICE
+          '
       - name: Emit both manifests
         run: |
           set -euo pipefail
