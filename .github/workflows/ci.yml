@@ -162,3 +162,65 @@ jobs:
         with:
           name: gate-metrics
           path: /tmp/gate-metrics.json
+
+  # ADR-0056. Prove the linux/amd64 Docker path: build the image twice with no
+  # shared cache and compare the governed inputs each build recorded. This
+  # compares inputs, not output bytes; see docs/RELEASE.md. The native macOS
+  # server is a separate artifact and is not built here.
+  release-inputs:
+    name: release-inputs (linux/amd64 Docker path)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the linux/amd64 image twice with no shared cache
+        run: |
+          set -euo pipefail
+          docker buildx build --no-cache --platform linux/amd64 -t nightjar:repro-a .
+          docker buildx build --no-cache --platform linux/amd64 -t nightjar:repro-b .
+      - name: Capture one probe bundle per build
+        run: |
+          set -euo pipefail
+          dir="${{ runner.temp }}/release-input-manifests"
+          mkdir -p "$dir"
+          capture() {
+            tag="$1"
+            out="$2"
+            {
+              echo "image_id: $(docker image inspect --format '{{.Id}}' "$tag")"
+              docker run --rm --entrypoint sh "$tag" -c '
+                echo "binary_sha256: $(sha256sum /usr/local/bin/nightjar | cut -d" " -f1)"
+                echo "toolchain.node: $(sed -n 1p /etc/nightjar-release-inputs/toolchains-web.txt)"
+                echo "toolchain.npm: $(sed -n 2p /etc/nightjar-release-inputs/toolchains-web.txt)"
+                echo "toolchain.rust: $(sed -n 1p /etc/nightjar-release-inputs/toolchains-server.txt)"
+                echo "toolchain.cargo: $(sed -n 2p /etc/nightjar-release-inputs/toolchains-server.txt)"
+                dpkg-query -W -f="dpkg: \${binary:Package} \${Version} \${source:Package} \${source:Version} \${Architecture}\n"
+                echo "ffmpeg_buildconf:"
+                ffmpeg -buildconf
+                echo "end_ffmpeg_buildconf"
+              '
+            } > "$out"
+          }
+          capture nightjar:repro-a "$dir/probe-a.txt"
+          capture nightjar:repro-b "$dir/probe-b.txt"
+      - name: Emit both manifests
+        run: |
+          set -euo pipefail
+          dir="${{ runner.temp }}/release-input-manifests"
+          python3 scripts/check_release_inputs.py emit --out "$dir/manifest-a.json" --tree . --target x86_64-unknown-linux-gnu --probe "$dir/probe-a.txt"
+          python3 scripts/check_release_inputs.py emit --out "$dir/manifest-b.json" --tree . --target x86_64-unknown-linux-gnu --probe "$dir/probe-b.txt"
+      - name: Compare the two manifests
+        run: |
+          set -euo pipefail
+          dir="${{ runner.temp }}/release-input-manifests"
+          python3 scripts/check_release_inputs.py compare "$dir/manifest-a.json" "$dir/manifest-b.json" | tee "$dir/compare.txt"
+      - name: Prove the comparator can fail
+        run: |
+          set -euo pipefail
+          dir="${{ runner.temp }}/release-input-manifests"
+          python3 scripts/check_release_inputs.py selftest | tee "$dir/controls.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-input-manifests
+          path: ${{ runner.temp }}/release-input-manifests/
