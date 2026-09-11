@@ -1,6 +1,6 @@
 # ADR-0003: Phase 1 library schema and API shape
 
-- Status: accepted
+- Status: accepted (items 3 and 4 superseded 2026-09-07)
 - Date: 2026-07-25
 
 ## Context
@@ -16,9 +16,16 @@ direct play. Schema and `/v0` shapes are expensive to undo (Rule 6.1).
    is `(library_id, path)` with a UNIQUE constraint; path bytes are stored as
    UTF-8 with lossy fallback recorded separately when needed.
 3. **No auth in v0.** Single-user local trust. Auth arrives in Phase 3.
-4. **API prefix `/api/v0`.** Additive within v0; breaking changes require `/v1`
-   (Rule 2.3 when frozen). OpenAPI is the source of truth; the web client is
-   generated from it.
+4. **API prefix `/api/v0`.** OpenAPI is the source of truth; the web client is
+   generated from it. Follow [Rule 2.3](../../ENGINEERING_RULES.md): API
+   versioning serves supported official clients. Breaking changes require a
+   verified official-client rollout and compatibility plan, not a third-party
+   support window. Use a version or capability distinction when needed to keep
+   supported official clients working through the rollout. *Superseded
+   2026-09-07:* the former additive-only and mandatory-new-major policy no
+   longer governs. Original decision: **API prefix `/api/v0`.** Additive within
+   v0; breaking changes require `/v1` (Rule 2.3 when frozen). OpenAPI is the
+   source of truth; the web client is generated from it.
 5. **Direct play only.** *Superseded by ADR-0006 (2026-07-25), which adds
    remux delivery and replaces the `directPlay`/`needsTranscode` fields with
    `playbackMethod`.* Original decision: `playback-info` reports
@@ -27,6 +34,16 @@ direct play. Schema and `/v0` shapes are expensive to undo (Rule 6.1).
    crashes.
 6. Library kinds are `movies` | `shows`. Item kinds are `movie` | `episode` |
    `unknown` from filename parse; metadata matching is Phase 3.
+
+### Historical supersession — authentication (2026-09-07)
+
+[ADR-0034](0034-accounts-and-profiles.md) supersedes decision 3's statement
+that v0 has no auth. The original decision and its Phase 1 local-trust rationale
+are retained as historical record; this supersession does not change decision
+4's API prefix or its versioning policy. Current implementation references are
+the OpenAPI bearer/cookie schemes and auth routes,
+`server/crates/api/src/routes/auth.rs`, and the accounts/profiles/sessions
+migration under `server/crates/db/migrations/`.
 
 ## Consequences
 

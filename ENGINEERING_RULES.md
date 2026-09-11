@@ -21,9 +21,32 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 ## 2. Architecture Rules
 
-**Rule 2.1 — Dumb clients, smart server.** All logic (transcode decisions, watch state, metadata, auth, sorting) lives server-side. Clients render API responses and play streams. A client that computes anything the server could compute is a bug.
-**Rule 2.2 — The API is the product.** Every feature is API-first. The web UI consumes the same public API as every other client. No private/internal endpoints.
-**Rule 2.3 — API stability.** Once v1 is published, endpoints are never broken, only versioned. Additive changes only within a version.
+**Rule 2.1 — Server authority, explicit client responsibilities.** The server
+owns authorization, durable watch state, metadata identity, shared library
+ordering and playback-method policy. Clients report capabilities, send user
+intent and render server state. Clients own interaction, accessibility,
+transient presentation state and device-local playback mechanics. Local
+playback behaviour may adapt within the server's policy; it may not bypass
+permissions, invent durable state or independently choose a conflicting
+playback method.
+**Rule 2.2 — A documented API driven by first-party clients.** Every
+media-server feature is API-first. Official web and native clients use the
+same documented media-server API and authorization rules; no official client
+receives a hidden permission bypass. The roadmap and compatibility tests
+prioritize supported official clients. External clients may use the published
+API, but their feature requests and release schedules do not define Nightjar's
+support commitment. Any hosted billing or relay-control API has a separate,
+documented service boundary and cannot weaken media-server authorization.
+**Rule 2.3 — API versions coordinate official clients.** The API is an
+implementation contract for Nightjar's official clients, not a third-party
+compatibility commitment. It may change whenever product needs require,
+including breaking changes. Versions and capability negotiation coordinate
+supported official client/server combinations. Coordinate breaking changes
+with official-client updates and provide a tested upgrade path; account for
+app-store rollout delays before retiring a path used by supported clients.
+No additive-only, long-term support, advance-notice or migration commitment
+is made to third-party consumers. External consumers track changes themselves
+and do not constrain releases. Keep the API specification accurate.
 **Rule 2.4 — One player interface.** Playback behaviour (attach, seek, track selection, state, errors) is owned once: the Dart player interface plus the server session contract. Platform engines implement that interface. Do not invent a second OSD, scrubber, or playback-method decision per platform. This replaced "one player core" under Rule 6.4 when the engine bake-off measured that a single Rust/libmpv core could not clear the household platforms, and that per-platform engines are what maximise direct play (ADR-0021).
 **Rule 2.5 — FFmpeg is orchestrated, never forked or patched.** We adapt to FFmpeg, not the reverse.
 

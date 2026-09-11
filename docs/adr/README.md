@@ -20,7 +20,7 @@ not here — this page is the reference, not the tour.
 |---|---|---|---|---|
 | [0001](0001-client-platforms.md) | Client platform strategy | Superseded | — | [0021](0021-client-architecture.md) (whole) |
 | [0002](0002-builtin-https-acme.md) | Built-in HTTPS / ACME | **Proposed** | — | — |
-| [0003](0003-phase1-schema-api.md) | Phase 1 library schema and API shape | Partially superseded | — | §5 by [0006](0006-phase2-remux-decision.md) |
+| [0003](0003-phase1-schema-api.md) | Phase 1 library schema and API shape | Partially superseded (items 3 and 4, 2026-09-07) | — | §5 by [0006](0006-phase2-remux-decision.md); item 3 by [0034](0034-accounts-and-profiles.md); item 4 by [Rule 2.3](../../ENGINEERING_RULES.md) (2026-09-07) |
 | [0004](0004-async-scan-jobs.md) | Async scan jobs and Gate 1 index-pass criterion | Accepted | — | — |
 | [0005](0005-gate1-close-pi-carry.md) | Close Gate 1 with Pi hardware scan carried forward | Accepted | — | — |
 | [0006](0006-phase2-remux-decision.md) | Phase 2 playback decision engine and remux delivery | Partially superseded | [0003](0003-phase1-schema-api.md) §5 | [0011](0011-remux-session-convergence.md) (delivery / remux job / cache / `remuxState`; decision-engine shape stands) |

@@ -49,9 +49,10 @@ that reads like a careful senior engineer wrote it.
 - FFmpeg is invoked as a child process through the existing orchestration in
   `server/crates/transcode`. Never add an FFmpeg wrapper crate. Never suggest
   patching FFmpeg.
-- All logic lives server-side (Rule 2.1). If you find yourself writing sorting,
-  filtering, transcode decisions, or auth checks in Svelte or Dart, stop and move
-  it behind the API.
+- Preserve the server/client responsibilities in Rule 2.1. Authorization,
+  durable state and playback-method policy remain server-owned. Keep device
+  interaction, accessibility and transient playback mechanics in the client;
+  client behaviour must remain within server policy.
 - Every new capability is expressed in api/openapi.yaml FIRST, then implemented.
   Never hand-write API types in clients; they are generated.
 - Nothing may break single-binary deployment (Rule 1.2): the server ships as
@@ -130,9 +131,10 @@ that reads like a careful senior engineer wrote it.
 - Migrations: SQLite schema changes are append-only numbered migrations following
   the existing pattern. Never edit a shipped migration. Schema changes are
   irreversible decisions; flag that an ADR is required (Rule 6.1) before writing one.
-- Public API changes: additive only within a version (Rule 2.3). If a task
-  requires breaking an endpoint, stop and flag it. That is a versioning decision
-  for a human.
+- Public API changes follow Rule 2.3. Breaking changes require a verified
+  official-client rollout and compatibility plan, not a third-party support
+  window. Use a version or capability distinction when needed to keep supported
+  official clients working through the rollout.
 - Commit messages and PR titles/bodies: follow docs/GIT_RULES.md §2–3 exactly
   (`area: imperative subject under 72 chars`). Never add AI attribution,
   Co-Authored-By bots, or `feat:`/`fix:` prefixes.
@@ -144,8 +146,9 @@ that reads like a careful senior engineer wrote it.
   hardcode hex values, fonts, or radii. User-visible strings live in
   `web/src/lib/copy.ts`. No new UI dependencies (no component libraries, no CSS
   frameworks beyond what exists).
-- Client state is UI state only (open menus, scroll position). Watch state,
-  sort order, and permissions come from the server. Cache, don't compute
+- Client state owns interaction and transient presentation state. Watch state,
+  sort order, permissions and playback-method policy come from the server;
+  clients cache server state and do not compute or invent durable state
   (Rule 2.1).
 - Flutter: playback goes through the one Dart player interface, never a
   bespoke per-platform playback path (Rule 2.4). The engine behind that
