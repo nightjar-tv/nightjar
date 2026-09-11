@@ -140,8 +140,11 @@ surfaced it. Nothing in the check would have.
 ## 5. Tags & releases
 - Semantic versioning: `v1.2.3`. Tags are annotated and signed, created only
   from green `main`.
-- Pre-1.0: `v0.x.y`, breaking changes allowed with a CHANGELOG note. Post-1.0:
-  API breaking changes are forbidden within /v1 (Rule 2.3).
+- Pre-1.0: `v0.x.y`, breaking changes allowed with a CHANGELOG note. API
+  versioning follows Rule 2.3 and coordinates supported official clients,
+  including app-store rollout delays. Post-1.0 API changes also follow Rule
+  2.3; breaking changes require a verified official-client rollout and
+  compatibility plan.
 - CHANGELOG.md is written for users, updated in the release PR. Not
   auto-generated commit spam.
 
