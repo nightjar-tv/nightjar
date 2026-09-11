@@ -1,0 +1,90 @@
+{
+  "retrieved": "2026-08-13T06:28:12Z",
+  "license": "GPL-3.0-only",
+  "repositories": {
+    "sonarr": {
+      "url": "https://github.com/Sonarr/Sonarr",
+      "ref": "a533a1a463add90fd919060b6abd426d5665859d",
+      "path": "src/NzbDrone.Core.Test/ParserTests"
+    },
+    "radarr": {
+      "url": "https://github.com/Radarr/Radarr",
+      "ref": "34b0f5450fdc346cc72cf18669e601d68b974250",
+      "path": "src/NzbDrone.Core.Test/ParserTests"
+    }
+  },
+  "sources": [
+    {
+      "file": "radarr-EditionParserFixture.cs",
+      "repository": "radarr",
+      "upstream_file": "EditionParserFixture.cs",
+      "sha256": "963ef744e70c2d1127fa91893ad4c01f3d1a879433b8219d1ae103c56f517f01"
+    },
+    {
+      "file": "radarr-ParserFixture.cs",
+      "repository": "radarr",
+      "upstream_file": "ParserFixture.cs",
+      "sha256": "4b48f995ab0b370561c141e05250a785528fa3ba723d7308dc40922366d0be03"
+    },
+    {
+      "file": "sonarr-AbsoluteEpisodeNumberParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "AbsoluteEpisodeNumberParserFixture.cs",
+      "sha256": "5bdf58e311672c6531714b28f2eea3f9c08fbf94eeb5380e5aeef7ccdb89bdb0"
+    },
+    {
+      "file": "sonarr-CrapParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "CrapParserFixture.cs",
+      "sha256": "a653a8ea6538931fa24d54442dac17ee9452ba508aaaf370183dcb065e70b5bb"
+    },
+    {
+      "file": "sonarr-DailyEpisodeParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "DailyEpisodeParserFixture.cs",
+      "sha256": "d4905f0ae688688f2ac94a93b185b25ab878df097de32fc619561d6af0184d9b"
+    },
+    {
+      "file": "sonarr-MiniSeriesEpisodeParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "MiniSeriesEpisodeParserFixture.cs",
+      "sha256": "05b4f8d2f3bb10677672007f210fe0393b4fa97dfdd588837420889cf6c77165"
+    },
+    {
+      "file": "sonarr-MultiEpisodeParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "MultiEpisodeParserFixture.cs",
+      "sha256": "b41c5d11fd2253fd7ca4d06570c41d55e2aa784cde2270aa6f35e1d749f6a24d"
+    },
+    {
+      "file": "sonarr-ParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "ParserFixture.cs",
+      "sha256": "d328af39d16f6e2db57e039c4d51478a5fb549713d2750c540f2910ae8daf26e"
+    },
+    {
+      "file": "sonarr-PathParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "PathParserFixture.cs",
+      "sha256": "3b34877a42f40a98f35d775db8b83b4c62af0590ace2b0b213025640f0b65fb2"
+    },
+    {
+      "file": "sonarr-SeasonParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "SeasonParserFixture.cs",
+      "sha256": "77e91e8e9cd8cea0a5acb31c07867b23059c9e315d324b013513b582ca36e85c"
+    },
+    {
+      "file": "sonarr-SingleEpisodeParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "SingleEpisodeParserFixture.cs",
+      "sha256": "3647e3a3ce3e568f80b933946238e9fae1c5e68723662ac3c819ce60a4a99871"
+    },
+    {
+      "file": "sonarr-UnicodeReleaseParserFixture.cs",
+      "repository": "sonarr",
+      "upstream_file": "UnicodeReleaseParserFixture.cs",
+      "sha256": "60c47dbfcf48692b4608f635335596572814264e142ab4960c32a5cbf0af130d"
+    }
+  ]
+}
