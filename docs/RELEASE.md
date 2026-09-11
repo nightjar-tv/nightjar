@@ -110,6 +110,61 @@ line with the same timestamp, followed by `apt-get source <source package>`,
 fetches the exact source. `scripts/check_notices.py check` fails if this route
 drifts from the `Dockerfile` pins.
 
+### The complete installed-package record
+
+The five packages above are the top-level summary, not the boundary. The image
+also writes a record of every installed binary package to
+`/usr/share/doc/nightjar/debian/installed-packages.txt`. The `Dockerfile`
+builds it with `dpkg-query` after installation and sorts it, so the same pinned
+inputs produce the same record. Each line is tab-separated:
+
+```text
+<binary package> <binary version> <source package> <source version> <architecture>
+```
+
+The image does not duplicate the transitive copyright files. Each installed
+package keeps its Debian copyright file at the standard
+`/usr/share/doc/<binary package>/copyright` path, and native Linux CI checks
+that every package in the record has a readable file there.
+
+### Retrieving the source of any recorded package
+
+The record names the exact source package and source version for every
+installed package, so one route covers all of them. The route uses only the
+pinned snapshots and needs no live mirror:
+
+1. Read the source package and source version from the record line.
+2. Point `deb-src` at both pinned snapshots:
+
+   ```text
+   deb-src http://snapshot.debian.org/archive/debian/20260901T000000Z bookworm main
+   deb-src http://snapshot.debian.org/archive/debian-security/20260901T000000Z bookworm-security main
+   ```
+
+3. Fetch the exact version:
+
+   ```text
+   apt-get -o Acquire::Check-Valid-Until=false update
+   apt-get source <source package>=<source version>
+   ```
+
+4. If `apt-get source` cannot serve the exact version, fetch the matching
+   `.dsc`, `.orig.tar.*` and `.debian.tar.*` files from the archive pool. The
+   main archive serves `pool/main` and the security archive serves
+   `pool/updates/main`:
+
+   ```text
+   snapshot.debian.org/archive/debian/<timestamp>/pool/main/<letter>/<source package>/
+   snapshot.debian.org/archive/debian-security/<timestamp>/pool/updates/main/<letter>/<source package>/
+   ```
+
+   `<letter>` is the first letter of the source package name. `<timestamp>` is
+   the matching pinned timestamp. Fetch only the exact version the record
+   names; a pool directory can hold more than one version.
+
+This procedure is a retrieval route. It is not a license conclusion or a legal
+clearance, and it states no public release.
+
 ## Refreshing a pin
 
 A refresh is an explicit release-maintenance action, not a calendar cadence.

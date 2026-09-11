@@ -77,6 +77,40 @@ SOURCE_MARKERS = (
     "No Nightjar release or tag exists yet",
 )
 
+# The complete installed-package/source record generated inside the image.
+INSTALLED_RECORD_PATH = "/usr/share/doc/nightjar/debian/installed-packages.txt"
+
+# Dockerfile tokens that produce the complete record from dpkg-query.
+DOCKER_RECORD_MARKERS = (
+    "dpkg-query -W -f=",
+    "${db:Status-Status}",
+    "${Package}",
+    "${source:Package}",
+    "${source:Version}",
+    "${Architecture}",
+    INSTALLED_RECORD_PATH,
+    "LC_ALL=C sort",
+)
+
+# CI tokens that validate the record inside the built linux/amd64 image.
+CI_RECORD_MARKERS = (
+    INSTALLED_RECORD_PATH,
+    'test -s "$record"',
+    'LC_ALL=C sort -c "$record"',
+    'grep -q "^$pkg[[:space:]]" "$record"',
+    'test -r "/usr/share/doc/$binary/copyright"',
+)
+
+# Literal strings docs/RELEASE.md must state about the generic record route.
+RECORD_MARKERS = (
+    INSTALLED_RECORD_PATH,
+    "pool/updates/main",
+    "apt-get source <source package>=<source version>",
+    "not a license conclusion or a legal",
+)
+
+CI_FILE = ".github/workflows/ci.yml"
+
 NOTICE_FILES = (
     "NOTICE",
     "notices/README.md",
@@ -208,6 +242,11 @@ def check_tree(root):
     hls_notice = (root / "notices" / "hls.js-1.6.16.txt").read_text(encoding="utf-8")
     release = (root / "docs" / "RELEASE.md").read_text(encoding="utf-8")
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    ci_path = root / CI_FILE
+    require(ci_path.is_file(), f"missing CI workflow: {CI_FILE}")
+    if failures:
+        return failures
+    ci = ci_path.read_text(encoding="utf-8")
 
     for marker in NOTICE_MARKERS:
         require(marker in notice, f"NOTICE does not name: {marker}")
@@ -307,6 +346,22 @@ def check_tree(root):
             f"NOTICE does not record {package} version {version}",
         )
 
+    for marker in DOCKER_RECORD_MARKERS:
+        require(
+            marker in dockerfile,
+            f"Dockerfile does not generate the complete installed-package record: {marker}",
+        )
+    for marker in CI_RECORD_MARKERS:
+        require(
+            marker in ci,
+            f"CI workflow does not validate the complete installed-package record: {marker}",
+        )
+    for marker in RECORD_MARKERS:
+        require(
+            marker in release,
+            f"docs/RELEASE.md does not document the complete record route: {marker}",
+        )
+
     return failures
 
 
@@ -339,7 +394,13 @@ def copy_notice_tree(real, target):
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(real / relative, destination)
-    for relative in ("server/Cargo.lock", "web/package-lock.json", "docs/RELEASE.md", "Dockerfile"):
+    for relative in (
+        "server/Cargo.lock",
+        "web/package-lock.json",
+        "docs/RELEASE.md",
+        "Dockerfile",
+        CI_FILE,
+    ):
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(real / relative, destination)
@@ -403,6 +464,33 @@ def selftest_mutations():
     def change_notice_version(root):
         mutate_text(root / "NOTICE", "7:5.1.9-0+deb12u1", "0:0")
 
+    def drop_record_generation(root):
+        mutate_text(root / "Dockerfile", "RUN dpkg-query -W", "RUN true")
+
+    def drop_ci_record_check(root):
+        mutate_text(root / ".github" / "workflows" / "ci.yml", 'test -s "$record"', "")
+
+    def drop_ci_pinned_membership(root):
+        mutate_text(
+            root / ".github" / "workflows" / "ci.yml",
+            'grep -q "^$pkg[[:space:]]" "$record"',
+            "",
+        )
+
+    def drop_ci_copyright_check(root):
+        mutate_text(
+            root / ".github" / "workflows" / "ci.yml",
+            'test -r "/usr/share/doc/$binary/copyright"',
+            "",
+        )
+
+    def drop_record_doc(root):
+        mutate_text(
+            root / "docs" / "RELEASE.md",
+            INSTALLED_RECORD_PATH,
+            "/usr/share/doc/nightjar/debian/removed.txt",
+        )
+
     return (
         ("drop locked crate from map", drop_locked_crate),
         ("add unlisted locked crate", add_locked_crate),
@@ -413,6 +501,11 @@ def selftest_mutations():
         ("drop Apache text", drop_apache_text),
         ("drop NOTICE marker", drop_notice_marker),
         ("change NOTICE version", change_notice_version),
+        ("drop installed-package record generation", drop_record_generation),
+        ("drop CI record check", drop_ci_record_check),
+        ("drop CI pinned-package membership", drop_ci_pinned_membership),
+        ("drop CI copyright readability check", drop_ci_copyright_check),
+        ("drop record from release doc", drop_record_doc),
     )
 
 
