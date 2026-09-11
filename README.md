@@ -68,9 +68,12 @@ this README does not claim the v1 gates have passed.
 Build and run from source using the instructions above. See the ADR register
 for accepted decisions and their implementation qualifications.
 
-## Contributing
+## Contributing, security and support
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report bugs in GitHub Issues and
+vulnerabilities through the private route in [SECURITY.md](SECURITY.md). Support
+covers official releases only; see [SUPPORT.md](SUPPORT.md). Names and logos are
+governed by [TRADEMARKS.md](TRADEMARKS.md).
 
 ## License
 

@@ -1,5 +1,35 @@
 # Contributing
 
+Anyone may report a bug or suggest a change. Implementation contributions are
+by invitation: ask a maintainer before you write code. We may close an
+unsolicited implementation pull request without reviewing the patch.
+
+This policy governs what this project accepts upstream. It does not limit the
+rights the GPL-3.0-only licence grants you to use, study, modify, redistribute
+or fork the software, or to run it as an independent service.
+
+## Reports and suggestions
+
+Use GitHub Issues for a reproducible bug report or a feature suggestion. We
+triage them against the supported scope (Rule 3.2) and do not promise to merge
+unsolicited code. Report a security issue through the private route in
+[SECURITY.md](SECURITY.md), never a public issue.
+
+## Invited contributions and the DCO
+
+Every invited contribution needs a `Signed-off-by` line. Add it with
+`git commit -s`. The sign-off certifies the
+[Developer Certificate of Origin 1.1](DCO), the standard text at
+<https://developercertificate.org/>: that you created the work or have the right
+to submit it under the project licence. It is not a copyright assignment, and it
+grants no right to relicense your work under proprietary terms. You keep your
+copyright.
+
+The invitation covers the GPL-3.0-only server and embedded web UI. It does not
+cover the proprietary official native clients or the operated Plus service.
+Contributor rights for those components are not settled, and this GPL and DCO
+workflow does not infer them.
+
 Read [ENGINEERING_RULES.md](ENGINEERING_RULES.md) first. It is short, and it is
 the law here: stack, scope, and how AI-assisted contributions are handled.
 

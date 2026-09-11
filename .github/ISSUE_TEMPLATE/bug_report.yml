@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible bug in Nightjar.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security vulnerability here. Use the private route in
+        [SECURITY.md](https://github.com/nightjar-tv/nightjar/blob/main/SECURITY.md).
+
+        Do not paste secrets, tokens or personal data. Redact them from logs.
+        Do not attach copyrighted media. Use a small synthetic file, or one you
+        have the right to share.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest sequence that shows the bug.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The release tag or commit you tested. Current main is unreleased.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste relevant logs with secrets and personal data removed.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: media
+    attributes:
+      label: Media
+      options:
+        - label: Any media I attach is synthetic, or I have the right to share it.
+          required: true
