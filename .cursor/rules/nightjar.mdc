@@ -54,8 +54,10 @@ that reads like a careful senior engineer wrote it.
   it behind the API.
 - Every new capability is expressed in api/openapi.yaml FIRST, then implemented.
   Never hand-write API types in clients; they are generated.
-- Nothing may break single-binary deployment (Rule 1.2): no runtime file
-  dependencies, no sidecar processes, no "just install X first."
+- Nothing may break single-binary deployment (Rule 1.2): the server ships as
+  one executable. FFmpeg/ffprobe and required hardware drivers are documented
+  external dependencies, not part of it. Never require an additional
+  application service or runtime.
 
 ## 2. Dependencies (Rule 4.4)
 

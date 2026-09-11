@@ -17,7 +17,7 @@ This document governs all humans and LLMs contributing to this project. When in 
 | Distribution | Single static binary; Docker as primary channel | No installers, no bundled runtimes |
 
 **Rule 1.1** — Adding any new language, framework, database, or service dependency requires an ADR and unanimous approval. Default answer: no.
-**Rule 1.2** — The server ships as ONE binary. Any change that breaks single-binary deployment is rejected.
+**Rule 1.2** — The server ships as ONE binary: server, scanner, and embedded web UI. FFmpeg/ffprobe and required hardware drivers are external dependencies, not part of that executable. Any change that breaks single-binary deployment is rejected.
 
 ## 2. Architecture Rules
 
@@ -29,7 +29,7 @@ This document governs all humans and LLMs contributing to this project. When in 
 
 ## 3. Scope Rules (v1 lock)
 
-**IN scope:** library scan, metadata (TMDB/TVDB), direct play, remux, hardware transcode, HLS, multi-user auth, watch state/resume, text subtitles (embedded and sidecar, served as WebVTT), image-subtitle burn-in, web UI, Android/Android TV, iOS, tvOS subject to the timeboxed spike and go/no-go in ADR-0001, Tizen/webOS web wrappers.
+**IN scope:** library scan, metadata (TMDB/TVDB; TVDB unresolved and evidence-gated per ADR-0031 §7), direct play, remux, hardware transcode, HLS, multi-user auth, watch state/resume, text subtitles (embedded and sidecar, served as WebVTT), image-subtitle burn-in, web UI, Android/Android TV, iOS, tvOS subject to the timeboxed spike and go/no-go in ADR-0001, Tizen/webOS web wrappers.
 
 **OUT of scope for v1 — auto-reject any PR, issue, or suggestion containing:** Live TV, DVR, plugins/extension system, music/photo libraries, federation/multi-server, cloud sync, social features, recommendations/ML, themes beyond light/dark, restyling image subtitles.
 
