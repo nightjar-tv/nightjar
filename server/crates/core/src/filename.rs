@@ -1680,6 +1680,18 @@ fn merged_absolute(base: &ParsedName, above: &ParsedName, season: Option<i32>) -
 /// and `tv.episodetitle` (5,844), which read 0.0% correct.
 pub fn parse_filename_in(file_name: &str, ctx: FolderContext<'_>) -> ParsedName {
     let mut parsed = parse_filename(file_name);
+    if parsed.kind != MediaKind::Episode
+        && let (Some(folder), Some(season)) = (ctx.folder_title, ctx.season)
+        && let Some(episode) = leading_episode_word(strip_extension(file_name))
+    {
+        parsed.title = folder.trim().to_string();
+        parsed.kind = MediaKind::Episode;
+        parsed.season = Some(season);
+        parsed.episode = Some(episode);
+        parsed.episode_end = None;
+        parsed.episode_absolute = false;
+        return parsed;
+    }
     if parsed.title.is_empty()
         && let Some(folder) = ctx.folder_title
     {
@@ -1857,6 +1869,33 @@ pub fn leading_episode_number(stem: &str) -> Option<i32> {
         return None;
     }
     stem[..n].parse::<i32>().ok().filter(|e| *e >= 1)
+}
+
+fn leading_episode_word(stem: &str) -> Option<i32> {
+    let lower = stem.to_ascii_lowercase();
+    let rest = lower.strip_prefix("episode")?;
+    if !rest
+        .as_bytes()
+        .first()
+        .is_some_and(|b| matches!(b, b' ' | b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=5).contains(&digits) {
+        return None;
+    }
+    let end = 1 + digits;
+    if rest.as_bytes().get(end).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    if !rest[end..].starts_with(" - ") {
+        return None;
+    }
+    rest[1..end]
+        .parse::<i32>()
+        .ok()
+        .filter(|episode| *episode > 0)
 }
 
 /// Parse a media filename (not a full path) into title / kind / episode fields.
@@ -5580,6 +5619,35 @@ mod tests {
         assert_eq!(p.kind, MediaKind::Movie);
         assert_eq!(p.year, Some(2021));
         assert!(p.title.starts_with("Another Movie"));
+    }
+
+    #[test]
+    fn parser_regressions_for_folder_context() {
+        let lantern = parse_filename_in(
+            "Episode 05 - Quiet Voltage.mkv",
+            FolderContext {
+                folder_title: Some("Lantern District"),
+                season: Some(2),
+            },
+        );
+        assert_eq!(lantern.title, "Lantern District");
+        assert_eq!(lantern.kind, MediaKind::Episode);
+        assert_eq!(lantern.season, Some(2));
+        assert_eq!(lantern.episode, Some(5));
+    }
+
+    #[test]
+    fn explicit_episode_markers_remain_unchanged() {
+        let circuit = parse_filename("North Circuit 2x03.mkv");
+        assert_eq!(
+            (circuit.kind, circuit.season, circuit.episode),
+            (MediaKind::Episode, Some(2), Some(3))
+        );
+        let marked = parse_filename("S01E02--.mkv");
+        assert_eq!(
+            (marked.kind, marked.season, marked.episode),
+            (MediaKind::Episode, Some(1), Some(2))
+        );
     }
 }
 
