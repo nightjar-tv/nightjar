@@ -2,6 +2,8 @@
 
 - Status: accepted
 - Date: 2026-08-06
+- Amended: 2026-09-12 — the wire shape and write semantics item 6 left open are
+  recorded in the amendment at the end. The implementation matches it.
 - Accepted: 2026-08-06, once ADR-0039 and ADR-0040 were accepted. ADR-0039
   supplies the series entity and the `series_key` item 8 rolls up over; ADR-0040
   supplies the role model item 7's ownership rule reads. Sign-off for both:
@@ -234,3 +236,41 @@ write path will see `media_items` and wonder.
   rail's visual design are Block 3.
 - Whether the rail hides a series whose next episode is not yet downloaded is a
   Block 3 presentation question and does not change this table.
+
+---
+
+## Amendment 2026-09-12 — the wire shape and write semantics
+
+Item 6 fixes the route and puts the key in the query. It does not say what the
+request and response carry, and Rules 4.9 and 6.1 need that shape before the
+writer exists. This amendment records it. It adds no route and changes no
+earlier item.
+
+1. **The PUT request is exactly `{positionMs, durationMs}`, and both are
+   required.** `played` is server-derived. `hidden` stays reserved for the
+   later rollup block and is not writable here. A client timestamp is not
+   accepted, because item 3 makes the server clock authoritative.
+
+2. **GET and PUT share the envelope `{state: WatchState|null}`.** `WatchState`
+   carries `itemKey`, `positionMs`, `durationMs`, `played`, `hidden`,
+   `firstPlayedAt`, and `lastPlayedAt`.
+
+3. **A valid report below 2% removes any existing state.** A report at or above
+   2% keeps a resume point. At or above 90% the item is played. An update from
+   a played item to below 90% clears `played`, which is the rewatch case. Every
+   qualifying write overwrites the row, so a later lower position wins over an
+   earlier higher one. Highest-position-wins stays rejected per item 3.
+
+4. **Zero duration, a negative position, and a position greater than duration
+   are refused with the typed validation response at HTTP 422.** The request is
+   well formed and its values are not. The error carries the code
+   `validation_error`.
+
+5. **`firstPlayedAt` is the server time of the first qualifying write at or
+   above 2%, and it is preserved.** `lastPlayedAt` is the server time of every
+   qualifying write.
+
+6. **`itemKey` resolves through the current effective identity layer before a
+   write is accepted.** The API treats it as opaque and does not parse it. A key
+   that does not resolve returns the typed not-found response at HTTP 404, so
+   no orphan state is created.

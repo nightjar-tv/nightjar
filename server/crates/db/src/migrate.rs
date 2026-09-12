@@ -74,6 +74,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         25,
         include_str!("../migrations/025_accounts_username_case_insensitive.sql"),
     ),
+    (26, include_str!("../migrations/026_watch_state.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -362,7 +363,26 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 25);
+        assert_eq!(v, 26);
+        // 026 (ADR-0035 item 1): the table, its primary key and the recent
+        // index exist, and the two boolean columns reject a value outside 0/1.
+        let has_watch_state: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'watch_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_watch_state, 1);
+        let has_watch_state_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_watch_state_recent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_watch_state_index, 1);
         let has_series: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series'",
@@ -1893,11 +1913,15 @@ mod tests {
     }
 
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks.
+    /// way a real install upgrading into it looks. Migration 26 and its table
+    /// are removed with it, so `migrate` sees a database at version 24 and
+    /// applies both in order.
     fn rewind_to_24(conn: &Connection) {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_accounts_username_nocase;
-             DELETE FROM schema_migrations WHERE version = 25;",
+             DROP INDEX IF EXISTS idx_watch_state_recent;
+             DROP TABLE IF EXISTS watch_state;
+             DELETE FROM schema_migrations WHERE version IN (25, 26);",
         )
         .unwrap();
     }
@@ -1963,5 +1987,86 @@ mod tests {
                  VALUES ('ROOT', 'h', 'member');",
         );
         assert!(dup.is_err(), "the new index must refuse a case-variant");
+    }
+
+    /// 026 (ADR-0035 item 1). An install that already holds accounts and
+    /// profiles upgrades in place: the table arrives empty, `(profile_id,
+    /// item_key)` is the primary key, the boolean flags are closed, and
+    /// deleting a profile takes its watch state with it.
+    #[test]
+    fn migration_26_adds_watch_state_and_cascades_on_profile_delete() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS.iter().take(25) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (1, 'a', 'x', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+                 VALUES (1, 1, 'aa', 'P');
+             INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+                 VALUES (1, 'a.mkv', 1, 1, 'A', 'movie');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            count(&conn, "watch_state"),
+            0,
+            "the new table arrives empty"
+        );
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute(
+            "INSERT INTO watch_state
+                (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                 first_played_at, last_played_at)
+             VALUES (1, 'path:1:a.mkv', 1000, 10000, 0, 0,
+                     '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "INSERT INTO watch_state
+                (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                 first_played_at, last_played_at)
+             VALUES (1, 'path:1:a.mkv', 2000, 10000, 0, 0,
+                     '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z')",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "(profile_id, item_key) is the primary key"
+        );
+        let bad_played = conn.execute(
+            "INSERT INTO watch_state
+                (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                 first_played_at, last_played_at)
+             VALUES (1, 'path:1:b.mkv', 2000, 10000, 2, 0,
+                     '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z')",
+            [],
+        );
+        assert!(bad_played.is_err(), "played is a 0/1 flag");
+
+        conn.execute("DELETE FROM profiles WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            count(&conn, "watch_state"),
+            0,
+            "profile deletion takes its watch state"
+        );
     }
 }

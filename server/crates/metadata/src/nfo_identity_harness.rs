@@ -702,18 +702,11 @@ fn nfo_07_absent_body_is_not_identity_evidence() {
 
 // --- NFO-08: malformed, corrected, manual-assign ----------------------------
 
-fn create_watch_tables(conn: &Connection) {
+// `watch_state` now comes from migration 026 (ADR-0035). Only the
+// playback-events table is still test-local, because ADR-0036 is unbuilt.
+fn create_playback_events_table(conn: &Connection) {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS watch_state (
-            profile_id INTEGER NOT NULL,
-            item_key TEXT NOT NULL,
-            position_ms INTEGER NOT NULL,
-            duration_ms INTEGER,
-            played INTEGER NOT NULL DEFAULT 0,
-            last_played_at TEXT NOT NULL,
-            PRIMARY KEY (profile_id, item_key)
-         );
-         CREATE TABLE IF NOT EXISTS playback_events (
+        "CREATE TABLE IF NOT EXISTS playback_events (
             profile_id INTEGER NOT NULL,
             item_key TEXT NOT NULL,
             played_at TEXT NOT NULL,
@@ -722,13 +715,16 @@ fn create_watch_tables(conn: &Connection) {
             PRIMARY KEY (profile_id, item_key, played_at)
          );",
     )
-    .expect("create watch tables");
+    .expect("create playback_events");
 }
 
 fn seed_watch_rows(conn: &Connection, old_key: &str) {
     conn.execute(
-        "INSERT INTO watch_state (profile_id, item_key, position_ms, duration_ms, played, last_played_at)
-         VALUES (1, ?1, 3412000, 6100000, 1, '2026-01-05T21:14:00Z')",
+        "INSERT INTO watch_state
+            (profile_id, item_key, position_ms, duration_ms, played, hidden,
+             first_played_at, last_played_at)
+         VALUES (1, ?1, 3412000, 6100000, 1, 0,
+                 '2026-01-05T21:14:00Z', '2026-01-05T21:14:00Z')",
         rusqlite::params![old_key],
     )
     .expect("seed watch_state");
@@ -772,7 +768,16 @@ fn seed_nfo08(conn: &Connection, lib: &Path) -> (i64, String) {
         Some("xml/NFO-08/initial-malformed.nfo"),
     );
     let old_key = path_item_key(1, &case_media_path("NFO-08"));
-    create_watch_tables(conn);
+    // Watch state belongs to a profile (ADR-0035). The migrations create the
+    // table; this fixture owns the profile it points at.
+    conn.execute_batch(
+        "INSERT INTO accounts (id, username, password_hash, role)
+             VALUES (1, 'nfo08', 'x', 'owner');
+         INSERT INTO profiles (id, account_id, profile_ref, name)
+             VALUES (1, 1, 'nfo08profile', 'NFO-08');",
+    )
+    .expect("seed watch-state profile");
+    create_playback_events_table(conn);
     seed_watch_rows(conn, &old_key);
     (item, old_key)
 }

@@ -22,6 +22,7 @@ mod raw_payload;
 mod resolve;
 mod series_bindings;
 mod tmdb;
+mod watch_state;
 
 #[cfg(test)]
 #[path = "nfo_identity_harness.rs"]
@@ -51,7 +52,7 @@ pub use fix::{
 pub use item_detail::{ItemArtwork, ItemMetadata, item_metadata};
 pub use item_links::{
     clear_all_links_for_media_item, effective_item_key, effective_item_keys_for_library,
-    link_keys_for_item, path_item_key, replace_auto_link, replace_auto_links,
+    item_key_resolves, link_keys_for_item, path_item_key, replace_auto_link, replace_auto_links,
     series_key_for_show_folder, set_manually_matched, upsert_link,
 };
 pub use match_score::{
@@ -97,3 +98,4 @@ pub use tmdb::{
     TmdbStub, embedded_application_key, map_episodes_from_season, map_movie_detail, map_tv_detail,
     resolve_credentials, resolve_credentials_with,
 };
+pub use watch_state::{WatchError, WatchWriteOutcome, read_watch_state, write_watch_report};

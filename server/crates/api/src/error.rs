@@ -1,9 +1,10 @@
 use axum::{
     Json,
+    extract::{FromRequest, Request, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 #[derive(Serialize)]
 pub struct ErrorBody {
@@ -58,6 +59,17 @@ impl ApiError {
         }
     }
 
+    /// The request parsed and its values are not usable (ADR-0035 amendment
+    /// item 4). Distinct from [`Self::bad_request`], which is a request the
+    /// server could not read at all.
+    pub fn unprocessable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: msg.into(),
+            code: "validation_error",
+        }
+    }
+
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -89,6 +101,62 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// A JSON request body whose refusals answer in the repository's error shape.
+///
+/// Axum's [`Json`] rejection writes a plain-text body, so a client that
+/// branches on `code` (Rule 4.11) cannot tell a malformed body from a missing
+/// content type. This keeps axum's status for each case — 400 for a syntax
+/// error, 415 for a missing JSON content type, 422 for a body that parsed but
+/// does not match the target shape — and maps the message to [`ErrorBody`].
+pub struct TypedJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for TypedJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<serde_json::Value>::from_request(req, state)
+            .await
+            .map_err(typed_json_rejection)?;
+        // serde accepts a struct as a JSON array in field order, which is a
+        // shape this API never means. A body is an object or it is refused.
+        if !value.is_object() {
+            return Err(ApiError::unprocessable(
+                "request body must be a JSON object",
+            ));
+        }
+        let body = serde_json::from_value(value).map_err(|error| {
+            ApiError::unprocessable(format!(
+                "Failed to deserialize the JSON body into the target type: {error}"
+            ))
+        })?;
+        Ok(TypedJson(body))
+    }
+}
+
+/// Map a [`JsonRejection`] to the typed error body, keeping its status.
+fn typed_json_rejection(rejection: JsonRejection) -> ApiError {
+    match &rejection {
+        JsonRejection::MissingJsonContentType(_) => ApiError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: rejection.body_text(),
+            code: "unsupported_media_type",
+        },
+        JsonRejection::JsonDataError(_) => ApiError::unprocessable(rejection.body_text()),
+        JsonRejection::JsonSyntaxError(_) => ApiError::bad_request(rejection.body_text()),
+        // A body that could not be read at all: keep axum's status and call it
+        // a bad request, because the client can only fix the bytes it sent.
+        _ => ApiError {
+            status: rejection.status(),
+            message: rejection.body_text(),
+            code: "bad_request",
+        },
+    }
+}
 
 /// Run handler work that blocks — SQLite, the filesystem, or an ffprobe child
 /// — off the async runtime.

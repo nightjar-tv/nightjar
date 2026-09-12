@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, HashMap};
 use nightjar_db::{resolve_media_path, show_folder_relpath};
 
 use crate::item_links::{
-    EPISODE_KEY_PREFIX, FOLDER_KEY_PREFIX, MOVIE_KEY_PREFIX, PATH_KEY_PREFIX, SHOW_KEY_PREFIX,
-    effective_item_keys_for_library, series_key_for_show_folder,
+    EPISODE_KEY_PREFIX, FOLDER_KEY_PREFIX, MOVIE_KEY_PREFIX, PathKeyError, SHOW_KEY_PREFIX,
+    effective_item_keys_for_library, parse_path_key, series_key_for_show_folder,
 };
 use crate::model::ArtworkKind;
 
@@ -639,11 +639,23 @@ fn resolve_series_key(conn: &Connection, series_key: &str) -> Result<SeriesScope
         }
         return Ok(SeriesScope::Movie { libraries });
     }
-    if let Some(rest) = series_key.strip_prefix(PATH_KEY_PREFIX) {
-        let (library_id, _) = split_library_id(rest, series_key)?;
-        return Ok(SeriesScope::Movie {
-            libraries: vec![library_id],
-        });
+    match parse_path_key(series_key) {
+        Ok((library_id, _)) => {
+            return Ok(SeriesScope::Movie {
+                libraries: vec![library_id],
+            });
+        }
+        Err(PathKeyError::MissingLibraryId) => {
+            return Err(format!("series key has no library id: {series_key}"));
+        }
+        Err(PathKeyError::NonNumericLibraryId) => {
+            return Err(format!(
+                "series key has a non-numeric library id: {series_key}"
+            ));
+        }
+        // Not a path key: fall through to the same final refusal it always
+        // got, so this branch changes no accepted key.
+        Err(PathKeyError::NotAPathKey) => {}
     }
     Err(format!("not a series key: {series_key}"))
 }

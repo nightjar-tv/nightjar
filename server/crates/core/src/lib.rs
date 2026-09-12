@@ -5,6 +5,7 @@ mod models;
 mod playback;
 mod scan_progress;
 mod track_select;
+mod watch;
 
 pub use filename::{
     FolderContext, MAX_EPISODE_RANGE, ParsedName, leading_episode_number, parse_filename,
@@ -25,6 +26,7 @@ pub use track_select::{
     DEFAULT_PREFERENCE_LANGUAGE, TrackCandidate, TrackSelection, select_audio_track,
     select_subtitle_track, title_looks_forced, title_looks_sdh,
 };
+pub use watch::{PLAYED_AT_PERCENT, RESUME_FLOOR_PERCENT, WatchReport, watch_report};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
