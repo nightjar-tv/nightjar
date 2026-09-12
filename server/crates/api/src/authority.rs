@@ -6,13 +6,14 @@
 
 use crate::error::ApiError;
 use crate::state::AppState;
-use axum::extract::{FromRequestParts, OptionalFromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, RawPathParams, Request, State};
 use axum::http::{Method, request::Parts};
 use axum::middleware::Next;
 use axum::response::Response;
 use nightjar_auth::token_sha256_hex;
 use nightjar_core::Role;
 use nightjar_db::{SessionRejection, SessionRow};
+use nightjar_transcode::SessionOwner;
 
 /// The whole unauthenticated surface of the API (ADR-0034 item 11).
 ///
@@ -190,6 +191,72 @@ impl Caller {
     pub fn may_act_on_account(&self, account_id: i64) -> bool {
         self.session.account_id == account_id || self.has_account_powers()
     }
+
+    /// The playback-session ownership identity (ADR-0034 item 8): the account
+    /// plus the selected profile, and nothing else.
+    ///
+    /// Account scope has no profile, so its key can never equal a session's:
+    /// a session is always created from a profile-scope caller. The key is
+    /// built from the resolved session row, never from a query field, a role,
+    /// or the credential text.
+    pub fn session_owner(&self) -> SessionOwner {
+        SessionOwner::new(format!(
+            "{}:{}",
+            self.session.account_id,
+            self.session.active_profile_id.unwrap_or_default()
+        ))
+    }
+}
+
+/// The one ownership boundary for playback sessions (ADR-0034 item 8).
+///
+/// Every session-scoped route carries a `{session_id}` path parameter, so this
+/// layer runs on all routes and enforces only where that parameter exists.
+/// That is deliberate: a route added under the session namespace is covered
+/// because nobody did anything, which is the direction the default has to
+/// point (the same reason [`require_session`] wraps the whole router).
+///
+/// A caller who is not the owner gets exactly the missing-session 404, before
+/// the handler can touch last-access, readiness, or session state. The owner
+/// keeps the handler's current behaviour.
+///
+/// Applied *inside* [`require_session`] so the resolved caller is already in
+/// the request extensions.
+pub async fn require_session_owner(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let (mut parts, body) = request.into_parts();
+    // `RawPathParams` is populated by routing for every matched route. An
+    // error here means the route has no parameter set to read, so it is not a
+    // session resource and this layer has nothing to decide.
+    let session_id = RawPathParams::from_request_parts(&mut parts, &state)
+        .await
+        .ok()
+        .and_then(|params| {
+            params
+                .iter()
+                .find(|(key, _)| *key == "session_id")
+                .map(|(_, value)| value.to_string())
+        });
+    let Some(session_id) = session_id else {
+        return Ok(next.run(Request::from_parts(parts, body)).await);
+    };
+    let Some(caller) = parts.extensions.get::<Caller>() else {
+        // `require_session` runs first and resolves the caller. Arriving here
+        // without one is a wiring bug, and it fails closed rather than
+        // serving a session to nobody.
+        return Err(ApiError::unauthorized(
+            "no_credential: no session presented",
+        ));
+    };
+    if !state.hls.is_owned_by(&session_id, &caller.session_owner()) {
+        return Err(ApiError::not_found(format!(
+            "session {session_id} not found"
+        )));
+    }
+    Ok(next.run(Request::from_parts(parts, body)).await)
 }
 
 fn rejection_error(rejection: SessionRejection) -> ApiError {
@@ -273,7 +340,21 @@ pub const SESSION_COOKIE: &str = "nj_session";
 pub struct AdminCaller;
 
 /// A caller who has selected a profile (ADR-0034 item 3), same reasoning.
-pub struct WatchingCaller;
+///
+/// It carries the ownership identity resolved at extraction. That is the
+/// "watching identity" the profile-scope gate used to discard: a session is
+/// bound to it at create (ADR-0034 item 8), so the value has to survive the
+/// extraction rather than be looked up a second time.
+#[derive(Debug, Clone)]
+pub struct WatchingCaller {
+    owner: SessionOwner,
+}
+
+impl WatchingCaller {
+    pub fn owner(&self) -> &SessionOwner {
+        &self.owner
+    }
+}
 
 impl FromRequestParts<AppState> for AdminCaller {
     type Rejection = ApiError;
@@ -299,7 +380,9 @@ impl FromRequestParts<AppState> for WatchingCaller {
         let caller =
             <Caller as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
         caller.require_profile_scope()?;
-        Ok(Self)
+        Ok(Self {
+            owner: caller.session_owner(),
+        })
     }
 }
 

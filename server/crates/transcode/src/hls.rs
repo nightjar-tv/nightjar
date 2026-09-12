@@ -305,6 +305,21 @@ impl AudioSelection {
     }
 }
 
+/// Opaque playback-session ownership identity (ADR-0034 item 8).
+///
+/// A session belongs to the account and profile that created it. The registry
+/// never parses this value and never puts it on the wire; it only compares it
+/// for equality. The API builds it from the authenticated caller, so the
+/// identity cannot come from a query field or a token's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOwner(String);
+
+impl SessionOwner {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 pub struct HlsSessionRegistry {
     root: PathBuf,
     /// Explicit operator escape hatch. Normal admission has no configured cap
@@ -368,6 +383,10 @@ pub struct HlsSubtitleTrack {
 
 struct Session {
     item_id: i64,
+    /// Who created this session (ADR-0034 item 8). Set once at create and
+    /// never changed: a seek restarts the encoder in place, it does not
+    /// transfer the session.
+    owner: SessionOwner,
     src: PathBuf,
     dir: PathBuf,
     /// On-disk budget for this session's run dirs (ADR-0020 §12). A field
@@ -1530,6 +1549,7 @@ impl HlsSessionRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
+        owner: SessionOwner,
         item_id: i64,
         src: &Path,
         start_ms: u64,
@@ -1722,6 +1742,7 @@ impl HlsSessionRegistry {
             id.clone(),
             Session {
                 item_id,
+                owner,
                 src: src.to_path_buf(),
                 dir: dir.clone(),
                 // One session budget is shared by every rung directory; it
@@ -1789,6 +1810,20 @@ impl HlsSessionRegistry {
             .ok()?
             .get(session_id)
             .map(|s| s.item_id)
+    }
+
+    /// Whether `owner` created `session_id` (ADR-0034 item 8).
+    ///
+    /// A missing session and another caller's session answer `false`, so a
+    /// caller cannot tell the two apart. This reads no session state and does
+    /// not touch `last_access`: the ownership boundary runs before any
+    /// operation, so an unauthorized request must not look like activity.
+    pub fn is_owned_by(&self, session_id: &str, owner: &SessionOwner) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(session_id).map(|s| &s.owner == owner))
+            .unwrap_or(false)
     }
 
     pub fn encoder(&self, session_id: &str) -> Option<SessionEncoder> {
@@ -4741,6 +4776,7 @@ mod tests {
     fn make_test_session(dir: &Path) -> Session {
         Session {
             item_id: 1,
+            owner: SessionOwner::new("test"),
             src: PathBuf::from("/dev/null"),
             dir: dir.to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -4774,6 +4810,39 @@ mod tests {
             db: None,
             map_build_in_flight: None,
         }
+    }
+
+    /// `is_owned_by` answers for the creating owner and nobody else, and a
+    /// missing session is indistinguishable from someone else's.
+    ///
+    /// The API maps a false to the same 404 as a missing session, so this
+    /// primitive is the whole confidentiality property: a different owner and
+    /// an absent session must both be false, never a distinguishable error.
+    #[test]
+    fn is_owned_by_matches_only_the_creator() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 1, "libx264", None, None).unwrap();
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), make_test_session(dir.path()));
+
+        let owner = SessionOwner::new("test");
+        let other = SessionOwner::new("somebody-else");
+
+        assert!(
+            reg.is_owned_by("s1", &owner),
+            "the creator owns the session"
+        );
+        assert!(
+            !reg.is_owned_by("s1", &other),
+            "another owner must not match"
+        );
+        assert!(
+            !reg.is_owned_by("s2", &owner),
+            "a missing session must not match the owner"
+        );
     }
 
     /// A run advanced on one rung leaves every other rung's encoder alone.
@@ -8120,6 +8189,7 @@ mod tests {
         let play_ms = 2_538_000u64;
         let mut session = Session {
             item_id: 1,
+            owner: SessionOwner::new("test"),
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -8290,6 +8360,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -8335,6 +8406,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 play_ms,
@@ -8381,6 +8453,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -8482,6 +8555,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -8547,6 +8621,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -8616,6 +8691,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -8720,6 +8796,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 20_000,
@@ -8792,6 +8869,7 @@ mod tests {
 
         let prior = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -8809,6 +8887,7 @@ mod tests {
 
         let switched = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 play_ms,
@@ -8922,6 +9001,7 @@ mod tests {
         // call; the client tears the prior session down after cutover.
         let switched = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 40_000,
@@ -8996,6 +9076,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 play_ms,
@@ -9036,6 +9117,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -9150,6 +9232,7 @@ mod tests {
         // Short window: we only need first video seg + first subtitle slice.
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &corpus,
                 0,
@@ -9295,6 +9378,7 @@ mod tests {
             .unwrap();
             let id = reg
                 .start(
+                    SessionOwner::new("test"),
                     1,
                     &corpus,
                     0,
@@ -9402,6 +9486,7 @@ mod tests {
                 .unwrap();
                 let id = reg
                     .start(
+                        SessionOwner::new("test"),
                         1,
                         &corpus,
                         0,
@@ -9477,6 +9562,7 @@ mod tests {
         .unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -9526,6 +9612,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let a = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -9541,6 +9628,7 @@ mod tests {
             .unwrap();
         let b = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -9557,6 +9645,7 @@ mod tests {
         assert_ne!(a, b);
         assert!(matches!(
             reg.start(
+                SessionOwner::new("test"),
                 2,
                 &src,
                 0,
@@ -9593,6 +9682,7 @@ mod tests {
                 .unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -9634,6 +9724,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -9938,6 +10029,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -10407,6 +10499,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &corpus,
                 0,
@@ -10462,6 +10555,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -10544,6 +10638,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &corpus,
                 0,
@@ -10585,6 +10680,7 @@ mod tests {
         });
         let session = Session {
             item_id: 33,
+            owner: SessionOwner::new("test"),
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -10662,6 +10758,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 2, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -10837,6 +10934,7 @@ mod tests {
         fs::create_dir_all(&run0).unwrap();
         let mut session = Session {
             item_id: 8519,
+            owner: SessionOwner::new("test"),
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -10892,6 +10990,7 @@ mod tests {
     fn eof_test_session(dir: &Path, duration_ms: u64) -> Session {
         Session {
             item_id: 8519,
+            owner: SessionOwner::new("test"),
             src: PathBuf::from("/dev/null"),
             dir: dir.to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -11007,6 +11106,7 @@ mod tests {
 
         let mut session = Session {
             item_id: 1,
+            owner: SessionOwner::new("test"),
             src: PathBuf::from("/dev/null"),
             dir: session_dir.to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -11378,6 +11478,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -11430,6 +11531,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 8000,
@@ -11477,6 +11579,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 4000,
@@ -11514,6 +11617,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -11569,6 +11673,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -11613,6 +11718,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -11656,6 +11762,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -11702,6 +11809,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -11771,6 +11879,7 @@ mod tests {
 
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -11866,6 +11975,7 @@ mod tests {
 
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 8000,
@@ -11928,6 +12038,7 @@ mod tests {
 
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 8000,
@@ -11991,6 +12102,7 @@ mod tests {
 
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 8000,
@@ -12094,6 +12206,7 @@ mod tests {
 
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 2000,
@@ -12153,6 +12266,7 @@ mod tests {
         let before = Instant::now();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 2000,
@@ -12214,6 +12328,7 @@ mod tests {
         let before = Instant::now();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 0,
@@ -12267,6 +12382,7 @@ mod tests {
                 .unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 &src,
                 6000,
@@ -12387,6 +12503,7 @@ mod tests {
             HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "copy", None, None).unwrap();
         let id = reg
             .start(
+                SessionOwner::new("test"),
                 1,
                 src,
                 request_ms,
