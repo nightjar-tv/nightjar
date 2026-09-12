@@ -72,6 +72,7 @@ not here — this page is the reference, not the tour.
 | [0054](0054-full-title-playlist-for-transcode.md) | The transcode playlist lists the whole title | **Proposed** (decisions 1, 2 and 3 corrected 2026-08-31 by measurement; **decision 4 overturned** the same day — init is not identical across runs — which bounds decision 5; **decision 5 settled and shipped** in `#189`; decision 3's latency citation corrected and its trigger consequence named by [0055](0055-a-far-scrub-is-a-segment-miss.md)) | [0020](0020-copy-mode-segment-boundaries.md) §4 **in every mode**, and its miss policy | — |
 | [0055](0055-a-far-scrub-is-a-segment-miss.md) | A far scrub is a segment miss, not a POST | **Proposed** | — | — |
 | [0056](0056-reproducible-release-input-manifest.md) | A reproducible release input manifest | **Accepted** (2026-09-11) | — | — |
+| [0057](0057-no-tvdb-api-in-v1.md) | No TheTVDB API integration in v1 | **Accepted** (2026-09-12) | — | — |
 
 ## Why the numbers jump from 0043 to 0046
 

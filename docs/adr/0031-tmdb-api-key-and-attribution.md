@@ -238,6 +238,16 @@ If TVDB stays: its licensing and attribution model differ. Its terms have
 + override + attribution surfaces) applies. Open until a separate ADR or
 an amendment here after the terms are read.
 
+> **Amendment 2026-09-12: TVDB is not in v1.** The question above is
+> decided by [ADR-0057](0057-no-tvdb-api-in-v1.md). Nightjar makes no
+> TheTVDB API calls in v1; TMDB is the sole network metadata provider.
+> Existing TVDB identifiers parsed from NFO or TMDB metadata remain
+> canonical external identifiers and may be sent to TMDB `/find`, which
+> is not TheTVDB API use. The 50-show sample this section named was not
+> run; a full-library census answered the question instead. The two
+> paragraphs above are preserved as written. This amendment records the
+> decision and does not rewrite the original rationale.
+
 ## Alternatives considered
 
 **Require every operator to bring a TMDB key; no embedded key.** Rejected:
@@ -283,8 +293,9 @@ credential home (ADR-0026 §5); tokens are not browse data.
   (§1); cadence and staggering are decided there, not here.
 - Termination purge capability is **post-v1** (§6); provenance for it
   rides the refresh strategy, not ADR-0029 reopen.
-- TVDB: run or skip the 50-show TMDB coverage sample before investing in
-  a TVDB terms read (§7).
+- TVDB: the full-library census replaced the 50-show TMDB coverage sample
+  (§7); [ADR-0057](0057-no-tvdb-api-in-v1.md) closes the question. No TVDB
+  terms read is needed for v1.
 - **Constitution hygiene (separate act):** Continuity's standing review
   rules 4.10–4.12 are not in `ENGINEERING_RULES.md`. Either amend the
   constitution at the next Rule 6.3 gate read-through (unanimous approval
