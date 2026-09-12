@@ -16,7 +16,9 @@
 //! are listed separately rather than guessed into a season.
 
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use nightjar_db::{resolve_media_path, show_folder_relpath};
 
@@ -25,6 +27,24 @@ use crate::item_links::{
     effective_item_keys_for_library, parse_path_key, series_key_for_show_folder,
 };
 use crate::model::ArtworkKind;
+
+// Test-only count of library reads, so a regression test can prove a request
+// reads each library once rather than once per series. Thread-local keeps
+// parallel tests from seeing one another's reads.
+#[cfg(test)]
+thread_local! {
+    static LIBRARY_VIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_library_views() {
+    LIBRARY_VIEWS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn library_views_built() -> usize {
+    LIBRARY_VIEWS.with(std::cell::Cell::get)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
@@ -149,6 +169,7 @@ struct Library {
 }
 
 /// One media row joined to the canonical episode it is linked to, if any.
+#[derive(Clone)]
 struct ItemRow {
     id: i64,
     path: String,
@@ -349,6 +370,120 @@ fn series_units(conn: &Connection, library: &Library) -> Result<LibraryUnits, St
     })
 }
 
+/// One library's identity and item rows, read once and reused.
+struct LibraryView {
+    library: Library,
+    keys: HashMap<i64, String>,
+    items: Vec<ItemRow>,
+    /// Item indices by show folder, so a series lookup touches only its rows
+    /// instead of filtering the whole library once per series.
+    by_folder: HashMap<String, Vec<usize>>,
+    /// Item indices by effective item key, the movie-side index.
+    by_key: HashMap<String, Vec<usize>>,
+}
+
+/// Request-local reads shared across many series lookups in one call.
+///
+/// A rail request resolves many series at once. Without this, every series
+/// re-reads each library it touches and the work multiplies by the series
+/// count. The cache lives for one call and is dropped with it: nothing is
+/// persisted and nothing crosses requests (ADR-0035 item 8).
+#[derive(Default)]
+pub struct SeriesCache {
+    libraries: HashMap<i64, Option<Rc<LibraryView>>>,
+    bindings: HashMap<(i64, String), Rc<Vec<crate::series_bindings::SeriesBinding>>>,
+    show_meta: HashMap<i64, Option<Rc<ShowMeta>>>,
+    movie_meta: HashMap<String, Option<Rc<ShowMeta>>>,
+}
+
+impl SeriesCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The library's view, built once per library per request.
+    fn view(
+        &mut self,
+        conn: &Connection,
+        library_id: i64,
+    ) -> Result<Option<Rc<LibraryView>>, String> {
+        if let Entry::Vacant(entry) = self.libraries.entry(library_id) {
+            entry.insert(library_view(conn, library_id)?);
+        }
+        Ok(self.libraries.get(&library_id).cloned().flatten())
+    }
+
+    fn bindings_for(
+        &mut self,
+        conn: &Connection,
+        library_id: i64,
+        folder: &str,
+    ) -> Result<Rc<Vec<crate::series_bindings::SeriesBinding>>, String> {
+        let key = (library_id, folder.to_string());
+        if let Entry::Vacant(entry) = self.bindings.entry(key.clone()) {
+            let rows = crate::series_bindings::for_folder(conn, library_id, folder)?;
+            entry.insert(Rc::new(rows));
+        }
+        Ok(self.bindings.get(&key).expect("just inserted").clone())
+    }
+
+    fn show_meta(
+        &mut self,
+        conn: &Connection,
+        show_id: i64,
+    ) -> Result<Option<Rc<ShowMeta>>, String> {
+        if let Entry::Vacant(entry) = self.show_meta.entry(show_id) {
+            entry.insert(show_meta(conn, show_id)?.map(Rc::new));
+        }
+        Ok(self.show_meta.get(&show_id).cloned().flatten())
+    }
+
+    fn movie_meta(
+        &mut self,
+        conn: &Connection,
+        provider_id: &str,
+    ) -> Result<Option<Rc<ShowMeta>>, String> {
+        if let Entry::Vacant(entry) = self.movie_meta.entry(provider_id.to_string()) {
+            entry.insert(movie_meta(conn, provider_id)?.map(Rc::new));
+        }
+        Ok(self.movie_meta.get(provider_id).cloned().flatten())
+    }
+
+    /// How many libraries this request has read. Test-only: it is the
+    /// observable that pins the "read each library once" property.
+    #[cfg(test)]
+    pub(crate) fn library_views(&self) -> usize {
+        self.libraries.len()
+    }
+}
+
+/// One library's identity and item rows in a single read.
+fn library_view(conn: &Connection, library_id: i64) -> Result<Option<Rc<LibraryView>>, String> {
+    let Some(library) = library(conn, library_id)? else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    LIBRARY_VIEWS.with(|count| count.set(count.get() + 1));
+    let keys = effective_item_keys_for_library(conn, library_id)?;
+    let items = library_items(conn, library_id)?;
+    let mut by_folder: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let folder = show_folder_relpath(&item.path, &library.root);
+        by_folder.entry(folder).or_default().push(index);
+        if let Some(key) = keys.get(&item.id) {
+            by_key.entry(key.clone()).or_default().push(index);
+        }
+    }
+    Ok(Some(Rc::new(LibraryView {
+        library,
+        keys,
+        items,
+        by_folder,
+        by_key,
+    })))
+}
+
 /// One unit and the media rows under it, resolved from an opaque `series_key`.
 ///
 /// A `tmdb:show:` key can be bound by more than one folder, and by folders in
@@ -358,14 +493,28 @@ fn series_units(conn: &Connection, library: &Library) -> Result<LibraryUnits, St
 /// caller can reach past the listing's single merged unit. `Ok(None)` means
 /// nothing resolves under the key.
 pub fn get_series(conn: &Connection, series_key: &str) -> Result<Option<SeriesDetail>, String> {
+    let mut cache = SeriesCache::new();
+    get_series_cached(conn, series_key, &mut cache)
+}
+
+/// [`get_series`] with a caller-owned request cache, so a caller that resolves
+/// many series reads each library once instead of once per series.
+pub fn get_series_cached(
+    conn: &Connection,
+    series_key: &str,
+    cache: &mut SeriesCache,
+) -> Result<Option<SeriesDetail>, String> {
     match resolve_series_key(conn, series_key)? {
-        SeriesScope::Folders { folders, entity } => show_detail(conn, series_key, folders, entity),
-        SeriesScope::Movie { libraries } => movie_detail(conn, series_key, libraries),
+        SeriesScope::Folders { folders, entity } => {
+            show_detail(conn, cache, series_key, folders, entity)
+        }
+        SeriesScope::Movie { libraries } => movie_detail(conn, cache, series_key, libraries),
     }
 }
 
 fn show_detail(
     conn: &Connection,
+    cache: &mut SeriesCache,
     series_key: &str,
     folders: Vec<(i64, String)>,
     bound_entity: Option<i64>,
@@ -387,22 +536,26 @@ fn show_detail(
     let mut episodes = Vec::new();
     let mut entity = bound_entity;
     let mut fallback_title = String::new();
-    // One read per folder, not per episode.
-    let mut binding_cache: BTreeMap<(i64, String), Vec<crate::series_bindings::SeriesBinding>> =
-        BTreeMap::new();
     for (library_id, folders) in &by_library {
-        let Some(library) = library(conn, *library_id)? else {
+        let Some(view) = cache.view(conn, *library_id)? else {
             continue;
         };
         if fallback_title.is_empty() {
-            fallback_title = folder_title(&folders[0], &library.name);
+            fallback_title = folder_title(&folders[0], &view.library.name);
         }
-        let keys = effective_item_keys_for_library(conn, *library_id)?;
-        for item in library_items(conn, *library_id)? {
-            let folder = show_folder_relpath(&item.path, &library.root);
-            if !folders.contains(&folder) {
-                continue;
+        // Only the matching rows, in media-item order, so a folder holding
+        // several shows picks the same `entity` the full scan did.
+        let mut indices: Vec<usize> = Vec::new();
+        for folder in folders {
+            if let Some(found) = view.by_folder.get(folder) {
+                indices.extend(found.iter().copied());
             }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        for index in indices {
+            let item = &view.items[index];
+            let folder = show_folder_relpath(&item.path, &view.library.root);
             if entity.is_none() {
                 entity = item.tmdb_show;
             }
@@ -417,9 +570,9 @@ fn show_detail(
             // one binding takes `folder_season_for`'s unbounded path and its
             // response does not move (Rule 2.3).
             let item_entity = item.tmdb_show;
-            let mut ep = episode_from(&library, item, &keys)?;
+            let mut ep = episode_from(&view.library, item.clone(), &view.keys)?;
             if let (Some(entity_id), Some(canonical_season)) = (item_entity, ep.season) {
-                let bindings = bindings_for(conn, *library_id, &folder, &mut binding_cache)?;
+                let bindings = cache.bindings_for(conn, *library_id, &folder)?;
                 if let Some(b) = bindings
                     .iter()
                     .find(|b| b.tmdb_show_id == entity_id && !b.is_primary)
@@ -441,7 +594,10 @@ fn show_detail(
         (None, Some(_)) => UnitIdentity::EntityOnly,
         (None, None) => UnitIdentity::Unidentified,
     };
-    let meta = entity.map(|id| show_meta(conn, id)).transpose()?.flatten();
+    let meta = match entity {
+        Some(id) => cache.show_meta(conn, id)?,
+        None => None,
+    };
     let item_count = episodes.len() as i64;
     let (seasons, unnumbered) = group_by_season(episodes);
     Ok(Some(SeriesDetail {
@@ -465,24 +621,25 @@ fn show_detail(
 /// what stops the merged unit from hiding a file.
 fn movie_detail(
     conn: &Connection,
+    cache: &mut SeriesCache,
     series_key: &str,
     libraries: Vec<i64>,
 ) -> Result<Option<SeriesDetail>, String> {
     let mut files = Vec::new();
     let mut fallback_title = String::new();
     for library_id in libraries {
-        let Some(library) = library(conn, library_id)? else {
+        let Some(view) = cache.view(conn, library_id)? else {
             continue;
         };
-        let keys = effective_item_keys_for_library(conn, library_id)?;
-        for item in library_items(conn, library_id)? {
-            if keys.get(&item.id).map(String::as_str) != Some(series_key) {
-                continue;
-            }
+        let Some(indices) = view.by_key.get(series_key) else {
+            continue;
+        };
+        for &index in indices {
+            let item = &view.items[index];
             if fallback_title.is_empty() {
                 fallback_title = item.title.clone();
             }
-            files.push(episode_from(&library, item, &keys)?);
+            files.push(episode_from(&view.library, item.clone(), &view.keys)?);
         }
     }
 
@@ -490,11 +647,10 @@ fn movie_detail(
         return Ok(None);
     }
 
-    let meta = series_key
-        .strip_prefix(MOVIE_KEY_PREFIX)
-        .map(|id| movie_meta(conn, id))
-        .transpose()?
-        .flatten();
+    let meta = match series_key.strip_prefix(MOVIE_KEY_PREFIX) {
+        Some(id) => cache.movie_meta(conn, id)?,
+        None => None,
+    };
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Some(SeriesDetail {
         series_key: series_key.to_string(),
@@ -512,21 +668,6 @@ fn movie_detail(
         seasons: Vec::new(),
         unnumbered: files,
     }))
-}
-
-/// Bindings for one folder, read once and cached for the request.
-fn bindings_for<'a>(
-    conn: &Connection,
-    library_id: i64,
-    folder: &str,
-    cache: &'a mut BTreeMap<(i64, String), Vec<crate::series_bindings::SeriesBinding>>,
-) -> Result<&'a Vec<crate::series_bindings::SeriesBinding>, String> {
-    let key = (library_id, folder.to_string());
-    if !cache.contains_key(&key) {
-        let rows = crate::series_bindings::for_folder(conn, library_id, folder)?;
-        cache.insert(key.clone(), rows);
-    }
-    Ok(cache.get(&key).expect("just inserted"))
 }
 
 fn episode_from(
@@ -689,7 +830,10 @@ fn library(conn: &Connection, library_id: i64) -> Result<Option<Library>, String
     .map_err(|e| format!("browse library {library_id}: {e}"))
 }
 
-fn series_bindings(conn: &Connection, library_id: i64) -> Result<HashMap<String, i64>, String> {
+pub(crate) fn series_bindings(
+    conn: &Connection,
+    library_id: i64,
+) -> Result<HashMap<String, i64>, String> {
     let mut stmt = conn
         .prepare("SELECT relpath, tmdb_show_id FROM series WHERE library_id = ?1")
         .map_err(|e| format!("prepare series bindings: {e}"))?;
@@ -1479,5 +1623,42 @@ mod tests {
         assert_eq!(listed.units.len(), 1, "one folder, one unit");
         assert_eq!(listed.units[0].series_key, "tmdb:show:4454");
         assert_eq!(listed.units[0].item_count, 4);
+    }
+
+    /// Bounded-work regression: a request that resolves many series must read
+    /// each library once. The count is the observable; without the shared
+    /// cache `get_series` re-reads the whole library per series.
+    #[test]
+    fn one_cache_reads_each_library_once_for_many_series() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind)
+                  VALUES (1, 'Shows', '/Shows', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'Alpha', 100), (1, 'Beta', 200), (1, 'Gamma', 300);
+             INSERT INTO media_items (id, library_id, path, mtime_ms, size_bytes, title, kind)
+                  VALUES (1, 1, 'Alpha/S01E01.mkv', 1, 1, 'A', 'episode'),
+                         (2, 1, 'Beta/S01E01.mkv', 1, 1, 'B', 'episode'),
+                         (3, 1, 'Gamma/S01E01.mkv', 1, 1, 'G', 'episode');",
+        )
+        .unwrap();
+
+        let mut shared = SeriesCache::new();
+        for key in ["tmdb:show:100", "tmdb:show:200", "tmdb:show:300"] {
+            let detail = get_series_cached(&c, key, &mut shared).unwrap().unwrap();
+            assert_eq!(detail.item_count, 1, "{key}");
+        }
+        assert_eq!(shared.library_views(), 1, "three series, one library read");
+
+        // The negative case: three separate caches read the library three
+        // times, which is the multiplicative work the shared cache removes.
+        let mut per_call = 0;
+        for key in ["tmdb:show:100", "tmdb:show:200", "tmdb:show:300"] {
+            let mut fresh = SeriesCache::new();
+            get_series_cached(&c, key, &mut fresh).unwrap();
+            per_call += fresh.library_views();
+        }
+        assert_eq!(per_call, 3, "one read per series without the shared cache");
     }
 }

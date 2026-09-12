@@ -5,7 +5,7 @@
 //! carries a position and a duration and nothing else: `played` is derived and
 //! `hidden` belongs to the later rollup block.
 
-use crate::authority::{Caller, INSUFFICIENT_ROLE};
+use crate::authority::{Caller, authorize_profile_ref};
 use crate::error::{ApiError, ApiResult, TypedJson, blocking};
 use crate::state::AppState;
 use axum::Json;
@@ -70,7 +70,7 @@ pub async fn get_state(
 ) -> ApiResult<Json<WatchStateEnvelope>> {
     blocking(move || {
         let item_key = required_item_key(&query)?;
-        let profile_id = authorize_profile(&state, &caller, &profile_ref)?;
+        let profile_id = authorize_profile_ref(&state, &caller, &profile_ref)?;
         let found = state
             .db
             .with_conn(|conn| Ok(read_watch_state(conn, profile_id, &item_key)))
@@ -96,7 +96,7 @@ pub async fn put_state(
 ) -> ApiResult<Json<WatchStateEnvelope>> {
     blocking(move || {
         let item_key = required_item_key(&query)?;
-        let profile_id = authorize_profile(&state, &caller, &profile_ref)?;
+        let profile_id = authorize_profile_ref(&state, &caller, &profile_ref)?;
         let outcome = state
             .db
             .with_conn(|conn| {
@@ -128,22 +128,6 @@ fn required_item_key(query: &WatchStateQuery) -> ApiResult<String> {
     match query.item_key.as_deref() {
         Some(key) if !key.is_empty() => Ok(key.to_string()),
         _ => Err(ApiError::bad_request("itemKey is required")),
-    }
-}
-
-/// Resolve `profile_ref` and apply ADR-0035 item 7.
-///
-/// A profile that does not exist and one this caller may not address get the
-/// same named forbidden error, so the response cannot be used to probe for a
-/// ref.
-fn authorize_profile(state: &AppState, caller: &Caller, profile_ref: &str) -> ApiResult<i64> {
-    let profile = state
-        .db
-        .with_conn(|conn| nightjar_db::profile_by_ref(conn, profile_ref))
-        .map_err(ApiError::internal)?;
-    match profile.filter(|p| caller.may_address_profile(p)) {
-        Some(profile) => Ok(profile.id),
-        None => Err(ApiError::forbidden(INSUFFICIENT_ROLE)),
     }
 }
 

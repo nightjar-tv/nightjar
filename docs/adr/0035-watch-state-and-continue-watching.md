@@ -3,7 +3,9 @@
 - Status: accepted
 - Date: 2026-08-06
 - Amended: 2026-09-12 — the wire shape and write semantics item 6 left open are
-  recorded in the amendment at the end. The implementation matches it.
+  recorded in the first amendment, and the continue-watching request and
+  response wire contract is recorded in the second. The implementation matches
+  both.
 - Accepted: 2026-08-06, once ADR-0039 and ADR-0040 were accepted. ADR-0039
   supplies the series entity and the `series_key` item 8 rolls up over; ADR-0040
   supplies the role model item 7's ownership rule reads. Sign-off for both:
@@ -274,3 +276,47 @@ earlier item.
    write is accepted.** The API treats it as opaque and does not parse it. A key
    that does not resolve returns the typed not-found response at HTTP 404, so
    no orphan state is created.
+
+---
+
+## Amendment 2026-09-12 (second) — the continue-watching wire contract
+
+Item 6 fixes the route and item 8 fixes the rollup. This amendment records the
+request and response that route carries, so the handler and the OpenAPI document
+cannot drift. It adds no route, changes no earlier item, and decides no policy
+item 8 does not already decide. The implementation matches it.
+
+1. **The request is `GET /api/v0/profiles/{profileRef}/continue-watching` with
+   one optional query parameter, `limit`.** `profileRef` is the profile whose
+   rail is read, and item 7's rule decides whether the caller may address it.
+
+2. **`limit` is a non-negative `int32`, applied after series collapse (item 8).**
+   Absent means the whole rail; `0` yields an empty list. A value that is not a
+   non-negative `int32` is the typed `bad_request` at HTTP 400.
+
+3. **The 200 response is exactly `{ items: ContinueWatchingEntry[] }`.** Each
+   entry is exactly:
+
+   ```
+   { seriesKey: string, itemKey: string, itemId: integer,
+     title: string, kind: "movie" | "episode",
+     season?: integer, episode?: integer, showTitle?: string,
+     positionMs: integer, durationMs: integer, played: boolean,
+     lastPlayedAt: string }
+   ```
+
+   `seriesKey` and `itemKey` are the opaque keys item 8 groups and resumes by
+   (ADR-0039 item 2, ADR-0025 §1); clients pass them back as received. `itemId`
+   is the media row to open. `title` is the canonical title when there is one,
+   else the scan-derived title. `season` and `episode` are `int32` values in
+   the folder's numbering, which ADR-0046 item 3(a) resolves for a
+   multi-entity folder, present only when the chosen item has them;
+   `showTitle` is present for an episode and absent for a movie. `positionMs`
+   and `durationMs` are
+   `int64`, and both are zero for a next-episode entry, which has no stored
+   state. `lastPlayedAt` is the series' most recent non-hidden activity, and
+   item 8 sorts on it descending with `seriesKey` breaking a tie.
+
+4. **A `profileRef` the caller may not address and one that does not exist get
+   the same named `forbidden` at HTTP 403**, per item 7. The route does not
+   answer 404, so the response cannot probe for a profile.
