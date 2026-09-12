@@ -28,6 +28,13 @@ pub(crate) mod test_support {
     /// the real startup path probes ffmpeg encoders, which is far too slow to
     /// pay per test. The pool still spawns its worker threads, which idle.
     pub(crate) fn state(dir: &std::path::Path) -> AppState {
+        state_with_encoder_cap(dir, 1)
+    }
+
+    /// The same state with an explicit operator encoder cap. A test that wants
+    /// the per-account ceiling to be the binding limit raises this above the
+    /// account value, so measured/operator admission does not refuse first.
+    pub(crate) fn state_with_encoder_cap(dir: &std::path::Path, max_encoders: usize) -> AppState {
         let db = Arc::new(Db::open(std::path::Path::new(":memory:")).unwrap());
         let subs = Arc::new(nightjar_transcode::SubsStore::new(dir.join("subs")).unwrap());
         let caps = Arc::new(nightjar_transcode::TranscodeCapabilities::software_only(
@@ -36,7 +43,7 @@ pub(crate) mod test_support {
         ));
         let hls = nightjar_transcode::HlsSessionRegistry::with_cap(
             dir.join("hls"),
-            1,
+            max_encoders,
             caps.preferred_encode_leg.clone(),
             Some(Arc::clone(&subs)),
             Some(Arc::clone(&db)),

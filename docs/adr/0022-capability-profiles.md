@@ -121,6 +121,35 @@ local-versus-remote detection land (Phase 3 security pass), any remote policy
 cap is advisory by design: behind a reverse proxy every client can look local.
 Do not read this section as shipped enforceable behaviour.
 
+**Amended 2026-09-12 (B2-9).** Accounts exist and carry the policy half as
+nullable positive integers on `accounts`: `max_bitrate_bps`, `max_height`, and
+`max_concurrent_sessions`. Null means no account policy ceiling and remains the
+shipped default for all three. One server-side composition is shared by
+`playback-info`, `/stream`, and session start: the effective bitrate and height
+are the tighter non-null value of client capability and account policy, and the
+capability and policy reason vocabularies stay distinct. No caller can bypass
+policy by supplying a wider capability query.
+
+The one writer is `PATCH /api/v0/accounts/{accountId}/playback-policy`, with
+the exact body `{maxConcurrentSessions, maxBitrateBps, maxHeight}` (each
+`integer|null`), a full replacement whose omitted field means null. Owner or
+manager in account scope may set any account; member and profile-scope callers
+are refused. ADR-0034 item 8 records the authority and error codes.
+
+Trusted-proxy posture is preserved. There is exactly one local/remote
+classifier; it returns **unknown-as-local** and ignores forwarding headers.
+Stored remote bitrate and height limits are therefore **surfaced but not
+applied** yet: the account response and `playback-info` carry them, and tests
+pin that honest advisory behaviour and that spoofed forwarding headers do not
+activate them. A direct byte request that exceeds the effective ceiling returns
+the existing typed **415** session-required response.
+
+Per-account playback concurrency is the exception: it is enforceable now and is
+not advisory (ADR-0034 item 8). Session start takes an optional
+`replacesSessionId` so a track switch or seek-fork can retire its predecessor
+and take over its slot without a second one; ADR-0034 item 8 records the
+success/failure lifecycle.
+
 **Direct play.** A policy ceiling cannot shape a byte-range serve of the
 original file; there is no encoder in that path. Enforcing a lower height or
 bitrate against a higher source means refusing the stream or demoting the
@@ -210,6 +239,11 @@ ceilings here now choose which rungs a client is offered.
   (prefer ceiling-fitting direct play over transcoding a larger version).
   Rank-function shape check against ADR-0024 before a second ranker; Block 3
   owns version UI.
+- Amendment (2026-09-12, B2-9): §5's policy half ships as nullable account
+  columns `max_bitrate_bps`, `max_height`, `max_concurrent_sessions`. Bitrate
+  and height stay advisory (surfaced, not applied) under the unknown-as-local
+  classifier; per-account concurrency is enforceable now (ADR-0034 item 8).
+  One composition is shared by `playback-info`, `/stream`, and session start.
 - Client work (ADR-0021) cannot claim real-server direct play until this ADR
   is accepted and implemented.
 - N100 measurement remains a hardware task on the Gate 2 long pole (with Pi 4

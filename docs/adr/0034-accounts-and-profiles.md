@@ -11,6 +11,11 @@
 - Amended: 2026-08-11 — item 9's cookie list is eight entries and now nine, by
   splitting a session's `init.mp4` out of the `{asset}` capture (issue #96).
   The described surface is unchanged; the enumeration is one step less open
+- Amended: 2026-09-12 — item 8's per-account playback concurrency is enforced
+  by B2-9: a nullable positive integer counted across every profile of the
+  account at session start, refused with a typed 503 distinct from measured
+  host admission, reserved atomically and released on failure/delete/idle/
+  shutdown
 - Depends on: ADR-0003 §3 (no auth in v0, ended by this ADR); ADR-0007
   (playback sessions, cap model); ADR-0011 (session sharing removed);
   ADR-0022 §5 (policy ceilings, no policy schema until accounts exist);
@@ -210,12 +215,52 @@ profile holds viewing identity and never holds authority.**
    policy, and a refusal carries a ceiling reason that names which of the two
    bound. Enforcement is at playback session start and nowhere else.
 
-   Enforcement waits for B2-9 because it touches transcode session lifecycle and
-   can regress the Gate 2 concurrent-1080p floor, and B2-9 is where the ceiling
-   reason strings already live. The numeric default stays open until B2-9
-   measures it. **Login sessions are not capped, now or in B2-9.** That number is
-   device count, and capping it signs a household out of its television to admit
-   a phone.
+   **Amended 2026-09-12 (B2-9).** The per-account limit is enforceable now and
+   is not advisory. The contract:
+
+   - `accounts.max_concurrent_sessions` is a nullable positive integer; null
+     means no account policy ceiling and remains the shipped default. Do not
+     infer a finite household default from machine capacity.
+   - The cap counts concurrent **playback** sessions across every profile under
+     the authenticated account, at playback-session creation. It counts playback
+     sessions only — not login sessions, encoders, or ABR rungs.
+   - The effective limit is the tighter of the account value and what admission
+     measures. A refusal is typed **503** with a stable account-ceiling
+     code/reason distinct from measured host admission (`admission_refused`).
+   - Capacity is reserved atomically before the existing spawn/insert gap and
+     released on every start failure, explicit delete, idle cleanup, and
+     shutdown. Playback ownership and accounting carry typed account identity;
+     the opaque owner string is never parsed.
+   - Lowering a cap does not evict incumbents. Profile ownership isolation is
+     unchanged.
+
+   **Writer.** `PATCH /api/v0/accounts/{accountId}/playback-policy` is the one
+   writer. Its body is exactly
+   `{maxConcurrentSessions: integer|null, maxBitrateBps: integer|null,
+   maxHeight: integer|null}`, a full replacement: an omitted field means null,
+   so `{}` clears all three. `maxConcurrentSessions` accepts `1..=u32::MAX`;
+   zero, negative, one above the maximum, and any unknown body field are typed
+   **422**. Authority is account powers: an owner or manager in **account
+   scope** may set any account, a member and every profile-scope session are
+   refused before the target is looked up, and an unknown target after an
+   authorized lookup is the typed **404**.
+
+   **Replacement.** Session start takes an optional `replacesSessionId`. It must
+   name a live session of the authenticated account and profile on the same
+   item; same identity alone is not proof that two devices are one playback, so
+   without the reference every POST is a new playback and respects the ceiling.
+   At most one replacement per predecessor is reserved atomically. If the
+   successor starts, the predecessor's playback authority is retired and its
+   teardown begins server-side — the client does not have to DELETE it — while
+   measured admission keeps counting both encoders until cleanup finishes. If
+   the successor start fails, the replacement reservation is released and the
+   predecessor stays playable. A retired predecessor, and a predecessor with an
+   in-flight replacement, are both refused, so a replacement chain is linear and
+   cannot accumulate unbounded cleanup.
+
+   Enforcement is at playback session start and nowhere else. **Login sessions
+   are not capped, now or in B2-9.** That number is device count, and capping it
+   signs a household out of its television to admit a phone.
 
 9. **One credential, two transports, one verifier.** The API authenticates with
    `Authorization: Bearer <token>`. Login additionally sets an `HttpOnly`,

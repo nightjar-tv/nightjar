@@ -226,6 +226,9 @@ fn scan_index_runs_while_a_session_seeks_and_cleans_up() {
     let session = hls
         .start(
             SessionOwner::new("test"),
+            0,
+            None,
+            None,
             item.id,
             &source,
             0,

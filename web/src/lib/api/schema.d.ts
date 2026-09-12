@@ -756,6 +756,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/accounts/{accountId}/playback-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Set an account's playback-policy ceilings (owner and manager)
+         * @description Full replacement of the three account ceilings (ADR-0034 item 8, ADR-0022 §5 as amended 2026-09-12): `maxConcurrentSessions`, `maxBitrateBps` and `maxHeight`. Null or omitted means no account ceiling, which is the shipped default for all three; `{}` clears all three. Zero, negative or out-of-range values are refused with the typed 422, and an unknown body field is refused rather than ignored. `maxBitrateBps` and `maxHeight` are advisory until trusted-proxy work lands: surfaced on the account and on `playbackInfo`, not byte-enforced. `maxConcurrentSessions` is enforced at playback session creation. Owner or manager in account scope may set any account; a member and every profile-scope session are refused before the target is looked up, so an unknown target is the typed 404.
+         */
+        patch: operations["updateAccountPlaybackPolicy"];
+        trace?: never;
+    };
     "/api/v0/profiles": {
         parameters: {
             query?: never;
@@ -1197,8 +1217,12 @@ export interface components {
             id: number;
             username: string;
             role: components["schemas"]["Role"];
-            /** @description Concurrent playback across every profile on this account; null means no per-account limit, which is the shipped default. The shape is decided by ADR-0034 item 8 and **enforced in B2-9**, so nothing reads it yet. */
+            /** @description Concurrent playback across every profile on this account; null means no per-account limit, which is the shipped default. The shape is decided by ADR-0034 item 8 and **enforced in B2-9** at playback session creation. */
             maxConcurrentSessions?: number | null;
+            /** @description Account policy bitrate ceiling in bits per second; null means no ceiling, which is the shipped default (ADR-0022 §5 as amended 2026-09-12). Advisory until trusted-proxy work lands: surfaced on this response and on `playbackInfo`, not byte-enforced. */
+            maxBitrateBps?: number | null;
+            /** @description Account policy height ceiling; null means no ceiling, which is the shipped default. Advisory like `maxBitrateBps`. */
+            maxHeight?: number | null;
         };
         Profile: {
             /** @description Opaque and durable (ADR-0034 item 6). Never `profileId`, which ADR-0022 uses for the client capability profile. Clients treat it as opaque exactly as they treat `itemKey`. */
@@ -1214,6 +1238,15 @@ export interface components {
              * @enum {string}
              */
             subtitleDefault?: "auto" | "off";
+        };
+        /** @description Full replacement of the three account playback ceilings. An omitted field means null, so `{}` clears all three. */
+        PlaybackPolicyRequest: {
+            /** @description Concurrent playback sessions across every profile. The maximum is `u32::MAX`, the bound the enforcement path reads. */
+            maxConcurrentSessions?: number | null;
+            /** @description Account policy bitrate ceiling in bits per second. */
+            maxBitrateBps?: number | null;
+            /** @description Account policy height ceiling in pixels. */
+            maxHeight?: number | null;
         };
         CreateAccountRequest: {
             username: string;
@@ -1566,6 +1599,16 @@ export interface components {
             audioReason?: string | null;
             /** @description Why a subtitle track was selected, or why none was. Stored `off` and a profile default of `off` both select none, and say so. */
             subtitleReason?: string | null;
+            /**
+             * Format: int64
+             * @description The account policy bitrate ceiling, surfaced whether or not applied (ADR-0022 §5 as amended 2026-09-12). Absent means no account ceiling.
+             */
+            policyMaxBitrateBps?: number | null;
+            /**
+             * Format: int64
+             * @description The account policy height ceiling, surfaced whether or not applied.
+             */
+            policyMaxHeight?: number | null;
         };
         AudioTrack: {
             /** @description Stable id `e{streamIndex}`, the same scheme as embedded subtitles (ADR-0010 / ADR-0012). */
@@ -2386,6 +2429,8 @@ export interface operations {
                 audioTrackId?: string;
                 /** @description Burn-in subtitle track from playbackInfo.subtitleTracks with render=burnIn (ADR-0018). Soft (WebVTT) tracks are selected via MEDIA / track elements, not this param. Switching burn-in starts a new session at the current position and DELETEs the old one. Selecting burn-in on a DirectPlay title starts a transcode session. */
                 subtitleTrackId?: string;
+                /** @description Explicit predecessor for a replacement start (ADR-0034 item 8). Must name a live session of the authenticated account and profile on the same item. A successor that starts through it takes over the predecessor's account slot and retires the predecessor's playback authority server-side; the client does not need to DELETE it. Without this parameter a start at the account ceiling is refused, because same identity is not proof that two devices are one playback. At most one replacement per predecessor is pending at a time. */
+                replacesSessionId?: string;
             };
             header?: never;
             path: {
@@ -2404,8 +2449,17 @@ export interface operations {
                     "application/json": components["schemas"]["TranscodeSession"];
                 };
             };
-            /** @description Not found */
+            /** @description Item not found, or `replacesSessionId` names no playable session of this account and profile. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `replacesSessionId` already has an in-flight replacement. One successor per predecessor. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2422,7 +2476,16 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Admission refused: no capacity for another encoder (ADR-0050). Retryable. The body's `code` is `admission_refused`; a client retries on that code, not on the sentence in `error`. */
+            /** @description `replacesSessionId` names a session on a different item. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Admission refused: no capacity for another encoder (ADR-0050), or the authenticated account is at its `maxConcurrentSessions` ceiling (ADR-0034 item 8). The body's `code` tells them apart: `admission_refused` is retryable; `account_ceiling_refused` is not retryable until a session ends or the account limit moves. A client branches on `code`, not on the sentence in `error`. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -3231,6 +3294,59 @@ export interface operations {
             };
             /** @description Named forbidden error; a manager cannot change any role */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateAccountPlaybackPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                accountId: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlaybackPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated account */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            /** @description Named forbidden error: a member, or any profile-scope session. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No such account, after authority was settled. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description A ceiling is zero, negative or out of range, or the body carries an unknown field. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -227,6 +227,128 @@ pub fn resolve_profile_bag(
     profile
 }
 
+/// The account's policy half of the playback ceilings (ADR-0022 §5 as amended
+/// 2026-09-12, ADR-0034 item 8). Null means no account ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccountPlaybackPolicy {
+    /// Concurrent playback sessions across every profile of the account
+    /// (ADR-0034 item 8). Null means no account limit.
+    pub max_concurrent_sessions: Option<u32>,
+    pub max_bitrate_bps: Option<u64>,
+    pub max_height: Option<u32>,
+}
+
+/// The one capability/policy composition (ADR-0022 §5 as amended 2026-09-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackCeilings {
+    /// The ceiling the decision uses.
+    pub max_bitrate_bps: Option<u64>,
+    pub max_height: Option<u32>,
+    /// The account policy values, surfaced whether or not applied.
+    pub policy_max_bitrate_bps: Option<u64>,
+    pub policy_max_height: Option<u32>,
+    /// True when the policy half tightened the applied ceiling. False means it
+    /// was surfaced only, which is the shipped behaviour (see below).
+    pub policy_applied: bool,
+    /// Names the policy source when it tightened the ceiling. The capability
+    /// vocabulary (`profile maxBitrateBps`) is deliberately not reused.
+    pub policy_reason: Option<String>,
+}
+
+/// The tighter of two optional ceilings: the smaller set value when both are
+/// set, the set value when one is `None` (`None` = no ceiling).
+fn tighter_ceiling<T: Ord + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Where a playback request came from, as the one classifier can tell
+/// (ADR-0022 §5 as amended 2026-09-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientOrigin {
+    Local,
+    Remote,
+}
+
+/// The one local/remote classifier.
+///
+/// It returns **unknown-as-local**: no trusted-proxy configuration exists yet,
+/// so every request is local and the account policy half is surfaced, not
+/// applied. It reads no request and takes no forwarding header, so
+/// `X-Forwarded-For` and `Forwarded` cannot activate a remote policy. A real
+/// classifier is trusted-proxy work and is deliberately not built here.
+pub fn classify_client_origin() -> ClientOrigin {
+    ClientOrigin::Local
+}
+
+/// Compose client capability with account policy (ADR-0022 §5 as amended).
+///
+/// `origin` is what [`classify_client_origin`] says. With the shipped
+/// unknown-as-local answer the policy half is surfaced in [`PlaybackCeilings`]
+/// and its reason but does not tighten the applied ceiling. When the origin is
+/// [`ClientOrigin::Remote`], the applied ceiling is the tighter non-null value
+/// of the two, so a wider capability query cannot widen past policy.
+pub fn compose_playback_ceilings(
+    capability: &ClientCapabilityProfile,
+    policy: AccountPlaybackPolicy,
+    origin: ClientOrigin,
+) -> PlaybackCeilings {
+    let remote = origin == ClientOrigin::Remote;
+    let max_bitrate_bps = if remote {
+        tighter_ceiling(capability.max_bitrate_bps, policy.max_bitrate_bps)
+    } else {
+        capability.max_bitrate_bps
+    };
+    let max_height = if remote {
+        tighter_ceiling(capability.max_height, policy.max_height)
+    } else {
+        capability.max_height
+    };
+    let policy_reason = if remote {
+        policy_ceiling_reason(capability, policy)
+    } else {
+        None
+    };
+    PlaybackCeilings {
+        max_bitrate_bps,
+        max_height,
+        policy_max_bitrate_bps: policy.max_bitrate_bps,
+        policy_max_height: policy.max_height,
+        // A tie is not the policy tightening anything: the client ceiling was
+        // already at that value. `policy_ceiling_reason` uses the same strict
+        // comparison, so the two can never disagree (Rule 4.11).
+        policy_applied: policy_reason.is_some(),
+        policy_reason,
+    }
+}
+
+/// Why the account policy tightened the applied ceiling, named with the policy
+/// vocabulary so an operator can tell a policy cap from a capability one.
+fn policy_ceiling_reason(
+    capability: &ClientCapabilityProfile,
+    policy: AccountPlaybackPolicy,
+) -> Option<String> {
+    if let Some(pol) = policy.max_height
+        && capability.max_height.is_none_or(|cap| pol < cap)
+    {
+        return Some(format!(
+            "account maxHeight {pol} is tighter than the client ceiling"
+        ));
+    }
+    if let Some(pol) = policy.max_bitrate_bps
+        && capability.max_bitrate_bps.is_none_or(|cap| pol < cap)
+    {
+        return Some(format!(
+            "account maxBitrateBps {pol} is tighter than the client ceiling"
+        ));
+    }
+    None
+}
+
 /// ADR-0041 Decisions 3–4: does this client/method need a standalone
 /// subtitle extraction job, or is the rendition produced elsewhere?
 ///
@@ -1067,7 +1189,126 @@ mod tests {
         assert_eq!(p.video_codecs, BROWSER_V0.video_codecs);
     }
 
-    /// ADR-0041 Decisions 3–4, table-driven: standalone extraction fires
+    /// ADR-0022 §5 as amended (B2-9): the one composition is the tighter of
+    /// client capability and account policy, with the policy vocabulary
+    /// distinct from the capability one. `remote` is what the single
+    /// unknown-as-local classifier would say.
+    #[test]
+    fn composition_takes_the_tighter_non_null_ceiling() {
+        let cap = |bitrate, height| ClientCapabilityProfile {
+            max_bitrate_bps: bitrate,
+            max_height: height,
+            ..BROWSER_V0
+        };
+
+        // Both null: no ceiling, no policy in force.
+        let none = compose_playback_ceilings(
+            &cap(None, None),
+            AccountPlaybackPolicy::default(),
+            ClientOrigin::Remote,
+        );
+        assert_eq!(none.max_bitrate_bps, None);
+        assert_eq!(none.max_height, None);
+        assert!(!none.policy_applied);
+        assert_eq!(none.policy_reason, None);
+
+        // One null: the set value wins, and when it is the policy's it is
+        // named as the policy's.
+        let one = compose_playback_ceilings(
+            &cap(None, Some(1080)),
+            AccountPlaybackPolicy {
+                max_concurrent_sessions: None,
+                max_bitrate_bps: Some(8_000_000),
+                max_height: None,
+            },
+            ClientOrigin::Remote,
+        );
+        assert_eq!(one.max_height, Some(1080));
+        assert_eq!(one.max_bitrate_bps, Some(8_000_000));
+        assert!(one.policy_applied);
+        assert!(
+            one.policy_reason.as_deref().unwrap().contains("account"),
+            "{:?}",
+            one.policy_reason
+        );
+
+        // Both finite: the smaller wins. Capability tighter -> policy is
+        // surfaced but not applied.
+        let cap_tighter = compose_playback_ceilings(
+            &cap(Some(5_000_000), Some(1080)),
+            AccountPlaybackPolicy {
+                max_concurrent_sessions: None,
+                max_bitrate_bps: Some(8_000_000),
+                max_height: Some(2160),
+            },
+            ClientOrigin::Remote,
+        );
+        assert_eq!(cap_tighter.max_bitrate_bps, Some(5_000_000));
+        assert_eq!(cap_tighter.max_height, Some(1080));
+        assert!(!cap_tighter.policy_applied);
+        assert_eq!(cap_tighter.policy_max_bitrate_bps, Some(8_000_000));
+        assert_eq!(cap_tighter.policy_max_height, Some(2160));
+
+        // Policy tighter -> applied, and the reason names the policy field.
+        let policy_tighter = compose_playback_ceilings(
+            &cap(Some(40_000_000), Some(2160)),
+            AccountPlaybackPolicy {
+                max_concurrent_sessions: None,
+                max_bitrate_bps: Some(8_000_000),
+                max_height: Some(1080),
+            },
+            ClientOrigin::Remote,
+        );
+        assert_eq!(policy_tighter.max_bitrate_bps, Some(8_000_000));
+        assert_eq!(policy_tighter.max_height, Some(1080));
+        assert!(policy_tighter.policy_applied);
+        let reason = policy_tighter.policy_reason.as_deref().unwrap();
+        assert!(reason.contains("account maxHeight"), "{reason}");
+
+        // A tie keeps the value but the policy did not tighten anything: the
+        // capability was already at that ceiling, so `policy_applied` is false
+        // and no policy reason is named.
+        let tie = compose_playback_ceilings(
+            &cap(Some(8_000_000), Some(1080)),
+            AccountPlaybackPolicy {
+                max_concurrent_sessions: None,
+                max_bitrate_bps: Some(8_000_000),
+                max_height: Some(1080),
+            },
+            ClientOrigin::Remote,
+        );
+        assert_eq!(tie.max_bitrate_bps, Some(8_000_000));
+        assert_eq!(tie.max_height, Some(1080));
+        assert!(!tie.policy_applied);
+        assert_eq!(tie.policy_reason, None);
+    }
+
+    /// Unknown-as-local: with `remote == false` the policy is surfaced and not
+    /// applied, which is the shipped posture until trusted-proxy work lands.
+    #[test]
+    fn local_origin_surfaces_policy_without_applying_it() {
+        let cap = ClientCapabilityProfile {
+            max_bitrate_bps: None,
+            max_height: None,
+            ..BROWSER_V0
+        };
+        let composed = compose_playback_ceilings(
+            &cap,
+            AccountPlaybackPolicy {
+                max_concurrent_sessions: None,
+                max_bitrate_bps: Some(8_000_000),
+                max_height: Some(1080),
+            },
+            ClientOrigin::Local,
+        );
+        assert_eq!(composed.max_bitrate_bps, None, "not applied locally");
+        assert_eq!(composed.max_height, None, "not applied locally");
+        assert_eq!(composed.policy_max_bitrate_bps, Some(8_000_000));
+        assert_eq!(composed.policy_max_height, Some(1080));
+        assert!(!composed.policy_applied);
+        assert_eq!(composed.policy_reason, None);
+    }
+
     /// only for a `BROWSER_V0`-class client on a direct-play method.
     #[test]
     fn standalone_extract_gating() {

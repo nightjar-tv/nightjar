@@ -15,7 +15,8 @@ pub use accounts::{
     create_session, delete_account, delete_profile, library_exists, list_accounts, now_iso,
     profile_by_id, profile_by_ref, profiles_for_account, revoke_all_for_account, revoke_session,
     session_expiry, session_for_token, set_active_profile, set_password_hash, set_role,
-    touch_last_seen, transfer_ownership, update_profile_preferences,
+    touch_last_seen, transfer_ownership, update_account_playback_policy,
+    update_profile_preferences,
 };
 pub use content_id::{
     CONTENT_ID_WINDOW, content_id_for_path, content_id_from_reader, content_id_matches,

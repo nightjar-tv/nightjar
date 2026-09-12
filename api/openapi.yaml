@@ -633,6 +633,21 @@ paths:
             session.
           schema:
             type: string
+        - name: replacesSessionId
+          in: query
+          required: false
+          description: >
+            Explicit predecessor for a replacement start (ADR-0034 item 8).
+            Must name a live session of the authenticated account and profile
+            on the same item. A successor that starts through it takes over
+            the predecessor's account slot and retires the predecessor's
+            playback authority server-side; the client does not need to DELETE
+            it. Without this parameter a start at the account ceiling is
+            refused, because same identity is not proof that two devices are
+            one playback. At most one replacement per predecessor is pending
+            at a time.
+          schema:
+            type: string
       responses:
         "202":
           description: Session started for this item
@@ -641,7 +656,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/TranscodeSession"
         "404":
-          description: Not found
+          description: >
+            Item not found, or `replacesSessionId` names no playable session of
+            this account and profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >
+            `replacesSessionId` already has an in-flight replacement. One
+            successor per predecessor.
           content:
             application/json:
               schema:
@@ -654,11 +679,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "422":
+          description: >
+            `replacesSessionId` names a session on a different item.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           description: >
-            Admission refused: no capacity for another encoder (ADR-0050).
-            Retryable. The body's `code` is `admission_refused`; a client
-            retries on that code, not on the sentence in `error`.
+            Admission refused: no capacity for another encoder (ADR-0050), or
+            the authenticated account is at its `maxConcurrentSessions` ceiling
+            (ADR-0034 item 8). The body's `code` tells them apart:
+            `admission_refused` is retryable; `account_ceiling_refused` is not
+            retryable until a session ends or the account limit moves. A client
+            branches on `code`, not on the sentence in `error`.
           content:
             application/json:
               schema:
@@ -1425,6 +1460,65 @@ paths:
                 $ref: "#/components/schemas/Error"
         "403":
           description: Named forbidden error; a manager cannot change any role
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v0/accounts/{accountId}/playback-policy:
+    patch:
+      operationId: updateAccountPlaybackPolicy
+      summary: Set an account's playback-policy ceilings (owner and manager)
+      description: >
+        Full replacement of the three account ceilings (ADR-0034 item 8,
+        ADR-0022 §5 as amended 2026-09-12): `maxConcurrentSessions`,
+        `maxBitrateBps` and `maxHeight`. Null or omitted means no account
+        ceiling, which is the shipped default for all three; `{}` clears all
+        three. Zero, negative or out-of-range values are refused with the typed
+        422, and an unknown body field is refused rather than ignored.
+        `maxBitrateBps` and `maxHeight` are advisory until trusted-proxy work
+        lands: surfaced on the account and on `playbackInfo`, not
+        byte-enforced. `maxConcurrentSessions` is enforced at playback session
+        creation. Owner or manager in account scope may set any account; a
+        member and every profile-scope session are refused before the target is
+        looked up, so an unknown target is the typed 404.
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaybackPolicyRequest"
+      responses:
+        "200":
+          description: Updated account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "403":
+          description: >
+            Named forbidden error: a member, or any profile-scope session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such account, after authority was settled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: >
+            A ceiling is zero, negative or out of range, or the body carries an
+            unknown field.
           content:
             application/json:
               schema:
@@ -2594,8 +2688,22 @@ components:
           description: >
             Concurrent playback across every profile on this account; null
             means no per-account limit, which is the shipped default. The shape
-            is decided by ADR-0034 item 8 and **enforced in B2-9**, so nothing
-            reads it yet.
+            is decided by ADR-0034 item 8 and **enforced in B2-9** at playback
+            session creation.
+        maxBitrateBps:
+          type: integer
+          nullable: true
+          description: >
+            Account policy bitrate ceiling in bits per second; null means no
+            ceiling, which is the shipped default (ADR-0022 §5 as amended
+            2026-09-12). Advisory until trusted-proxy work lands: surfaced on
+            this response and on `playbackInfo`, not byte-enforced.
+        maxHeight:
+          type: integer
+          nullable: true
+          description: >
+            Account policy height ceiling; null means no ceiling, which is the
+            shipped default. Advisory like `maxBitrateBps`.
 
     Profile:
       type: object
@@ -2626,6 +2734,33 @@ components:
             `auto` runs the ADR-0024 rule and may select nothing; `off` selects
             nothing on purpose. The two are different choices (ADR-0038
             item 1).
+
+    PlaybackPolicyRequest:
+      type: object
+      additionalProperties: false
+      description: >
+        Full replacement of the three account playback ceilings. An omitted
+        field means null, so `{}` clears all three.
+      properties:
+        maxConcurrentSessions:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 4294967295
+          description: >
+            Concurrent playback sessions across every profile. The maximum is
+            `u32::MAX`, the bound the enforcement path reads.
+        maxBitrateBps:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Account policy bitrate ceiling in bits per second.
+        maxHeight:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 4294967295
+          description: Account policy height ceiling in pixels.
 
     CreateAccountRequest:
       type: object
@@ -3337,6 +3472,20 @@ components:
           description: >
             Why a subtitle track was selected, or why none was. Stored `off`
             and a profile default of `off` both select none, and say so.
+        policyMaxBitrateBps:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            The account policy bitrate ceiling, surfaced whether or not applied
+            (ADR-0022 §5 as amended 2026-09-12). Absent means no account
+            ceiling.
+        policyMaxHeight:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            The account policy height ceiling, surfaced whether or not applied.
 
     AudioTrack:
       type: object

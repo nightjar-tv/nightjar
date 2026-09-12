@@ -35,7 +35,7 @@ use crate::hls_policy::{
 };
 use nightjar_core::VideoEncodePlan;
 use nightjar_db::Db;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -261,6 +261,22 @@ pub enum StartSessionError {
     /// Measured memory reserve or the operator's explicit encoder cap refused
     /// this newcomer.
     AdmissionRefused,
+    /// The authenticated account is already at its `max_concurrent_sessions`
+    /// ceiling (ADR-0034 item 8). Distinct from `AdmissionRefused`: this is a
+    /// per-account policy limit, not measured host capacity.
+    AccountCeilingRefused,
+    /// `replacesSessionId` names no live session of the authenticated account
+    /// and profile (ADR-0034 item 8). A missing session, another account's or
+    /// profile's session, and an already-retired predecessor all answer here,
+    /// so the caller cannot tell them apart.
+    PredecessorNotFound,
+    /// `replacesSessionId` names a live session of this account and profile on
+    /// a different item. A replacement continues one playback, so the item must
+    /// match.
+    PredecessorItemMismatch,
+    /// `replacesSessionId` already has an in-flight replacement. Concurrent and
+    /// repeated predecessor reuse is refused; one successor per predecessor.
+    ReplacementAlreadyPending,
     Spawn(String),
 }
 
@@ -320,6 +336,44 @@ impl SessionOwner {
     }
 }
 
+/// Releases an account reservation when a start never reaches insert
+/// (ADR-0034 item 8). A failed spawn, or any error between the reservation and
+/// the insert, must not leak a slot or a pending replacement.
+struct AccountSlotGuard<'a> {
+    registry: &'a HlsSessionRegistry,
+    account_id: i64,
+    /// A predecessor whose one pending replacement this start reserved.
+    /// Released if the start never inserts, so the predecessor stays playable
+    /// and can be replaced by a later successor.
+    replacement_of: Option<String>,
+    armed: bool,
+}
+
+impl AccountSlotGuard<'_> {
+    /// The session is in the registry, so the pending half is released and the
+    /// session entry carries the slot from here. The predecessor's pending
+    /// replacement is released too: it is retired in the same locked step.
+    fn commit(mut self) {
+        self.registry.release_pending_account_slot(self.account_id);
+        if let Some(prior) = &self.replacement_of {
+            self.registry.release_pending_replacement(prior);
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for AccountSlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.registry.release_pending_account_slot(self.account_id);
+        if let Some(prior) = &self.replacement_of {
+            self.registry.release_pending_replacement(prior);
+        }
+    }
+}
+
 pub struct HlsSessionRegistry {
     root: PathBuf,
     /// Explicit operator escape hatch. Normal admission has no configured cap
@@ -342,6 +396,17 @@ pub struct HlsSessionRegistry {
     map_build_in_flight: Mutex<Option<Arc<MapBuildInFlight>>>,
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, Session>>,
+    /// Account slots reserved by in-flight starts, before the session reaches
+    /// `sessions` (ADR-0034 item 8). A start reserves here under the
+    /// `sessions` lock, so two simultaneous starts cannot both count a
+    /// not-yet-inserted sibling. The reservation moves into the session entry
+    /// at insert and is released on every path that never inserts.
+    pending_account_slots: Mutex<HashMap<i64, usize>>,
+    /// Predecessor session ids with an in-flight explicit replacement
+    /// (ADR-0034 item 8). A start with `replacesSessionId` reserves here under
+    /// the `sessions` lock, so two successors cannot both claim one
+    /// predecessor. Released at insert, or on any path that never inserts.
+    pending_replacements: Mutex<HashSet<String>>,
 }
 
 /// ADR-0041 Decision 7: a piggyback target for a session on an `eligible`
@@ -387,6 +452,21 @@ struct Session {
     /// never changed: a seek restarts the encoder in place, it does not
     /// transfer the session.
     owner: SessionOwner,
+    /// The authenticated account, typed. The account ceiling counts playback
+    /// sessions by this field; the opaque `owner` string is never parsed.
+    account_id: i64,
+    /// Whether this session holds one of its account's concurrency slots
+    /// (ADR-0034 item 8). An explicit replacement retires the predecessor in
+    /// the same locked step the successor takes the slot, so the predecessor
+    /// keeps its encoder until teardown finishes but no longer counts against
+    /// the account.
+    account_slot_held: bool,
+    /// Set when an explicit `replacesSessionId` successor retired this session
+    /// (ADR-0034 item 8). A retired session keeps its encoder until teardown
+    /// finishes, so measured admission still counts it, but it holds no
+    /// account slot, no playback authority, and cannot be a replacement
+    /// target again.
+    retired: bool,
     src: PathBuf,
     dir: PathBuf,
     /// On-disk budget for this session's run dirs (ADR-0020 §12). A field
@@ -1515,6 +1595,8 @@ impl HlsSessionRegistry {
             map_build_in_flight: Mutex::new(None),
             next_id: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
+            pending_account_slots: Mutex::new(HashMap::new()),
+            pending_replacements: Mutex::new(HashSet::new()),
         });
         let reaper = Arc::clone(&registry);
         std::thread::Builder::new()
@@ -1546,10 +1628,20 @@ impl HlsSessionRegistry {
     /// ADR-0018). `subtitle_tracks` is snapshotted here and never revisited.
     /// `encode_plan` applies only in Transcode mode (ADR-0022). `piggyback`
     /// arms the ADR-0041 Decision 7 side output for an `eligible` item.
+    ///
+    /// `replaces_session_id` is the optional explicit replacement (ADR-0034
+    /// item 8). It must name a live session of the same account and profile on
+    /// the same item. A successor admitted through it takes over the
+    /// predecessor's account slot and retires it; without it, a start at the
+    /// account ceiling is refused, because same identity is not proof that two
+    /// devices are one playback.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         owner: SessionOwner,
+        account_id: i64,
+        account_max_concurrent_sessions: Option<u32>,
+        replaces_session_id: Option<String>,
         item_id: i64,
         src: &Path,
         start_ms: u64,
@@ -1643,6 +1735,75 @@ impl HlsSessionRegistry {
             return Err(StartSessionError::AdmissionRefused);
         }
 
+        // ADR-0034 item 8: the per-account ceiling, reserved atomically before
+        // the spawn/insert gap. The count is playback sessions across every
+        // profile of this account plus in-flight reservations. Measured
+        // admission has already refused above its own limit, so the effective
+        // limit is the tighter of the account value and measured capacity.
+        let mut pending = self
+            .pending_account_slots
+            .lock()
+            .map_err(|_| StartSessionError::Spawn("hls account slots lock poisoned".into()))?;
+        let live_held = sessions
+            .values()
+            .filter(|s| s.account_id == account_id && s.account_slot_held && !s.retired)
+            .count();
+        let reserved_for_account = pending.get(&account_id).copied().unwrap_or(0);
+        let at_ceiling = account_max_concurrent_sessions
+            .is_some_and(|limit| live_held + reserved_for_account >= limit as usize);
+
+        // An explicit `replacesSessionId` is the only path that may start at
+        // the ceiling. Validate the predecessor against the authenticated
+        // account, profile and item: same identity alone is not proof that two
+        // devices are one playback, so an unrelated POST still refuses.
+        let replacement_of = match replaces_session_id {
+            None => None,
+            Some(prior_id) => match sessions.get(&prior_id) {
+                Some(prior)
+                    if prior.account_id == account_id
+                        && prior.owner == owner
+                        && prior.item_id == item_id
+                        && !prior.retired =>
+                {
+                    Some(prior_id)
+                }
+                Some(prior)
+                    if prior.account_id == account_id && prior.owner == owner && !prior.retired =>
+                {
+                    return Err(StartSessionError::PredecessorItemMismatch);
+                }
+                _ => return Err(StartSessionError::PredecessorNotFound),
+            },
+        };
+        if replacement_of.is_none() && at_ceiling {
+            return Err(StartSessionError::AccountCeilingRefused);
+        }
+        // Reserve the predecessor and the successor's slot in one locked step.
+        // A predecessor already reserved by an in-flight successor refuses the
+        // newcomer, so one predecessor has at most one pending replacement.
+        let mut pending_replacements = self
+            .pending_replacements
+            .lock()
+            .map_err(|_| StartSessionError::Spawn("hls replacements lock poisoned".into()))?;
+        if let Some(prior) = &replacement_of
+            && !pending_replacements.insert(prior.clone())
+        {
+            return Err(StartSessionError::ReplacementAlreadyPending);
+        }
+        *pending.entry(account_id).or_insert(0) += 1;
+        drop(pending_replacements);
+        drop(pending);
+        // Releases the reservation, and the pending replacement, on any path
+        // that does not insert a session. The sessions lock is released before
+        // the fallible work so the guard can take it back safely.
+        let slot = AccountSlotGuard {
+            registry: self,
+            account_id,
+            replacement_of: replacement_of.clone(),
+            armed: true,
+        };
+        drop(sessions);
+
         let id = format!("s{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let dir = self.root.join(&id);
         fs::create_dir_all(&dir).map_err(|e| {
@@ -1653,9 +1814,6 @@ impl HlsSessionRegistry {
         fs::create_dir_all(&run_dir).map_err(|e| {
             StartSessionError::Spawn(format!("create run dir {}: {e}", run_dir.display()))
         })?;
-        // Release before ASS demux / ffmpeg spawn so a multi-minute NAS extract
-        // does not freeze every other HLS request on this lock.
-        drop(sessions);
 
         let spawn_started = Instant::now();
         let mut map_binding = MapBinding::new(keyframe_map);
@@ -1743,6 +1901,9 @@ impl HlsSessionRegistry {
             Session {
                 item_id,
                 owner,
+                account_id,
+                account_slot_held: true,
+                retired: false,
                 src: src.to_path_buf(),
                 dir: dir.clone(),
                 // One session budget is shared by every rung directory; it
@@ -1790,7 +1951,53 @@ impl HlsSessionRegistry {
                 last_requested_ms: play_start_ms,
             },
         );
+        // Retire the predecessor in the same locked step the successor takes
+        // the slot. The predecessor keeps its encoder until teardown finishes,
+        // so measured admission still counts both encoders, but it holds no
+        // account slot, no playback authority, and cannot be replaced again.
+        if let Some(prior) = &replacement_of
+            && let Some(session) = sessions.get_mut(prior)
+        {
+            session.retired = true;
+            session.account_slot_held = false;
+        }
+        // The session entry now carries the account slot, so the in-flight
+        // reservation is released. This runs under the sessions lock, so no
+        // concurrent start can observe both at once.
+        slot.commit();
+        drop(sessions);
+        // Server-side teardown: the client never has to DELETE the predecessor,
+        // and a chained replacement cannot accumulate cleanup work because each
+        // predecessor is retired once and torn down before this start returns.
+        if let Some(prior) = replacement_of {
+            self.stop(&prior);
+        }
         Ok(id)
+    }
+
+    /// Release one in-flight account reservation. Called by the start guard on
+    /// every path that never inserts a session.
+    fn release_pending_account_slot(&self, account_id: i64) {
+        let Ok(mut pending) = self.pending_account_slots.lock() else {
+            return;
+        };
+        let Some(count) = pending.get_mut(&account_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            pending.remove(&account_id);
+        }
+    }
+
+    /// Release one predecessor's pending replacement (ADR-0034 item 8). Called
+    /// by the start guard on every path that never inserts a session, so the
+    /// predecessor stays playable and can be replaced by a later successor.
+    fn release_pending_replacement(&self, session_id: &str) {
+        let Ok(mut pending) = self.pending_replacements.lock() else {
+            return;
+        };
+        pending.remove(session_id);
     }
 
     /// True when a spawn in this session held a keyframe map but still had
@@ -1814,15 +2021,21 @@ impl HlsSessionRegistry {
 
     /// Whether `owner` created `session_id` (ADR-0034 item 8).
     ///
-    /// A missing session and another caller's session answer `false`, so a
-    /// caller cannot tell the two apart. This reads no session state and does
-    /// not touch `last_access`: the ownership boundary runs before any
-    /// operation, so an unauthorized request must not look like activity.
+    /// A missing session, another caller's session, and a retired predecessor
+    /// all answer `false`, so a caller cannot tell them apart and a replaced
+    /// session loses its playback authority at once. This reads no session
+    /// state and does not touch `last_access`: the ownership boundary runs
+    /// before any operation, so an unauthorized request must not look like
+    /// activity.
     pub fn is_owned_by(&self, session_id: &str, owner: &SessionOwner) -> bool {
         self.sessions
             .lock()
             .ok()
-            .and_then(|sessions| sessions.get(session_id).map(|s| &s.owner == owner))
+            .and_then(|sessions| {
+                sessions
+                    .get(session_id)
+                    .map(|s| !s.retired && &s.owner == owner)
+            })
             .unwrap_or(false)
     }
 
@@ -2803,6 +3016,16 @@ impl HlsSessionRegistry {
                 stop_child(&mut state.child);
                 reap_all_superseded(session, rung);
             }
+            // ADR-0034 item 8: shutdown releases every account slot, including
+            // any reservation still in the spawn/insert gap. The process is
+            // ending, so this is the last word on the count.
+            session.account_slot_held = false;
+        }
+        if let Ok(mut pending) = self.pending_account_slots.lock() {
+            pending.clear();
+        }
+        if let Ok(mut pending) = self.pending_replacements.lock() {
+            pending.clear();
         }
         killed
     }
@@ -4777,6 +5000,9 @@ mod tests {
         Session {
             item_id: 1,
             owner: SessionOwner::new("test"),
+            account_id: 0,
+            account_slot_held: true,
+            retired: false,
             src: PathBuf::from("/dev/null"),
             dir: dir.to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -4843,6 +5069,596 @@ mod tests {
             !reg.is_owned_by("s2", &owner),
             "a missing session must not match the owner"
         );
+    }
+
+    // ---- ADR-0034 item 8: per-account playback concurrency ----
+
+    /// One held playback session for `account_id`, as a prior client would
+    /// have left it. No child: the accounting is what these tests pin.
+    fn held_account_session(dir: &Path, account_id: i64, owner: &str, item_id: i64) -> Session {
+        let mut session = make_test_session(dir);
+        session.account_id = account_id;
+        session.owner = SessionOwner::new(owner);
+        session.item_id = item_id;
+        session.account_slot_held = true;
+        session
+    }
+
+    fn start_copy(
+        reg: &HlsSessionRegistry,
+        owner: &str,
+        account_id: i64,
+        limit: Option<u32>,
+        item_id: i64,
+        src: &Path,
+    ) -> Result<String, StartSessionError> {
+        start_replacing(reg, owner, account_id, limit, item_id, None, src)
+    }
+
+    /// [`start_copy`] with an explicit `replacesSessionId` (ADR-0034 item 8).
+    #[allow(clippy::too_many_arguments)]
+    fn start_replacing(
+        reg: &HlsSessionRegistry,
+        owner: &str,
+        account_id: i64,
+        limit: Option<u32>,
+        item_id: i64,
+        replaces: Option<&str>,
+        src: &Path,
+    ) -> Result<String, StartSessionError> {
+        reg.start(
+            SessionOwner::new(owner),
+            account_id,
+            limit,
+            replaces.map(str::to_string),
+            item_id,
+            src,
+            0,
+            FIXTURE_MS,
+            SessionMode::Copy,
+            stereo(),
+            vec![],
+            None,
+            None,
+            VideoEncodePlan::default(),
+            None,
+        )
+    }
+
+    /// The ceiling counts by account across every profile: a sibling profile
+    /// shares it, and a different account has its own.
+    #[test]
+    fn account_ceiling_counts_by_account_not_by_profile() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let held_dir = dir.path().join("held");
+        fs::create_dir_all(&held_dir).unwrap();
+        reg.sessions.lock().unwrap().insert(
+            "held".to_string(),
+            held_account_session(&held_dir, 7, "7:1", 1),
+        );
+
+        // A sibling profile on account 7 is still at the ceiling.
+        let refused = start_copy(&reg, "7:2", 7, Some(1), 2, &src);
+        assert!(
+            matches!(refused, Err(StartSessionError::AccountCeilingRefused)),
+            "{refused:?}"
+        );
+
+        // Account 8 has its own ceiling.
+        let admitted = start_copy(&reg, "8:1", 8, Some(1), 2, &src);
+        assert!(admitted.is_ok(), "{admitted:?}");
+        if let Ok(id) = admitted {
+            reg.stop(&id);
+        }
+    }
+
+    /// An explicit `replacesSessionId` on the same account, profile and item
+    /// transfers the account slot: the successor starts at a cap of one, the
+    /// predecessor loses playback authority, and it is torn down server-side
+    /// without a client DELETE.
+    #[test]
+    fn explicit_replacement_transfers_the_slot_and_retires_the_predecessor() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+
+        // A real incumbent holds the one slot.
+        let incumbent = start_copy(&reg, "7:1", 7, None, 1, &src).unwrap();
+        let owner = SessionOwner::new("7:1");
+        assert!(reg.is_owned_by(&incumbent, &owner));
+
+        let replacement = start_replacing(&reg, "7:1", 7, Some(1), 1, Some(&incumbent), &src);
+        let replacement = replacement.expect("the replacement takes the slot");
+        assert_ne!(replacement, incumbent);
+
+        // The predecessor lost playback authority and was torn down; it was not
+        // left for the client to DELETE.
+        assert!(
+            !reg.is_owned_by(&incumbent, &owner),
+            "a retired predecessor has no playback authority"
+        );
+        assert!(
+            reg.view(&incumbent).is_err(),
+            "a retired predecessor is gone, not serving"
+        );
+        assert!(
+            reg.view(&replacement).is_ok(),
+            "the successor serves in its place"
+        );
+        reg.stop(&replacement);
+    }
+
+    /// Without an explicit reference, a same-identity POST at the ceiling is a
+    /// new playback and must refuse. Same identity is authorization context,
+    /// not proof that two devices are one playback (fix round 1, item 1).
+    #[test]
+    fn a_reference_less_start_at_the_ceiling_refuses() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let incumbent = start_copy(&reg, "7:1", 7, None, 1, &src).unwrap();
+
+        // Same owner, same item, no `replacesSessionId`: still refused.
+        let refused = start_copy(&reg, "7:1", 7, Some(1), 1, &src);
+        assert!(
+            matches!(refused, Err(StartSessionError::AccountCeilingRefused)),
+            "{refused:?}"
+        );
+        reg.stop(&incumbent);
+    }
+
+    /// The predecessor must belong to the authenticated account and profile
+    /// and be on the same item. A mismatch is refused, and a missing or
+    /// already-retired predecessor is indistinguishable from another caller's.
+    #[test]
+    fn replacement_requires_the_same_account_profile_and_item() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let held_dir = dir.path().join("held");
+        fs::create_dir_all(&held_dir).unwrap();
+        reg.sessions.lock().unwrap().insert(
+            "held".to_string(),
+            held_account_session(&held_dir, 7, "7:1", 5),
+        );
+
+        // Another profile on the same account.
+        let wrong_profile = start_replacing(&reg, "7:2", 7, Some(1), 5, Some("held"), &src);
+        assert!(
+            matches!(wrong_profile, Err(StartSessionError::PredecessorNotFound)),
+            "{wrong_profile:?}"
+        );
+        // Another account.
+        let wrong_account = start_replacing(&reg, "7:1", 8, Some(1), 5, Some("held"), &src);
+        assert!(
+            matches!(wrong_account, Err(StartSessionError::PredecessorNotFound)),
+            "{wrong_account:?}"
+        );
+        // Same account and profile, different item.
+        let wrong_item = start_replacing(&reg, "7:1", 7, Some(1), 99, Some("held"), &src);
+        assert!(
+            matches!(wrong_item, Err(StartSessionError::PredecessorItemMismatch)),
+            "{wrong_item:?}"
+        );
+        // An unknown id.
+        let unknown = start_replacing(&reg, "7:1", 7, Some(1), 5, Some("nope"), &src);
+        assert!(
+            matches!(unknown, Err(StartSessionError::PredecessorNotFound)),
+            "{unknown:?}"
+        );
+        // None of the refusals touched the predecessor.
+        assert!(reg.is_owned_by("held", &SessionOwner::new("7:1")));
+    }
+
+    /// One predecessor has at most one pending replacement. A second successor
+    /// naming a predecessor already reserved by an in-flight start is refused.
+    #[test]
+    fn duplicate_pending_replacement_is_refused() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let held_dir = dir.path().join("held");
+        fs::create_dir_all(&held_dir).unwrap();
+        reg.sessions.lock().unwrap().insert(
+            "held".to_string(),
+            held_account_session(&held_dir, 7, "7:1", 5),
+        );
+        // Stand in for the first successor still in the spawn/insert gap.
+        reg.pending_replacements
+            .lock()
+            .unwrap()
+            .insert("held".to_string());
+
+        let refused = start_replacing(&reg, "7:1", 7, Some(1), 5, Some("held"), &src);
+        assert!(
+            matches!(refused, Err(StartSessionError::ReplacementAlreadyPending)),
+            "{refused:?}"
+        );
+        // The pending reservation is untouched by the refusal, so the in-flight
+        // successor still owns it.
+        assert!(reg.pending_replacements.lock().unwrap().contains("held"));
+    }
+
+    /// A successor that fails before insert releases its pending replacement
+    /// and leaves the predecessor playable. The retry succeeding is the
+    /// positive control that the first failure did not strand the reservation.
+    #[test]
+    fn a_failed_replacement_rolls_back_and_leaves_the_predecessor_playable() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let held_dir = dir.path().join("held");
+        fs::create_dir_all(&held_dir).unwrap();
+        reg.sessions.lock().unwrap().insert(
+            "held".to_string(),
+            held_account_session(&held_dir, 7, "7:1", 5),
+        );
+        let owner = SessionOwner::new("7:1");
+        // The successor's directory path is a file, so `create_dir_all` fails
+        // after the replacement reservation and before the insert.
+        fs::write(reg.root.join("s1"), b"not a directory").unwrap();
+
+        let failed = start_replacing(&reg, "7:1", 7, Some(1), 5, Some("held"), &src);
+        assert!(
+            matches!(failed, Err(StartSessionError::Spawn(_))),
+            "{failed:?}"
+        );
+        assert!(
+            reg.is_owned_by("held", &owner),
+            "a failed successor leaves the predecessor playable"
+        );
+        assert!(
+            reg.pending_replacements.lock().unwrap().is_empty(),
+            "the failed start released its pending replacement"
+        );
+
+        // Positive control: the same predecessor can be replaced once the
+        // obstacle is gone, so the reservation really was released.
+        fs::remove_file(reg.root.join("s1")).unwrap();
+        let retried = start_replacing(&reg, "7:1", 7, Some(1), 5, Some("held"), &src);
+        assert!(retried.is_ok(), "{retried:?}");
+        if let Ok(id) = retried {
+            reg.stop(&id);
+        }
+    }
+
+    /// A retired predecessor cannot be named again, so a replacement chain is
+    /// linear and one predecessor never accumulates successors or cleanup.
+    #[test]
+    fn replacement_chains_cannot_reuse_a_retired_predecessor() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let first = start_copy(&reg, "7:1", 7, None, 1, &src).unwrap();
+        let second = start_replacing(&reg, "7:1", 7, Some(1), 1, Some(&first), &src)
+            .expect("first replacement");
+        let third = start_replacing(&reg, "7:1", 7, Some(1), 1, Some(&second), &src)
+            .expect("chained replacement");
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+
+        // The oldest predecessor is retired and cannot be named again.
+        let reuse = start_replacing(&reg, "7:1", 7, Some(1), 1, Some(&first), &src);
+        assert!(
+            matches!(reuse, Err(StartSessionError::PredecessorNotFound)),
+            "{reuse:?}"
+        );
+        reg.stop(&third);
+    }
+
+    /// A start that fails before insert releases its reservation. The positive
+    /// control is the second start: it is admitted only because the failed
+    /// start did not leak the slot.
+    #[test]
+    fn a_failed_start_releases_the_account_reservation() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        // The first session's directory path is a file, so `create_dir_all`
+        // fails after the reservation and before the insert.
+        fs::write(reg.root.join("s1"), b"not a directory").unwrap();
+
+        let failed = start_copy(&reg, "7:1", 7, Some(1), 1, &src);
+        assert!(
+            matches!(failed, Err(StartSessionError::Spawn(_))),
+            "{failed:?}"
+        );
+
+        let admitted = start_copy(&reg, "7:1", 7, Some(1), 2, &src);
+        assert!(admitted.is_ok(), "{admitted:?}");
+        if let Ok(id) = admitted {
+            reg.stop(&id);
+        }
+    }
+
+    /// `stop` and the idle reaper both drop the account count, so the next
+    /// start is admitted again.
+    #[test]
+    fn stop_and_idle_reap_release_the_account_slot() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let first = start_copy(&reg, "7:1", 7, Some(1), 1, &src).unwrap();
+        let refused = start_copy(&reg, "7:1", 7, Some(1), 2, &src);
+        assert!(
+            matches!(refused, Err(StartSessionError::AccountCeilingRefused)),
+            "{refused:?}"
+        );
+        assert!(reg.stop(&first));
+        let after_stop = start_copy(&reg, "7:1", 7, Some(1), 2, &src);
+        assert!(after_stop.is_ok(), "{after_stop:?}");
+        if let Ok(id) = after_stop {
+            reg.stop(&id);
+        }
+
+        // Idle reap: an old idle clock takes the session and its slot.
+        let stale_dir = dir.path().join("stale");
+        fs::create_dir_all(&stale_dir).unwrap();
+        let mut stale = held_account_session(&stale_dir, 7, "7:1", 3);
+        stale.last_access = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("stale".to_string(), stale);
+        reg.reap_stale_sessions();
+        assert!(
+            reg.sessions.lock().unwrap().get("stale").is_none(),
+            "the idle session was reaped"
+        );
+        let after_reap = start_copy(&reg, "7:1", 7, Some(1), 4, &src);
+        assert!(after_reap.is_ok(), "{after_reap:?}");
+        if let Ok(id) = after_reap {
+            reg.stop(&id);
+        }
+    }
+
+    /// A seek restarts the encoder in place, so it never takes a second
+    /// account slot: the count is unchanged and an unrelated start still
+    /// refuses at the cap.
+    #[test]
+    fn a_seek_does_not_consume_a_second_account_slot() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let id = start_copy(&reg, "7:1", 7, Some(1), 1, &src).unwrap();
+        let _ = wait_playlist(&reg, &id);
+        let seeked = reg.seek(&id, 2_000);
+        assert!(seeked.is_ok(), "{seeked:?}");
+        assert_eq!(
+            reg.sessions.lock().unwrap().len(),
+            1,
+            "a seek reuses the session, not a second one"
+        );
+        let refused = start_copy(&reg, "7:1", 7, Some(1), 2, &src);
+        assert!(
+            matches!(refused, Err(StartSessionError::AccountCeilingRefused)),
+            "{refused:?}"
+        );
+        reg.stop(&id);
+    }
+
+    #[test]
+    fn a_null_account_limit_admits_every_session() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+        let held_dir = dir.path().join("held");
+        fs::create_dir_all(&held_dir).unwrap();
+        for i in 0..3 {
+            reg.sessions.lock().unwrap().insert(
+                format!("held{i}"),
+                held_account_session(&held_dir, 7, &format!("7:{i}"), i as i64),
+            );
+        }
+        let admitted = start_copy(&reg, "7:9", 7, None, 9, &src);
+        assert!(admitted.is_ok(), "{admitted:?}");
+        if let Ok(id) = admitted {
+            reg.stop(&id);
+        }
+    }
+
+    /// Lowering the cap does not evict an incumbent; it only refuses the next
+    /// start.
+    #[test]
+    fn lowering_the_cap_keeps_incumbents() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = HlsSessionRegistry::with_measured_admission(
+            dir.path().join("hls"),
+            "libx264",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let incumbent = start_copy(&reg, "7:1", 7, None, 1, &src).unwrap();
+        // A later start carries a strict cap; the incumbent is untouched.
+        let refused = start_copy(&reg, "7:1", 7, Some(1), 2, &src);
+        assert!(
+            matches!(refused, Err(StartSessionError::AccountCeilingRefused)),
+            "{refused:?}"
+        );
+        assert!(
+            reg.view(&incumbent).is_ok(),
+            "the incumbent keeps serving after the cap is lowered"
+        );
+        reg.stop(&incumbent);
+    }
+
+    /// The race, with its positive control stated: six starts cross one
+    /// barrier at a cap of one. The in-flight reservation is the only thing
+    /// that makes the count see the winner before it inserts; with the
+    /// reservation removed every thread would read zero live sessions and the
+    /// test would admit six.
+    #[test]
+    fn concurrent_starts_at_a_cap_admit_exactly_the_cap() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        make_fixture_secs(&src, 4);
+        let reg = Arc::new(
+            HlsSessionRegistry::with_measured_admission(
+                dir.path().join("hls"),
+                "libx264",
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let mut handles = Vec::new();
+        for i in 0..6i64 {
+            let reg = Arc::clone(&reg);
+            let src = src.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                start_copy(&reg, &format!("7:{i}"), 7, Some(1), 100 + i, &src)
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let admitted: Vec<&String> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "exactly the cap is admitted: {results:?}"
+        );
+        for id in admitted {
+            reg.stop(id);
+        }
     }
 
     /// A run advanced on one rung leaves every other rung's encoder alone.
@@ -8190,6 +9006,9 @@ mod tests {
         let mut session = Session {
             item_id: 1,
             owner: SessionOwner::new("test"),
+            account_id: 0,
+            account_slot_held: true,
+            retired: false,
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -8361,6 +9180,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -8407,6 +9229,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 play_ms,
@@ -8454,6 +9279,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -8556,6 +9384,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -8622,6 +9453,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -8692,6 +9526,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -8797,6 +9634,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 20_000,
@@ -8870,6 +9710,9 @@ mod tests {
         let prior = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -8888,6 +9731,9 @@ mod tests {
         let switched = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 play_ms,
@@ -9002,6 +9848,9 @@ mod tests {
         let switched = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 40_000,
@@ -9077,6 +9926,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 play_ms,
@@ -9118,6 +9970,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -9233,6 +10088,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &corpus,
                 0,
@@ -9379,6 +10237,9 @@ mod tests {
             let id = reg
                 .start(
                     SessionOwner::new("test"),
+                    0,
+                    None,
+                    None,
                     1,
                     &corpus,
                     0,
@@ -9487,6 +10348,9 @@ mod tests {
                 let id = reg
                     .start(
                         SessionOwner::new("test"),
+                        0,
+                        None,
+                        None,
                         1,
                         &corpus,
                         0,
@@ -9563,6 +10427,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -9613,6 +10480,9 @@ mod tests {
         let a = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -9629,6 +10499,9 @@ mod tests {
         let b = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -9646,6 +10519,9 @@ mod tests {
         assert!(matches!(
             reg.start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 2,
                 &src,
                 0,
@@ -9683,6 +10559,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -9725,6 +10604,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -10030,6 +10912,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -10500,6 +11385,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &corpus,
                 0,
@@ -10556,6 +11444,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -10639,6 +11530,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &corpus,
                 0,
@@ -10681,6 +11575,9 @@ mod tests {
         let session = Session {
             item_id: 33,
             owner: SessionOwner::new("test"),
+            account_id: 0,
+            account_slot_held: true,
+            retired: false,
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -10759,6 +11656,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -10935,6 +11835,9 @@ mod tests {
         let mut session = Session {
             item_id: 8519,
             owner: SessionOwner::new("test"),
+            account_id: 0,
+            account_slot_held: true,
+            retired: false,
             src: PathBuf::from("/dev/null"),
             dir: dir.path().to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -10991,6 +11894,9 @@ mod tests {
         Session {
             item_id: 8519,
             owner: SessionOwner::new("test"),
+            account_id: 0,
+            account_slot_held: true,
+            retired: false,
             src: PathBuf::from("/dev/null"),
             dir: dir.to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -11107,6 +12013,9 @@ mod tests {
         let mut session = Session {
             item_id: 1,
             owner: SessionOwner::new("test"),
+            account_id: 0,
+            account_slot_held: true,
+            retired: false,
             src: PathBuf::from("/dev/null"),
             dir: session_dir.to_path_buf(),
             run_cache_budget_bytes: SESSION_RUN_CACHE_BUDGET_BYTES,
@@ -11479,6 +12388,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -11532,6 +12444,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 8000,
@@ -11580,6 +12495,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 4000,
@@ -11618,6 +12536,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -11674,6 +12595,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -11719,6 +12643,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -11763,6 +12690,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -11810,6 +12740,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -11880,6 +12813,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -11976,6 +12912,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 8000,
@@ -12039,6 +12978,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 8000,
@@ -12103,6 +13045,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 8000,
@@ -12207,6 +13152,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 2000,
@@ -12267,6 +13215,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 2000,
@@ -12329,6 +13280,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 0,
@@ -12383,6 +13337,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 &src,
                 6000,
@@ -12504,6 +13461,9 @@ mod tests {
         let id = reg
             .start(
                 SessionOwner::new("test"),
+                0,
+                None,
+                None,
                 1,
                 src,
                 request_ms,

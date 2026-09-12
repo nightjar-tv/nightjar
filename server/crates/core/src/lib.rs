@@ -13,10 +13,11 @@ pub use filename::{
 };
 pub use models::{LibraryKind, MediaKind, Role};
 pub use playback::{
-    AETHER_V0, BROWSER_V0, ClientCapabilityProfile, HdrCapability, MEDIA3_V0, MPV_V0,
-    PlaybackDecision, PlaybackMethod, VideoEncodePlan, decide_playback, is_dolby_vision_profile5,
-    known_profile, method_from_manifest_expect, mime_for_path, needs_standalone_subtitle_extract,
-    resolve_profile, resolve_profile_bag, video_encode_plan,
+    AETHER_V0, AccountPlaybackPolicy, BROWSER_V0, ClientCapabilityProfile, ClientOrigin,
+    HdrCapability, MEDIA3_V0, MPV_V0, PlaybackCeilings, PlaybackDecision, PlaybackMethod,
+    VideoEncodePlan, classify_client_origin, compose_playback_ceilings, decide_playback,
+    is_dolby_vision_profile5, known_profile, method_from_manifest_expect, mime_for_path,
+    needs_standalone_subtitle_extract, resolve_profile, resolve_profile_bag, video_encode_plan,
 };
 pub use scan_progress::{
     IndexPass, PROBE_BAR_MIN_QUEUE_DEPTH, ProgressDisplay, metadata_display, probe_display,

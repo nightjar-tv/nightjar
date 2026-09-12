@@ -9,7 +9,8 @@ use axum::{
     response::Response,
 };
 use nightjar_core::{
-    BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, TrackCandidate,
+    AccountPlaybackPolicy, BROWSER_V0, ClientCapabilityProfile, PlaybackCeilings, PlaybackDecision,
+    PlaybackMethod, TrackCandidate, classify_client_origin, compose_playback_ceilings,
     decide_playback, known_profile, needs_standalone_subtitle_extract, resolve_profile_bag,
     title_looks_forced, title_looks_sdh,
 };
@@ -205,6 +206,13 @@ pub struct PlaybackInfoDto {
     /// Why a subtitle track was selected, or why none was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_reason: Option<String>,
+    /// The account policy bitrate ceiling, surfaced whether or not applied
+    /// (ADR-0022 §5 as amended 2026-09-12). Absent means no account ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_max_bitrate_bps: Option<i64>,
+    /// The account policy height ceiling, surfaced whether or not applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_max_height: Option<i64>,
 }
 
 pub async fn get(
@@ -331,6 +339,47 @@ pub fn profile_from_query(
     resolve_profile_bag(profile_id, max_bitrate_bps, max_height, hdr)
 }
 
+/// Load the account's playback-policy ceilings (ADR-0022 §5 as amended
+/// 2026-09-12, ADR-0034 item 8). Null columns become `None`.
+pub(crate) fn account_playback_policy(
+    state: &AppState,
+    account_id: i64,
+) -> ApiResult<AccountPlaybackPolicy> {
+    let account = state
+        .db
+        .with_conn(|conn| nightjar_db::account_by_id(conn, account_id))
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal(format!("account {account_id} not found")))?;
+    Ok(AccountPlaybackPolicy {
+        max_concurrent_sessions: account
+            .max_concurrent_sessions
+            .and_then(|v| u32::try_from(v).ok()),
+        max_bitrate_bps: account.max_bitrate_bps.and_then(|v| u64::try_from(v).ok()),
+        max_height: account.max_height.and_then(|v| u32::try_from(v).ok()),
+    })
+}
+
+/// The one capability/policy composition, applied to a capability profile
+/// (ADR-0022 §5 as amended 2026-09-12). Shared by playback-info, `/stream` and
+/// session start, so all three agree on the effective ceiling.
+///
+/// The origin comes from the single unknown-as-local classifier, so the policy
+/// half is surfaced and not applied, and no request header can change that. A
+/// wider capability query cannot widen the applied ceiling either, because the
+/// composition only ever narrows.
+pub(crate) fn apply_playback_policy(
+    capability: ClientCapabilityProfile,
+    policy: AccountPlaybackPolicy,
+) -> (ClientCapabilityProfile, PlaybackCeilings) {
+    let ceilings = compose_playback_ceilings(&capability, policy, classify_client_origin());
+    let effective = ClientCapabilityProfile {
+        max_bitrate_bps: ceilings.max_bitrate_bps,
+        max_height: ceilings.max_height,
+        ..capability
+    };
+    (effective, ceilings)
+}
+
 pub async fn playback_info(
     State(state): State<AppState>,
     caller: Caller,
@@ -340,7 +389,13 @@ pub async fn playback_info(
     // Every step below blocks: two DB reads, and `subtitle_tracks_for` /
     // `audio_tracks_for` each wait on an ffprobe child reading over SMB.
     blocking(move || {
-        playback_info_blocking(state, item_id, query, caller.session.active_profile_id)
+        playback_info_blocking(
+            state,
+            item_id,
+            query,
+            caller.session.active_profile_id,
+            caller.session.account_id,
+        )
     })
     .await
 }
@@ -350,18 +405,21 @@ fn playback_info_blocking(
     item_id: i64,
     query: ProfileQuery,
     profile_id: Option<i64>,
+    account_id: i64,
 ) -> ApiResult<Json<PlaybackInfoDto>> {
     let row = state
         .db
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let profile = profile_from_query(
+    let capability = profile_from_query(
         query.profile_id.as_deref(),
         query.max_bitrate_bps,
         query.max_height,
         query.hdr.as_deref(),
     );
+    let policy = account_playback_policy(&state, account_id)?;
+    let (profile, ceilings) = apply_playback_policy(capability, policy);
     let decision = decide(&row, &profile, state.tonemap_available);
     let root = library_root(&state, row.library_id)?;
     let abs = abs_path(&root, &row.path);
@@ -474,6 +532,8 @@ fn playback_info_blocking(
         subtitle_tracks,
         audio_reason: Some(audio_selection.reason),
         subtitle_reason: Some(subtitle_selection.reason),
+        policy_max_bitrate_bps: ceilings.policy_max_bitrate_bps.map(|v| v as i64),
+        policy_max_height: ceilings.policy_max_height.map(|v| v as i64),
     }))
 }
 
@@ -856,5 +916,231 @@ mod playback_info_reason_tests {
         let audio = non_empty_string(&body, "audioReason");
         let subtitle = non_empty_string(&body, "subtitleReason");
         assert_ne!(audio, subtitle, "each axis explains itself: {body}");
+    }
+}
+
+/// The one capability/policy composition through the real router (ADR-0022 §5
+/// as amended 2026-09-12). The account policy is surfaced and not applied,
+/// because the single classifier is unknown-as-local; a capability query still
+/// narrows the applied ceiling, and forwarding headers change neither.
+#[cfg(test)]
+mod policy_composition_router_tests {
+    use crate::routes::router;
+    use crate::state::{AppState, test_support};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use nightjar_auth::mint_session_token;
+    use nightjar_db::{NewLibrary, ProbeUpdate, UpsertItem};
+    use tower::ServiceExt;
+
+    /// One account with one profile-scoped session. `policy` sets the account
+    /// bitrate/height ceilings, or leaves all three null.
+    fn profile_token(state: &AppState, username: &str, policy: Option<(i64, i64)>) -> String {
+        let minted = mint_session_token();
+        let profile_ref = format!("{username:0<32}");
+        state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                let (account_id, profile_id) = nightjar_db::create_account_with_profile(
+                    conn,
+                    username,
+                    &hash,
+                    "member",
+                    "P",
+                    &profile_ref,
+                )?;
+                if let Some((bitrate, height)) = policy {
+                    nightjar_db::update_account_playback_policy(
+                        conn,
+                        account_id,
+                        None,
+                        Some(bitrate),
+                        Some(height),
+                    )?;
+                }
+                let expires = nightjar_db::session_expiry(conn)?;
+                let session = nightjar_db::create_session(
+                    conn,
+                    account_id,
+                    &minted.sha256_hex,
+                    "t",
+                    &expires,
+                )?;
+                nightjar_db::set_active_profile(conn, session, Some(profile_id))?;
+                Ok(())
+            })
+            .unwrap();
+        minted.plaintext
+    }
+
+    /// A library, a probed h264/aac/mp4 item that direct-plays, and the bytes
+    /// `/stream` serves.
+    fn seed_direct_play_item(state: &AppState, dir: &std::path::Path) -> i64 {
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "movies".to_string(),
+                path: dir.to_string_lossy().into_owned(),
+                kind: "movies".to_string(),
+            })
+            .unwrap();
+        let ids = state
+            .db
+            .upsert_items_indexed(
+                library.id,
+                &[UpsertItem {
+                    path: "movie.mp4".to_string(),
+                    mtime_ms: 0,
+                    size_bytes: 1,
+                    title: "movie".to_string(),
+                    kind: "movie".to_string(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        state
+            .db
+            .apply_probe_update(&ProbeUpdate {
+                item_id,
+                duration_ms: Some(4_000),
+                container: Some("mp4".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+                audio_channels: Some(2),
+                width: Some(1920),
+                height: Some(1080),
+                video_bitrate_bps: Some(40_000_000),
+                video_frame_rate_num: Some(24),
+                video_frame_rate_den: Some(1),
+                hdr: None,
+                probe_status: "probed".to_string(),
+                scan_error: None,
+            })
+            .unwrap();
+        std::fs::write(dir.join("movie.mp4"), b"enough bytes to serve a range").unwrap();
+        item_id
+    }
+
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        token: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = router(state.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        (status, text)
+    }
+
+    #[tokio::test]
+    async fn playback_info_surfaces_the_policy_and_stays_advisory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let item_id = seed_direct_play_item(&state, dir.path());
+        let capped = profile_token(&state, "capped", Some((8_000_000, 480)));
+        let uncapped = profile_token(&state, "uncapped", None);
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/api/v0/items/{item_id}/playback-info"),
+            &capped,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"policyMaxBitrateBps\":8000000"), "{body}");
+        assert!(body.contains("\"policyMaxHeight\":480"), "{body}");
+        // Advisory: the account cap did not force a session.
+        assert!(body.contains("\"playbackMethod\":\"directPlay\""), "{body}");
+
+        // Null ceilings are absent, the same shape as the account response.
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/api/v0/items/{item_id}/playback-info"),
+            &uncapped,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("policyMaxBitrateBps"), "{body}");
+        assert!(!body.contains("policyMaxHeight"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn stream_is_advisory_for_policy_and_enforces_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let item_id = seed_direct_play_item(&state, dir.path());
+        let token = profile_token(&state, "capped", Some((8_000_000, 480)));
+        let stream = format!("/api/v0/items/{item_id}/stream");
+
+        // The account cap does not stop a direct byte serve: advisory.
+        let (status, body) = call(&state, "GET", &stream, &token, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // A capability query ceiling below the source height still forces the
+        // existing typed 415 session-required response.
+        let capped_stream = format!("{stream}?maxHeight=480");
+        let (status, body) = call(&state, "GET", &capped_stream, &token, &[]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+
+        // A forwarding header cannot activate the remote policy half, so the
+        // uncapped byte serve is unchanged.
+        let (status, body) = call(
+            &state,
+            "GET",
+            &stream,
+            &token,
+            &[
+                ("x-forwarded-for", "203.0.113.7"),
+                ("forwarded", "for=203.0.113.7"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn session_start_is_advisory_for_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let item_id = seed_direct_play_item(&state, dir.path());
+        let token = profile_token(&state, "capped", Some((8_000_000, 480)));
+
+        // The account cap did not turn direct play into a session, so the
+        // route answers the existing "does not need a session" 415. A remote
+        // classifier would have started a session here.
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/api/v0/items/{item_id}/sessions"),
+            &token,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+        assert!(body.contains("does not need a session"), "{body}");
     }
 }

@@ -74,6 +74,11 @@ pub struct AccountRow {
     /// way `libraries.kind` is parsed to `LibraryKind` at the route.
     pub role: String,
     pub max_concurrent_sessions: Option<i64>,
+    /// Account policy bitrate ceiling; null means no ceiling (ADR-0022 §5 as
+    /// amended 2026-09-12). Advisory until trusted-proxy work lands.
+    pub max_bitrate_bps: Option<i64>,
+    /// Account policy height ceiling; null means no ceiling.
+    pub max_height: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +197,8 @@ pub fn account_by_username(
     username: &str,
 ) -> Result<Option<AccountRow>, String> {
     conn.query_row(
-        "SELECT id, username, password_hash, role, max_concurrent_sessions
+        "SELECT id, username, password_hash, role, max_concurrent_sessions,
+                max_bitrate_bps, max_height
          FROM accounts WHERE username = ?1 COLLATE NOCASE",
         params![username],
         map_account,
@@ -203,7 +209,8 @@ pub fn account_by_username(
 
 pub fn account_by_id(conn: &Connection, id: i64) -> Result<Option<AccountRow>, String> {
     conn.query_row(
-        "SELECT id, username, password_hash, role, max_concurrent_sessions
+        "SELECT id, username, password_hash, role, max_concurrent_sessions,
+                max_bitrate_bps, max_height
          FROM accounts WHERE id = ?1",
         params![id],
         map_account,
@@ -215,7 +222,8 @@ pub fn account_by_id(conn: &Connection, id: i64) -> Result<Option<AccountRow>, S
 pub fn list_accounts(conn: &Connection) -> Result<Vec<AccountRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, username, password_hash, role, max_concurrent_sessions
+            "SELECT id, username, password_hash, role, max_concurrent_sessions,
+                    max_bitrate_bps, max_height
              FROM accounts ORDER BY id",
         )
         .map_err(|e| format!("prepare list accounts: {e}"))?;
@@ -236,6 +244,8 @@ fn map_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
         password_hash: r.get(2)?,
         role: r.get(3)?,
         max_concurrent_sessions: r.get(4)?,
+        max_bitrate_bps: r.get(5)?,
+        max_height: r.get(6)?,
     })
 }
 
@@ -431,6 +441,32 @@ pub fn set_role(conn: &Connection, account_id: i64, role: &str) -> Result<(), St
         params![account_id, role],
     )
     .map_err(|e| format!("set role: {e}"))?;
+    Ok(())
+}
+
+/// Replace an account's three playback-policy ceilings (ADR-0034 item 8,
+/// ADR-0022 §5 as amended 2026-09-12). Full replacement: `None` clears the
+/// ceiling. Positivity is the migration CHECK; a caller validating shape is
+/// the route's job.
+pub fn update_account_playback_policy(
+    conn: &Connection,
+    account_id: i64,
+    max_concurrent_sessions: Option<i64>,
+    max_bitrate_bps: Option<i64>,
+    max_height: Option<i64>,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE accounts
+            SET max_concurrent_sessions = ?2, max_bitrate_bps = ?3, max_height = ?4
+          WHERE id = ?1",
+        params![
+            account_id,
+            max_concurrent_sessions,
+            max_bitrate_bps,
+            max_height
+        ],
+    )
+    .map_err(|e| format!("update account playback policy: {e}"))?;
     Ok(())
 }
 
@@ -657,10 +693,72 @@ mod tests {
         assert!(!profiles[0].simple_interface);
     }
 
-    /// The account insert is first, so a duplicate username never reaches the
-    /// OPEN-DEFECTS entry 14, the uniqueness half. `Root` and `root` were two
-    /// accounts and the `UNIQUE` constraint did not stop it, because migration
-    /// 020 gave the column no collation.
+    /// B2-9 (ADR-0034 item 8, ADR-0022 §5 as amended): the three account
+    /// policy ceilings are nullable positive integers. Fresh accounts default
+    /// to null, positive values round-trip, null clears, and each column's
+    /// CHECK rejects zero and negatives. The negative case per column is the
+    /// point: a constraint that only rejected one column would pass a test
+    /// that tried one value.
+    #[test]
+    fn account_playback_policy_defaults_null_and_constrains_positivity() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate(&conn).unwrap();
+        create_account_with_profile(&conn, "a", "h", "owner", "P", "r0").unwrap();
+        let account = account_by_username(&conn, "a").unwrap().unwrap();
+
+        // Null is the shipped default for all three, not a machine guess.
+        assert_eq!(account.max_concurrent_sessions, None);
+        assert_eq!(account.max_bitrate_bps, None);
+        assert_eq!(account.max_height, None);
+
+        // Positive values round-trip.
+        update_account_playback_policy(&conn, account.id, Some(3), Some(8_000_000), Some(1080))
+            .unwrap();
+        let round = account_by_id(&conn, account.id).unwrap().unwrap();
+        assert_eq!(round.max_concurrent_sessions, Some(3));
+        assert_eq!(round.max_bitrate_bps, Some(8_000_000));
+        assert_eq!(round.max_height, Some(1080));
+
+        // Null clears every ceiling again.
+        update_account_playback_policy(&conn, account.id, None, None, None).unwrap();
+        let cleared = account_by_id(&conn, account.id).unwrap().unwrap();
+        assert_eq!(cleared.max_concurrent_sessions, None);
+        assert_eq!(cleared.max_bitrate_bps, None);
+        assert_eq!(cleared.max_height, None);
+
+        // Each constraint rejects zero and negatives.
+        for column in ["max_concurrent_sessions", "max_bitrate_bps", "max_height"] {
+            for bad in [0i64, -1] {
+                let sql = format!("UPDATE accounts SET {column} = ?1 WHERE id = ?2");
+                assert!(
+                    conn.execute(&sql, params![bad, account.id]).is_err(),
+                    "{column} = {bad} must be refused by the CHECK"
+                );
+            }
+        }
+
+        // The concurrency column carries the enforcement path's `u32` bound, so
+        // a value the boundary would reject cannot be stored either. The
+        // maximum itself is accepted, which proves a bound rather than a
+        // blanket refusal.
+        let set_concurrency = |value: i64| {
+            conn.execute(
+                "UPDATE accounts SET max_concurrent_sessions = ?1 WHERE id = ?2",
+                params![value, account.id],
+            )
+        };
+        assert!(
+            set_concurrency(i64::from(u32::MAX)).is_ok(),
+            "the u32 maximum is a legal concurrency ceiling"
+        );
+        assert!(
+            set_concurrency(i64::from(u32::MAX) + 1).is_err(),
+            "one above the u32 maximum must be refused"
+        );
+        update_account_playback_policy(&conn, account.id, None, None, None).unwrap();
+    }
+
     #[test]
     fn two_usernames_differing_only_in_case_cannot_both_exist() {
         let conn = Connection::open_in_memory().unwrap();
