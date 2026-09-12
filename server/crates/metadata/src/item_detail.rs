@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::artwork::resolve_artwork_key;
 use crate::canonical::get_canonical;
 use crate::item_links::{
-    EPISODE_KEY_PREFIX, MOVIE_KEY_PREFIX, SHOW_KEY_PREFIX, effective_item_key,
+    EPISODE_KEY_PREFIX, MOVIE_KEY_PREFIX, SHOW_KEY_PREFIX, effective_item_key, series_key_for_item,
 };
 use crate::model::{ArtworkKind, CanonicalMetadata, CastMember, Rating};
 
@@ -71,13 +71,26 @@ pub fn item_metadata(
     relpath: &str,
 ) -> Result<ItemMetadata, String> {
     let item_key = effective_item_key(conn, media_item_id, library_id, relpath)?;
+    // ADR-0039 item 5: the series key comes from the one resolver, for a movie
+    // and an episode alike, matched or unmatched. It follows the folder
+    // binding, which is the edge this response's link back uses; the entity
+    // edge below still owns the facts and the artwork (ADR-0039 item 6).
+    let (kind, library_path) = series_context(conn, media_item_id)?;
+    let series_key = series_key_for_item(
+        conn,
+        media_item_id,
+        library_id,
+        relpath,
+        &library_path,
+        &kind,
+    )?;
     let Some((entity_kind, provider_id)) = provider_entity(&item_key) else {
         // ADR-0029 §1.3: no provider entity, no canonical row. The client falls
         // back to the scan fields already on the response.
-        return unmatched(conn, item_key);
+        return unmatched(conn, item_key, series_key);
     };
     let Some(own) = get_canonical(conn, "tmdb", entity_kind, &provider_id)? else {
-        return unmatched(conn, item_key);
+        return unmatched(conn, item_key, series_key);
     };
 
     let show = show_row_for_episode(conn, entity_kind, &provider_id)?;
@@ -103,9 +116,23 @@ pub fn item_metadata(
         // inherit: a show's score is not this episode's score.
         ratings: own.ratings,
         artwork,
-        series_key: show_key,
+        series_key: Some(series_key),
         show_title: show_meta.map(|m| m.title.clone()),
     })
+}
+
+/// The scan kind and library root [`series_key_for_item`] needs. One read,
+/// because an episode's key derives from its show folder and a movie's from its
+/// own item key, and those two questions need different columns.
+fn series_context(conn: &Connection, media_item_id: i64) -> Result<(String, String), String> {
+    conn.query_row(
+        "SELECT m.kind, l.path FROM media_items m
+         JOIN libraries l ON l.id = m.library_id
+         WHERE m.id = ?1",
+        params![media_item_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(|e| format!("series context for item {media_item_id}: {e}"))
 }
 
 /// An item with no canonical row: a key, whatever art the serve path can find,
@@ -116,10 +143,15 @@ pub fn item_metadata(
 /// the grid already renders posters from, so returning an empty array here
 /// would advertise "this title has none" about images the very next request
 /// serves.
-fn unmatched(conn: &Connection, item_key: String) -> Result<ItemMetadata, String> {
+fn unmatched(
+    conn: &Connection,
+    item_key: String,
+    series_key: String,
+) -> Result<ItemMetadata, String> {
     let artwork = advertised_artwork(conn, &item_key)?;
     Ok(ItemMetadata {
         item_key,
+        series_key: Some(series_key),
         artwork,
         ..ItemMetadata::default()
     })
@@ -225,6 +257,11 @@ mod tests {
                     (9, 2, 'Mystery Folder/e1.mkv', 1, 1, 'e1', 'episode', NULL, NULL),
                     (20, 1, 'Fight Club (1999)/f.mkv', 1, 1, 'Fight Club', 'movie', NULL, NULL);
 
+             -- The folder binding ADR-0039 item 5 resolves an episode's series
+             -- key from. Mystery Folder has no row, so it keys as a folder.
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (2, 'Futurama', 615);
+
              INSERT INTO metadata_canonical
                   (provider, entity_kind, provider_id, title, year, plot, runtime_minutes,
                    genres_json, cast_json, ratings_json, artwork_json, ids_json, projected_at,
@@ -276,9 +313,11 @@ mod tests {
         // Not inherited: a show's score is not this episode's score.
         assert_eq!(meta.ratings.len(), 1);
         assert_eq!(meta.ratings[0].value, 8.1);
-        // Art follows the entity edge and is served under the show's key.
+        // The series key follows the folder binding, which is the link-back
+        // edge (ADR-0039 item 5); the art below follows the entity edge.
         assert_eq!(meta.series_key.as_deref(), Some("tmdb:show:615"));
         assert_eq!(meta.show_title.as_deref(), Some("Futurama"));
+
         assert_eq!(
             meta.artwork,
             vec![
@@ -304,8 +343,9 @@ mod tests {
         assert_eq!(meta.genres, vec!["Drama"]);
         assert_eq!(meta.ratings[0].source, "imdb");
         assert_eq!(meta.ratings[0].votes, Some(993_807));
-        // A movie has no parent to inherit from and no series to link to.
-        assert_eq!(meta.series_key, None);
+        // A movie is a series of one, so its series key is its own item key
+        // (ADR-0039 item 2) rather than absent.
+        assert_eq!(meta.series_key.as_deref(), Some("tmdb:movie:550"));
         assert_eq!(meta.artwork.len(), 1);
         assert_eq!(meta.artwork[0].item_key, "tmdb:movie:550");
     }
@@ -324,7 +364,9 @@ mod tests {
         assert_eq!(meta.title, None);
         assert!(meta.genres.is_empty());
         assert!(meta.artwork.is_empty());
-        assert_eq!(meta.series_key, None);
+        // No link and no binding, so the resolver gives the folder key: an
+        // unmatched episode still has a series to sit in (ADR-0039 item 3).
+        assert_eq!(meta.series_key.as_deref(), Some("folder:2:Mystery Folder"));
     }
 
     /// An episode matched at show level but not yet season-bound: the effective

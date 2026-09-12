@@ -695,13 +695,18 @@ fn series_bindings(conn: &Connection, library_id: i64) -> Result<HashMap<String,
         .map_err(|e| format!("prepare series bindings: {e}"))?;
     let rows = stmt
         .query_map(params![library_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
         })
         .map_err(|e| format!("query series bindings: {e}"))?;
     let mut out = HashMap::new();
     for row in rows {
         let (relpath, show_id) = row.map_err(|e| format!("series binding row: {e}"))?;
-        out.insert(relpath, show_id);
+        // A row with a null `tmdb_show_id` is a folder that has formed a group
+        // and has no entity yet (ADR-0039 item 3). It is not a binding, so it
+        // is left out and the folder keys as `folder:{library}:{relpath}`.
+        if let Some(show_id) = show_id {
+            out.insert(relpath, show_id);
+        }
     }
     Ok(out)
 }

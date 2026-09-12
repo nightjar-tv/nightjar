@@ -258,6 +258,11 @@ pub fn assign<T: MetadataSource, A: ArtworkInvalidate>(
                 .map_err(|e| format!("begin assign tx: {e}"))?;
             clear_all_links_for_media_item(&tx, item.id)?;
             upsert_link(&tx, item.id, &key, true)?;
+            // ADR-0039 item 7, movie direction: a movie's series key is its
+            // item key, so this bind changes both and runs both migrators over
+            // the same value in the same transaction. The tables the series
+            // migrator rewrites do not exist yet, so this no-ops today.
+            migrator::migrate_series_keys(&tx, &old_effective, &key)?;
             tx.commit().map_err(|e| format!("commit assign: {e}"))?;
             (key, meta)
         }
