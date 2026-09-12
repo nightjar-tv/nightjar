@@ -991,6 +991,92 @@ fn nfo_08_manual_assign_records_manually_matched_and_migrates_watch() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// ADR-0039 item 7, movie direction, production path: a manual movie assign
+/// changes the movie's series key (its item key), so the assign must run the
+/// series migrator in the same transaction. The migrator no-ops while no
+/// series-keyed table exists, so a table that *does* exist is what makes the
+/// call observable: `migrate_series_keys` refuses a declared table with no
+/// merge rule, and only an assign that actually reaches it returns that error.
+/// Asserting the assign succeeds would pass whether or not the call is wired.
+#[test]
+fn nfo_09_movie_assign_runs_the_series_key_migrator() {
+    test_fixture::reset();
+    register_case_routes("NFO-08");
+    let root = test_root("nfo_09_assign_series_migrator");
+    let conn = open_db(&root);
+    let lib = root.join("L");
+    std::fs::create_dir_all(&lib).unwrap();
+    let (item, _old_key) = seed_nfo08(&conn, &lib);
+    let _ = run_drain(&conn, &fixture_client());
+    assert_eq!(status(&conn, item).as_deref(), Some("unmatched"));
+
+    conn.execute_batch("CREATE TABLE kids_overrides (profile_id INTEGER, series_key TEXT)")
+        .unwrap();
+
+    let client = fixture_client();
+    let resolver = Resolver { tmdb: &client };
+    let err = assign(
+        &conn,
+        &resolver,
+        &client,
+        &NoopArtwork,
+        &AssignRequest {
+            media_item_id: item,
+            kind: "movie".into(),
+            tmdb_id: 9200008,
+        },
+    )
+    .expect_err("a movie assign must call the series-key migrator");
+    assert!(
+        err.contains("kids_overrides"),
+        "the assign reached the series migrator, which refused the table: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The other movie owner that already migrates the item key: the complete-NFO
+/// path. Same proof shape as the assign test — a present `kids_overrides`
+/// table turns the series migrator's no-op into a loud refusal, so the drain
+/// errors only if this path calls it.
+#[test]
+fn nfo_09_nfo_ready_runs_the_series_key_migrator() {
+    test_fixture::reset();
+    register_case_routes("NFO-08");
+    let root = test_root("nfo_09_ready_series_migrator");
+    let conn = open_db(&root);
+    let lib = root.join("L");
+    std::fs::create_dir_all(&lib).unwrap();
+    let (item, _old_key) = seed_nfo08(&conn, &lib);
+    write_sidecar(
+        &lib,
+        &case_folder("NFO-08"),
+        &case_media_path("NFO-08"),
+        &fixture_bytes("xml/NFO-08/corrected-body.nfo"),
+    );
+    retry_unmatched(&conn, item).expect("retry_unmatched must not error");
+
+    conn.execute_batch("CREATE TABLE kids_overrides (profile_id INTEGER, series_key TEXT)")
+        .unwrap();
+
+    let client = fixture_client();
+    let resolver = Resolver { tmdb: &client };
+    let err = drain_pending(
+        &conn,
+        &resolver,
+        &AtomicU64::new(0),
+        &AtomicU64::new(0),
+        DrainOptions::default(),
+    )
+    .expect_err("the complete-NFO path must call the series-key migrator");
+    assert!(
+        err.contains("kids_overrides"),
+        "the drain reached the series migrator, which refused the table: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- negative provider control ----------------------------------------------
 
 #[test]

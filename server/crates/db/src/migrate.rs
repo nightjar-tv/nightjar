@@ -75,6 +75,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/025_accounts_username_case_insensitive.sql"),
     ),
     (26, include_str!("../migrations/026_watch_state.sql")),
+    (
+        27,
+        include_str!("../migrations/027_series_binding_without_entity.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -108,6 +112,20 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         } else {
             0
         };
+        // 027 rebuilds `series`. A rebuild is the one migration shape that can
+        // silently lose rows, so both it and the `series_entity_bindings` rows
+        // that cascade from it are counted either side, the same guard 6 and 12
+        // carry.
+        let before_series = if version == 27 {
+            count_table(conn, "series")?
+        } else {
+            0
+        };
+        let before_bindings = if version == 27 {
+            count_table(conn, "series_entity_bindings")?
+        } else {
+            0
+        };
         // Migration 25 adds a case-insensitive unique index over `username`.
         // If an install already holds two accounts differing only in case the
         // index cannot be built, and SQLite would say so as
@@ -116,6 +134,21 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         if version == 25 {
             refuse_colliding_usernames(conn)?;
         }
+
+        // Migration 27 rebuilds `series`, which `series_entity_bindings`
+        // references ON DELETE CASCADE. With foreign keys live, the rebuild's
+        // `DROP TABLE series` performs an implicit delete and takes every
+        // binding with it. SQLite's table-rebuild procedure turns the pragma
+        // off *outside* the transaction — it is a no-op inside one, which is
+        // the constraint migration 025's comment names — so it is turned off
+        // here and restored after the commit.
+        let restore_foreign_keys = if version == 27 && foreign_keys_enabled(conn)? {
+            conn.execute_batch("PRAGMA foreign_keys=OFF;")
+                .map_err(|e| format!("disable foreign keys for migration 27: {e}"))?;
+            true
+        } else {
+            false
+        };
 
         let tx = conn
             .unchecked_transaction()
@@ -158,6 +191,21 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             derive_series_rows(&tx)?;
         }
 
+        if version == 27 {
+            let after_series = count_table(&tx, "series")?;
+            let after_bindings = count_table(&tx, "series_entity_bindings")?;
+            if after_series != before_series {
+                return Err(format!(
+                    "migration 27 aborted: series count {before_series} -> {after_series}"
+                ));
+            }
+            if after_bindings != before_bindings {
+                return Err(format!(
+                    "migration 27 aborted: series_entity_bindings count {before_bindings} -> {after_bindings}"
+                ));
+            }
+        }
+
         tx.execute(
             "INSERT INTO schema_migrations (version) VALUES (?1)",
             [version],
@@ -165,6 +213,10 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("record migration {version}: {e}"))?;
         tx.commit()
             .map_err(|e| format!("commit migration {version}: {e}"))?;
+        if restore_foreign_keys {
+            conn.execute_batch("PRAGMA foreign_keys=ON;")
+                .map_err(|e| format!("restore foreign keys after migration 27: {e}"))?;
+        }
         tracing::info!(version, "applied database migration");
     }
     Ok(())
@@ -345,6 +397,15 @@ fn count_table(conn: &Connection, table: &str) -> Result<i64, String> {
         .map_err(|e| format!("count {table}: {e}"))
 }
 
+/// Whether foreign keys are live on this connection. The migration 27 rebuild
+/// reads it so it restores the pragma to what it found rather than assuming.
+fn foreign_keys_enabled(conn: &Connection) -> Result<bool, String> {
+    let on: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .map_err(|e| format!("read foreign_keys pragma: {e}"))?;
+    Ok(on != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +424,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 26);
+        assert_eq!(v, 27);
         // 026 (ADR-0035 item 1): the table, its primary key and the recent
         // index exist, and the two boolean columns reject a value outside 0/1.
         let has_watch_state: i64 = conn
@@ -1669,6 +1730,32 @@ mod tests {
         conn
     }
 
+    /// Apply every migration up to and including `through`, without the
+    /// version-specific code steps. This is how a populated pre-027 database is
+    /// built: rows are inserted after the DDL exists and before 027 runs, which
+    /// is exactly the upgrade shape 027 has to survive.
+    fn migrate_through(conn: &Connection, through: i64) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+        for &(version, sql) in MIGRATIONS {
+            if version > through {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+    }
+
     /// One row of `series_entity_bindings`, named rather than an 8-tuple so
     /// the assertions below read as the schema they are checking.
     #[derive(Debug, PartialEq, Eq)]
@@ -1912,16 +1999,145 @@ mod tests {
         );
     }
 
+    /// ADR-0039 item 3. 027 is the rebuild that drops a NOT NULL, and a rebuild
+    /// is the one migration shape that can lose rows silently — here with a
+    /// second table cascading from it. This is the dogfood-shaped upgrade: rows
+    /// already present, bound, some with a second entity, and every one of them
+    /// must survive the copy.
+    #[test]
+    fn migration_27_keeps_every_series_row_binding_and_allows_a_null() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate_through(&c, 26);
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES
+               (1, 'Shameless (US) (2011)', 34343),
+               (1, 'Shameless (UK) (2004)', 20610),
+               (1, 'Alpha', 55);
+             INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary,
+                 folder_season_start, folder_season_end,
+                 entity_season_start, entity_season_end)
+             VALUES
+                (1, 'Alpha', 55, 1, NULL, NULL, NULL, NULL),
+                (1, 'Alpha', 77, 0, 9, 11, 1, 3);",
+        )
+        .unwrap();
+        let before_series = count_table(&c, "series").unwrap();
+        let before_bindings = binding_rows(&c);
+
+        migrate(&c).unwrap();
+
+        assert_eq!(
+            count_table(&c, "series").unwrap(),
+            before_series,
+            "no series row lost"
+        );
+        assert_eq!(
+            binding_rows(&c),
+            before_bindings,
+            "no binding lost or rewritten by the parent rebuild"
+        );
+
+        // The point of the rebuild: a folder can now have a row and no entity.
+        c.execute(
+            "INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Unbound', NULL)",
+            [],
+        )
+        .unwrap();
+        let unbound: Option<i64> = c
+            .query_row(
+                "SELECT tmdb_show_id FROM series WHERE relpath = 'Unbound'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unbound, None);
+
+        // The child foreign key survived the parent rebuild: a binding with no
+        // series row is still refused.
+        let err = c
+            .execute(
+                "INSERT INTO series_entity_bindings
+                    (library_id, relpath, tmdb_show_id, is_primary)
+                 VALUES (1, 'Nonexistent', 99, 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "expected a foreign key violation, got: {err}"
+        );
+    }
+
+    /// The primary key and the library cascade are carried over by the rebuild,
+    /// not re-stated by luck. Both would be easy to drop while copying the DDL,
+    /// and the cascade now runs through `series` into its bindings.
+    #[test]
+    fn migration_27_keeps_the_primary_key_and_the_cascade() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate_through(&c, 26);
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO libraries (name, path, kind) VALUES ('S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 55);
+             INSERT INTO series_entity_bindings
+                (library_id, relpath, tmdb_show_id, is_primary)
+             VALUES (1, 'Alpha', 55, 1);",
+        )
+        .unwrap();
+        let dup = c.execute(
+            "INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 99)",
+            [],
+        );
+        assert!(dup.is_err(), "(library_id, relpath) is still unique");
+
+        c.execute("DELETE FROM libraries WHERE id = 1", []).unwrap();
+        assert_eq!(
+            count_table(&c, "series").unwrap(),
+            0,
+            "the row cascades with its library"
+        );
+        assert_eq!(
+            count_table(&c, "series_entity_bindings").unwrap(),
+            0,
+            "and its bindings cascade through it"
+        );
+    }
+
+    /// A fresh install reaches 027 with no rows, and the rebuilt table takes a
+    /// null binding immediately. `migrates_fresh_db` pins the version; this is
+    /// the shape a brand-new library will actually write.
+    #[test]
+    fn migration_27_on_a_fresh_install_allows_a_null_binding() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/S', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', NULL);",
+        )
+        .unwrap();
+        let nulls: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM series WHERE tmdb_show_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+    }
+
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migration 26 and its table
-    /// are removed with it, so `migrate` sees a database at version 24 and
-    /// applies both in order.
+    /// way a real install upgrading into it looks. Migrations 26 and 27 and
+    /// their schema are removed with it, so `migrate` sees a database at
+    /// version 24 and applies all three in order.
     fn rewind_to_24(conn: &Connection) {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_accounts_username_nocase;
              DROP INDEX IF EXISTS idx_watch_state_recent;
              DROP TABLE IF EXISTS watch_state;
-             DELETE FROM schema_migrations WHERE version IN (25, 26);",
+             DELETE FROM schema_migrations WHERE version IN (25, 26, 27);",
         )
         .unwrap();
     }

@@ -99,13 +99,18 @@ fn main() {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(2)?,
                 ))
             })
             .unwrap();
         for row in rows {
             let (lib, relpath, show) = row.unwrap();
-            series.insert((lib, relpath), show);
+            // A row with a null `tmdb_show_id` is a folder that has formed a
+            // group and has no entity yet (ADR-0039 item 3). It is not
+            // identity, so it is not a folder this measurement can key on.
+            if let Some(show) = show {
+                series.insert((lib, relpath), show);
+            }
         }
     }
     let folder_of = |lib: i64, path: &str| -> String {

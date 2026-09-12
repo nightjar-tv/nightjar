@@ -166,8 +166,8 @@ struct LibraryItemRow {
     library_path: String,
 }
 
-/// All-items Visible proxy: movies by title; shows by provisional soft key
-/// (`clean_show_title` → yearless `query_key`). Rank is a library property.
+/// All-items Visible proxy: movies by title; shows by their `series_key`
+/// (ADR-0039 item 4). Rank is a library property.
 pub fn snapshot_visible_proxy(conn: &Connection) -> Result<VisibleProxy, String> {
     snapshot_visible_proxy_filtered(conn, VISIBLE_FIRST_SCREEN_N, &[])
 }
@@ -263,8 +263,9 @@ pub fn snapshot_visible_proxy_filtered(
                 }
             }
             "shows" => {
-                // Prefer durable tmdb_show when episode links exist (ADR-0029 §2.5);
-                // otherwise resolve soft key (ADR-0026 §8 provisional).
+                // The unit is the episode's `series_key` (ADR-0039 item 4):
+                // the folder binding when it has one, the folder key when it
+                // does not.
                 let mut by_show: HashMap<String, Vec<&LibraryItemRow>> = HashMap::new();
                 for it in &items {
                     if it.kind != "episode" {
@@ -302,22 +303,34 @@ pub fn snapshot_visible_proxy_filtered(
     Ok(VisibleProxy { units })
 }
 
-/// Browse unit for one episode file: `tv|tmdb:{show_id}` when linked or when
-/// the folder has stored series identity (ADR-0033), else soft-key `tv|{query_key}`.
+/// Browse unit for one episode file: its `series_key` (ADR-0039 item 4).
+///
+/// **The soft key is gone from here, and that is the change rather than a side
+/// effect.** It used to be the fallback for a folder with no `series` row, so
+/// two unmatched folders that fold to one cleaned title — `Shameless (US)` and
+/// `Shameless (UK)` — shared one browse unit and one Visible proxy slot. That
+/// is the D2 collision ADR-0033 exists to prevent, surviving on the browse side
+/// because ADR-0033 only removed it from group formation. `clean_show_title` →
+/// `query_key` stays exactly where ADR-0033 item 3 put it, in the matcher,
+/// matching-only.
+///
+/// **The folder binding is the edge, and the episode's own link is deliberately
+/// not consulted** (ADR-0039 item 6). The question here is which show this file
+/// is grouped with *in this library*, which the folder answers before any match
+/// exists — and item 3 guarantees the row exists as soon as the folder forms a
+/// group. The entity edge answers a different question and is what item detail
+/// and certification follow.
 fn visible_show_unit_key(conn: &Connection, it: &LibraryItemRow) -> Result<String, String> {
-    if let Some(show_id) = tmdb_show_for_media_item(conn, it.id)? {
-        return Ok(format!("tv|tmdb:{show_id}"));
-    }
-    // Folder-scoped identity: a folder with a series row keys with its bound
-    // siblings instead of folding to a shared soft key (two fold-colliding
-    // folders never merge into one card, ADR-0033 Q2/Q3).
-    let folder = show_folder_relpath(&it.path, &it.library_path);
-    if let Some(show_id) = series_show_id_for_folder(conn, it.library_id, &folder)? {
-        return Ok(format!("tv|tmdb:{show_id}"));
-    }
-    let (ct, _) = clean_show_title(&it.title);
-    let qk = query_key(&ct, None);
-    Ok(format!("tv|{qk}"))
+    // Not its own resolution: item 5 says one function answers this and there
+    // is no second resolver, so this is the call and not a copy of it.
+    item_links::series_key_for_item(
+        conn,
+        it.id,
+        it.library_id,
+        &it.path,
+        &it.library_path,
+        &it.kind,
+    )
 }
 
 /// ADR-0033: stored series identity for a show folder, or `None` when the
@@ -352,13 +365,19 @@ pub(crate) fn series_show_id_for_folder(
     if show_folder.is_empty() {
         return Ok(None);
     }
-    conn.query_row(
-        "SELECT tmdb_show_id FROM series WHERE library_id = ?1 AND relpath = ?2",
-        params![library_id, show_folder],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(|e| format!("series row lookup: {e}"))
+    // Two nullables flattened to one: no row, or a row with no entity. Both
+    // mean "not bound" to every caller here (ADR-0039 item 3). Without the
+    // flatten, a present row with a null `tmdb_show_id` is a `rusqlite` type
+    // error on every unmatched folder.
+    Ok(conn
+        .query_row(
+            "SELECT tmdb_show_id FROM series WHERE library_id = ?1 AND relpath = ?2",
+            params![library_id, show_folder],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("series row lookup: {e}"))?
+        .flatten())
 }
 
 /// ADR-0033: upsert the folder-keyed series row from a fresh TV match. A
@@ -371,64 +390,28 @@ fn upsert_series_row(conn: &Connection, g: &QueryGroup, show_id: i64) -> Result<
     if g.show_folder.is_empty() {
         return Ok(());
     }
-    conn.execute(
+    // Read before write: this is the one place a folder's series key changes,
+    // so it is the one place that knows both sides of the change.
+    let previous = series_show_id_for_folder(conn, g.library_id, &g.show_folder)?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin series row tx: {e}"))?;
+    tx.execute(
         "INSERT INTO series (library_id, relpath, tmdb_show_id)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(library_id, relpath) DO UPDATE SET tmdb_show_id = excluded.tmdb_show_id",
         params![g.library_id, g.show_folder, show_id],
     )
     .map_err(|e| format!("upsert series row: {e}"))?;
+    // ADR-0039 item 7: the same owner, in the same transaction, with no
+    // separate trigger to remember. A folder's series key changes only when
+    // this row acquires or changes `tmdb_show_id`, which is exactly here.
+    let old_key = item_links::series_key_for_show_folder(g.library_id, &g.show_folder, previous);
+    let new_key =
+        item_links::series_key_for_show_folder(g.library_id, &g.show_folder, Some(show_id));
+    crate::migrator::migrate_series_keys(&tx, &old_key, &new_key)?;
+    tx.commit().map_err(|e| format!("commit series row: {e}"))?;
     Ok(())
-}
-
-fn tmdb_show_for_media_item(conn: &Connection, media_item_id: i64) -> Result<Option<i64>, String> {
-    let key: Option<String> = conn
-        .query_row(
-            "SELECT item_key FROM media_item_links
-             WHERE media_item_id = ?1 AND item_key LIKE 'tmdb:episode:%'
-             ORDER BY manually_matched DESC, item_key
-             LIMIT 1",
-            params![media_item_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| format!("episode link for visible: {e}"))?;
-    if let Some(key) = key
-        && let Some(ep_id) = key.strip_prefix("tmdb:episode:")
-    {
-        let show: Option<i64> = conn
-            .query_row(
-                "SELECT tmdb_show FROM metadata_canonical
-                 WHERE provider = 'tmdb' AND entity_kind = 'episode' AND provider_id = ?1",
-                params![ep_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("tmdb_show for visible: {e}"))?;
-        if let Some(show) = show {
-            return Ok(Some(show));
-        }
-    }
-    // Unbound episode (widened-`unmatched` keeps `tmdb:show:{id}`, ADR-0026
-    // §8.1): read the show link directly so the file keys with its bound
-    // siblings instead of falling back to a soft key.
-    let show_key: Option<String> = conn
-        .query_row(
-            "SELECT item_key FROM media_item_links
-             WHERE media_item_id = ?1 AND item_key LIKE 'tmdb:show:%'
-             ORDER BY manually_matched DESC, item_key
-             LIMIT 1",
-            params![media_item_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| format!("show link for visible: {e}"))?;
-    if let Some(rest) = show_key.and_then(|k| k.strip_prefix("tmdb:show:").map(str::to_string))
-        && let Ok(n) = rest.parse::<i64>()
-    {
-        return Ok(Some(n));
-    }
-    Ok(None)
 }
 
 fn band_for_item(
@@ -831,13 +814,16 @@ fn status_query_groups(
                     })
                     .collect();
                 let pref = pick_reference_episode(&ref_eps, &ct);
-                // The group's browse unit: the folder's stored series id when
-                // it has one, else the soft key — matching
-                // [`visible_show_unit_key`] so poster attribution lands.
-                let unit_key = match series_by_folder.get(&folder_key) {
-                    Some(show_id) => format!("tv|tmdb:{show_id}"),
-                    None => format!("tv|{}", query_key(&ct, None)),
-                };
+                // The group's browse unit is the same `series_key`
+                // [`visible_show_unit_key`] computes, so poster attribution
+                // lands (ADR-0039 item 4). `folder_key` is `(library_id,
+                // relpath)`, which is what the `series` row is keyed on, so
+                // the two cannot disagree about what a folder is.
+                let unit_key = item_links::series_key_for_show_folder(
+                    folder_key.0,
+                    &folder_key.1,
+                    series_by_folder.get(&folder_key).copied().flatten(),
+                );
                 let g = ep_groups.entry(group_key).or_insert_with(|| QueryGroup {
                     resolve_kind: MetadataKind::Episode,
                     path: path0.to_string(),
@@ -904,6 +890,24 @@ fn status_query_groups(
         }
     }
 
+    // ADR-0039 item 3: a `series` row exists once a folder forms a resolve
+    // group, not once it matches. Written here because this is where group
+    // formation happens and the real `(library_id, show_folder)` pair is in
+    // hand, so migration, queue and rollup cannot disagree about what a folder
+    // is.
+    //
+    // `INSERT OR IGNORE`, so a folder that is already bound keeps its entity.
+    // The row is the fact that the folder is known; the entity is a separate
+    // fact that arrives later or never. `ep_groups` is keyed by the group key
+    // (synthesised for a root-level file), so the real folder comes from the
+    // group's own `show_folder`, and the empty case is skipped.
+    let formed_folders: Vec<(i64, String)> = ep_groups
+        .values()
+        .filter(|g| !g.show_folder.is_empty())
+        .map(|g| (g.library_id, g.show_folder.clone()))
+        .collect();
+    ensure_series_rows(conn, &formed_folders)?;
+
     let mut out: Vec<QueryGroup> = movie_groups
         .into_values()
         .chain(ep_groups.into_values())
@@ -932,10 +936,10 @@ fn status_query_groups(
 /// entity**, against 150 correct.
 ///
 /// So when there is no folder to scope by, scope by the title the filename
-/// carries. This is what the browse side already does: [`visible_show_unit_key`]
-/// falls back to the soft key `tv|{query_key}` when the folder has no series
-/// row, so browse splits root-level files by title while grouping merged them.
-/// The two now agree.
+/// carries. Grouping splits root-level files by title; the browse unit no
+/// longer follows the soft key (ADR-0039 item 4), so a root library is one
+/// `folder:{library}:` unit even though its groups are per-title. The grouping
+/// split is the one that prevents the wrong bind, and it is the one that stays.
 ///
 /// **It needs the basename to carry a title.** A shared root of `S01E01.mkv`
 /// has neither a folder nor a title, so it still groups as one — the case
@@ -951,7 +955,37 @@ fn episode_group_key(library_id: i64, show_folder: &str, cleaned_title: &str) ->
     }
 }
 
-fn load_series_rows(conn: &Connection) -> Result<HashMap<(i64, String), i64>, String> {
+/// Write an entity-less `series` row for every folder that formed a group.
+///
+/// Never overwrites: a bound folder keeps its `tmdb_show_id`. The write is
+/// idempotent, which matters because this runs on every queue pass, not once.
+fn ensure_series_rows(conn: &Connection, folders: &[(i64, String)]) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR IGNORE INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (?1, ?2, NULL)",
+        )
+        .map_err(|e| format!("prepare series row insert: {e}"))?;
+    for (library_id, relpath) in folders {
+        stmt.execute(params![library_id, relpath])
+            .map_err(|e| format!("insert series row: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Every `series` row, including the ones with no entity yet.
+///
+/// The value is `Option<i64>` rather than the row being absent, because
+/// ADR-0039 item 3 makes those two different facts: a missing row means the
+/// folder has not formed a group, and a row with a null `tmdb_show_id` means it
+/// has and is not bound. Collapsing them would put the folder key and the
+/// no-such-folder case on the same branch.
+///
+/// A `''` relpath is skipped for the same reason [`series_show_id_for_folder`]
+/// declines it: it is the absence of a folder, not a folder every root-level
+/// file shares. Filtering on load means the group unit key cannot resurrect a
+/// legacy row this build would no longer write.
+fn load_series_rows(conn: &Connection) -> Result<HashMap<(i64, String), Option<i64>>, String> {
     let mut stmt = conn
         .prepare("SELECT library_id, relpath, tmdb_show_id FROM series")
         .map_err(|e| format!("prepare series rows: {e}"))?;
@@ -960,17 +994,13 @@ fn load_series_rows(conn: &Connection) -> Result<HashMap<(i64, String), i64>, St
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(2)?,
             ))
         })
         .map_err(|e| format!("query series rows: {e}"))?;
     let mut out = HashMap::new();
     for row in rows {
         let (library_id, relpath, tmdb_show_id) = row.map_err(|e| format!("series row: {e}"))?;
-        // Skipped for the same reason [`series_show_id_for_folder`] declines
-        // it: a `''` relpath is the absence of a folder, not a folder every
-        // root-level file shares. Filtering on load means the group unit key
-        // cannot resurrect a legacy row this build would no longer write.
         if relpath.is_empty() {
             continue;
         }
@@ -2329,6 +2359,10 @@ fn persist_nfo_ready_and_link(
             )
             .map_err(|e| format!("nfo ready item {id}: {e}"))?;
         let old_effective = item_links::effective_item_key(&tx, *id, library_id, &path)?;
+        // ADR-0039 item 7, movie direction: this path is a complete movie NFO,
+        // whose series key is its item key, so the same bind runs the series
+        // migrator over the same value in the same transaction.
+        migrator::migrate_series_keys(&tx, &old_effective, key)?;
         if !old_for_migrate.contains(&old_effective) {
             old_for_migrate.push(old_effective);
         }
@@ -2808,6 +2842,95 @@ mod tests {
         let groups = pending_query_groups(&c, &proxy).unwrap();
         assert_eq!(groups.len(), 2);
         assert!(groups[0].max_id > groups[1].max_id);
+    }
+
+    /// Two unmatched show folders that fold to one cleaned title. The D2 shape
+    /// ADR-0033 removed from group formation and ADR-0039 item 4 removes from
+    /// the browse unit.
+    fn seeded_shows() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/tmp/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind, season, episode)
+             VALUES
+               (1, 'Shameless (US) (2011)/S01E01.mkv', 1, 1, 'Shameless', 'episode', 1, 1),
+               (1, 'Shameless (UK) (2004)/S01E01.mkv', 1, 1, 'Shameless', 'episode', 1, 1);",
+        )
+        .unwrap();
+        c
+    }
+
+    /// ADR-0039 item 3: the row is written when the folder forms a resolve
+    /// group, not when it matches. Before this, `folder:` keys existed in the
+    /// ADR and nowhere in the database.
+    #[test]
+    fn forming_a_group_writes_a_series_row_with_no_entity() {
+        let c = seeded_shows();
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        pending_query_groups(&c, &proxy).unwrap();
+
+        let mut stmt = c
+            .prepare("SELECT relpath, tmdb_show_id FROM series ORDER BY relpath")
+            .unwrap();
+        let rows: Vec<(String, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Shameless (UK) (2004)".to_string(), None),
+                ("Shameless (US) (2011)".to_string(), None),
+            ],
+            "one row per folder that formed a group, neither bound"
+        );
+    }
+
+    /// And it never overwrites a binding. This runs on every queue pass, so an
+    /// insert that clobbered would unbind the library one drain at a time.
+    #[test]
+    fn forming_a_group_again_leaves_a_bound_folder_alone() {
+        let c = seeded_shows();
+        c.execute(
+            "INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Shameless (US) (2011)', 34343)",
+            [],
+        )
+        .unwrap();
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        pending_query_groups(&c, &proxy).unwrap();
+        pending_query_groups(&c, &proxy).unwrap();
+
+        let bound: Option<i64> = c
+            .query_row(
+                "SELECT tmdb_show_id FROM series WHERE relpath = 'Shameless (US) (2011)'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound, Some(34343), "the binding survives repeated passes");
+    }
+
+    /// ADR-0039 item 4, and this is the shipped-behaviour change rather than a
+    /// side effect of it. Two unmatched folders that fold to one cleaned title
+    /// used to share a browse unit and one Visible proxy slot — the D2
+    /// collision ADR-0033 exists to prevent, surviving on the browse side
+    /// because ADR-0033 only removed it from group formation.
+    #[test]
+    fn unbound_fold_colliding_folders_no_longer_share_a_browse_unit() {
+        let c = seeded_shows();
+        let proxy = snapshot_visible_proxy(&c).unwrap();
+        let keys: HashSet<&str> = proxy.units.iter().map(|u| u.unit_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "folder:1:Shameless (US) (2011)",
+                "folder:1:Shameless (UK) (2004)"
+            ]),
+            "two folders, two units, and neither is a soft key"
+        );
     }
 
     #[test]
@@ -3568,7 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_uses_tmdb_show_when_episode_linked() {
+    fn visible_collapses_folders_bound_to_one_show() {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
         c.execute_batch(
@@ -3583,16 +3706,21 @@ mod tests {
                ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z'),
                ('tmdb', 'episode', '1002', 'Pilot', '{\"tmdb\":1002}', 55, '2026-01-01T00:00:00Z');
              INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
-             VALUES (1, 'tmdb:episode:1001', 0), (2, 'tmdb:episode:1002', 0);",
+             VALUES (1, 'tmdb:episode:1001', 0), (2, 'tmdb:episode:1002', 0);
+             -- The bindings the drain writes when each folder matches show 55.
+             -- ADR-0039 item 6 makes the folder the edge for browse grouping,
+             -- so the rows are what collapse these two, not the episode links.
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Alpha', 55), (1, 'Alpha Alias', 55);",
         )
         .unwrap();
         let proxy = snapshot_visible_proxy_n(&c, 10).unwrap();
         assert_eq!(
             proxy.units.len(),
             1,
-            "two soft keys collapse under one tmdb_show"
+            "two folders bound to one show are one browse unit"
         );
-        assert_eq!(proxy.units[0].unit_key, "tv|tmdb:55");
+        assert_eq!(proxy.units[0].unit_key, "tmdb:show:55");
         assert_eq!(proxy.units[0].item_ids.len(), 2);
     }
 
@@ -4791,8 +4919,9 @@ mod tests {
     }
 
     /// RC3: an episode holding only `tmdb:show:{id}` keys with its bound
-    /// siblings (same show, same browse card). Fails on main: the show-link
-    /// episode fell back to a soft key and split the show.
+    /// sibling (same show, same browse card). ADR-0039 item 6 makes the folder
+    /// the browse edge, so the two `series` rows are what collapse them and the
+    /// show-link episode keys with its sibling.
     #[test]
     fn episode_with_only_show_link_keys_with_bound_sibling() {
         let c = Connection::open_in_memory().unwrap();
@@ -4808,12 +4937,14 @@ mod tests {
              ) VALUES
                ('tmdb', 'episode', '1001', 'Pilot', '{\"tmdb\":1001}', 55, '2026-01-01T00:00:00Z');
              INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
-             VALUES (1, 'tmdb:episode:1001', 0), (2, 'tmdb:show:55', 0);",
+             VALUES (1, 'tmdb:episode:1001', 0), (2, 'tmdb:show:55', 0);
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+             VALUES (1, 'Alpha', 55), (1, 'Alpha Alias', 55);",
         )
         .unwrap();
         let proxy = snapshot_visible_proxy_n(&c, 10).unwrap();
         assert_eq!(proxy.units.len(), 1, "one show must be one browse unit");
-        assert_eq!(proxy.units[0].unit_key, "tv|tmdb:55");
+        assert_eq!(proxy.units[0].unit_key, "tmdb:show:55");
         assert_eq!(proxy.units[0].item_ids.len(), 2);
     }
 
@@ -5520,7 +5651,7 @@ mod tests {
         let keys: HashSet<_> = proxy.units.iter().map(|u| u.unit_key.as_str()).collect();
         assert_eq!(
             keys,
-            HashSet::from(["tv|tmdb:34343", "tv|tmdb:20610"]),
+            HashSet::from(["tmdb:show:34343", "tmdb:show:20610"]),
             "the fold-colliding folders must not share a browse card"
         );
     }

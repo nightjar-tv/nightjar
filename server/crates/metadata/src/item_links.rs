@@ -3,6 +3,8 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::{HashMap, HashSet};
 
+use nightjar_db::show_folder_relpath;
+
 /// The `item_key` / `series_key` prefixes (ADR-0025 §1, ADR-0039 item 2).
 ///
 /// Declared here because this module owns the key grammar. Readers elsewhere
@@ -297,6 +299,43 @@ pub fn series_key_for_show_folder(
     }
 }
 
+/// The series key for one item, and the only function that answers it
+/// (ADR-0039 item 5).
+///
+/// Two shapes, because item 6 says the two edges are deliberately different:
+/// an episode's series is the folder it sits in, which has an answer before any
+/// match; a movie is a series of one and its series key *is* its item key, so
+/// this reuses the ADR-0025 grammar rather than inventing a third.
+///
+/// Derived, never stored. A folder that binds later must not leave a stale key
+/// behind, which is the same argument ADR-0029 §2.2 makes about the canonical
+/// projection.
+pub fn series_key_for_item(
+    conn: &Connection,
+    media_item_id: i64,
+    library_id: i64,
+    relpath: &str,
+    library_path: &str,
+    kind: &str,
+) -> Result<String, String> {
+    if kind != "episode" {
+        // Includes an unmatched movie, whose key is `path:{library}:{relpath}`
+        // because that is what `effective_item_key` already returns.
+        return effective_item_key(conn, media_item_id, library_id, relpath);
+    }
+    let folder = show_folder_relpath(relpath, library_path);
+    let show_id: Option<i64> = conn
+        .query_row(
+            "SELECT tmdb_show_id FROM series WHERE library_id = ?1 AND relpath = ?2",
+            params![library_id, folder],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("series row lookup: {e}"))?
+        .flatten();
+    Ok(series_key_for_show_folder(library_id, &folder, show_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,10 +442,61 @@ mod tests {
         // Provisional `tmdb:show:` links (ADR-0026 §8.4) recover ids on the
         // art path only; they must never own watch state.
         assert!(!is_watch_item_key("tmdb:show:1396"));
+        // ADR-0039 item 9: the folder form is a series key too, and is
+        // rejected by construction for the same reason. A green test whose
+        // subject is a boundary needs the negative case.
+        assert!(!is_watch_item_key("folder:1:Alpha"));
         assert!(is_watch_item_key("tmdb:movie:550"));
         assert!(is_watch_item_key("tmdb:episode:1"));
         assert!(is_watch_item_key("path:1:a.mkv"));
         assert!(is_watch_item_key("tvdb:123"));
+    }
+
+    /// ADR-0039 item 2 and item 6. An episode's series key comes from its
+    /// folder, and a movie's is its own item key — two shapes, one function.
+    #[test]
+    fn series_key_follows_the_folder_for_an_episode_and_the_item_for_a_movie() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('S', '/S', 'shows');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 'Alpha/S01E01.mkv', 1, 1, 'Alpha', 'episode'),
+                    (1, 'Film.mkv', 1, 1, 'Film', 'movie');",
+        )
+        .unwrap();
+
+        // Unbound folder: the folder key, which exists before any match.
+        let key = series_key_for_item(&c, 1, 1, "Alpha/S01E01.mkv", "/S", "episode").unwrap();
+        assert_eq!(key, "folder:1:Alpha");
+
+        // Bound folder: the entity key.
+        c.execute(
+            "INSERT INTO series (library_id, relpath, tmdb_show_id) VALUES (1, 'Alpha', 55)",
+            [],
+        )
+        .unwrap();
+        let key = series_key_for_item(&c, 1, 1, "Alpha/S01E01.mkv", "/S", "episode").unwrap();
+        assert_eq!(key, "tmdb:show:55");
+
+        // A row with a null binding is the same answer as no row: not bound.
+        c.execute("UPDATE series SET tmdb_show_id = NULL", [])
+            .unwrap();
+        let key = series_key_for_item(&c, 1, 1, "Alpha/S01E01.mkv", "/S", "episode").unwrap();
+        assert_eq!(key, "folder:1:Alpha");
+
+        // A movie is a series of one: unmatched is its path key, matched is
+        // its provider key, and neither is a new grammar.
+        let key = series_key_for_item(&c, 2, 1, "Film.mkv", "/S", "movie").unwrap();
+        assert_eq!(key, "path:1:Film.mkv");
+        c.execute(
+            "INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+             VALUES (2, 'tmdb:movie:77', 0)",
+            [],
+        )
+        .unwrap();
+        let key = series_key_for_item(&c, 2, 1, "Film.mkv", "/S", "movie").unwrap();
+        assert_eq!(key, "tmdb:movie:77");
     }
 
     /// The one shared path-key parse, pinned at its boundaries. A relative path

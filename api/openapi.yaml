@@ -2357,8 +2357,11 @@ components:
               type: string
               nullable: true
               description: >
-                Opaque series_key of the show an episode belongs to, for the
-                link back to GET /api/v0/series. Absent for a movie.
+                Opaque series_key (ADR-0039 item 2), for the link back to
+                GET /api/v0/series. An episode's key is its show folder's
+                binding (`tmdb:show:{id}` when bound, `folder:{libraryId}:{relpath}`
+                when not); a movie is a series of one, so its key is its own
+                `itemKey`.
             showTitle:
               type: string
               nullable: true

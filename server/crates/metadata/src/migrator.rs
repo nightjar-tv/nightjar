@@ -1,9 +1,77 @@
-//! ADR-0025 §5 item_key migrator (watch state + playback events).
+//! Key migrators: ADR-0025 §5 for `item_key`, ADR-0039 item 7 for
+//! `series_key`.
 //!
-//! No-op when those tables do not exist yet (Block 2). Assign/clear always
-//! call this so the path is one (Rule 4.11) when watch state lands.
+//! Both no-op while their tables do not exist yet (Block 2). Every caller runs
+//! them anyway so the path is one (Rule 4.11) when those tables land. Two
+//! functions rather than one because they rewrite different tables — a movie
+//! assign runs both over the same value, which is exactly the case that would
+//! make merging them look reasonable and would then hide which table each rule
+//! applies to.
 
 use rusqlite::{Connection, OptionalExtension, params};
+
+/// Rewrite `series_key` on every table keyed by it (ADR-0039 item 7).
+///
+/// **The tables this rewrites do not exist yet, and the list is here rather
+/// than at each future call site so there is one place to add them.**
+/// `profile_track_choice` arrives with B2-8 and the kids override table with
+/// B2-6. Until then this is reached, finds nothing, and reports that it found
+/// nothing — which is different from not being called.
+///
+/// **Merge on collision, which is the common case rather than the exotic one.**
+/// Two folders can bind the same show (a split library, or extras in a sibling
+/// directory), so two keys arrive at one and collide on
+/// `(profile_id, series_key)`:
+///
+/// - `profile_track_choice`: newer `updated_at` wins. There is no ratio to
+///   compare the way ADR-0025 §5 compares position, and a preference has no
+///   partial state.
+/// - Kids overrides: the **more restrictive** entry survives. That is ADR-0037
+///   item 6's precedence — blocked, then allowed, then the ladder — applied to
+///   a merge rather than a second ordering invented here.
+///
+/// **Unbind does not call this.** ADR-0028 clear-match returns a folder to a
+/// `folder:` key and the rows stay on `tmdb:show:{id}`, because rewriting them
+/// would be wrong while a second folder is still bound to that show, and
+/// re-binding the same folder reattaches them for free.
+pub fn migrate_series_keys(
+    conn: &Connection,
+    old_key: &str,
+    new_key: &str,
+) -> Result<SeriesMigrateReport, String> {
+    if old_key == new_key {
+        return Ok(SeriesMigrateReport::default());
+    }
+    let present: Vec<&str> = SERIES_KEYED_TABLES
+        .iter()
+        .copied()
+        .filter(|t| table_exists(conn, t).unwrap_or(false))
+        .collect();
+    if let Some(table) = present.first() {
+        // Unreachable until B2-6 and B2-8 add the tables, and it fails loudly
+        // rather than silently doing nothing. The merge rules above are what a
+        // writer implements here; writing them now, against a schema that does
+        // not exist, would be inventing the schema (Rule 4.9).
+        return Err(format!(
+            "series_key migration for {table} is unimplemented: the table exists, \
+             so the merge rule in this function's documentation now has to be written"
+        ));
+    }
+    Ok(SeriesMigrateReport {
+        tables_present: present.len(),
+    })
+}
+
+/// Every table keyed on `series_key`. Add here, not at a call site.
+const SERIES_KEYED_TABLES: &[&str] = &["profile_track_choice", "kids_overrides"];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SeriesMigrateReport {
+    /// How many of [`SERIES_KEYED_TABLES`] were present. Zero is the expected
+    /// value today and is reported rather than assumed, so a caller can tell
+    /// "nothing to move" from "never ran".
+    pub tables_present: usize,
+}
 
 /// Rewrite `item_key` on watch/playback tables from `old_keys` → `new_key`.
 ///
@@ -228,6 +296,76 @@ fn migrate_events(conn: &Connection, old_key: &str, new_key: &str) -> Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0039 item 7. The tables land with B2-6 and B2-8, so today this
+    /// finds nothing — and reports that it found nothing, which is a different
+    /// fact from never having been called. Without the count, a future reader
+    /// cannot tell a working migrator from an unwired one.
+    #[test]
+    fn series_key_migration_reports_that_no_keyed_table_exists_yet() {
+        let c = Connection::open_in_memory().unwrap();
+        let r = migrate_series_keys(&c, "folder:1:Alpha", "tmdb:show:55").unwrap();
+        assert_eq!(r.tables_present, 0);
+    }
+
+    /// A bind that does not change the key is not a migration. This is the
+    /// common case on a re-match to the same show, and it must not be counted
+    /// or logged as a rewrite.
+    #[test]
+    fn series_key_migration_is_a_no_op_when_the_key_is_unchanged() {
+        let c = Connection::open_in_memory().unwrap();
+        let r = migrate_series_keys(&c, "tmdb:show:55", "tmdb:show:55").unwrap();
+        assert_eq!(r, SeriesMigrateReport::default());
+    }
+
+    /// The other half of the contract: a declared table that exists without its
+    /// merge rule is an error, not a silent no-op. A migrator that returned
+    /// `Ok` here would leave a future writer's rows unrewritten and say
+    /// nothing.
+    #[test]
+    fn series_key_migration_refuses_a_present_table_with_no_merge_rule() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE profile_track_choice (profile_id INTEGER, series_key TEXT)")
+            .unwrap();
+        let err = migrate_series_keys(&c, "folder:1:Alpha", "tmdb:show:55").unwrap_err();
+        assert!(err.contains("profile_track_choice"), "{err}");
+    }
+
+    /// ADR-0039 item 7: a movie assign changes the item key and the series key
+    /// at once, so both migrators run over the same value. They rewrite
+    /// different tables and must compose without either seeing the other's
+    /// rows.
+    #[test]
+    fn item_and_series_migrators_compose_over_one_value() {
+        let c = Connection::open_in_memory().unwrap();
+        nightjar_db::migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (1, 'a', 'x', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+                 VALUES (1, 1, 'aa', 'P');
+             INSERT INTO watch_state
+                 (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                  first_played_at, last_played_at)
+             VALUES
+                 (1, 'path:1:a.mkv', 9000, 10000, 0, 0,
+                  '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let item = migrate_item_keys(&c, &["path:1:a.mkv".into()], "tmdb:movie:9").unwrap();
+        let series = migrate_series_keys(&c, "path:1:a.mkv", "tmdb:movie:9").unwrap();
+        assert!(item.tables_present, "the live watch-state migrator ran");
+        assert_eq!(item.watch_rewrites, 1);
+        assert_eq!(
+            series.tables_present, 0,
+            "no series-keyed table exists yet, and it says so"
+        );
+        let key: String = c
+            .query_row("SELECT item_key FROM watch_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(key, "tmdb:movie:9");
+    }
 
     /// The guard for a database that predates migration 026. It no longer
     /// needs a migrated connection: an empty one is exactly that database.

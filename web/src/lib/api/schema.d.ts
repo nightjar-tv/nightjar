@@ -1112,7 +1112,7 @@ export interface components {
             cast?: components["schemas"]["CastMember"][];
             /** @description Only the kinds this title has. For an episode these come from the show entity, which is where poster, backdrop and logo live (ADR-0029 §1.2 gives episode rows a still and nothing else). */
             artwork?: components["schemas"]["ItemArtwork"][];
-            /** @description Opaque series_key of the show an episode belongs to, for the link back to GET /api/v0/series. Absent for a movie. */
+            /** @description Opaque series_key (ADR-0039 item 2), for the link back to GET /api/v0/series. An episode's key is its show folder's binding (`tmdb:show:{id}` when bound, `folder:{libraryId}:{relpath}` when not); a movie is a series of one, so its key is its own `itemKey`. */
             seriesKey?: string | null;
             showTitle?: string | null;
         };
