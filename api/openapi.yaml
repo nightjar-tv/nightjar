@@ -1887,6 +1887,70 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v0/profiles/{profileRef}/continue-watching:
+    get:
+      operationId: getContinueWatching
+      summary: Read one profile's continue-watching rail
+      description: >
+        ADR-0035 item 6 and item 8. The rollup is computed server-side and
+        collapses a series to one entry: the newest in-progress episode if
+        there is one, otherwise the first available unwatched episode after the
+        highest completed ordinal, both in the folder's numbering (ADR-0046
+        item 3(a)). Series identity is the
+        folder-resolved `seriesKey`, so an unmatched show groups and can resume
+        but never infers a next episode from filenames. A movie is its own
+        series. Hidden rows never appear. The rail sorts on `lastPlayedAt`
+        descending, with `seriesKey` breaking a tie. `limit` is applied after
+        series collapse.
+
+
+        `profileRef` is the profile whose rail is read, which is a different
+        question from the session's own scope. A profile session reaches only
+        its active profile; from account scope an owner or manager reaches any
+        profile and a member reaches the profiles under its own account. A ref
+        the caller may not address and a ref that does not exist get the same
+        named 403, so the response cannot be used to probe for a profile.
+      parameters:
+        - name: profileRef
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Maximum number of series entries. Applied after series collapse, so
+            one show costs one slot however many episodes it holds. Absent
+            means the whole rail.
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+      responses:
+        "200":
+          description: The collapsed rail, most recent series first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContinueWatchingEnvelope"
+        "400":
+          description: >
+            The `limit` query is not a non-negative integer, so the server
+            could not read the request. The code is `bad_request`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: >
+            The caller may not address this profile, or it does not exist. The
+            two are one response so the ref cannot be probed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v0/system/transcode:
     get:
       operationId: getTranscodeCapabilities
@@ -2848,6 +2912,89 @@ components:
           oneOf:
             - $ref: "#/components/schemas/WatchState"
             - type: "null"
+
+    ContinueWatchingEntry:
+      type: object
+      required:
+        - seriesKey
+        - itemKey
+        - itemId
+        - title
+        - kind
+        - positionMs
+        - durationMs
+        - played
+        - lastPlayedAt
+      properties:
+        seriesKey:
+          type: string
+          description: >
+            Opaque series key (ADR-0039 item 2). Pass it back exactly as
+            received.
+        itemKey:
+          type: string
+          description: >
+            Opaque item key of the episode or movie to resume (ADR-0025 §1),
+            returned as received.
+        itemId:
+          type: integer
+          format: int64
+          description: The media row to open.
+        title:
+          type: string
+          description: >
+            Canonical title when the item has one, else the scan-derived title.
+        kind:
+          type: string
+          enum: [movie, episode]
+        season:
+          type: integer
+          format: int32
+          description: >
+            Season in the folder's numbering (ADR-0046 item 3(a)). Present only
+            when the item has one.
+        episode:
+          type: integer
+          format: int32
+          description: >
+            Episode in the folder's numbering (ADR-0046 item 3(a)). Present only
+            when the item has one.
+        showTitle:
+          type: string
+          description: The show's title for an episode; absent for a movie.
+        positionMs:
+          type: integer
+          format: int64
+          description: >
+            Resume position. Zero for a next-episode entry, which has no stored
+            state yet.
+        durationMs:
+          type: integer
+          format: int64
+          description: >
+            Duration snapshot of the file that was playing. Zero for a
+            next-episode entry.
+        played:
+          type: boolean
+          description: Whether the chosen item is marked played.
+        lastPlayedAt:
+          type: string
+          format: date-time
+          description: >
+            When this series entry was last touched. The rail sorts on this
+            descending.
+
+    ContinueWatchingEnvelope:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: >
+            One entry per series, most recent first, after series collapse and
+            any `limit`.
+          items:
+            $ref: "#/components/schemas/ContinueWatchingEntry"
 
     CreateProfileRequest:
       type: object

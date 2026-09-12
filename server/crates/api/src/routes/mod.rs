@@ -2,6 +2,7 @@ mod accounts;
 mod artwork;
 pub mod auth;
 mod browse;
+mod continue_watching;
 pub mod items;
 mod libraries;
 mod metadata_fix;
@@ -83,6 +84,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v0/profiles/{profile_ref}/watch-state",
             get(watch_state::get_state).put(watch_state::put_state),
+        )
+        .route(
+            "/api/v0/profiles/{profile_ref}/continue-watching",
+            get(continue_watching::list),
         )
         .route(
             "/api/v0/profiles/{profile_ref}/track-choice",
@@ -339,6 +344,11 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
     (
         "PUT",
         "/api/v0/profiles/{profile_ref}/watch-state",
+        Authority::ProfileRef,
+    ),
+    (
+        "GET",
+        "/api/v0/profiles/{profile_ref}/continue-watching",
         Authority::ProfileRef,
     ),
     ("GET", "/api/v0/items/{item_id}", Authority::AnySession),

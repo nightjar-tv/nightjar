@@ -222,6 +222,27 @@ impl Caller {
     }
 }
 
+/// Resolve `profile_ref` and apply ADR-0035 item 7.
+///
+/// A profile that does not exist and one this caller may not address get the
+/// same named forbidden error, so the response cannot be used to probe for a
+/// ref. One function because every profile-scoped route draws the same
+/// boundary (Rule 4.11).
+pub fn authorize_profile_ref(
+    state: &AppState,
+    caller: &Caller,
+    profile_ref: &str,
+) -> Result<i64, ApiError> {
+    let profile = state
+        .db
+        .with_conn(|conn| nightjar_db::profile_by_ref(conn, profile_ref))
+        .map_err(ApiError::internal)?;
+    match profile.filter(|p| caller.may_address_profile(p)) {
+        Some(profile) => Ok(profile.id),
+        None => Err(ApiError::forbidden(INSUFFICIENT_ROLE)),
+    }
+}
+
 /// The one ownership boundary for playback sessions (ADR-0034 item 8).
 ///
 /// Every session-scoped route carries a `{session_id}` path parameter, so this

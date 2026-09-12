@@ -878,6 +878,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/profiles/{profileRef}/continue-watching": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one profile's continue-watching rail
+         * @description ADR-0035 item 6 and item 8. The rollup is computed server-side and collapses a series to one entry: the newest in-progress episode if there is one, otherwise the first available unwatched episode after the highest completed ordinal, both in the folder's numbering (ADR-0046 item 3(a)). Series identity is the folder-resolved `seriesKey`, so an unmatched show groups and can resume but never infers a next episode from filenames. A movie is its own series. Hidden rows never appear. The rail sorts on `lastPlayedAt` descending, with `seriesKey` breaking a tie. `limit` is applied after series collapse.
+         *
+         *     `profileRef` is the profile whose rail is read, which is a different question from the session's own scope. A profile session reaches only its active profile; from account scope an owner or manager reaches any profile and a member reaches the profiles under its own account. A ref the caller may not address and a ref that does not exist get the same named 403, so the response cannot be used to probe for a profile.
+         */
+        get: operations["getContinueWatching"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/system/transcode": {
         parameters: {
             query?: never;
@@ -1293,6 +1315,54 @@ export interface components {
         WatchStateEnvelope: {
             /** @description The stored state, or null when the item has none. A resolved item with no state and an unresolvable key are different answers: this one is 200 with null, the other is 404. */
             state: components["schemas"]["WatchState"] | null;
+        };
+        ContinueWatchingEntry: {
+            /** @description Opaque series key (ADR-0039 item 2). Pass it back exactly as received. */
+            seriesKey: string;
+            /** @description Opaque item key of the episode or movie to resume (ADR-0025 §1), returned as received. */
+            itemKey: string;
+            /**
+             * Format: int64
+             * @description The media row to open.
+             */
+            itemId: number;
+            /** @description Canonical title when the item has one, else the scan-derived title. */
+            title: string;
+            /** @enum {string} */
+            kind: "movie" | "episode";
+            /**
+             * Format: int32
+             * @description Season in the folder's numbering (ADR-0046 item 3(a)). Present only when the item has one.
+             */
+            season?: number;
+            /**
+             * Format: int32
+             * @description Episode in the folder's numbering (ADR-0046 item 3(a)). Present only when the item has one.
+             */
+            episode?: number;
+            /** @description The show's title for an episode; absent for a movie. */
+            showTitle?: string;
+            /**
+             * Format: int64
+             * @description Resume position. Zero for a next-episode entry, which has no stored state yet.
+             */
+            positionMs: number;
+            /**
+             * Format: int64
+             * @description Duration snapshot of the file that was playing. Zero for a next-episode entry.
+             */
+            durationMs: number;
+            /** @description Whether the chosen item is marked played. */
+            played: boolean;
+            /**
+             * Format: date-time
+             * @description When this series entry was last touched. The rail sorts on this descending.
+             */
+            lastPlayedAt: string;
+        };
+        ContinueWatchingEnvelope: {
+            /** @description One entry per series, most recent first, after series collapse and any `limit`. */
+            items: components["schemas"]["ContinueWatchingEntry"][];
         };
         CreateProfileRequest: {
             name: string;
@@ -3668,6 +3738,49 @@ export interface operations {
             };
             /** @description The body parsed but does not match the accepted shape — a prohibited or unknown field, a missing required field, or a field of the wrong type — or its values are not usable: a zero duration, a negative position, or a position past the duration. The code is `validation_error`. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getContinueWatching: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of series entries. Applied after series collapse, so one show costs one slot however many episodes it holds. Absent means the whole rail. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                profileRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The collapsed rail, most recent series first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContinueWatchingEnvelope"];
+                };
+            };
+            /** @description The `limit` query is not a non-negative integer, so the server could not read the request. The code is `bad_request`. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller may not address this profile, or it does not exist. The two are one response so the ref cannot be probed. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

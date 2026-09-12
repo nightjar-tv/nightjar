@@ -7,6 +7,7 @@ mod artwork;
 mod browse;
 mod canonical;
 mod clean;
+mod continue_watching;
 mod fix;
 mod item_detail;
 mod item_links;
@@ -46,6 +47,7 @@ pub use clean::{
     fold_title_orthography, pick_reference_episode, series_library_year,
     strip_trailing_source_token, year_from_path, year_from_show_folder,
 };
+pub use continue_watching::{ContinueWatchingEntry, continue_watching};
 pub use fix::{
     ArtworkInvalidate, AssignRequest, AssignResult, ClearResult, FixCandidate, FixItemView,
     NoopArtwork, assign, clear_match, get_fix_item, retry_unmatched, search_candidates,
