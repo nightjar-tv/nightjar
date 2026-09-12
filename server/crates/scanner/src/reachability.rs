@@ -132,6 +132,11 @@ fn check_with(path: &Path, timeout: Duration, probe: ProbeFn, spawn: SpawnFn) ->
 }
 
 /// True when an error string indicates mount/IO absence rather than corrupt media.
+///
+/// The last four arms are the write-side kinds from an FFmpeg child, which
+/// reaches this classifier only as stderr text (ADR-0041 Decision 8 item 2):
+/// a full, read-only, or unwritable subtitle volume is operational and clears,
+/// so it must route to `unavailable`, never a permanent `error`.
 pub fn message_looks_unavailable(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("no such file")
@@ -145,6 +150,10 @@ pub fn message_looks_unavailable(msg: &str) -> bool {
         || lower.contains("stale file handle")
         || lower.contains("estale")
         || lower.contains("enotconn")
+        || lower.contains("no space left")
+        || lower.contains("read-only file system")
+        || lower.contains("permission denied")
+        || lower.contains("quota exceeded")
         || lower.starts_with("unavailable:")
 }
 
@@ -340,6 +349,76 @@ mod tests {
         assert_eq!(HUNG_PROBE_ENTRIES.load(Ordering::SeqCst), 1);
     }
 
+    static DELAYED_PROBE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    static DELAYED_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Probe that answers slowly, like an SMB `is_dir` under load rather than a
+    /// permanently hung mount. It always answers `true`.
+    fn delayed_probe(_: &Path) -> bool {
+        DELAYED_PROBE_ENTRIES.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        true
+    }
+
+    fn counting_spawn(
+        path: PathBuf,
+        probe: ProbeFn,
+    ) -> std::io::Result<std::sync::mpsc::Sender<ProbeRequest>> {
+        DELAYED_SPAWNS.fetch_add(1, Ordering::SeqCst);
+        spawn_worker(path, probe)
+    }
+
+    /// R4 storage bounds: a slow probe is bounded by the caller's timeout (the
+    /// tick does not wait out the mount), and the next tick queues behind the
+    /// same worker instead of stranding a second thread. The probe-entry and
+    /// spawn counts are positive controls: a dead instrument would leave them
+    /// at zero.
+    #[test]
+    fn delayed_probe_timeout_is_bounded_and_reuses_one_worker() {
+        DELAYED_PROBE_ENTRIES.store(0, Ordering::SeqCst);
+        DELAYED_SPAWNS.store(0, Ordering::SeqCst);
+        let path = probe_path("delayed");
+        let short = Duration::from_millis(30);
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            check_with(&path, short, delayed_probe, counting_spawn),
+            Reachability::Unreachable
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(300),
+            "the tick must return at its own timeout, not wait out the probe: {waited:?}"
+        );
+
+        // The probe really ran: wait for it to be entered before the second
+        // tick, so "one spawn" below is not a race against the first spawn.
+        for _ in 0..1000 {
+            if DELAYED_PROBE_ENTRIES.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(DELAYED_PROBE_ENTRIES.load(Ordering::SeqCst), 1);
+
+        // A later tick with room for the delay still reaches the root, through
+        // the worker that already exists.
+        assert_eq!(
+            check_with(&path, Duration::from_secs(3), delayed_probe, counting_spawn),
+            Reachability::Reachable
+        );
+        assert_eq!(
+            DELAYED_SPAWNS.load(Ordering::SeqCst),
+            1,
+            "one worker per root path"
+        );
+        assert_eq!(
+            DELAYED_PROBE_ENTRIES.load(Ordering::SeqCst),
+            2,
+            "the second tick must be answered by the same worker, not a new one"
+        );
+    }
+
     #[test]
     fn spawn_failure_is_not_reported_as_unreachable() {
         let path = probe_path("spawn-failure");
@@ -351,5 +430,30 @@ mod tests {
         });
         assert_eq!(result, Reachability::CheckFailed);
         assert_ne!(result, Reachability::Unreachable);
+    }
+
+    /// R4 storage bounds: an FFmpeg child's write failure reaches the pool only
+    /// as stderr text, so the classifier must read the write-side kinds from
+    /// that text. A corrupt source stays a permanent `error`: it is the
+    /// negative control that keeps the new arms from swallowing every failure.
+    #[test]
+    fn ffmpeg_write_failure_strings_are_availability() {
+        for stderr in [
+            "ffmpeg exited exit status: 243: Error opening output e2.tmp.srt: Permission denied",
+            "ffmpeg exited exit status: 1: No space left on device",
+            "ffmpeg exited exit status: 1: Read-only file system",
+            "ffmpeg exited exit status: 1: Disk quota exceeded",
+        ] {
+            assert!(
+                message_looks_unavailable(stderr),
+                "write failure must be availability: {stderr}"
+            );
+        }
+        assert!(
+            !message_looks_unavailable(
+                "ffmpeg exited exit status: 1: Invalid data found when processing input"
+            ),
+            "a corrupt source is a permanent error, not availability"
+        );
     }
 }
