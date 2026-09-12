@@ -1,6 +1,6 @@
 //! File↔item join (ADR-0029 §2). Provider keys only; path keys are derived.
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::{HashMap, HashSet};
 
 /// The `item_key` / `series_key` prefixes (ADR-0025 §1, ADR-0039 item 2).
@@ -159,6 +159,75 @@ pub fn effective_item_key(
 
 pub fn path_item_key(library_id: i64, relpath: &str) -> String {
     format!("path:{library_id}:{relpath}")
+}
+
+/// Why a `path:` item key did not parse.
+///
+/// The caller formats its own message from this, so the grammar is parsed in
+/// one place (Rule 4.11) while the wording stays with the caller that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKeyError {
+    /// The key does not carry the `path:` prefix.
+    NotAPathKey,
+    /// There is no `:` between the prefix and the relative path.
+    MissingLibraryId,
+    /// The text before the first `:` is not an integer library id.
+    NonNumericLibraryId,
+}
+
+/// Parse a `path:` item key into its library id and relative path.
+///
+/// The relative path may itself contain `:`, the library id may not, so the
+/// first separator is the only one that divides them. Artwork, browse, and the
+/// identity check all read the grammar from here rather than spelling the
+/// prefix and the split again.
+pub fn parse_path_key(key: &str) -> Result<(i64, &str), PathKeyError> {
+    let rest = key
+        .strip_prefix(PATH_KEY_PREFIX)
+        .ok_or(PathKeyError::NotAPathKey)?;
+    let (library_id, relpath) = rest.split_once(':').ok_or(PathKeyError::MissingLibraryId)?;
+    let library_id = library_id
+        .parse()
+        .map_err(|_| PathKeyError::NonNumericLibraryId)?;
+    Ok((library_id, relpath))
+}
+
+/// Whether `key` names a real item through the current effective identity
+/// layer (ADR-0035 amendment 2026-09-12 item 6).
+///
+/// The API passes the key through opaque and never parses it. The grammar
+/// lives here, so this is the one place a key is parsed. A provider key
+/// resolves when a watch-shaped link carries it; a path key resolves when a
+/// media row sits at that library and relative path. A key that does not fit
+/// the grammar does not resolve, which is the same answer as a key that names
+/// nothing and keeps the API from turning client input into a 500.
+pub fn item_key_resolves(conn: &Connection, key: &str) -> Result<bool, String> {
+    if !is_watch_item_key(key) {
+        return Ok(false);
+    }
+    if key.starts_with(PATH_KEY_PREFIX) {
+        let Ok((library_id, relpath)) = parse_path_key(key) else {
+            return Ok(false);
+        };
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM media_items WHERE library_id = ?1 AND path = ?2 LIMIT 1",
+                params![library_id, relpath],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("resolve path item_key {key}: {e}"))?;
+        return Ok(exists.is_some());
+    }
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM media_item_links WHERE item_key = ?1 LIMIT 1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("resolve item_key {key}: {e}"))?;
+    Ok(exists.is_some())
 }
 
 /// Bulk [`effective_item_key`] for a whole library, keyed by media item id.
@@ -338,5 +407,53 @@ mod tests {
         assert!(is_watch_item_key("tmdb:episode:1"));
         assert!(is_watch_item_key("path:1:a.mkv"));
         assert!(is_watch_item_key("tvdb:123"));
+    }
+
+    /// The one shared path-key parse, pinned at its boundaries. A relative path
+    /// keeps its own colons; a key with no separator and a key with a
+    /// non-numeric id are two different refusals, which is what lets browse
+    /// keep its two messages.
+    #[test]
+    fn path_key_parse_grammar() {
+        assert_eq!(parse_path_key("path:1:a.mkv"), Ok((1, "a.mkv")));
+        assert_eq!(parse_path_key("path:12:a:b/c.mkv"), Ok((12, "a:b/c.mkv")));
+        assert_eq!(parse_path_key("path:"), Err(PathKeyError::MissingLibraryId));
+        assert_eq!(
+            parse_path_key("path:1"),
+            Err(PathKeyError::MissingLibraryId)
+        );
+        assert_eq!(
+            parse_path_key("path:abc:a.mkv"),
+            Err(PathKeyError::NonNumericLibraryId)
+        );
+        assert_eq!(
+            parse_path_key("tmdb:movie:550"),
+            Err(PathKeyError::NotAPathKey)
+        );
+    }
+
+    /// ADR-0035 amendment item 6: only a key the identity layer can resolve is
+    /// accepted, and a key that does not fit the grammar is unresolved rather
+    /// than an error.
+    #[test]
+    fn only_an_existing_item_key_resolves() {
+        let c = mem();
+        // The positive control: the one item in the fixture.
+        assert!(item_key_resolves(&c, "path:1:a.mkv").unwrap());
+        // A path key at the right library but no row, a path key at no
+        // library, and a malformed path key are all unresolved.
+        assert!(!item_key_resolves(&c, "path:1:missing.mkv").unwrap());
+        assert!(!item_key_resolves(&c, "path:9:a.mkv").unwrap());
+        assert!(!item_key_resolves(&c, "path:abc:a.mkv").unwrap());
+        assert!(!item_key_resolves(&c, "path:1").unwrap());
+        // A provider key with no link is unresolved, and a show link is not a
+        // watch key even though it is a real link.
+        assert!(!item_key_resolves(&c, "tmdb:movie:550").unwrap());
+        assert!(!item_key_resolves(&c, "tmdb:show:1396").unwrap());
+
+        let tx = c.unchecked_transaction().unwrap();
+        upsert_link(&tx, 1, "tmdb:movie:550", false).unwrap();
+        tx.commit().unwrap();
+        assert!(item_key_resolves(&c, "tmdb:movie:550").unwrap());
     }
 }

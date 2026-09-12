@@ -326,7 +326,7 @@ pub fn resolve_artwork_key(
     if let Some(path) = artwork_path_for_item_key(conn, item_key, kind) {
         return Ok((item_key.to_string(), Some(path)));
     }
-    if let Some((library_id, relpath)) = parse_path_key(item_key) {
+    if let Ok((library_id, relpath)) = crate::item_links::parse_path_key(item_key) {
         for media_item_id in media_item_ids_for_path(conn, library_id, relpath)? {
             for link in crate::item_links::link_keys_for_item(conn, media_item_id)? {
                 if (link.starts_with("tmdb:movie:") || link.starts_with("tmdb:show:"))
@@ -338,12 +338,6 @@ pub fn resolve_artwork_key(
         }
     }
     Ok((item_key.to_string(), None))
-}
-
-fn parse_path_key(item_key: &str) -> Option<(i64, &str)> {
-    let rest = item_key.strip_prefix("path:")?;
-    let (library_id, relpath) = rest.split_once(':')?;
-    Some((library_id.parse().ok()?, relpath))
 }
 
 fn media_item_ids_for_path(

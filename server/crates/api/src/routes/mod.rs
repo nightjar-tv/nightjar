@@ -8,6 +8,7 @@ mod metadata_fix;
 pub mod sessions;
 mod system;
 mod track_ids;
+mod watch_state;
 
 use crate::state::AppState;
 use axum::{
@@ -73,6 +74,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v0/profiles/{profile_ref}",
             delete(accounts::delete_profile),
+        )
+        .route(
+            "/api/v0/profiles/{profile_ref}/watch-state",
+            get(watch_state::get_state).put(watch_state::put_state),
         )
         .route("/api/v0/items/{item_id}", get(items::get))
         .route(
@@ -197,11 +202,11 @@ async fn health() -> Json<Health> {
 }
 /// What a route requires of the caller behind it.
 ///
-/// Six values because the boundaries this server actually draws are six, and
-/// collapsing any two would make the table lie somewhere. `AnySession` is not
-/// a filler value: it is the positive statement that a route is deliberately
-/// open to every logged-in caller, and having to write it is what stops a new
-/// route being classified by nobody.
+/// Seven values because the boundaries this server actually draws are seven,
+/// and collapsing any two would make the table lie somewhere. `AnySession` is
+/// not a filler value: it is the positive statement that a route is
+/// deliberately open to every logged-in caller, and having to write it is what
+/// stops a new route being classified by nobody.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Authority {
@@ -211,6 +216,9 @@ pub(crate) enum Authority {
     Owner,
     /// Anyone, for their own account; refused for anyone else's.
     OwnAccount,
+    /// Any authenticated caller; which `{profile_ref}` in the path is
+    /// reachable is ADR-0035 item 7's rule, enforced inside the handler.
+    ProfileRef,
     /// A profile must be selected (ADR-0034 item 3). The byte routes.
     ProfileScope,
     /// The caller created the session (ADR-0034 item 8). A non-owner gets the
@@ -294,6 +302,16 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
         "DELETE",
         "/api/v0/profiles/{profile_ref}",
         Authority::OwnAccount,
+    ),
+    (
+        "GET",
+        "/api/v0/profiles/{profile_ref}/watch-state",
+        Authority::ProfileRef,
+    ),
+    (
+        "PUT",
+        "/api/v0/profiles/{profile_ref}/watch-state",
+        Authority::ProfileRef,
     ),
     ("GET", "/api/v0/items/{item_id}", Authority::AnySession),
     (
@@ -733,6 +751,18 @@ mod route_authority_tests {
         }
     }
 
+    /// A watch-state request aimed at one actor's profile, for `ProfileRef`.
+    fn profile_ref_request(method: &str, pattern: &str, actor: &Actor) -> (String, String) {
+        let uri = route_source::concrete(pattern)
+            .replace("/profiles/1/", &format!("/profiles/{}/", actor.profile_ref))
+            + "?itemKey=path:1:none";
+        let body = match method {
+            "PUT" => r#"{"positionMs":1000,"durationMs":10000}"#.to_string(),
+            _ => "{}".to_string(),
+        };
+        (uri, body)
+    }
+
     /// The refusal is asserted, not the gate's presence. A route wired to the
     /// extractor but demanding the wrong thing passes a presence check and
     /// fails this — which is how the `OwnAccount` rows were found, because the
@@ -844,6 +874,79 @@ mod route_authority_tests {
                         admitted,
                         StatusCode::FORBIDDEN,
                         "{method} {pattern} must admit a profile-scope session"
+                    );
+                }
+                Authority::ProfileRef => {
+                    // A profile session reaches its own active profile...
+                    let (own_uri, own_body) = profile_ref_request(method, pattern, &member);
+                    let (admitted, text) =
+                        call(state.clone(), method, &own_uri, &own_body, &watcher_token).await;
+                    assert_ne!(
+                        admitted,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must admit the active profile: {text}"
+                    );
+
+                    // ...and no other profile, whether it exists or not. The
+                    // refusal is the same named forbidden shape either way.
+                    let (other_uri, other_body) = profile_ref_request(method, pattern, &owner);
+                    let (refused, text) = call(
+                        state.clone(),
+                        method,
+                        &other_uri,
+                        &other_body,
+                        &watcher_token,
+                    )
+                    .await;
+                    assert_eq!(
+                        refused,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must refuse another profile"
+                    );
+                    assert!(
+                        text.contains("insufficient_role"),
+                        "{method} {pattern} refused another profile but not by that name: {text}"
+                    );
+
+                    // A member in account scope reaches its own account's
+                    // profile and not another account's.
+                    let (member_uri, member_body) = profile_ref_request(method, pattern, &member);
+                    let (member_admitted, _) = call(
+                        state.clone(),
+                        method,
+                        &member_uri,
+                        &member_body,
+                        &member_token,
+                    )
+                    .await;
+                    assert_ne!(
+                        member_admitted,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must admit a member's own account"
+                    );
+                    let (owner_uri, owner_body) = profile_ref_request(method, pattern, &owner);
+                    let (member_refused, _) = call(
+                        state.clone(),
+                        method,
+                        &owner_uri,
+                        &owner_body,
+                        &member_token,
+                    )
+                    .await;
+                    assert_eq!(
+                        member_refused,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must refuse a member aimed at another account"
+                    );
+
+                    // An owner in account scope reaches any profile.
+                    let (owner_uri, owner_body) = profile_ref_request(method, pattern, &member);
+                    let (owner_admitted, _) =
+                        call(state.clone(), method, &owner_uri, &owner_body, &owner_token).await;
+                    assert_ne!(
+                        owner_admitted,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must admit an account power"
                     );
                 }
                 Authority::SessionOwner => {

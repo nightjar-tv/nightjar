@@ -12,7 +12,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use nightjar_auth::token_sha256_hex;
 use nightjar_core::Role;
-use nightjar_db::{SessionRejection, SessionRow};
+use nightjar_db::{ProfileRow, SessionRejection, SessionRow};
 use nightjar_transcode::SessionOwner;
 
 /// The whole unauthenticated surface of the API (ADR-0034 item 11).
@@ -190,6 +190,20 @@ impl Caller {
     /// account exists, so the answer cannot be used to probe for one.
     pub fn may_act_on_account(&self, account_id: i64) -> bool {
         self.session.account_id == account_id || self.has_account_powers()
+    }
+
+    /// Which `profileRef`s this caller may address (ADR-0035 item 7).
+    ///
+    /// A profile-scope session reaches only its active profile. From account
+    /// scope an owner or manager reaches any profile, and a member reaches the
+    /// profiles under its own account. The refusal at the call site is the
+    /// same for a profile that does not exist and one this caller may not
+    /// address, so the answer cannot be used to probe for a ref.
+    pub fn may_address_profile(&self, profile: &ProfileRow) -> bool {
+        match self.session.active_profile_id {
+            Some(active) => active == profile.id,
+            None => self.has_account_powers() || self.session.account_id == profile.account_id,
+        }
     }
 
     /// The playback-session ownership identity (ADR-0034 item 8): the account

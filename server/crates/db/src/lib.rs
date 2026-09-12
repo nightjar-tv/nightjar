@@ -6,6 +6,7 @@ mod migrate;
 mod paths;
 mod status;
 mod store;
+mod watch;
 
 pub use accounts::{
     AccountRow, ProfileRow, SessionRejection, SessionRow, account_by_id, account_by_username,
@@ -34,6 +35,7 @@ pub use store::{
     ScanJobRow, ScanProgressCounts, SidecarRow, SubtitleTrackRow, UpsertItem, with_write_tx,
     write_tx,
 };
+pub use watch::{WatchStateRow, delete_watch_state, load_watch_state, upsert_watch_state};
 
 use std::path::{Path, PathBuf};
 

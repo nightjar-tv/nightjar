@@ -804,6 +804,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v0/profiles/{profileRef}/watch-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one profile's watch state for an item
+         * @description ADR-0035 item 6 and its 2026-09-12 amendment. `profileRef` is the profile whose state is read, which is a different question from the session's own scope. A profile session reaches only its active profile; from account scope an owner or manager reaches any profile and a member reaches the profiles under its own account. A ref the caller may not address and a ref that does not exist get the same named 403, so the response cannot be used to probe for a profile.
+         *
+         *     A key the server cannot resolve through its effective identity layer is a 404. A resolvable item with no stored state is a 200 with `state: null`, which is a different answer and is deliberately kept so.
+         */
+        get: operations["getWatchState"];
+        /**
+         * Report a profile's playback position for an item
+         * @description The body is exactly `positionMs` and `durationMs`. `played` is derived from the 90% ceiling and is never accepted from a client; `hidden` belongs to the later rollup block and is not writable here; a client timestamp is refused with the typed 422 because the server clock stamps every write (ADR-0035 items 2 and 3 and the amendment).
+         *
+         *     Below 2% of duration the write removes any existing state. At or above 90% the item is played, and a later report below 90% clears `played` for a rewatch. Every qualifying write overwrites the row, so a reverse seek wins over an earlier higher position.
+         */
+        put: operations["putWatchState"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v0/system/transcode": {
         parameters: {
             query?: never;
@@ -1156,6 +1184,45 @@ export interface components {
             role: components["schemas"]["Role"];
             /** @description Name for the profile created alongside the account. */
             profileName?: string;
+        };
+        /** @description The whole write body (ADR-0035 amendment item 1). `played`, `hidden` and a client timestamp are not fields, so a client cannot set them. A prohibited or unknown field is refused with the typed 422 rather than ignored: the body is exactly these two values. */
+        WatchReportRequest: {
+            /**
+             * Format: int64
+             * @description Current playback position in milliseconds.
+             */
+            positionMs: number;
+            /**
+             * Format: int64
+             * @description Duration of the file that was playing, in milliseconds. A snapshot, not a foreign key to the current file (ADR-0035 item 1).
+             */
+            durationMs: number;
+        };
+        WatchState: {
+            /** @description Opaque item key (ADR-0025 §1), returned as received. */
+            itemKey: string;
+            /** Format: int64 */
+            positionMs: number;
+            /** Format: int64 */
+            durationMs: number;
+            /** @description Derived from the 90% ceiling, never client-supplied. */
+            played: boolean;
+            /** @description Reserved for the later rollup block. Always false until that block writes it; this route preserves whatever it finds. */
+            hidden: boolean;
+            /**
+             * Format: date-time
+             * @description Server time of the first qualifying write at or above 2%. Preserved across later writes.
+             */
+            firstPlayedAt: string;
+            /**
+             * Format: date-time
+             * @description Server time of the latest qualifying write.
+             */
+            lastPlayedAt: string;
+        };
+        WatchStateEnvelope: {
+            /** @description The stored state, or null when the item has none. A resolved item with no state and an unresolvable key are different answers: this one is 200 with null, the other is 404. */
+            state: components["schemas"]["WatchState"] | null;
         };
         CreateProfileRequest: {
             name: string;
@@ -3155,6 +3222,132 @@ export interface operations {
             };
             /** @description Named forbidden error */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getWatchState: {
+        parameters: {
+            query: {
+                /** @description Opaque item key (ADR-0025 §1). Pass it back exactly as received, percent-encoded like any query value. */
+                itemKey: string;
+            };
+            header?: never;
+            path: {
+                profileRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored state, or null when the item has none. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchStateEnvelope"];
+                };
+            };
+            /** @description The itemKey query is missing or empty. The code is `bad_request`. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller may not address this profile, or it does not exist. The two are one response so the ref cannot be probed. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The itemKey does not resolve to an item. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    putWatchState: {
+        parameters: {
+            query: {
+                /** @description Opaque item key (ADR-0025 §1), exactly as received. */
+                itemKey: string;
+            };
+            header?: never;
+            path: {
+                profileRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WatchReportRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored state, or null when the report was below the resume floor and removed it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchStateEnvelope"];
+                };
+            };
+            /** @description The itemKey query is missing or empty, or the body is not valid JSON so the server could not read the request at all. The code is `bad_request`. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller may not address this profile, or it does not exist. The two are one response so the ref cannot be probed. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The itemKey does not resolve to an item, so no state is written. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The request did not carry a JSON content type. The code is `unsupported_media_type`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The body parsed but does not match the accepted shape — a prohibited or unknown field, a missing required field, or a field of the wrong type — or its values are not usable: a zero duration, a negative position, or a position past the duration. The code is `validation_error`. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
