@@ -1,7 +1,7 @@
 //! Accounts, roles and profiles (ADR-0034 items 1, 3, 7; ADR-0040 items 1, 3).
 
 use crate::authority::{Caller, INSUFFICIENT_ROLE};
-use crate::error::{ApiError, ApiResult, blocking};
+use crate::error::{ApiError, ApiResult, TypedJson, blocking};
 use crate::routes::auth::{AccountDto, ProfileDto, account_dto, profile_dto};
 use crate::state::AppState;
 use axum::Json;
@@ -99,6 +99,38 @@ pub(crate) fn validate_subtitle_default(value: Option<&str>) -> ApiResult<String
         Some(_) => Err(ApiError::unprocessable(
             "subtitleDefault must be \"auto\" or \"off\"",
         )),
+    }
+}
+
+/// The playback-policy update body (ADR-0034 item 8, ADR-0022 §5 as amended
+/// 2026-09-12). A full replacement of the three account ceilings: an omitted
+/// field clears that ceiling, so `{}` clears all three. Unknown fields are
+/// refused with the typed 422 rather than ignored, so the body is exactly the
+/// three values.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlaybackPolicyRequest {
+    #[serde(default)]
+    pub max_concurrent_sessions: Option<i64>,
+    #[serde(default)]
+    pub max_bitrate_bps: Option<i64>,
+    #[serde(default)]
+    pub max_height: Option<i64>,
+}
+
+/// A policy ceiling is null or a positive integer no greater than `max`.
+/// Zero, negatives and out-of-range values are the typed 422.
+pub(crate) fn validate_policy_ceiling(
+    name: &str,
+    value: Option<i64>,
+    max: i64,
+) -> ApiResult<Option<i64>> {
+    match value {
+        None => Ok(None),
+        Some(v) if v > 0 && v <= max => Ok(Some(v)),
+        Some(v) => Err(ApiError::unprocessable(format!(
+            "{name} must be a positive integer no greater than {max}, or null; got {v}"
+        ))),
     }
 }
 
@@ -287,6 +319,59 @@ pub async fn set_role(
                 .map_err(ApiError::internal)?,
         }
         Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+/// Set an account's playback-policy ceilings (ADR-0034 item 8, ADR-0022 §5 as
+/// amended 2026-09-12).
+///
+/// Authority is account powers: owner or manager in account scope, for any
+/// account. A member and every profile-scope session are refused, and refused
+/// before the target is looked up, so a member cannot use the response to
+/// learn whether an account exists. The lookup runs only after authority is
+/// settled; an unknown target is then the typed 404.
+pub async fn update_playback_policy(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(account_id): Path<i64>,
+    TypedJson(body): TypedJson<PlaybackPolicyRequest>,
+) -> ApiResult<Json<AccountDto>> {
+    blocking(move || {
+        caller.require_account_powers()?;
+        // Concurrency is applied as a `u32` at session start (ADR-0034 item 8),
+        // so the boundary accepts exactly `1..=u32::MAX` and storage agrees via
+        // the migration CHECK. Height is modelled as a `u32` everywhere it is
+        // applied (ADR-0022). Bitrate is `u64`-shaped and needs no tighter
+        // bound than the column.
+        let max_concurrent_sessions = validate_policy_ceiling(
+            "maxConcurrentSessions",
+            body.max_concurrent_sessions,
+            i64::from(u32::MAX),
+        )?;
+        let max_bitrate_bps =
+            validate_policy_ceiling("maxBitrateBps", body.max_bitrate_bps, i64::MAX)?;
+        let max_height =
+            validate_policy_ceiling("maxHeight", body.max_height, i64::from(u32::MAX))?;
+        let account = state
+            .db
+            .with_conn(|conn| {
+                let Some(existing) = nightjar_db::account_by_id(conn, account_id)? else {
+                    return Ok(None);
+                };
+                nightjar_db::update_account_playback_policy(
+                    conn,
+                    existing.id,
+                    max_concurrent_sessions,
+                    max_bitrate_bps,
+                    max_height,
+                )?;
+                nightjar_db::account_by_id(conn, existing.id)
+            })
+            .map_err(ApiError::internal)?;
+        let account = account
+            .ok_or_else(|| ApiError::not_found(format!("account {account_id} not found")))?;
+        Ok(Json(account_dto(&account)?))
     })
     .await
 }
@@ -742,5 +827,210 @@ mod profile_routing_tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("\"preferredLanguage\":null"), "{body}");
         assert!(body.contains("\"subtitleDefault\":\"auto\""), "{body}");
+    }
+}
+
+/// The playback-policy route through the real router (ADR-0034 item 8,
+/// ADR-0022 §5 as amended 2026-09-12).
+#[cfg(test)]
+mod playback_policy_routing_tests {
+    use crate::routes::router;
+    use crate::state::{AppState, test_support};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use nightjar_auth::mint_session_token;
+    use tower::ServiceExt;
+
+    struct Actor {
+        account_id: i64,
+        token: String,
+    }
+
+    /// One account, one profile, one session. `scoped` narrows the session to
+    /// the profile, which is what separates an account power from a viewer.
+    fn actor(state: &AppState, username: &str, role: &str, scoped: bool) -> Actor {
+        let minted = mint_session_token();
+        let account_id = state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                let (account_id, profile_id) = nightjar_db::create_account_with_profile(
+                    conn,
+                    username,
+                    &hash,
+                    role,
+                    "P",
+                    &format!("{username:0<32}"),
+                )?;
+                let expires = nightjar_db::session_expiry(conn)?;
+                let session = nightjar_db::create_session(
+                    conn,
+                    account_id,
+                    &minted.sha256_hex,
+                    "t",
+                    &expires,
+                )?;
+                if scoped {
+                    nightjar_db::set_active_profile(conn, session, Some(profile_id))?;
+                }
+                Ok(account_id)
+            })
+            .unwrap();
+        Actor {
+            account_id,
+            token: minted.plaintext,
+        }
+    }
+
+    async fn send(state: &AppState, uri: &str, body: &str, token: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        (status, text)
+    }
+
+    fn error_code(body: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("error body is not JSON: {e}: {body}"));
+        value
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or_else(|| panic!("no code in {body}"))
+            .to_string()
+    }
+
+    /// An owner and a manager each set an account, and the response carries
+    /// the three fields. The manager sets the owner's account, so the test
+    /// proves "any account" rather than "own account".
+    #[tokio::test]
+    async fn owner_and_manager_set_any_account_and_the_response_carries_the_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner", "owner", false);
+        let manager = actor(&state, "manager", "manager", false);
+
+        let uri = format!("/api/v0/accounts/{}/playback-policy", manager.account_id);
+        let (status, body) = send(
+            &state,
+            &uri,
+            r#"{"maxConcurrentSessions":2,"maxBitrateBps":8000000,"maxHeight":1080}"#,
+            &owner.token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"maxConcurrentSessions\":2"), "{body}");
+        assert!(body.contains("\"maxBitrateBps\":8000000"), "{body}");
+        assert!(body.contains("\"maxHeight\":1080"), "{body}");
+
+        let uri = format!("/api/v0/accounts/{}/playback-policy", owner.account_id);
+        let (status, body) = send(
+            &state,
+            &uri,
+            r#"{"maxConcurrentSessions":null,"maxBitrateBps":null,"maxHeight":720}"#,
+            &manager.token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"maxHeight\":720"), "{body}");
+        assert!(
+            !body.contains("maxConcurrentSessions"),
+            "a cleared ceiling is omitted, the same as a never-set one: {body}"
+        );
+
+        // Full replacement: an empty body clears every ceiling.
+        let (status, body) = send(&state, &uri, "{}", &manager.token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("maxHeight"), "{body}");
+        assert!(!body.contains("maxBitrateBps"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn member_and_profile_scope_are_forbidden_and_unknown_target_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner", "owner", false);
+        let member = actor(&state, "member", "member", false);
+        let scoped = actor(&state, "scoped", "manager", true);
+
+        let uri = format!("/api/v0/accounts/{}/playback-policy", member.account_id);
+        let (status, text) = send(&state, &uri, "{}", &member.token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(error_code(&text), "forbidden");
+        assert!(text.contains("insufficient_role"), "{text}");
+
+        // A profile-scope session is refused even when the account behind it
+        // is the owner (ADR-0034 item 3).
+        let (status, text) = send(&state, &uri, "{}", &scoped.token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert!(text.contains("insufficient_role"), "{text}");
+
+        // Unknown target, after an authorized lookup, is the typed 404.
+        let (status, text) = send(
+            &state,
+            "/api/v0/accounts/999999/playback-policy",
+            "{}",
+            &owner.token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+        assert_eq!(error_code(&text), "not_found");
+    }
+
+    #[tokio::test]
+    async fn invalid_values_and_unknown_fields_are_typed_422() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner", "owner", false);
+        let uri = format!("/api/v0/accounts/{}/playback-policy", owner.account_id);
+
+        for body in [
+            r#"{"maxConcurrentSessions":0}"#,
+            r#"{"maxConcurrentSessions":-1}"#,
+            // One above `u32::MAX`, the bound the enforcement path reads.
+            r#"{"maxConcurrentSessions":4294967296}"#,
+            r#"{"maxBitrateBps":0}"#,
+            r#"{"maxBitrateBps":-5}"#,
+            r#"{"maxHeight":0}"#,
+            r#"{"maxHeight":-1}"#,
+            // One above `u32::MAX`, which cannot be a height.
+            r#"{"maxHeight":4294967296}"#,
+        ] {
+            let (status, text) = send(&state, &uri, body, &owner.token).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {text}");
+            assert_eq!(error_code(&text), "validation_error", "{body}: {text}");
+        }
+
+        // An unknown field is refused, not ignored.
+        let (status, text) =
+            send(&state, &uri, r#"{"maxHeight":720,"nope":1}"#, &owner.token).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+        assert_eq!(error_code(&text), "validation_error", "{text}");
+
+        // The positive controls: each bound itself is accepted and stored, so
+        // the out-of-range cases prove a bound rather than a blanket refusal.
+        let (status, text) = send(&state, &uri, r#"{"maxHeight":4294967295}"#, &owner.token).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let (status, text) = send(
+            &state,
+            &uri,
+            r#"{"maxConcurrentSessions":4294967295}"#,
+            &owner.token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(
+            text.contains("\"maxConcurrentSessions\":4294967295"),
+            "the boundary maximum is stored, so storage agrees with enforcement: {text}"
+        );
     }
 }

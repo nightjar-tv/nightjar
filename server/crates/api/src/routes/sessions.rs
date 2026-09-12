@@ -1,7 +1,8 @@
 use crate::authority::WatchingCaller;
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::routes::items::{
-    abs_path, decide, library_root, profile_from_query, subtitle_tracks_for,
+    abs_path, account_playback_policy, apply_playback_policy, decide, library_root,
+    profile_from_query, subtitle_tracks_for,
 };
 use crate::state::AppState;
 use axum::{
@@ -58,6 +59,12 @@ fn log_hls_client_req(
 /// other goes red (Rule 4.11).
 pub const ADMISSION_REFUSED_CODE: &str = "admission_refused";
 
+/// Wire code carried by the 503 account-ceiling-refusal body (ADR-0034
+/// item 8). Distinct from [`ADMISSION_REFUSED_CODE`]: this names a per-account
+/// policy limit, not measured host capacity. A client retries an admission
+/// refusal but must not retry this one until a session ends or the cap moves.
+pub const ACCOUNT_CEILING_REFUSED_CODE: &str = "account_ceiling_refused";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeSessionDto {
@@ -92,6 +99,11 @@ pub struct StartQuery {
     pub max_bitrate_bps: Option<u64>,
     pub max_height: Option<u32>,
     pub hdr: Option<String>,
+    /// Explicit predecessor for a replacement start (ADR-0034 item 8). The
+    /// predecessor must be a live session of the authenticated account and
+    /// profile on the same item. Without it, a start at the account ceiling is
+    /// refused rather than treated as a replacement.
+    pub replaces_session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,7 +156,8 @@ pub async fn start(
     // still parking the runtime.
     let owner = watching.owner().clone();
     let profile_id = watching.profile_id();
-    blocking(move || start_blocking(state, item_id, query, owner, profile_id)).await
+    let account_id = watching.account_id();
+    blocking(move || start_blocking(state, item_id, query, owner, profile_id, account_id)).await
 }
 
 fn start_blocking(
@@ -153,18 +166,25 @@ fn start_blocking(
     query: StartQuery,
     owner: SessionOwner,
     profile_id: i64,
+    account_id: i64,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
     let row = state
         .db
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let profile = profile_from_query(
+    let capability = profile_from_query(
         query.profile_id.as_deref(),
         query.max_bitrate_bps,
         query.max_height,
         query.hdr.as_deref(),
     );
+    // The one composition, shared with playback-info and `/stream`
+    // (ADR-0022 §5 as amended). Unknown-as-local, so the policy half is
+    // surfaced and not applied.
+    let policy = account_playback_policy(&state, account_id)?;
+    let account_max_concurrent_sessions = policy.max_concurrent_sessions;
+    let (profile, _ceilings) = apply_playback_policy(capability, policy);
     let decision = decide(&row, &profile, state.tonemap_available);
     if row.probe_status != "probed" {
         return Err(ApiError {
@@ -290,6 +310,9 @@ fn start_blocking(
     let src = abs_path(&lib_root, &row.path);
     let started = hls.start(
         owner,
+        account_id,
+        account_max_concurrent_sessions,
+        query.replaces_session_id.clone(),
         item_id,
         &src,
         start_ms,
@@ -327,6 +350,37 @@ fn start_blocking(
                 message: "playback capacity is temporarily unavailable; retry shortly".into(),
                 code: ADMISSION_REFUSED_CODE,
             })
+        }
+        Err(StartSessionError::AccountCeilingRefused) => {
+            log_hls_client_req("-", "POST /sessions", Some(start_ms), 503, None);
+            Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "this account has reached its concurrent playback limit; \
+                          stop a playback session or raise the account limit"
+                    .into(),
+                code: ACCOUNT_CEILING_REFUSED_CODE,
+            })
+        }
+        // A missing predecessor, another account's or profile's predecessor,
+        // and an already-retired one are one answer, so the caller cannot use
+        // the response to probe other sessions.
+        Err(StartSessionError::PredecessorNotFound) => {
+            log_hls_client_req("-", "POST /sessions", Some(start_ms), 404, None);
+            Err(ApiError::not_found(
+                "replacesSessionId names no playable session of this account and profile",
+            ))
+        }
+        Err(StartSessionError::PredecessorItemMismatch) => {
+            log_hls_client_req("-", "POST /sessions", Some(start_ms), 422, None);
+            Err(ApiError::unprocessable(
+                "replacesSessionId must name a session on the same item",
+            ))
+        }
+        Err(StartSessionError::ReplacementAlreadyPending) => {
+            log_hls_client_req("-", "POST /sessions", Some(start_ms), 409, None);
+            Err(ApiError::conflict(
+                "replacesSessionId already has an in-flight replacement",
+            ))
         }
         Err(StartSessionError::Spawn(e)) => Err(ApiError::internal(e)),
     }
@@ -1560,6 +1614,7 @@ mod tests {
 mod ownership_tests {
     use crate::authority::SESSION_COOKIE;
     use crate::routes::router;
+    use crate::routes::sessions::{ACCOUNT_CEILING_REFUSED_CODE, ADMISSION_REFUSED_CODE};
     use crate::state::{AppState, test_support};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1846,6 +1901,136 @@ mod ownership_tests {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "session start: {body}");
         field(&body, "sessionId").to_string()
+    }
+
+    /// ADR-0034 item 8 through the real router: the account ceiling counts
+    /// across sibling profiles, and the refusal is a typed 503 whose code is
+    /// distinct from measured-admission refusal.
+    #[tokio::test]
+    async fn the_account_ceiling_is_a_typed_503_distinct_from_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        // Operator admission is above the account cap, so the account ceiling
+        // is the binding limit and its typed code is what a client sees.
+        let state = test_support::state_with_encoder_cap(dir.path(), 4);
+        if !ffmpeg_available() || !write_fixture(dir.path()) {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let owner = actor(&state, "capped");
+        state
+            .db
+            .with_conn(|conn| {
+                nightjar_db::update_account_playback_policy(
+                    conn,
+                    owner.account_id,
+                    Some(1),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        let owner_token = token_for(&state, &owner);
+        let sibling_token = second_profile_token(&state, owner.account_id);
+        let item_id = seed_item(&state, dir.path());
+
+        let _first = start_session(&state, &owner_token, item_id).await;
+
+        // The sibling profile shares the account's cap and is refused.
+        let (name, value) = bearer(&sibling_token);
+        let (status, body) = send(
+            state.clone(),
+            "POST",
+            &format!("/api/v0/items/{item_id}/sessions"),
+            Some((&name, &value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.contains(ACCOUNT_CEILING_REFUSED_CODE),
+            "the refusal names the account ceiling: {body}"
+        );
+        assert!(
+            !body.contains(ADMISSION_REFUSED_CODE),
+            "the account ceiling is not measured admission: {body}"
+        );
+    }
+
+    /// ADR-0034 item 8 through the real router: an explicit `replacesSessionId`
+    /// lets a successor start at the account cap, retires the predecessor's
+    /// playback authority, and refuses an unknown or another profile's
+    /// predecessor with the same missing-session 404.
+    #[tokio::test]
+    async fn explicit_replaces_session_id_retires_the_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state_with_encoder_cap(dir.path(), 4);
+        if !ffmpeg_available() || !write_fixture(dir.path()) {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let owner = actor(&state, "owner");
+        state
+            .db
+            .with_conn(|conn| {
+                nightjar_db::update_account_playback_policy(
+                    conn,
+                    owner.account_id,
+                    Some(1),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        let owner_token = token_for(&state, &owner);
+        let sibling_token = second_profile_token(&state, owner.account_id);
+        let item_id = seed_item(&state, dir.path());
+        let first = start_session(&state, &owner_token, item_id).await;
+        let (name, value) = bearer(&owner_token);
+        let start_uri = format!("/api/v0/items/{item_id}/sessions");
+
+        // No reference at the cap: a same-identity POST is a new playback and
+        // refuses. There is no implicit replacement.
+        let (status, body) =
+            send(state.clone(), "POST", &start_uri, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains(ACCOUNT_CEILING_REFUSED_CODE), "{body}");
+
+        // An unknown reference is the missing-session 404, not a ceiling
+        // refusal.
+        let unknown = format!("{start_uri}?replacesSessionId=nope");
+        let (status, body) = send(state.clone(), "POST", &unknown, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // A sibling profile cannot name another profile's session.
+        let (sibling_name, sibling_value) = bearer(&sibling_token);
+        let named = format!("{start_uri}?replacesSessionId={first}");
+        let (status, body) = send(
+            state.clone(),
+            "POST",
+            &named,
+            Some((&sibling_name, &sibling_value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // The owner's explicit replacement starts at the cap.
+        let (status, body) = send(state.clone(), "POST", &named, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let second = field(&body, "sessionId").to_string();
+        assert_ne!(second, first);
+
+        // The predecessor lost playback authority: its playlist is the same
+        // 404 as a missing session.
+        let (status, _) = send(
+            state.clone(),
+            "GET",
+            &format!("/api/v0/sessions/{first}/master.m3u8"),
+            Some((&name, &value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// The full session surface, in the order the router serves it. Every

@@ -1,6 +1,9 @@
 use crate::authority::WatchingCaller;
 use crate::error::{ApiError, ApiResult};
-use crate::routes::items::{ProfileQuery, abs_path, decide, library_root, profile_from_query};
+use crate::routes::items::{
+    ProfileQuery, abs_path, account_playback_policy, apply_playback_policy, decide, library_root,
+    profile_from_query,
+};
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -16,7 +19,7 @@ use tokio_util::io::ReaderStream;
 
 pub async fn stream_item(
     State(state): State<AppState>,
-    _watching: WatchingCaller,
+    watching: WatchingCaller,
     Path(item_id): Path<i64>,
     Query(query): Query<ProfileQuery>,
     headers: HeaderMap,
@@ -26,12 +29,17 @@ pub async fn stream_item(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
-    let profile = profile_from_query(
+    let capability = profile_from_query(
         query.profile_id.as_deref(),
         query.max_bitrate_bps,
         query.max_height,
         query.hdr.as_deref(),
     );
+    // The one composition, shared with playback-info and session start. The
+    // classifier is unknown-as-local, so the account policy is surfaced and
+    // not applied; a forwarding header cannot change that.
+    let policy = account_playback_policy(&state, watching.account_id())?;
+    let (profile, _ceilings) = apply_playback_policy(capability, policy);
     let decision = decide(&row, &profile, state.tonemap_available);
 
     match decision.method {

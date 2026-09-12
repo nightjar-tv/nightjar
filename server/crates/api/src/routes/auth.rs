@@ -29,6 +29,13 @@ pub struct AccountDto {
     pub role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_sessions: Option<i64>,
+    /// Account policy bitrate ceiling; null/absent means no ceiling
+    /// (ADR-0022 §5 as amended 2026-09-12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_bps: Option<i64>,
+    /// Account policy height ceiling; null/absent means no ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -100,6 +107,8 @@ pub(crate) fn account_dto(row: &AccountRow) -> ApiResult<AccountDto> {
         username: row.username.clone(),
         role: role.as_str(),
         max_concurrent_sessions: row.max_concurrent_sessions,
+        max_bitrate_bps: row.max_bitrate_bps,
+        max_height: row.max_height,
     })
 }
 

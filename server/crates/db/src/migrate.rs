@@ -83,6 +83,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         28,
         include_str!("../migrations/028_track_selection_persistence.sql"),
     ),
+    (
+        29,
+        include_str!("../migrations/029_account_playback_policy.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -130,6 +134,23 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         } else {
             0
         };
+        // 029 rebuilds `accounts`. `profiles` and `login_sessions` cascade
+        // from it, so all three are counted either side of the copy.
+        let before_accounts = if version == 29 {
+            count_table(conn, "accounts")?
+        } else {
+            0
+        };
+        let before_account_profiles = if version == 29 {
+            count_table(conn, "profiles")?
+        } else {
+            0
+        };
+        let before_account_sessions = if version == 29 {
+            count_table(conn, "login_sessions")?
+        } else {
+            0
+        };
         // Migration 25 adds a case-insensitive unique index over `username`.
         // If an install already holds two accounts differing only in case the
         // index cannot be built, and SQLite would say so as
@@ -140,15 +161,18 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         }
 
         // Migration 27 rebuilds `series`, which `series_entity_bindings`
-        // references ON DELETE CASCADE. With foreign keys live, the rebuild's
-        // `DROP TABLE series` performs an implicit delete and takes every
-        // binding with it. SQLite's table-rebuild procedure turns the pragma
-        // off *outside* the transaction — it is a no-op inside one, which is
-        // the constraint migration 025's comment names — so it is turned off
-        // here and restored after the commit.
-        let restore_foreign_keys = if version == 27 && foreign_keys_enabled(conn)? {
+        // references ON DELETE CASCADE. Migration 29 rebuilds `accounts`,
+        // which `profiles` and `login_sessions` reference ON DELETE CASCADE.
+        // With foreign keys live, the rebuild's `DROP TABLE` performs an
+        // implicit delete and takes every child row with it. SQLite's
+        // table-rebuild procedure turns the pragma off *outside* the
+        // transaction — it is a no-op inside one, which is the constraint
+        // migration 025's comment names — so it is turned off here and
+        // restored after the commit.
+        let rebuilds_parent = version == 27 || version == 29;
+        let restore_foreign_keys = if rebuilds_parent && foreign_keys_enabled(conn)? {
             conn.execute_batch("PRAGMA foreign_keys=OFF;")
-                .map_err(|e| format!("disable foreign keys for migration 27: {e}"))?;
+                .map_err(|e| format!("disable foreign keys for migration {version}: {e}"))?;
             true
         } else {
             false
@@ -210,6 +234,27 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             }
         }
 
+        if version == 29 {
+            let after_accounts = count_table(&tx, "accounts")?;
+            let after_profiles = count_table(&tx, "profiles")?;
+            let after_sessions = count_table(&tx, "login_sessions")?;
+            if after_accounts != before_accounts {
+                return Err(format!(
+                    "migration 29 aborted: accounts count {before_accounts} -> {after_accounts}"
+                ));
+            }
+            if after_profiles != before_account_profiles {
+                return Err(format!(
+                    "migration 29 aborted: profiles count {before_account_profiles} -> {after_profiles}"
+                ));
+            }
+            if after_sessions != before_account_sessions {
+                return Err(format!(
+                    "migration 29 aborted: login_sessions count {before_account_sessions} -> {after_sessions}"
+                ));
+            }
+        }
+
         tx.execute(
             "INSERT INTO schema_migrations (version) VALUES (?1)",
             [version],
@@ -219,7 +264,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("commit migration {version}: {e}"))?;
         if restore_foreign_keys {
             conn.execute_batch("PRAGMA foreign_keys=ON;")
-                .map_err(|e| format!("restore foreign keys after migration 27: {e}"))?;
+                .map_err(|e| format!("restore foreign keys after migration {version}: {e}"))?;
         }
         tracing::info!(version, "applied database migration");
     }
@@ -428,7 +473,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 28);
+        assert_eq!(v, 29);
         // 026 (ADR-0035 item 1): the table, its primary key and the recent
         // index exist, and the two boolean columns reject a value outside 0/1.
         let has_watch_state: i64 = conn
@@ -2153,10 +2198,67 @@ mod tests {
         assert_eq!(nulls, 1);
     }
 
+    /// 029 rebuilds `accounts` to give all three policy columns the same
+    /// positivity CHECK. The rebuild must not lose accounts, profiles or login
+    /// sessions, and AUTOINCREMENT must continue past the copied ids.
+    #[test]
+    fn migration_29_rebuilds_accounts_without_losing_children() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, 28);
+        conn.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role, max_concurrent_sessions)
+                 VALUES (1, 'a', 'h', 'owner', 2), (2, 'b', 'h', 'member', NULL);
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+                 VALUES (1, 1, 'r1', 'P1');
+             INSERT INTO login_sessions
+                 (account_id, active_profile_id, token_sha256, client_label, expires_at)
+                 VALUES (1, 1, 'tok', 'tv', '2099-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let accounts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        let profiles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM profiles", [], |r| r.get(0))
+            .unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM login_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((accounts, profiles, sessions), (2, 1, 1));
+        // The existing concurrency value survived the rebuild.
+        let kept: Option<i64> = conn
+            .query_row(
+                "SELECT max_concurrent_sessions FROM accounts WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, Some(2));
+
+        // AUTOINCREMENT continues past the copied ids rather than reusing one.
+        conn.execute(
+            "INSERT INTO accounts (username, password_hash, role) VALUES ('c', 'h', 'member')",
+            [],
+        )
+        .unwrap();
+        let new_id: i64 = conn
+            .query_row("SELECT id FROM accounts WHERE username = 'c'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            new_id > 2,
+            "AUTOINCREMENT continues past the copy: {new_id}"
+        );
+    }
+
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migrations 26, 27 and 28
+    /// way a real install upgrading into it looks. Migrations 26 through 29
     /// and their schema are removed with it, so `migrate` sees a database at
-    /// version 24 and applies all four in order.
+    /// version 24 and applies all five in order.
     ///
     /// Migration 28 adds columns to `profiles`, so the rewind rebuilds that
     /// table rather than dropping the columns: SQLite refuses to drop a column
@@ -2185,7 +2287,7 @@ mod tests {
              DROP TABLE profiles;
              ALTER TABLE profiles_rewind RENAME TO profiles;
              CREATE INDEX idx_profiles_account ON profiles(account_id);
-             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28);",
+             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29);",
         )
         .unwrap();
     }

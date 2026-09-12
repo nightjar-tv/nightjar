@@ -363,11 +363,19 @@ pub struct AdminCaller;
 pub struct WatchingCaller {
     owner: SessionOwner,
     profile_id: i64,
+    account_id: i64,
 }
 
 impl WatchingCaller {
     pub fn owner(&self) -> &SessionOwner {
         &self.owner
+    }
+
+    /// The authenticated account, typed (ADR-0034 item 8). The playback
+    /// policy ceilings hang off it; the opaque owner string is never parsed
+    /// to recover it.
+    pub fn account_id(&self) -> i64 {
+        self.account_id
     }
 
     /// The selected profile's row id. Track-selection preferences hang off it
@@ -407,6 +415,7 @@ impl FromRequestParts<AppState> for WatchingCaller {
                 .session
                 .active_profile_id
                 .ok_or_else(|| ApiError::internal("profile-scope session without a profile"))?,
+            account_id: caller.session.account_id,
         })
     }
 }

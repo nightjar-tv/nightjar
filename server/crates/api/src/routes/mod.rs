@@ -14,7 +14,7 @@ mod watch_state;
 use crate::state::AppState;
 use axum::{
     Json, Router, middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use serde::Serialize;
 
@@ -67,6 +67,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v0/accounts/{account_id}/role",
             put(accounts::set_role),
+        )
+        .route(
+            "/api/v0/accounts/{account_id}/playback-policy",
+            patch(accounts::update_playback_policy),
         )
         .route(
             "/api/v0/profiles",
@@ -304,6 +308,11 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
         "PUT",
         "/api/v0/accounts/{account_id}/role",
         Authority::Owner,
+    ),
+    (
+        "PATCH",
+        "/api/v0/accounts/{account_id}/playback-policy",
+        Authority::AccountPowers,
     ),
     ("GET", "/api/v0/profiles", Authority::OwnAccount),
     ("POST", "/api/v0/profiles", Authority::OwnAccount),
