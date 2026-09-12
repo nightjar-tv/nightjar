@@ -66,6 +66,12 @@ export const copy = {
 	/** The demo client's login, kept alive until Block 3 supplies the real
 	 *  one. Every route but four needs a session now (ADR-0034 item 11). */
 	checkingSession: 'Checking your session…',
+	/** The server did not answer and the stored credential is still good as
+	 *  far as we know. Offer the retry that needs no password, because the
+	 *  gate keeps the token for exactly this case. */
+	sessionUnavailable:
+		"Couldn't reach the server. Your sign-in is still saved. Check your connection, then try again.",
+	retry: 'Try again',
 	loginHint: 'Sign in to browse this server.',
 	bootstrapHint: 'No account exists yet. The first one you make owns this server.',
 	signIn: 'Sign in',

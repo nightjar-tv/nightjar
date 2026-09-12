@@ -44,11 +44,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		} catch {
 			/* ignore */
 		}
-		// Carry the server's machine code beside the sentence: the watch
-		// page's retry decision matches `code`, never the wording of
-		// `message`. Plain Error keeps one thrown-error path.
-		const error = new Error(message) as Error & { code?: string };
+		// Carry the server's machine code and HTTP status beside the sentence.
+		// The watch page's retry decision matches `code`; the sign-in gate
+		// classifies on `status`, because a 401 is a dead credential and a
+		// 5xx or 403 is not. Neither reads the wording of `message`. Plain
+		// Error keeps one thrown-error path.
+		const error = new Error(message) as Error & { code?: string; status?: number };
 		if (code) error.code = code;
+		error.status = res.status;
 		throw error;
 	}
 	if (res.status === 204) return undefined as T;

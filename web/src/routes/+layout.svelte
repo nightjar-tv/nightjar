@@ -3,43 +3,40 @@
 	import { api } from '$lib/api/client';
 	import { copy } from '$lib/copy';
 	import { clearToken, storeToken, storedToken } from '$lib/session';
+	import { resolveGate, type Gate } from '$lib/sessionGate';
 
 	let { children } = $props();
 
 	// `unknown` until the first check finishes, so the app is not drawn behind
 	// a login form and is not drawn without one either.
-	type Gate = 'unknown' | 'bootstrap' | 'login' | 'in';
+	type Screen = 'unknown' | Gate;
 
-	let gate = $state<Gate>('unknown');
+	let gate = $state<Screen>('unknown');
 	let username = $state('');
 	let password = $state('');
 	let error = $state<string | null>(null);
 	let busy = $state(false);
 
 	async function settle() {
-		const setup = await api.getSetupState();
-		if (!setup.adminExists) {
-			gate = 'bootstrap';
-			return;
-		}
-		if (!storedToken()) {
-			gate = 'login';
-			return;
-		}
+		busy = true;
 		try {
 			// Any valid session is "logged in". **Narrowing to a profile happens
 			// at playback, not here** — see `api.ensureProfileScope`. Doing it
 			// on every load made account scope unreachable, and with it every
 			// account-powers route, so a fresh install could not add a library
 			// through the form on `/` (OPEN-DEFECTS entry 15).
-			await api.getSession();
-			gate = 'in';
-		} catch {
-			// Expired, revoked, or from a database that has since been
-			// replaced. There is no refresh token by design (ADR-0034 item 5),
-			// so the answer is always to log in again.
-			clearToken();
-			gate = 'login';
+			//
+			// Only a 401 clears the token. A transport error, a 5xx, or a 403
+			// keeps it and answers `unavailable`, because none of those says the
+			// credential is bad (sessionGate.ts).
+			gate = await resolveGate({
+				getSetupState: api.getSetupState,
+				getSession: api.getSession,
+				hasToken: () => storedToken() !== null,
+				clearToken
+			});
+		} finally {
+			busy = false;
 		}
 	}
 
@@ -76,8 +73,10 @@
 
 	onMount(() => {
 		settle().catch((e: Error) => {
+			// resolveGate answers a gate for every expected failure; this is the
+			// last-resort catch so the app is never stuck on "checking".
 			error = e.message;
-			gate = 'login';
+			gate = 'unavailable';
 		});
 	});
 </script>
@@ -89,6 +88,12 @@
 	{@render children()}
 {:else if gate === 'unknown'}
 	<p class="settling">{copy.checkingSession}</p>
+{:else if gate === 'unavailable'}
+	<main>
+		<h1>nightjar</h1>
+		<p class="hint">{copy.sessionUnavailable}</p>
+		<button type="button" onclick={settle} disabled={busy}>{copy.retry}</button>
+	</main>
 {:else}
 	<main>
 		<h1>nightjar</h1>
