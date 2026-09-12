@@ -54,6 +54,52 @@ pub struct CreateProfileRequest {
     pub classification_cap: Option<String>,
     #[serde(default)]
     pub simple_interface: bool,
+    /// ISO-639-1-shaped lowercase code, or null (ADR-0038 amendment §2).
+    #[serde(default)]
+    pub preferred_language: Option<String>,
+    /// `auto` | `off`; omitted means `auto`.
+    #[serde(default)]
+    pub subtitle_default: Option<String>,
+}
+
+/// The profile update body (ADR-0038 amendment §2). A full replacement of the
+/// two preference fields: omitted `preferredLanguage` clears it and omitted
+/// `subtitleDefault` means `auto`, the same defaults a create with neither
+/// field gets.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateProfileRequest {
+    #[serde(default)]
+    pub preferred_language: Option<String>,
+    #[serde(default)]
+    pub subtitle_default: Option<String>,
+}
+
+/// A profile language is null or a lowercase two-letter ASCII code shaped like
+/// ISO 639-1; anything else is the typed 422 (ADR-0038 amendment §2).
+pub(crate) fn validate_preferred_language(value: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let valid = value.len() == 2 && value.bytes().all(|b| b.is_ascii_lowercase());
+    if valid {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(ApiError::unprocessable(
+            "preferredLanguage must be a lowercase two-letter ISO 639-1 code or null",
+        ))
+    }
+}
+
+/// A subtitle default is `auto` or `off`; omitted means `auto`.
+pub(crate) fn validate_subtitle_default(value: Option<&str>) -> ApiResult<String> {
+    match value {
+        None | Some("auto") => Ok("auto".to_string()),
+        Some("off") => Ok("off".to_string()),
+        Some(_) => Err(ApiError::unprocessable(
+            "subtitleDefault must be \"auto\" or \"off\"",
+        )),
+    }
 }
 
 /// What a role change resolves to once authority is settled.
@@ -283,6 +329,8 @@ pub async fn create_profile(
         if body.name.trim().is_empty() {
             return Err(ApiError::bad_request("name is required"));
         }
+        let preferred_language = validate_preferred_language(body.preferred_language.as_deref())?;
+        let subtitle_default = validate_subtitle_default(body.subtitle_default.as_deref())?;
         let profile_ref = mint_profile_ref();
         let row = state
             .db
@@ -294,12 +342,55 @@ pub async fn create_profile(
                     body.name.trim(),
                     body.classification_cap.as_deref(),
                     body.simple_interface,
+                    preferred_language.as_deref(),
+                    &subtitle_default,
                 )?;
                 nightjar_db::profile_by_ref(conn, &profile_ref)?
                     .ok_or_else(|| "profile vanished after creation".to_string())
             })
             .map_err(ApiError::internal)?;
         Ok((StatusCode::CREATED, Json(profile_dto(&row))))
+    })
+    .await
+}
+
+/// Update a profile's track-selection preferences (ADR-0038 amendment §2).
+///
+/// Authority is ADR-0035 item 7, the same rule the profile read uses: a profile
+/// session reaches its active profile, and from account scope an owner or
+/// manager reaches any profile while a member reaches its own account's. A ref
+/// the caller may not address and one that does not exist get the same named
+/// forbidden response.
+pub async fn update_profile(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(profile_ref): Path<String>,
+    Json(body): Json<UpdateProfileRequest>,
+) -> ApiResult<Json<ProfileDto>> {
+    blocking(move || {
+        let preferred_language = validate_preferred_language(body.preferred_language.as_deref())?;
+        let subtitle_default = validate_subtitle_default(body.subtitle_default.as_deref())?;
+        let profile = state
+            .db
+            .with_conn(|conn| nightjar_db::profile_by_ref(conn, &profile_ref))
+            .map_err(ApiError::internal)?;
+        let Some(profile) = profile.filter(|p| caller.may_address_profile(p)) else {
+            return Err(ApiError::forbidden(INSUFFICIENT_ROLE));
+        };
+        let row = state
+            .db
+            .with_conn(|conn| {
+                nightjar_db::update_profile_preferences(
+                    conn,
+                    profile.id,
+                    preferred_language.as_deref(),
+                    &subtitle_default,
+                )?;
+                nightjar_db::profile_by_id(conn, profile.id)?
+                    .ok_or_else(|| "profile vanished after update".to_string())
+            })
+            .map_err(ApiError::internal)?;
+        Ok(Json(profile_dto(&row)))
     })
     .await
 }
@@ -455,5 +546,201 @@ mod tests {
             "an owner acting as a profile is not acting as the owner"
         );
         assert!(authorize_account_delete(&narrowed_owner, Role::Member).is_err());
+    }
+
+    /// ADR-0038 amendment §2: a language is null or a lowercase two-letter
+    /// ASCII code. The negative cases are the shapes a client is most likely
+    /// to send, including the uppercase and three-letter forms.
+    #[test]
+    fn profile_language_shape_is_a_closed_set() {
+        assert_eq!(validate_preferred_language(None).unwrap(), None);
+        for good in ["en", "ja", "pt", "zz"] {
+            assert_eq!(
+                validate_preferred_language(Some(good)).unwrap().as_deref(),
+                Some(good)
+            );
+        }
+        for bad in ["EN", "eng", "e", "e1", "1e", "", " en", "en ", "én"] {
+            assert!(
+                validate_preferred_language(Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_default_is_auto_or_off() {
+        assert_eq!(validate_subtitle_default(None).unwrap(), "auto");
+        assert_eq!(validate_subtitle_default(Some("auto")).unwrap(), "auto");
+        assert_eq!(validate_subtitle_default(Some("off")).unwrap(), "off");
+        for bad in ["OFF", "on", "", "true"] {
+            assert!(
+                validate_subtitle_default(Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+}
+
+/// Profile create/read/update through the real router (ADR-0038 amendment §2).
+#[cfg(test)]
+mod profile_routing_tests {
+    use crate::routes::router;
+    use crate::state::{AppState, test_support};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use nightjar_auth::mint_session_token;
+    use tower::ServiceExt;
+
+    fn owner_token(state: &AppState) -> String {
+        let minted = mint_session_token();
+        state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                nightjar_db::create_account_with_profile(conn, "o", &hash, "owner", "P", "r0")?;
+                let account = nightjar_db::account_by_username(conn, "o")?.unwrap();
+                let expires = nightjar_db::session_expiry(conn)?;
+                nightjar_db::create_session(conn, account.id, &minted.sha256_hex, "t", &expires)?;
+                Ok(())
+            })
+            .unwrap();
+        minted.plaintext
+    }
+
+    async fn send(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: &str,
+        token: &str,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        (status, text)
+    }
+
+    fn error_code(body: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("error body is not JSON: {e}: {body}"));
+        value
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or_else(|| panic!("no code in {body}"))
+            .to_string()
+    }
+
+    /// Existing clients that send neither field get null / `auto`, and a
+    /// create that does send them stores and returns them.
+    #[tokio::test]
+    async fn create_defaults_to_null_and_auto_and_accepts_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let token = owner_token(&state);
+
+        let (status, body) = send(
+            &state,
+            "POST",
+            "/api/v0/profiles",
+            r#"{"name":"Kid"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("\"preferredLanguage\":null"), "{body}");
+        assert!(body.contains("\"subtitleDefault\":\"auto\""), "{body}");
+
+        let (status, body) = send(
+            &state,
+            "POST",
+            "/api/v0/profiles",
+            r#"{"name":"Anime","preferredLanguage":"ja","subtitleDefault":"off"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("\"preferredLanguage\":\"ja\""), "{body}");
+        assert!(body.contains("\"subtitleDefault\":\"off\""), "{body}");
+
+        // The list read carries both fields too.
+        let (status, body) = send(&state, "GET", "/api/v0/profiles", "{}", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"preferredLanguage\":\"ja\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_language_is_a_typed_422() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let token = owner_token(&state);
+
+        for bad in ["EN", "eng", "e", "english"] {
+            let body = format!(r#"{{"name":"X","preferredLanguage":"{bad}"}}"#);
+            let (status, text) = send(&state, "POST", "/api/v0/profiles", &body, &token).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {text}");
+            assert_eq!(error_code(&text), "validation_error", "{bad}: {text}");
+        }
+        // The positive control: a valid code on the same route is created.
+        let (status, text) = send(
+            &state,
+            "POST",
+            "/api/v0/profiles",
+            r#"{"name":"X","preferredLanguage":"en"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{text}");
+    }
+
+    /// Update is a full replacement: a valid body stores, and null clears.
+    #[tokio::test]
+    async fn update_replaces_the_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let token = owner_token(&state);
+        let (_, created) = send(
+            &state,
+            "POST",
+            "/api/v0/profiles",
+            r#"{"name":"X","preferredLanguage":"en","subtitleDefault":"auto"}"#,
+            &token,
+        )
+        .await;
+        let profile_ref = created
+            .split("\"profileRef\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("profileRef in the create response")
+            .to_string();
+        let uri = format!("/api/v0/profiles/{profile_ref}");
+
+        let (status, body) = send(
+            &state,
+            "PATCH",
+            &uri,
+            r#"{"preferredLanguage":"ja","subtitleDefault":"off"}"#,
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"preferredLanguage\":\"ja\""), "{body}");
+        assert!(body.contains("\"subtitleDefault\":\"off\""), "{body}");
+
+        // Omitted fields are the defaults, so an empty body clears.
+        let (status, body) = send(&state, "PATCH", &uri, "{}", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"preferredLanguage\":null"), "{body}");
+        assert!(body.contains("\"subtitleDefault\":\"auto\""), "{body}");
     }
 }

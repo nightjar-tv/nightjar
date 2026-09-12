@@ -6,15 +6,16 @@ mod migrate;
 mod paths;
 mod status;
 mod store;
+mod track_choice;
 mod watch;
 
 pub use accounts::{
     AccountRow, ProfileRow, SessionRejection, SessionRow, account_by_id, account_by_username,
     account_exists, admin_exists, classify_session, create_account_with_profile, create_profile,
     create_session, delete_account, delete_profile, library_exists, list_accounts, now_iso,
-    profile_by_ref, profiles_for_account, revoke_all_for_account, revoke_session, session_expiry,
-    session_for_token, set_active_profile, set_password_hash, set_role, touch_last_seen,
-    transfer_ownership,
+    profile_by_id, profile_by_ref, profiles_for_account, revoke_all_for_account, revoke_session,
+    session_expiry, session_for_token, set_active_profile, set_password_hash, set_role,
+    touch_last_seen, transfer_ownership, update_profile_preferences,
 };
 pub use content_id::{
     CONTENT_ID_WINDOW, content_id_for_path, content_id_from_reader, content_id_matches,
@@ -34,6 +35,9 @@ pub use store::{
     Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary, ProbeUpdate,
     ScanJobRow, ScanProgressCounts, SidecarRow, SubtitleTrackRow, UpsertItem, with_write_tx,
     write_tx,
+};
+pub use track_choice::{
+    SubtitleChoiceRow, TrackChoiceRow, TrackDescription, load_track_choice, upsert_track_choice,
 };
 pub use watch::{WatchStateRow, delete_watch_state, load_watch_state, upsert_watch_state};
 

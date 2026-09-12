@@ -23,8 +23,9 @@ pub use scan_progress::{
     probe_total,
 };
 pub use track_select::{
-    DEFAULT_PREFERENCE_LANGUAGE, TrackCandidate, TrackSelection, select_audio_track,
-    select_subtitle_track, title_looks_forced, title_looks_sdh,
+    DEFAULT_PREFERENCE_LANGUAGE, TrackCandidate, TrackSelection, select_audio_for_description,
+    select_audio_track, select_subtitle_for_description, select_subtitle_track, title_looks_forced,
+    title_looks_sdh,
 };
 pub use watch::{PLAYED_AT_PERCENT, RESUME_FLOOR_PERCENT, WatchReport, watch_report};
 

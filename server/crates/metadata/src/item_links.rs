@@ -299,6 +299,84 @@ pub fn series_key_for_show_folder(
     }
 }
 
+/// Whether `key` names a real series through the effective series identity
+/// layer (ADR-0039 items 2 and 5; ADR-0038 amendment §2).
+///
+/// The API passes a `seriesKey` through opaque and never parses it; the
+/// grammar lives here. This answers "does this key name a series", which is a
+/// different question from `browse::resolve_series_key`'s "what does this key
+/// cover" — the same split `item_key_resolves` and `effective_item_key` have,
+/// and not a second answer to one question. The answer mirrors
+/// [`series_key_for_item`] exactly:
+///
+/// - `folder:` resolves when a `series` row sits at that folder with a null
+///   `tmdb_show_id` (a bound folder derives a `tmdb:show:` key instead).
+/// - `tmdb:show:` resolves when any `series` row is bound to that entity.
+/// - `tmdb:movie:` resolves when a watch-shaped link carries it, and `path:`
+///   when a movie row sits at that library and relative path — a movie's
+///   series key is its own `item_key`.
+///
+/// A key that does not fit the grammar does not resolve, which is the same
+/// answer as a key that names nothing.
+pub fn series_key_resolves(conn: &Connection, key: &str) -> Result<bool, String> {
+    if let Some(rest) = key.strip_prefix(FOLDER_KEY_PREFIX) {
+        let Some((library_id, relpath)) = rest.split_once(':') else {
+            return Ok(false);
+        };
+        let Ok(library_id) = library_id.parse::<i64>() else {
+            return Ok(false);
+        };
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM series
+                 WHERE library_id = ?1 AND relpath = ?2 AND tmdb_show_id IS NULL LIMIT 1",
+                params![library_id, relpath],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("resolve folder series key {key}: {e}"))?;
+        return Ok(exists.is_some());
+    }
+    if let Some(id) = key.strip_prefix(SHOW_KEY_PREFIX) {
+        let Ok(show_id) = id.parse::<i64>() else {
+            return Ok(false);
+        };
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM series WHERE tmdb_show_id = ?1 LIMIT 1",
+                params![show_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("resolve show series key {key}: {e}"))?;
+        return Ok(exists.is_some());
+    }
+    if key.starts_with(MOVIE_KEY_PREFIX) {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM media_item_links WHERE item_key = ?1 LIMIT 1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("resolve movie series key {key}: {e}"))?;
+        return Ok(exists.is_some());
+    }
+    if let Ok((library_id, relpath)) = parse_path_key(key) {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM media_items
+                 WHERE library_id = ?1 AND path = ?2 AND kind = 'movie' LIMIT 1",
+                params![library_id, relpath],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("resolve path series key {key}: {e}"))?;
+        return Ok(exists.is_some());
+    }
+    Ok(false)
+}
+
 /// The series key for one item, and the only function that answers it
 /// (ADR-0039 item 5).
 ///

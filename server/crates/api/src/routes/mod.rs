@@ -7,6 +7,7 @@ mod libraries;
 mod metadata_fix;
 pub mod sessions;
 mod system;
+mod track_choice;
 mod track_ids;
 mod watch_state;
 
@@ -73,11 +74,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v0/profiles/{profile_ref}",
-            delete(accounts::delete_profile),
+            delete(accounts::delete_profile).patch(accounts::update_profile),
         )
         .route(
             "/api/v0/profiles/{profile_ref}/watch-state",
             get(watch_state::get_state).put(watch_state::put_state),
+        )
+        .route(
+            "/api/v0/profiles/{profile_ref}/track-choice",
+            put(track_choice::put_choice),
         )
         .route("/api/v0/items/{item_id}", get(items::get))
         .route(
@@ -221,6 +226,10 @@ pub(crate) enum Authority {
     ProfileRef,
     /// A profile must be selected (ADR-0034 item 3). The byte routes.
     ProfileScope,
+    /// The caller's active profile must be exactly the `{profile_ref}` in the
+    /// path (ADR-0038 item 7): stricter than [`Authority::ProfileRef`], which
+    /// also admits account scope. An account-scope token is refused.
+    ActiveProfileOnly,
     /// The caller created the session (ADR-0034 item 8). A non-owner gets the
     /// missing-session 404, so this is narrower than `AnySession`.
     SessionOwner,
@@ -302,6 +311,16 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
         "DELETE",
         "/api/v0/profiles/{profile_ref}",
         Authority::OwnAccount,
+    ),
+    (
+        "PATCH",
+        "/api/v0/profiles/{profile_ref}",
+        Authority::OwnAccount,
+    ),
+    (
+        "PUT",
+        "/api/v0/profiles/{profile_ref}/track-choice",
+        Authority::ActiveProfileOnly,
     ),
     (
         "GET",
@@ -668,6 +687,8 @@ mod route_authority_tests {
                     "spare",
                     None,
                     false,
+                    None,
+                    "auto",
                 )?;
                 Ok(())
             })
@@ -722,12 +743,20 @@ mod route_authority_tests {
             ("POST", "/api/v0/accounts") => {
                 r#"{"username":"new","password":"y","role":"member"}"#.to_string()
             }
+            ("PUT", "/api/v0/profiles/{profile_ref}/track-choice") => {
+                r#"{"audio":null,"subtitle":{"mode":"unset"}}"#.to_string()
+            }
             ("PUT", _) => r#"{"role":"manager"}"#.to_string(),
             ("POST", "/api/v0/profiles") => r#"{"name":"x"}"#.to_string(),
             ("POST", "/api/v0/libraries") => {
                 r#"{"name":"x","path":"/nonexistent","kind":"movies"}"#.to_string()
             }
             _ => "{}".to_string(),
+        };
+        let uri = if pattern == "/api/v0/profiles/{profile_ref}/track-choice" {
+            format!("{uri}?seriesKey=path:1:none")
+        } else {
+            uri
         };
         (uri, body)
     }
@@ -746,6 +775,10 @@ mod route_authority_tests {
             ("DELETE", "/api/v0/profiles/{profile_ref}") => (
                 format!("/api/v0/profiles/{}", other.profile_ref),
                 "{}".to_string(),
+            ),
+            ("PATCH", "/api/v0/profiles/{profile_ref}") => (
+                format!("/api/v0/profiles/{}", other.profile_ref),
+                r#"{"subtitleDefault":"off"}"#.to_string(),
             ),
             _ => unreachable!("only OwnAccount routes have an other-account form"),
         }
@@ -948,6 +981,53 @@ mod route_authority_tests {
                         StatusCode::FORBIDDEN,
                         "{method} {pattern} must admit an account power"
                     );
+                }
+                Authority::ActiveProfileOnly => {
+                    // The active profile's own session is admitted (a 404 for an
+                    // unresolved series key is fine; what is asserted is that it
+                    // is not the authority refusal).
+                    let (own_uri, own_body) = own_request(method, pattern, &member);
+                    let (admitted, text) =
+                        call(state.clone(), method, &own_uri, &own_body, &watcher_token).await;
+                    assert_ne!(
+                        admitted,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must admit the active profile: {text}"
+                    );
+
+                    // An account-scope token is refused, even an owner's: a
+                    // track choice with no playback is not a thing a user can
+                    // mean (ADR-0038 item 7).
+                    for scope in [&owner_token, &member_token] {
+                        let (refused, text) =
+                            call(state.clone(), method, &own_uri, &own_body, scope).await;
+                        assert_eq!(
+                            refused,
+                            StatusCode::FORBIDDEN,
+                            "{method} {pattern} must refuse account scope"
+                        );
+                        assert!(
+                            text.contains("insufficient_role"),
+                            "{method} {pattern} refused but not by name: {text}"
+                        );
+                    }
+
+                    // ...and another profile's session is refused.
+                    let (other_uri, other_body) = own_request(method, pattern, &owner);
+                    let (refused, text) = call(
+                        state.clone(),
+                        method,
+                        &other_uri,
+                        &other_body,
+                        &watcher_token,
+                    )
+                    .await;
+                    assert_eq!(
+                        refused,
+                        StatusCode::FORBIDDEN,
+                        "{method} {pattern} must refuse another profile"
+                    );
+                    assert!(text.contains("insufficient_role"), "{text}");
                 }
                 Authority::SessionOwner => {
                     // The concrete session id does not exist, so this asserts

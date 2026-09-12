@@ -12,12 +12,13 @@ use axum::{
     response::Response,
 };
 use nightjar_core::{
-    ClientCapabilityProfile, DEFAULT_PREFERENCE_LANGUAGE, PlaybackMethod, TrackCandidate,
-    select_audio_track, select_subtitle_track, video_encode_plan,
+    ClientCapabilityProfile, PlaybackMethod, TrackCandidate, TrackSelection,
+    select_audio_for_description, select_audio_track, select_subtitle_for_description,
+    select_subtitle_track, video_encode_plan,
 };
 use nightjar_db::MediaItemRow;
 use nightjar_db::SubtitleTrackRow;
-use nightjar_db::resolve_media_path;
+use nightjar_db::{SubtitleChoiceRow, TrackDescription, resolve_media_path};
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeMap, PiggybackExtract,
     PlaylistError, SessionMode, SessionOwner, StartSessionError, VideoRung, burn_in_kind_for_codec,
@@ -72,6 +73,13 @@ pub struct TranscodeSessionDto {
     pub media_origin_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usable_extent_ms: Option<u64>,
+    /// Why this session's audio track was selected (ADR-0038 item 5). Server
+    /// time only, and the string the track menu shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_reason: Option<String>,
+    /// Why this session's subtitle track was selected, or why none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +126,8 @@ fn dto_from_view(view: nightjar_transcode::SessionView) -> TranscodeSessionDto {
         landed_ms: view.landed_ms,
         media_origin_ms: view.media_origin_ms,
         usable_extent_ms: view.usable_extent_ms,
+        audio_reason: None,
+        subtitle_reason: None,
     }
 }
 
@@ -133,7 +143,8 @@ pub async fn start(
     // most expensive part of the most latency-sensitive route was the part
     // still parking the runtime.
     let owner = watching.owner().clone();
-    blocking(move || start_blocking(state, item_id, query, owner)).await
+    let profile_id = watching.profile_id();
+    blocking(move || start_blocking(state, item_id, query, owner, profile_id)).await
 }
 
 fn start_blocking(
@@ -141,6 +152,7 @@ fn start_blocking(
     item_id: i64,
     query: StartQuery,
     owner: SessionOwner,
+    profile_id: i64,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
     let row = state
         .db
@@ -172,12 +184,19 @@ fn start_blocking(
         });
     };
 
-    let audio = resolve_audio(&state, &row, query.audio_track_id.as_deref(), &profile)?;
+    let prefs = load_track_preferences(&state, Some(profile_id), &row);
+    let audio = resolve_audio(
+        &state,
+        &row,
+        query.audio_track_id.as_deref(),
+        &profile,
+        &prefs,
+    )?;
     let burn_in = resolve_burn_in(&state, &row, query.subtitle_track_id.as_deref())?;
 
     // DirectPlay is allowed when a track selection requires encode work the
     // progressive path cannot do (ADR-0012 hybrid / ADR-0018 burn-in).
-    let needs_encode_selection = burn_in.is_some() || audio.needs_downmix();
+    let needs_encode_selection = burn_in.is_some() || audio.selection.needs_downmix();
     let mut mode = match decision.method {
         PlaybackMethod::Remux => SessionMode::Copy,
         PlaybackMethod::Transcode => SessionMode::Transcode,
@@ -198,18 +217,32 @@ fn start_blocking(
     }
 
     let lib_root = library_root(&state, row.library_id)?;
-    let subtitle_tracks = match subtitle_tracks_for(&state, &row, &lib_root) {
-        Ok(tracks) => match snapshot_hls_tracks(&state, &row, &lib_root, &tracks) {
-            Ok(snap) => snap,
+    let (subtitle_tracks, subtitle_reason) = match subtitle_tracks_for(&state, &row, &lib_root) {
+        Ok(tracks) => match snapshot_hls_tracks(
+            &state,
+            &row,
+            &lib_root,
+            &tracks,
+            &prefs,
+            audio.language.as_deref(),
+        ) {
+            Ok((snap, reason)) => (snap, reason),
             Err(e) => {
                 tracing::warn!(item_id, error = %e, "subtitle snapshot failed at session start");
-                Vec::new()
+                (Vec::new(), "subtitle snapshot failed".to_string())
             }
         },
         Err(e) => {
             tracing::warn!(item_id, error = %e, "subtitle list failed at session start");
-            Vec::new()
+            (Vec::new(), "subtitle list failed".to_string())
         }
+    };
+    // An explicit burn-in track is the selection, whatever the soft default
+    // would have been.
+    let subtitle_reason = if burn_in.is_some() {
+        "client requested subtitleTrackId".to_string()
+    } else {
+        subtitle_reason
     };
 
     let start_ms = query.start_ms.unwrap_or(0);
@@ -262,7 +295,7 @@ fn start_blocking(
         start_ms,
         duration_ms as u64,
         mode,
-        audio,
+        audio.selection,
         subtitle_tracks,
         burn_in,
         keyframe_map,
@@ -279,7 +312,10 @@ fn start_blocking(
                 request_map_rebuild(&state, &row);
             }
             log_hls_client_req(&session_id, "POST /sessions", Some(start_ms), 202, None);
-            Ok((StatusCode::ACCEPTED, Json(dto_from_view(view))))
+            let mut dto = dto_from_view(view);
+            dto.audio_reason = Some(audio.reason);
+            dto.subtitle_reason = Some(subtitle_reason);
+            Ok((StatusCode::ACCEPTED, Json(dto)))
         }
         Err(StartSessionError::AdmissionRefused) => {
             log_hls_client_req("-", "POST /sessions", Some(start_ms), 503, None);
@@ -371,13 +407,166 @@ pub(crate) fn request_map_rebuild(state: &AppState, row: &MediaItemRow) {
         .prioritize_map_rebuild(row.id, row.library_id, abs_path(&root, &row.path));
 }
 
-/// Which audio stream this session maps (ADR-0012 / ADR-0024).
+/// The profile defaults and per-series override that feed selection
+/// (ADR-0038 items 1, 3 and 6).
+pub(crate) struct TrackPreferences {
+    pub preferred_language: Option<String>,
+    /// `auto` | `off`.
+    pub subtitle_default: String,
+    pub audio_description: Option<TrackDescription>,
+    pub subtitle_choice: SubtitleChoiceRow,
+}
+
+impl TrackPreferences {
+    /// No profile or no stored preference: ADR-0024's no-preference case and
+    /// `auto`, which is what a profile nobody configured gets.
+    fn none() -> Self {
+        Self {
+            preferred_language: None,
+            subtitle_default: "auto".to_string(),
+            audio_description: None,
+            subtitle_choice: SubtitleChoiceRow::Unset,
+        }
+    }
+}
+
+/// Load the profile defaults and the series override for one item.
+///
+/// `profile_id` is `None` for an account-scope caller (playback-info can be
+/// read there), which is the no-preference case. Every read failure degrades to
+/// the no-preference case with a log rather than failing playback: a preference
+/// is an input to selection, not a precondition for it.
+pub(crate) fn load_track_preferences(
+    state: &AppState,
+    profile_id: Option<i64>,
+    row: &MediaItemRow,
+) -> TrackPreferences {
+    let Some(profile_id) = profile_id else {
+        return TrackPreferences::none();
+    };
+    let root = match library_root(state, row.library_id) {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(item_id = row.id, error = ?e, "library root read failed");
+            return TrackPreferences::none();
+        }
+    };
+    let loaded = state.db.with_conn(|conn| {
+        let profile = nightjar_db::profile_by_id(conn, profile_id)?;
+        // The series key is derived through the one resolver (ADR-0039 item 5).
+        let series_key = nightjar_metadata::series_key_for_item(
+            conn,
+            row.id,
+            row.library_id,
+            &row.path,
+            &root,
+            &row.kind,
+        )?;
+        let choice = nightjar_db::load_track_choice(conn, profile_id, &series_key)?;
+        Ok((profile, choice))
+    });
+    match loaded {
+        Ok((Some(profile), choice)) => TrackPreferences {
+            preferred_language: profile.preferred_language,
+            subtitle_default: profile.subtitle_default,
+            audio_description: choice.as_ref().and_then(|c| c.audio.clone()),
+            subtitle_choice: choice
+                .map(|c| c.subtitle)
+                .unwrap_or(SubtitleChoiceRow::Unset),
+        },
+        Ok((None, _)) => TrackPreferences::none(),
+        Err(e) => {
+            tracing::warn!(item_id = row.id, error = %e, "track preference read failed");
+            TrackPreferences::none()
+        }
+    }
+}
+
+/// Audio precedence (ADR-0038 item 6): stored description, then profile
+/// default, then the ADR-0024 rank rule, then the audio last resort. A stored
+/// description that matches nothing falls through with the ranker's reason.
+pub(crate) fn choose_audio_track(
+    candidates: &[TrackCandidate],
+    prefs: &TrackPreferences,
+) -> TrackSelection {
+    if let Some(desc) = prefs.audio_description.as_ref()
+        && let Some(selection) = select_audio_for_description(
+            candidates,
+            desc.language.as_deref(),
+            &desc.kind,
+            desc.sdh,
+            desc.forced,
+        )
+    {
+        return selection;
+    }
+    select_audio_track(candidates, prefs.preferred_language.as_deref())
+}
+
+/// Subtitle precedence (ADR-0038 item 6). `off` selects none; `track` restricts
+/// candidates and ranks, falling through to the profile default when nothing
+/// matches; `unset` uses the profile default directly. The profile default
+/// `off` selects none, and `auto` runs the ADR-0024 rule.
+pub(crate) fn choose_subtitle_track(
+    candidates: &[TrackCandidate],
+    prefs: &TrackPreferences,
+    audio_language: Option<&str>,
+) -> TrackSelection {
+    match &prefs.subtitle_choice {
+        SubtitleChoiceRow::Off => TrackSelection {
+            track_id: None,
+            reason: "subtitles off for this series".to_string(),
+        },
+        SubtitleChoiceRow::Track(desc) => {
+            if let Some(selection) = select_subtitle_for_description(
+                candidates,
+                desc.language.as_deref(),
+                &desc.kind,
+                desc.sdh,
+                desc.forced,
+            ) {
+                return selection;
+            }
+            profile_subtitle_default(candidates, prefs, audio_language)
+        }
+        SubtitleChoiceRow::Unset => profile_subtitle_default(candidates, prefs, audio_language),
+    }
+}
+
+fn profile_subtitle_default(
+    candidates: &[TrackCandidate],
+    prefs: &TrackPreferences,
+    audio_language: Option<&str>,
+) -> TrackSelection {
+    if prefs.subtitle_default == "off" {
+        return TrackSelection {
+            track_id: None,
+            reason: "subtitles off by profile default".to_string(),
+        };
+    }
+    select_subtitle_track(
+        candidates,
+        prefs.preferred_language.as_deref(),
+        audio_language,
+    )
+}
+
+/// A resolved audio stream plus the reason and language selection produced.
+pub(crate) struct ResolvedAudio {
+    pub selection: AudioSelection,
+    /// The selected track's language, for the subtitle forced rule.
+    pub language: Option<String>,
+    pub reason: String,
+}
+
+/// Which audio stream this session maps (ADR-0012 / ADR-0024 / ADR-0038).
 fn resolve_audio(
     state: &AppState,
     row: &MediaItemRow,
     requested: Option<&str>,
     profile: &ClientCapabilityProfile,
-) -> Result<AudioSelection, ApiError> {
+    prefs: &TrackPreferences,
+) -> Result<ResolvedAudio, ApiError> {
     let max_channels = profile.max_audio_channels.unwrap_or(u32::MAX);
     let root = library_root(state, row.library_id)?;
     let tracks = match list_audio_tracks(&abs_path(&root, &row.path)) {
@@ -386,17 +575,21 @@ fn resolve_audio(
         // applies the ceiling, so a failed inventory need not fail playback.
         Err(e) if requested.is_none() => {
             tracing::warn!(item_id = row.id, error = %e, "audio track list failed at session start");
-            return Ok(AudioSelection {
-                stream_index: None,
-                channels: stored_channels(row),
-                channel_layout: None,
-                max_channels,
+            return Ok(ResolvedAudio {
+                selection: AudioSelection {
+                    stream_index: None,
+                    channels: stored_channels(row),
+                    channel_layout: None,
+                    max_channels,
+                },
+                language: None,
+                reason: "audio track list unavailable".to_string(),
             });
         }
         Err(e) => return Err(ApiError::internal(e)),
     };
 
-    let track = match requested {
+    let (track, language, reason) = match requested {
         Some(id) => {
             let t = tracks.iter().find(|t| t.track_id() == id).ok_or_else(|| {
                 ApiError::not_found(format!("audio track {id} not found for item {}", row.id))
@@ -407,7 +600,11 @@ fn resolve_audio(
                 reason = "client requested audioTrackId",
                 "audio track selected"
             );
-            Some(t)
+            (
+                Some(t),
+                t.language.clone(),
+                "client requested audioTrackId".to_string(),
+            )
         }
         None => {
             let candidates: Vec<TrackCandidate> = tracks
@@ -422,19 +619,22 @@ fn resolve_audio(
                     stream_index: t.stream_index,
                 })
                 .collect();
-            let sel = select_audio_track(&candidates, Some(DEFAULT_PREFERENCE_LANGUAGE));
+            let sel = choose_audio_track(&candidates, prefs);
             tracing::info!(
                 item_id = row.id,
                 track_id = sel.track_id.as_deref().unwrap_or("-"),
                 reason = %sel.reason,
                 "audio track selected"
             );
-            sel.track_id
+            let t = sel
+                .track_id
                 .as_deref()
-                .and_then(|id| tracks.iter().find(|t| t.track_id() == id))
+                .and_then(|id| tracks.iter().find(|t| t.track_id() == id));
+            let language = t.and_then(|t| t.language.clone());
+            (t, language, sel.reason)
         }
     };
-    Ok(match track {
+    let selection = match track {
         Some(t) => AudioSelection {
             stream_index: Some(t.stream_index),
             channels: t.channels,
@@ -447,6 +647,11 @@ fn resolve_audio(
             channel_layout: None,
             max_channels,
         },
+    };
+    Ok(ResolvedAudio {
+        selection,
+        language,
+        reason,
     })
 }
 
@@ -548,7 +753,9 @@ fn snapshot_hls_tracks(
     row: &MediaItemRow,
     library_root: &str,
     tracks: &[crate::routes::items::SubtitleTrackDto],
-) -> Result<Vec<HlsSubtitleTrack>, String> {
+    prefs: &TrackPreferences,
+    audio_language: Option<&str>,
+) -> Result<(Vec<HlsSubtitleTrack>, String), String> {
     let sidecars = state.db.list_item_sidecars(row.id)?;
     let ready: Vec<&crate::routes::items::SubtitleTrackDto> = tracks
         .iter()
@@ -559,27 +766,6 @@ fn snapshot_hls_tracks(
         // captions appear on the next session once complete.
         .filter(|t| t.readiness == Some("complete") && t.url.is_some())
         .collect();
-    let audio_lang = list_audio_tracks(&abs_path(library_root, &row.path))
-        .ok()
-        .and_then(|audio| {
-            let cands: Vec<TrackCandidate> = audio
-                .iter()
-                .map(|t| TrackCandidate {
-                    track_id: t.track_id(),
-                    language: t.language.clone(),
-                    title: t.title.clone(),
-                    is_default: t.is_default,
-                    is_forced: false,
-                    is_image: false,
-                    stream_index: t.stream_index,
-                })
-                .collect();
-            let id = select_audio_track(&cands, Some(DEFAULT_PREFERENCE_LANGUAGE)).track_id?;
-            audio
-                .iter()
-                .find(|t| t.track_id() == id)
-                .and_then(|t| t.language.clone())
-        });
     let sub_cands: Vec<TrackCandidate> = ready
         .iter()
         .map(|t| TrackCandidate {
@@ -592,11 +778,9 @@ fn snapshot_hls_tracks(
             stream_index: t.stream_index.unwrap_or(u32::MAX),
         })
         .collect();
-    let sub_sel = select_subtitle_track(
-        &sub_cands,
-        Some(DEFAULT_PREFERENCE_LANGUAGE),
-        audio_lang.as_deref(),
-    );
+    // The selected audio track's language decides the forced rule, so it is the
+    // language the session actually chose, not a second guess (ADR-0024 §2.3).
+    let sub_sel = choose_subtitle_track(&sub_cands, prefs, audio_language);
     tracing::info!(
         item_id = row.id,
         track_id = sub_sel.track_id.as_deref().unwrap_or("-"),
@@ -635,7 +819,7 @@ fn snapshot_hls_tracks(
             item_vtt_path: Some(state.subs.vtt_path(row.id, &t.track_id)),
         });
     }
-    Ok(out)
+    Ok((out, sub_sel.reason))
 }
 
 pub async fn get(
@@ -1452,6 +1636,8 @@ mod ownership_tests {
                     "second",
                     None,
                     false,
+                    None,
+                    "auto",
                 )?;
                 let expires = nightjar_db::session_expiry(conn)?;
                 let session = nightjar_db::create_session(
@@ -1954,5 +2140,237 @@ mod ownership_tests {
             StatusCode::NOT_FOUND,
             "another cookie must not read the session"
         );
+    }
+}
+
+/// ADR-0038 item 6 selection precedence, exercised through the same functions
+/// the session and playback-info routes call.
+#[cfg(test)]
+mod track_preference_tests {
+    use super::*;
+
+    fn cand(id: &str, lang: &str, title: &str, index: u32, forced: bool) -> TrackCandidate {
+        TrackCandidate {
+            track_id: id.into(),
+            language: Some(lang.into()),
+            title: Some(title.into()),
+            is_default: false,
+            is_forced: forced,
+            is_image: false,
+            stream_index: index,
+        }
+    }
+
+    fn prefs(
+        language: Option<&str>,
+        subtitle_default: &str,
+        audio: Option<TrackDescription>,
+        subtitle: SubtitleChoiceRow,
+    ) -> TrackPreferences {
+        TrackPreferences {
+            preferred_language: language.map(str::to_string),
+            subtitle_default: subtitle_default.to_string(),
+            audio_description: audio,
+            subtitle_choice: subtitle,
+        }
+    }
+
+    fn desc(language: Option<&str>, kind: &str, sdh: bool, forced: bool) -> TrackDescription {
+        TrackDescription {
+            language: language.map(str::to_string),
+            kind: kind.to_string(),
+            sdh,
+            forced,
+        }
+    }
+
+    /// Audio precedence: the stored description wins over the profile default,
+    /// and a description that matches nothing falls through to the profile
+    /// default ranker with the ranker's reason.
+    #[test]
+    fn stored_audio_description_wins_then_falls_through() {
+        let tracks = vec![
+            cand("e1", "en", "Commentary", 1, false),
+            cand("e2", "en", "Main", 2, false),
+            cand("e3", "ja", "Japanese", 3, false),
+        ];
+        // Stored commentary wins over profile `en` main.
+        let p = prefs(
+            Some("en"),
+            "auto",
+            Some(desc(Some("en"), "commentary", false, false)),
+            SubtitleChoiceRow::Unset,
+        );
+        let sel = choose_audio_track(&tracks, &p);
+        assert_eq!(sel.track_id.as_deref(), Some("e1"), "{sel:?}");
+        assert!(sel.reason.contains("stored choice"), "{}", sel.reason);
+
+        // A stored `ja` description that no longer exists falls through to the
+        // profile default, and the reason is the ranker's existing vocabulary.
+        let p = prefs(
+            Some("en"),
+            "auto",
+            Some(desc(Some("de"), "main", false, false)),
+            SubtitleChoiceRow::Unset,
+        );
+        let sel = choose_audio_track(&tracks, &p);
+        assert_eq!(sel.track_id.as_deref(), Some("e2"), "{sel:?}");
+        assert!(
+            sel.reason.contains("matched your preference"),
+            "{}",
+            sel.reason
+        );
+    }
+
+    /// Subtitle precedence: stored `off` selects none even though the profile
+    /// default would select one; stored `track` resolves by description.
+    #[test]
+    fn stored_subtitle_off_selects_none_and_track_resolves() {
+        let tracks = vec![
+            cand("e3", "en", "English", 3, false),
+            cand("e4", "en", "English [SDH]", 4, false),
+        ];
+        let off = prefs(Some("en"), "auto", None, SubtitleChoiceRow::Off);
+        let sel = choose_subtitle_track(&tracks, &off, Some("en"));
+        assert_eq!(sel.track_id, None, "{sel:?}");
+        assert!(sel.reason.contains("off"), "{}", sel.reason);
+
+        let track = prefs(
+            Some("en"),
+            "auto",
+            None,
+            SubtitleChoiceRow::Track(desc(Some("en"), "main", true, false)),
+        );
+        let sel = choose_subtitle_track(&tracks, &track, Some("en"));
+        assert_eq!(sel.track_id.as_deref(), Some("e4"), "{sel:?}");
+        assert!(sel.reason.contains("stored choice"), "{}", sel.reason);
+    }
+
+    /// `unset` uses the profile default; a profile default of `off` selects
+    /// none even when a preference language would match.
+    #[test]
+    fn unset_uses_the_profile_default_and_off_is_off() {
+        let tracks = vec![cand("e3", "en", "English", 3, false)];
+        let auto = prefs(Some("en"), "auto", None, SubtitleChoiceRow::Unset);
+        let sel = choose_subtitle_track(&tracks, &auto, Some("en"));
+        assert_eq!(sel.track_id.as_deref(), Some("e3"), "{sel:?}");
+
+        let off = prefs(Some("en"), "off", None, SubtitleChoiceRow::Unset);
+        let sel = choose_subtitle_track(&tracks, &off, Some("en"));
+        assert_eq!(sel.track_id, None, "{sel:?}");
+        assert!(sel.reason.contains("profile default"), "{}", sel.reason);
+    }
+
+    /// A profile with no language is ADR-0024's no-preference case: audio
+    /// still resolves (last resort), subtitles select nothing.
+    #[test]
+    fn a_profile_with_no_language_is_the_no_preference_case() {
+        let audio = vec![cand("e2", "en", "Main", 2, false)];
+        let p = prefs(None, "auto", None, SubtitleChoiceRow::Unset);
+        let sel = choose_audio_track(&audio, &p);
+        assert_eq!(sel.track_id.as_deref(), Some("e2"), "{sel:?}");
+        assert!(sel.reason.contains("first eligible"), "{}", sel.reason);
+
+        let subs = vec![cand("e3", "en", "English", 3, false)];
+        let sel = choose_subtitle_track(&subs, &p, Some("en"));
+        assert_eq!(sel.track_id, None, "{sel:?}");
+    }
+
+    /// The production read path, end to end without ffprobe: a profile's
+    /// defaults and its per-series override are loaded from the database and
+    /// fed to the same selection functions the session uses. The stored audio
+    /// description outranks the profile language, and the stored subtitle
+    /// `off` outranks the profile default.
+    #[test]
+    fn loaded_preferences_carry_the_series_override_into_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        let library = state
+            .db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "shows".to_string(),
+                path: "/media/shows".to_string(),
+                kind: "shows".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_items_indexed(
+                library.id,
+                &[nightjar_db::UpsertItem {
+                    path: "Alpha/Season 1/Alpha.S01E01.mkv".to_string(),
+                    mtime_ms: 0,
+                    size_bytes: 1,
+                    title: "Alpha".to_string(),
+                    kind: "episode".to_string(),
+                    year: None,
+                    season: Some(1),
+                    episode: Some(1),
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let (profile_id, item_id) = state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                nightjar_db::create_account_with_profile(conn, "a", &hash, "owner", "P", "r0")?;
+                let profile = nightjar_db::profile_by_ref(conn, "r0")?.unwrap();
+                nightjar_db::update_profile_preferences(conn, profile.id, Some("ja"), "off")?;
+                conn.execute(
+                    "INSERT INTO series (library_id, relpath, tmdb_show_id)
+                     VALUES (?1, 'Alpha', NULL)",
+                    [library.id],
+                )
+                .map_err(|e| e.to_string())?;
+                let series_key = format!("folder:{}:Alpha", library.id);
+                nightjar_db::upsert_track_choice(
+                    conn,
+                    profile.id,
+                    &series_key,
+                    Some(&TrackDescription {
+                        language: Some("en".to_string()),
+                        kind: "main".to_string(),
+                        sdh: false,
+                        forced: false,
+                    }),
+                    &SubtitleChoiceRow::Off,
+                    "2026-09-12T00:00:00.000Z",
+                )?;
+                let item_id: i64 = conn
+                    .query_row("SELECT id FROM media_items LIMIT 1", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())?;
+                Ok((profile.id, item_id))
+            })
+            .unwrap();
+
+        let row = state.db.get_item(item_id).unwrap().unwrap();
+        let loaded = load_track_preferences(&state, Some(profile_id), &row);
+        assert_eq!(loaded.preferred_language.as_deref(), Some("ja"));
+        assert_eq!(loaded.subtitle_default, "off");
+        assert_eq!(
+            loaded
+                .audio_description
+                .as_ref()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("en")
+        );
+
+        let tracks = vec![
+            cand("e1", "ja", "Japanese", 1, false),
+            cand("e2", "en", "English", 2, false),
+        ];
+        // The stored description wins over the profile default `ja`.
+        let audio = choose_audio_track(&tracks, &loaded);
+        assert_eq!(audio.track_id.as_deref(), Some("e2"), "{audio:?}");
+        assert!(audio.reason.contains("stored choice"), "{}", audio.reason);
+
+        // The stored `off` wins over the profile default `off` too, and says so.
+        let subs = vec![cand("e3", "en", "English", 3, false)];
+        let subtitle = choose_subtitle_track(&subs, &loaded, Some("en"));
+        assert_eq!(subtitle.track_id, None, "{subtitle:?}");
+        assert!(subtitle.reason.contains("off"), "{}", subtitle.reason);
     }
 }
