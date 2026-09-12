@@ -1770,6 +1770,100 @@ mod tests {
         assert_eq!(LibraryPool::next_kind(&queue, false), NextKind::Probe);
     }
 
+    /// R4 storage bounds: the index walk holds the process-wide index epoch,
+    /// and that pause must not starve a seek's keyframe-map build. A
+    /// playback-triggered rebuild is priority work and runs through the epoch
+    /// (ADR-0013 §11); ordinary background work stays queued until the walk
+    /// releases it. The pool's own pending flags are the observable that each
+    /// build was selected.
+    #[test]
+    fn priority_map_build_runs_while_index_epoch_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let playing = media.join("Playing.mkv");
+        let waiting = media.join("Waiting.mkv");
+        std::fs::write(&playing, b"not a real mkv").unwrap();
+        std::fs::write(&waiting, b"not a real mkv").unwrap();
+
+        let (db, pool) = test_pool(dir.path());
+        let lib = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let item = |path: &str, title: &str| nightjar_db::UpsertItem {
+            path: path.into(),
+            mtime_ms: 1,
+            size_bytes: 12,
+            title: title.into(),
+            kind: "movie".into(),
+            year: None,
+            season: None,
+            episode: None,
+            content_id: None,
+        };
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[
+                    item("Playing.mkv", "Playing"),
+                    item("Waiting.mkv", "Waiting"),
+                ],
+            )
+            .unwrap();
+
+        let epoch = pool.enter_index_epoch(lib.id);
+        // A session seeking this title asks for its keyframe map; that is priority.
+        pool.prioritize_map_rebuild(ids[0], lib.id, playing);
+        // Ordinary background work stays behind the walk.
+        pool.enqueue_map_rebuild(ids[1], lib.id, waiting);
+
+        // The priority build must leave the queue and finish while the epoch is
+        // held. Waiting on the pool's own pending flag, not on a fixed sleep,
+        // keeps this independent of how long a junk-container build takes.
+        let mut ran = false;
+        for _ in 0..400 {
+            if !pool.map_build_pending(ids[0]) {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            ran,
+            "a seek's map build must not be starved by the index walk"
+        );
+        assert_eq!(
+            db.get_item(ids[1]).unwrap().unwrap().map_status,
+            "pending",
+            "ordinary map work must stay paused while the walk holds the epoch"
+        );
+        assert_eq!(
+            pool.background_progress().queued_maps,
+            1,
+            "the ordinary map must still be queued behind the walk"
+        );
+
+        // Release the walk: the ordinary map must leave the queue. This checks
+        // selection, not completion, so a slow build is not a false failure.
+        drop(epoch);
+        let mut selected = false;
+        for _ in 0..400 {
+            if pool.background_progress().queued_maps == 0 {
+                selected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            selected,
+            "the ordinary map must run once the walk releases the epoch"
+        );
+    }
+
     #[test]
     fn enter_index_epoch_is_exclusive() {
         let dir = tempfile::tempdir().unwrap();

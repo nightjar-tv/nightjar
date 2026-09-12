@@ -71,6 +71,12 @@ const PROGRESS_TICK: Duration = Duration::from_millis(500);
 const MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// IO kinds that usually mean the mount/share is gone, not a bad subtitle file.
+///
+/// Write-side kinds (`PermissionDenied`, `StorageFull`, `QuotaExceeded`,
+/// `ReadOnlyFilesystem`) are here too: a full or read-only subtitle volume is
+/// an operational failure that clears, so the scanner must retry it as
+/// `unavailable`, never retire the item as a permanent `error` (ADR-0041
+/// Decision 8.3).
 pub fn io_error_is_availability(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
@@ -83,10 +89,26 @@ pub fn io_error_is_availability(err: &std::io::Error) -> bool {
             | ErrorKind::BrokenPipe
             | ErrorKind::TimedOut
             | ErrorKind::UnexpectedEof
+            | ErrorKind::PermissionDenied
+            | ErrorKind::StorageFull
+            | ErrorKind::QuotaExceeded
+            | ErrorKind::ReadOnlyFilesystem
     ) || err.raw_os_error().is_some_and(|c| {
-        // ESTALE / ENOTCONN on Unix when the SMB mount half-dies.
-        c == 70 || c == 57 || c == 60
+        // ESTALE / ENOTCONN on Unix when the SMB mount half-dies; ENOSPC /
+        // EDQUOT when the subtitle volume fills while the kind is still Other.
+        c == 70 || c == 57 || c == 60 || c == 28 || c == 69
     })
+}
+
+/// Render an IO error for the scanner's classifier. The availability decision
+/// is made here, where the error kind still exists; the scanner only ever sees
+/// the string and keys off the `unavailable:` prefix (Rule 4.11).
+fn io_failure_message(context: &str, err: &std::io::Error) -> String {
+    if io_error_is_availability(err) {
+        format!("unavailable: {context}: {err}")
+    } else {
+        format!("{context}: {err}")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,23 +697,24 @@ pub fn concat_webvtt_segments(bodies: &[String]) -> String {
 
 fn write_webvtt(dest: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("create subtitle dir {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            io_failure_message(&format!("create subtitle dir {}", parent.display()), &e)
+        })?;
     }
     // Temp write + fsync + atomic rename per track: a reader never sees a
     // half-written WebVTT, and a crash mid-write cannot corrupt a
     // previously-good track (ADR-0041 Decision 8.4).
     let tmp = dest.with_extension("tmp.vtt");
-    let mut file =
-        fs::File::create(&tmp).map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
+    let mut file = fs::File::create(&tmp)
+        .map_err(|e| io_failure_message(&format!("write subtitle tmp {}", tmp.display()), &e))?;
     file.write_all(body.as_bytes())
-        .map_err(|e| format!("write subtitle tmp {}: {e}", tmp.display()))?;
+        .map_err(|e| io_failure_message(&format!("write subtitle tmp {}", tmp.display()), &e))?;
     file.sync_all()
-        .map_err(|e| format!("fsync subtitle tmp {}: {e}", tmp.display()))?;
+        .map_err(|e| io_failure_message(&format!("fsync subtitle tmp {}", tmp.display()), &e))?;
     drop(file);
     fs::rename(&tmp, dest).map_err(|e| {
         let _ = fs::remove_file(&tmp);
-        format!("rename subtitle {}: {e}", dest.display())
+        io_failure_message(&format!("rename subtitle {}", dest.display()), &e)
     })?;
     Ok(())
 }
@@ -927,7 +950,7 @@ pub fn extract_item_subtitles(
     // delete previously-good tracks (ADR-0041 Decision 8.5). Stale tracks from
     // an older generation are swept only after a full success below.
     fs::create_dir_all(store.item_dir(item_id))
-        .map_err(|e| format!("create subtitle dir for item {item_id}: {e}"))?;
+        .map_err(|e| io_failure_message(&format!("create subtitle dir for item {item_id}"), &e))?;
 
     for s in &embedded {
         store.set_progress(item_id, &s.track_id(), TrackReadiness::Preparing, 0);
@@ -1940,6 +1963,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.starts_with("unavailable:"), "{err}");
+    }
+
+    /// R4 storage bounds: a write-side failure (full, read-only, or
+    /// permission-denied volume) is availability, so the scanner retries it
+    /// instead of retiring the item as a permanent error. `InvalidData` is the
+    /// negative control: a corrupt sidecar keeps the old classification.
+    #[test]
+    fn write_side_io_errors_are_availability() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::StorageFull,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::ReadOnlyFilesystem,
+        ] {
+            assert!(
+                io_error_is_availability(&Error::new(kind, "simulated")),
+                "{kind:?} must be availability"
+            );
+        }
+        assert!(!io_error_is_availability(&Error::new(
+            ErrorKind::InvalidData,
+            "corrupt sidecar"
+        )));
     }
 
     /// ADR-0041 Decision 8.7: the library-reachability cancel signal kills an

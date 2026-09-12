@@ -582,6 +582,47 @@ mod tests {
         );
     }
 
+    /// R4 storage bounds: a directory the process cannot read is counted as a
+    /// listing error and its media is not claimed. The walk never opens media,
+    /// so a permission failure here is a readdir failure, not a probe failure.
+    /// The recovered pass is the positive control (Rule 4.15): the error count
+    /// returns to zero only because the file is genuinely found.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_counted_and_recovers_when_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let open = root.path().join("open");
+        let locked = root.path().join("locked");
+        fs::create_dir(&open).unwrap();
+        fs::create_dir(&locked).unwrap();
+        File::create(open.join("visible.mp4")).unwrap();
+        File::create(locked.join("hidden.mkv")).unwrap();
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = walk_media_files_cached_with_concurrency(root.path(), None, 1).unwrap();
+        assert_eq!(denied.files.len(), 1, "only the readable file is listed");
+        assert!(
+            denied.files[0].path.ends_with("visible.mp4"),
+            "got {:?}",
+            denied.files[0].path
+        );
+        assert_eq!(
+            denied.listing_errors, 1,
+            "an unreadable directory must be counted, not silently skipped"
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let recovered = walk_media_files_cached_with_concurrency(root.path(), None, 1).unwrap();
+        assert_eq!(
+            recovered.files.len(),
+            2,
+            "the walk must find the hidden file once the directory is readable again"
+        );
+        assert_eq!(recovered.listing_errors, 0);
+    }
+
     #[test]
     fn directory_symlink_cycle_does_not_spin() {
         let root = tempdir().unwrap();

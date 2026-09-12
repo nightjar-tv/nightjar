@@ -1477,6 +1477,246 @@ mod tests {
         let _ = before;
     }
 
+    /// R4 storage bounds: a mount that disappears is a disconnect, not an empty
+    /// library. The scan is refused, the library pauses, and no rows are
+    /// deleted. Reconnecting recovers: reachability returns and a fresh scan
+    /// completes. The row count on both sides of the flap is the corruption
+    /// check.
+    #[test]
+    fn mount_disconnect_then_reconnect_keeps_items_and_rescans() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        let offline = dir.path().join("media-offline");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job);
+        assert_eq!(db.count_items(lib.id).unwrap(), 1);
+
+        // Disconnect: the mount root disappears.
+        fs::rename(&media, &offline).unwrap();
+        let refused = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id);
+        assert!(refused.is_err(), "a disconnected root must refuse the scan");
+        assert!(
+            !pool.is_library_reachable(lib.id),
+            "a missing root must pause the library"
+        );
+        assert_eq!(
+            db.count_items(lib.id).unwrap(),
+            1,
+            "a disconnect must not delete rows"
+        );
+
+        // Reconnect.
+        fs::rename(&offline, &media).unwrap();
+        pool.tick_reachability().unwrap();
+        assert!(pool.is_library_reachable(lib.id), "the root is back");
+
+        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job2);
+        assert_eq!(db.count_items(lib.id).unwrap(), 1);
+    }
+
+    /// R4 storage bounds: a write failure on the subtitle volume (simulated
+    /// with a read-only subs root) is an availability failure, not a permanent
+    /// `error`. The existing read-failure test covers ENOENT; this covers the
+    /// write half. The recovered extract is the positive control: the same item
+    /// reaches `ready` once the volume is writable, so `unavailable` is not
+    /// "nothing ever works".
+    #[cfg(unix)]
+    #[test]
+    fn write_failure_during_extract_is_unavailable_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        fs::write(
+            media.join("Movie.en.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nHi\n",
+        )
+        .unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let subs_root = dir.path().join("subs");
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Movie.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.replace_item_sidecars(
+            item_id,
+            &[nightjar_db::SidecarRow {
+                media_item_id: item_id,
+                track_id: "s-en".into(),
+                path: "Movie.en.srt".into(),
+                mtime_ms: 1,
+                size_bytes: 39,
+                format: "srt".into(),
+                language: Some("en".into()),
+                forced: false,
+                sdh: false,
+            }],
+        )
+        .unwrap();
+        db.set_subtitle_status(item_id, "eligible").unwrap();
+
+        fs::set_permissions(&subs_root, fs::Permissions::from_mode(0o500)).unwrap();
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video.clone()));
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = db.get_item(item_id).unwrap().unwrap().subtitle_status;
+            if status != "pending" && status != "eligible" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        fs::set_permissions(&subs_root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            status, "unavailable",
+            "a write failure is availability, not a permanent error"
+        );
+
+        // Recovery: the same item extracts once the volume is writable.
+        db.set_subtitle_status(item_id, "eligible").unwrap();
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video));
+        let mut ready = false;
+        for _ in 0..200 {
+            if db.get_item(item_id).unwrap().unwrap().subtitle_status == "ready" {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(ready, "extract must succeed once the volume is writable");
+    }
+
+    /// R4 storage bounds, embedded half: an FFmpeg write failure while it
+    /// demuxes an embedded subtitle stream is availability, not a permanent
+    /// `error`. The item dir is pre-created read-only, so `create_dir_all`
+    /// succeeds and the failure is the real `ffmpeg` child failing to open its
+    /// output. That is the path the sidecar test cannot reach. Recovery to
+    /// `ready` once the dir is writable is the positive control.
+    #[cfg(unix)]
+    #[test]
+    fn embedded_ffmpeg_write_failure_is_unavailable_and_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        if !require_ffmpeg() {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let fixture = corpus_fixture("h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&fixture) {
+            return;
+        }
+        fs::copy(&fixture, media.join("h264_aac_srt_mkv.mkv")).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "h264_aac_srt_mkv.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 64240,
+                    title: "subbed".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.set_subtitle_status(item_id, "eligible").unwrap();
+
+        // The item dir exists but is read-only, so the failure is the child's
+        // write, not `create_dir_all`.
+        let item_dir = dir.path().join("subs").join(item_id.to_string());
+        fs::create_dir_all(&item_dir).unwrap();
+        fs::set_permissions(&item_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, media.join("x")));
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = db.get_item(item_id).unwrap().unwrap().subtitle_status;
+            if status != "pending" && status != "eligible" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        fs::set_permissions(&item_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            status, "unavailable",
+            "an ffmpeg write failure is availability, not a permanent error"
+        );
+
+        // Recovery: the same item extracts once the dir is writable.
+        db.set_subtitle_status(item_id, "eligible").unwrap();
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, media.join("x")));
+        let mut ready = false;
+        for _ in 0..400 {
+            if db.get_item(item_id).unwrap().unwrap().subtitle_status == "ready" {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(ready, "extract must succeed once the dir is writable");
+    }
+
     #[test]
     fn unavailable_root_dispatches_no_item_work() {
         let dir = tempfile::tempdir().unwrap();
