@@ -79,6 +79,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         27,
         include_str!("../migrations/027_series_binding_without_entity.sql"),
     ),
+    (
+        28,
+        include_str!("../migrations/028_track_selection_persistence.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -424,7 +428,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 27);
+        assert_eq!(v, 28);
         // 026 (ADR-0035 item 1): the table, its primary key and the recent
         // index exist, and the two boolean columns reject a value outside 0/1.
         let has_watch_state: i64 = conn
@@ -461,6 +465,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_series_bindings, 1);
+        // 028 (ADR-0038 amendment): the profile defaults and the per-series
+        // override table exist, with the three-valued subtitle mode.
+        let has_track_choice: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'profile_track_choice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_track_choice, 1);
+        for col in ["preferred_language", "subtitle_default"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('profiles') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{col}");
+        }
         // 022: both decision columns exist and are nullable, so an existing
         // row reads NULL — "decided before this migration", distinguishable
         // from every real token.
@@ -2129,15 +2154,38 @@ mod tests {
     }
 
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migrations 26 and 27 and
-    /// their schema are removed with it, so `migrate` sees a database at
-    /// version 24 and applies all three in order.
+    /// way a real install upgrading into it looks. Migrations 26, 27 and 28
+    /// and their schema are removed with it, so `migrate` sees a database at
+    /// version 24 and applies all four in order.
+    ///
+    /// Migration 28 adds columns to `profiles`, so the rewind rebuilds that
+    /// table rather than dropping the columns: SQLite refuses to drop a column
+    /// a CHECK constraint names, and `subtitle_default` has one.
     fn rewind_to_24(conn: &Connection) {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_accounts_username_nocase;
              DROP INDEX IF EXISTS idx_watch_state_recent;
              DROP TABLE IF EXISTS watch_state;
-             DELETE FROM schema_migrations WHERE version IN (25, 26, 27);",
+             DROP TABLE IF EXISTS profile_track_choice;
+             CREATE TABLE profiles_rewind (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 profile_ref TEXT NOT NULL UNIQUE,
+                 name TEXT NOT NULL,
+                 classification_cap TEXT,
+                 simple_interface INTEGER NOT NULL DEFAULT 0
+                     CHECK (simple_interface IN (0, 1)),
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO profiles_rewind
+                 (id, account_id, profile_ref, name, classification_cap,
+                  simple_interface, created_at)
+             SELECT id, account_id, profile_ref, name, classification_cap,
+                    simple_interface, created_at FROM profiles;
+             DROP TABLE profiles;
+             ALTER TABLE profiles_rewind RENAME TO profiles;
+             CREATE INDEX idx_profiles_account ON profiles(account_id);
+             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28);",
         )
         .unwrap();
     }

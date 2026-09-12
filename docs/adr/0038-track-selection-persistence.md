@@ -1,6 +1,7 @@
 # ADR-0038: Track selection persistence
 
-- Status: accepted
+- Status: accepted; amended 2026-09-12 (new amendment — exact stored and wire
+  shapes for B2-8, in place, Rule 6.4)
 - Date: 2026-08-06
 - Accepted: 2026-08-06, once ADR-0039 was accepted. It supplies the `series_key`
   item 4 stores against, including for unmatched show folders, and the migrator
@@ -175,3 +176,98 @@ worse than no persistence at all because the viewer cannot predict it.
 - A profile with no language set behaves as ADR-0024's no-preference case, which
   falls back to the container default path for audio. That is the pre-profile
   behaviour showing through for a profile nobody configured.
+
+---
+
+## Amendment 2026-09-12 — exact stored and wire shapes (B2-8)
+
+The Decision items above fix the model. This amendment freezes the column
+names, the wire field names, and the nullability each mode allows, so the
+migration and the API cannot drift apart. It changes no ranking policy
+(ADR-0024) and no key grammar (ADR-0039).
+
+### 1. Stored shapes (migration 028)
+
+`profiles` gains:
+
+- `preferred_language TEXT NULL` — a lowercase two-letter ASCII
+  ISO-639-1-shaped code, or null. One field for audio and subtitles (item 1).
+- `subtitle_default TEXT NOT NULL DEFAULT 'auto'`
+  `CHECK (subtitle_default IN ('auto', 'off'))`.
+
+`profile_track_choice`, keyed `(profile_id, series_key)`:
+
+- `profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE` —
+  profile deletion cascades (ADR-0034 item 7).
+- `series_key TEXT NOT NULL` — the ADR-0039 key, opaque on the wire.
+- Audio description, nullable as a set: `audio_language TEXT NULL`,
+  `audio_kind TEXT NULL CHECK (audio_kind IN ('main', 'commentary', 'signs'))`,
+  `audio_sdh INTEGER NULL CHECK (audio_sdh IN (0, 1))`,
+  `audio_forced INTEGER NULL CHECK (audio_forced IN (0, 1))`. A description is
+  present when `audio_kind IS NOT NULL`; `audio_language` may still be null.
+  A CHECK makes the set all-or-nothing, so a half-written description cannot
+  exist.
+- Subtitle choice, three-valued: `subtitle_mode TEXT NOT NULL`
+  `CHECK (subtitle_mode IN ('unset', 'off', 'track'))`, with the same four
+  nullable description columns (`subtitle_language`, `subtitle_kind`,
+  `subtitle_sdh`, `subtitle_forced`). A CHECK makes the description columns
+  all-null unless `subtitle_mode = 'track'`, and all-non-null except
+  `subtitle_language` when `subtitle_mode = 'track'`.
+- `updated_at TEXT NOT NULL` — server time only.
+- `PRIMARY KEY (profile_id, series_key)`.
+
+**No column stores a stream index or a `trackId`** (item 2; ADR-0012, ADR-0010
+inventories are the source of truth). The table holds descriptions only.
+
+### 2. Wire shapes
+
+Profile create, update, and read gain optional `preferredLanguage` (`string |
+null`) and `subtitleDefault` (`"auto" | "off"`). A language is null or a
+lowercase two-letter ASCII ISO-639-1-shaped code; any other value is a typed
+`422`. Existing clients that send neither field get null / `auto`.
+
+`PUT /api/v0/profiles/{profileRef}/track-choice?seriesKey=…` is a full
+replacement. Its body is exactly:
+
+```
+{ audio: TrackDescription | null, subtitle: SubtitleChoice }
+```
+
+`TrackDescription` is exactly:
+
+```
+{ language: string | null, kind: "main" | "commentary" | "signs",
+  sdh: boolean, forced: boolean }
+```
+
+`SubtitleChoice` is tagged, one of:
+
+```
+{ mode: "unset" }
+{ mode: "off" }
+{ mode: "track", track: TrackDescription }
+```
+
+Unknown fields are rejected with a typed `422`. The response is
+`{ choice: ProfileTrackChoice }`, and every timestamp is server time.
+
+The route and its `seriesKey` query parameter are frozen by item 7 and
+ADR-0035 item 6 (slashes in `folder:` keys). `seriesKey` is opaque; it must
+resolve through the effective series identity layer or the write returns a
+typed `404`. Only the profile-scope session for that exact profile may write;
+every account-scope token and every other profile gets the existing
+non-leaking forbidden response.
+
+### 3. Resolution and migration stay as decided
+
+Selection precedence is item 6: explicit request track id, then stored
+description, then profile defaults, then the ADR-0024 rank rule, then
+ADR-0024 §4's audio last resort. A stored description is resolved by
+restricting candidates and calling the same rank function; no match falls
+through with an existing-vocabulary reason. Subtitle `off` selects none;
+`unset` uses the profile default. Reasons ride the existing playback-info and
+session response fields (item 5).
+
+The ADR-0039 item 7 migrator is extended to rewrite `profile_track_choice`
+alongside its other tables: a per-profile collision keeps the newer
+`updated_at`. Binding and rebinding migrate; unbinding deliberately does not.

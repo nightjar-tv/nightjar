@@ -801,6 +801,32 @@ export interface paths {
         delete: operations["deleteProfile"];
         options?: never;
         head?: never;
+        /**
+         * Update a profile's track-selection preferences
+         * @description ADR-0038 amendment §2. A full replacement of the two preference fields. Authority is ADR-0035 item 7: a profile session reaches its active profile, and from account scope an owner or manager reaches any profile while a member reaches its own account's. A ref the caller may not address and one that does not exist get the same named 403.
+         */
+        patch: operations["updateProfile"];
+        trace?: never;
+    };
+    "/api/v0/profiles/{profileRef}/track-choice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replace a profile's track choice for one series
+         * @description ADR-0038 item 7 and its 2026-09-12 amendment. The body is a full replacement: `{audio: TrackDescription|null, subtitle: SubtitleChoice}`, and unknown fields are refused with the typed 422. `seriesKey` is an opaque query parameter rather than a path segment because a `folder:`-keyed series key contains slashes (ADR-0035 item 6), and it must resolve through the effective series identity layer or the write is a typed 404.
+         *
+         *     Only the profile-scope session for that exact profile may write. Every account-scope token and every other profile gets the existing non-leaking forbidden response.
+         */
+        put: operations["putTrackChoice"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
         patch?: never;
         trace?: never;
     };
@@ -940,6 +966,10 @@ export interface components {
              * @description When a producer reaches EOF materially short of the container's claimed duration, the usable media end in milliseconds. Absent when unknown or undamaged.
              */
             usableExtentMs?: number;
+            /** @description Why this session's audio track was selected (ADR-0038 item 5). The string the track menu shows. Absent on responses that do not select a track (get, seek). */
+            audioReason?: string | null;
+            /** @description Why this session's subtitle track was selected, or why none was (ADR-0038 item 5). Absent on responses that do not select a track. */
+            subtitleReason?: string | null;
         };
         Library: {
             /** Format: int64 */
@@ -1177,6 +1207,13 @@ export interface components {
             /** @description Null is uncapped. What a cap means is B2-D's decision. */
             classificationCap?: string | null;
             simpleInterface: boolean;
+            /** @description ISO-639-1-shaped lowercase two-letter code, or null for no preference (ADR-0038 item 1). One field for audio and subtitles. */
+            preferredLanguage?: string | null;
+            /**
+             * @description `auto` runs the ADR-0024 rule and may select nothing; `off` selects nothing on purpose. The two are different choices (ADR-0038 item 1).
+             * @enum {string}
+             */
+            subtitleDefault?: "auto" | "off";
         };
         CreateAccountRequest: {
             username: string;
@@ -1234,6 +1271,60 @@ export interface components {
             classificationCap?: string | null;
             /** @default false */
             simpleInterface: boolean;
+            /** @description ISO-639-1-shaped lowercase two-letter code, or null. Any other value is the typed 422. */
+            preferredLanguage?: string | null;
+            /**
+             * @description Omitted means `auto`, so an existing client that sends neither preference field gets the same defaults as a create with neither field (ADR-0038 amendment §2).
+             * @enum {string}
+             */
+            subtitleDefault?: "auto" | "off";
+        };
+        /** @description A full replacement of the two preference fields (ADR-0038 amendment §2). An omitted `preferredLanguage` clears it and an omitted `subtitleDefault` means `auto`, the same defaults a create with neither field gets. */
+        UpdateProfileRequest: {
+            /** @description ISO-639-1-shaped lowercase two-letter code, or null. Any other value is the typed 422. */
+            preferredLanguage?: string | null;
+            /** @enum {string} */
+            subtitleDefault?: "auto" | "off";
+        };
+        /** @description Language, kind and flags of one stored choice (ADR-0024 §3, ADR-0038 item 2). Never a stream index. */
+        TrackDescription: {
+            /** @description ISO 639-1 when known; null when the description does not name one. */
+            language?: string | null;
+            /** @enum {string} */
+            kind: "main" | "commentary" | "signs";
+            sdh: boolean;
+            forced: boolean;
+        };
+        /** @description The three-valued subtitle choice (ADR-0038 item 4). `unset` and `off` are deliberately distinct. */
+        SubtitleChoice: {
+            /** @enum {string} */
+            mode: "unset";
+        } | {
+            /** @enum {string} */
+            mode: "off";
+        } | {
+            /** @enum {string} */
+            mode: "track";
+            track: components["schemas"]["TrackDescription"];
+        };
+        /** @description The full-replacement body (ADR-0038 amendment §2). */
+        TrackChoiceRequest: {
+            audio?: components["schemas"]["TrackDescription"] | null;
+            subtitle: components["schemas"]["SubtitleChoice"];
+        };
+        TrackChoice: {
+            /** @description Opaque series key (ADR-0039 item 2), returned as received. */
+            seriesKey: string;
+            audio?: components["schemas"]["TrackDescription"] | null;
+            subtitle: components["schemas"]["SubtitleChoice"];
+            /**
+             * Format: date-time
+             * @description Server time of the latest write.
+             */
+            updatedAt: string;
+        };
+        TrackChoiceEnvelope: {
+            choice: components["schemas"]["TrackChoice"];
         };
         /**
          * @description Metadata pipeline state (ADR-0026). `pending` = search tier queued; `matched` = identity found, detail enrichment pending; `ready` = full metadata bound; `unmatched` = search terminal no-match.
@@ -1471,6 +1562,10 @@ export interface components {
             subtitleStatus: components["schemas"]["SubtitleStatus"];
             /** @description Subtitle tracks (ADR-0010 / ADR-0013 / ADR-0018). Soft text and burn-in (ASS/SSA/PGS) share one shape; differ by render. Soft tracks expose url when WebVTT is extracted; burnIn tracks are selected via subtitleTrackId on session start. Listed the same way for directPlay, remux, and transcode. */
             subtitleTracks?: components["schemas"]["SubtitleTrack"][];
+            /** @description Why the audio track was selected (ADR-0038 item 5). Runs the same precedence a session does: stored description, then profile default, then the ADR-0024 rank rule, then the audio last resort. */
+            audioReason?: string | null;
+            /** @description Why a subtitle track was selected, or why none was. Stored `off` and a profile default of `off` both select none, and say so. */
+            subtitleReason?: string | null;
         };
         AudioTrack: {
             /** @description Stable id `e{streamIndex}`, the same scheme as embedded subtitles (ADR-0010 / ADR-0012). */
@@ -3222,6 +3317,115 @@ export interface operations {
             };
             /** @description Named forbidden error */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                profileRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Profile"];
+                };
+            };
+            /** @description Named forbidden error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description A language that is not a lowercase two-letter code or null, or a subtitle default that is neither `auto` nor `off`. The code is `validation_error`. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    putTrackChoice: {
+        parameters: {
+            query: {
+                /** @description Opaque series key (ADR-0039 item 2). Pass it back exactly as received, percent-encoded like any query value. */
+                seriesKey: string;
+            };
+            header?: never;
+            path: {
+                profileRef: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrackChoiceRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored choice, with server time. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrackChoiceEnvelope"];
+                };
+            };
+            /** @description The seriesKey query is missing or empty. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller is not this profile's own profile-scope session, or the ref does not exist. The two are one response so the ref cannot be probed. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The seriesKey does not resolve to a series. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The body is not exactly the required shape, carries an unknown field, or names an unknown kind or mode. The code is `validation_error`. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

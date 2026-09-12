@@ -84,6 +84,11 @@ pub struct ProfileRow {
     pub name: String,
     pub classification_cap: Option<String>,
     pub simple_interface: bool,
+    /// ISO-639-1-shaped lowercase code, or null for no preference
+    /// (ADR-0038 item 1 and its 2026-09-12 amendment).
+    pub preferred_language: Option<String>,
+    /// `auto` | `off` (ADR-0038 item 1).
+    pub subtitle_default: String,
 }
 
 /// A session resolved from a presented token, with the account's role already
@@ -243,13 +248,16 @@ fn map_profile(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRow> {
         name: r.get(3)?,
         classification_cap: r.get(4)?,
         simple_interface: simple != 0,
+        preferred_language: r.get(6)?,
+        subtitle_default: r.get(7)?,
     })
 }
 
 pub fn profiles_for_account(conn: &Connection, account_id: i64) -> Result<Vec<ProfileRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, account_id, profile_ref, name, classification_cap, simple_interface
+            "SELECT id, account_id, profile_ref, name, classification_cap, simple_interface,
+                    preferred_language, subtitle_default
              FROM profiles WHERE account_id = ?1 ORDER BY id",
         )
         .map_err(|e| format!("prepare profiles: {e}"))?;
@@ -265,13 +273,26 @@ pub fn profiles_for_account(conn: &Connection, account_id: i64) -> Result<Vec<Pr
 
 pub fn profile_by_ref(conn: &Connection, profile_ref: &str) -> Result<Option<ProfileRow>, String> {
     conn.query_row(
-        "SELECT id, account_id, profile_ref, name, classification_cap, simple_interface
+        "SELECT id, account_id, profile_ref, name, classification_cap, simple_interface,
+                preferred_language, subtitle_default
          FROM profiles WHERE profile_ref = ?1",
         params![profile_ref],
         map_profile,
     )
     .optional()
     .map_err(|e| format!("profile by ref: {e}"))
+}
+
+pub fn profile_by_id(conn: &Connection, profile_id: i64) -> Result<Option<ProfileRow>, String> {
+    conn.query_row(
+        "SELECT id, account_id, profile_ref, name, classification_cap, simple_interface,
+                preferred_language, subtitle_default
+         FROM profiles WHERE id = ?1",
+        params![profile_id],
+        map_profile,
+    )
+    .optional()
+    .map_err(|e| format!("profile by id: {e}"))
 }
 
 /// Create an account and its first profile in one transaction (ADR-0034
@@ -304,6 +325,7 @@ pub fn create_account_with_profile(
     Ok((account_id, profile_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_profile(
     conn: &Connection,
     account_id: i64,
@@ -311,21 +333,42 @@ pub fn create_profile(
     name: &str,
     classification_cap: Option<&str>,
     simple_interface: bool,
+    preferred_language: Option<&str>,
+    subtitle_default: &str,
 ) -> Result<i64, String> {
     conn.execute(
         "INSERT INTO profiles
-             (account_id, profile_ref, name, classification_cap, simple_interface)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+             (account_id, profile_ref, name, classification_cap, simple_interface,
+              preferred_language, subtitle_default)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             account_id,
             profile_ref,
             name,
             classification_cap,
-            simple_interface as i64
+            simple_interface as i64,
+            preferred_language,
+            subtitle_default
         ],
     )
     .map_err(|e| format!("insert profile: {e}"))?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Replace a profile's preference fields (ADR-0038 amendment §2). Null
+/// language clears the preference; `subtitle_default` is `auto` or `off`.
+pub fn update_profile_preferences(
+    conn: &Connection,
+    profile_id: i64,
+    preferred_language: Option<&str>,
+    subtitle_default: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE profiles SET preferred_language = ?2, subtitle_default = ?3 WHERE id = ?1",
+        params![profile_id, preferred_language, subtitle_default],
+    )
+    .map_err(|e| format!("update profile preferences: {e}"))?;
+    Ok(())
 }
 
 pub fn create_session(

@@ -192,28 +192,8 @@ pub fn select_subtitle_track(
 }
 
 fn select_forced_subtitle(tracks: &[TrackCandidate], pref: &str) -> TrackSelection {
-    let mut best: Option<(u8, bool, bool, u32, usize)> = None;
-    for (i, t) in tracks.iter().enumerate() {
-        if !track_lang_matches(t, pref) {
-            continue;
-        }
-        let bits = KindBits::from_title(t.title.as_deref());
-        if !is_forced(t, bits) {
-            continue;
-        }
-        let key = (
-            bits.kind_penalty(),
-            !t.is_default,
-            t.is_image,
-            t.stream_index,
-            i,
-        );
-        if best.as_ref().is_none_or(|b| key < *b) {
-            best = Some(key);
-        }
-    }
-    match best {
-        Some((_, _, _, _, idx)) => {
+    match best_subtitle_among(tracks, Some(pref), Some(true)) {
+        Some(idx) => {
             let t = &tracks[idx];
             let lang = t.language.as_deref().unwrap_or("und");
             TrackSelection {
@@ -231,29 +211,8 @@ fn select_forced_subtitle(tracks: &[TrackCandidate], pref: &str) -> TrackSelecti
 }
 
 fn select_dialogue_subtitle(tracks: &[TrackCandidate], pref: &str) -> TrackSelection {
-    let mut best: Option<(u8, bool, bool, u32, usize)> = None;
-    for (i, t) in tracks.iter().enumerate() {
-        if !track_lang_matches(t, pref) {
-            continue;
-        }
-        let bits = KindBits::from_title(t.title.as_deref());
-        // Matching audio: forced does not auto-select (Phase 2 item 5).
-        if is_forced(t, bits) {
-            continue;
-        }
-        let key = (
-            bits.kind_penalty(),
-            !t.is_default,
-            t.is_image,
-            t.stream_index,
-            i,
-        );
-        if best.as_ref().is_none_or(|b| key < *b) {
-            best = Some(key);
-        }
-    }
-    match best {
-        Some((_, _, _, _, idx)) => {
+    match best_subtitle_among(tracks, Some(pref), Some(false)) {
+        Some(idx) => {
             let t = &tracks[idx];
             let bits = KindBits::from_title(t.title.as_deref());
             let lang = t.language.as_deref().unwrap_or("und");
@@ -272,6 +231,115 @@ fn select_dialogue_subtitle(tracks: &[TrackCandidate], pref: &str) -> TrackSelec
             reason: format!("no track matched language {pref}"),
         },
     }
+}
+
+/// The one subtitle rank loop (ADR-0024 §1, Rule 4.11).
+///
+/// `pref` restricts by language when set; `want_forced` restricts by the forced
+/// flag when set. The stored-description path passes both, the preference path
+/// passes language only. Returns the winning index into `tracks`.
+fn best_subtitle_among(
+    tracks: &[TrackCandidate],
+    pref: Option<&str>,
+    want_forced: Option<bool>,
+) -> Option<usize> {
+    let mut best: Option<(u8, bool, bool, u32, usize)> = None;
+    for (i, t) in tracks.iter().enumerate() {
+        if let Some(p) = pref.filter(|s| !s.is_empty())
+            && !track_lang_matches(t, p)
+        {
+            continue;
+        }
+        let bits = KindBits::from_title(t.title.as_deref());
+        if let Some(forced) = want_forced
+            && is_forced(t, bits) != forced
+        {
+            continue;
+        }
+        let key = (
+            bits.kind_penalty(),
+            !t.is_default,
+            t.is_image,
+            t.stream_index,
+            i,
+        );
+        if best.as_ref().is_none_or(|b| key < *b) {
+            best = Some(key);
+        }
+    }
+    best.map(|(_, _, _, _, idx)| idx)
+}
+
+/// Whether a track is the one a stored description names.
+///
+/// `kind` is the closed `main` | `commentary` | `signs` set the storage CHECK
+/// enforces; a track's kind is derived from its title with the same tokens the
+/// ranker uses. A null `language` on the description matches any language,
+/// which is the shape the wire allows.
+fn description_matches(
+    t: &TrackCandidate,
+    language: Option<&str>,
+    kind: &str,
+    sdh: bool,
+    forced: bool,
+) -> bool {
+    if let Some(lang) = language.filter(|s| !s.is_empty())
+        && !track_lang_matches(t, lang)
+    {
+        return false;
+    }
+    let bits = KindBits::from_title(t.title.as_deref());
+    let track_kind = if bits.commentary {
+        "commentary"
+    } else if bits.signs {
+        "signs"
+    } else {
+        "main"
+    };
+    track_kind == kind && bits.sdh == sdh && is_forced(t, bits) == forced
+}
+
+/// Resolve a stored audio description by restricting candidates and calling the
+/// same rank function (ADR-0038 item 2, Rule 4.11). `None` when nothing
+/// matches, which is the caller's signal to fall through.
+pub fn select_audio_for_description(
+    tracks: &[TrackCandidate],
+    language: Option<&str>,
+    kind: &str,
+    sdh: bool,
+    forced: bool,
+) -> Option<TrackSelection> {
+    let matching: Vec<TrackCandidate> = tracks
+        .iter()
+        .filter(|t| description_matches(t, language, kind, sdh, forced))
+        .cloned()
+        .collect();
+    let mut sel = best_audio_among(&matching, language)?;
+    sel.reason = format!("stored choice: {}", sel.reason);
+    Some(sel)
+}
+
+/// Resolve a stored subtitle description the same way. `None` when nothing
+/// matches.
+pub fn select_subtitle_for_description(
+    tracks: &[TrackCandidate],
+    language: Option<&str>,
+    kind: &str,
+    sdh: bool,
+    forced: bool,
+) -> Option<TrackSelection> {
+    let matching: Vec<TrackCandidate> = tracks
+        .iter()
+        .filter(|t| description_matches(t, language, kind, sdh, forced))
+        .cloned()
+        .collect();
+    let idx = best_subtitle_among(&matching, language, Some(forced))?;
+    let t = &matching[idx];
+    let lang = t.language.as_deref().unwrap_or("und");
+    Some(TrackSelection {
+        track_id: Some(t.track_id.clone()),
+        reason: format!("{lang}, matched stored choice"),
+    })
 }
 
 /// Closed-list SDH detection for inventory DTOs (same tokens as the ranker).
@@ -417,6 +485,63 @@ mod tests {
         // No default flags — Emby-style trap on the audio axis.
         let sel = select_audio_track(&adv_audio(), Some("en"));
         assert_ne!(sel.track_id.as_deref(), Some("e1"));
+        assert_eq!(sel.track_id.as_deref(), Some("e2"));
+    }
+
+    /// ADR-0038 item 2: a stored description restricts candidates and then the
+    /// same ranker picks. A description naming commentary must not fall back to
+    /// the main track, and the reason says it came from the stored choice.
+    #[test]
+    fn stored_audio_description_restricts_then_ranks() {
+        let tracks = adv_audio();
+        let sel = select_audio_for_description(&tracks, Some("en"), "commentary", false, false)
+            .expect("a matching commentary track");
+        assert_eq!(sel.track_id.as_deref(), Some("e1"), "{sel:?}");
+        assert!(sel.reason.contains("stored choice"), "{}", sel.reason);
+
+        let main = select_audio_for_description(&tracks, Some("en"), "main", false, false)
+            .expect("the main track");
+        assert_eq!(main.track_id.as_deref(), Some("e2"));
+    }
+
+    /// A description no candidate matches resolves to `None`, which is the
+    /// caller's signal to fall through rather than select the wrong track.
+    #[test]
+    fn stored_description_with_no_match_is_none() {
+        let tracks = adv_audio();
+        assert_eq!(
+            select_audio_for_description(&tracks, Some("ja"), "main", false, false),
+            None
+        );
+        assert_eq!(
+            select_subtitle_for_description(&adv_subs(), Some("en"), "signs", false, false),
+            None
+        );
+    }
+
+    /// Forced is part of the stored description, so a forced stored choice
+    /// selects the forced track and a non-forced one skips it.
+    #[test]
+    fn stored_subtitle_description_carries_the_forced_flag() {
+        let tracks = vec![
+            cand("e2", "en", "English (Forced)", 2, true, false),
+            cand("e3", "en", "English", 3, false, false),
+        ];
+        let forced = select_subtitle_for_description(&tracks, Some("en"), "main", false, true)
+            .expect("the forced track");
+        assert_eq!(forced.track_id.as_deref(), Some("e2"), "{forced:?}");
+
+        let dialogue = select_subtitle_for_description(&tracks, Some("en"), "main", false, false)
+            .expect("the full track");
+        assert_eq!(dialogue.track_id.as_deref(), Some("e3"), "{dialogue:?}");
+    }
+
+    /// A null language on the stored description matches any language and the
+    /// ranker decides, which is the shape the wire allows.
+    #[test]
+    fn stored_description_with_null_language_matches_any() {
+        let sel = select_audio_for_description(&adv_audio(), None, "main", false, false)
+            .expect("a main track whatever its language");
         assert_eq!(sel.track_id.as_deref(), Some("e2"));
     }
 }

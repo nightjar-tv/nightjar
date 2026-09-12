@@ -39,6 +39,11 @@ pub struct ProfileDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification_cap: Option<String>,
     pub simple_interface: bool,
+    /// ISO-639-1-shaped lowercase code, or null for no preference
+    /// (ADR-0038 amendment §2).
+    pub preferred_language: Option<String>,
+    /// `auto` | `off`.
+    pub subtitle_default: String,
 }
 
 #[derive(Serialize)]
@@ -104,6 +109,8 @@ pub(crate) fn profile_dto(row: &ProfileRow) -> ProfileDto {
         name: row.name.clone(),
         classification_cap: row.classification_cap.clone(),
         simple_interface: row.simple_interface,
+        preferred_language: row.preferred_language.clone(),
+        subtitle_default: row.subtitle_default.clone(),
     }
 }
 

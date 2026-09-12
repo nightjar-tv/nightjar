@@ -1,3 +1,4 @@
+use crate::authority::Caller;
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::state::AppState;
 use axum::{
@@ -8,9 +9,9 @@ use axum::{
     response::Response,
 };
 use nightjar_core::{
-    BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, decide_playback,
-    known_profile, needs_standalone_subtitle_extract, resolve_profile_bag, title_looks_forced,
-    title_looks_sdh,
+    BROWSER_V0, ClientCapabilityProfile, PlaybackDecision, PlaybackMethod, TrackCandidate,
+    decide_playback, known_profile, needs_standalone_subtitle_extract, resolve_profile_bag,
+    title_looks_forced, title_looks_sdh,
 };
 use nightjar_db::{MediaItemRow, SidecarRow, resolve_media_path};
 use nightjar_metadata::{ArtworkKind, ItemMetadata, item_metadata, rating_max};
@@ -198,6 +199,12 @@ pub struct PlaybackInfoDto {
     pub subtitle_status: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub subtitle_tracks: Vec<SubtitleTrackDto>,
+    /// Why the audio track was selected (ADR-0038 item 5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_reason: Option<String>,
+    /// Why a subtitle track was selected, or why none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle_reason: Option<String>,
 }
 
 pub async fn get(
@@ -326,18 +333,23 @@ pub fn profile_from_query(
 
 pub async fn playback_info(
     State(state): State<AppState>,
+    caller: Caller,
     Path(item_id): Path<i64>,
     Query(query): Query<ProfileQuery>,
 ) -> ApiResult<Json<PlaybackInfoDto>> {
     // Every step below blocks: two DB reads, and `subtitle_tracks_for` /
     // `audio_tracks_for` each wait on an ffprobe child reading over SMB.
-    blocking(move || playback_info_blocking(state, item_id, query)).await
+    blocking(move || {
+        playback_info_blocking(state, item_id, query, caller.session.active_profile_id)
+    })
+    .await
 }
 
 fn playback_info_blocking(
     state: AppState,
     item_id: i64,
     query: ProfileQuery,
+    profile_id: Option<i64>,
 ) -> ApiResult<Json<PlaybackInfoDto>> {
     let row = state
         .db
@@ -406,6 +418,46 @@ fn playback_info_blocking(
         crate::routes::sessions::request_map_rebuild(&state, &row);
     }
 
+    // ADR-0038 item 5: the selection reasons ride this response so the track
+    // menu can explain itself. The selection runs the same precedence the
+    // session does (Rule 4.11).
+    let prefs = super::sessions::load_track_preferences(&state, profile_id, &row);
+    let audio_candidates: Vec<TrackCandidate> = audio_tracks
+        .iter()
+        .map(|a| TrackCandidate {
+            track_id: a.track_id.clone(),
+            language: a.language.clone(),
+            title: a.label.clone(),
+            is_default: a.default,
+            is_forced: false,
+            is_image: false,
+            stream_index: a.stream_index,
+        })
+        .collect();
+    let audio_selection = super::sessions::choose_audio_track(&audio_candidates, &prefs);
+    let audio_language = audio_selection
+        .track_id
+        .as_deref()
+        .and_then(|id| audio_tracks.iter().find(|a| a.track_id == id))
+        .and_then(|a| a.language.clone());
+    let subtitle_candidates: Vec<TrackCandidate> = subtitle_tracks
+        .iter()
+        .map(|t| TrackCandidate {
+            track_id: t.track_id.clone(),
+            language: t.language.clone(),
+            title: t.label.clone(),
+            is_default: false,
+            is_forced: t.forced,
+            is_image: false,
+            stream_index: t.stream_index.unwrap_or(u32::MAX),
+        })
+        .collect();
+    let subtitle_selection = super::sessions::choose_subtitle_track(
+        &subtitle_candidates,
+        &prefs,
+        audio_language.as_deref(),
+    );
+
     Ok(Json(PlaybackInfoDto {
         item_id: row.id,
         playback_method: decision.method.as_str(),
@@ -420,6 +472,8 @@ fn playback_info_blocking(
         audio_tracks,
         subtitle_status: row.subtitle_status.clone(),
         subtitle_tracks,
+        audio_reason: Some(audio_selection.reason),
+        subtitle_reason: Some(subtitle_selection.reason),
     }))
 }
 
@@ -686,5 +740,121 @@ pub fn to_dto(row: MediaItemRow, library_root: &str) -> MediaItemDto {
         metadata_status: row.metadata_status,
         scan_error: row.scan_error,
         playback_method: decision.method.as_str(),
+    }
+}
+
+/// ADR-0038 item 5, through the real router. The selection reasons ride
+/// playback-info so the track menu can explain itself. Asserting the JSON
+/// strings, not the DTO source, is what makes deleting either field fail.
+#[cfg(test)]
+mod playback_info_reason_tests {
+    use crate::routes::router;
+    use crate::state::{AppState, test_support};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use nightjar_auth::mint_session_token;
+    use nightjar_db::{NewLibrary, UpsertItem};
+    use tower::ServiceExt;
+
+    /// One account, one profile, one profile-scoped session token.
+    fn profile_token(state: &AppState) -> String {
+        let minted = mint_session_token();
+        state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                nightjar_db::create_account_with_profile(
+                    conn,
+                    "m",
+                    &hash,
+                    "member",
+                    "P",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )?;
+                let account = nightjar_db::account_by_username(conn, "m")?.unwrap();
+                let profile =
+                    nightjar_db::profile_by_ref(conn, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?.unwrap();
+                let expires = nightjar_db::session_expiry(conn)?;
+                let session = nightjar_db::create_session(
+                    conn,
+                    account.id,
+                    &minted.sha256_hex,
+                    "t",
+                    &expires,
+                )?;
+                nightjar_db::set_active_profile(conn, session, Some(profile.id))?;
+                Ok(())
+            })
+            .unwrap();
+        minted.plaintext
+    }
+
+    /// A library and one indexed item. No media file is written: the track
+    /// lists fail and are caught, which is exactly the no-inventory path the
+    /// reasons must still cover.
+    fn seed_item(state: &AppState, dir: &std::path::Path) -> i64 {
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "shows".to_string(),
+                path: dir.to_string_lossy().into_owned(),
+                kind: "shows".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_items_indexed(
+                library.id,
+                &[UpsertItem {
+                    path: "a/s01e01.mkv".to_string(),
+                    mtime_ms: 0,
+                    size_bytes: 1,
+                    title: "a".to_string(),
+                    kind: "episode".to_string(),
+                    year: None,
+                    season: Some(1),
+                    episode: Some(1),
+                    content_id: None,
+                }],
+            )
+            .unwrap()[0]
+    }
+
+    /// Reads a non-empty string field, panicking when the key is absent. The
+    /// absent case is the failure this test exists for.
+    fn non_empty_string(body: &str, key: &str) -> String {
+        let at = body
+            .find(&format!("\"{key}\":\""))
+            .unwrap_or_else(|| panic!("no {key} in {body}"));
+        let start = at + key.len() + 4;
+        let end = body[start..].find('"').unwrap() + start;
+        let value = &body[start..end];
+        assert!(!value.is_empty(), "{key} is empty: {body}");
+        value.to_string()
+    }
+
+    #[tokio::test]
+    async fn playback_info_exposes_selection_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let token = profile_token(&state);
+        let item_id = seed_item(&state, dir.path());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v0/items/{item_id}/playback-info"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+
+        let audio = non_empty_string(&body, "audioReason");
+        let subtitle = non_empty_string(&body, "subtitleReason");
+        assert_ne!(audio, subtitle, "each axis explains itself: {body}");
     }
 }

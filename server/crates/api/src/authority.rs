@@ -362,11 +362,18 @@ pub struct AdminCaller;
 #[derive(Debug, Clone)]
 pub struct WatchingCaller {
     owner: SessionOwner,
+    profile_id: i64,
 }
 
 impl WatchingCaller {
     pub fn owner(&self) -> &SessionOwner {
         &self.owner
+    }
+
+    /// The selected profile's row id. Track-selection preferences hang off it
+    /// (ADR-0038 item 1), and `require_profile_scope` guarantees it exists.
+    pub fn profile_id(&self) -> i64 {
+        self.profile_id
     }
 }
 
@@ -396,6 +403,10 @@ impl FromRequestParts<AppState> for WatchingCaller {
         caller.require_profile_scope()?;
         Ok(Self {
             owner: caller.session_owner(),
+            profile_id: caller
+                .session
+                .active_profile_id
+                .ok_or_else(|| ApiError::internal("profile-scope session without a profile"))?,
         })
     }
 }

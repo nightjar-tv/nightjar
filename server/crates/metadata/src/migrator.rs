@@ -12,11 +12,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Rewrite `series_key` on every table keyed by it (ADR-0039 item 7).
 ///
-/// **The tables this rewrites do not exist yet, and the list is here rather
-/// than at each future call site so there is one place to add them.**
-/// `profile_track_choice` arrives with B2-8 and the kids override table with
-/// B2-6. Until then this is reached, finds nothing, and reports that it found
-/// nothing — which is different from not being called.
+/// **`profile_track_choice` is implemented here (B2-8).** The kids override
+/// table arrives with B2-6 and is still unimplemented: if it is present this
+/// fails loudly rather than silently doing nothing, because its merge rule
+/// (the more restrictive entry survives) is a different rule from the one
+/// below and must be written when the table lands.
 ///
 /// **Merge on collision, which is the common case rather than the exotic one.**
 /// Two folders can bind the same show (a split library, or extras in a sibling
@@ -47,19 +47,96 @@ pub fn migrate_series_keys(
         .copied()
         .filter(|t| table_exists(conn, t).unwrap_or(false))
         .collect();
-    if let Some(table) = present.first() {
-        // Unreachable until B2-6 and B2-8 add the tables, and it fails loudly
-        // rather than silently doing nothing. The merge rules above are what a
-        // writer implements here; writing them now, against a schema that does
-        // not exist, would be inventing the schema (Rule 4.9).
-        return Err(format!(
-            "series_key migration for {table} is unimplemented: the table exists, \
+    if present.contains(&"kids_overrides") {
+        return Err(
+            "series_key migration for kids_overrides is unimplemented: the table exists, \
              so the merge rule in this function's documentation now has to be written"
-        ));
+                .to_string(),
+        );
     }
-    Ok(SeriesMigrateReport {
+    let mut report = SeriesMigrateReport {
         tables_present: present.len(),
-    })
+        ..Default::default()
+    };
+    if present.contains(&"profile_track_choice") {
+        report.track_choice_rewrites = migrate_track_choice(conn, old_key, new_key)?;
+    }
+    Ok(report)
+}
+
+/// Move `profile_track_choice` rows from `old_key` to `new_key`, per profile.
+///
+/// Collision keeps the newer `updated_at`. Timestamps compare as strings, which
+/// is sound because every writer uses `strftime('%Y-%m-%dT%H:%M:%fZ')`: fixed
+/// width, UTC, therefore lexicographically ordered.
+fn migrate_track_choice(conn: &Connection, old_key: &str, new_key: &str) -> Result<usize, String> {
+    let mut moved = 0;
+    for profile_id in profiles_with_series_key(conn, old_key)? {
+        let old_updated = track_choice_updated_at(conn, profile_id, old_key)?;
+        let new_updated = track_choice_updated_at(conn, profile_id, new_key)?;
+        match (old_updated, new_updated) {
+            (Some(_), None) => {
+                conn.execute(
+                    "UPDATE profile_track_choice SET series_key = ?1
+                     WHERE profile_id = ?2 AND series_key = ?3",
+                    params![new_key, profile_id, old_key],
+                )
+                .map_err(|e| format!("rewrite track choice: {e}"))?;
+            }
+            (Some(old), Some(new)) => {
+                if old > new {
+                    conn.execute(
+                        "DELETE FROM profile_track_choice
+                         WHERE profile_id = ?1 AND series_key = ?2",
+                        params![profile_id, new_key],
+                    )
+                    .map_err(|e| format!("delete newer track choice: {e}"))?;
+                    conn.execute(
+                        "UPDATE profile_track_choice SET series_key = ?1
+                         WHERE profile_id = ?2 AND series_key = ?3",
+                        params![new_key, profile_id, old_key],
+                    )
+                    .map_err(|e| format!("promote older track choice: {e}"))?;
+                } else {
+                    conn.execute(
+                        "DELETE FROM profile_track_choice
+                         WHERE profile_id = ?1 AND series_key = ?2",
+                        params![profile_id, old_key],
+                    )
+                    .map_err(|e| format!("drop older track choice: {e}"))?;
+                }
+            }
+            (None, _) => continue,
+        }
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+fn profiles_with_series_key(conn: &Connection, key: &str) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT profile_id FROM profile_track_choice WHERE series_key = ?1")
+        .map_err(|e| format!("prepare track-choice profiles: {e}"))?;
+    let rows = stmt
+        .query_map(params![key], |r| r.get(0))
+        .map_err(|e| format!("query track-choice profiles: {e}"))?;
+    rows.collect::<Result<Vec<i64>, _>>()
+        .map_err(|e| format!("track-choice profile row: {e}"))
+}
+
+fn track_choice_updated_at(
+    conn: &Connection,
+    profile_id: i64,
+    key: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT updated_at FROM profile_track_choice
+         WHERE profile_id = ?1 AND series_key = ?2",
+        params![profile_id, key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("load track-choice timestamp: {e}"))
 }
 
 /// Every table keyed on `series_key`. Add here, not at a call site.
@@ -67,10 +144,11 @@ const SERIES_KEYED_TABLES: &[&str] = &["profile_track_choice", "kids_overrides"]
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SeriesMigrateReport {
-    /// How many of [`SERIES_KEYED_TABLES`] were present. Zero is the expected
-    /// value today and is reported rather than assumed, so a caller can tell
-    /// "nothing to move" from "never ran".
+    /// How many of [`SERIES_KEYED_TABLES`] were present. Zero means "nothing to
+    /// move" rather than "never ran", which is why it is reported.
     pub tables_present: usize,
+    /// Rows moved or merged in `profile_track_choice` (B2-8).
+    pub track_choice_rewrites: usize,
 }
 
 /// Rewrite `item_key` on watch/playback tables from `old_keys` → `new_key`.
@@ -321,14 +399,143 @@ mod tests {
     /// The other half of the contract: a declared table that exists without its
     /// merge rule is an error, not a silent no-op. A migrator that returned
     /// `Ok` here would leave a future writer's rows unrewritten and say
-    /// nothing.
+    /// nothing. `profile_track_choice` gained its rule in B2-8; the kids
+    /// override table (B2-6) is still unimplemented, so that is the table this
+    /// asserts on.
     #[test]
     fn series_key_migration_refuses_a_present_table_with_no_merge_rule() {
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE profile_track_choice (profile_id INTEGER, series_key TEXT)")
+        c.execute_batch("CREATE TABLE kids_overrides (profile_id INTEGER, series_key TEXT)")
             .unwrap();
         let err = migrate_series_keys(&c, "folder:1:Alpha", "tmdb:show:55").unwrap_err();
-        assert!(err.contains("profile_track_choice"), "{err}");
+        assert!(err.contains("kids_overrides"), "{err}");
+    }
+
+    /// ADR-0039 item 7, the B2-8 half: a folder bind moves every profile's
+    /// `profile_track_choice` row from the `folder:` key to the show key.
+    #[test]
+    fn series_key_migration_rewrites_track_choices() {
+        let c = migrated_with_profiles();
+        c.execute_batch(
+            "INSERT INTO profile_track_choice
+                 (profile_id, series_key, subtitle_mode, updated_at)
+             VALUES (1, 'folder:1:Alpha', 'off', '2026-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let report = migrate_series_keys(&c, "folder:1:Alpha", "tmdb:show:55").unwrap();
+        assert_eq!(report.tables_present, 1);
+        assert_eq!(report.track_choice_rewrites, 1);
+        let key: String = c
+            .query_row("SELECT series_key FROM profile_track_choice", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(key, "tmdb:show:55");
+    }
+
+    /// Two profiles move independently, and a collision keeps the newer
+    /// `updated_at` — per profile, not globally. Profile 1's new-key row is
+    /// newer (so the old row is dropped); profile 2's old-key row is newer (so
+    /// it replaces the new-key row).
+    #[test]
+    fn series_key_migration_merges_per_profile_keeping_the_newer_timestamp() {
+        let c = migrated_with_profiles();
+        c.execute_batch(
+            "INSERT INTO profile_track_choice
+                 (profile_id, series_key, subtitle_mode, updated_at)
+             VALUES
+                 (1, 'folder:1:Alpha', 'off',    '2026-01-01T00:00:00.000Z'),
+                 (1, 'tmdb:show:55',   'unset',  '2026-02-01T00:00:00.000Z'),
+                 (2, 'folder:1:Alpha', 'off',    '2026-02-01T00:00:00.000Z'),
+                 (2, 'tmdb:show:55',   'unset',  '2026-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let report = migrate_series_keys(&c, "folder:1:Alpha", "tmdb:show:55").unwrap();
+        assert_eq!(report.track_choice_rewrites, 2);
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = c
+                .prepare(
+                    "SELECT profile_id, subtitle_mode, updated_at
+                     FROM profile_track_choice WHERE series_key = 'tmdb:show:55'
+                     ORDER BY profile_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "unset".to_string(),
+                    "2026-02-01T00:00:00.000Z".to_string()
+                ),
+                (2, "off".to_string(), "2026-02-01T00:00:00.000Z".to_string()),
+            ],
+            "newer updated_at wins per profile"
+        );
+        let stale: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM profile_track_choice WHERE series_key = 'folder:1:Alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    /// A movie assign runs both migrators over one value: the item migrator
+    /// rewrites `watch_state` and the series migrator rewrites the track
+    /// choice, and neither touches the other's table.
+    #[test]
+    fn movie_bind_runs_both_migrators_over_one_value() {
+        let c = migrated_with_profiles();
+        c.execute_batch(
+            "INSERT INTO watch_state
+                 (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                  first_played_at, last_played_at)
+             VALUES (1, 'path:1:Film.mkv', 9000, 10000, 0, 0,
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+             INSERT INTO profile_track_choice
+                 (profile_id, series_key, subtitle_mode, updated_at)
+             VALUES (1, 'path:1:Film.mkv', 'off', '2026-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let item = migrate_item_keys(&c, &["path:1:Film.mkv".into()], "tmdb:movie:9").unwrap();
+        let series = migrate_series_keys(&c, "path:1:Film.mkv", "tmdb:movie:9").unwrap();
+        assert_eq!(item.watch_rewrites, 1);
+        assert_eq!(series.track_choice_rewrites, 1);
+        let item_key: String = c
+            .query_row("SELECT item_key FROM watch_state", [], |r| r.get(0))
+            .unwrap();
+        let series_key: String = c
+            .query_row("SELECT series_key FROM profile_track_choice", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(item_key, "tmdb:movie:9");
+        assert_eq!(series_key, "tmdb:movie:9");
+    }
+
+    /// A migrated database with two profiles on one account, for the series-key
+    /// migrator tests.
+    fn migrated_with_profiles() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        nightjar_db::migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (1, 'a', 'x', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+                 VALUES (1, 1, 'aa', 'P1'), (2, 1, 'bb', 'P2');",
+        )
+        .unwrap();
+        c
     }
 
     /// ADR-0039 item 7: a movie assign changes the item key and the series key
@@ -358,9 +565,10 @@ mod tests {
         assert!(item.tables_present, "the live watch-state migrator ran");
         assert_eq!(item.watch_rewrites, 1);
         assert_eq!(
-            series.tables_present, 0,
-            "no series-keyed table exists yet, and it says so"
+            series.tables_present, 1,
+            "profile_track_choice exists and is handled (B2-8)"
         );
+        assert_eq!(series.track_choice_rewrites, 0, "no choice was stored");
         let key: String = c
             .query_row("SELECT item_key FROM watch_state", [], |r| r.get(0))
             .unwrap();
