@@ -20,7 +20,7 @@ use nightjar_db::SubtitleTrackRow;
 use nightjar_db::resolve_media_path;
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeMap, PiggybackExtract,
-    PlaylistError, SessionMode, StartSessionError, VideoRung, burn_in_kind_for_codec,
+    PlaylistError, SessionMode, SessionOwner, StartSessionError, VideoRung, burn_in_kind_for_codec,
     list_audio_tracks, list_burn_in_subtitles, parse_time_keyed_segment_name,
 };
 use serde::{Deserialize, Serialize};
@@ -123,7 +123,7 @@ fn dto_from_view(view: nightjar_transcode::SessionView) -> TranscodeSessionDto {
 
 pub async fn start(
     State(state): State<AppState>,
-    _watching: WatchingCaller,
+    watching: WatchingCaller,
     Path(item_id): Path<i64>,
     Query(query): Query<StartQuery>,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
@@ -132,13 +132,15 @@ pub async fn start(
     // used to run on a Tokio worker with only `hls.start` moved off, so the
     // most expensive part of the most latency-sensitive route was the part
     // still parking the runtime.
-    blocking(move || start_blocking(state, item_id, query)).await
+    let owner = watching.owner().clone();
+    blocking(move || start_blocking(state, item_id, query, owner)).await
 }
 
 fn start_blocking(
     state: AppState,
     item_id: i64,
     query: StartQuery,
+    owner: SessionOwner,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
     let row = state
         .db
@@ -254,6 +256,7 @@ fn start_blocking(
     let hls = Arc::clone(&state.hls);
     let src = abs_path(&lib_root, &row.path);
     let started = hls.start(
+        owner,
         item_id,
         &src,
         start_ms,
@@ -1360,5 +1363,596 @@ mod tests {
                 "status={status} tracks={tracks:?}"
             );
         }
+    }
+}
+
+/// ADR-0034 item 8, end to end through the real router.
+///
+/// Two distinct accounts, each with its own profile, drive real requests. The
+/// first creates a real session; the second must be answered exactly as if the
+/// session did not exist. The owner controls prove the refusal is ownership
+/// and not a handler that happens to be broken for everyone.
+#[cfg(test)]
+mod ownership_tests {
+    use crate::authority::SESSION_COOKIE;
+    use crate::routes::router;
+    use crate::state::{AppState, test_support};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use nightjar_auth::{mint_profile_ref, mint_session_token};
+    use nightjar_db::{NewLibrary, ProbeUpdate, SidecarRow, UpsertItem};
+    use tower::ServiceExt;
+
+    struct Actor {
+        account_id: i64,
+        profile_id: i64,
+    }
+
+    fn actor(state: &AppState, username: &str) -> Actor {
+        let profile_ref = mint_profile_ref();
+        state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                nightjar_db::create_account_with_profile(
+                    conn,
+                    username,
+                    &hash,
+                    "member",
+                    "P",
+                    &profile_ref,
+                )?;
+                let account = nightjar_db::account_by_username(conn, username)?.unwrap();
+                let profile = nightjar_db::profile_by_ref(conn, &profile_ref)?.unwrap();
+                Ok((account.id, profile.id))
+            })
+            .map(|(account_id, profile_id)| Actor {
+                account_id,
+                profile_id,
+            })
+            .unwrap()
+    }
+
+    /// A profile-scoped session token for this actor.
+    fn token_for(state: &AppState, actor: &Actor) -> String {
+        let minted = mint_session_token();
+        state
+            .db
+            .with_conn(|conn| {
+                let expires = nightjar_db::session_expiry(conn)?;
+                let session = nightjar_db::create_session(
+                    conn,
+                    actor.account_id,
+                    &minted.sha256_hex,
+                    "t",
+                    &expires,
+                )?;
+                nightjar_db::set_active_profile(conn, session, Some(actor.profile_id))?;
+                Ok(())
+            })
+            .unwrap();
+        minted.plaintext
+    }
+
+    /// A second profile on `account_id`, plus a profile-scoped token for it.
+    ///
+    /// `actor` mints an account and its first profile together. This adds a
+    /// sibling profile to an account that already exists: the account is the
+    /// same, the watching identity is not (ADR-0034 item 8).
+    fn second_profile_token(state: &AppState, account_id: i64) -> String {
+        let profile_ref = mint_profile_ref();
+        let minted = mint_session_token();
+        state
+            .db
+            .with_conn(|conn| {
+                let profile_id = nightjar_db::create_profile(
+                    conn,
+                    account_id,
+                    &profile_ref,
+                    "second",
+                    None,
+                    false,
+                )?;
+                let expires = nightjar_db::session_expiry(conn)?;
+                let session = nightjar_db::create_session(
+                    conn,
+                    account_id,
+                    &minted.sha256_hex,
+                    "t",
+                    &expires,
+                )?;
+                nightjar_db::set_active_profile(conn, session, Some(profile_id))?;
+                Ok(())
+            })
+            .unwrap();
+        minted.plaintext
+    }
+
+    fn ffmpeg_available() -> bool {
+        let ok = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok && std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_some() {
+            panic!("NIGHTJAR_TEST_REQUIRE_FFMPEG is set but ffmpeg is not on PATH");
+        }
+        ok
+    }
+
+    /// A tiny real H.264/AAC Matroska, so the session path spawns a real
+    /// FFmpeg rather than a mock that could hide an ownership gap.
+    fn write_fixture(dir: &std::path::Path) -> bool {
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-t",
+                "4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg("-y")
+            .arg(dir.join("in.mkv"))
+            .output();
+        out.is_ok_and(|o| o.status.success())
+    }
+
+    /// A library, a probed item, and a complete sidecar subtitle track. The
+    /// container forces a stream-copy session (BROWSER_V0 cannot read mkv),
+    /// which is enough to prove the ownership boundary for every session
+    /// resource.
+    fn seed_item(state: &AppState, dir: &std::path::Path) -> i64 {
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "movies".to_string(),
+                path: dir.to_string_lossy().into_owned(),
+                kind: "movies".to_string(),
+            })
+            .unwrap();
+        let ids = state
+            .db
+            .upsert_items_indexed(
+                library.id,
+                &[UpsertItem {
+                    path: "in.mkv".to_string(),
+                    mtime_ms: 0,
+                    size_bytes: 1,
+                    title: "in".to_string(),
+                    kind: "movie".to_string(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        state
+            .db
+            .apply_probe_update(&ProbeUpdate {
+                item_id,
+                duration_ms: Some(4_000),
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+                audio_channels: Some(2),
+                width: Some(160),
+                height: Some(120),
+                video_bitrate_bps: Some(200_000),
+                video_frame_rate_num: Some(10),
+                video_frame_rate_den: Some(1),
+                hdr: None,
+                probe_status: "probed".to_string(),
+                scan_error: None,
+            })
+            .unwrap();
+        state.db.set_subtitle_status(item_id, "ready").unwrap();
+        state
+            .db
+            .replace_item_sidecars(
+                item_id,
+                &[SidecarRow {
+                    media_item_id: item_id,
+                    track_id: "s-en".to_string(),
+                    path: "subs/s-en.vtt".to_string(),
+                    mtime_ms: 0,
+                    size_bytes: 1,
+                    format: "vtt".to_string(),
+                    language: None,
+                    forced: false,
+                    sdh: false,
+                }],
+            )
+            .unwrap();
+        state
+            .subs
+            .publish_item_vtt(
+                item_id,
+                "s-en",
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhi\n",
+            )
+            .unwrap();
+        item_id
+    }
+
+    async fn send(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        credential: Option<(&str, &str)>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some((name, value)) = credential {
+            builder = builder.header(name, value);
+        }
+        let response = router(state)
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        (status, text)
+    }
+
+    fn bearer(token: &str) -> (String, String) {
+        ("authorization".to_string(), format!("Bearer {token}"))
+    }
+
+    fn cookie(token: &str) -> (String, String) {
+        ("cookie".to_string(), format!("{SESSION_COOKIE}={token}"))
+    }
+
+    /// The segment basename the playlist actually names. Guessing the
+    /// producer's first land would pin the test to an encoder detail; the
+    /// playlist is the contract a client reads.
+    fn first_segment_basename(playlist: &str) -> Option<String> {
+        playlist
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| {
+                let name = line.rsplit('/').next().unwrap_or(line);
+                name.ends_with(".m4s").then(|| name.to_string())
+            })
+    }
+
+    fn field<'a>(json: &'a str, key: &str) -> &'a str {
+        let at = json
+            .find(&format!("\"{key}\":\""))
+            .unwrap_or_else(|| panic!("no {key} in {json}"))
+            + key.len()
+            + 4;
+        let end = json[at..].find('"').unwrap() + at;
+        &json[at..end]
+    }
+
+    /// Creates a session as `owner` and returns its id.
+    async fn start_session(state: &AppState, owner_token: &str, item_id: i64) -> String {
+        let (bearer_name, bearer_value) = bearer(owner_token);
+        let (status, body) = send(
+            state.clone(),
+            "POST",
+            &format!("/api/v0/items/{item_id}/sessions"),
+            Some((&bearer_name, &bearer_value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "session start: {body}");
+        field(&body, "sessionId").to_string()
+    }
+
+    /// The full session surface, in the order the router serves it. Every
+    /// entry is a GET so the cookie transport can be exercised on each.
+    fn get_routes(session_id: &str) -> Vec<String> {
+        vec![
+            format!("/api/v0/sessions/{session_id}"),
+            format!("/api/v0/sessions/{session_id}/master.m3u8"),
+            format!("/api/v0/sessions/{session_id}/index.m3u8"),
+            format!("/api/v0/sessions/{session_id}/v/single/index.m3u8"),
+            format!("/api/v0/sessions/{session_id}/runs/0/init.mp4"),
+            format!("/api/v0/sessions/{session_id}/init.mp4"),
+            format!("/api/v0/sessions/{session_id}/subs/s-en.m3u8"),
+        ]
+    }
+
+    /// The second account cannot inspect, seek, or read any session resource,
+    /// and the owner is not blocked by the boundary that refuses the second.
+    #[tokio::test]
+    async fn a_second_profile_cannot_reach_another_profiles_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        if !ffmpeg_available() || !write_fixture(dir.path()) {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let owner = actor(&state, "owner-a");
+        let other = actor(&state, "owner-b");
+        let owner_token = token_for(&state, &owner);
+        let other_token = token_for(&state, &other);
+        let item_id = seed_item(&state, dir.path());
+        let session_id = start_session(&state, &owner_token, item_id).await;
+
+        // The playlist names the segment. Read it once and cover both the
+        // flat and the rung-scoped segment route with that name.
+        let index = format!("/api/v0/sessions/{session_id}/index.m3u8");
+        let (on, ov) = bearer(&owner_token);
+        let (_, playlist_body) = send(state.clone(), "GET", &index, Some((&on, &ov)), "").await;
+        let segment = first_segment_basename(&playlist_body)
+            .unwrap_or_else(|| panic!("playlist names no segment: {playlist_body}"));
+        let mut routes = get_routes(&session_id);
+        routes.push(format!("/api/v0/sessions/{session_id}/{segment}"));
+        routes.push(format!("/api/v0/sessions/{session_id}/v/single/{segment}"));
+
+        for uri in routes {
+            let (owner_name, owner_value) = bearer(&owner_token);
+            let (owner_status, owner_body) = send(
+                state.clone(),
+                "GET",
+                &uri,
+                Some((&owner_name, &owner_value)),
+                "",
+            )
+            .await;
+            assert_eq!(
+                owner_status,
+                StatusCode::OK,
+                "the owner must read {uri}: {owner_body}"
+            );
+
+            let (other_name, other_value) = bearer(&other_token);
+            let (other_status, _) = send(
+                state.clone(),
+                "GET",
+                &uri,
+                Some((&other_name, &other_value)),
+                "",
+            )
+            .await;
+            assert_eq!(
+                other_status,
+                StatusCode::NOT_FOUND,
+                "a second profile must not read {uri}"
+            );
+        }
+
+        // The subtitle segment shares the `subs/{*asset}` route with the
+        // playlist. The refusal must come from the ownership boundary, not
+        // from the asset parser: the handler's own 404 says `subtitle asset
+        // … for session …`, so only the exact missing-session message proves
+        // the ownership layer ran first.
+        let sub_segment = format!("/api/v0/sessions/{session_id}/subs/s-en/seg000.vtt");
+        let (other_name, other_value) = bearer(&other_token);
+        let (sub_status, sub_body) = send(
+            state.clone(),
+            "GET",
+            &sub_segment,
+            Some((&other_name, &other_value)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            sub_status,
+            StatusCode::NOT_FOUND,
+            "a second profile must not read a subtitle segment"
+        );
+        assert_eq!(
+            field(&sub_body, "error"),
+            format!("session {session_id} not found"),
+            "the refusal must come from the ownership boundary, not the \
+             subtitle asset parser: {sub_body}"
+        );
+
+        // Seek: the owner's restart applies, the second profile's is a 404.
+        let seek = format!("/api/v0/sessions/{session_id}/seek?startMs=1000");
+        let (owner_name, owner_value) = bearer(&owner_token);
+        let (owner_status, _) = send(
+            state.clone(),
+            "POST",
+            &seek,
+            Some((&owner_name, &owner_value)),
+            "",
+        )
+        .await;
+        assert_eq!(owner_status, StatusCode::ACCEPTED, "the owner may seek");
+        let (other_name, other_value) = bearer(&other_token);
+        let (other_status, _) = send(
+            state.clone(),
+            "POST",
+            &seek,
+            Some((&other_name, &other_value)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            other_status,
+            StatusCode::NOT_FOUND,
+            "a second profile must not seek"
+        );
+    }
+
+    /// A sibling profile under one account never reaches the session its
+    /// account-mate created (ADR-0034 item 8).
+    ///
+    /// This is the same-account half of the boundary, and the half the
+    /// two-account tests cannot see: `session_owner` keys on account *and*
+    /// profile, so an account-only key leaves every two-account test green.
+    /// Here the account is identical, so an account-only key makes the
+    /// sibling's key equal the creator's and turns the sibling's 404 into a
+    /// 200 on both routes.
+    #[tokio::test]
+    async fn a_sibling_profile_cannot_reach_the_sessions_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        if !ffmpeg_available() || !write_fixture(dir.path()) {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let owner = actor(&state, "owner-a");
+        let owner_token = token_for(&state, &owner);
+        let sibling_token = second_profile_token(&state, owner.account_id);
+        let item_id = seed_item(&state, dir.path());
+        let session_id = start_session(&state, &owner_token, item_id).await;
+
+        let routes = [
+            format!("/api/v0/sessions/{session_id}"),
+            format!("/api/v0/sessions/{session_id}/index.m3u8"),
+        ];
+        for uri in routes {
+            let (sibling_name, sibling_value) = bearer(&sibling_token);
+            let (refused, refused_body) = send(
+                state.clone(),
+                "GET",
+                &uri,
+                Some((&sibling_name, &sibling_value)),
+                "",
+            )
+            .await;
+            assert_eq!(
+                refused,
+                StatusCode::NOT_FOUND,
+                "a sibling profile must not read {uri}: {refused_body}"
+            );
+
+            let (owner_name, owner_value) = bearer(&owner_token);
+            let (admitted, admitted_body) = send(
+                state.clone(),
+                "GET",
+                &uri,
+                Some((&owner_name, &owner_value)),
+                "",
+            )
+            .await;
+            assert_eq!(
+                admitted,
+                StatusCode::OK,
+                "the creating profile must read {uri}: {admitted_body}"
+            );
+        }
+    }
+
+    /// An unauthorized DELETE is refused and leaves the session playing for
+    /// its owner. The refusal must not stop, reap, or refresh the session.
+    #[tokio::test]
+    async fn an_unauthorized_delete_does_not_stop_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        if !ffmpeg_available() || !write_fixture(dir.path()) {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let owner = actor(&state, "owner-a");
+        let other = actor(&state, "owner-b");
+        let owner_token = token_for(&state, &owner);
+        let other_token = token_for(&state, &other);
+        let item_id = seed_item(&state, dir.path());
+        let session_id = start_session(&state, &owner_token, item_id).await;
+        let view = format!("/api/v0/sessions/{session_id}");
+
+        let (other_name, other_value) = bearer(&other_token);
+        let (refused, _) = send(
+            state.clone(),
+            "DELETE",
+            &view,
+            Some((&other_name, &other_value)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            refused,
+            StatusCode::NOT_FOUND,
+            "a second profile must not stop the session"
+        );
+
+        let (owner_name, owner_value) = bearer(&owner_token);
+        let (alive, _) = send(
+            state.clone(),
+            "GET",
+            &view,
+            Some((&owner_name, &owner_value)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            alive,
+            StatusCode::OK,
+            "the refused DELETE must leave the session for its owner"
+        );
+
+        let (stopped, _) = send(
+            state.clone(),
+            "DELETE",
+            &view,
+            Some((&owner_name, &owner_value)),
+            "",
+        )
+        .await;
+        assert_eq!(stopped, StatusCode::NO_CONTENT, "the owner may stop it");
+    }
+
+    /// The same boundary holds on the cookie transport the browser uses for
+    /// byte routes: a listed GET is accepted for the owner and 404s for
+    /// anyone else, before readiness or session state is read.
+    #[tokio::test]
+    async fn a_cookie_authenticated_byte_route_enforces_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        if !ffmpeg_available() || !write_fixture(dir.path()) {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let owner = actor(&state, "owner-a");
+        let other = actor(&state, "owner-b");
+        let owner_token = token_for(&state, &owner);
+        let other_token = token_for(&state, &other);
+        let item_id = seed_item(&state, dir.path());
+        let session_id = start_session(&state, &owner_token, item_id).await;
+        let uri = format!("/api/v0/sessions/{session_id}/index.m3u8");
+
+        let (owner_name, owner_value) = cookie(&owner_token);
+        let (owner_status, _) = send(
+            state.clone(),
+            "GET",
+            &uri,
+            Some((&owner_name, &owner_value)),
+            "",
+        )
+        .await;
+        assert_eq!(owner_status, StatusCode::OK, "the owner's cookie may read");
+
+        let (other_name, other_value) = cookie(&other_token);
+        let (other_status, _) = send(
+            state.clone(),
+            "GET",
+            &uri,
+            Some((&other_name, &other_value)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            other_status,
+            StatusCode::NOT_FOUND,
+            "another cookie must not read the session"
+        );
     }
 }

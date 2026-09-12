@@ -18,7 +18,7 @@ mod virtual_input;
 pub use audio::{AudioStream, list_audio_tracks, stereo_downmix_filter};
 pub use hls::{
     AudioSelection, EncoderKind, HlsSessionRegistry, HlsSubtitleTrack, PiggybackExtract,
-    PlaylistError, SessionEncoder, SessionMode, SessionView, StartSessionError,
+    PlaylistError, SessionEncoder, SessionMode, SessionOwner, SessionView, StartSessionError,
     host_tonemap_available,
 };
 pub use hls_master::VideoRung;

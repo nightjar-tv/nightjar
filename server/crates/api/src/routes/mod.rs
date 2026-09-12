@@ -161,6 +161,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v0/sessions/{session_id}/{asset}",
             get(sessions::segment),
         )
+        // ADR-0034 item 8. The playback-session ownership boundary, applied
+        // before every session operation because every session route carries
+        // `{session_id}`. Added *before* `require_session` so that layer runs
+        // first and resolves the caller this one reads. One boundary for
+        // view, seek, stop, playlists, init, segments and subtitles.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::authority::require_session_owner,
+        ))
         // ADR-0034 item 11. `route_layer`, not `layer`: it runs only once
         // routing has resolved a handler, so every route above is behind it
         // and anything matching nothing falls through to the SPA static
@@ -188,7 +197,7 @@ async fn health() -> Json<Health> {
 }
 /// What a route requires of the caller behind it.
 ///
-/// Five values because the boundaries this server actually draws are five, and
+/// Six values because the boundaries this server actually draws are six, and
 /// collapsing any two would make the table lie somewhere. `AnySession` is not
 /// a filler value: it is the positive statement that a route is deliberately
 /// open to every logged-in caller, and having to write it is what stops a new
@@ -204,6 +213,9 @@ pub(crate) enum Authority {
     OwnAccount,
     /// A profile must be selected (ADR-0034 item 3). The byte routes.
     ProfileScope,
+    /// The caller created the session (ADR-0034 item 8). A non-owner gets the
+    /// missing-session 404, so this is narrower than `AnySession`.
+    SessionOwner,
     /// Any authenticated caller, said out loud rather than by omission.
     AnySession,
 }
@@ -332,57 +344,57 @@ pub(crate) const ROUTE_AUTHORITY: &[(&str, &str, Authority)] = &[
     (
         "GET",
         "/api/v0/sessions/{session_id}/master.m3u8",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/index.m3u8",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/v/{rung}/index.m3u8",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/v/{rung}/{asset}",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/runs/{run_id}/init.mp4",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/subs/{*asset}",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "POST",
         "/api/v0/sessions/{session_id}/seek",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "DELETE",
         "/api/v0/sessions/{session_id}",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/init.mp4",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
     (
         "GET",
         "/api/v0/sessions/{session_id}/{asset}",
-        Authority::AnySession,
+        Authority::SessionOwner,
     ),
 ];
 
@@ -832,6 +844,26 @@ mod route_authority_tests {
                         admitted,
                         StatusCode::FORBIDDEN,
                         "{method} {pattern} must admit a profile-scope session"
+                    );
+                }
+                Authority::SessionOwner => {
+                    // The concrete session id does not exist, so this asserts
+                    // only the non-owner refusal: the ownership boundary
+                    // answers the same missing-session 404 as the handler. The
+                    // positive and live halves — the owner is admitted, and a
+                    // sibling profile under the same account is not — need a
+                    // real session and live in
+                    // `routes::sessions::ownership_tests`.
+                    let (refused, text) =
+                        call(state.clone(), method, &uri, &body, &watcher_token).await;
+                    assert_eq!(
+                        refused,
+                        StatusCode::NOT_FOUND,
+                        "{method} {pattern} must refuse a non-owner"
+                    );
+                    assert!(
+                        text.contains("not found"),
+                        "{method} {pattern} refused a non-owner but not by that name: {text}"
                     );
                 }
                 Authority::AnySession => {

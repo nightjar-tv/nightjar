@@ -13,7 +13,7 @@ use nightjar_core::VideoEncodePlan;
 use nightjar_db::{Db, NewLibrary};
 use nightjar_scanner::{LibraryPool, start_scan_job};
 use nightjar_transcode::{
-    AudioSelection, HlsSessionRegistry, PlaylistError, SessionMode, SubsStore,
+    AudioSelection, HlsSessionRegistry, PlaylistError, SessionMode, SessionOwner, SubsStore,
     parse_time_keyed_segment_name,
 };
 use std::fs;
@@ -225,6 +225,7 @@ fn scan_index_runs_while_a_session_seeks_and_cleans_up() {
     .unwrap();
     let session = hls
         .start(
+            SessionOwner::new("test"),
             item.id,
             &source,
             0,
