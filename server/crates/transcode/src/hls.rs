@@ -118,6 +118,14 @@ const THROTTLE_TICK: Duration = Duration::from_millis(250);
 const REAP_AFTER: Duration = Duration::from_secs(5);
 // Useless if it does not outlast the seek it follows.
 const _: () = assert!(REAP_AFTER.as_millis() > 2400);
+/// Most superseded encoders one session may retain, across every rung
+/// (ADR-0050 §5, amended 2026-09-12).
+///
+/// The bound is per session, not per rung and not global. A single rung
+/// therefore has at most three live or terminating children: the current
+/// producer plus this many retained. Every rung's supersessions contribute to
+/// the same retained total, so a ladder shares one cap.
+const MAX_RETAINED_ENCODERS: usize = 2;
 /// Still justified under producer-truth: EVENT playlists list segments the
 /// producer is still writing; Safari prefetches ~two past the on-disk
 /// frontier. Those GETs Wait (cook), they do not scrub. Far scrub is
@@ -4383,29 +4391,97 @@ fn push_audio_encode(cmd: &mut Command, downmix: Option<&str>) {
 /// process for [`REAP_AFTER`] and then kill it — suspend-then-reap, the exact
 /// policy ADR-0050 §5 was amended to forbid.
 fn supersede_child(session: &mut Session, rung: VideoRung) {
-    let state = session.encoder_state_mut(rung);
-    // Resume before setting it aside, while the child is still this state's
-    // live child and the only thing that can signal it is this call under this lock.
-    if state.throttled
-        && let Some(child) = state.child.as_ref()
-    {
-        signal_child(child, false);
-    }
-    let Some(child) = state.child.take() else {
-        return;
-    };
-    let rss_bytes = state.child_rss_bytes.take();
-    // The flag described the child that just left.
-    state.throttled = false;
-    state.superseded.push(SupersededEncoder {
-        child,
-        rss_bytes,
-        reap_at: Instant::now() + REAP_AFTER,
+    let (child, rss_bytes, run_id) = {
+        let state = session.encoder_state_mut(rung);
+        // Resume before setting it aside, while the child is still this state's
+        // live child and the only thing that can signal it is this call under this lock.
+        if state.throttled
+            && let Some(child) = state.child.as_ref()
+        {
+            signal_child(child, false);
+        }
+        let Some(child) = state.child.take() else {
+            return;
+        };
+        let rss_bytes = state.child_rss_bytes.take();
+        // The flag described the child that just left.
+        state.throttled = false;
         // `restart_at` calls this before it assigns the new run, so
         // `current_run_id` here is exactly the run being set aside. Read it,
         // do not infer it later.
-        run_id: state.current_run_id,
-    });
+        (child, rss_bytes, state.current_run_id)
+    };
+    // Make room before this run joins the retained set, so a supersession can
+    // never leave a third retained encoder (ADR-0050 §5, amended 2026-09-12).
+    enforce_retained_cap(session);
+    session
+        .encoder_state_mut(rung)
+        .superseded
+        .push(SupersededEncoder {
+            child,
+            rss_bytes,
+            reap_at: Instant::now() + REAP_AFTER,
+            run_id,
+        });
+}
+
+/// Enforce the per-session retained-encoder cap before a supersession joins
+/// the set (ADR-0050 §5, amended 2026-09-12).
+///
+/// A session may retain at most [`MAX_RETAINED_ENCODERS`] superseded encoders
+/// across every rung. When the set is already at the cap, the run retained
+/// longest is ingested, terminated and reaped, then removed — in that order,
+/// so its produced bytes stay in the map and its child stays in
+/// [`live_encoder_load_centi`] until `wait()` confirms exit. A child that is
+/// still running must never leave the accounting.
+///
+/// The current producer is never a candidate: only
+/// [`EncoderState::superseded`] is walked, and the run being superseded is not
+/// pushed until after this returns. Run ids are session-global and monotonic
+/// ([`Session::allocate_run_id`]), so the smallest id is the run retained
+/// longest — the oldest across every rung.
+///
+/// This blocks on `wait()` under the sessions mutex, as [`reap_superseded`]
+/// already does on the throttle tick. The cap must not hand the teardown to a
+/// detached cleanup that returns before exit.
+fn enforce_retained_cap(session: &mut Session) {
+    let retained: usize = session
+        .encoder_states
+        .values()
+        .map(|state| state.superseded.len())
+        .sum();
+    if retained < MAX_RETAINED_ENCODERS {
+        return;
+    }
+    let Some((rung, run_id)) = session
+        .encoder_states
+        .iter()
+        .flat_map(|(rung, state)| {
+            state
+                .superseded
+                .iter()
+                .map(move |held| (*rung, held.run_id))
+        })
+        .min_by_key(|(_, run_id)| *run_id)
+    else {
+        return;
+    };
+    // Ingest first: the bytes this run wrote must be in the map before the
+    // process that wrote them is gone. The map is what keeps them readable.
+    sync_superseded_run_indexes(session, rung);
+    let state = session.encoder_state_mut(rung);
+    let Some(index) = state
+        .superseded
+        .iter()
+        .position(|held| held.run_id == run_id)
+    else {
+        return;
+    };
+    // Kill and wait while it is still counted; `remove` only after `wait`
+    // confirms the exit.
+    let _ = state.superseded[index].child.kill();
+    let _ = state.superseded[index].child.wait();
+    state.superseded.remove(index);
 }
 
 /// Runs with an encoder still writing into them: the current one, plus every
@@ -5348,6 +5424,23 @@ mod tests {
             .expect("spawn sleep")
     }
 
+    /// One retained encoder with a live stand-in, plus that child's pid so the
+    /// test can assert on the process rather than on the bookkeeping.
+    #[cfg(unix)]
+    fn retained_encoder(run_id: u64) -> (SupersededEncoder, u32) {
+        let child = spawn_stand_in_encoder();
+        let pid = child.id();
+        (
+            SupersededEncoder {
+                child,
+                rss_bytes: None,
+                reap_at: Instant::now() + REAP_AFTER,
+                run_id,
+            },
+            pid,
+        )
+    }
+
     #[cfg(unix)]
     #[test]
     fn superseded_encoder_counts_against_live_encoder_cap() {
@@ -5861,6 +5954,358 @@ mod tests {
                 "teardown leaves no encoder behind"
             );
         }
+    }
+
+    /// Positive control for the child-process instrument the cap tests read.
+    ///
+    /// Every "Gone" assertion below is meaningful only if [`child_state`] can
+    /// tell a live stand-in from a reaped one on this host. Spawn one, read it
+    /// live, reap it, read it gone. If this fails, the cap tests prove nothing.
+    #[cfg(unix)]
+    #[test]
+    fn stand_in_encoder_instrument_sees_live_then_gone() {
+        let mut child = spawn_stand_in_encoder();
+        let pid = child.id();
+        assert_eq!(child_state(pid), ChildState::Running);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(child_state(pid), ChildState::Gone);
+    }
+
+    /// A third supersession reaps only the oldest retained encoder.
+    ///
+    /// The cap is two retained per session (ADR-0050 §5, amended 2026-09-12).
+    /// The child being superseded joins the set as the newest retained, so the
+    /// two newest and that former producer all stay alive.
+    #[cfg(unix)]
+    #[test]
+    fn a_third_supersession_reaps_only_the_oldest_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        let (held_a, pid_a) = retained_encoder(1);
+        let (held_b, pid_b) = retained_encoder(2);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded = vec![held_a, held_b];
+
+        let producer = spawn_stand_in_encoder();
+        let pid_producer = producer.id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 3;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(producer);
+
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
+
+        assert_eq!(
+            child_state(pid_a),
+            ChildState::Gone,
+            "the oldest retained is the only victim"
+        );
+        assert_eq!(
+            child_state(pid_b),
+            ChildState::Running,
+            "the newer retained survives"
+        );
+        assert_eq!(
+            child_state(pid_producer),
+            ChildState::Running,
+            "the producer just set aside survives"
+        );
+        assert_eq!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .iter()
+                .map(|s| s.run_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the two newest retained remain"
+        );
+
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
+    }
+
+    /// Cap enforcement never selects the current producer.
+    ///
+    /// The selection walks [`EncoderState::superseded`] only. A live current
+    /// child sits beside a full retained set here, and must be untouched.
+    #[cfg(unix)]
+    #[test]
+    fn cap_enforcement_never_reaps_the_current_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        let (held_a, pid_a) = retained_encoder(1);
+        let (held_b, pid_b) = retained_encoder(2);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded = vec![held_a, held_b];
+        let current = spawn_stand_in_encoder();
+        let pid_current = current.id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(current);
+
+        enforce_retained_cap(&mut session);
+
+        assert_eq!(
+            child_state(pid_current),
+            ChildState::Running,
+            "the current producer is never a candidate"
+        );
+        assert_eq!(
+            child_state(pid_a),
+            ChildState::Gone,
+            "the oldest retained is the only victim"
+        );
+        assert_eq!(child_state(pid_b), ChildState::Running);
+        assert_eq!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .iter()
+                .map(|s| s.run_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
+        stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
+    }
+
+    /// Every rung contributes to one session-wide retained total.
+    ///
+    /// One held encoder sits on each rung. A supersession on the second rung
+    /// fills the cap, and the victim is the oldest across both rungs rather
+    /// than the second rung's own oldest.
+    #[cfg(unix)]
+    #[test]
+    fn mixed_rung_retention_shares_the_same_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        session.encoder_states = HashMap::from([
+            (
+                VideoRung::SingleVideo,
+                EncoderState {
+                    current_run_id: 1,
+                    child: None,
+                    child_rss_bytes: None,
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+            (
+                VideoRung::SecondVideo,
+                EncoderState {
+                    current_run_id: 2,
+                    child: None,
+                    child_rss_bytes: None,
+                    throttled: false,
+                    superseded: Vec::new(),
+                },
+            ),
+        ]);
+        session.segment_maps = HashMap::from([
+            (VideoRung::SingleVideo, Default::default()),
+            (VideoRung::SecondVideo, Default::default()),
+        ]);
+        let (held_a, pid_a) = retained_encoder(1);
+        let (held_b, pid_b) = retained_encoder(2);
+        session.encoder_state_mut(VideoRung::SingleVideo).superseded = vec![held_a];
+        session.encoder_state_mut(VideoRung::SecondVideo).superseded = vec![held_b];
+
+        let producer = spawn_stand_in_encoder();
+        let pid_producer = producer.id();
+        session
+            .encoder_state_mut(VideoRung::SecondVideo)
+            .current_run_id = 3;
+        session.encoder_state_mut(VideoRung::SecondVideo).child = Some(producer);
+
+        supersede_child(&mut session, VideoRung::SecondVideo);
+
+        assert_eq!(
+            child_state(pid_a),
+            ChildState::Gone,
+            "the oldest across all rungs is reaped, not the target rung's own"
+        );
+        assert_eq!(
+            child_state(pid_b),
+            ChildState::Running,
+            "the other rung's newer retained survives"
+        );
+        assert_eq!(child_state(pid_producer), ChildState::Running);
+        assert!(
+            session
+                .encoder_state(VideoRung::SingleVideo)
+                .superseded
+                .is_empty()
+        );
+        assert_eq!(
+            session
+                .encoder_state(VideoRung::SecondVideo)
+                .superseded
+                .iter()
+                .map(|s| s.run_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        for rung in [VideoRung::SingleVideo, VideoRung::SecondVideo] {
+            reap_all_superseded(&mut session, rung);
+        }
+    }
+
+    /// The cap reaps first, then the latest requested land still applies.
+    ///
+    /// This drives [`restart_at`]'s map-hit exit, so no ffmpeg is needed: the
+    /// seek must land on the mapped segment after enforcement has run.
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_does_not_stop_the_latest_seek_from_landing() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        write_producer_run(&session_dir, 0, 0, &[0, 2_000, 4_000, 6_000]);
+
+        let mut session = make_test_session(&session_dir);
+        let (held_a, pid_a) = retained_encoder(1);
+        let (held_b, pid_b) = retained_encoder(2);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded = vec![held_a, held_b];
+
+        let producer = spawn_stand_in_encoder();
+        let pid_producer = producer.id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 3;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(producer);
+
+        restart_at(
+            &mut session,
+            SINGLE_VIDEO_RUNG,
+            4_000,
+            &crate::EncodeLeg::software(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.start_ms, 4_000,
+            "the latest requested land is applied"
+        );
+        assert_eq!(session.play_start_ms, 4_000);
+        assert_eq!(
+            child_state(pid_a),
+            ChildState::Gone,
+            "the cap reaped the oldest before the seek continued"
+        );
+        assert_eq!(child_state(pid_b), ChildState::Running);
+        assert_eq!(child_state(pid_producer), ChildState::Running);
+
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
+    }
+
+    /// A reaped run's already-produced bytes stay readable through the map.
+    ///
+    /// The cap ingests the oldest run's index before it terminates the process,
+    /// so the segments it wrote are still session-owned and servable. This
+    /// asserts the bytes, not the bookkeeping: a reap that dropped the map with
+    /// the process would 404 here.
+    #[cfg(unix)]
+    #[test]
+    fn bytes_from_a_reaped_run_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg =
+            HlsSessionRegistry::with_cap(dir.path().join("hls"), 3, "libx264", None, None).unwrap();
+        let session_dir = dir.path().join("hls").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // run_0 produced one segment at 0 and one at 2_000. It is the oldest
+        // retained, so the cap reaps it.
+        write_producer_run(&session_dir, 0, 0, &[0, 2_000]);
+        let mut session = make_test_session(&session_dir);
+        session.duration_ms = 60_000;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 0;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(spawn_stand_in_encoder());
+        let oldest_pid = session
+            .encoder_state(SINGLE_VIDEO_RUNG)
+            .child
+            .as_ref()
+            .unwrap()
+            .id();
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
+        assert_eq!(child_state(oldest_pid), ChildState::Running);
+
+        // A newer retained run fills the cap; the next supersession reaps run_0.
+        let (held, pid_held) = retained_encoder(1);
+        session
+            .encoder_state_mut(SINGLE_VIDEO_RUNG)
+            .superseded
+            .push(held);
+        let producer = spawn_stand_in_encoder();
+        let pid_producer = producer.id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 3;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(producer);
+
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
+        assert_eq!(
+            child_state(oldest_pid),
+            ChildState::Gone,
+            "the oldest retained run was reaped"
+        );
+        assert_eq!(child_state(pid_held), ChildState::Running);
+        assert_eq!(child_state(pid_producer), ChildState::Running);
+        assert!(
+            session.segment_map(SINGLE_VIDEO_RUNG).get(0).is_some(),
+            "the reaped run's index is still in the map"
+        );
+
+        reg.sessions
+            .lock()
+            .unwrap()
+            .insert("s1".to_string(), session);
+
+        let name = crate::hls_segment_map::time_keyed_segment_name(0);
+        let served = reg.asset("s1", &name, None);
+        assert_eq!(
+            served.as_deref().map_err(|e| format!("{e:?}")),
+            Ok(crate::hls_segment_map::fake_sidx_seg(0).as_slice()),
+            "a reaped run's bytes stay servable through the map"
+        );
+
+        assert!(reg.stop("s1"), "cleanup reaps the remaining children");
+    }
+
+    /// Teardown reaps every remaining child after the cap has run.
+    ///
+    /// The cap leaves one oldest run already reaped; the live producer and both
+    /// survivors must not outlive the session.
+    #[cfg(unix)]
+    #[test]
+    fn teardown_after_a_capped_supersession_reaps_every_remaining_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_test_session(dir.path());
+        let (held_a, pid_a) = retained_encoder(1);
+        let (held_b, pid_b) = retained_encoder(2);
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).superseded = vec![held_a, held_b];
+
+        let producer = spawn_stand_in_encoder();
+        let pid_producer = producer.id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).current_run_id = 3;
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(producer);
+
+        supersede_child(&mut session, SINGLE_VIDEO_RUNG);
+        assert_eq!(
+            child_state(pid_a),
+            ChildState::Gone,
+            "the cap reaped the oldest"
+        );
+
+        // What a restart leaves: a new live producer beside the retained set.
+        let new_producer = spawn_stand_in_encoder();
+        let pid_new_producer = new_producer.id();
+        session.encoder_state_mut(SINGLE_VIDEO_RUNG).child = Some(new_producer);
+
+        stop_child(&mut session.encoder_state_mut(SINGLE_VIDEO_RUNG).child);
+        reap_all_superseded(&mut session, SINGLE_VIDEO_RUNG);
+
+        assert_eq!(child_state(pid_new_producer), ChildState::Gone);
+        assert_eq!(child_state(pid_b), ChildState::Gone);
+        assert_eq!(child_state(pid_producer), ChildState::Gone);
+        assert!(
+            session
+                .encoder_state(SINGLE_VIDEO_RUNG)
+                .superseded
+                .is_empty()
+        );
     }
 
     /// Clean server exit reaps every encoder through the registry API — each

@@ -293,6 +293,37 @@ run, and the bench now refuses a run where one would not.
    rather than bursty. **That case is still uncaptured, and it is the one that
    would reopen this.**
 
+   **Amended 2026-09-12 — cap retained encoders at two per session, shared
+   across rungs.** R4 reproduced the missing resource failure on unchanged
+   `54541a5` with generated 300 s faststart MP4 and Matroska sources, real
+   authenticated HTTP requests and real FFmpeg children on Apple Silicon.
+   Alternating uncached seeks at 500 ms peaked at five children for one
+   session. Three authorized mixed sessions peaked at 15 children and about
+   1.39 GiB aggregate child RSS; every seek was still accepted. An independent
+   process sampler had a live one-child control, counted all descendants and
+   observed zero after DELETE teardown. These figures describe that machine
+   and workload, not a universal RSS budget.
+
+   Before a supersession would retain a third encoder, ingest its run index and
+   terminate and reap the oldest retained encoder. It remains counted until
+   exit is confirmed; moving it to detached cleanup does not satisfy the cap.
+   The current producer is never selected, the latest explicit seek still
+   applies, and the five-second reap remains the maximum lifetime below the
+   cap. Produced bytes and init data remain session-owned and readable through
+   the existing map. An unfinished request on the reaped run follows the
+   existing bounded hold/retryable-failure policy; the cap must not fabricate
+   success or turn it into a premature 404.
+
+   The bound is per session rather than a global session or encoder cap. For a
+   single rung it permits at most three live or terminating children: one
+   current and two retained. Every rung and every supersession path contributes
+   to the same retained total. `POST /seek` keeps its existing applied `202`;
+   this amendment does not add rejection, silent queuing or request
+   coalescing. The external workload must confirm a peak no greater than three
+   per single-rung session and nine across three sessions, including termination
+   overlap, while the final seek becomes playable, another viewer progresses
+   and teardown leaves no descendant.
+
 6. **Do not cap concurrent encoding below the live transcode-session count.**
    `slots = N`. Capping saves no work; it selects which session waits. At
    `slots=1` one session waited 19.5 s while another waited 3.3 s; at
