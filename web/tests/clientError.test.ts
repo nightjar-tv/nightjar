@@ -32,9 +32,10 @@ describe('api error message fallback', () => {
 		stubFetch(502, { body: '<html>Bad gateway</html>' });
 		const err = await api.listLibraries().then(
 			() => assert.fail('expected a thrown error'),
-			(e: Error) => e
+			(e: Error & { status?: number }) => e
 		);
 		assert.equal(err.message, 'HTTP 502');
+		assert.equal(err.status, 502);
 	});
 
 	it('keeps the server JSON envelope sentence and code over the fallback', async () => {
@@ -43,18 +44,38 @@ describe('api error message fallback', () => {
 		});
 		const err = await api.listLibraries().then(
 			() => assert.fail('expected a thrown error'),
-			(e: Error & { code?: string }) => e
+			(e: Error & { code?: string; status?: number }) => e
 		);
 		assert.equal(err.message, 'name is required');
 		assert.equal(err.code, 'bad_request');
+		assert.equal(err.status, 422);
+	});
+
+	it('exposes the status so the gate can classify a dead credential', async () => {
+		// The sign-in gate clears the token only on a 401 (sessionGate.ts),
+		// so the 401 and its machine code have to survive the throw.
+		stubFetch(401, {
+			body: JSON.stringify({
+				error: 'session_expired: session has expired',
+				code: 'unauthorized'
+			})
+		});
+		const err = await api.listLibraries().then(
+			() => assert.fail('expected a thrown error'),
+			(e: Error & { code?: string; status?: number }) => e
+		);
+		assert.equal(err.status, 401);
+		assert.equal(err.code, 'unauthorized');
+		assert.equal(err.message, 'session_expired: session has expired');
 	});
 
 	it('keeps a non-empty HTTP/1 reason phrase for a non-JSON error body', async () => {
 		stubFetch(503, { statusText: 'Service Unavailable', body: '<html>down</html>' });
 		const err = await api.listLibraries().then(
 			() => assert.fail('expected a thrown error'),
-			(e: Error) => e
+			(e: Error & { status?: number }) => e
 		);
 		assert.equal(err.message, 'Service Unavailable');
+		assert.equal(err.status, 503);
 	});
 });
