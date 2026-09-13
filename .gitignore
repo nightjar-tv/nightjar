@@ -40,6 +40,9 @@ tmp_safari_cue_check/
 # Script bytecode
 scripts/__pycache__/
 
+# PERF-1C disposable qualification data and results (never ship)
+.perf-1c-run/
+
 # Gate 2 orphan soak live logs (script is tracked; runs are local)
 notes/gate2/
 
