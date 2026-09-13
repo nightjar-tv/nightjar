@@ -151,7 +151,9 @@ jobs:
       - name: Gate 1 smoke (startup, RAM, WAL kill-9, Range)
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
-        run: ./scripts/gate1_ci.sh | tee /tmp/gate1_ci.txt
+        run: |
+          set -o pipefail
+          ./scripts/gate1_ci.sh | tee /tmp/gate1_ci.txt
       - name: Gate 1 scan 10k
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
@@ -159,7 +161,23 @@ jobs:
           # ADR-0004: floor catches half-speed regressions, not runner jitter.
           # ubuntu-latest often sits ~50 files/sec; 40 still fails a true halving.
           PROBE_FLOOR_FPS: "40"
-        run: ./scripts/gate1_scan_10k.sh | tee /tmp/gate1_scan.txt
+        run: |
+          set -o pipefail
+          ./scripts/gate1_scan_10k.sh | tee /tmp/gate1_scan.txt
+      # The two steps above pipe through `tee`, which reports tee's status and
+      # not the producer's unless `pipefail` is set. Each sets it explicitly
+      # because the runner's default shell does not guarantee it. This control
+      # runs the same pipeline form with a producer that must fail, so the form
+      # is proven to propagate a producer failure rather than assumed.
+      - name: Prove the Gate 1 tee pipeline propagates a producer failure
+        env:
+          NIGHTJAR_BIN: ${{ github.workspace }}/nonexistent/nightjar
+        run: |
+          set -o pipefail
+          if ./scripts/gate1_ci.sh | tee /tmp/gate1_pipeline_control.txt; then
+            echo "FAIL: the tee pipeline swallowed a failing producer" >&2
+            exit 1
+          fi
       - name: Benchmark delta (report only)
         env:
           NIGHTJAR_BIN: ${{ github.workspace }}/server/target/release/nightjar
