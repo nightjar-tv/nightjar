@@ -1,4 +1,4 @@
-use crate::authority::WatchingCaller;
+use crate::authority::{WatchingCaller, require_item_visible_for_profile};
 use crate::error::{ApiError, ApiResult, blocking};
 use crate::routes::items::{
     abs_path, account_playback_policy, apply_playback_policy, decide, library_root,
@@ -168,6 +168,11 @@ fn start_blocking(
     profile_id: i64,
     account_id: i64,
 ) -> ApiResult<(StatusCode, Json<TranscodeSessionDto>)> {
+    // A playback session is item-returning in effect and is not exempt
+    // (ADR-0037 item 7). The gate runs first, so a capped profile denied by
+    // certification gets the missing-item 404 before the row is read, before
+    // any probe, and before `hls.start` creates a session or an encoder.
+    require_item_visible_for_profile(&state, profile_id, item_id)?;
     let row = state
         .db
         .get_item(item_id)

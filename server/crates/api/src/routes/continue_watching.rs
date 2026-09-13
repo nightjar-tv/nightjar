@@ -97,10 +97,11 @@ pub async fn list(
 ) -> ApiResult<Json<ContinueWatchingEnvelope>> {
     blocking(move || {
         let profile_id = authorize_profile_ref(&state, &caller, &profile_ref)?;
+        let scope = crate::authority::viewer_scope(&state, &caller)?;
         let limit = parse_limit(&query)?;
         let entries = state
             .db
-            .with_conn(|conn| continue_watching(conn, profile_id, limit))
+            .with_conn(|conn| continue_watching(conn, profile_id, limit, &scope))
             .map_err(ApiError::internal)?;
         Ok(Json(ContinueWatchingEnvelope {
             items: entries.into_iter().map(Into::into).collect(),
@@ -468,6 +469,88 @@ mod tests {
         assert_eq!(items[0]["title"], "Alpha");
         assert_eq!(items[0]["kind"], "movie");
         assert_eq!(items[1]["itemKey"], "tmdb:movie:551");
+    }
+
+    /// The rail is item-returning and is not exempt (ADR-0037 items 5 and 7):
+    /// an over-cap title and an uncertified title are absent, an at-cap title
+    /// stays. The positive control is the `G` title, so a filter that hid
+    /// everything would fail.
+    #[tokio::test]
+    async fn a_capped_profile_rail_hides_over_cap_and_uncertified_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let kid = actor(&state, "kidacct", "member", "kid");
+        let token = token(&state, &kid, true);
+        let library = seed_library(&state, "movies", "/media/movies", "movies");
+        let ids = seed_items(
+            &state,
+            library,
+            &[
+                ("Family.mkv", "Family", "movie", None, None),
+                ("Grown.mkv", "Grown", "movie", None, None),
+                ("Uncertified.mkv", "Uncertified", "movie", None, None),
+            ],
+        );
+        link(&state, ids[0], "tmdb:movie:1");
+        link(&state, ids[1], "tmdb:movie:2");
+        link(&state, ids[2], "tmdb:movie:3");
+        canonical_movie(&state, 1, "Family");
+        canonical_movie(&state, 2, "Grown");
+        canonical_movie(&state, 3, "Uncertified");
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE metadata_canonical SET certifications_json = '{\"US\":\"G\"}'
+                      WHERE provider_id = '1'",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE metadata_canonical SET certifications_json = '{\"US\":\"R\"}'
+                      WHERE provider_id = '2'",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                // Item 3 is left NULL: uncertified.
+                for id in &ids {
+                    conn.execute(
+                        "UPDATE media_items SET metadata_status = 'ready' WHERE id = ?1",
+                        rusqlite::params![id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        state
+            .db
+            .with_conn(|conn| nightjar_db::select_classification_region(conn, "US"))
+            .unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE profiles SET classification_cap = 'little_kid' WHERE id = ?1",
+                    rusqlite::params![kid.profile_id],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        for (key, at) in [
+            ("tmdb:movie:1", "2026-09-12T10:00:00.000Z"),
+            ("tmdb:movie:2", "2026-09-12T09:00:00.000Z"),
+            ("tmdb:movie:3", "2026-09-12T08:00:00.000Z"),
+        ] {
+            watch(&state, kid.profile_id, key, 1_000, 10_000, false, false, at);
+        }
+
+        let (status, body) = rail(&state, &token, &kid.profile_ref, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let items = items(&body);
+        assert_eq!(items.len(), 1, "only the G title survives: {body}");
+        assert_eq!(items[0]["itemKey"], "tmdb:movie:1");
     }
 
     /// A movie at the played threshold drops off the rail (ADR-0035 item 2),

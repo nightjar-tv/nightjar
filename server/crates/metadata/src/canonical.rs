@@ -204,7 +204,29 @@ pub fn persist_mapped_hit(
     meta: &CanonicalMetadata,
 ) -> Result<(), String> {
     raw_payload::persist_hit_with_canonical(conn, provider, raw, |tx| {
-        upsert_canonical(tx, provider, meta)
+        upsert_canonical(tx, provider, meta)?;
+        // ADR-0037 item 8: the board labels are parsed from the same stored
+        // payload, in the same transaction, and written with the policy version
+        // and the payload's byte hash. A malformed payload writes `{}` and its
+        // hash rather than rolling the whole projection back, so the processed
+        // marker always advances with its result.
+        let source_sha256 = nightjar_db::sha256_hex(raw.payload.as_bytes());
+        let certifications = match serde_json::from_str::<Value>(&raw.payload) {
+            Ok(data) => crate::certification_projection::parse_provider_certifications(
+                &nightjar_core::CertificationLadder::shipped(),
+                &raw.entity_kind,
+                &data,
+            ),
+            Err(_) => crate::certification_projection::Certifications::new(),
+        };
+        crate::certification_projection::write_certifications(
+            tx,
+            provider,
+            &raw.entity_kind,
+            &raw.provider_id,
+            &certifications,
+            Some(&source_sha256),
+        )
     })
 }
 
@@ -438,16 +460,58 @@ pub fn reproject_from_payload(
 ) -> Result<CanonicalMetadata, String> {
     let body = raw_payload::get_raw_payload(conn, provider, entity_kind, provider_id)?
         .ok_or_else(|| format!("no payload for {provider}/{entity_kind}/{provider_id}"))?;
-    let data: Value = serde_json::from_str(&body).map_err(|e| format!("payload JSON: {e}"))?;
-    let meta = match entity_kind {
-        "movie" => map_movie_detail(&data).map_err(|e: ResolveError| e.to_string())?,
-        "tv" => map_tv_detail(&data).map_err(|e: ResolveError| e.to_string())?,
-        other => return Err(format!("reproject unsupported entity_kind {other}")),
+    let source_sha256 = nightjar_db::sha256_hex(body.as_bytes());
+    let ladder = nightjar_core::CertificationLadder::shipped();
+    let parsed = serde_json::from_str::<Value>(&body);
+    let mapped = match &parsed {
+        Ok(data) => match entity_kind {
+            "movie" => map_movie_detail(data).map_err(|e: ResolveError| e.to_string()),
+            "tv" => map_tv_detail(data).map_err(|e: ResolveError| e.to_string()),
+            other => Err(format!("reproject unsupported entity_kind {other}")),
+        },
+        Err(e) => Err(format!("payload JSON: {e}")),
+    };
+    let meta = match mapped {
+        Ok(meta) => meta,
+        Err(e) => {
+            // A present payload that cannot be mapped still records its
+            // processed projection (`{}`, current version, its byte hash). The
+            // canonical row is left as it was and the marker does not loop.
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("begin reproject: {e}"))?;
+            crate::certification_projection::write_certifications(
+                &tx,
+                provider,
+                entity_kind,
+                provider_id,
+                &crate::certification_projection::Certifications::new(),
+                Some(&source_sha256),
+            )?;
+            tx.commit().map_err(|e| format!("commit reproject: {e}"))?;
+            return Err(e);
+        }
+    };
+    let certifications = match &parsed {
+        Ok(data) => crate::certification_projection::parse_provider_certifications(
+            &ladder,
+            entity_kind,
+            data,
+        ),
+        Err(_) => crate::certification_projection::Certifications::new(),
     };
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| format!("begin reproject: {e}"))?;
     upsert_canonical(&tx, provider, &meta)?;
+    crate::certification_projection::write_certifications(
+        &tx,
+        provider,
+        entity_kind,
+        provider_id,
+        &certifications,
+        Some(&source_sha256),
+    )?;
     tx.commit().map_err(|e| format!("commit reproject: {e}"))?;
     Ok(meta)
 }

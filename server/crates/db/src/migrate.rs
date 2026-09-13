@@ -87,6 +87,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
         29,
         include_str!("../migrations/029_account_playback_policy.sql"),
     ),
+    (30, include_str!("../migrations/030_kids_scope.sql")),
+    (
+        31,
+        include_str!("../migrations/031_certification_processing.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -473,7 +478,38 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 29);
+        assert_eq!(v, 31);
+        // 031 (ADR-0037 item 8, Astra correction): the processed-state marker
+        // exists. The version is NOT NULL with a 0 default, so an upgraded row
+        // reads "unprocessed" rather than NULL; the hash is nullable because a
+        // no-payload row legitimately keeps NULL.
+        let projection_version_not_null: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('metadata_canonical')
+                  WHERE name = 'certifications_projection_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(projection_version_not_null, 1);
+        let projection_version_default: Option<String> = conn
+            .query_row(
+                "SELECT dflt_value FROM pragma_table_info('metadata_canonical')
+                  WHERE name = 'certifications_projection_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(projection_version_default.as_deref(), Some("0"));
+        let source_sha256_not_null: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('metadata_canonical')
+                  WHERE name = 'certifications_source_sha256'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_sha256_not_null, 0, "the hash column is nullable");
         // 026 (ADR-0035 item 1): the table, its primary key and the recent
         // index exist, and the two boolean columns reject a value outside 0/1.
         let has_watch_state: i64 = conn
@@ -740,6 +776,37 @@ mod tests {
             .query_row("SELECT content_id FROM media_items", [], |r| r.get(0))
             .unwrap();
         assert_eq!(content_id, None);
+        // 031 upgrade: a populated database reaches the two new columns, and
+        // the existing canonical row reads version 0 (unprocessed) with a NULL
+        // hash, so the back-fill selects it.
+        conn.execute_batch(
+            "INSERT INTO metadata_canonical
+                 (provider, entity_kind, provider_id, title, ids_json, projected_at)
+             VALUES ('tmdb', 'movie', '550', 'A', '{}', 'now');",
+        )
+        .unwrap();
+        let (upgraded_version, upgraded_hash): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT certifications_projection_version, certifications_source_sha256
+                   FROM metadata_canonical",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(upgraded_version, 0, "an upgraded row is unprocessed");
+        assert_eq!(upgraded_hash, None);
+        // Repeat safety: a second migrate is a no-op and leaves the columns.
+        migrate(&conn).unwrap();
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('metadata_canonical')
+                  WHERE name IN ('certifications_projection_version',
+                                 'certifications_source_sha256')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_there, 2);
     }
 
     #[test]
@@ -2287,7 +2354,11 @@ mod tests {
              DROP TABLE profiles;
              ALTER TABLE profiles_rewind RENAME TO profiles;
              CREATE INDEX idx_profiles_account ON profiles(account_id);
-             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29);",
+             DROP TABLE IF EXISTS server_settings;
+             ALTER TABLE metadata_canonical DROP COLUMN certifications_source_sha256;
+             ALTER TABLE metadata_canonical DROP COLUMN certifications_projection_version;
+             ALTER TABLE metadata_canonical DROP COLUMN certifications_json;
+             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31);",
         )
         .unwrap();
     }

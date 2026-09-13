@@ -217,9 +217,11 @@ pub struct PlaybackInfoDto {
 
 pub async fn get(
     State(state): State<AppState>,
+    caller: crate::authority::Caller,
     Path(item_id): Path<i64>,
 ) -> ApiResult<Json<MediaItemDetailDto>> {
     blocking(move || {
+        crate::authority::require_item_visible(&state, &caller, item_id)?;
         let row = state
             .db
             .get_item(item_id)
@@ -389,6 +391,7 @@ pub async fn playback_info(
     // Every step below blocks: two DB reads, and `subtitle_tracks_for` /
     // `audio_tracks_for` each wait on an ffprobe child reading over SMB.
     blocking(move || {
+        crate::authority::require_item_visible(&state, &caller, item_id)?;
         playback_info_blocking(
             state,
             item_id,
@@ -539,6 +542,7 @@ fn playback_info_blocking(
 
 pub async fn subtitle_vtt(
     State(state): State<AppState>,
+    caller: Caller,
     Path((item_id, asset)): Path<(i64, String)>,
 ) -> ApiResult<Response> {
     let track_id = asset
@@ -548,6 +552,7 @@ pub async fn subtitle_vtt(
         .to_string();
     // The DB read and the subs-store lookups block; the body read does not.
     let (path, cache) = blocking(move || {
+        crate::authority::require_item_visible(&state, &caller, item_id)?;
         let row = state
             .db
             .get_item(item_id)
@@ -1142,5 +1147,285 @@ mod policy_composition_router_tests {
         .await;
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
         assert!(body.contains("does not need a session"), "{body}");
+    }
+}
+
+/// Direct item, byte, and session-creation routes behind the kids filter
+/// (ADR-0037 item 7). A denied item answers the same 404 a missing one does,
+/// so the response cannot be used to probe for titles a profile may not see.
+#[cfg(test)]
+mod kids_scope_router_tests {
+    use crate::routes::router;
+    use crate::state::{AppState, test_support};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use nightjar_auth::mint_session_token;
+    use nightjar_db::{NewLibrary, UpsertItem};
+    use tower::ServiceExt;
+
+    /// One account with one capped, profile-scoped session. The region is
+    /// selected first because a cap cannot be set without one.
+    fn capped_token(state: &AppState, cap: &str) -> String {
+        let minted = mint_session_token();
+        state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                let (account_id, profile_id) = nightjar_db::create_account_with_profile(
+                    conn, "kid", &hash, "member", "P", "kidref",
+                )?;
+                nightjar_db::select_classification_region(conn, "US")?;
+                conn.execute(
+                    "UPDATE profiles SET classification_cap = ?1 WHERE id = ?2",
+                    rusqlite::params![cap, profile_id],
+                )
+                .map_err(|e| e.to_string())?;
+                let expires = nightjar_db::session_expiry(conn)?;
+                let session = nightjar_db::create_session(
+                    conn,
+                    account_id,
+                    &minted.sha256_hex,
+                    "t",
+                    &expires,
+                )?;
+                nightjar_db::set_active_profile(conn, session, Some(profile_id))?;
+                Ok(())
+            })
+            .unwrap();
+        minted.plaintext
+    }
+
+    /// A library with one direct-play movie. `certification` is written to the
+    /// canonical row when given; the item is `ready` either way.
+    fn seed_movie(
+        state: &AppState,
+        dir: &std::path::Path,
+        library_id: i64,
+        provider_id: &str,
+        certification: Option<&str>,
+    ) -> i64 {
+        let item_id = state
+            .db
+            .upsert_items_indexed(
+                library_id,
+                &[UpsertItem {
+                    path: format!("{provider_id}.mp4"),
+                    mtime_ms: 0,
+                    size_bytes: 1,
+                    title: format!("movie {provider_id}"),
+                    kind: "movie".to_string(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap()[0];
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO media_item_links (media_item_id, item_key, manually_matched)
+                     VALUES (?1, ?2, 0)",
+                    rusqlite::params![item_id, format!("tmdb:movie:{provider_id}")],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO metadata_canonical
+                        (provider, entity_kind, provider_id, title, ids_json, projected_at,
+                         certifications_json)
+                     VALUES ('tmdb', 'movie', ?1, 'M', '{}', 'now', ?2)",
+                    rusqlite::params![provider_id, certification],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE media_items SET metadata_status = 'ready' WHERE id = ?1",
+                    rusqlite::params![item_id],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(dir.join(format!("{provider_id}.mp4")), b"bytes to serve").unwrap();
+        item_id
+    }
+
+    async fn call(state: &AppState, uri: &str, token: &str) -> StatusCode {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Start a playback session for `item_id` through the real router, and
+    /// return the status and error body.
+    async fn start_session(state: &AppState, item_id: i64, token: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v0/items/{item_id}/sessions"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    /// The `error` sentence an `ApiError` body carries.
+    fn error_message(body: &str) -> &str {
+        let at = body
+            .find("\"error\":\"")
+            .unwrap_or_else(|| panic!("no error field in {body}"))
+            + "\"error\":\"".len();
+        let end = body[at..].find('"').unwrap() + at;
+        &body[at..end]
+    }
+
+    #[tokio::test]
+    async fn direct_item_and_bytes_deny_over_cap_and_uncertified() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let token = capped_token(&state, "little_kid");
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "movies".to_string(),
+                path: dir.path().to_string_lossy().into_owned(),
+                kind: "movies".to_string(),
+            })
+            .unwrap()
+            .id;
+        let in_cap = seed_movie(&state, dir.path(), library, "1", Some("{\"US\":\"G\"}"));
+        let over_cap = seed_movie(&state, dir.path(), library, "2", Some("{\"US\":\"R\"}"));
+        let uncertified = seed_movie(&state, dir.path(), library, "3", None);
+
+        // Positive control: the at-cap title is served.
+        assert_eq!(
+            call(&state, &format!("/api/v0/items/{in_cap}"), &token).await,
+            StatusCode::OK
+        );
+        // Over-cap and uncertified deny on the detail route...
+        assert_eq!(
+            call(&state, &format!("/api/v0/items/{over_cap}"), &token).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(&state, &format!("/api/v0/items/{uncertified}"), &token).await,
+            StatusCode::NOT_FOUND
+        );
+        // ...and on the bytes route, before any file is opened.
+        assert_eq!(
+            call(&state, &format!("/api/v0/items/{over_cap}/stream"), &token).await,
+            StatusCode::NOT_FOUND
+        );
+        // The at-cap title clears the visibility gate, so the bytes route
+        // reaches its own method decision (415 here: the fixture is not
+        // probed). It is not the 404 a denied item gets.
+        assert_ne!(
+            call(&state, &format!("/api/v0/items/{in_cap}/stream"), &token).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// An account-scope session is unrestricted (ADR-0037 item 7), so the same
+    /// over-cap item is served. Without this the filter could be hiding
+    /// everything and the test above would still pass.
+    #[tokio::test]
+    async fn account_scope_is_unrestricted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "movies".to_string(),
+                path: dir.path().to_string_lossy().into_owned(),
+                kind: "movies".to_string(),
+            })
+            .unwrap()
+            .id;
+        let over_cap = seed_movie(&state, dir.path(), library, "9", Some("{\"US\":\"R\"}"));
+        let token = {
+            let minted = mint_session_token();
+            state
+                .db
+                .with_conn(|conn| {
+                    let hash =
+                        nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                    let (account_id, _) = nightjar_db::create_account_with_profile(
+                        conn, "adult", &hash, "owner", "P", "ownerref",
+                    )?;
+                    let expires = nightjar_db::session_expiry(conn)?;
+                    nightjar_db::create_session(
+                        conn,
+                        account_id,
+                        &minted.sha256_hex,
+                        "t",
+                        &expires,
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            minted.plaintext
+        };
+        assert_eq!(
+            call(&state, &format!("/api/v0/items/{over_cap}"), &token).await,
+            StatusCode::OK
+        );
+    }
+
+    /// Session creation is item-returning in effect and is not exempt
+    /// (ADR-0037 item 7).
+    ///
+    /// The negative uses a known, over-cap item that is not probed. Without the
+    /// gate the handler reaches its readiness check and answers 415; with the
+    /// gate the answer is the missing-item 404, which the handler returns before
+    /// it reads the row, probes a track, or calls `hls.start`, so no session and
+    /// no encoder is created. The at-cap item is the positive control: it clears
+    /// the gate and reaches that readiness check.
+    #[tokio::test]
+    async fn session_start_denies_over_cap_and_uncertified() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let token = capped_token(&state, "little_kid");
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "movies".to_string(),
+                path: dir.path().to_string_lossy().into_owned(),
+                kind: "movies".to_string(),
+            })
+            .unwrap()
+            .id;
+        let in_cap = seed_movie(&state, dir.path(), library, "1", Some("{\"US\":\"G\"}"));
+        let over_cap = seed_movie(&state, dir.path(), library, "2", Some("{\"US\":\"R\"}"));
+        let uncertified = seed_movie(&state, dir.path(), library, "3", None);
+
+        // Positive control: the at-cap title clears the visibility gate, so
+        // the handler answers its own readiness refusal (415: not probed), not
+        // the gate's 404.
+        let (status, body) = start_session(&state, in_cap, &token).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+
+        // Over-cap and uncertified get the same 404 a missing item gets.
+        for denied in [over_cap, uncertified] {
+            let (status, body) = start_session(&state, denied, &token).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(
+                error_message(&body),
+                format!("item {denied} not found"),
+                "{body}"
+            );
+        }
     }
 }

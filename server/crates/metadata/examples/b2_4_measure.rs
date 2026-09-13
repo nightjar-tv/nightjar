@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use nightjar_core::ViewerScope;
 use nightjar_metadata::continue_watching;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -65,7 +66,7 @@ fn main() {
         .ok();
 
     let start = Instant::now();
-    let first = match continue_watching(&conn, profile_id, limit) {
+    let first = match continue_watching(&conn, profile_id, limit, &ViewerScope::Account) {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("continue_watching failed: {e}");
@@ -79,7 +80,7 @@ fn main() {
     let mut warm_durations_us = Vec::with_capacity(WARM_RUNS);
     for _ in 0..WARM_RUNS {
         let start = Instant::now();
-        match continue_watching(&conn, profile_id, limit) {
+        match continue_watching(&conn, profile_id, limit, &ViewerScope::Account) {
             Ok(entries) => {
                 warm_durations_us.push(start.elapsed().as_micros() as u64);
                 if entries.len() != output_count {

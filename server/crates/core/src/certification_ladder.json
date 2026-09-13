@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "source": "TMDB board labels, curated by hand 2026-09-13 for B2-6. One rung per raw label; the array order is the ladder and the tier is the named cap (ADR-0037 items 3 and 4).",
+  "regions": {
+    "US": [
+      { "label": "TV-Y", "tier": "little_kid" },
+      { "label": "TV-Y7", "tier": "little_kid" },
+      { "label": "TV-G", "tier": "little_kid" },
+      { "label": "G", "tier": "little_kid" },
+      { "label": "PG", "tier": "little_kid" },
+      { "label": "TV-PG", "tier": "big_kid" },
+      { "label": "PG-13", "tier": "teen" },
+      { "label": "TV-14", "tier": "teen" },
+      { "label": "R", "tier": "adult" },
+      { "label": "NC-17", "tier": "adult" },
+      { "label": "TV-MA", "tier": "adult" }
+    ],
+    "AU": [
+      { "label": "G", "tier": "little_kid" },
+      { "label": "PG", "tier": "little_kid" },
+      { "label": "M", "tier": "big_kid" },
+      { "label": "MA 15+", "tier": "teen" },
+      { "label": "R 18+", "tier": "adult" },
+      { "label": "X 18+", "tier": "adult" }
+    ],
+    "DE": [
+      { "label": "0", "tier": "little_kid" },
+      { "label": "6", "tier": "little_kid" },
+      { "label": "12", "tier": "big_kid" },
+      { "label": "16", "tier": "teen" },
+      { "label": "18", "tier": "adult" }
+    ],
+    "BR": [
+      { "label": "L", "tier": "little_kid" },
+      { "label": "10", "tier": "little_kid" },
+      { "label": "12", "tier": "big_kid" },
+      { "label": "14", "tier": "teen" },
+      { "label": "16", "tier": "teen" },
+      { "label": "18", "tier": "adult" }
+    ],
+    "GB": [
+      { "label": "U", "tier": "little_kid" },
+      { "label": "PG", "tier": "little_kid" },
+      { "label": "12", "tier": "big_kid" },
+      { "label": "12A", "tier": "big_kid" },
+      { "label": "15", "tier": "teen" },
+      { "label": "18", "tier": "adult" },
+      { "label": "R18", "tier": "adult" }
+    ]
+  }
+}

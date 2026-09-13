@@ -105,11 +105,13 @@ pub struct SeriesQuery {
 
 pub async fn list_units(
     State(state): State<AppState>,
+    caller: crate::authority::Caller,
     Path(library_id): Path<i64>,
 ) -> ApiResult<Json<LibraryUnitsDto>> {
     // A whole-library read, the same shape as `list_items` and behind the same
     // store mutex.
     blocking(move || {
+        let scope = crate::authority::viewer_scope(&state, &caller)?;
         let library = state
             .db
             .get_library(library_id)
@@ -117,7 +119,7 @@ pub async fn list_units(
             .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
         let listed = state
             .db
-            .with_conn(|c| list_library_units(c, library_id))
+            .with_conn(|c| list_library_units(c, library_id, &scope))
             .map_err(ApiError::internal)?;
         Ok(Json(units_to_dto(library_id, library.kind, listed)))
     })
@@ -126,15 +128,17 @@ pub async fn list_units(
 
 pub async fn get(
     State(state): State<AppState>,
+    caller: crate::authority::Caller,
     Query(query): Query<SeriesQuery>,
 ) -> ApiResult<Json<SeriesDetailDto>> {
     blocking(move || {
         if query.series_key.trim().is_empty() {
             return Err(ApiError::bad_request("seriesKey is required"));
         }
+        let scope = crate::authority::viewer_scope(&state, &caller)?;
         let detail = state
             .db
-            .with_conn(|c| get_series(c, &query.series_key))
+            .with_conn(|c| get_series(c, &query.series_key, &scope))
             .map_err(ApiError::bad_request)?
             .ok_or_else(|| {
                 ApiError::not_found(format!("no series under key {}", query.series_key))

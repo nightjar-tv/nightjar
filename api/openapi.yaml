@@ -2694,6 +2694,13 @@ components:
         clientLabel:
           type: string
           description: Names this device in the session list. Defaults to a generic label.
+        classificationRegion:
+          type: string
+          description: >
+            ADR-0037 item 2. The server's one classification board, an
+            uppercase ISO 3166-1 region code. Selected once here and locked
+            afterwards; no route changes it. A profile cannot carry a
+            classification cap until a region is selected.
 
     LoginRequest:
       type: object
@@ -2783,7 +2790,10 @@ components:
         classificationCap:
           type: string
           nullable: true
-          description: Null is uncapped. What a cap means is B2-D's decision.
+          description: >
+            Null is uncapped. Otherwise one of the four named tiers from
+            ADR-0037 item 4: `little_kid`, `big_kid`, `teen`, or `adult`. Any
+            other value is refused with the typed 400.
         simpleInterface: { type: boolean }
         preferredLanguage:
           type: string

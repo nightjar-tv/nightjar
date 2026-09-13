@@ -6,6 +6,7 @@
 mod artwork;
 mod browse;
 mod canonical;
+mod certification_projection;
 mod clean;
 mod continue_watching;
 mod fix;
@@ -21,6 +22,7 @@ mod queue;
 mod rate_limit;
 mod raw_payload;
 mod resolve;
+mod scope;
 mod series_bindings;
 mod tmdb;
 mod track_choice;
@@ -41,6 +43,11 @@ pub use browse::{
 pub use canonical::{
     canonical_from_search_hit, get_canonical, merge_prefer_left, persist_mapped_hit,
     persist_season_projection, reproject_from_payload, upsert_canonical,
+};
+pub use certification_projection::{
+    CERTIFICATION_PROJECTION_VERSION, CertificationBackfillStats, Certifications,
+    backfill_certifications, count_unknown_regions, needs_reprojection,
+    parse_provider_certifications, write_certifications,
 };
 pub use clean::{
     after_token_episode_title, clean_movie_title, clean_show_title, episode_title_rejected,
@@ -96,6 +103,10 @@ pub use raw_payload::{
 pub use resolve::{
     MetadataOrigin, MetadataSource, NfoSource, ProviderResult, ResolveError, ResolveInput,
     ResolveOutcome, Resolver, UnresolvedReason, resolve,
+};
+pub use scope::{
+    SCOPE_BATCH, VisibilityCache, artwork_key_is_visible, item_is_visible, visible_item_ids,
+    visible_item_ids_cached,
 };
 pub use tmdb::{
     CredError, RawProviderPayload, TmdbClient, TmdbCredentials, TmdbKeySource, TmdbResolve,

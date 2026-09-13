@@ -27,6 +27,8 @@ use crate::item_links::{
     effective_item_keys_for_library, parse_path_key, series_key_for_show_folder,
 };
 use crate::model::ArtworkKind;
+use crate::scope::{VisibilityCache, visible_item_ids_cached};
+use nightjar_core::ViewerScope;
 
 // Test-only count of library reads, so a regression test can prove a request
 // reads each library once rather than once per series. Thread-local keeps
@@ -196,13 +198,20 @@ struct ShowMeta {
     has_poster: bool,
 }
 
-pub fn list_library_units(conn: &Connection, library_id: i64) -> Result<LibraryUnits, String> {
+pub fn list_library_units(
+    conn: &Connection,
+    library_id: i64,
+    scope: &ViewerScope,
+) -> Result<LibraryUnits, String> {
     let library =
         library(conn, library_id)?.ok_or_else(|| format!("library {library_id} not found"))?;
+    // One cache for the whole request, so the listing pays the visibility batch
+    // once even though it is built from several reads.
+    let mut visibility = VisibilityCache::new();
     if library.kind == "movies" {
-        movie_units(conn, &library)
+        movie_units(conn, &library, scope, &mut visibility)
     } else {
-        series_units(conn, &library)
+        series_units(conn, &library, scope, &mut visibility)
     }
 }
 
@@ -234,7 +243,12 @@ impl UnitTally {
     }
 }
 
-fn movie_units(conn: &Connection, library: &Library) -> Result<LibraryUnits, String> {
+fn movie_units(
+    conn: &Connection,
+    library: &Library,
+    scope: &ViewerScope,
+    visibility: &mut VisibilityCache,
+) -> Result<LibraryUnits, String> {
     let keys = effective_item_keys_for_library(conn, library.id)?;
     let movies = movie_canonical(conn)?;
 
@@ -250,11 +264,19 @@ fn movie_units(conn: &Connection, library: &Library) -> Result<LibraryUnits, Str
             ))
         })
         .map_err(|e| format!("query movie units: {e}"))?;
+    let mut rows_vec = Vec::new();
+    for row in rows {
+        rows_vec.push(row.map_err(|e| format!("movie unit row: {e}"))?);
+    }
+    let ids: Vec<i64> = rows_vec.iter().map(|(id, _, _)| *id).collect();
+    let visible = visible_item_ids_cached(conn, scope, &ids, visibility)?;
 
     let mut tallies: BTreeMap<String, UnitTally> = BTreeMap::new();
     let mut items = 0i64;
-    for row in rows {
-        let (id, title, year) = row.map_err(|e| format!("movie unit row: {e}"))?;
+    for (id, title, year) in rows_vec {
+        if !visible.contains(&id) {
+            continue;
+        }
         // A movie's series key is its own item_key (ADR-0039 item 2), so the
         // two never disagree and there is no second grammar for the one kind
         // where a series is a single file.
@@ -307,10 +329,21 @@ fn movie_units(conn: &Connection, library: &Library) -> Result<LibraryUnits, Str
     })
 }
 
-fn series_units(conn: &Connection, library: &Library) -> Result<LibraryUnits, String> {
+fn series_units(
+    conn: &Connection,
+    library: &Library,
+    scope: &ViewerScope,
+    visibility: &mut VisibilityCache,
+) -> Result<LibraryUnits, String> {
     let bindings = series_bindings(conn, library.id)?;
     let shows = show_canonical(conn)?;
     let items = library_items(conn, library.id)?;
+    let ids: Vec<i64> = items.iter().map(|item| item.id).collect();
+    let visible = visible_item_ids_cached(conn, scope, &ids, visibility)?;
+    let items: Vec<ItemRow> = items
+        .into_iter()
+        .filter(|item| visible.contains(&item.id))
+        .collect();
 
     let mut tallies: BTreeMap<String, UnitTally> = BTreeMap::new();
     for item in &items {
@@ -492,32 +525,46 @@ fn library_view(conn: &Connection, library_id: i64) -> Result<Option<Rc<LibraryV
 /// series of one (ADR-0039 item 2) and its several files are the only way a
 /// caller can reach past the listing's single merged unit. `Ok(None)` means
 /// nothing resolves under the key.
-pub fn get_series(conn: &Connection, series_key: &str) -> Result<Option<SeriesDetail>, String> {
+pub fn get_series(
+    conn: &Connection,
+    series_key: &str,
+    scope: &ViewerScope,
+) -> Result<Option<SeriesDetail>, String> {
     let mut cache = SeriesCache::new();
-    get_series_cached(conn, series_key, &mut cache)
+    let mut visibility = VisibilityCache::new();
+    get_series_cached(conn, series_key, &mut cache, &mut visibility, scope)
 }
 
-/// [`get_series`] with a caller-owned request cache, so a caller that resolves
-/// many series reads each library once instead of once per series.
+/// [`get_series`] with caller-owned request caches, so a caller that resolves
+/// many series reads each library once instead of once per series and reuses
+/// the same visibility facts. The `VisibilityCache` is the one request-local
+/// cache ADR-0037 item 7's filter reads through; passing it here is what keeps
+/// a rail request from paying the same batch twice.
 pub fn get_series_cached(
     conn: &Connection,
     series_key: &str,
     cache: &mut SeriesCache,
+    visibility: &mut VisibilityCache,
+    scope: &ViewerScope,
 ) -> Result<Option<SeriesDetail>, String> {
     match resolve_series_key(conn, series_key)? {
         SeriesScope::Folders { folders, entity } => {
-            show_detail(conn, cache, series_key, folders, entity)
+            show_detail(conn, cache, visibility, series_key, folders, entity, scope)
         }
-        SeriesScope::Movie { libraries } => movie_detail(conn, cache, series_key, libraries),
+        SeriesScope::Movie { libraries } => {
+            movie_detail(conn, cache, visibility, series_key, libraries, scope)
+        }
     }
 }
 
 fn show_detail(
     conn: &Connection,
     cache: &mut SeriesCache,
+    visibility: &mut VisibilityCache,
     series_key: &str,
     folders: Vec<(i64, String)>,
     bound_entity: Option<i64>,
+    scope: &ViewerScope,
 ) -> Result<Option<SeriesDetail>, String> {
     if folders.is_empty() {
         return Ok(None);
@@ -588,6 +635,14 @@ fn show_detail(
     if episodes.is_empty() {
         return Ok(None);
     }
+    // One filter, at the query layer: an episode outside the viewer's scope is
+    // not in the response at all (ADR-0037 item 7).
+    let episode_ids: Vec<i64> = episodes.iter().map(|e| e.item_id).collect();
+    let visible = visible_item_ids_cached(conn, scope, &episode_ids, visibility)?;
+    episodes.retain(|episode| visible.contains(&episode.item_id));
+    if episodes.is_empty() {
+        return Ok(None);
+    }
 
     let identity = match (bound_entity, entity) {
         (Some(_), _) => UnitIdentity::Bound,
@@ -622,8 +677,10 @@ fn show_detail(
 fn movie_detail(
     conn: &Connection,
     cache: &mut SeriesCache,
+    visibility: &mut VisibilityCache,
     series_key: &str,
     libraries: Vec<i64>,
+    scope: &ViewerScope,
 ) -> Result<Option<SeriesDetail>, String> {
     let mut files = Vec::new();
     let mut fallback_title = String::new();
@@ -643,6 +700,12 @@ fn movie_detail(
         }
     }
 
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let file_ids: Vec<i64> = files.iter().map(|f| f.item_id).collect();
+    let visible = visible_item_ids_cached(conn, scope, &file_ids, visibility)?;
+    files.retain(|file| visible.contains(&file.item_id));
     if files.is_empty() {
         return Ok(None);
     }
@@ -1148,11 +1211,48 @@ mod tests {
             .unwrap_or_else(|| panic!("no unit titled {title}"))
     }
 
+    /// The listing and the series detail both run the one scope filter
+    /// (ADR-0037 item 7). Account scope is the positive control: a filter that
+    /// hid everything would fail the second half.
+    #[test]
+    fn a_capped_scope_hides_a_series_and_its_episodes() {
+        use nightjar_core::CertificationTier;
+        let c = shows_library();
+        c.execute(
+            "UPDATE metadata_canonical SET certifications_json = '{\"US\":\"TV-MA\"}'
+              WHERE provider_id = '615'",
+            [],
+        )
+        .unwrap();
+        let scope = ViewerScope::Profile {
+            cap: CertificationTier::LittleKid,
+            region: "US".into(),
+        };
+        let listed = list_library_units(&c, 2, &scope).unwrap();
+        // Every series in this fixture is either over cap or uncertified, so
+        // none survives; the assertion is the absence, not a count.
+        assert!(
+            listed.units.iter().all(|u| u.title != "Futurama"),
+            "the TV-MA series is over a little-kid cap"
+        );
+        assert!(listed.units.is_empty(), "{:?}", listed.units);
+        assert!(get_series(&c, "tmdb:show:615", &scope).unwrap().is_none());
+
+        // Account scope sees the same library in full.
+        let all = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
+        assert!(all.units.iter().any(|u| u.title == "Futurama"));
+        assert!(
+            get_series(&c, "tmdb:show:615", &ViewerScope::Account)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// One unit per show folder, not one per episode.
     #[test]
     fn shows_collapse_to_folders() {
         let c = shows_library();
-        let listed = list_library_units(&c, 2).unwrap();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
         assert_unit_keys_unique(&listed);
         assert_eq!(listed.unit_kind, UnitKind::Series);
         assert_eq!(listed.units.len(), 4, "four folders, nine episode files");
@@ -1171,7 +1271,7 @@ mod tests {
     #[test]
     fn every_item_is_covered_by_a_unit() {
         let c = shows_library();
-        let listed = list_library_units(&c, 2).unwrap();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
         let items: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM media_items WHERE library_id = 2",
@@ -1192,7 +1292,7 @@ mod tests {
     #[test]
     fn identity_states_are_counted() {
         let c = shows_library();
-        let listed = list_library_units(&c, 2).unwrap();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
         // Distinct shows, not `series` rows: two folders bound to one show are
         // one unit (ADR-0039 item 8). On the dogfood library that is the
         // difference between 722 rows and 720 units.
@@ -1219,7 +1319,7 @@ mod tests {
     #[test]
     fn entity_only_folder_keeps_its_show_metadata() {
         let c = shows_library();
-        let listed = list_library_units(&c, 2).unwrap();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
         let known = unit(&listed.units, "Known Show");
         assert_eq!(known.identity, UnitIdentity::EntityOnly);
         assert_eq!(known.series_key, "folder:2:Known Show");
@@ -1238,7 +1338,7 @@ mod tests {
     #[test]
     fn unidentified_folder_falls_back_to_its_name() {
         let c = shows_library();
-        let listed = list_library_units(&c, 2).unwrap();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
         let mystery = unit(&listed.units, "Mystery Folder");
         assert_eq!(mystery.identity, UnitIdentity::Unidentified);
         assert_eq!(mystery.series_key, "folder:2:Mystery Folder");
@@ -1250,7 +1350,9 @@ mod tests {
     #[test]
     fn episodes_order_by_canonical_numbers() {
         let c = shows_library();
-        let series = get_series(&c, "tmdb:show:615").unwrap().unwrap();
+        let series = get_series(&c, "tmdb:show:615", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(series.title, "Futurama");
         assert_eq!(series.identity, UnitIdentity::Bound);
 
@@ -1273,7 +1375,9 @@ mod tests {
     #[test]
     fn absolute_numbering_files_land_in_their_canonical_season() {
         let c = shows_library();
-        let series = get_series(&c, "tmdb:show:30984").unwrap().unwrap();
+        let series = get_series(&c, "tmdb:show:30984", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(series.seasons.len(), 1);
         let season = &series.seasons[0];
         assert_eq!(season.season, 2, "canonical season, not the filename's 1");
@@ -1291,7 +1395,9 @@ mod tests {
     #[test]
     fn below_floor_episodes_are_reachable_not_swallowed() {
         let c = shows_library();
-        let series = get_series(&c, "tmdb:show:615").unwrap().unwrap();
+        let series = get_series(&c, "tmdb:show:615", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(series.item_count, 5);
         assert_eq!(series.unnumbered.len(), 1);
         let stray = &series.unnumbered[0];
@@ -1310,7 +1416,9 @@ mod tests {
     #[test]
     fn folder_key_resolves_an_unbound_series() {
         let c = shows_library();
-        let series = get_series(&c, "folder:2:Mystery Folder").unwrap().unwrap();
+        let series = get_series(&c, "folder:2:Mystery Folder", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(series.identity, UnitIdentity::Unidentified);
         assert_eq!(series.title, "Mystery Folder");
         assert_eq!(series.seasons.len(), 0);
@@ -1324,11 +1432,23 @@ mod tests {
     #[test]
     fn unknown_and_malformed_series_keys() {
         let c = shows_library();
-        assert!(get_series(&c, "tmdb:show:1").unwrap().is_none());
-        assert!(get_series(&c, "folder:2:Nothing Here").unwrap().is_none());
-        assert!(get_series(&c, "tmdb:movie:550").unwrap().is_none());
-        assert!(get_series(&c, "folder:notanumber:x").is_err());
-        assert!(get_series(&c, "nonsense").is_err());
+        assert!(
+            get_series(&c, "tmdb:show:1", &ViewerScope::Account)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_series(&c, "folder:2:Nothing Here", &ViewerScope::Account)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_series(&c, "tmdb:movie:550", &ViewerScope::Account)
+                .unwrap()
+                .is_none()
+        );
+        assert!(get_series(&c, "folder:notanumber:x", &ViewerScope::Account).is_err());
+        assert!(get_series(&c, "nonsense", &ViewerScope::Account).is_err());
     }
 
     /// ADR-0039 item 8: several folders bound to one show are one unit, and a
@@ -1348,7 +1468,7 @@ mod tests {
         )
         .unwrap();
 
-        let listed = list_library_units(&c, 2).unwrap();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
         assert_unit_keys_unique(&listed);
         // Three `series` rows for show 615, one unit.
         assert_eq!(listed.counts.bound, 2, "Futurama and Bleach");
@@ -1361,7 +1481,9 @@ mod tests {
             listed.counts.items
         );
         // The detail is the union over all three folders (ADR-0039 item 8).
-        let series = get_series(&c, "tmdb:show:615").unwrap().unwrap();
+        let series = get_series(&c, "tmdb:show:615", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(series.item_count, 7);
     }
 
@@ -1389,7 +1511,7 @@ mod tests {
         )
         .unwrap();
 
-        let listed = list_library_units(&c, 1).unwrap();
+        let listed = list_library_units(&c, 1, &ViewerScope::Account).unwrap();
         assert_unit_keys_unique(&listed);
         assert_eq!(listed.units.len(), 2, "three files, two films");
         assert_eq!(listed.counts.items, 3, "no file is dropped by the merge");
@@ -1403,7 +1525,9 @@ mod tests {
         assert_eq!(unit(&listed.units, "Solo").item_id, Some(3));
 
         // Both versions are reachable rather than hidden behind the merge.
-        let detail = get_series(&c, "tmdb:movie:550").unwrap().unwrap();
+        let detail = get_series(&c, "tmdb:movie:550", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(detail.kind, UnitKind::Movie);
         assert_eq!(detail.title, "Fight Club");
         assert_eq!(detail.seasons.len(), 0, "a film has no episode numbering");
@@ -1422,7 +1546,9 @@ mod tests {
              VALUES (1, 1, 'Unknown Rip/u.mkv', 1, 1, 'Unknown Rip', 'movie');",
         )
         .unwrap();
-        let detail = get_series(&c, "path:1:Unknown Rip/u.mkv").unwrap().unwrap();
+        let detail = get_series(&c, "path:1:Unknown Rip/u.mkv", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(detail.kind, UnitKind::Movie);
         assert_eq!(detail.identity, UnitIdentity::Unidentified);
         assert_eq!(detail.item_count, 1);
@@ -1447,7 +1573,7 @@ mod tests {
         )
         .unwrap();
 
-        let listed = list_library_units(&c, 1).unwrap();
+        let listed = list_library_units(&c, 1, &ViewerScope::Account).unwrap();
         assert_unit_keys_unique(&listed);
         assert_eq!(listed.unit_kind, UnitKind::Movie);
         assert_eq!(listed.units.len(), 2);
@@ -1483,7 +1609,7 @@ mod tests {
                     (3, 'Season 1/b.mkv', 1, 1, 'b', 'episode');",
         )
         .unwrap();
-        let listed = list_library_units(&c, 3).unwrap();
+        let listed = list_library_units(&c, 3, &ViewerScope::Account).unwrap();
         assert_eq!(listed.units.len(), 1);
         assert_eq!(listed.units[0].series_key, "folder:3:");
         assert_eq!(listed.units[0].title, "One Show");
@@ -1538,7 +1664,9 @@ mod tests {
         )
         .unwrap();
 
-        let detail = get_series(&c, "tmdb:show:4454").unwrap().unwrap();
+        let detail = get_series(&c, "tmdb:show:4454", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         let seasons: Vec<i32> = detail.seasons.iter().map(|s| s.season).collect();
         assert_eq!(
             seasons,
@@ -1563,7 +1691,9 @@ mod tests {
         migrate(&c).unwrap();
         will_and_grace(&c);
 
-        let detail = get_series(&c, "tmdb:show:4454").unwrap().unwrap();
+        let detail = get_series(&c, "tmdb:show:4454", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         let seasons: Vec<i32> = detail.seasons.iter().map(|s| s.season).collect();
         assert_eq!(
             seasons,
@@ -1593,7 +1723,9 @@ mod tests {
         )
         .unwrap();
 
-        let detail = get_series(&c, "tmdb:show:4454").unwrap().unwrap();
+        let detail = get_series(&c, "tmdb:show:4454", &ViewerScope::Account)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             detail.seasons.iter().map(|s| s.season).collect::<Vec<_>>(),
             vec![1, 2]
@@ -1618,7 +1750,7 @@ mod tests {
         )
         .unwrap();
 
-        let listed = list_library_units(&c, 1).unwrap();
+        let listed = list_library_units(&c, 1, &ViewerScope::Account).unwrap();
         assert_unit_keys_unique(&listed);
         assert_eq!(listed.units.len(), 1, "one folder, one unit");
         assert_eq!(listed.units[0].series_key, "tmdb:show:4454");
@@ -1645,8 +1777,12 @@ mod tests {
         .unwrap();
 
         let mut shared = SeriesCache::new();
+        let mut visibility = VisibilityCache::new();
         for key in ["tmdb:show:100", "tmdb:show:200", "tmdb:show:300"] {
-            let detail = get_series_cached(&c, key, &mut shared).unwrap().unwrap();
+            let detail =
+                get_series_cached(&c, key, &mut shared, &mut visibility, &ViewerScope::Account)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(detail.item_count, 1, "{key}");
         }
         assert_eq!(shared.library_views(), 1, "three series, one library read");
@@ -1656,7 +1792,8 @@ mod tests {
         let mut per_call = 0;
         for key in ["tmdb:show:100", "tmdb:show:200", "tmdb:show:300"] {
             let mut fresh = SeriesCache::new();
-            get_series_cached(&c, key, &mut fresh).unwrap();
+            let mut visibility = VisibilityCache::new();
+            get_series_cached(&c, key, &mut fresh, &mut visibility, &ViewerScope::Account).unwrap();
             per_call += fresh.library_views();
         }
         assert_eq!(per_call, 3, "one read per series without the shared cache");

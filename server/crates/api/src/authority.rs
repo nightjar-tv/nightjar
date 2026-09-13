@@ -11,8 +11,9 @@ use axum::http::{Method, request::Parts};
 use axum::middleware::Next;
 use axum::response::Response;
 use nightjar_auth::token_sha256_hex;
-use nightjar_core::Role;
+use nightjar_core::{CertificationTier, Role, ViewerScope};
 use nightjar_db::{ProfileRow, SessionRejection, SessionRow};
+use nightjar_metadata::item_is_visible;
 use nightjar_transcode::SessionOwner;
 
 /// The whole unauthenticated surface of the API (ADR-0034 item 11).
@@ -240,6 +241,97 @@ pub fn authorize_profile_ref(
     match profile.filter(|p| caller.may_address_profile(p)) {
         Some(profile) => Ok(profile.id),
         None => Err(ApiError::forbidden(INSUFFICIENT_ROLE)),
+    }
+}
+
+/// The viewer scope for a route's shared item reads (ADR-0037 item 7).
+///
+/// One constructor, so every item-returning surface resolves the same way. An
+/// account session, and a profile that carries no cap, are unrestricted; a
+/// capped profile carries its tier and the locked server region. A capped
+/// profile with no region selected is a server misconfiguration and fails
+/// closed rather than browsing uncapped.
+pub fn viewer_scope(state: &AppState, caller: &Caller) -> Result<ViewerScope, ApiError> {
+    let Some(profile_id) = caller.session.active_profile_id else {
+        return Ok(ViewerScope::Account);
+    };
+    viewer_scope_for_profile(state, profile_id)
+}
+
+/// The scope for a known profile id. `WatchingCaller` already guarantees
+/// profile scope, so it resolves through this one path (Rule 4.11).
+pub fn viewer_scope_for_profile(
+    state: &AppState,
+    profile_id: i64,
+) -> Result<ViewerScope, ApiError> {
+    let cap = state
+        .db
+        .with_conn(|conn| nightjar_db::profile_by_id(conn, profile_id))
+        .map_err(ApiError::internal)?
+        .and_then(|profile| profile.classification_cap)
+        .map(|cap| {
+            CertificationTier::parse(&cap).ok_or_else(|| {
+                ApiError::internal(format!(
+                    "profile {profile_id} carries an unknown classification cap: {cap}"
+                ))
+            })
+        })
+        .transpose()?;
+    let Some(cap) = cap else {
+        // No cap is unrestricted by design (ADR-0034 item 8, ADR-0037 item 1).
+        return Ok(ViewerScope::Account);
+    };
+    let region = state
+        .db
+        .with_conn(nightjar_db::classification_region)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::internal(
+                "a capped profile exists but no classification region is selected (ADR-0037 item 2)",
+            )
+        })?;
+    Ok(ViewerScope::Profile { cap, region })
+}
+
+/// The direct item/bytes gate. A denied item gets the same 404 a missing one
+/// gets, so the response cannot be used to probe for titles a profile may not
+/// see (ADR-0037 item 5).
+pub fn require_item_visible(
+    state: &AppState,
+    caller: &Caller,
+    item_id: i64,
+) -> Result<(), ApiError> {
+    let scope = viewer_scope(state, caller)?;
+    require_item_visible_in_scope(state, &scope, item_id)
+}
+
+/// The same gate for a watching (profile-scope) caller, which carries the
+/// profile id rather than a whole [`Caller`]. Session creation is item-returning
+/// in effect and is not exempt (ADR-0037 item 7).
+pub fn require_item_visible_for_profile(
+    state: &AppState,
+    profile_id: i64,
+    item_id: i64,
+) -> Result<(), ApiError> {
+    let scope = viewer_scope_for_profile(state, profile_id)?;
+    require_item_visible_in_scope(state, &scope, item_id)
+}
+
+/// The one visibility check, once the scope is resolved. One body, so every
+/// item-returning surface answers a denied item the same way (Rule 4.11).
+fn require_item_visible_in_scope(
+    state: &AppState,
+    scope: &ViewerScope,
+    item_id: i64,
+) -> Result<(), ApiError> {
+    let visible = state
+        .db
+        .with_conn(|conn| item_is_visible(conn, scope, item_id))
+        .map_err(ApiError::internal)?;
+    if visible {
+        Ok(())
+    } else {
+        Err(ApiError::not_found(format!("item {item_id} not found")))
     }
 }
 
@@ -621,6 +713,46 @@ mod tests {
                 "{near_miss} must not be cookie-accepted"
             );
         }
+    }
+
+    /// A pre-B2-6 database can carry a `classification_cap` the tier set does
+    /// not know: the column shipped in migration 020 with no CHECK. The
+    /// upgraded row must fail closed with an internal error, never widen to
+    /// account scope. The test writes the bad value directly, which is the only
+    /// way such a row exists.
+    #[test]
+    fn a_legacy_invalid_cap_fails_closed_instead_of_browsing_unrestricted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        let profile_id = state
+            .db
+            .with_conn(|conn| {
+                let hash = nightjar_auth::hash_password("x").map_err(|e| format!("hash: {e:?}"))?;
+                let (_, profile_id) = nightjar_db::create_account_with_profile(
+                    conn,
+                    "legacy",
+                    &hash,
+                    "member",
+                    "P",
+                    "legacyref",
+                )?;
+                conn.execute(
+                    "UPDATE profiles SET classification_cap = 'garbage' WHERE id = ?1",
+                    rusqlite::params![profile_id],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(profile_id)
+            })
+            .unwrap();
+
+        let err = viewer_scope_for_profile(&state, profile_id)
+            .expect_err("an unknown cap must not resolve to a scope");
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.message.contains("garbage"),
+            "the refusal names the value: {}",
+            err.message
+        );
     }
 }
 

@@ -5,9 +5,10 @@
 
 use nightjar_db::db_path;
 use nightjar_metadata::{
-    ApiRateLimiter, ArtworkKind, ArtworkStore, CanonicalMetadata, DEFAULT_MAX_IN_FLIGHT,
-    DEFAULT_REQUESTS_PER_SEC, DrainOptions, MetadataKind, PosterWarm, Resolver, TmdbClient,
-    drain_pending, resolve_credentials_with, sweep_stale_cleaner_versions,
+    ApiRateLimiter, ArtworkKind, ArtworkStore, CanonicalMetadata, CertificationBackfillStats,
+    DEFAULT_MAX_IN_FLIGHT, DEFAULT_REQUESTS_PER_SEC, DrainOptions, MetadataKind, PROVIDER_TMDB,
+    PosterWarm, Resolver, TmdbClient, backfill_certifications, drain_pending,
+    resolve_credentials_with, sweep_stale_cleaner_versions,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,27 @@ pub fn spawn_metadata_drain(data_dir: PathBuf) {
 
 fn run_loop(data_dir: &Path) {
     let path = db_path(data_dir);
+    // ADR-0037 item 8: project the board labels for canonical movie/tv rows
+    // written before the column existed. Local reads of already-stored
+    // payloads only — no provider call — and bounded batches, so a restart
+    // resumes rather than repeating what it finished.
+    match open_drain_conn(&path) {
+        Ok(conn) => match backfill_all_certifications(&conn) {
+            Ok(stats) if stats.scanned > 0 => tracing::info!(
+                scanned = stats.scanned,
+                updated = stats.updated,
+                no_payload = stats.no_payload,
+                malformed = stats.malformed,
+                unknown_regions = stats.unknown_regions,
+                "certification backfill complete"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "certification backfill failed"),
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "certification backfill open failed")
+        }
+    }
     // Best-effort artwork cache for matched-time poster warm (ADR-0027 §5);
     // a failed store only disables warming, never the drain.
     let artwork_store: Option<Arc<ArtworkStore>> = match ArtworkStore::new(data_dir) {
@@ -217,6 +239,38 @@ fn warm_item_key(meta: &CanonicalMetadata) -> Option<String> {
             .tmdb
             .or(meta.ids.tmdb_show)
             .map(|id| format!("tmdb:show:{id}")),
+    }
+}
+
+/// How many rows one backfill batch projects. A bounded batch keeps startup
+/// work finite on a large library while the loop still reaches every row.
+const CERTIFICATION_BACKFILL_BATCH: i64 = 500;
+
+/// Project board labels for every canonical movie/tv row whose projection is
+/// missing or stale. Restart-safe: the cursor sweeps every movie/tv row and
+/// compares the raw payload hash, so a current row with an unchanged payload is
+/// skipped without a parse or a write. Each batch advances the bounded cursor,
+/// so the loop terminates once it passes the last row. A projection or storage
+/// failure returns before the write commits, so the row keeps its stale state
+/// and is retried on the next run.
+fn backfill_all_certifications(conn: &Connection) -> Result<CertificationBackfillStats, String> {
+    let mut total = CertificationBackfillStats::default();
+    let mut cursor: Option<(String, String)> = None;
+    loop {
+        let after = cursor
+            .as_ref()
+            .map(|(kind, id)| (kind.as_str(), id.as_str()));
+        let (stats, next) =
+            backfill_certifications(conn, PROVIDER_TMDB, after, CERTIFICATION_BACKFILL_BATCH)?;
+        total.scanned += stats.scanned;
+        total.updated += stats.updated;
+        total.no_payload += stats.no_payload;
+        total.malformed += stats.malformed;
+        total.unknown_regions += stats.unknown_regions;
+        if stats.scanned == 0 {
+            return Ok(total);
+        }
+        cursor = next;
     }
 }
 
