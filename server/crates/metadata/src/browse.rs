@@ -17,7 +17,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use nightjar_db::{resolve_media_path, show_folder_relpath};
@@ -46,6 +46,24 @@ pub(crate) fn reset_library_views() {
 #[cfg(test)]
 pub(crate) fn library_views_built() -> usize {
     LIBRARY_VIEWS.with(std::cell::Cell::get)
+}
+
+// Test-only count of bound-entity id loads, so a regression test can prove a
+// listing loads the SQL-cast binding set once rather than once per canonical
+// row. Thread-local keeps parallel tests from seeing one another's loads.
+#[cfg(test)]
+thread_local! {
+    static BINDING_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_binding_loads() {
+    BINDING_LOADS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn binding_loads() -> usize {
+    BINDING_LOADS.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1073,17 +1091,50 @@ fn movie_canonical(conn: &Connection) -> Result<HashMap<String, ShowMeta>, Strin
 /// Show entities no `series` row binds anywhere. They produce no unit, because
 /// a unit is a folder of files, so the listing reports the number rather than
 /// letting them vanish (ADR-0039 item 1: the entity outlives any folder).
+///
+/// The bound ids are loaded once, as their exact SQL text form, and the
+/// canonical TV ids are scanned once. A correlated `CAST(s.tmdb_show_id AS TEXT)
+/// = c.provider_id` scans every `series` row for every canonical row, which is
+/// quadratic on a large library. The two reads below are equivalent: `CAST`
+/// renders the integer exactly as the correlated form did, so a provider id
+/// that is not that decimal text (leading zero, non-numeric, other digits) still
+/// does not match; a null `tmdb_show_id` renders as null and never matches.
 fn show_entities_without_binding(conn: &Connection) -> Result<i64, String> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM metadata_canonical c
-         WHERE c.provider = 'tmdb' AND c.entity_kind = 'tv'
-           AND NOT EXISTS (
-                SELECT 1 FROM series s WHERE CAST(s.tmdb_show_id AS TEXT) = c.provider_id
-           )",
-        [],
-        |r| r.get(0),
-    )
-    .map_err(|e| format!("show entities without binding: {e}"))
+    let mut bound = HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT CAST(tmdb_show_id AS TEXT) FROM series
+                 WHERE tmdb_show_id IS NOT NULL",
+            )
+            .map_err(|e| format!("prepare bound show ids: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query bound show ids: {e}"))?;
+        for row in rows {
+            bound.insert(row.map_err(|e| format!("bound show id row: {e}"))?);
+        }
+    }
+    #[cfg(test)]
+    BINDING_LOADS.with(|count| count.set(count.get() + 1));
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT provider_id FROM metadata_canonical
+             WHERE provider = 'tmdb' AND entity_kind = 'tv'",
+        )
+        .map_err(|e| format!("prepare canonical tv ids: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("query canonical tv ids: {e}"))?;
+    let mut count = 0i64;
+    for row in rows {
+        let provider_id = row.map_err(|e| format!("canonical tv id row: {e}"))?;
+        if !bound.contains(&provider_id) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Whether a canonical `artwork_json` holds a poster ref. Parsed once per
@@ -1797,5 +1848,141 @@ mod tests {
             per_call += fresh.library_views();
         }
         assert_eq!(per_call, 3, "one read per series without the shared cache");
+    }
+
+    /// A shows library whose bindings carry every edge the unbound count must
+    /// keep: a duplicate binding, a null binding, an unbound entity, a binding
+    /// in another library, and provider-id text that is not the cast integer.
+    fn binding_edges_library() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO libraries (id, name, path, kind)
+                  VALUES (1, 'Shows', '/Shows', 'shows'),
+                         (2, 'Other', '/Other', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'A', 100),
+                         -- Duplicate binding: two folders, one entity.
+                         (1, 'B', 200), (1, 'C', 200),
+                         -- Null binding: a group with no entity yet.
+                         (1, 'D', NULL),
+                         -- Bound in a second library; the count is server-wide.
+                         (2, 'E', 600),
+                         -- Cast text '5000', not the canonical text '0500'.
+                         (2, 'F', 5000);
+             INSERT INTO metadata_canonical
+                  (provider, entity_kind, provider_id, title, ids_json, projected_at)
+                  VALUES ('tmdb', 'tv', '100', 'A', '{}', 'now'),
+                         ('tmdb', 'tv', '200', 'B', '{}', 'now'),
+                         ('tmdb', 'tv', '300', 'D', '{}', 'now'),
+                         ('tmdb', 'tv', '400', 'Unbound', '{}', 'now'),
+                         ('tmdb', 'tv', '5000', 'Cast Bound', '{}', 'now'),
+                         ('tmdb', 'tv', '0500', 'Leading Zero', '{}', 'now'),
+                         ('tmdb', 'tv', 'abc', 'Non Numeric', '{}', 'now'),
+                         ('tmdb', 'tv', '600', 'Other Library', '{}', 'now');",
+        )
+        .unwrap();
+        c
+    }
+
+    /// The two reads replace one correlated `NOT EXISTS`. The correlated form
+    /// is the oracle here, so a change in text equality, null handling or
+    /// cross-library scope fails rather than silently moving the count.
+    #[test]
+    fn binding_count_keeps_duplicate_null_cross_library_and_text_edges() {
+        let c = binding_edges_library();
+        let oracle: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_canonical c
+                 WHERE c.provider = 'tmdb' AND c.entity_kind = 'tv'
+                   AND NOT EXISTS (
+                        SELECT 1 FROM series s
+                         WHERE CAST(s.tmdb_show_id AS TEXT) = c.provider_id
+                   )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oracle, 4, "300, 400, '0500' and 'abc' bind nothing");
+        assert_eq!(show_entities_without_binding(&c).unwrap(), oracle);
+
+        // The listing reports the same server-wide number for either library.
+        for library_id in [1, 2] {
+            let listed = list_library_units(&c, library_id, &ViewerScope::Account).unwrap();
+            assert_eq!(listed.counts.show_entities_without_binding, Some(oracle));
+        }
+    }
+
+    /// The binding set is loaded once per listing, not once per canonical row.
+    /// The counter is the observable; a per-row load would make it 50.
+    #[test]
+    fn one_listing_loads_the_binding_set_once() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let mut sql = String::from(
+            "INSERT INTO libraries (id, name, path, kind)
+                  VALUES (1, 'Shows', '/Shows', 'shows');
+             INSERT INTO series (library_id, relpath, tmdb_show_id)
+                  VALUES (1, 'A', 0);",
+        );
+        for id in 0..50 {
+            sql.push_str(&format!(
+                "INSERT INTO metadata_canonical
+                     (provider, entity_kind, provider_id, title, ids_json, projected_at)
+                     VALUES ('tmdb', 'tv', '{id}', 'S{id}', '{{}}', 'now');"
+            ));
+        }
+        c.execute_batch(&sql).unwrap();
+
+        reset_binding_loads();
+        let listed = list_library_units(&c, 1, &ViewerScope::Account).unwrap();
+        // Entity 0 is bound; the other 49 canonical rows are not.
+        assert_eq!(listed.counts.show_entities_without_binding, Some(49));
+        assert_eq!(binding_loads(), 1, "one listing, one binding-set load");
+    }
+
+    /// The complete listing — units, order and every count — is unchanged by
+    /// the rewrite of the one query this slice touches.
+    #[test]
+    fn complete_listing_is_unchanged_by_the_binding_count_rewrite() {
+        let c = shows_library();
+        let listed = list_library_units(&c, 2, &ViewerScope::Account).unwrap();
+        let shape: Vec<(&str, &str, UnitIdentity, i64)> = listed
+            .units
+            .iter()
+            .map(|u| {
+                (
+                    u.series_key.as_str(),
+                    u.title.as_str(),
+                    u.identity,
+                    u.item_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("tmdb:show:30984", "Bleach", UnitIdentity::Bound, 2),
+                ("tmdb:show:615", "Futurama", UnitIdentity::Bound, 5),
+                (
+                    "folder:2:Known Show",
+                    "Known Show",
+                    UnitIdentity::EntityOnly,
+                    1
+                ),
+                (
+                    "folder:2:Mystery Folder",
+                    "Mystery Folder",
+                    UnitIdentity::Unidentified,
+                    1
+                ),
+            ]
+        );
+        assert_eq!(listed.counts.items, 9);
+        assert_eq!(listed.counts.units, 4);
+        assert_eq!(listed.counts.bound, 2);
+        assert_eq!(listed.counts.entity_only, 1);
+        assert_eq!(listed.counts.unidentified, 1);
+        assert_eq!(listed.counts.show_entities_without_binding, Some(2));
     }
 }
