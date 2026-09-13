@@ -12,6 +12,8 @@ PROBE_FLOOR_FPS="${PROBE_FLOOR_FPS:-50}"
 DATA="$(mktemp -d)"
 LOG="$(mktemp)"
 PID=""
+AUTH=""
+BODY=""
 BENCH="${BENCH_DIR:-$ROOT/testdata/bench_10k}"
 
 cleanup() {
@@ -20,8 +22,14 @@ cleanup() {
     wait "$PID" 2>/dev/null || true
   fi
   rm -rf "$DATA" "$LOG"
+  [[ -n "${AUTH}" ]] && rm -f "$AUTH"
+  [[ -n "${BODY}" ]] && rm -f "$BODY"
 }
 trap cleanup EXIT
+# A signal must exit through cleanup once and must not continue the script.
+# Drop the traps first so cleanup does not run a second time on exit.
+trap 'trap - EXIT INT TERM; cleanup || true; exit 130' INT
+trap 'trap - EXIT INT TERM; cleanup || true; exit 143' TERM
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing binary: $BIN" >&2
@@ -38,10 +46,27 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 
-curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
+# ADR-0034 items 9 and 10. The harness owns one disposable account, created
+# through the shipped bootstrap route after the startup timing above so no
+# measurement includes Argon2 work. The token is captured into a shell
+# variable and a 0600 curl config file and is never printed; the data
+# directory cleanup removes is the only durable copy of the credential.
+PASS="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+# The disposable password goes into a 0600 mktemp payload, not curl argv, so it
+# never shows in ps. mktemp creates the file mode 0600.
+BODY="$(mktemp)"
+printf '{"username":"gate1_harness","password":"%s","clientLabel":"gate1 harness"}' "$PASS" > "$BODY"
+TOKEN="$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/auth/bootstrap" \
+  -H 'content-type: application/json' \
+  --data @"$BODY" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')"
+AUTH="$(mktemp)"
+printf 'header = "authorization: Bearer %s"\n' "$TOKEN" > "$AUTH"
+
+curl -sf --config "$AUTH" -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
   -H 'content-type: application/json' \
   -d "{\"name\":\"bench10k\",\"path\":\"${BENCH}\",\"kind\":\"movies\"}" >/dev/null
-LIB=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print([l["id"] for l in json.load(sys.stdin)["libraries"] if l["name"]=="bench10k"][0])')
+LIB=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print([l["id"] for l in json.load(sys.stdin)["libraries"] if l["name"]=="bench10k"][0])')
 
 echo "scanning library ${LIB} (index budget ${BUDGET_S}s)…"
 python3 - <<PY
@@ -54,18 +79,29 @@ port = "${PORT}"
 lib = "${LIB}"
 budget = float("${BUDGET_S}")
 probe_floor = float("${PROBE_FLOOR_FPS}")
+token = "${TOKEN}"
+
+def auth_headers(extra=None):
+    headers = {"Authorization": f"Bearer {token}"}
+    if extra:
+        headers.update(extra)
+    return headers
 
 def get(url):
-    with urllib.request.urlopen(url, timeout=30) as r:
+    req = urllib.request.Request(url, headers=auth_headers())
+    with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
-req = urllib.request.Request(
-    f"http://127.0.0.1:{port}/api/v0/libraries/{lib}/scan",
-    method="POST",
-    data=b"",
-    headers={"Content-Type": "application/json"},
-)
-with urllib.request.urlopen(req, timeout=30) as r:
+def post(url):
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        data=b"",
+        headers=auth_headers({"Content-Type": "application/json"}),
+    )
+    return urllib.request.urlopen(req, timeout=30)
+
+with post(f"http://127.0.0.1:{port}/api/v0/libraries/{lib}/scan") as r:
     assert r.status == 202, r.status
     accepted = json.load(r)
 job_id = accepted["jobId"]
@@ -120,13 +156,7 @@ if fail_reason:
     raise SystemExit(fail_reason)
 
 # Unchanged rescan: index pass <5s
-req2 = urllib.request.Request(
-    f"http://127.0.0.1:{port}/api/v0/libraries/{lib}/scan",
-    method="POST",
-    data=b"",
-    headers={"Content-Type": "application/json"},
-)
-with urllib.request.urlopen(req2, timeout=30) as r:
+with post(f"http://127.0.0.1:{port}/api/v0/libraries/{lib}/scan") as r:
     job2_id = json.load(r)["jobId"]
 t1 = time.perf_counter()
 while True:

@@ -11,6 +11,9 @@ DATA="$(mktemp -d)"
 MEDIA="$(mktemp -d)"
 LOG="$(mktemp)"
 PID=""
+AUTH=""
+BODY=""
+MEDIA2=""
 
 cleanup() {
   if [[ -n "${PID}" ]] && kill -0 "$PID" 2>/dev/null; then
@@ -18,8 +21,15 @@ cleanup() {
     wait "$PID" 2>/dev/null || true
   fi
   rm -rf "$DATA" "$MEDIA" "$LOG"
+  [[ -n "${MEDIA2}" ]] && rm -rf "$MEDIA2"
+  [[ -n "${AUTH}" ]] && rm -f "$AUTH"
+  [[ -n "${BODY}" ]] && rm -f "$BODY"
 }
 trap cleanup EXIT
+# A signal must exit through cleanup once and must not continue the script.
+# Drop the traps first so cleanup does not run a second time on exit.
+trap 'trap - EXIT INT TERM; cleanup || true; exit 130' INT
+trap 'trap - EXIT INT TERM; cleanup || true; exit 143' TERM
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing binary: $BIN (build release nightjar first)" >&2
@@ -97,18 +107,47 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 
-curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
+# ADR-0034 items 9 and 10. The harness owns one disposable account, created
+# through the shipped bootstrap route after the startup timing above so the
+# samples never include Argon2 work. The token is captured into a shell
+# variable and a 0600 curl config file and is never printed; the data
+# directory cleanup removes is the only durable copy of the credential.
+PASS="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+# The disposable password goes into a 0600 mktemp payload, not curl argv, so it
+# never shows in ps. mktemp creates the file mode 0600.
+BODY="$(mktemp)"
+printf '{"username":"gate1_harness","password":"%s","clientLabel":"gate1 harness"}' "$PASS" > "$BODY"
+TOKEN="$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/auth/bootstrap" \
+  -H 'content-type: application/json' \
+  --data @"$BODY" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')"
+AUTH="$(mktemp)"
+printf 'header = "authorization: Bearer %s"\n' "$TOKEN" > "$AUTH"
+# The byte routes need a selected profile (ADR-0034 item 3). Narrowing here
+# and widening below keeps the administrative token in account scope for the
+# library and scan calls that require it.
+PROFILE="$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/profiles" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["profiles"][0]["profileRef"])')"
+
+curl -sf --config "$AUTH" -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
   -H 'content-type: application/json' \
   -d "{\"name\":\"t\",\"path\":\"${MEDIA}\",\"kind\":\"movies\"}" >/dev/null
-LIB=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print(json.load(sys.stdin)["libraries"][0]["id"])')
-JOB=$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/scan" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobId"])')
+LIB=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print(json.load(sys.stdin)["libraries"][0]["id"])')
+JOB=$(curl -sf --config "$AUTH" -X POST "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/scan" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobId"])')
 python3 - <<PY
 import json, time, urllib.request
+
 port = "${PORT}"
 job = "${JOB}"
+token = "${TOKEN}"
+
+def get(url):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.load(r)
+
 for _ in range(200):
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v0/scan-jobs/{job}", timeout=5) as r:
-        body = json.load(r)
+    body = get(f"http://127.0.0.1:{port}/api/v0/scan-jobs/{job}")
     if body["state"] in ("completed", "failed"):
         if body["state"] != "completed":
             raise SystemExit(f"scan failed: {body}")
@@ -117,7 +156,7 @@ for _ in range(200):
 else:
     raise SystemExit("scan never completed")
 PY
-ITEM=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(json.load(sys.stdin)["items"][0]["id"])')
+ITEM=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(json.load(sys.stdin)["items"][0]["id"])')
 
 # Criterion is idle RAM with the library loaded, not cold empty process.
 sleep 0.5
@@ -129,16 +168,26 @@ if [[ "$RSS_MB" -gt 50 ]]; then
   exit 1
 fi
 
+# ADR-0034 item 3: the byte routes refuse account scope, so narrow the session
+# to the bootstrap profile for the Range dance and widen it back afterwards.
+curl -sf --config "$AUTH" -X POST "http://127.0.0.1:${PORT}/api/v0/auth/session" \
+  -H 'content-type: application/json' \
+  -d "{\"profileRef\":\"${PROFILE}\"}" >/dev/null
+
 # Range dance: open-ended (Chrome), tiny probe then mid-file seek (Safari-ish).
 python3 - <<PY
 import urllib.request, time
 
 port = "${PORT}"
 item = "${ITEM}"
+token = "${TOKEN}"
 base = f"http://127.0.0.1:{port}/api/v0/items/{item}/stream"
 
 def get(range_header):
-    req = urllib.request.Request(base, headers={"Range": range_header})
+    req = urllib.request.Request(
+        base,
+        headers={"Range": range_header, "Authorization": f"Bearer {token}"},
+    )
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=3) as r:
         status = r.status
@@ -166,6 +215,14 @@ if status != 206 or n == 0 or elapsed > 2.0:
     raise SystemExit("mid-file seek Range failed")
 PY
 
+# Widen back to account scope with the password (ADR-0034 item 3), so the
+# library and scan calls after the restart keep account powers. The password
+# travels in the 0600 payload file, not curl argv.
+printf '{"password":"%s"}' "$PASS" > "$BODY"
+curl -sf --config "$AUTH" -X DELETE "http://127.0.0.1:${PORT}/api/v0/auth/session" \
+  -H 'content-type: application/json' \
+  --data @"$BODY" >/dev/null
+
 # Kill -9 after a completed scan; WAL must still serve the library.
 kill -9 "$PID"
 wait "$PID" 2>/dev/null || true
@@ -179,7 +236,7 @@ for _ in $(seq 1 100); do
   fi
   sleep 0.05
 done
-COUNT=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
+COUNT=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
 echo "wal_items_after_kill9=${COUNT}"
 if [[ "$COUNT" -lt 1 ]]; then
   echo "FAIL: library empty or corrupt after kill -9" >&2
@@ -197,11 +254,11 @@ ffmpeg -y -hide_banner -loglevel error \
 for i in $(seq 1 40); do
   ln "$MEDIA2/during.mp4" "$MEDIA2/during_${i}.mp4" 2>/dev/null || cp "$MEDIA2/during.mp4" "$MEDIA2/during_${i}.mp4"
 done
-curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
+curl -sf --config "$AUTH" -X POST "http://127.0.0.1:${PORT}/api/v0/libraries" \
   -H 'content-type: application/json' \
   -d "{\"name\":\"during\",\"path\":\"${MEDIA2}\",\"kind\":\"movies\"}" >/dev/null
-LIB2=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print([l["id"] for l in json.load(sys.stdin)["libraries"] if l["name"]=="during"][0])')
-JOB2=$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/scan" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobId"])')
+LIB2=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries" | python3 -c 'import sys,json; print([l["id"] for l in json.load(sys.stdin)["libraries"] if l["name"]=="during"][0])')
+JOB2=$(curl -sf --config "$AUTH" -X POST "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/scan" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobId"])')
 # This is only a best-effort timing window, not proof that the process is
 # mid-probe; proving that would require a scan log line or progress endpoint,
 # neither of which this scan currently exposes.
@@ -219,8 +276,8 @@ for _ in $(seq 1 100); do
   fi
   sleep 0.05
 done
-COUNT1=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
-COUNT2=$(curl -sf "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
+COUNT1=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
+COUNT2=$(curl -sf --config "$AUTH" "http://127.0.0.1:${PORT}/api/v0/libraries/${LIB2}/items" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["items"]))')
 echo "wal_after_midscan_kill9 lib1=${COUNT1} lib2=${COUNT2} (job ${JOB2} interrupted)"
 if [[ "$COUNT1" -lt 1 ]]; then
   echo "FAIL: prior library lost after mid-scan kill -9" >&2
