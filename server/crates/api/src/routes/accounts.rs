@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use nightjar_auth::{hash_password, mint_profile_ref};
-use nightjar_core::Role;
+use nightjar_core::{CertificationTier, Role};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -414,6 +414,30 @@ pub async fn create_profile(
         if body.name.trim().is_empty() {
             return Err(ApiError::bad_request("name is required"));
         }
+        // ADR-0037 item 4: the cap is one of the four named tiers, and a cap
+        // cannot be set before the server's classification region exists
+        // (item 2). Both are checked before the row is written.
+        let classification_cap = body
+            .classification_cap
+            .as_deref()
+            .map(str::trim)
+            .filter(|cap| !cap.is_empty());
+        if let Some(cap) = classification_cap {
+            if CertificationTier::parse(cap).is_none() {
+                return Err(ApiError::bad_request(
+                    "classificationCap must be one of little_kid, big_kid, teen, adult",
+                ));
+            }
+            let region = state
+                .db
+                .with_conn(nightjar_db::classification_region)
+                .map_err(ApiError::internal)?;
+            if region.is_none() {
+                return Err(ApiError::bad_request(
+                    "classification region is not selected; set it at setup before capping a profile",
+                ));
+            }
+        }
         let preferred_language = validate_preferred_language(body.preferred_language.as_deref())?;
         let subtitle_default = validate_subtitle_default(body.subtitle_default.as_deref())?;
         let profile_ref = mint_profile_ref();
@@ -425,7 +449,7 @@ pub async fn create_profile(
                     account_id,
                     &profile_ref,
                     body.name.trim(),
-                    body.classification_cap.as_deref(),
+                    classification_cap,
                     body.simple_interface,
                     preferred_language.as_deref(),
                     &subtitle_default,

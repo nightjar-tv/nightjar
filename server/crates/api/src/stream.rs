@@ -29,6 +29,8 @@ pub async fn stream_item(
         .get_item(item_id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
+    // The bytes route is item-returning and is not exempt (ADR-0037 item 7).
+    crate::authority::require_item_visible_for_profile(&state, watching.profile_id(), item_id)?;
     let capability = profile_from_query(
         query.profile_id.as_deref(),
         query.max_bitrate_bps,

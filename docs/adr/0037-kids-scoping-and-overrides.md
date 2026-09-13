@@ -176,6 +176,35 @@ an account holder can override it.**
    `release_dates` and `content_ratings`, and `metadata_raw_payloads` stores the
    raw body keyed by provider entity, so the labels are on disk and unparsed.
 
+   **Regional aggregation is conservative and independent.** Provider payloads
+   may contain several non-empty labels for one region. A movie's release type
+   and date do not identify which edition exists in the local library, so the
+   projection does not prefer theatrical, digital, newest or oldest. It
+   deduplicates identical labels and, when every distinct label is recognized by
+   the shipped ladder for that region, stores the most restrictive rung. Any
+   unknown non-empty label makes that region unknown and therefore denied; the
+   raw payload remains the evidence. Duplicate television ratings use the same
+   rule. A conflict or unknown label in one country never erases another
+   country's usable projection, and there is still no cross-region fallback.
+
+   Projection completion is versioned against its source payload with two
+   columns beside `certifications_json`:
+   `certifications_projection_version INTEGER NOT NULL DEFAULT 0` and
+   `certifications_source_sha256 TEXT NULL`. Version `0` is unprocessed or
+   legacy; this policy starts at version `1` and increments whenever its
+   reduction semantics change. The hash is SHA-256 over the exact stored raw
+   payload bytes, using the existing hashing facility; a timestamp is not a
+   content identity.
+
+   Successful processing atomically writes the JSON result (including `{}` for
+   no usable label), current policy version and source hash. No raw payload
+   writes `{}`, the current version and a NULL hash; a malformed present payload
+   writes `{}`, the current version and its byte hash. Re-project iff the
+   version differs, `certifications_json` is NULL, or the current raw hash is
+   NULL-safely different. Hash comparison belongs in the cursor-bounded
+   background projection pass, never a playback request. A projection or
+   storage failure does not advance the marker.
+
    **Confirm coverage before B2-6 dispatches, and report three numbers, not
    one.** Movies, series, and episodes are counted separately, because
    `content_ratings` is series-level and episodes will show zero by construction

@@ -1206,6 +1206,8 @@ export interface components {
             password: string;
             /** @description Names this device in the session list. Defaults to a generic label. */
             clientLabel?: string;
+            /** @description ADR-0037 item 2. The server's one classification board, an uppercase ISO 3166-1 region code. Selected once here and locked afterwards; no route changes it. A profile cannot carry a classification cap until a region is selected. */
+            classificationRegion?: string;
         };
         LoginRequest: {
             username: string;
@@ -1250,7 +1252,7 @@ export interface components {
             /** @description Opaque and durable (ADR-0034 item 6). Never `profileId`, which ADR-0022 uses for the client capability profile. Clients treat it as opaque exactly as they treat `itemKey`. */
             profileRef: string;
             name: string;
-            /** @description Null is uncapped. What a cap means is B2-D's decision. */
+            /** @description Null is uncapped. Otherwise one of the four named tiers from ADR-0037 item 4: `little_kid`, `big_kid`, `teen`, or `adult`. Any other value is refused with the typed 400. */
             classificationCap?: string | null;
             simpleInterface: boolean;
             /** @description ISO-639-1-shaped lowercase two-letter code, or null for no preference (ADR-0038 item 1). One field for audio and subtitles. */

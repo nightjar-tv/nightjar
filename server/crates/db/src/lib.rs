@@ -4,6 +4,7 @@ mod accounts;
 mod content_id;
 mod migrate;
 mod paths;
+mod server_settings;
 mod status;
 mod store;
 mod track_choice;
@@ -20,7 +21,7 @@ pub use accounts::{
 };
 pub use content_id::{
     CONTENT_ID_WINDOW, content_id_for_path, content_id_from_reader, content_id_matches,
-    format_content_id,
+    format_content_id, sha256_hex,
 };
 pub use migrate::migrate;
 pub use paths::{
@@ -28,6 +29,7 @@ pub use paths::{
     paths_fold_equal, require_library_root, require_relpath, resolve_media_path,
     season_number_for_path, show_folder_relpath, to_relpath, under_numbered_season_directory,
 };
+pub use server_settings::{classification_region, select_classification_region};
 pub use status::{
     SidecarPresence, SubtitleTrackKind, backoff_days, classify_subtitle_status,
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,

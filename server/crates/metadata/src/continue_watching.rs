@@ -29,6 +29,8 @@ use crate::item_links::{
     EPISODE_KEY_PREFIX, MOVIE_KEY_PREFIX, PATH_KEY_PREFIX, effective_item_keys_for_library,
     parse_path_key, path_item_key, series_key_for_show_folder,
 };
+use crate::scope::{VisibilityCache, visible_item_ids_cached};
+use nightjar_core::ViewerScope;
 
 /// How many keys one batched identity query carries. Keeps the bound under
 /// SQLite's parameter limit on any build while turning a per-row loop into a
@@ -76,9 +78,22 @@ pub fn continue_watching(
     conn: &Connection,
     profile_id: i64,
     limit: Option<usize>,
+    scope: &ViewerScope,
 ) -> Result<Vec<ContinueWatchingEntry>, String> {
     let rows = load_watch_rows(conn, profile_id)?;
     let candidates = resolve_candidates(conn, rows)?;
+
+    // One filter at the query layer, applied **before** the series rollup
+    // (ADR-0037 item 7). An over-cap candidate must not consume the series'
+    // single slot, so invisible candidates never reach the collapse. The cache
+    // is reused below for the episodes a series detail offers.
+    let mut visibility = VisibilityCache::new();
+    let candidate_ids: Vec<i64> = candidates.iter().map(|c| c.resolved.item_id).collect();
+    let visible_candidates = visible_item_ids_cached(conn, scope, &candidate_ids, &mut visibility)?;
+    let candidates: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| visible_candidates.contains(&c.resolved.item_id))
+        .collect();
 
     // Collapse duplicate files by logical item: two stored keys that resolve to
     // one effective item key are one candidate. The newest activity wins, and
@@ -110,7 +125,14 @@ pub fn continue_watching(
     let mut cache = SeriesCache::new();
     let mut entries = Vec::new();
     for (series_key, candidates) in groups {
-        if let Some(entry) = collapse_series(conn, &mut cache, &series_key, &candidates)? {
+        if let Some(entry) = collapse_series(
+            conn,
+            &mut cache,
+            &mut visibility,
+            &series_key,
+            &candidates,
+            scope,
+        )? {
             entries.push(entry);
         }
     }
@@ -541,8 +563,10 @@ fn canonical_for_many(
 fn collapse_series(
     conn: &Connection,
     cache: &mut SeriesCache,
+    visibility: &mut VisibilityCache,
     series_key: &str,
     candidates: &[Candidate],
+    scope: &ViewerScope,
 ) -> Result<Option<ContinueWatchingEntry>, String> {
     // `hidden` removes an item from the rail without marking it played
     // (ADR-0035 item 9), so hidden candidates never appear and never order.
@@ -582,9 +606,15 @@ fn collapse_series(
                 .cmp(&b.last_played_at)
                 .then_with(|| b.resolved.effective_key.cmp(&a.resolved.effective_key))
         });
-    let Some(detail) = get_series_cached(conn, series_key, cache)? else {
+    let Some(detail) = get_series_cached(conn, series_key, cache, visibility, scope)? else {
         return Ok(None);
     };
+    // Visibility before the rollup: the shared scoped-series helper applies the
+    // same viewer scope and the same request-local visibility cache the
+    // candidates above used, so the next-episode walk never offers an episode
+    // the viewer cannot see and the filter is not written a second time here
+    // (Rule 4.11).
+
     let show_title = Some(detail.title.clone());
     // One numbering scheme for the whole collapse: the folder's, which is what
     // `get_series` reports and what browse shows (ADR-0046 item 3a). A
@@ -810,7 +840,7 @@ mod tests {
         let profile_id = seed_shows(&conn, 6, 4);
         reset_counters();
 
-        let entries = continue_watching(&conn, profile_id, None).unwrap();
+        let entries = continue_watching(&conn, profile_id, None, &ViewerScope::Account).unwrap();
         assert_eq!(entries.len(), 6, "one entry per show");
 
         assert_eq!(
@@ -872,7 +902,7 @@ mod tests {
         .unwrap();
         reset_counters();
 
-        let entries = continue_watching(&conn, profile_id, None).unwrap();
+        let entries = continue_watching(&conn, profile_id, None, &ViewerScope::Account).unwrap();
         assert_eq!(entries.len(), 1, "the duplicate collapses to one entry");
         assert_eq!(entries[0].item_key, "tmdb:movie:550");
         assert_eq!(entries[0].position_ms, 4000, "the newer row wins");

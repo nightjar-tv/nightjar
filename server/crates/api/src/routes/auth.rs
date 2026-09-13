@@ -78,6 +78,10 @@ pub struct BootstrapRequest {
     pub username: String,
     pub password: String,
     pub client_label: Option<String>,
+    /// ADR-0037 item 2: the server's one classification board, selected once
+    /// here and locked afterwards. Optional at bootstrap; a capped profile
+    /// cannot be created until it is set.
+    pub classification_region: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +208,25 @@ pub async fn bootstrap(
         }
         let hash = hash_password(&body.password)
             .map_err(|e| ApiError::internal(format!("hash password: {e:?}")))?;
+        // ADR-0037 item 2: the region is selected once, at setup, and no route
+        // changes it afterwards. It is written before the account so a refused
+        // region leaves no half-bootstrapped install.
+        if let Some(region) = body.classification_region.as_deref() {
+            let region = region.trim();
+            // ADR-0037 item 3: the setup choice is a region the shipped ladder
+            // actually carries. A shape-valid region the ladder does not know
+            // would be stored and then deny every capped profile, so it is
+            // refused here, before either the setting or the owner is written.
+            if !nightjar_core::CertificationLadder::shipped().has_region(region) {
+                return Err(ApiError::bad_request(format!(
+                    "classification_region_unknown: {region} is not in the shipped ladder"
+                )));
+            }
+            state
+                .db
+                .with_conn(|conn| nightjar_db::select_classification_region(conn, region))
+                .map_err(ApiError::bad_request)?;
+        }
         let account = state
             .db
             .with_conn(|conn| {
@@ -508,6 +531,7 @@ mod tests {
                 username: "founder".into(),
                 password: "correct horse".into(),
                 client_label: Some("first run".into()),
+                classification_region: Some("US".into()),
             }),
         )
         .await
@@ -528,6 +552,12 @@ mod tests {
             profiles, 1,
             "an account with no profile cannot write watch state"
         );
+        // ADR-0037 item 2: the setup boundary selects the region once.
+        let region = state
+            .db
+            .with_conn(nightjar_db::classification_region)
+            .unwrap();
+        assert_eq!(region.as_deref(), Some("US"));
 
         let second = bootstrap(
             State(state.clone()),
@@ -535,6 +565,7 @@ mod tests {
                 username: "usurper".into(),
                 password: "any".into(),
                 client_label: None,
+                classification_region: None,
             }),
         )
         .await
@@ -549,6 +580,92 @@ mod tests {
         let accounts = state.db.with_conn(nightjar_db::list_accounts).unwrap();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].username, "founder");
+    }
+
+    /// ADR-0037 item 3: the setup choice must be a region the shipped ladder
+    /// actually carries. A shape-valid region the ladder does not know (`ZZ`)
+    /// is refused before either commit, so a refused setup leaves the install
+    /// untouched and still bootstrappable.
+    #[tokio::test]
+    async fn bootstrap_refuses_a_region_the_shipped_ladder_does_not_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+
+        let refused = bootstrap(
+            State(state.clone()),
+            Json(BootstrapRequest {
+                username: "founder".into(),
+                password: "correct horse".into(),
+                client_label: None,
+                classification_region: Some("ZZ".into()),
+            }),
+        )
+        .await
+        .expect_err("a region the shipped ladder does not carry must be refused");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{refused:?}");
+        assert!(
+            refused
+                .message
+                .starts_with("classification_region_unknown:"),
+            "named, not a generic 400: {refused:?}"
+        );
+
+        // Atomicity: the refused region committed neither the setting nor the
+        // owner. Without the ladder check the setting would hold `ZZ` and the
+        // owner would exist, so both assertions fail on the unguarded path.
+        let (account_exists, region) = state
+            .db
+            .with_conn(|conn| {
+                Ok((
+                    nightjar_db::account_exists(conn)?,
+                    nightjar_db::classification_region(conn)?,
+                ))
+            })
+            .unwrap();
+        assert!(!account_exists, "a refused region must not mint the owner");
+        assert_eq!(region, None, "a refused region must not be stored");
+
+        // The install is still bootstrappable, so the refusal was a refusal and
+        // not a half-write that closed the setup path.
+        let accepted = bootstrap(
+            State(state.clone()),
+            Json(BootstrapRequest {
+                username: "founder".into(),
+                password: "correct horse".into(),
+                client_label: None,
+                classification_region: Some("AU".into()),
+            }),
+        )
+        .await
+        .expect("a refused region must not close bootstrap");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+    }
+
+    /// ADR-0037 item 3: AU, DE and BR are boards the shipped ladder carries.
+    /// Each region bootstraps on a fresh install and round-trips.
+    #[tokio::test]
+    async fn bootstrap_accepts_au_de_and_br() {
+        for region in ["AU", "DE", "BR"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::state::test_support::state(dir.path());
+            let created = bootstrap(
+                State(state.clone()),
+                Json(BootstrapRequest {
+                    username: "founder".into(),
+                    password: "correct horse".into(),
+                    client_label: None,
+                    classification_region: Some(region.into()),
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{region} must be accepted: {e:?}"));
+            assert_eq!(created.status(), StatusCode::CREATED, "{region}");
+            let stored = state
+                .db
+                .with_conn(nightjar_db::classification_region)
+                .unwrap();
+            assert_eq!(stored.as_deref(), Some(region), "{region} must round-trip");
+        }
     }
 
     /// The gate is "no account exists", not "no admin exists". A member-only
@@ -573,6 +690,7 @@ mod tests {
                 username: "usurper".into(),
                 password: "any".into(),
                 client_label: None,
+                classification_region: None,
             }),
         )
         .await
@@ -634,5 +752,159 @@ mod tests {
             wrong.message, absent.message,
             "the two must be indistinguishable in the response as well as in timing"
         );
+    }
+
+    /// ADR-0037 items 2 and 4: a cap is one of the four named tiers, and a cap
+    /// cannot be set before the server classification region exists.
+    #[tokio::test]
+    async fn a_capped_profile_requires_a_selected_region_and_a_known_tier() {
+        use crate::routes::accounts::{CreateProfileRequest, create_profile};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        bootstrap(
+            State(state.clone()),
+            Json(BootstrapRequest {
+                username: "o".into(),
+                password: "p".into(),
+                client_label: None,
+                classification_region: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let account_id = state
+            .db
+            .with_conn(|conn| Ok(nightjar_db::account_by_username(conn, "o")?.unwrap().id))
+            .unwrap();
+        let caller = Caller {
+            session: nightjar_db::SessionRow {
+                id: 1,
+                account_id,
+                role: "owner".into(),
+                active_profile_id: None,
+                client_label: "t".into(),
+                expires_at: "2099-01-01T00:00:00.000Z".into(),
+                revoked_at: None,
+            },
+            role: Role::Owner,
+        };
+        let body = |cap: Option<&str>| {
+            Json(CreateProfileRequest {
+                name: "Kid".into(),
+                account_id: None,
+                classification_cap: cap.map(str::to_string),
+                simple_interface: false,
+                preferred_language: None,
+                subtitle_default: None,
+            })
+        };
+
+        // No region yet: a cap is refused, and nothing is written.
+        let err = match create_profile(
+            State(state.clone()),
+            caller.clone(),
+            body(Some("little_kid")),
+        )
+        .await
+        {
+            Ok(_) => panic!("a cap before a region must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{err:?}");
+
+        // Region selected: an unknown tier is still refused.
+        state
+            .db
+            .with_conn(|conn| nightjar_db::select_classification_region(conn, "US"))
+            .unwrap();
+        let err = match create_profile(State(state.clone()), caller.clone(), body(Some("toddler")))
+            .await
+        {
+            Ok(_) => panic!("an unknown tier must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{err:?}");
+
+        // A known tier succeeds.
+        let created = create_profile(
+            State(state.clone()),
+            caller.clone(),
+            body(Some("little_kid")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.0, StatusCode::CREATED);
+    }
+
+    /// ADR-0037 item 4: an empty or whitespace-only cap is not a known tier and
+    /// must not be stored verbatim. It means "no cap", so the row stays NULL
+    /// and the profile resolves to unrestricted scope instead of a stored value
+    /// that later fails `CertificationTier::parse` and answers 500.
+    #[tokio::test]
+    async fn an_empty_or_whitespace_cap_is_stored_as_no_cap() {
+        use crate::authority::viewer_scope_for_profile;
+        use crate::routes::accounts::{CreateProfileRequest, create_profile};
+        use nightjar_core::ViewerScope;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::test_support::state(dir.path());
+        bootstrap(
+            State(state.clone()),
+            Json(BootstrapRequest {
+                username: "o".into(),
+                password: "p".into(),
+                client_label: None,
+                classification_region: Some("US".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let account_id = state
+            .db
+            .with_conn(|conn| Ok(nightjar_db::account_by_username(conn, "o")?.unwrap().id))
+            .unwrap();
+        let caller = Caller {
+            session: nightjar_db::SessionRow {
+                id: 1,
+                account_id,
+                role: "owner".into(),
+                active_profile_id: None,
+                client_label: "t".into(),
+                expires_at: "2099-01-01T00:00:00.000Z".into(),
+                revoked_at: None,
+            },
+            role: Role::Owner,
+        };
+        let body = |cap: &str| {
+            Json(CreateProfileRequest {
+                name: "Kid".into(),
+                account_id: None,
+                classification_cap: Some(cap.to_string()),
+                simple_interface: false,
+                preferred_language: None,
+                subtitle_default: None,
+            })
+        };
+
+        for raw in ["", "   "] {
+            let created = create_profile(State(state.clone()), caller.clone(), body(raw))
+                .await
+                .unwrap();
+            assert_eq!(created.0, StatusCode::CREATED, "raw cap {raw:?}");
+            let profile_ref = created.1.profile_ref.clone();
+            let stored = state
+                .db
+                .with_conn(|conn| Ok(nightjar_db::profile_by_ref(conn, &profile_ref)?.unwrap()))
+                .unwrap();
+            assert_eq!(
+                stored.classification_cap, None,
+                "raw cap {raw:?} must not be stored"
+            );
+            let scope = viewer_scope_for_profile(&state, stored.id)
+                .expect("a stored non-tier cap would answer 500 here");
+            assert!(
+                matches!(scope, ViewerScope::Account),
+                "raw cap {raw:?} must resolve as uncapped, got {scope:?}"
+            );
+        }
     }
 }

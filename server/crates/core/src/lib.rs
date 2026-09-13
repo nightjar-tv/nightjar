@@ -7,9 +7,19 @@ mod scan_progress;
 mod track_select;
 mod watch;
 
+mod certification;
+mod kids_scope;
+
+pub use certification::{
+    CertificationLadder, CertificationTier, LadderError, LadderRung, RegionLadder,
+};
 pub use filename::{
     FolderContext, MAX_EPISODE_RANGE, ParsedName, leading_episode_number, parse_filename,
     parse_filename_in, parse_with_parent,
+};
+pub use kids_scope::{
+    ItemCertification, KidsDenialReason, KidsScopeDecision, KidsScopeFacts, ViewerScope,
+    decide_kids_scope,
 };
 pub use models::{LibraryKind, MediaKind, Role};
 pub use playback::{

@@ -431,22 +431,36 @@ fn progress_to_dto(
 
 pub async fn list_items(
     State(state): State<AppState>,
+    caller: crate::authority::Caller,
     Path(library_id): Path<i64>,
 ) -> ApiResult<Json<ItemsResponse>> {
     // The whole-library read behind the grid. On a 23k-item library this holds
     // the store mutex long enough to matter, and it ran on a Tokio worker.
     blocking(move || {
+        let scope = crate::authority::viewer_scope(&state, &caller)?;
         let lib = state
             .db
             .get_library(library_id)
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::not_found(format!("library {library_id} not found")))?;
         let root = lib.path.clone();
-        let items = state
+        let rows = state
             .db
             .list_items(library_id)
-            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        // One cache per request, so the visibility batch is issued once even if
+        // the caller makes more than one decision.
+        let mut visibility = nightjar_metadata::VisibilityCache::new();
+        let visible = state
+            .db
+            .with_conn(|conn| {
+                nightjar_metadata::visible_item_ids_cached(conn, &scope, &ids, &mut visibility)
+            })
+            .map_err(ApiError::internal)?;
+        let items = rows
             .into_iter()
+            .filter(|row| visible.contains(&row.id))
             .map(|row| super::items::to_dto(row, &root))
             .collect();
         Ok(Json(ItemsResponse { items }))

@@ -98,7 +98,11 @@ fn read_windows<R: Read + Seek>(
     Ok((first, last))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `bytes`. The one hashing facility in the tree:
+/// `content_id` builds its identity from it, and the ADR-0037 item 8
+/// certification projection hashes the exact stored payload bytes with it
+/// rather than growing a second implementation.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for byte in digest {
