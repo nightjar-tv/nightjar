@@ -5,7 +5,7 @@ use crate::paths::{
 };
 use crate::status::{backoff_days, parse_map_status, parse_probe_status, parse_subtitle_status};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -253,7 +253,7 @@ pub struct ItemPathRow {
 }
 
 /// Filesystem subtitle sidecar stored at index time (ADR-0010).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarRow {
     pub media_item_id: i64,
     pub track_id: String,
@@ -264,6 +264,55 @@ pub struct SidecarRow {
     pub language: Option<String>,
     pub forced: bool,
     pub sdh: bool,
+    /// ADR-0010 §4 / ADR-0023 §6 bounded identity of the sidecar bytes. `None`
+    /// is a legacy row an explicit reconciliation has not verified yet.
+    pub content_id: Option<String>,
+    /// DB-allocated generation, positive once assigned. `None` is unverified.
+    pub sidecar_generation: Option<i64>,
+}
+
+/// One sidecar a successful directory discovery observed (ADR-0010 §4).
+///
+/// The scanner computes `content_id` from the sidecar's own bounded windows;
+/// the DB never reads the filesystem. An identity read failure is an error at
+/// the call site rather than a `None` here, so a row cannot be reconciled
+/// without an observed identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedSidecar {
+    pub track_id: String,
+    pub path: String,
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+    pub format: String,
+    pub language: Option<String>,
+    pub forced: bool,
+    pub sdh: bool,
+    pub content_id: String,
+}
+
+/// One row a reconciliation rewrote: the stored row before, the stored row
+/// after (ADR-0010 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarChange {
+    pub before: SidecarRow,
+    pub after: SidecarRow,
+}
+
+/// The exact set delta one committed reconciliation produced (ADR-0010 §4).
+///
+/// Later artifact handling consumes this rather than inferring the delta from
+/// a second read. An empty delta is an unchanged set, not a missing one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidecarDelta {
+    pub added: Vec<SidecarRow>,
+    pub changed: Vec<SidecarChange>,
+    pub removed: Vec<SidecarRow>,
+}
+
+impl SidecarDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
 }
 
 /// One persisted subtitle stream row in `media_item_subtitle_tracks`
@@ -1478,19 +1527,51 @@ impl Db {
         self.delete_missing_fold(library_id, &folds)
     }
 
-    /// Replace all sidecar rows for one media item (index-pass association).
-    pub fn replace_item_sidecars(
+    /// Reconcile the stored sidecar set for one item against one complete,
+    /// successful discovery (ADR-0010 §4).
+    ///
+    /// One transaction. Added and changed rows receive a generation greater
+    /// than every generation previously allocated for the item; unchanged rows
+    /// are not rewritten and keep their row and generation; rows absent from
+    /// `observed` are removed. Membership after commit is exactly the observed
+    /// set.
+    ///
+    /// `observed` must come from a successful complete discovery with a
+    /// computed identity for every entry. A duplicate `track_id`, an invalid
+    /// path, or any write failure returns an error and rolls the whole set
+    /// back, so no partial delta or partial membership becomes visible.
+    ///
+    /// The bounded digest is change detection, not proof that two files are
+    /// equal: a change outside both 64-KiB windows with the same size can
+    /// collide (ADR-0023 §6, ADR-0010 §4). Generations prevent remove/re-add
+    /// ABA; they do not widen the fingerprint.
+    pub fn reconcile_item_sidecars(
         &self,
         media_item_id: i64,
-        sidecars: &[SidecarRow],
-    ) -> Result<bool, String> {
+        observed: &[ObservedSidecar],
+    ) -> Result<SidecarDelta, String> {
+        // Duplicate track ids would break the (item, track_id) primary key
+        // part-way through the set. Discovery already applies its deterministic
+        // format winner, so a duplicate here is a caller defect; refuse the
+        // whole set before a transaction can write anything.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(observed.len());
+        for s in observed {
+            if !seen.insert(s.track_id.as_str()) {
+                return Err(format!(
+                    "duplicate sidecar track_id {} for item {media_item_id}",
+                    s.track_id
+                ));
+            }
+            require_relpath(&s.path)?;
+        }
+
         // Reads before it writes, so it takes the write lock up front. As a
         // deferred transaction this SELECT took a read snapshot that the
-        // metadata drain's next commit invalidated, and the DELETE below then
-        // failed instantly with SQLITE_BUSY_SNAPSHOT — 285 times on the
-        // 2026-08-07 cold scan, median 93 µs apart, each one a WARN with no
-        // retry and nothing to revisit the item. The external subtitle was
-        // simply never associated.
+        // metadata drain's next commit invalidated, and the DELETE then failed
+        // instantly with SQLITE_BUSY_SNAPSHOT — 285 times on the 2026-08-07
+        // cold scan, median 93 µs apart, each one a WARN with no retry and
+        // nothing to revisit the item. The external subtitle was simply never
+        // associated.
         let conn = self.lock()?;
 
         // Nothing found beside the file and nothing stored: there is nothing to
@@ -1498,12 +1579,12 @@ impl Db {
         //
         // The index pass calls this for *every* item it upserts, and on a
         // typical library most items have no sidecar. Without this the pass
-        // pays one `BEGIN IMMEDIATE` and one no-op `DELETE` per item —
-        // ~25,000 of them on a cold scan of the dogfood library — each holding
-        // the write lock across its own SELECT. Taking the lock up front is
-        // what makes the read-then-write path correct, so this is the other
-        // half of that change: keep the lock for the items that need it and
-        // stop taking it for the ones that do not.
+        // pays one `BEGIN IMMEDIATE` and one no-op write per item — ~25,000 of
+        // them on a cold scan of the dogfood library — each holding the write
+        // lock across its own SELECT. Taking the lock up front is what makes
+        // the read-then-write path correct, so this is the other half of that
+        // change: keep the lock for the items that need it and stop taking it
+        // for the ones that do not.
         //
         // It is deliberately **not** enough that nothing was found. No
         // sidecars on disk with rows still stored is the sidecar-was-deleted
@@ -1515,88 +1596,136 @@ impl Db {
         // `media_item_sidecars`, so no row can appear between the check and
         // the return. It is an index lookup
         // (`idx_media_item_sidecars_item`), not a scan.
-        if sidecars.is_empty() && !has_stored_sidecars(&conn, media_item_id)? {
-            return Ok(false);
+        if observed.is_empty() && !has_stored_sidecars(&conn, media_item_id)? {
+            return Ok(SidecarDelta::default());
         }
 
         with_write_tx(&conn, |tx| {
-            let existing: Vec<SidecarRow> = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
-                                format, language, forced, sdh
-                         FROM media_item_sidecars WHERE media_item_id = ?1 ORDER BY track_id",
-                    )
-                    .map_err(|e| format!("prepare existing sidecars: {e}"))?;
-                stmt.query_map([media_item_id], map_sidecar)
-                    .map_err(|e| format!("list existing sidecars: {e}"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("read existing sidecars: {e}"))?
-            };
-            let changed = existing.len() != sidecars.len()
-                || existing.iter().zip(sidecars).any(|(a, b)| {
-                    a.track_id != b.track_id
-                        || a.path != b.path
-                        || a.mtime_ms != b.mtime_ms
-                        || a.size_bytes != b.size_bytes
-                        || a.format != b.format
-                        || a.language != b.language
-                        || a.forced != b.forced
-                        || a.sdh != b.sdh
-                });
-            tx.execute(
-                "DELETE FROM media_item_sidecars WHERE media_item_id = ?1",
-                [media_item_id],
-            )
-            .map_err(|e| format!("clear sidecars for item {media_item_id}: {e}"))?;
+            let existing = load_sidecars(tx, media_item_id)?;
+            let by_track: HashMap<&str, &SidecarRow> = existing
+                .iter()
+                .map(|row| (row.track_id.as_str(), row))
+                .collect();
+
+            // The durable allocator: one row per item, never removed by a
+            // membership change, so a removed path cannot reuse its generation
+            // when it returns, including across restart. Starts at 0; the
+            // first allocated generation is 1.
+            let mut last_generation: i64 = tx
+                .query_row(
+                    "SELECT last_generation FROM media_item_sidecar_generations
+                     WHERE media_item_id = ?1",
+                    [media_item_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("read sidecar generation for item {media_item_id}: {e}"))?
+                .unwrap_or(0);
+
+            let mut delta = SidecarDelta::default();
             {
-                let mut stmt = tx
+                let mut update = tx
+                    .prepare(
+                        "UPDATE media_item_sidecars
+                            SET path = ?3, mtime_ms = ?4, size_bytes = ?5, format = ?6,
+                                language = ?7, forced = ?8, sdh = ?9,
+                                content_id = ?10, sidecar_generation = ?11
+                          WHERE media_item_id = ?1 AND track_id = ?2",
+                    )
+                    .map_err(|e| format!("prepare sidecar update: {e}"))?;
+                let mut insert = tx
                     .prepare(
                         "INSERT INTO media_item_sidecars (
                             media_item_id, track_id, path, mtime_ms, size_bytes,
-                            format, language, forced, sdh
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            format, language, forced, sdh, content_id, sidecar_generation
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     )
                     .map_err(|e| format!("prepare sidecar insert: {e}"))?;
-                for s in sidecars {
-                    let path = require_relpath(&s.path)?;
-                    stmt.execute(params![
-                        media_item_id,
-                        s.track_id,
-                        path,
-                        s.mtime_ms,
-                        s.size_bytes,
-                        s.format,
-                        s.language,
-                        s.forced as i64,
-                        s.sdh as i64,
-                    ])
-                    .map_err(|e| format!("insert sidecar {}: {e}", s.track_id))?;
+
+                for s in observed {
+                    let stored = by_track.get(s.track_id.as_str()).copied();
+                    if stored.is_some_and(|row| sidecar_is_unchanged(row, s)) {
+                        continue;
+                    }
+                    last_generation += 1;
+                    let generation = last_generation;
+                    match stored {
+                        Some(before) => {
+                            update
+                                .execute(params![
+                                    media_item_id,
+                                    s.track_id,
+                                    s.path,
+                                    s.mtime_ms,
+                                    s.size_bytes,
+                                    s.format,
+                                    s.language,
+                                    s.forced as i64,
+                                    s.sdh as i64,
+                                    s.content_id,
+                                    generation,
+                                ])
+                                .map_err(|e| format!("update sidecar {}: {e}", s.track_id))?;
+                            delta.changed.push(SidecarChange {
+                                before: before.clone(),
+                                after: stored_sidecar(media_item_id, s, generation),
+                            });
+                        }
+                        None => {
+                            insert
+                                .execute(params![
+                                    media_item_id,
+                                    s.track_id,
+                                    s.path,
+                                    s.mtime_ms,
+                                    s.size_bytes,
+                                    s.format,
+                                    s.language,
+                                    s.forced as i64,
+                                    s.sdh as i64,
+                                    s.content_id,
+                                    generation,
+                                ])
+                                .map_err(|e| format!("insert sidecar {}: {e}", s.track_id))?;
+                            delta
+                                .added
+                                .push(stored_sidecar(media_item_id, s, generation));
+                        }
+                    }
                 }
             }
-            Ok(changed)
+
+            // Membership after commit is exactly the discovered set.
+            for row in &existing {
+                if seen.contains(row.track_id.as_str()) {
+                    continue;
+                }
+                tx.execute(
+                    "DELETE FROM media_item_sidecars WHERE media_item_id = ?1 AND track_id = ?2",
+                    params![media_item_id, row.track_id],
+                )
+                .map_err(|e| format!("remove sidecar {}: {e}", row.track_id))?;
+                delta.removed.push(row.clone());
+            }
+
+            if !delta.added.is_empty() || !delta.changed.is_empty() {
+                tx.execute(
+                    "INSERT INTO media_item_sidecar_generations (media_item_id, last_generation)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(media_item_id)
+                     DO UPDATE SET last_generation = excluded.last_generation",
+                    params![media_item_id, last_generation],
+                )
+                .map_err(|e| format!("record sidecar generation for item {media_item_id}: {e}"))?;
+            }
+
+            Ok(delta)
         })
     }
 
     pub fn list_item_sidecars(&self, media_item_id: i64) -> Result<Vec<SidecarRow>, String> {
         let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
-                        format, language, forced, sdh
-                 FROM media_item_sidecars
-                 WHERE media_item_id = ?1
-                 ORDER BY track_id",
-            )
-            .map_err(|e| format!("prepare list sidecars: {e}"))?;
-        let rows = stmt
-            .query_map([media_item_id], map_sidecar)
-            .map_err(|e| format!("list sidecars for item {media_item_id}: {e}"))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| format!("map sidecar: {e}"))?);
-        }
-        Ok(out)
+        load_sidecars(&conn, media_item_id)
     }
 
     /// Replace all subtitle-stream inventory rows for one media item
@@ -1682,7 +1811,7 @@ impl Db {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
-                    format, language, forced, sdh
+                    format, language, forced, sdh, content_id, sidecar_generation
              FROM media_item_sidecars
              WHERE media_item_id = ?1 AND track_id = ?2",
             params![media_item_id, track_id],
@@ -2084,7 +2213,63 @@ fn map_sidecar(r: &rusqlite::Row<'_>) -> rusqlite::Result<SidecarRow> {
         language: r.get(6)?,
         forced: forced != 0,
         sdh: sdh != 0,
+        content_id: r.get(9)?,
+        sidecar_generation: r.get(10)?,
     })
+}
+
+/// All stored sidecars for one item, ordered by `track_id`.
+fn load_sidecars(conn: &Connection, media_item_id: i64) -> Result<Vec<SidecarRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                    format, language, forced, sdh, content_id, sidecar_generation
+             FROM media_item_sidecars
+             WHERE media_item_id = ?1
+             ORDER BY track_id",
+        )
+        .map_err(|e| format!("prepare list sidecars: {e}"))?;
+    let rows = stmt
+        .query_map([media_item_id], map_sidecar)
+        .map_err(|e| format!("list sidecars for item {media_item_id}: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("map sidecar: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// A stored row as the reconciliation will leave it.
+fn stored_sidecar(media_item_id: i64, s: &ObservedSidecar, generation: i64) -> SidecarRow {
+    SidecarRow {
+        media_item_id,
+        track_id: s.track_id.clone(),
+        path: s.path.clone(),
+        mtime_ms: s.mtime_ms,
+        size_bytes: s.size_bytes,
+        format: s.format.clone(),
+        language: s.language.clone(),
+        forced: s.forced,
+        sdh: s.sdh,
+        content_id: Some(s.content_id.clone()),
+        sidecar_generation: Some(generation),
+    }
+}
+
+/// Whether a stored row already matches the observation exactly.
+///
+/// A stored row with no `content_id` is an unverified legacy row, so it can
+/// never be unchanged: the first reconciliation assigns it identity and a
+/// generation.
+fn sidecar_is_unchanged(row: &SidecarRow, s: &ObservedSidecar) -> bool {
+    row.content_id.as_deref() == Some(s.content_id.as_str())
+        && row.path == s.path
+        && row.mtime_ms == s.mtime_ms
+        && row.size_bytes == s.size_bytes
+        && row.format == s.format
+        && row.language == s.language
+        && row.forced == s.forced
+        && row.sdh == s.sdh
 }
 
 /// Whether any sidecar row is stored for this item.
@@ -2462,17 +2647,18 @@ mod tests {
         .unwrap()[0]
     }
 
-    fn sidecar(item_id: i64, track_id: &str) -> SidecarRow {
-        SidecarRow {
-            media_item_id: item_id,
+    /// One observed sidecar with a distinct identity per `track_id`.
+    fn observed(track_id: &str) -> ObservedSidecar {
+        ObservedSidecar {
             track_id: track_id.into(),
-            path: "clip.en.srt".into(),
+            path: format!("clip.{track_id}.srt"),
             mtime_ms: 10,
             size_bytes: 20,
             format: "srt".into(),
             language: Some("en".into()),
             forced: false,
             sdh: false,
+            content_id: format!("20-first-{track_id}-last-{track_id}"),
         }
     }
 
@@ -2507,10 +2693,10 @@ mod tests {
             )
             .unwrap();
 
-        let changed = db
-            .replace_item_sidecars(item_id, &[])
+        let delta = db
+            .reconcile_item_sidecars(item_id, &[])
             .expect("must not need the write lock when there is nothing to reconcile");
-        assert!(!changed, "nothing to reconcile is not a change");
+        assert!(delta.is_empty(), "nothing to reconcile is not a change");
 
         drop(blocker);
     }
@@ -2524,25 +2710,292 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let item_id = item_for_sidecars(&db);
 
-        assert!(
-            db.replace_item_sidecars(item_id, &[sidecar(item_id, "s1")])
-                .unwrap(),
+        let added = db
+            .reconcile_item_sidecars(item_id, &[observed("s1")])
+            .unwrap();
+        assert_eq!(
+            added.added.len(),
+            1,
             "storing the first sidecar is a change"
         );
         assert_eq!(db.list_item_sidecars(item_id).unwrap().len(), 1);
 
         // Sidecar file removed from disk: discovery finds nothing.
-        assert!(
-            db.replace_item_sidecars(item_id, &[]).unwrap(),
+        let removed = db.reconcile_item_sidecars(item_id, &[]).unwrap();
+        assert_eq!(
+            removed.removed.len(),
+            1,
             "removing the last sidecar is a change"
         );
+        assert!(removed.added.is_empty() && removed.changed.is_empty());
         assert!(
             db.list_item_sidecars(item_id).unwrap().is_empty(),
             "stored rows must be deleted when the sidecar is gone"
         );
 
         // And now that both sides are empty, the fast path applies.
-        assert!(!db.replace_item_sidecars(item_id, &[]).unwrap());
+        assert!(db.reconcile_item_sidecars(item_id, &[]).unwrap().is_empty());
+    }
+
+    /// An unchanged set reports nothing and rewrites nothing: the row and its
+    /// generation survive a second identical reconciliation.
+    #[test]
+    fn unchanged_reconciliation_is_an_empty_delta_and_keeps_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        let first = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        assert_eq!(first.added.len(), 1);
+        assert!(first.changed.is_empty() && first.removed.is_empty());
+        let stored = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_eq!(stored.sidecar_generation, Some(1));
+        assert_eq!(
+            stored.content_id.as_deref(),
+            Some("20-first-s-en-last-s-en")
+        );
+        assert_eq!(first.added[0], stored);
+
+        let second = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        assert!(second.is_empty(), "unchanged set must not report a delta");
+        assert_eq!(
+            db.get_item_sidecar(item_id, "s-en").unwrap().unwrap(),
+            stored,
+            "an unchanged row is not rewritten and keeps its generation"
+        );
+    }
+
+    /// A row exactly as migration 033 leaves it — stored attributes, no
+    /// identity, no generation — is not unchanged. The first reconciliation
+    /// assigns both lazily.
+    #[test]
+    fn a_legacy_unverified_row_is_verified_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO media_item_sidecars
+                    (media_item_id, track_id, path, mtime_ms, size_bytes, format, language)
+                 VALUES (?1, 's-en', 'clip.s-en.srt', 10, 20, 'srt', 'en')",
+                [item_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let delta = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+        assert_eq!(delta.changed.len(), 1, "unverified is not unchanged");
+        assert_eq!(delta.changed[0].before.content_id, None);
+        assert_eq!(delta.changed[0].before.sidecar_generation, None);
+        assert_eq!(delta.changed[0].after.sidecar_generation, Some(1));
+        assert_eq!(
+            delta.changed[0].after.content_id.as_deref(),
+            Some("20-first-s-en-last-s-en")
+        );
+    }
+
+    /// Same path, mtime and size; only the bounded identity differs. That is a
+    /// changed row with a new generation, not an unchanged one.
+    #[test]
+    fn edited_bytes_receive_a_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        db.reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        let before = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+
+        let mut edited = observed("s-en");
+        edited.content_id = "20-first-edit-last-edit".into();
+        let delta = db.reconcile_item_sidecars(item_id, &[edited]).unwrap();
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(delta.changed[0].before, before);
+        assert_eq!(delta.changed[0].after.sidecar_generation, Some(2));
+        assert_eq!(
+            delta.changed[0].after.content_id.as_deref(),
+            Some("20-first-edit-last-edit")
+        );
+        assert_eq!(
+            db.get_item_sidecar(item_id, "s-en").unwrap().unwrap(),
+            delta.changed[0].after
+        );
+    }
+
+    /// Add and remove report exactly the rows that moved; the unchanged row
+    /// stays out of the delta, and membership after commit is the observed set.
+    #[test]
+    fn add_and_remove_report_the_exact_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        let added = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        let ids = |rows: &[SidecarRow]| -> Vec<String> {
+            rows.iter().map(|r| r.track_id.clone()).collect()
+        };
+        assert_eq!(ids(&added.added), vec!["s-en".to_string()]);
+        assert!(added.changed.is_empty() && added.removed.is_empty());
+
+        // Adjacent (`s-en`) and nested `Subs/` (`s-Subs.en`) membership at once.
+        let both = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en"), observed("s-Subs.en")])
+            .unwrap();
+        assert_eq!(ids(&both.added), vec!["s-Subs.en".to_string()]);
+        assert!(
+            both.changed.is_empty() && both.removed.is_empty(),
+            "the unchanged row stays out of the delta"
+        );
+        assert_eq!(
+            ids(&db.list_item_sidecars(item_id).unwrap()),
+            vec!["s-Subs.en".to_string(), "s-en".to_string()]
+        );
+
+        let removed = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        assert_eq!(ids(&removed.removed), vec!["s-Subs.en".to_string()]);
+        assert!(removed.added.is_empty() && removed.changed.is_empty());
+        assert_eq!(
+            ids(&db.list_item_sidecars(item_id).unwrap()),
+            vec!["s-en".to_string()]
+        );
+    }
+
+    /// A removed path that returns after a restart gets a strictly newer
+    /// generation: the allocator is durable and membership deletion leaves it.
+    #[test]
+    fn remove_then_readd_across_restart_cannot_reuse_a_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+
+        let db = Db::open(&path).unwrap();
+        let item_id = item_for_sidecars(&db);
+        db.reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        let first = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_eq!(first.sidecar_generation, Some(1));
+
+        db.reconcile_item_sidecars(item_id, &[]).unwrap();
+        assert!(db.get_item_sidecar(item_id, "s-en").unwrap().is_none());
+        drop(db);
+
+        // Restart: same database file, a new connection.
+        let db = Db::open(&path).unwrap();
+        let readded = db
+            .reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        assert_eq!(readded.added.len(), 1);
+        assert_eq!(readded.added[0].sidecar_generation, Some(2));
+        assert!(
+            readded.added[0].sidecar_generation > first.sidecar_generation,
+            "re-adding must not reuse the deleted generation"
+        );
+    }
+
+    /// A duplicate `track_id` is a caller defect and is refused before any
+    /// write; the prior set and the allocator are untouched.
+    #[test]
+    fn duplicate_track_ids_are_rejected_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+        db.reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        let stored = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+
+        let mut changed = observed("s-en");
+        changed.content_id = "20-first-new-last-new".into();
+        let err = db
+            .reconcile_item_sidecars(item_id, &[changed.clone(), changed])
+            .unwrap_err();
+        assert!(err.contains("duplicate sidecar track_id"), "{err}");
+        assert_eq!(
+            db.get_item_sidecar(item_id, "s-en").unwrap().unwrap(),
+            stored,
+            "the prior set is preserved"
+        );
+
+        // The refused attempt allocated nothing: the next accepted change is 2.
+        let mut next = observed("s-en");
+        next.content_id = "20-first-two-last-two".into();
+        let delta = db.reconcile_item_sidecars(item_id, &[next]).unwrap();
+        assert_eq!(delta.changed[0].after.sidecar_generation, Some(2));
+    }
+
+    /// An invalid stored path is refused before any write, atomically.
+    #[test]
+    fn an_invalid_stored_path_is_rejected_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+
+        let mut bad = observed("s-en");
+        bad.path = "/absolute.srt".into();
+        let err = db.reconcile_item_sidecars(item_id, &[bad]).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        assert!(db.list_item_sidecars(item_id).unwrap().is_empty());
+    }
+
+    /// A write failure inside the set rolls the whole set back: no partial
+    /// delta, no partial membership, and no generation consumed.
+    #[test]
+    fn a_write_failure_rolls_back_the_whole_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let item_id = item_for_sidecars(&db);
+        db.reconcile_item_sidecars(item_id, &[observed("s-en")])
+            .unwrap();
+        let stored = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+
+        // Injected failure: the second insert aborts inside the transaction.
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER sidecar_insert_boom BEFORE INSERT ON media_item_sidecars
+                 WHEN NEW.track_id = 'boom'
+                 BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let mut changed = observed("s-en");
+        changed.content_id = "20-first-edit-last-edit".into();
+        let err = db
+            .reconcile_item_sidecars(item_id, &[changed, observed("boom")])
+            .unwrap_err();
+        assert!(err.contains("injected write failure"), "{err}");
+
+        assert_eq!(
+            db.list_item_sidecars(item_id).unwrap(),
+            vec![stored.clone()],
+            "the failed set leaves the prior membership and generation untouched"
+        );
+
+        db.with_conn(|c| {
+            c.execute_batch("DROP TRIGGER sidecar_insert_boom;")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        // The rolled-back attempt consumed no generation.
+        let mut retry = observed("s-en");
+        retry.content_id = "20-first-edit-last-edit".into();
+        let delta = db.reconcile_item_sidecars(item_id, &[retry]).unwrap();
+        assert_eq!(delta.changed[0].after.sidecar_generation, Some(2));
     }
 
     /// One indexed item with a ready map, both stamped with `content_id`.
@@ -3263,9 +3716,12 @@ mod tests {
             ProbePublication::Published { .. }
         ));
 
-        assert!(
-            db.replace_item_sidecars(id, &[sidecar(id, "s-en")])
+        assert_eq!(
+            db.reconcile_item_sidecars(id, &[observed("s-en")])
                 .unwrap()
+                .added
+                .len(),
+            1
         );
 
         let row = db.get_item(id).unwrap().unwrap();
