@@ -149,6 +149,16 @@ pub struct MediaItemRow {
     pub map_content_id: Option<String>,
     /// Metadata pipeline state: pending | matched | ready | unmatched (ADR-0026).
     pub metadata_status: String,
+    /// ADR-0058: moves when the scanner accepts a change to the observed
+    /// bytes, the source path, or the library-root binding. Always >= 1.
+    pub media_revision: i64,
+    /// ADR-0058: counts accepted publications; independent of media identity.
+    pub probe_revision: i64,
+    /// ADR-0058: the media revision the last publication was certified against,
+    /// or NULL when no revisioned publication has landed.
+    pub probed_media_revision: Option<i64>,
+    /// ADR-0058: the selected absolute video stream index, or NULL.
+    pub video_stream_index: Option<i64>,
 }
 
 /// A stored keyframe map (ADR-0023 §7) whose stamps match live identity.
@@ -368,11 +378,41 @@ impl Db {
     pub fn update_library_path(&self, library_id: i64, path: &str) -> Result<(), String> {
         let root = require_library_root(path)?;
         let conn = self.lock()?;
-        conn.execute(
+        // Reads `libraries.path` before it writes, so take the write lock up
+        // front rather than upgrading a deferred read snapshot (see `write_tx`).
+        let tx = write_tx(&conn)?;
+        // ADR-0058: the library-root binding is part of the media identity a
+        // probe snapshot is captured against, so a root that actually moves
+        // invalidates every item's snapshot exactly once. A no-op write (same
+        // normalized root) must not move a revision.
+        let moved: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM libraries WHERE id = ?1 AND path <> ?2",
+                params![library_id, root],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("check library path change: {e}"))?;
+        tx.execute(
             "UPDATE libraries SET path = ?2 WHERE id = ?1",
             params![library_id, root],
         )
         .map_err(|e| format!("update library path: {e}"))?;
+        if moved > 0 {
+            tx.execute(
+                "UPDATE media_items SET
+                    media_revision = CASE
+                        WHEN media_revision = 9223372036854775807 THEN -1
+                        ELSE media_revision + 1
+                    END,
+                    probed_media_revision = NULL,
+                    probed_content_id = NULL
+                 WHERE library_id = ?1",
+                params![library_id],
+            )
+            .map_err(|e| format!("bump media revision for library {library_id}: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit library path update: {e}"))?;
         Ok(())
     }
 
@@ -415,8 +455,19 @@ impl Db {
             }
             match to_relpath(&lib.path, Path::new(&path)) {
                 Some(rel) => {
+                    // ADR-0058: the stored source path is part of the media
+                    // identity a snapshot is captured against, so rewriting an
+                    // absolute legacy path to a library-relative one moves the
+                    // revision and clears both validity stamps.
                     conn.execute(
-                        "UPDATE media_items SET path = ?2 WHERE id = ?1",
+                        "UPDATE media_items SET path = ?2,
+                            media_revision = CASE
+                                WHEN media_revision = 9223372036854775807 THEN -1
+                                ELSE media_revision + 1
+                            END,
+                            probed_media_revision = NULL,
+                            probed_content_id = NULL
+                         WHERE id = ?1",
                         params![id, rel],
                     )
                     .map_err(|e| format!("repair item {id}: {e}"))?;
@@ -542,7 +593,9 @@ impl Db {
                         probe_status, scan_error, subtitle_status,
                         content_id, probed_content_id,
                         subtitle_content_id, usable_extent_ms, usable_extent_content_id,
-                        map_status, map_content_id, metadata_status
+                        map_status, map_content_id, metadata_status,
+                        media_revision, probe_revision, probed_media_revision,
+                        video_stream_index
                  FROM media_items
                  WHERE library_id = ?1
                  ORDER BY title COLLATE NOCASE, season, episode",
@@ -565,7 +618,9 @@ impl Db {
                     probe_status, scan_error, subtitle_status,
                     content_id, probed_content_id,
                     subtitle_content_id, usable_extent_ms, usable_extent_content_id,
-                    map_status, map_content_id, metadata_status
+                    map_status, map_content_id, metadata_status,
+                    media_revision, probe_revision, probed_media_revision,
+                    video_stream_index
              FROM media_items WHERE id = ?1",
             [id],
             map_item,
@@ -635,28 +690,40 @@ impl Db {
                         year = excluded.year,
                         season = excluded.season,
                         episode = excluded.episode,
-                        duration_ms = NULL,
-                        container = NULL,
-                        video_codec = NULL,
-                        audio_codec = NULL,
-                        audio_channels = NULL,
-                        width = NULL,
-                        height = NULL,
-                        video_bitrate_bps = NULL,
-                        video_frame_rate_num = NULL,
-                        video_frame_rate_den = NULL,
-                        hdr = NULL,
                         probe_status = 'indexed',
                         scan_error = NULL,
                         probed_at = NULL,
                         subtitle_status = 'pending',
                         content_id = excluded.content_id,
-                        probed_content_id = NULL,
                         subtitle_content_id = NULL,
                         usable_extent_ms = NULL,
                         usable_extent_content_id = NULL,
                         map_status = 'pending',
-                        map_content_id = NULL",
+                        map_content_id = NULL,
+                        media_revision = CASE
+                            WHEN excluded.content_id IS NOT NULL
+                             AND media_items.content_id IS NOT NULL
+                             AND excluded.content_id <> media_items.content_id
+                            THEN CASE
+                                WHEN media_revision = 9223372036854775807 THEN -1
+                                ELSE media_revision + 1
+                            END
+                            ELSE media_revision
+                        END,
+                        probed_media_revision = CASE
+                            WHEN excluded.content_id IS NOT NULL
+                             AND media_items.content_id IS NOT NULL
+                             AND excluded.content_id <> media_items.content_id
+                            THEN NULL
+                            ELSE probed_media_revision
+                        END,
+                        probed_content_id = CASE
+                            WHEN excluded.content_id IS NOT NULL
+                             AND media_items.content_id IS NOT NULL
+                             AND excluded.content_id <> media_items.content_id
+                            THEN NULL
+                            ELSE probed_content_id
+                        END",
                 )
                 .map_err(|e| format!("prepare index upsert: {e}"))?;
             for item in items {
@@ -1588,6 +1655,10 @@ fn map_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItemRow> {
         map_status: r.get(29)?,
         map_content_id: r.get(30)?,
         metadata_status: r.get(31)?,
+        media_revision: r.get(32)?,
+        probe_revision: r.get(33)?,
+        probed_media_revision: r.get(34)?,
+        video_stream_index: r.get(35)?,
     })
 }
 
@@ -2243,5 +2314,303 @@ mod tests {
         let job = db.latest_scan_job(lib.id).unwrap().unwrap();
         assert_eq!(job.id, second);
         assert_eq!(job.state, "indexing");
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0058 revision reconciliation
+    // ------------------------------------------------------------------
+
+    fn revision_library(db: &Db, root: &str) -> i64 {
+        db.create_library(&NewLibrary {
+            name: "films".into(),
+            path: root.into(),
+            kind: "movies".into(),
+        })
+        .unwrap()
+        .id
+    }
+
+    fn upsert_observed(
+        db: &Db,
+        library_id: i64,
+        path: &str,
+        mtime_ms: i64,
+        content_id: Option<&str>,
+    ) -> i64 {
+        db.upsert_items_indexed(
+            library_id,
+            &[UpsertItem {
+                path: path.into(),
+                mtime_ms,
+                size_bytes: 2,
+                title: "clip".into(),
+                kind: "movie".into(),
+                year: None,
+                season: None,
+                episode: None,
+                content_id: content_id.map(str::to_string),
+            }],
+        )
+        .unwrap()[0]
+    }
+
+    /// Record a successful legacy probe: technical facts plus the content-id
+    /// validity stamp. `probed_media_revision` is not written by this path
+    /// (publication is a later slice), so tests that need it set it directly.
+    fn record_probe(db: &Db, item_id: i64) {
+        db.apply_probe_update(&ProbeUpdate {
+            item_id,
+            duration_ms: Some(1000),
+            container: Some("matroska".into()),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            audio_channels: Some(2),
+            width: Some(1920),
+            height: Some(1080),
+            video_bitrate_bps: Some(5_000_000),
+            video_frame_rate_num: Some(24),
+            video_frame_rate_den: Some(1),
+            hdr: Some("none".into()),
+            probe_status: "probed".into(),
+            scan_error: None,
+        })
+        .unwrap();
+    }
+
+    fn set_probed_media_revision(db: &Db, item_id: i64, revision: i64) {
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET probed_media_revision = ?2 WHERE id = ?1",
+                params![item_id, revision],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+    }
+
+    fn raw_media_revision(db: &Db, item_id: i64) -> i64 {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT media_revision FROM media_items WHERE id = ?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn new_item_starts_at_revision_one_and_unprobed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.media_revision, 1);
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probed_content_id, None);
+        assert_eq!(row.video_stream_index, None);
+    }
+
+    /// The observation is unchanged when the content identity is: a touch must
+    /// not move the revision or clear the validity stamps.
+    #[test]
+    fn unchanged_observation_does_not_move_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        record_probe(&db, id);
+        set_probed_media_revision(&db, id, 1);
+
+        upsert_observed(&db, lib, "clip.mkv", 2, Some("1-aaa-bbb"));
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.media_revision, 1, "a touch is not a media change");
+        assert_eq!(row.probed_media_revision, Some(1));
+        assert_eq!(row.probed_content_id.as_deref(), Some("1-aaa-bbb"));
+    }
+
+    /// A different content identity moves the revision exactly once and clears
+    /// both validity stamps. Repeating the same observation moves nothing.
+    #[test]
+    fn changed_content_identity_moves_the_revision_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        record_probe(&db, id);
+        set_probed_media_revision(&db, id, 1);
+
+        upsert_observed(&db, lib, "clip.mkv", 2, Some("2-ccc-ddd"));
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.media_revision, 2, "one accepted change, one increment");
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probed_content_id, None);
+        assert_eq!(
+            row.probe_revision, 0,
+            "identity change is not a publication"
+        );
+
+        upsert_observed(&db, lib, "clip.mkv", 3, Some("2-ccc-ddd"));
+        assert_eq!(
+            raw_media_revision(&db, id),
+            2,
+            "the same identity again is not a second change"
+        );
+    }
+
+    /// ADR-0058: an invalid validity stamp makes the prior facts
+    /// diagnostic-only; the facts themselves are not cleared.
+    #[test]
+    fn identity_change_keeps_legacy_technical_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        record_probe(&db, id);
+
+        upsert_observed(&db, lib, "clip.mkv", 2, Some("2-ccc-ddd"));
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.duration_ms, Some(1000));
+        assert_eq!(row.container.as_deref(), Some("matroska"));
+        assert_eq!(row.video_codec.as_deref(), Some("h264"));
+        assert_eq!(row.width, Some(1920));
+        assert_eq!(row.probed_content_id, None, "stamp cleared");
+        assert_eq!(row.media_revision, 2);
+    }
+
+    /// A library-root move rebinds every item, so it moves each revision once
+    /// and clears the stamps. Re-stating the same root is a no-op.
+    #[test]
+    fn library_root_change_moves_the_revision_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        record_probe(&db, id);
+        set_probed_media_revision(&db, id, 1);
+
+        db.update_library_path(lib, "/films2").unwrap();
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.media_revision, 2);
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probed_content_id, None);
+
+        db.update_library_path(lib, "/films2").unwrap();
+        assert_eq!(
+            raw_media_revision(&db, id),
+            2,
+            "the same root is not a second change"
+        );
+
+        db.update_library_path(lib, "/films3").unwrap();
+        assert_eq!(raw_media_revision(&db, id), 3);
+    }
+
+    /// A legacy absolute stored path is a different source path from the
+    /// relative one the repair writes, so the repair moves the revision once.
+    #[test]
+    fn legacy_path_repair_moves_the_revision_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = db
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO media_items
+                        (library_id, path, mtime_ms, size_bytes, title, kind,
+                         content_id, probed_content_id, media_revision, probe_revision)
+                     VALUES (?1, '/films/clip.mkv', 1, 2, 'clip', 'movie',
+                             '1-aaa-bbb', '1-aaa-bbb', 1, 0)",
+                    params![lib],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(c.last_insert_rowid())
+            })
+            .unwrap();
+
+        let unresolved = db.repair_library_paths(lib).unwrap();
+
+        assert_eq!(unresolved, 0);
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.path, "clip.mkv");
+        assert_eq!(row.media_revision, 2);
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probed_content_id, None);
+    }
+
+    /// Sidecars belong to the item but not to its media identity, so replacing
+    /// them moves neither revision.
+    #[test]
+    fn sidecar_only_change_moves_neither_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        record_probe(&db, id);
+        set_probed_media_revision(&db, id, 1);
+
+        assert!(
+            db.replace_item_sidecars(id, &[sidecar(id, "s-en")])
+                .unwrap()
+        );
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.media_revision, 1);
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probed_media_revision, Some(1));
+        assert_eq!(row.probed_content_id.as_deref(), Some("1-aaa-bbb"));
+    }
+
+    /// The revision is bounded, and the increment refuses to wrap: at the
+    /// maximum the write aborts and the row is left as it was.
+    #[test]
+    fn media_revision_overflow_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET media_revision = ?2 WHERE id = ?1",
+                params![id, i64::MAX],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let err = db
+            .upsert_items_indexed(
+                lib,
+                &[UpsertItem {
+                    path: "clip.mkv".into(),
+                    mtime_ms: 2,
+                    size_bytes: 2,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some("2-ccc-ddd".into()),
+                }],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("check") || err.to_lowercase().contains("constraint"),
+            "overflow must abort on the revision CHECK, got: {err}"
+        );
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.media_revision, i64::MAX, "the abort rolls back");
+        assert_eq!(row.content_id.as_deref(), Some("1-aaa-bbb"));
     }
 }

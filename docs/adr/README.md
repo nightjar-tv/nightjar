@@ -73,6 +73,7 @@ not here — this page is the reference, not the tour.
 | [0055](0055-a-far-scrub-is-a-segment-miss.md) | A far scrub is a segment miss, not a POST | **Proposed** | — | — |
 | [0056](0056-reproducible-release-input-manifest.md) | A reproducible release input manifest | **Accepted** (2026-09-11) | — | — |
 | [0057](0057-no-tvdb-api-in-v1.md) | No TheTVDB API integration in v1 | **Accepted** (2026-09-12) | — | — |
+| [0058](0058-revision-safe-probe-snapshots.md) | Revision-safe atomic probe snapshots | **Accepted** (2026-09-14) | — | — |
 
 ## Why the numbers jump from 0043 to 0046
 
