@@ -345,6 +345,17 @@ pub enum ScanTrigger {
     FollowUp,
 }
 
+impl ScanTrigger {
+    /// Manual intent: the operator (or library create) asked for the walk, so
+    /// it must observe the tree as it is now instead of reusing the
+    /// per-directory mtime cache. A `FollowUp` exists only because a manual
+    /// request coalesced onto a running job, so it carries the same intent.
+    /// The periodic poll keeps the cache (ADR-0015).
+    fn is_fresh_walk(self) -> bool {
+        !matches!(self, ScanTrigger::Poll)
+    }
+}
+
 /// Request a full-library scan (ADR-0015). Entry for poll, manual scan, library
 /// create, and internal follow-up — not for notify creates ([`hint_ingest`]).
 ///
@@ -388,8 +399,9 @@ pub fn request_scan(
     let job_id = db.create_scan_job(library_id)?;
     let db_worker = Arc::clone(&db);
     let pool_worker = Arc::clone(&pool);
+    let fresh = trigger.is_fresh_walk();
     spawn_job_worker(&db, job_id, "scan", None, move || {
-        let outcome = match run_scan_job(&db_worker, &pool_worker, job_id, library_id) {
+        let outcome = match run_scan_job(&db_worker, &pool_worker, job_id, library_id, fresh) {
             Ok(probe_duration_ms) => Some(probe_duration_ms),
             Err(e) => {
                 tracing::error!(job_id, library_id, error = %e, "scan job failed");
@@ -515,6 +527,7 @@ pub fn hint_ingest(
 
     if let Some(row) = matches.first()
         && row.mtime_ms == mtime_ms
+        && row.size_bytes == size_bytes
     {
         if row.probe_status == "indexed" {
             let abs = resolve_media_path(&library_root, &row.path);
@@ -734,7 +747,7 @@ fn run_repoint_job(
         let _ = db.repair_library_paths(library_id)?;
         let _ = pool.set_library_reachability(library_id, &candidate, true);
         pool.replace_walk_cache(library_id, dry_cache);
-        run_index_pass(db, pool, job_id, library_id, Some(outcome), &probes)?;
+        run_index_pass(db, pool, job_id, library_id, Some(outcome), false, &probes)?;
     }
     finish_scan_probes(pool, library_id, probes)
 }
@@ -744,9 +757,10 @@ fn run_scan_job(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
+    fresh: bool,
 ) -> Result<u64, String> {
     db.set_scan_job_state(job_id, "indexing")?;
-    run_index_and_probe(db, pool, job_id, library_id)
+    run_index_and_probe(db, pool, job_id, library_id, fresh)
 }
 
 fn run_index_and_probe(
@@ -754,11 +768,12 @@ fn run_index_and_probe(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
+    fresh: bool,
 ) -> Result<u64, String> {
     let probes = pool.start_probe_batch();
     {
         let _epoch = pool.enter_index_epoch(library_id);
-        run_index_pass(db, pool, job_id, library_id, None, &probes)?;
+        run_index_pass(db, pool, job_id, library_id, None, fresh, &probes)?;
     }
     finish_scan_probes(pool, library_id, probes)
 }
@@ -805,6 +820,11 @@ fn complete_job(db: &Db, job_id: i64, library_id: i64, probe_duration_ms: u64) {
 /// When `prewalked` is `Some`, the file list is reused (repoint: same cold walk
 /// as the retain dry-run). Caller must have reseeded WalkCache for the new root.
 ///
+/// When `fresh` is true (manual scan), every directory is re-listed and the
+/// shared walk cache is refreshed from that pass, so a file edited in place
+/// under an unchanged parent mtime is still observed. Automatic scans reuse the
+/// cache (ADR-0015).
+///
 /// Probes are pushed into `probes` as they are discovered rather than returned
 /// as a batch for the caller to enqueue afterwards (ADR-0004 §2.4). Returns how
 /// many were pushed. Note that the readdir walk still runs to completion before
@@ -816,6 +836,7 @@ fn run_index_pass(
     job_id: i64,
     library_id: i64,
     prewalked: Option<walk::WalkOutcome>,
+    fresh: bool,
     probes: &pool::ProbeBatch,
 ) -> Result<usize, String> {
     let lib = db
@@ -862,6 +883,17 @@ fn run_index_pass(
         let (cache_warm, outcome) = if let Some(outcome) = prewalked {
             // Repoint reseeded cache from the dry-run; treat as warm for next poll.
             (true, outcome)
+        } else if fresh {
+            // Manual scan: re-list every directory so an in-place edit under an
+            // unchanged parent mtime is observed, then keep the refreshed cache
+            // for the next automatic poll. `cache_warm` still reports whether
+            // the library had a prior index, which is what gates sidecar
+            // rediscovery on the directories whose mtime moved.
+            let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
+            let outcome = pool.with_walk_cache(library_id, |cache| {
+                walk::walk_media_files_fresh(root, cache)
+            })?;
+            (cache_warm, outcome)
         } else {
             let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
             let outcome = pool.with_walk_cache(library_id, |cache| {
@@ -971,7 +1003,9 @@ fn run_index_pass(
                     );
                     continue;
                 }
-                Some([row]) if row.mtime_ms == file.mtime_ms => {
+                Some([row])
+                    if row.mtime_ms == file.mtime_ms && row.size_bytes == file.size_bytes =>
+                {
                     unchanged += 1;
                     if row.probe_status == "indexed" {
                         let abs = resolve_media_path(&library_root, &row.path);
@@ -1020,6 +1054,7 @@ fn run_index_pass(
                                 id: 0,
                                 path: store_path,
                                 mtime_ms: file.mtime_ms,
+                                size_bytes: file.size_bytes,
                                 probe_status: "indexed".into(),
                             }],
                         );
@@ -1177,7 +1212,7 @@ fn run_index_pass(
                     continue;
                 }
                 let row = &rows[0];
-                if row.mtime_ms != file.mtime_ms {
+                if row.mtime_ms != file.mtime_ms || row.size_bytes != file.size_bytes {
                     continue;
                 }
                 let item_id = row.id;
@@ -1514,12 +1549,22 @@ mod tests {
         wait_job(&db, job0);
         assert_eq!(db.count_items(lib.id).unwrap(), 2, "setup: A and B indexed");
 
+        // Scans 2-5 use the automatic poll: manual scans now walk fresh
+        // (SCAN-D2A), and this regression is about the cached path, so the
+        // poll is the trigger that exercises it.
+        //
         // Scan 2: B's stat fails, so the fresh listing is partial. The dir mtime
         // moved, so this pass re-lists and caches the partial result.
         thread::sleep(Duration::from_millis(1100));
         fs::remove_file(&b).unwrap();
         symlink("missing-target.mkv", &b).unwrap();
-        let job1 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job1 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
         wait_job(&db, job1);
         assert_eq!(
             db.count_items(lib.id).unwrap(),
@@ -1529,7 +1574,13 @@ mod tests {
 
         // Scan 3: same directory mtime. The cached partial listing must not be
         // reused, so the doubt persists and B's row is kept.
-        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job2 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
         wait_job(&db, job2);
         let job2_row = db.get_scan_job(job2).unwrap().unwrap();
         assert_eq!(
@@ -1544,7 +1595,13 @@ mod tests {
         thread::sleep(Duration::from_millis(1100));
         fs::remove_file(&b).unwrap();
         fs::write(&b, b"b2").unwrap();
-        let job3 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job3 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
         wait_job(&db, job3);
         assert_eq!(
             db.count_items(lib.id).unwrap(),
@@ -1555,7 +1612,13 @@ mod tests {
         // Scan 5: B is really gone. A complete listing deletes it normally.
         thread::sleep(Duration::from_millis(1100));
         fs::remove_file(&b).unwrap();
-        let job4 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let job4 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
         wait_job(&db, job4);
         let job4_row = db.get_scan_job(job4).unwrap().unwrap();
         assert_eq!(job4_row.removed, 1, "a real removal must still delete");
@@ -2770,6 +2833,237 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         assert_eq!(completed, 2, "manual dirty must spawn one follow-up");
+    }
+
+    /// SCAN-D2A: an in-place edit keeps the parent directory mtime, so the
+    /// automatic poll reuses its cached listing and misses the change. A manual
+    /// scan must re-list and observe it. The poll is the negative control: it
+    /// proves the cache is still the automatic path.
+    #[cfg(unix)]
+    #[test]
+    fn manual_scan_observes_in_place_edit_with_unchanged_parent_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let file = media.join("Movie.mp4");
+        fs::write(&file, b"v1").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+        assert_eq!(db.list_items(lib.id).unwrap()[0].size_bytes, 2);
+
+        // In-place edit: the file mtime moves, the parent mtime is put back.
+        let dir_mtime = fs::metadata(&media).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(&file, b"v2-longer").unwrap();
+        std::fs::File::open(&media)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(dir_mtime))
+            .unwrap();
+
+        let poll = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        wait_job(&db, poll);
+        let poll_row = db.get_scan_job(poll).unwrap().unwrap();
+        assert_eq!(
+            poll_row.updated, 0,
+            "the cached poll must not observe the in-place edit"
+        );
+        assert_eq!(db.list_items(lib.id).unwrap()[0].size_bytes, 2);
+
+        let manual = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, manual);
+        let manual_row = db.get_scan_job(manual).unwrap().unwrap();
+        assert_eq!(
+            manual_row.updated, 1,
+            "the manual scan must observe the edit"
+        );
+        assert_eq!(db.list_items(lib.id).unwrap()[0].size_bytes, 9);
+    }
+
+    /// SCAN-D2A: a replacement that restores the file mtime but changes the
+    /// size must count as updated. The mtime alone cannot see it; the size in
+    /// the item comparison can. The repeat scan is the negative control: an
+    /// unchanged (mtime, size) pair is `unchanged`, not rewritten.
+    #[test]
+    fn replacement_with_restored_mtime_and_new_size_is_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let file = media.join("Movie.mp4");
+        fs::write(&file, b"v1").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+        let before = db.list_items(lib.id).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].size_bytes, 2);
+        let before_mtime = before[0].mtime_ms;
+
+        // Replace with longer content, then put the original mtime back.
+        fs::write(&file, b"v2-longer").unwrap();
+        std::fs::File::open(&file)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + Duration::from_millis(before_mtime as u64),
+                ),
+            )
+            .unwrap();
+        let restored_mtime = fs::metadata(&file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(
+            restored_mtime, before_mtime,
+            "setup: the file mtime must match the indexed value"
+        );
+
+        let manual = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, manual);
+        let row = db.get_scan_job(manual).unwrap().unwrap();
+        assert_eq!(row.updated, 1, "a size change at the same mtime is updated");
+        assert_eq!(db.list_items(lib.id).unwrap()[0].size_bytes, 9);
+
+        // Same (mtime, size) again: unchanged, no rewrite.
+        let repeat = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, repeat);
+        let row = db.get_scan_job(repeat).unwrap().unwrap();
+        assert_eq!(row.updated, 0, "unchanged (mtime, size) must not rewrite");
+        assert_eq!(row.unchanged, 1);
+    }
+
+    /// SCAN-D2A: a manual request that coalesces onto an active automatic scan
+    /// must produce a follow-up that walks fresh. The active poll is a warm
+    /// cached walk, so it cannot see the in-place edit; the follow-up must.
+    #[cfg(unix)]
+    #[test]
+    fn manual_during_active_scan_follow_up_observes_in_place_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let target = media.join("target.mp4");
+        fs::write(&target, b"v1").unwrap();
+        for i in 0..100 {
+            fs::write(media.join(format!("f{i:03}.mp4")), b"x").unwrap();
+        }
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        // Seed the cache (manual scan) and index the target.
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+        assert_eq!(
+            db.list_items(lib.id)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.path == "target.mp4")
+                .unwrap()
+                .size_bytes,
+            2
+        );
+
+        // Hold the index epoch so the active poll cannot run its walk while we
+        // edit the file and coalesce a manual request onto it.
+        let epoch = pool.enter_index_epoch(lib.id);
+        let job1 = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+
+        let dir_mtime = fs::metadata(&media).unwrap().modified().unwrap();
+        fs::write(&target, b"v2-longer").unwrap();
+        std::fs::File::open(&media)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(dir_mtime))
+            .unwrap();
+        let coalesced = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Manual,
+        )
+        .unwrap();
+        assert_eq!(coalesced, job1, "manual during active must coalesce");
+        drop(epoch);
+
+        wait_job(&db, job1);
+        let job1_row = db.get_scan_job(job1).unwrap().unwrap();
+        assert_eq!(
+            job1_row.updated, 0,
+            "the cached poll must not observe the in-place edit"
+        );
+
+        // The coalesced follow-up is a fresh walk and must observe it.
+        let follow = job1 + 1;
+        let mut follow_row = None;
+        for _ in 0..400 {
+            if let Ok(Some(j)) = db.get_scan_job(follow)
+                && (j.state == "completed" || j.state == "failed")
+            {
+                follow_row = Some(j);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let follow_row = follow_row.expect("coalesced follow-up job must exist");
+        assert_eq!(
+            follow_row.state, "completed",
+            "{:?}",
+            follow_row.error_message
+        );
+        assert_eq!(
+            follow_row.updated, 1,
+            "the fresh follow-up must observe the in-place edit"
+        );
+        assert_eq!(
+            db.list_items(lib.id)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.path == "target.mp4")
+                .unwrap()
+                .size_bytes,
+            9
+        );
     }
 
     #[test]

@@ -229,6 +229,7 @@ pub struct LibraryPool {
     walk_caches: Mutex<HashMap<i64, WalkCache>>,
     last_index_ms: AtomicU64,
     /// Manual POST .../scan while active: one follow-up after the job ends.
+    /// The follow-up carries the manual intent, so it walks fresh (SCAN-D2A).
     scan_dirty: Mutex<HashSet<i64>>,
     /// Path-hint upsert while a scan is active: skip delete_missing on that
     /// job (row may be outside the walk keep-set). Does not schedule follow-up.
@@ -414,6 +415,8 @@ impl LibraryPool {
     }
 
     /// Manual scan coalesce: one follow-up after the active job finishes.
+    /// The follow-up is a fresh walk, so a file edited during the active scan
+    /// is observed even when its parent directory mtime did not move.
     pub fn mark_scan_dirty(&self, library_id: i64) {
         self.scan_dirty
             .lock()

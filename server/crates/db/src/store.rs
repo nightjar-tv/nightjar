@@ -238,6 +238,7 @@ pub struct ItemPathRow {
     pub id: i64,
     pub path: String,
     pub mtime_ms: i64,
+    pub size_bytes: i64,
     pub probe_status: String,
 }
 
@@ -467,7 +468,7 @@ impl Db {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, path, mtime_ms, probe_status FROM media_items
+                "SELECT id, path, mtime_ms, size_bytes, probe_status FROM media_items
                  WHERE library_id = ?1",
             )
             .map_err(|e| format!("prepare item paths: {e}"))?;
@@ -477,7 +478,8 @@ impl Db {
                     id: r.get(0)?,
                     path: r.get(1)?,
                     mtime_ms: r.get(2)?,
-                    probe_status: r.get(3)?,
+                    size_bytes: r.get(3)?,
+                    probe_status: r.get(4)?,
                 })
             })
             .map_err(|e| format!("query item paths: {e}"))?;
