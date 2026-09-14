@@ -326,7 +326,7 @@ pub struct ProbeExpectation {
 ///
 /// Every scalar and both inventories travel together: a partial success is not
 /// a publication.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeSnapshot {
     pub duration_ms: Option<i64>,
     pub container: Option<String>,
@@ -348,6 +348,38 @@ pub struct ProbeSnapshot {
     /// Derived by [`crate::status::classify_subtitle_status`] (ADR-0041
     /// Decision 2).
     pub subtitle_status: String,
+}
+
+/// The certified result of one coherent probe read (ADR-0058 Reads).
+///
+/// It carries the stored [`ProbeSnapshot`] together with the revisions and
+/// identity that certify it, so a consumer never has to re-check the stamps
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedProbeSnapshot {
+    pub item_id: i64,
+    /// The media revision the snapshot was certified against; equal to the
+    /// row's `probed_media_revision`.
+    pub media_revision: i64,
+    /// The positive publication counter every scalar and child row bears.
+    pub probe_revision: i64,
+    /// The nonempty identity the snapshot was certified against.
+    pub content_id: String,
+    pub snapshot: ProbeSnapshot,
+}
+
+/// One coherent probe read for a media item (ADR-0058 Reads).
+///
+/// [`Db::coherent_probe_read`] returns `Ok(None)` when no such item exists, so
+/// an unknown item is never conflated with an existing item that is not
+/// certified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoherentProbeRead {
+    /// The stored facts are certified against the current media revision and
+    /// identity, and every child row carries the same positive probe revision.
+    Ready(Box<CertifiedProbeSnapshot>),
+    /// The item exists but its stored facts are not certified.
+    Unverified,
 }
 
 /// One probe run, ready to publish against its expectation (ADR-0058).
@@ -394,6 +426,33 @@ pub enum ProbeAccounting {
     ErrorOnly,
     /// Stale, superseded, or cancelled work: no count.
     None,
+}
+
+// Test-only rendezvous inside [`Db::coherent_probe_read`].
+//
+// The hook runs after the item SELECT has taken the transaction's read
+// snapshot and before the inventory SELECTs. A test uses it to commit a new
+// generation through a second connection in that window, which is the only
+// schedule that distinguishes one read transaction from a sequence of
+// autocommit reads.
+#[cfg(test)]
+thread_local! {
+    static PROBE_READ_AFTER_ITEM_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_probe_read_after_item_hook(hook: impl FnOnce() + 'static) {
+    PROBE_READ_AFTER_ITEM_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_probe_read_after_item_hook() {
+    PROBE_READ_AFTER_ITEM_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 impl Db {
@@ -955,6 +1014,164 @@ impl Db {
         // Reads before it writes, so take the write lock up front; `with_write_tx`
         // retries the lock rather than losing the publication to a busy peer.
         with_write_tx(&conn, |tx| publish_probe_tx(tx, expectation, outcome))
+    }
+
+    /// Read one item's certified probe snapshot inside one database read
+    /// transaction (ADR-0058 Reads).
+    ///
+    /// Returns `Ok(None)` for an unknown item. An existing item is
+    /// [`CoherentProbeRead::Ready`] only when `probe_status` is `probed`,
+    /// `probe_revision` is positive, `probed_media_revision` equals
+    /// `media_revision`, `content_id` is nonempty and equals
+    /// `probed_content_id`, and every stored audio and subtitle row bears that
+    /// same probe revision. Anything else is [`CoherentProbeRead::Unverified`];
+    /// a partially trusted snapshot is never returned.
+    ///
+    /// The item row and both inventories come from one deferred transaction.
+    /// A deferred read takes a single WAL snapshot at its first statement, so a
+    /// concurrent publication is either fully visible or not at all: the read
+    /// sees the prior coherent generation or the next one, never a mix.
+    pub fn coherent_probe_read(&self, item_id: i64) -> Result<Option<CoherentProbeRead>, String> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin probe read for item {item_id}: {e}"))?;
+
+        let item = tx
+            .query_row(
+                "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
+                        year, season, episode, duration_ms, container, video_codec,
+                        audio_codec, audio_channels, width, height, video_bitrate_bps,
+                        video_frame_rate_num, video_frame_rate_den, hdr,
+                        probe_status, scan_error, subtitle_status,
+                        content_id, probed_content_id,
+                        subtitle_content_id, usable_extent_ms, usable_extent_content_id,
+                        map_status, map_content_id, metadata_status,
+                        media_revision, probe_revision, probed_media_revision,
+                        video_stream_index
+                 FROM media_items WHERE id = ?1",
+                [item_id],
+                map_item,
+            )
+            .optional()
+            .map_err(|e| format!("read item {item_id}: {e}"))?;
+        let Some(item) = item else {
+            return Ok(None);
+        };
+
+        // The item SELECT above fixed this transaction's read snapshot; a test
+        // can commit a new generation before the inventory SELECTs run.
+        #[cfg(test)]
+        run_probe_read_after_item_hook();
+
+        // The child revision is read with the row: the returned inventory rows
+        // do not carry it, but certification requires every stored row to match
+        // the item's publication.
+        let audio = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT probe_revision, stream_index, codec, language, channels,
+                            channel_layout, title, is_default
+                     FROM media_item_audio_tracks
+                     WHERE media_item_id = ?1
+                     ORDER BY stream_index",
+                )
+                .map_err(|e| format!("prepare audio inventory for item {item_id}: {e}"))?;
+            stmt.query_map([item_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    AudioTrackRow {
+                        stream_index: r.get(1)?,
+                        codec: r.get(2)?,
+                        language: r.get(3)?,
+                        channels: r.get(4)?,
+                        channel_layout: r.get(5)?,
+                        title: r.get(6)?,
+                        is_default: r.get::<_, i64>(7)? != 0,
+                    },
+                ))
+            })
+            .map_err(|e| format!("read audio inventory for item {item_id}: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read audio inventory for item {item_id}: {e}"))?
+        };
+
+        let subtitles = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT probe_revision, media_item_id, stream_index, codec, language,
+                            title, forced, sdh, kind
+                     FROM media_item_subtitle_tracks
+                     WHERE media_item_id = ?1
+                     ORDER BY stream_index",
+                )
+                .map_err(|e| format!("prepare subtitle inventory for item {item_id}: {e}"))?;
+            stmt.query_map([item_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    SubtitleTrackRow {
+                        media_item_id: r.get(1)?,
+                        stream_index: r.get(2)?,
+                        codec: r.get(3)?,
+                        language: r.get(4)?,
+                        title: r.get(5)?,
+                        forced: r.get::<_, i64>(6)? != 0,
+                        sdh: r.get::<_, i64>(7)? != 0,
+                        kind: r.get(8)?,
+                    },
+                ))
+            })
+            .map_err(|e| format!("read subtitle inventory for item {item_id}: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read subtitle inventory for item {item_id}: {e}"))?
+        };
+
+        tx.commit()
+            .map_err(|e| format!("end probe read for item {item_id}: {e}"))?;
+
+        let Some(content_id) = item.content_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Ok(Some(CoherentProbeRead::Unverified));
+        };
+        let certified = item.probe_status == "probed"
+            && item.probe_revision > 0
+            && item.probed_media_revision == Some(item.media_revision)
+            && item.probed_content_id.as_deref() == Some(content_id)
+            && audio
+                .iter()
+                .all(|(revision, _)| *revision == item.probe_revision)
+            && subtitles
+                .iter()
+                .all(|(revision, _)| *revision == item.probe_revision);
+        if !certified {
+            return Ok(Some(CoherentProbeRead::Unverified));
+        }
+
+        let content_id = content_id.to_string();
+        Ok(Some(CoherentProbeRead::Ready(Box::new(
+            CertifiedProbeSnapshot {
+                item_id: item.id,
+                media_revision: item.media_revision,
+                probe_revision: item.probe_revision,
+                content_id,
+                snapshot: ProbeSnapshot {
+                    duration_ms: item.duration_ms,
+                    container: item.container,
+                    video_codec: item.video_codec,
+                    video_stream_index: item.video_stream_index,
+                    audio_codec: item.audio_codec,
+                    audio_channels: item.audio_channels,
+                    width: item.width,
+                    height: item.height,
+                    video_bitrate_bps: item.video_bitrate_bps,
+                    video_frame_rate_num: item.video_frame_rate_num,
+                    video_frame_rate_den: item.video_frame_rate_den,
+                    hdr: item.hdr,
+                    audio_tracks: audio.into_iter().map(|(_, track)| track).collect(),
+                    subtitle_tracks: subtitles.into_iter().map(|(_, track)| track).collect(),
+                    subtitle_status: item.subtitle_status,
+                },
+            },
+        ))))
     }
 
     pub fn set_subtitle_status(&self, item_id: i64, status: &str) -> Result<(), String> {
@@ -3624,5 +3841,479 @@ mod tests {
         assert_eq!(row.probed_content_id, None, "no certification");
         assert_eq!(row.probed_media_revision, None);
         assert_eq!(row.probe_revision, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0058 coherent probe read
+    // ------------------------------------------------------------------
+
+    /// The columns the certification gate reads, seeded directly so each case
+    /// controls status, revisions, and identity.
+    #[derive(Clone, Copy)]
+    struct Seed {
+        probe_status: &'static str,
+        media_revision: i64,
+        probe_revision: i64,
+        probed_media_revision: Option<i64>,
+        content_id: Option<&'static str>,
+        probed_content_id: Option<&'static str>,
+    }
+
+    fn seed_certifiable_item(db: &Db, library_id: i64, path: &str, seed: &Seed) -> i64 {
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO media_items
+                    (library_id, path, mtime_ms, size_bytes, title, kind,
+                     probe_status, media_revision, probe_revision,
+                     probed_media_revision, content_id, probed_content_id)
+                 VALUES (?1, ?2, 1, 2, 'clip', 'movie', ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    library_id,
+                    path,
+                    seed.probe_status,
+                    seed.media_revision,
+                    seed.probe_revision,
+                    seed.probed_media_revision,
+                    seed.content_id,
+                    seed.probed_content_id,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(c.last_insert_rowid())
+        })
+        .unwrap()
+    }
+
+    /// A publication's scalars and both inventories come back exactly, and each
+    /// inventory is ordered by absolute stream index regardless of insert order.
+    #[test]
+    fn coherent_read_returns_ready_with_exact_contents_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        let mut published = complete_snapshot(id);
+        published.audio_tracks = vec![
+            AudioTrackRow {
+                stream_index: 3,
+                codec: "opus".into(),
+                language: Some("jpn".into()),
+                channels: Some(6),
+                channel_layout: Some("5.1".into()),
+                title: Some("Surround".into()),
+                is_default: false,
+            },
+            AudioTrackRow {
+                stream_index: 1,
+                codec: "aac".into(),
+                language: Some("eng".into()),
+                channels: Some(2),
+                channel_layout: Some("stereo".into()),
+                title: Some("Main".into()),
+                is_default: true,
+            },
+            AudioTrackRow {
+                stream_index: 2,
+                codec: "flac".into(),
+                language: None,
+                channels: None,
+                channel_layout: None,
+                title: None,
+                is_default: false,
+            },
+        ];
+        published.subtitle_tracks = vec![
+            SubtitleTrackRow {
+                media_item_id: id,
+                stream_index: 5,
+                codec: "ass".into(),
+                language: Some("eng".into()),
+                title: Some("Signs".into()),
+                forced: true,
+                sdh: false,
+                kind: "ass".into(),
+            },
+            SubtitleTrackRow {
+                media_item_id: id,
+                stream_index: 4,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                title: None,
+                forced: false,
+                sdh: true,
+                kind: "text".into(),
+            },
+        ];
+        published.subtitle_status = "eligible".into();
+
+        let publication = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Success(Box::new(published.clone())),
+            )
+            .unwrap();
+        assert_eq!(
+            publication,
+            ProbePublication::Published {
+                media_revision: 1,
+                probe_revision: 1,
+            }
+        );
+
+        let read = db.coherent_probe_read(id).unwrap().unwrap();
+        let CoherentProbeRead::Ready(ready) = read else {
+            panic!("a certified publication must read as ready");
+        };
+        assert_eq!(ready.item_id, id);
+        assert_eq!(ready.media_revision, 1);
+        assert_eq!(ready.probe_revision, 1);
+        assert_eq!(ready.content_id, "1-aaa-bbb");
+
+        let mut expected = published;
+        expected.audio_tracks.sort_by_key(|t| t.stream_index);
+        expected.subtitle_tracks.sort_by_key(|t| t.stream_index);
+        assert_eq!(ready.snapshot, expected);
+        assert_eq!(
+            ready
+                .snapshot
+                .audio_tracks
+                .iter()
+                .map(|t| t.stream_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ready
+                .snapshot
+                .subtitle_tracks
+                .iter()
+                .map(|t| t.stream_index)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    /// The certification gate, positive and negative: status, revision
+    /// positivity, media-revision agreement, and identity presence and match.
+    /// The certified row with empty inventories is the control that proves the
+    /// gate can return `Ready`.
+    #[test]
+    fn coherent_read_certifies_only_a_matching_positive_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+
+        let cases: &[(&str, Seed, bool)] = &[
+            (
+                "certified",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: Some("1-aaa"),
+                    probed_content_id: Some("1-aaa"),
+                },
+                true,
+            ),
+            (
+                "indexed",
+                Seed {
+                    probe_status: "indexed",
+                    media_revision: 1,
+                    probe_revision: 0,
+                    probed_media_revision: None,
+                    content_id: Some("1-aaa"),
+                    probed_content_id: None,
+                },
+                false,
+            ),
+            (
+                "error",
+                Seed {
+                    probe_status: "error",
+                    media_revision: 1,
+                    probe_revision: 0,
+                    probed_media_revision: None,
+                    content_id: Some("1-aaa"),
+                    probed_content_id: None,
+                },
+                false,
+            ),
+            (
+                "unavailable",
+                Seed {
+                    probe_status: "unavailable",
+                    media_revision: 1,
+                    probe_revision: 0,
+                    probed_media_revision: None,
+                    content_id: Some("1-aaa"),
+                    probed_content_id: None,
+                },
+                false,
+            ),
+            (
+                "legacy probed at revision zero",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 0,
+                    probed_media_revision: None,
+                    content_id: Some("1-aaa"),
+                    probed_content_id: None,
+                },
+                false,
+            ),
+            (
+                "NULL identity",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: None,
+                    probed_content_id: None,
+                },
+                false,
+            ),
+            (
+                "empty identity",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: Some(""),
+                    probed_content_id: Some(""),
+                },
+                false,
+            ),
+            (
+                "identity mismatch",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: Some("1-aaa"),
+                    probed_content_id: Some("2-bbb"),
+                },
+                false,
+            ),
+            (
+                "identity stamp absent",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: Some("1-aaa"),
+                    probed_content_id: None,
+                },
+                false,
+            ),
+            (
+                "media revision mismatch",
+                Seed {
+                    probe_status: "probed",
+                    media_revision: 2,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: Some("1-aaa"),
+                    probed_content_id: Some("1-aaa"),
+                },
+                false,
+            ),
+        ];
+
+        for (i, (name, seed, ready)) in cases.iter().enumerate() {
+            let id = seed_certifiable_item(&db, lib, &format!("clip{i}.mkv"), seed);
+            let read = db.coherent_probe_read(id).unwrap().unwrap();
+            if *ready {
+                assert!(
+                    matches!(read, CoherentProbeRead::Ready(_)),
+                    "{name}: expected ready, got {read:?}"
+                );
+            } else {
+                assert_eq!(read, CoherentProbeRead::Unverified, "{name}");
+            }
+        }
+    }
+
+    /// Every stored child must bear the item's positive probe revision. A row
+    /// left at the migration default zero, or one from another publication,
+    /// makes the whole read `Unverified` rather than a partial snapshot.
+    #[test]
+    fn coherent_read_rejects_mixed_or_missing_child_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+
+        let cases: &[(&str, &[i64], &[i64])] = &[
+            ("audio row at revision zero", &[1, 0], &[1]),
+            ("subtitle row at revision zero", &[1], &[1, 0]),
+            ("subtitle row from a newer publication", &[1], &[1, 2]),
+        ];
+        for (i, (name, audio_revisions, subtitle_revisions)) in cases.iter().enumerate() {
+            let id = seed_certifiable_item(
+                &db,
+                lib,
+                &format!("clip{i}.mkv"),
+                &Seed {
+                    probe_status: "probed",
+                    media_revision: 1,
+                    probe_revision: 1,
+                    probed_media_revision: Some(1),
+                    content_id: Some("1-aaa"),
+                    probed_content_id: Some("1-aaa"),
+                },
+            );
+            db.with_conn(|c| {
+                for (n, revision) in audio_revisions.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO media_item_audio_tracks
+                            (media_item_id, probe_revision, stream_index, codec, is_default)
+                         VALUES (?1, ?2, ?3, 'aac', 0)",
+                        params![id, revision, n as i64],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                for (n, revision) in subtitle_revisions.iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO media_item_subtitle_tracks
+                            (media_item_id, probe_revision, stream_index, codec,
+                             forced, sdh, kind)
+                         VALUES (?1, ?2, ?3, 'subrip', 0, 0, 'text')",
+                        params![id, revision, n as i64],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+            assert_eq!(
+                db.coherent_probe_read(id).unwrap().unwrap(),
+                CoherentProbeRead::Unverified,
+                "{name}"
+            );
+        }
+    }
+
+    /// An unknown item is `None`, never `Unverified`: a missing item is a
+    /// different outcome from an existing item with uncertified facts.
+    #[test]
+    fn coherent_read_returns_none_for_an_unknown_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        revision_library(&db, "/films");
+
+        assert_eq!(db.coherent_probe_read(4242).unwrap(), None);
+    }
+
+    /// The item row and both inventories come from one read transaction, so a
+    /// reader that has fixed its snapshot cannot observe a publication that
+    /// commits afterwards. The reader pauses after its item SELECT; a second
+    /// connection publishes and commits a coherent next generation in that
+    /// window; the reader then reads the inventories and must return the old
+    /// generation whole, and a later read must return the new one whole.
+    ///
+    /// Three autocommit reads would see the item at revision 1 and the children
+    /// at revision 2, which fails certification and returns `Unverified`, so
+    /// this test fails if the read is not one transaction.
+    #[test]
+    fn coherent_read_holds_one_snapshot_while_a_writer_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        assert_eq!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published {
+                media_revision: 1,
+                probe_revision: 1,
+            }
+        );
+
+        let (snapshot_taken_tx, snapshot_taken_rx) = std::sync::mpsc::channel();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+
+        // The writer waits until the reader's item SELECT has fixed its read
+        // snapshot, then publishes generation 2 and commits it.
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            snapshot_taken_rx.recv().unwrap();
+            let conn = Connection::open(&writer_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            conn.execute(
+                "UPDATE media_items
+                    SET duration_ms = 2000, probe_revision = 2,
+                        probed_media_revision = media_revision
+                  WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM media_item_audio_tracks WHERE media_item_id = ?1",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO media_item_audio_tracks
+                    (media_item_id, probe_revision, stream_index, codec, is_default)
+                 VALUES (?1, 2, 5, 'opus', 0)",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM media_item_subtitle_tracks WHERE media_item_id = ?1",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO media_item_subtitle_tracks
+                    (media_item_id, probe_revision, stream_index, codec, forced, sdh, kind)
+                 VALUES (?1, 2, 6, 'ass', 0, 0, 'ass')",
+                [id],
+            )
+            .unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+            committed_tx.send(()).unwrap();
+        });
+
+        set_probe_read_after_item_hook(move || {
+            snapshot_taken_tx.send(()).unwrap();
+            committed_rx.recv().unwrap();
+        });
+
+        let old = match db.coherent_probe_read(id).unwrap().unwrap() {
+            CoherentProbeRead::Ready(snapshot) => snapshot,
+            CoherentProbeRead::Unverified => {
+                panic!("the reader's snapshot must still certify generation 1")
+            }
+        };
+        writer.join().unwrap();
+
+        assert_eq!(old.probe_revision, 1, "the reader keeps its own snapshot");
+        assert_eq!(old.media_revision, 1);
+        assert_eq!(old.content_id, "1-aaa-bbb");
+        assert_eq!(old.snapshot.duration_ms, Some(1000));
+        assert_eq!(old.snapshot.audio_tracks[0].codec, "aac");
+        assert_eq!(old.snapshot.subtitle_tracks[0].codec, "subrip");
+
+        // A new snapshot sees the committed generation whole, so the writer's
+        // commit is observable and the pause above was real.
+        let new = match db.coherent_probe_read(id).unwrap().unwrap() {
+            CoherentProbeRead::Ready(snapshot) => snapshot,
+            CoherentProbeRead::Unverified => panic!("the committed generation must certify"),
+        };
+        assert_eq!(new.probe_revision, 2);
+        assert_eq!(new.media_revision, 1);
+        assert_eq!(new.content_id, "1-aaa-bbb");
+        assert_eq!(new.snapshot.duration_ms, Some(2000));
+        assert_eq!(new.snapshot.audio_tracks[0].codec, "opus");
+        assert_eq!(new.snapshot.subtitle_tracks[0].codec, "ass");
     }
 }
