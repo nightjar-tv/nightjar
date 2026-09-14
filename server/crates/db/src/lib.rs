@@ -35,10 +35,10 @@ pub use status::{
     parse_map_container_kind, parse_map_status, parse_probe_status, parse_subtitle_status,
 };
 pub use store::{
-    AudioTrackRow, Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary,
-    ProbeAccounting, ProbeExpectation, ProbeOutcome, ProbePublication, ProbeSnapshot, ProbeUpdate,
-    ScanJobRow, ScanProgressCounts, SidecarRow, SubtitleTrackRow, UpsertItem, with_write_tx,
-    write_tx,
+    AudioTrackRow, CertifiedProbeSnapshot, CoherentProbeRead, Db, ItemPathRow, KeyframeMapRows,
+    LibraryRow, MediaItemRow, NewLibrary, ProbeAccounting, ProbeExpectation, ProbeOutcome,
+    ProbePublication, ProbeSnapshot, ProbeUpdate, ScanJobRow, ScanProgressCounts, SidecarRow,
+    SubtitleTrackRow, UpsertItem, with_write_tx, write_tx,
 };
 pub use track_choice::{
     SubtitleChoiceRow, TrackChoiceRow, TrackDescription, load_track_choice, upsert_track_choice,
