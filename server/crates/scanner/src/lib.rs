@@ -1477,6 +1477,91 @@ mod tests {
         let _ = before;
     }
 
+    /// R4 storage bounds (SCAN-D1): an incomplete listing cached by the walk
+    /// must not authorize `delete_missing` on a later unchanged-directory pass.
+    /// Scan 1 lists A and B. B then becomes a dangling symlink, so scan 2
+    /// caches a partial listing and skips delete under doubt. Scan 3 sees the
+    /// same directory mtime: the partial cache entry must not be reused, so B's
+    /// row survives. Restoring B gives a clean listing, and only then does
+    /// removing B delete it by the ordinary path. Unfixed, scan 3 loses B.
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_cached_listing_never_authorizes_deletion() {
+        use std::os::unix::fs::symlink;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let a = media.join("A.mp4");
+        let b = media.join("B.mkv");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        // Scan 1: complete listing. Both rows exist and the cache is complete.
+        let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job0);
+        assert_eq!(db.count_items(lib.id).unwrap(), 2, "setup: A and B indexed");
+
+        // Scan 2: B's stat fails, so the fresh listing is partial. The dir mtime
+        // moved, so this pass re-lists and caches the partial result.
+        thread::sleep(Duration::from_millis(1100));
+        fs::remove_file(&b).unwrap();
+        symlink("missing-target.mkv", &b).unwrap();
+        let job1 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job1);
+        assert_eq!(
+            db.count_items(lib.id).unwrap(),
+            2,
+            "a partial listing must not delete the unreadable entry's row"
+        );
+
+        // Scan 3: same directory mtime. The cached partial listing must not be
+        // reused, so the doubt persists and B's row is kept.
+        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job2);
+        let job2_row = db.get_scan_job(job2).unwrap().unwrap();
+        assert_eq!(
+            db.count_items(lib.id).unwrap(),
+            2,
+            "cached uncertainty must not authorize deletion; removed={}",
+            job2_row.removed
+        );
+
+        // Scan 4: B is a real file again, so the listing is clean and clears
+        // the doubt. Both rows are still there.
+        thread::sleep(Duration::from_millis(1100));
+        fs::remove_file(&b).unwrap();
+        fs::write(&b, b"b2").unwrap();
+        let job3 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job3);
+        assert_eq!(
+            db.count_items(lib.id).unwrap(),
+            2,
+            "a clean listing keeps both rows"
+        );
+
+        // Scan 5: B is really gone. A complete listing deletes it normally.
+        thread::sleep(Duration::from_millis(1100));
+        fs::remove_file(&b).unwrap();
+        let job4 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job4);
+        let job4_row = db.get_scan_job(job4).unwrap().unwrap();
+        assert_eq!(job4_row.removed, 1, "a real removal must still delete");
+        assert_eq!(db.count_items(lib.id).unwrap(), 1);
+    }
+
     /// R4 storage bounds: a mount that disappears is a disconnect, not an empty
     /// library. The scan is refused, the library pauses, and no rows are
     /// deleted. Reconnecting recovers: reachability returns and a fresh scan

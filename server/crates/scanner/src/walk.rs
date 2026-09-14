@@ -38,6 +38,12 @@ struct CachedDir {
     files: Vec<MediaFile>,
     /// Child directories discovered on the last listing of this directory.
     children: Vec<PathBuf>,
+    /// True when the last listing of this directory was partial: a readdir
+    /// entry or a child stat failed, so `files`/`children` may be missing
+    /// entries. A partial listing must never authorize `delete_missing`
+    /// (ADR-0014 §2), so a later pass re-lists instead of reusing it. A clean
+    /// listing clears the flag.
+    incomplete: bool,
 }
 
 /// Per-library walk memory so poll cycles can skip unchanged directories.
@@ -92,6 +98,11 @@ pub fn walk_concurrency() -> usize {
 /// re-listed: their prior file list and child set are reused. That is the cheap
 /// poll path (ADR-0013). Immediate-parent mtime updates when a file is added;
 /// ancestors need not.
+///
+/// A cached directory is reused only when its previous listing was complete. A
+/// listing that lost an entry to a readdir/stat failure is re-listed, so a
+/// partial file set never authorizes `delete_missing` on a later pass
+/// (ADR-0014 §2).
 pub fn walk_media_files_cached(
     root: &Path,
     cache: Option<&mut WalkCache>,
@@ -344,9 +355,14 @@ fn process_dir(dir: &Path, prev_dirs: Option<&HashMap<PathBuf, CachedDir>>) -> D
     };
     let mtime_ms = mtime_ms_from(&meta);
 
+    // Reuse the prior listing only when its mtime is unchanged AND that
+    // listing was complete. An incomplete entry is re-listed: reusing it would
+    // report zero listing errors on this pass, which would let a partial file
+    // set authorize `delete_missing` (ADR-0014 §2, Rule 4.15).
     if let Some(prev_dirs) = prev_dirs
         && let Some(prev) = prev_dirs.get(dir)
         && prev.mtime_ms == mtime_ms
+        && !prev.incomplete
     {
         return DirVisit::Cached {
             children: prev.children.clone(),
@@ -405,6 +421,7 @@ fn process_dir(dir: &Path, prev_dirs: Option<&HashMap<PathBuf, CachedDir>>) -> D
             mtime_ms,
             files,
             children: children.clone(),
+            incomplete: errors > 0,
         },
         errors,
         children,
@@ -489,6 +506,91 @@ mod tests {
             !third.relisted_dirs.contains(root.path()),
             "unchanged ancestors must not be re-listed"
         );
+    }
+
+    /// R4 storage bounds (SCAN-D1): a listing that lost an entry to a stat
+    /// failure must not become authoritative on the next unchanged-directory
+    /// pass. B is a dangling symlink on the first pass, so its stat fails and
+    /// only A is listed. The unchanged pass must re-list (not reuse) that
+    /// partial entry and report the doubt again; a clean listing clears it.
+    /// Both walk modes run the same scenario, so their completeness agrees.
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_listing_is_not_reused_in_either_walk_mode() {
+        use std::os::unix::fs::symlink;
+
+        for concurrency in [1usize, 8] {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join("A.mp4"), b"a").unwrap();
+            let b = root.path().join("B.mkv");
+            symlink("missing-target.mkv", &b).unwrap();
+
+            let mut cache = WalkCache::new();
+            let partial = walk_media_files_cached_with_concurrency(
+                root.path(),
+                Some(&mut cache),
+                concurrency,
+            )
+            .unwrap();
+            assert_eq!(
+                partial.files.len(),
+                1,
+                "conc={concurrency}: only A is listed while B's stat fails"
+            );
+            assert_eq!(
+                partial.listing_errors, 1,
+                "conc={concurrency}: the failed stat must be counted"
+            );
+
+            // Directory mtime is unchanged: a complete cache would be reused,
+            // but a partial one must be re-listed.
+            let cached_pass = walk_media_files_cached_with_concurrency(
+                root.path(),
+                Some(&mut cache),
+                concurrency,
+            )
+            .unwrap();
+            assert!(
+                cached_pass.relisted_dirs.contains(root.path()),
+                "conc={concurrency}: an incomplete listing must be re-listed, not reused"
+            );
+            assert_eq!(
+                cached_pass.listing_errors, 1,
+                "conc={concurrency}: the doubt must persist while B is unreadable"
+            );
+
+            // B becomes readable: a successful listing must clear the doubt.
+            fs::remove_file(&b).unwrap();
+            fs::write(&b, b"b").unwrap();
+            let clean = walk_media_files_cached_with_concurrency(
+                root.path(),
+                Some(&mut cache),
+                concurrency,
+            )
+            .unwrap();
+            assert_eq!(
+                clean.files.len(),
+                2,
+                "conc={concurrency}: both files are listed once B is readable"
+            );
+            assert_eq!(
+                clean.listing_errors, 0,
+                "conc={concurrency}: a clean listing must clear the doubt"
+            );
+
+            // And the clean entry is reusable again.
+            let clean_cached = walk_media_files_cached_with_concurrency(
+                root.path(),
+                Some(&mut cache),
+                concurrency,
+            )
+            .unwrap();
+            assert!(
+                clean_cached.relisted_dirs.is_empty(),
+                "conc={concurrency}: a complete entry is still reused"
+            );
+            assert_eq!(clean_cached.listing_errors, 0);
+        }
     }
 
     #[test]
