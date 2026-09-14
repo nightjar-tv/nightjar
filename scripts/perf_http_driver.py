@@ -15,6 +15,7 @@ Usage:
   perf_http_driver.py selftest
   perf_http_driver.py run --base-url URL --token-file TOKEN --state STATE.json \
       --scale 100k --requests 100 --out RESULT.json [--server-pid PID]
+  perf_http_driver.py run ... --readers 4 --endpoints units,detail,rail
 """
 
 from __future__ import annotations
@@ -23,8 +24,10 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -238,43 +241,112 @@ def _verify_rail(body: bytes, expected: list | None) -> dict:
     return {"entries": len(items), "series": len(seen)}
 
 
+def _verify_detail(body: bytes, item_id: int, item_key: str) -> dict:
+    """Assert the detail route returned the item the rail named.
+
+    The rail entry is the discovery source, so this proves the detail contract
+    agrees with the rail's `itemId` and effective `itemKey` rather than only
+    that the route answered 200.
+    """
+    payload = json.loads(body)
+    if payload.get("id") != item_id:
+        raise ValueError(f"detail id {payload.get('id')!r} != requested {item_id}")
+    if payload.get("itemKey") != item_key:
+        raise ValueError(
+            f"detail itemKey {payload.get('itemKey')!r} != rail {item_key!r}"
+        )
+    if not payload.get("path"):
+        raise ValueError("detail carries no path")
+    return {
+        "id": item_id,
+        "itemKey": item_key,
+        "kind": payload.get("kind"),
+        "has_series_key": bool(payload.get("seriesKey")),
+    }
+
+
 def _run_endpoint(
     client: Client,
     path: str,
     verify,
     requests: int,
     warm: int,
+    readers: int = 1,
 ) -> dict:
+    """Measure one endpoint with `readers` concurrent clients.
+
+    `requests` is the total measured requests for the endpoint, split as evenly
+    as possible across the readers. Warm-up is sequential and happens once,
+    before the readers start, so the route is warm for every reader. A 200
+    response counts toward the latency sample even if its body fails
+    verification; the correctness count is kept separate so a wrong body cannot
+    hide inside a fast p95.
+    """
+    if readers < 1:
+        _fail(f"readers must be at least 1, got {readers}")
     for _ in range(warm):
         status, body = client.request("GET", path)
         if status != 200:
             _fail(f"warm request to {path} failed with status {status}")
         verify(body)
 
+    lock = threading.Lock()
     durations: list[float] = []
     sizes: list[int] = []
     errors = 0
     correctness_errors = 0
     observed: dict = {}
-    for _ in range(requests):
-        try:
-            elapsed_ms, (status, body) = _measure_ms(lambda: client.request("GET", path))
-        except Exception:
-            errors += 1
-            continue
-        if status != 200:
-            errors += 1
-            continue
-        durations.append(elapsed_ms)
-        sizes.append(len(body))
-        try:
-            observed = verify(body)
-        except (ValueError, KeyError, TypeError):
-            correctness_errors += 1
+    per_reader: list[int] = []
+
+    shares = [
+        requests // readers + (1 if index < requests % readers else 0)
+        for index in range(readers)
+    ]
+
+    def worker(share: int) -> None:
+        nonlocal errors, correctness_errors, observed
+        local_completed = 0
+        for _ in range(share):
+            try:
+                elapsed_ms, (status, body) = _measure_ms(
+                    lambda: client.request("GET", path)
+                )
+            except Exception:
+                with lock:
+                    errors += 1
+                continue
+            if status != 200:
+                with lock:
+                    errors += 1
+                continue
+            try:
+                seen = verify(body)
+            except (ValueError, KeyError, TypeError):
+                with lock:
+                    correctness_errors += 1
+                    durations.append(elapsed_ms)
+                    sizes.append(len(body))
+                continue
+            with lock:
+                durations.append(elapsed_ms)
+                sizes.append(len(body))
+                observed = seen
+                local_completed += 1
+        with lock:
+            per_reader.append(local_completed)
+
+    wall_start = time.perf_counter()
+    threads = [threading.Thread(target=worker, args=(share,)) for share in shares]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    wall_ms = (time.perf_counter() - wall_start) * 1000.0
 
     ordered = sorted(durations)
     return {
         "path": path,
+        "readers": readers,
         "requests": requests,
         "warm": warm,
         "completed": len(durations),
@@ -282,7 +354,10 @@ def _run_endpoint(
         "correctness_errors": correctness_errors,
         "p50_ms": round(_percentile(ordered, 0.50), 3),
         "p95_ms": round(_percentile(ordered, 0.95), 3),
+        "p99_ms": round(_percentile(ordered, 0.99), 3),
         "max_ms": round(max(ordered), 3) if ordered else 0.0,
+        "wall_ms": round(wall_ms, 3),
+        "per_reader_completed": sorted(per_reader),
         "bytes_p50": _percentile([float(s) for s in sorted(sizes)], 0.50),
         "bytes_max": max(sizes) if sizes else 0,
         "observed": observed,
@@ -325,6 +400,41 @@ def _server_stats(pid: int) -> dict:
         return {"cpu_percent": None, "rss_kb": None}
 
 
+def _db_stats(db_path: Path) -> dict:
+    """The database counters SQLite exposes for the disposable file.
+
+    `page_count * page_size` is the whole-file size and `freelist_count` is the
+    free pages inside it; the WAL and shared-memory sidecars are counted by
+    their real file sizes. No server-side query or fetched-row counter exists
+    on these routes, so those are absent rather than invented.
+    """
+    if not db_path.exists():
+        return {"exists": False}
+    stats: dict = {"exists": True, "path": str(db_path)}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        finally:
+            conn.close()
+        stats.update(
+            {
+                "page_count": page_count,
+                "page_size": page_size,
+                "db_bytes": page_count * page_size,
+                "freelist_count": freelist,
+            }
+        )
+    except sqlite3.Error as error:
+        stats["error"] = str(error)
+    for suffix, key in (("-wal", "wal_bytes"), ("-shm", "shm_bytes")):
+        side = Path(str(db_path) + suffix)
+        stats[key] = side.stat().st_size if side.exists() else 0
+    return stats
+
+
 def _cmd_selftest(_: argparse.Namespace) -> int:
     slow_ms, _ = _measure_ms(lambda: time.sleep(SELFTEST_SLEEP_S))
     fast_ms, _ = _measure_ms(lambda: None)
@@ -363,33 +473,71 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not rail_expected:
         _fail("manifest carries no rail_expected projection; run verify-history first")
 
-    rss_before = _server_stats(args.server_pid) if args.server_pid else None
-    units = _run_endpoint(
-        client,
-        f"/api/v0/libraries/{library_id}/units",
-        _verify_units,
-        args.requests,
-        args.warm,
-    )
-    rail = _run_endpoint(
-        client,
-        f"/api/v0/profiles/{capped_ref}/continue-watching",
-        lambda body: _verify_rail(body, rail_expected),
-        args.requests,
-        args.warm,
-    )
-    rss_after = _server_stats(args.server_pid) if args.server_pid else None
+    endpoints = [name.strip() for name in args.endpoints.split(",") if name.strip()]
+    unknown = set(endpoints) - {"units", "rail", "detail"}
+    if unknown:
+        _fail(f"unknown endpoint(s): {', '.join(sorted(unknown))}")
+    if not endpoints:
+        _fail("--endpoints named no endpoint")
+
+    units_path = f"/api/v0/libraries/{library_id}/units"
+    rail_path = f"/api/v0/profiles/{capped_ref}/continue-watching"
+
+    # The rail is the discovery source for a visible item: it is already scoped
+    # to the caller's profile, so its first entry names an item the detail route
+    # must also serve. One request, not part of any measured cell.
+    detail_item_id: int | None = None
+    detail_item_key: str | None = None
+    if "detail" in endpoints:
+        status, body = client.request("GET", rail_path)
+        if status != 200:
+            _fail(f"detail discovery through the rail failed with status {status}")
+        entries = json.loads(body).get("items") or []
+        if not entries:
+            _fail("rail is empty; no visible item for the detail cell")
+        detail_item_id = int(entries[0]["itemId"])
+        detail_item_key = str(entries[0]["itemKey"])
+
+    stats_before = _server_stats(args.server_pid) if args.server_pid else None
+    measured: dict = {}
+    if "units" in endpoints:
+        measured["units"] = _run_endpoint(
+            client, units_path, _verify_units, args.requests, args.warm, args.readers
+        )
+    if "rail" in endpoints:
+        measured["rail"] = _run_endpoint(
+            client,
+            rail_path,
+            lambda body: _verify_rail(body, rail_expected),
+            args.requests,
+            args.warm,
+            args.readers,
+        )
+    if "detail" in endpoints:
+        measured["detail"] = _run_endpoint(
+            client,
+            f"/api/v0/items/{detail_item_id}",
+            lambda body: _verify_detail(body, detail_item_id, detail_item_key),
+            args.requests,
+            args.warm,
+            args.readers,
+        )
+    stats_after = _server_stats(args.server_pid) if args.server_pid else None
 
     result = {
         "scale": args.scale,
         "requests_per_endpoint": args.requests,
+        "readers": args.readers,
+        "endpoints_requested": endpoints,
         "warm": args.warm,
-        "endpoints": {"units": units, "rail": rail},
+        "endpoints": measured,
         "library": {
             "counts": manifest.get("counts", {}),
             "rail_expected_entries": len(rail_expected),
         },
-        "server": {"before": rss_before, "after": rss_after},
+        "server": {"before": stats_before, "after": stats_after},
+        "database": _db_stats(Path(args.db_path)) if args.db_path else {},
+        "detail_item": {"item_id": detail_item_id, "item_key": detail_item_key},
         "provenance": _provenance(
             Path(args.root).resolve(),
             Path(args.manifest) if args.manifest else None,
@@ -400,8 +548,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, sort_keys=True))
-    total_errors = units["errors"] + rail["errors"]
-    total_correctness = units["correctness_errors"] + rail["correctness_errors"]
+    total_errors = sum(cell["errors"] for cell in measured.values())
+    total_correctness = sum(cell["correctness_errors"] for cell in measured.values())
     if total_errors or total_correctness:
         return 1
     return 0
@@ -421,14 +569,26 @@ def main(argv: list[str]) -> int:
     selftest = sub.add_parser("selftest", help="prove the timing instrument detects slowness")
     selftest.set_defaults(func=_cmd_selftest)
 
-    run = sub.add_parser("run", help="measure the browse and rail routes")
+    run = sub.add_parser("run", help="measure the browse, detail and rail routes")
     run.add_argument("--base-url", required=True)
     run.add_argument("--token-file", required=True)
     run.add_argument("--state", required=True)
     run.add_argument("--scale", required=True)
     run.add_argument("--requests", type=int, default=100)
     run.add_argument("--warm", type=int, default=10)
+    run.add_argument(
+        "--readers",
+        type=int,
+        default=1,
+        help="concurrent readers; --requests is the total across all readers",
+    )
+    run.add_argument(
+        "--endpoints",
+        default="units,rail",
+        help="comma-separated subset of units,detail,rail",
+    )
     run.add_argument("--server-pid", type=int)
+    run.add_argument("--db-path", help="disposable SQLite file for database counters")
     run.add_argument("--root", default=".")
     run.add_argument("--manifest")
     run.add_argument("--seed", type=int)
