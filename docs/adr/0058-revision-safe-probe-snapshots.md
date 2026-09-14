@@ -64,6 +64,14 @@ probe_revision, content_id, mtime_ms, size_bytes}` before probing. A NULL
 filesystem validation happen outside the database transaction; changed input
 invalidates the result.
 
+Final validation applies to successful and failed probe execution. A final
+stat matching the captured mtime and size proceeds to the database CAS. A
+successful stat with a different tuple makes the result stale and publishes
+nothing. If stat cannot access the source, the worker may publish only
+`unavailable` carrying that access failure (never the earlier probe error),
+subject to the same CAS. Administrative cancellation while the source remains
+readable publishes nothing; cancellation is not itself a technical media fact.
+
 Publication uses `BEGIN IMMEDIATE`. Its compare-and-swap requires every
 captured field, including current library-root binding and expected
 `probe_revision`, still to match. On success, one transaction:
