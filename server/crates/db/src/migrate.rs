@@ -92,6 +92,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         31,
         include_str!("../migrations/031_certification_processing.sql"),
     ),
+    (32, include_str!("../migrations/032_probe_revisions.sql")),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -478,7 +479,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 31);
+        assert_eq!(v, 32);
         // 031 (ADR-0037 item 8, Astra correction): the processed-state marker
         // exists. The version is NOT NULL with a 0 default, so an upgraded row
         // reads "unprocessed" rather than NULL; the hash is nullable because a
@@ -2323,9 +2324,9 @@ mod tests {
     }
 
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migrations 26 through 29
+    /// way a real install upgrading into it looks. Migrations 26 through 32
     /// and their schema are removed with it, so `migrate` sees a database at
-    /// version 24 and applies all five in order.
+    /// version 24 and applies all of them in order.
     ///
     /// Migration 28 adds columns to `profiles`, so the rewind rebuilds that
     /// table rather than dropping the columns: SQLite refuses to drop a column
@@ -2358,7 +2359,13 @@ mod tests {
              ALTER TABLE metadata_canonical DROP COLUMN certifications_source_sha256;
              ALTER TABLE metadata_canonical DROP COLUMN certifications_projection_version;
              ALTER TABLE metadata_canonical DROP COLUMN certifications_json;
-             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31);",
+             DROP TABLE IF EXISTS media_item_audio_tracks;
+             ALTER TABLE media_item_subtitle_tracks DROP COLUMN probe_revision;
+             ALTER TABLE media_items DROP COLUMN media_revision;
+             ALTER TABLE media_items DROP COLUMN probe_revision;
+             ALTER TABLE media_items DROP COLUMN probed_media_revision;
+             ALTER TABLE media_items DROP COLUMN video_stream_index;
+             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32);",
         )
         .unwrap();
     }
@@ -2505,5 +2512,216 @@ mod tests {
             0,
             "profile deletion takes its watch state"
         );
+    }
+
+    /// 032 (ADR-0058). A populated install reaches the revision columns in
+    /// place: every existing row reads revision 1 / probe revision 0 with both
+    /// validity stamps cleared, the subtitle inventory is stamped revision 0,
+    /// the audio inventory arrives empty, and every row count the rest of the
+    /// system depends on is unchanged. The closed ranges are constraints, so
+    /// each is proved by a rejected write rather than by inspection.
+    #[test]
+    fn migration_32_adds_revisions_without_moving_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, 31);
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (
+                library_id, path, mtime_ms, size_bytes, title, kind, probe_status,
+                probed_content_id, duration_ms, container
+             ) VALUES
+                (1, 'a.mkv', 1, 2, 'A', 'movie', 'probed', '1-aaa-bbb', 1000, 'matroska'),
+                (1, 'b.mkv', 1, 2, 'B', 'movie', 'indexed', NULL, NULL, NULL);
+             INSERT INTO media_item_sidecars (
+                media_item_id, track_id, path, mtime_ms, size_bytes, format
+             ) VALUES (1, 's-en', 'a.en.srt', 1, 2, 'srt');
+             INSERT INTO media_item_links (media_item_id, item_key)
+             VALUES (1, 'tmdb:movie:1');
+             INSERT INTO media_item_subtitle_tracks (media_item_id, stream_index, codec, kind)
+             VALUES (1, 0, 'subrip', 'text');
+             INSERT INTO accounts (id, username, password_hash, role)
+             VALUES (1, 'a', 'h', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+             VALUES (1, 1, 'aa', 'P');
+             INSERT INTO watch_state
+                (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                 first_played_at, last_played_at)
+             VALUES (1, 'path:1:a.mkv', 1, 2, 0, 0,
+                     '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let items_before = count(&conn, "media_items");
+        let sidecars_before = count(&conn, "media_item_sidecars");
+        let links_before = count(&conn, "media_item_links");
+        let subtitles_before = count(&conn, "media_item_subtitle_tracks");
+        let watch_before = count(&conn, "watch_state");
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(count(&conn, "media_items"), items_before);
+        assert_eq!(count(&conn, "media_item_sidecars"), sidecars_before);
+        assert_eq!(count(&conn, "media_item_links"), links_before);
+        assert_eq!(count(&conn, "media_item_subtitle_tracks"), subtitles_before);
+        assert_eq!(count(&conn, "watch_state"), watch_before);
+        assert_eq!(
+            count(&conn, "media_item_audio_tracks"),
+            0,
+            "the migration schedules no probe and creates no inventory"
+        );
+
+        // Exact defaults and cleared validity stamps for every existing row.
+        #[derive(Debug, PartialEq, Eq)]
+        struct RevisionRow {
+            path: String,
+            media_revision: i64,
+            probe_revision: i64,
+            probed_media_revision: Option<i64>,
+            probed_content_id: Option<String>,
+            duration_ms: Option<i64>,
+            container: Option<String>,
+        }
+        let rows: Vec<RevisionRow> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT path, media_revision, probe_revision,
+                            probed_media_revision, probed_content_id, duration_ms, container
+                     FROM media_items ORDER BY path",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok(RevisionRow {
+                    path: r.get(0)?,
+                    media_revision: r.get(1)?,
+                    probe_revision: r.get(2)?,
+                    probed_media_revision: r.get(3)?,
+                    probed_content_id: r.get(4)?,
+                    duration_ms: r.get(5)?,
+                    container: r.get(6)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                RevisionRow {
+                    path: "a.mkv".to_string(),
+                    media_revision: 1,
+                    probe_revision: 0,
+                    probed_media_revision: None,
+                    probed_content_id: None,
+                    duration_ms: Some(1000),
+                    container: Some("matroska".to_string()),
+                },
+                RevisionRow {
+                    path: "b.mkv".to_string(),
+                    media_revision: 1,
+                    probe_revision: 0,
+                    probed_media_revision: None,
+                    probed_content_id: None,
+                    duration_ms: None,
+                    container: None,
+                },
+            ],
+            "revisions default, both validity stamps clear, facts stay"
+        );
+
+        // Subtitle rows are stamped probe revision 0.
+        let subtitle_revisions: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT probe_revision FROM media_item_subtitle_tracks")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(subtitle_revisions, vec![0]);
+
+        // The audio table carries ADR-0058's exact column list.
+        let audio_columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM pragma_table_info('media_item_audio_tracks')
+                     ORDER BY cid",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            audio_columns,
+            vec![
+                "media_item_id",
+                "probe_revision",
+                "stream_index",
+                "codec",
+                "language",
+                "channels",
+                "channel_layout",
+                "title",
+                "is_default",
+            ]
+        );
+        let has_item_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_media_item_audio_tracks_item'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_item_index, 1);
+
+        conn.execute(
+            "INSERT INTO media_item_audio_tracks
+                (media_item_id, probe_revision, stream_index, codec, is_default)
+             VALUES (1, 0, 0, 'aac', 1)",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "INSERT INTO media_item_audio_tracks
+                (media_item_id, probe_revision, stream_index, codec, is_default)
+             VALUES (1, 0, 0, 'ac3', 0)",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "(media_item_id, stream_index) is the primary key"
+        );
+        let bad_default = conn.execute(
+            "INSERT INTO media_item_audio_tracks
+                (media_item_id, probe_revision, stream_index, codec, is_default)
+             VALUES (1, 0, 1, 'aac', 2)",
+            [],
+        );
+        assert!(bad_default.is_err(), "is_default is a 0/1 flag");
+        let orphan = conn.execute(
+            "INSERT INTO media_item_audio_tracks
+                (media_item_id, probe_revision, stream_index, codec, is_default)
+             VALUES (99, 0, 0, 'aac', 0)",
+            [],
+        );
+        assert!(orphan.is_err(), "audio rows belong to an item");
+
+        let bad_media_revision = conn.execute(
+            "UPDATE media_items SET media_revision = 0 WHERE path = 'a.mkv'",
+            [],
+        );
+        assert!(bad_media_revision.is_err(), "media_revision >= 1");
+        let bad_probe_revision = conn.execute(
+            "UPDATE media_items SET probe_revision = -1 WHERE path = 'a.mkv'",
+            [],
+        );
+        assert!(bad_probe_revision.is_err(), "probe_revision >= 0");
+
+        // Repeat safety: a second migrate is a no-op and leaves the columns.
+        migrate(&conn).unwrap();
     }
 }
