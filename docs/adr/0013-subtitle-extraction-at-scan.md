@@ -207,6 +207,14 @@ longer runs.
       the parent was re-listed (a new `.srt` bumps that dir's mtime). A
       cold cache after restart skips the bulk pass; existing sidecar rows
       stay in the DB.
+
+      **Amended 2026-09-15 for explicit reconciliation.** The cold-cache skip
+      remains the automatic-poll rule, but it does not apply to a fresh/manual
+      scan requested by the operator. That path must reconcile supported
+      sidecars for unchanged media after restart, using the shared per-directory
+      discovery cache so siblings cause one listing rather than per-item
+      listings. A failed or incomplete listing preserves prior rows; it is not
+      interpreted as an empty successful directory.
    6. **Defer recursive `notify` until the first index pass finishes.**
       Arming recursive watches on an SMB Movies root during the cold walk
       competed for metadata IOPS and pushed walks past 15–20 minutes.

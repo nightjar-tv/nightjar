@@ -1203,13 +1203,17 @@ fn run_index_pass(
             tracing::warn!(error = %e, "subtitle orphan cleanup failed");
         }
 
-        // Rediscover sidecars beside unchanged media only when the walk cache was
-        // warm and the parent was re-listed (new .srt bumps dir mtime). A cold
-        // cache would mark every dir relisted and re-pay ~20 min of SMB readdir;
-        // existing sidecar rows stay in the DB across restarts, and add/update
-        // already ran associate_sidecars in flush.
+        // Rediscover sidecars beside unchanged media when the parent was
+        // re-listed (new .srt bumps dir mtime). The cold-cache skip is the
+        // automatic-poll rule (ADR-0013 §3): a cold cache would mark every dir
+        // relisted and re-pay ~20 min of SMB readdir, and existing sidecar rows
+        // stay in the DB across restarts. It does not apply to a fresh/manual
+        // scan the operator asked for (ADR-0013 amendment): after a restart
+        // that path must reconcile supported sidecars for unchanged media, and
+        // the shared `sidecar_dirs` cache keeps siblings to one listing. This
+        // adds no per-item listing and no automatic-poll policy change.
         let mut sidecar_checked = 0u32;
-        if cache_warm && allow_delete {
+        if (cache_warm || fresh) && allow_delete {
             for file in &files {
                 let Some(parent) = file.path.parent() else {
                     continue;
@@ -1302,32 +1306,52 @@ fn run_index_pass(
     Ok(to_probe)
 }
 
+/// Reconcile the stored sidecar set for one media item against a successful
+/// discovery (ADR-0010 §4).
+///
+/// Discovery reuses the caller's shared per-directory listing cache, so
+/// siblings cost one listing. The bounded identity read is the only additional
+/// filesystem work, and it runs only here, during explicit reconciliation —
+/// never on playback or an unchanged-media probe. A sidecar whose identity
+/// cannot be read fails the whole item: the prior set is preserved rather than
+/// a row written without identity.
 fn associate_sidecars(
     db: &Db,
     item_id: i64,
     library_root: &str,
     video_path: &Path,
     cache: &mut nightjar_transcode::SidecarDirCache,
-) -> Result<bool, String> {
+) -> Result<nightjar_db::SidecarDelta, String> {
     let found = nightjar_transcode::discover_sidecars_cached(video_path, Some(cache))?;
-    let rows: Vec<nightjar_db::SidecarRow> = found
-        .into_iter()
-        .filter_map(|s| {
-            let path = to_relpath(library_root, &s.path)?;
-            Some(nightjar_db::SidecarRow {
-                media_item_id: item_id,
-                track_id: s.track_id,
-                path,
-                mtime_ms: s.mtime_ms,
-                size_bytes: s.size_bytes,
-                format: s.format,
-                language: s.language,
-                forced: s.forced,
-                sdh: s.sdh,
-            })
-        })
-        .collect();
-    db.replace_item_sidecars(item_id, &rows)
+    let mut observed = Vec::with_capacity(found.len());
+    for s in found {
+        let Some(path) = to_relpath(library_root, &s.path) else {
+            continue;
+        };
+        let content_id = nightjar_db::content_id_for_path(&s.path)?;
+        observed.push(nightjar_db::ObservedSidecar {
+            track_id: s.track_id,
+            path,
+            mtime_ms: s.mtime_ms,
+            size_bytes: s.size_bytes,
+            format: s.format,
+            language: s.language,
+            forced: s.forced,
+            sdh: s.sdh,
+            content_id,
+        });
+    }
+    let delta = db.reconcile_item_sidecars(item_id, &observed)?;
+    if !delta.is_empty() {
+        tracing::info!(
+            item_id,
+            added = delta.added.len(),
+            changed = delta.changed.len(),
+            removed = delta.removed.len(),
+            "sidecar set reconciled"
+        );
+    }
+    Ok(delta)
 }
 
 pub fn version() -> &'static str {
@@ -1482,6 +1506,219 @@ mod tests {
         let ids: Vec<_> = sidecars.iter().map(|s| s.track_id.as_str()).collect();
         assert!(ids.contains(&"s-en"), "{ids:?}");
         assert!(ids.contains(&"s-Subs.en"), "{ids:?}");
+    }
+
+    /// Same path, size and restored mtime; only the bounded identity of the
+    /// sidecar bytes differs. The reconciliation must still see a change and
+    /// allocate a new generation.
+    #[test]
+    fn sidecar_bytes_changed_with_restored_mtime_and_size_receive_a_new_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let srt = media.join("Movie.en.srt");
+        fs::write(&srt, b"1\n00:00:00,000 --> 00:00:01,000\nHi\n").unwrap();
+        let mtime = fs::metadata(&srt).unwrap().modified().unwrap();
+
+        let db = nightjar_db::open(&dir).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let item_id = db
+            .upsert_items_indexed(
+                lib.id,
+                &[nightjar_db::UpsertItem {
+                    path: "Movie.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap()[0];
+        let root = media.to_string_lossy().into_owned();
+
+        let first = associate_sidecars(
+            &db,
+            item_id,
+            &root,
+            &video,
+            &mut nightjar_transcode::SidecarDirCache::default(),
+        )
+        .unwrap();
+        assert_eq!(first.added.len(), 1);
+        let before = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_eq!(before.sidecar_generation, Some(1));
+
+        // Same length, different bytes, mtime restored to the stored value.
+        fs::write(&srt, b"1\n00:00:00,000 --> 00:00:01,000\nYo\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&srt)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        let delta = associate_sidecars(
+            &db,
+            item_id,
+            &root,
+            &video,
+            &mut nightjar_transcode::SidecarDirCache::default(),
+        )
+        .unwrap();
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(
+            delta.changed[0].before.mtime_ms, delta.changed[0].after.mtime_ms,
+            "the mtime is restored"
+        );
+        assert_eq!(
+            delta.changed[0].before.size_bytes, delta.changed[0].after.size_bytes,
+            "the size is unchanged"
+        );
+        assert_ne!(
+            delta.changed[0].before.content_id, delta.changed[0].after.content_id,
+            "the bounded identity is the only signal that changed"
+        );
+        assert_eq!(delta.changed[0].after.sidecar_generation, Some(2));
+    }
+
+    /// ADR-0013 §3 amendment: the cold-cache skip is the automatic-poll rule
+    /// only. A manual scan after restart reconciles supported sidecars for
+    /// unchanged media, and an unchanged sidecar keeps its row and generation.
+    #[test]
+    fn manual_scan_after_restart_reconciles_sidecars_for_unchanged_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let srt = media.join("Movie.en.srt");
+        fs::write(&srt, b"1\n00:00:00,000 --> 00:00:01,000\nHi\n").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let pool = test_pool(&db, dir.path());
+        wait_job(
+            &db,
+            start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap(),
+        );
+
+        let item_id = db.list_items(lib.id).unwrap()[0].id;
+        let first = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_eq!(first.sidecar_generation, Some(1));
+        assert!(first.content_id.is_some());
+
+        // Restart: a new pool has a cold walk cache, and the media is unchanged.
+        let pool2 = test_pool(&db, dir.path());
+        wait_job(
+            &db,
+            start_scan_job(Arc::clone(&db), Arc::clone(&pool2), lib.id).unwrap(),
+        );
+        assert_eq!(
+            db.get_item_sidecar(item_id, "s-en").unwrap().unwrap(),
+            first,
+            "an unchanged sidecar keeps its row and generation across restart"
+        );
+
+        // Change only the sidecar bytes, leave the media untouched, restart
+        // again: the fresh scan must observe it.
+        fs::write(&srt, b"1\n00:00:00,000 --> 00:00:02,000\nYo\n").unwrap();
+        let pool3 = test_pool(&db, dir.path());
+        wait_job(
+            &db,
+            start_scan_job(Arc::clone(&db), Arc::clone(&pool3), lib.id).unwrap(),
+        );
+        let changed = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_eq!(changed.sidecar_generation, Some(2));
+        assert_ne!(changed.content_id, first.content_id);
+    }
+
+    #[test]
+    fn incomplete_sidecar_discovery_preserves_the_prior_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        fs::write(
+            media.join("Movie.en.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nHi\n",
+        )
+        .unwrap();
+        fs::write(
+            media.join("Movie.fr.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nSalut\n",
+        )
+        .unwrap();
+
+        let db = nightjar_db::open(&dir).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let item_id = db
+            .upsert_items_indexed(
+                lib.id,
+                &[nightjar_db::UpsertItem {
+                    path: "Movie.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap()[0];
+        let root = media.to_string_lossy().into_owned();
+        associate_sidecars(
+            &db,
+            item_id,
+            &root,
+            &video,
+            &mut nightjar_transcode::SidecarDirCache::default(),
+        )
+        .unwrap();
+        let before = db.list_item_sidecars(item_id).unwrap();
+        assert_eq!(before.len(), 2);
+
+        // Deterministically make the parent listing incomplete: discovery must
+        // fail before reconciliation instead of publishing an empty removal.
+        fs::remove_dir_all(&media).unwrap();
+        let error = associate_sidecars(
+            &db,
+            item_id,
+            &root,
+            &video,
+            &mut nightjar_transcode::SidecarDirCache::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("list subtitle dir"), "{error}");
+        assert_eq!(db.list_item_sidecars(item_id).unwrap(), before);
     }
 
     #[test]
@@ -1741,10 +1978,9 @@ mod tests {
             )
             .unwrap();
         let item_id = ids[0];
-        db.replace_item_sidecars(
+        db.reconcile_item_sidecars(
             item_id,
-            &[nightjar_db::SidecarRow {
-                media_item_id: item_id,
+            &[nightjar_db::ObservedSidecar {
                 track_id: "s-en".into(),
                 path: "Movie.en.srt".into(),
                 mtime_ms: 1,
@@ -1753,6 +1989,7 @@ mod tests {
                 language: Some("en".into()),
                 forced: false,
                 sdh: false,
+                content_id: "39-first-last".into(),
             }],
         )
         .unwrap();
@@ -3502,10 +3739,9 @@ mod tests {
             .unwrap();
         let item_id = ids[0];
         // Sidecar row pointing at a file that does not exist on disk.
-        db.replace_item_sidecars(
+        db.reconcile_item_sidecars(
             item_id,
-            &[nightjar_db::SidecarRow {
-                media_item_id: item_id,
+            &[nightjar_db::ObservedSidecar {
                 track_id: "s-en".into(),
                 path: "Video.en.srt".into(),
                 mtime_ms: 1,
@@ -3514,6 +3750,7 @@ mod tests {
                 language: Some("en".into()),
                 forced: false,
                 sdh: false,
+                content_id: "2-first-last".into(),
             }],
         )
         .unwrap();

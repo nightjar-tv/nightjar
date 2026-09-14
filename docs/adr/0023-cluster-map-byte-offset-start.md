@@ -312,8 +312,11 @@ Invalidation is string equality (`content_id_matches`).
 | `map_status` | `pending` \| `ready` \| `error` \| `unavailable` |
 | `map_content_id` | identity the map entries were built under |
 
-Sidecars stay on `media_item_sidecars` with their own mtime/size. A Bazarr SRT
-does not change `content_id` and must not force re-probe or a new map.
+Sidecars stay on `media_item_sidecars` with their own identity and generation
+defined by ADR-0010 §4. They reuse this section's bounded `content_id` shape for
+their own bytes; they do not reuse the media item's identity or revision. A
+Bazarr SRT does not change the media `content_id` and must not force re-probe or
+a new map.
 
 **`keyframe_map_entries`:**
 

@@ -1656,7 +1656,7 @@ mod ownership_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use nightjar_auth::{mint_profile_ref, mint_session_token};
-    use nightjar_db::{NewLibrary, ProbeUpdate, SidecarRow, UpsertItem};
+    use nightjar_db::{NewLibrary, ObservedSidecar, ProbeUpdate, UpsertItem};
     use tower::ServiceExt;
 
     struct Actor {
@@ -1841,10 +1841,9 @@ mod ownership_tests {
         state.db.set_subtitle_status(item_id, "ready").unwrap();
         state
             .db
-            .replace_item_sidecars(
+            .reconcile_item_sidecars(
                 item_id,
-                &[SidecarRow {
-                    media_item_id: item_id,
+                &[ObservedSidecar {
                     track_id: "s-en".to_string(),
                     path: "subs/s-en.vtt".to_string(),
                     mtime_ms: 0,
@@ -1853,6 +1852,7 @@ mod ownership_tests {
                     language: None,
                     forced: false,
                     sdh: false,
+                    content_id: "1-first-last".to_string(),
                 }],
             )
             .unwrap();

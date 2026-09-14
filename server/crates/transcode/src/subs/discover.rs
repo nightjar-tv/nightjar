@@ -65,7 +65,7 @@ pub fn discover_sidecars_cached(
     scan_dir(parent, stem, None, &mut out, cache.as_deref_mut())?;
     for sub in SUB_DIRS {
         let dir = parent.join(sub);
-        if cached_is_dir(&dir, cache.as_deref_mut()) {
+        if cached_is_dir(&dir, cache.as_deref_mut())? {
             scan_dir(&dir, stem, Some(sub), &mut out, cache.as_deref_mut())?;
         }
     }
@@ -102,16 +102,24 @@ fn format_rank(format: &str) -> u8 {
     }
 }
 
-fn cached_is_dir(dir: &Path, cache: Option<&mut SidecarDirCache>) -> bool {
+fn cached_is_dir(dir: &Path, cache: Option<&mut SidecarDirCache>) -> Result<bool, String> {
     if let Some(cache) = cache {
         if let Some(v) = cache.is_dir.get(dir) {
-            return *v;
+            return Ok(*v);
         }
-        let v = dir.is_dir();
+        let v = match fs::metadata(dir) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("inspect subtitle dir {}: {e}", dir.display())),
+        };
         cache.is_dir.insert(dir.to_path_buf(), v);
-        v
+        Ok(v)
     } else {
-        dir.is_dir()
+        match fs::metadata(dir) {
+            Ok(meta) => Ok(meta.is_dir()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("inspect subtitle dir {}: {e}", dir.display())),
+        }
     }
 }
 
@@ -132,19 +140,13 @@ fn list_sidecar_files(
 }
 
 fn read_sidecar_files(dir: &Path) -> Result<Vec<CachedSidecarFile>, String> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "skip unreadable subtitle dir");
-            return Ok(Vec::new());
-        }
-    };
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("list subtitle dir {}: {e}", dir.display()))?;
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("read entry in subtitle dir {}: {e}", dir.display()))?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let Some(ext) = path
             .extension()
             .and_then(|e| e.to_str())
@@ -161,19 +163,17 @@ fn read_sidecar_files(dir: &Path) -> Result<Vec<CachedSidecarFile>, String> {
         else {
             continue;
         };
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skip sidecar metadata");
-                continue;
-            }
-        };
+        let meta = fs::metadata(&path)
+            .map_err(|e| format!("read sidecar metadata {}: {e}", path.display()))?;
+        if !meta.is_file() {
+            continue;
+        }
         let mtime_ms = meta
             .modified()
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .map_err(|e| format!("read sidecar mtime {}: {e}", path.display()))?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| format!("invalid sidecar mtime {}: {e}", path.display()))?
+            .as_millis() as i64;
         out.push(CachedSidecarFile {
             path,
             file_stem,
@@ -359,6 +359,23 @@ mod tests {
         assert!(ids.contains(&"s-en"), "{ids:?}");
         assert!(ids.contains(&"s-Subs.en"), "{ids:?}");
         assert!(!ids.iter().any(|id| id.contains("Other")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_a_symlink_to_a_regular_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("Movie.mkv");
+        File::create(&video).unwrap();
+        let target = dir.path().join("subtitle-source");
+        File::create(&target).unwrap();
+        symlink(&target, dir.path().join("Movie.en.srt")).unwrap();
+
+        let found = discover_sidecars(&video).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].track_id, "s-en");
     }
 
     #[test]

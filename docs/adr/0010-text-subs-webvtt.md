@@ -1,6 +1,7 @@
 # ADR-0010: Text subtitle tracks as WebVTT sidecars
 
-- Status: accepted
+- Status: accepted; amended 2026-09-15 (§4 durable sidecar generations and
+  reconciliation delta)
 - Date: 2026-07-26
 
 ## Context
@@ -54,6 +55,47 @@ pass (Rule 6.1 / 4.9).
    media directory. The library watcher already triggers a rescan, so a
    subtitle added beside a video is picked up without a manual rescan.
    Sidecar extensions are never media items.
+
+   **Amended 2026-09-15 — durable sidecar reconciliation.** A supported
+   sidecar row carries an observed identity tuple of normalised stored path,
+   `mtime_ms`, `size_bytes`, and the bounded `content_id` shape defined by
+   ADR-0023 §6. The digest algorithm and string encoding are reused unchanged;
+   this is a sidecar instance of the existing identity mechanism, not a second
+   media fingerprint. It is computed during explicit fresh/manual
+   reconciliation, never on normal playback or an unchanged-media probe.
+
+   Each row also carries a positive, DB-allocated `sidecar_generation`.
+   Reconciliation is one transaction over the complete discovered set:
+   unchanged means identical source identity **and** identical stored track
+   attributes (format, language, forced/SDH flags and other persisted discovery
+   fields), and preserves the row and generation; addition or changed identity
+   or attributes receives a generation greater than every generation previously
+   allocated for that item; removal deletes membership. Removal followed by
+   re-addition cannot reuse the deleted generation, including across restart.
+   The result reports exact added, changed, and removed before/after rows so
+   later artifact handling consumes the committed delta rather than inferring
+   it from a second read. Duplicate `trackId` input is rejected atomically
+   after discovery's established deterministic format winner has been applied.
+   Failed directory discovery, identity reads, validation, or DB writes return
+   an error and preserve the entire prior set; absence is accepted only from a
+   successful complete discovery and no empty or partial delta is published.
+   Legacy migration preserves sidecar, item, metadata-link and watch-state row
+   counts, performs no filesystem reads or startup backfill, and marks existing
+   sidecars unverified until lazy explicit reconciliation assigns identity and
+   generation.
+
+   The bounded digest is change detection, not proof that two complete files
+   are equal: an adversarial or accidental change outside both 64-KiB windows
+   with the same size can collide. D2B accepts the same explicit limitation as
+   ADR-0023. Generation non-reuse prevents remove/re-add ABA but does not turn
+   the bounded fingerprint into a whole-file digest.
+
+   This amendment lands in three slices. D2B.1 owns only durable identity,
+   generation, and reconciliation delta. D2B.2 composes those rows with the
+   ADR-0058 coherent media snapshot for standalone immutable artifact
+   publication/serving. D2B.3 applies that same contract to piggyback and HLS.
+   No D2B.1 writer changes readiness, artifacts, URLs, playback, or automatic
+   polling policy.
 
 5. **Matching convention.** Same basename as the video, with optional
    language and flag suffixes before the extension; also the same names

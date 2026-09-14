@@ -93,6 +93,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/031_certification_processing.sql"),
     ),
     (32, include_str!("../migrations/032_probe_revisions.sql")),
+    (
+        33,
+        include_str!("../migrations/033_sidecar_identity_generation.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -479,7 +483,29 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 32);
+        assert_eq!(v, 33);
+        // 033 (ADR-0010 §4 amendment): the sidecar identity and generation
+        // columns and the durable allocator exist on a fresh install.
+        for col in ["content_id", "sidecar_generation"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('media_item_sidecars')
+                     WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{col}");
+        }
+        let has_sidecar_generations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'media_item_sidecar_generations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_sidecar_generations, 1);
         // 031 (ADR-0037 item 8, Astra correction): the processed-state marker
         // exists. The version is NOT NULL with a 0 default, so an upgraded row
         // reads "unprocessed" rather than NULL; the hash is nullable because a
@@ -2324,13 +2350,15 @@ mod tests {
     }
 
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migrations 26 through 32
+    /// way a real install upgrading into it looks. Migrations 26 through 33
     /// and their schema are removed with it, so `migrate` sees a database at
     /// version 24 and applies all of them in order.
     ///
-    /// Migration 28 adds columns to `profiles`, so the rewind rebuilds that
-    /// table rather than dropping the columns: SQLite refuses to drop a column
-    /// a CHECK constraint names, and `subtitle_default` has one.
+    /// Migration 28 adds columns to `profiles` and migration 33 adds columns
+    /// to `media_item_sidecars`, so the rewind rebuilds those tables rather
+    /// than dropping the columns: SQLite refuses to drop a column a CHECK
+    /// constraint names, and `subtitle_default` and `sidecar_generation` each
+    /// have one.
     fn rewind_to_24(conn: &Connection) {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_accounts_username_nocase;
@@ -2365,7 +2393,30 @@ mod tests {
              ALTER TABLE media_items DROP COLUMN probe_revision;
              ALTER TABLE media_items DROP COLUMN probed_media_revision;
              ALTER TABLE media_items DROP COLUMN video_stream_index;
-             DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32);",
+             DROP TABLE IF EXISTS media_item_sidecar_generations;
+             CREATE TABLE media_item_sidecars_rewind (
+                 media_item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+                 track_id TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 mtime_ms INTEGER NOT NULL,
+                 size_bytes INTEGER NOT NULL,
+                 format TEXT NOT NULL,
+                 language TEXT,
+                 forced INTEGER NOT NULL DEFAULT 0,
+                 sdh INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (media_item_id, track_id)
+             );
+             INSERT INTO media_item_sidecars_rewind
+                 (media_item_id, track_id, path, mtime_ms, size_bytes,
+                  format, language, forced, sdh)
+             SELECT media_item_id, track_id, path, mtime_ms, size_bytes,
+                    format, language, forced, sdh
+             FROM media_item_sidecars;
+             DROP TABLE media_item_sidecars;
+             ALTER TABLE media_item_sidecars_rewind RENAME TO media_item_sidecars;
+             CREATE INDEX idx_media_item_sidecars_item ON media_item_sidecars(media_item_id);
+             DELETE FROM schema_migrations
+             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33);",
         )
         .unwrap();
     }
@@ -2720,6 +2771,158 @@ mod tests {
             [],
         );
         assert!(bad_probe_revision.is_err(), "probe_revision >= 0");
+
+        // Repeat safety: a second migrate is a no-op and leaves the columns.
+        migrate(&conn).unwrap();
+    }
+
+    /// 033 (ADR-0010 §4 amendment). A populated install reaches the sidecar
+    /// identity and generation columns in place. Legacy rows are unverified:
+    /// `content_id` and `sidecar_generation` stay NULL because this migration
+    /// performs no filesystem read and no startup backfill, and the allocator
+    /// starts empty. Every row count the rest of the system depends on is
+    /// unchanged.
+    #[test]
+    fn migration_33_marks_legacy_sidecars_unverified_without_moving_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, 32);
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 'a.mkv', 1, 2, 'A', 'movie'),
+                    (1, 'b.mkv', 1, 2, 'B', 'movie');
+             INSERT INTO media_item_sidecars (
+                media_item_id, track_id, path, mtime_ms, size_bytes, format, language
+             ) VALUES
+                (1, 's-en', 'a.en.srt', 1, 2, 'srt', 'en'),
+                (2, 's', 'b.srt', 3, 4, 'srt', NULL);
+             INSERT INTO media_item_links (media_item_id, item_key)
+             VALUES (1, 'tmdb:movie:1');
+             INSERT INTO accounts (id, username, password_hash, role)
+             VALUES (1, 'a', 'h', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+             VALUES (1, 1, 'aa', 'P');
+             INSERT INTO watch_state
+                (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                 first_played_at, last_played_at)
+             VALUES (1, 'path:1:a.mkv', 1, 2, 0, 0,
+                     '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let items_before = count(&conn, "media_items");
+        let sidecars_before = count(&conn, "media_item_sidecars");
+        let links_before = count(&conn, "media_item_links");
+        let watch_before = count(&conn, "watch_state");
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(count(&conn, "media_items"), items_before);
+        assert_eq!(count(&conn, "media_item_sidecars"), sidecars_before);
+        assert_eq!(count(&conn, "media_item_links"), links_before);
+        assert_eq!(count(&conn, "watch_state"), watch_before);
+        assert_eq!(
+            count(&conn, "media_item_sidecar_generations"),
+            0,
+            "no generation is allocated by the migration"
+        );
+
+        // Legacy rows are unverified: no identity, no generation, attributes
+        // kept exactly as they were.
+        #[derive(Debug, PartialEq, Eq)]
+        struct LegacyRow {
+            media_item_id: i64,
+            track_id: String,
+            size_bytes: i64,
+            content_id: Option<String>,
+            sidecar_generation: Option<i64>,
+        }
+        let legacy: Vec<LegacyRow> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT media_item_id, track_id, size_bytes, content_id, sidecar_generation
+                     FROM media_item_sidecars ORDER BY media_item_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok(LegacyRow {
+                    media_item_id: r.get(0)?,
+                    track_id: r.get(1)?,
+                    size_bytes: r.get(2)?,
+                    content_id: r.get(3)?,
+                    sidecar_generation: r.get(4)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            legacy,
+            vec![
+                LegacyRow {
+                    media_item_id: 1,
+                    track_id: "s-en".to_string(),
+                    size_bytes: 2,
+                    content_id: None,
+                    sidecar_generation: None,
+                },
+                LegacyRow {
+                    media_item_id: 2,
+                    track_id: "s".to_string(),
+                    size_bytes: 4,
+                    content_id: None,
+                    sidecar_generation: None,
+                },
+            ]
+        );
+
+        // The generation CHECK is the closed set: zero is refused, positive is
+        // admitted.
+        assert!(
+            conn.execute(
+                "UPDATE media_item_sidecars SET sidecar_generation = 0
+                 WHERE media_item_id = 1 AND track_id = 's-en'",
+                [],
+            )
+            .is_err(),
+            "sidecar_generation must be positive once assigned"
+        );
+        conn.execute(
+            "UPDATE media_item_sidecars SET sidecar_generation = 1
+             WHERE media_item_id = 1 AND track_id = 's-en'",
+            [],
+        )
+        .unwrap();
+
+        // The allocator is per item and survives sidecar deletion.
+        conn.execute(
+            "INSERT INTO media_item_sidecar_generations (media_item_id, last_generation)
+             VALUES (1, 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM media_item_sidecars WHERE media_item_id = 1",
+            [],
+        )
+        .unwrap();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT last_generation FROM media_item_sidecar_generations WHERE media_item_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 3, "removal deletes membership, not the allocator");
+
+        // The allocator belongs to an item.
+        let orphan = conn.execute(
+            "INSERT INTO media_item_sidecar_generations (media_item_id, last_generation)
+             VALUES (99, 1)",
+            [],
+        );
+        assert!(orphan.is_err(), "allocator rows belong to an item");
 
         // Repeat safety: a second migrate is a no-op and leaves the columns.
         migrate(&conn).unwrap();
