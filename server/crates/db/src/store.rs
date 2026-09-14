@@ -267,7 +267,11 @@ pub struct SidecarRow {
 }
 
 /// One persisted subtitle stream row in `media_item_subtitle_tracks`
-/// (ADR-0041 Decision 1). Written at probe time; a re-probe replaces the rows.
+/// (ADR-0041 Decision 1). A re-probe replaces the rows.
+///
+/// The publisher writes `probe_revision` itself from the expectation, so the
+/// `media_item_id` here is not read: the row belongs to the item under CAS
+/// (ADR-0058).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTrackRow {
     pub media_item_id: i64,
@@ -279,6 +283,94 @@ pub struct SubtitleTrackRow {
     pub sdh: bool,
     /// `text` | `ass` | `image` | `unknown` (migration 017 CHECK).
     pub kind: String,
+}
+
+/// One audio stream row the publisher writes to `media_item_audio_tracks`
+/// (ADR-0058). Like [`SubtitleTrackRow`], the item comes from the expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioTrackRow {
+    pub stream_index: i64,
+    pub codec: String,
+    pub language: Option<String>,
+    pub channels: Option<i64>,
+    pub channel_layout: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
+}
+
+/// The captured expectation one probe result must still match to publish
+/// (ADR-0058).
+///
+/// The worker records every field before it probes. A publication commits only
+/// while the row still matches all of them, so a result can never describe
+/// bytes, a path, a library-root binding, or a media revision other than the
+/// one it observed.
+#[derive(Debug, Clone)]
+pub struct ProbeExpectation {
+    pub item_id: i64,
+    pub library_id: i64,
+    /// Current `libraries.path` the item is bound to.
+    pub library_root: String,
+    /// Stored `media_items.path`.
+    pub path: String,
+    pub media_revision: i64,
+    pub probe_revision: i64,
+    /// ADR-0023 identity observed before probing. `None` or empty cannot
+    /// certify a success.
+    pub content_id: Option<String>,
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+}
+
+/// The complete technical result of one successful probe (ADR-0058).
+///
+/// Every scalar and both inventories travel together: a partial success is not
+/// a publication.
+#[derive(Debug, Clone)]
+pub struct ProbeSnapshot {
+    pub duration_ms: Option<i64>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    /// Selected absolute video stream index.
+    pub video_stream_index: Option<i64>,
+    pub audio_codec: Option<String>,
+    pub audio_channels: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub video_bitrate_bps: Option<i64>,
+    pub video_frame_rate_num: Option<i64>,
+    pub video_frame_rate_den: Option<i64>,
+    pub hdr: Option<String>,
+    /// Complete audio inventory, ordered by absolute stream index.
+    pub audio_tracks: Vec<AudioTrackRow>,
+    /// Complete subtitle inventory, ordered by absolute stream index.
+    pub subtitle_tracks: Vec<SubtitleTrackRow>,
+    /// Derived by [`crate::status::classify_subtitle_status`] (ADR-0041
+    /// Decision 2).
+    pub subtitle_status: String,
+}
+
+/// One probe run, ready to publish against its expectation (ADR-0058).
+#[derive(Debug, Clone)]
+pub enum ProbeOutcome {
+    Success(Box<ProbeSnapshot>),
+    Failure {
+        /// `error` or `unavailable`; `probed` is not a failure.
+        probe_status: String,
+        scan_error: String,
+    },
+}
+
+/// What a publication did (ADR-0058).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePublication {
+    Published {
+        media_revision: i64,
+        probe_revision: i64,
+    },
+    FailureRecorded,
+    /// The captured expectation no longer matches, so nothing was written.
+    Stale,
 }
 
 impl Db {
@@ -769,6 +861,14 @@ impl Db {
         Ok(ids)
     }
 
+    /// Write technical scalars and a probe status without certifying a
+    /// snapshot (ADR-0058).
+    ///
+    /// **Legacy fact-only writer, narrowed.** It does not touch
+    /// `probed_content_id`, `probed_media_revision`, or `probe_revision`, so a
+    /// `probed` status written here leaves the row uncertified. Only
+    /// [`Db::publish_probe`] may certify a snapshot. The scanner's probe path
+    /// uses the publisher; this remains for tests that seed a probed item.
     pub fn apply_probe_update(&self, update: &ProbeUpdate) -> Result<(), String> {
         let status = parse_probe_status(&update.probe_status)?;
         let conn = self.lock()?;
@@ -787,8 +887,7 @@ impl Db {
                 hdr = ?10,
                 probe_status = ?11,
                 scan_error = ?12,
-                probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                probed_content_id = content_id
+                probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
                 update.item_id,
@@ -809,6 +908,30 @@ impl Db {
         )
         .map_err(|e| format!("apply probe for item {}: {e}", update.item_id))?;
         Ok(())
+    }
+
+    /// Publish one probe result atomically against its captured expectation
+    /// (ADR-0058).
+    ///
+    /// The transaction takes the write lock up front (`BEGIN IMMEDIATE`) and
+    /// CASes every captured field — item id, library id and current
+    /// library-root binding, stored path, media revision, expected probe
+    /// revision, content identity, mtime, and size. A mismatch writes nothing
+    /// and returns [`ProbePublication::Stale`]. A success writes every
+    /// scalar, replaces both complete inventories at `probe_revision + 1`, and
+    /// sets the validity stamps in that one transaction; a failure records the
+    /// status and error, clears both validity stamps, and leaves the prior
+    /// facts and inventories in place. Any child or scalar write failure rolls
+    /// the whole publication back and returns `Err`.
+    pub fn publish_probe(
+        &self,
+        expectation: &ProbeExpectation,
+        outcome: &ProbeOutcome,
+    ) -> Result<ProbePublication, String> {
+        let conn = self.lock()?;
+        // Reads before it writes, so take the write lock up front; `with_write_tx`
+        // retries the lock rather than losing the publication to a busy peer.
+        with_write_tx(&conn, |tx| publish_probe_tx(tx, expectation, outcome))
     }
 
     pub fn set_subtitle_status(&self, item_id: i64, status: &str) -> Result<(), String> {
@@ -1237,7 +1360,14 @@ impl Db {
     }
 
     /// Replace all subtitle-stream inventory rows for one media item
-    /// (ADR-0041 Decision 1, probe-time write; re-probe replaces the rows).
+    /// (ADR-0041 Decision 1; re-probe replaces the rows).
+    ///
+    /// **Legacy revision-0 writer, superseded in production.** The scanner's
+    /// probe publishes its inventory through [`Db::publish_probe`], which
+    /// stamps the rows with the new probe revision in the same transaction as
+    /// the scalars. Rows written here carry probe revision 0, so they cannot
+    /// certify a publication. This remains for tests that need a stored
+    /// inventory without a full snapshot.
     pub fn replace_item_subtitle_tracks(
         &self,
         media_item_id: i64,
@@ -1729,6 +1859,230 @@ fn map_subtitle_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubtitleTrackRo
         sdh: sdh != 0,
         kind: r.get(7)?,
     })
+}
+
+/// The body of [`Db::publish_probe`], run inside one `BEGIN IMMEDIATE`
+/// transaction (ADR-0058).
+///
+/// It is a free function so the transaction and the CAS stay together and the
+/// whole publication is one closure body: either every write in it commits or
+/// none does.
+fn publish_probe_tx(
+    tx: &Transaction<'_>,
+    expectation: &ProbeExpectation,
+    outcome: &ProbeOutcome,
+) -> Result<ProbePublication, String> {
+    // CAS every captured field. `m.content_id IS ?7` is the NULL-safe form:
+    // a captured NULL identity matches a NULL column and nothing else.
+    let matched: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT m.media_revision, m.probe_revision
+               FROM media_items m
+               JOIN libraries l ON l.id = m.library_id
+              WHERE m.id = ?1
+                AND m.library_id = ?2
+                AND l.path = ?3
+                AND m.path = ?4
+                AND m.media_revision = ?5
+                AND m.probe_revision = ?6
+                AND m.content_id IS ?7
+                AND m.mtime_ms = ?8
+                AND m.size_bytes = ?9",
+            params![
+                expectation.item_id,
+                expectation.library_id,
+                expectation.library_root,
+                expectation.path,
+                expectation.media_revision,
+                expectation.probe_revision,
+                expectation.content_id,
+                expectation.mtime_ms,
+                expectation.size_bytes,
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("probe CAS for item {}: {e}", expectation.item_id))?;
+    let Some((media_revision, probe_revision)) = matched else {
+        return Ok(ProbePublication::Stale);
+    };
+
+    match outcome {
+        ProbeOutcome::Failure {
+            probe_status,
+            scan_error,
+        } => {
+            let status = parse_probe_status(probe_status)?;
+            if !matches!(status, "error" | "unavailable") {
+                return Err(format!(
+                    "probe failure for item {} must be 'error' or 'unavailable', got '{status}'",
+                    expectation.item_id
+                ));
+            }
+            // Diagnostics land; both validity stamps clear; technical facts,
+            // inventories, and `probe_revision` are left as they were.
+            tx.execute(
+                "UPDATE media_items SET
+                    probe_status = ?2,
+                    scan_error = ?3,
+                    probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    probed_media_revision = NULL,
+                    probed_content_id = NULL
+                 WHERE id = ?1",
+                params![expectation.item_id, status, scan_error],
+            )
+            .map_err(|e| format!("record probe failure for item {}: {e}", expectation.item_id))?;
+            Ok(ProbePublication::FailureRecorded)
+        }
+        ProbeOutcome::Success(snapshot) => {
+            // NULL or empty identity cannot certify a success (ADR-0058).
+            let Some(content_id) = expectation
+                .content_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+            else {
+                return Ok(ProbePublication::Stale);
+            };
+            let subtitle_status = parse_subtitle_status(&snapshot.subtitle_status)?;
+            let next = probe_revision.checked_add(1).ok_or_else(|| {
+                format!("probe revision overflow for item {}", expectation.item_id)
+            })?;
+
+            tx.execute(
+                "UPDATE media_items SET
+                    duration_ms = ?2,
+                    container = ?3,
+                    video_codec = ?4,
+                    audio_codec = ?5,
+                    audio_channels = ?6,
+                    width = ?7,
+                    height = ?8,
+                    video_bitrate_bps = ?9,
+                    video_frame_rate_num = ?10,
+                    video_frame_rate_den = ?11,
+                    hdr = ?12,
+                    video_stream_index = ?13,
+                    probe_status = 'probed',
+                    scan_error = NULL,
+                    probed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    subtitle_status = ?14,
+                    subtitle_content_id = CASE
+                        WHEN ?14 IN ('ready', 'none') THEN ?17 ELSE NULL END,
+                    subtitle_attempt_count = 0,
+                    subtitle_next_retry_at = NULL,
+                    probe_revision = ?15,
+                    probed_media_revision = ?16,
+                    probed_content_id = ?17
+                 WHERE id = ?1",
+                params![
+                    expectation.item_id,
+                    snapshot.duration_ms,
+                    snapshot.container,
+                    snapshot.video_codec,
+                    snapshot.audio_codec,
+                    snapshot.audio_channels,
+                    snapshot.width,
+                    snapshot.height,
+                    snapshot.video_bitrate_bps,
+                    snapshot.video_frame_rate_num,
+                    snapshot.video_frame_rate_den,
+                    snapshot.hdr,
+                    snapshot.video_stream_index,
+                    subtitle_status,
+                    next,
+                    media_revision,
+                    content_id,
+                ],
+            )
+            .map_err(|e| format!("publish probe facts for item {}: {e}", expectation.item_id))?;
+
+            // Complete replacement, stamped with the new revision. An empty
+            // inventory deletes the old rows and inserts nothing.
+            tx.execute(
+                "DELETE FROM media_item_audio_tracks WHERE media_item_id = ?1",
+                [expectation.item_id],
+            )
+            .map_err(|e| {
+                format!(
+                    "clear audio inventory for item {}: {e}",
+                    expectation.item_id
+                )
+            })?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO media_item_audio_tracks (
+                            media_item_id, probe_revision, stream_index, codec, language,
+                            channels, channel_layout, title, is_default
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )
+                    .map_err(|e| format!("prepare audio track insert: {e}"))?;
+                for track in &snapshot.audio_tracks {
+                    stmt.execute(params![
+                        expectation.item_id,
+                        next,
+                        track.stream_index,
+                        track.codec,
+                        track.language,
+                        track.channels,
+                        track.channel_layout,
+                        track.title,
+                        track.is_default as i64,
+                    ])
+                    .map_err(|e| {
+                        format!(
+                            "insert audio track {} for item {}: {e}",
+                            track.stream_index, expectation.item_id
+                        )
+                    })?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM media_item_subtitle_tracks WHERE media_item_id = ?1",
+                [expectation.item_id],
+            )
+            .map_err(|e| {
+                format!(
+                    "clear subtitle inventory for item {}: {e}",
+                    expectation.item_id
+                )
+            })?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO media_item_subtitle_tracks (
+                            media_item_id, stream_index, codec, language, title,
+                            forced, sdh, kind, probe_revision
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )
+                    .map_err(|e| format!("prepare subtitle track insert: {e}"))?;
+                for track in &snapshot.subtitle_tracks {
+                    stmt.execute(params![
+                        expectation.item_id,
+                        track.stream_index,
+                        track.codec,
+                        track.language,
+                        track.title,
+                        track.forced as i64,
+                        track.sdh as i64,
+                        track.kind,
+                        next,
+                    ])
+                    .map_err(|e| {
+                        format!(
+                            "insert subtitle track {} for item {}: {e}",
+                            track.stream_index, expectation.item_id
+                        )
+                    })?;
+                }
+            }
+
+            Ok(ProbePublication::Published {
+                media_revision,
+                probe_revision: next,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2354,15 +2708,32 @@ mod tests {
         .unwrap()[0]
     }
 
-    /// Record a successful legacy probe: technical facts plus the content-id
-    /// validity stamp. `probed_media_revision` is not written by this path
-    /// (publication is a later slice), so tests that need it set it directly.
-    fn record_probe(db: &Db, item_id: i64) {
-        db.apply_probe_update(&ProbeUpdate {
-            item_id,
+    /// The expectation the publisher CASes, taken from the stored row exactly
+    /// as the scanner captures it before probing (ADR-0058).
+    fn expectation_of(db: &Db, item_id: i64) -> ProbeExpectation {
+        let row = db.get_item(item_id).unwrap().unwrap();
+        let lib = db.get_library(row.library_id).unwrap().unwrap();
+        ProbeExpectation {
+            item_id: row.id,
+            library_id: row.library_id,
+            library_root: lib.path,
+            path: row.path,
+            media_revision: row.media_revision,
+            probe_revision: row.probe_revision,
+            content_id: row.content_id,
+            mtime_ms: row.mtime_ms,
+            size_bytes: row.size_bytes,
+        }
+    }
+
+    /// One complete successful snapshot, with distinct values in every field
+    /// so a partial write is visible.
+    fn complete_snapshot(item_id: i64) -> ProbeSnapshot {
+        ProbeSnapshot {
             duration_ms: Some(1000),
             container: Some("matroska".into()),
             video_codec: Some("h264".into()),
+            video_stream_index: Some(0),
             audio_codec: Some("aac".into()),
             audio_channels: Some(2),
             width: Some(1920),
@@ -2371,22 +2742,35 @@ mod tests {
             video_frame_rate_num: Some(24),
             video_frame_rate_den: Some(1),
             hdr: Some("none".into()),
-            probe_status: "probed".into(),
-            scan_error: None,
-        })
-        .unwrap();
+            audio_tracks: vec![AudioTrackRow {
+                stream_index: 1,
+                codec: "aac".into(),
+                language: Some("eng".into()),
+                channels: Some(2),
+                channel_layout: Some("stereo".into()),
+                title: Some("Main".into()),
+                is_default: true,
+            }],
+            subtitle_tracks: vec![SubtitleTrackRow {
+                media_item_id: item_id,
+                stream_index: 2,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                title: None,
+                forced: false,
+                sdh: false,
+                kind: "text".into(),
+            }],
+            subtitle_status: "eligible".into(),
+        }
     }
 
-    fn set_probed_media_revision(db: &Db, item_id: i64, revision: i64) {
-        db.with_conn(|c| {
-            c.execute(
-                "UPDATE media_items SET probed_media_revision = ?2 WHERE id = ?1",
-                params![item_id, revision],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-        })
-        .unwrap();
+    fn publish_complete_success(db: &Db, item_id: i64) -> ProbePublication {
+        db.publish_probe(
+            &expectation_of(db, item_id),
+            &ProbeOutcome::Success(Box::new(complete_snapshot(item_id))),
+        )
+        .unwrap()
     }
 
     fn raw_media_revision(db: &Db, item_id: i64) -> i64 {
@@ -2396,6 +2780,57 @@ mod tests {
                 params![item_id],
                 |r| r.get(0),
             )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    /// `(probe_revision, probed_at, probe_status, scan_error)` straight from
+    /// the row, so a "complete no-op" can be asserted on columns the typed row
+    /// does not carry.
+    fn probe_stamps(db: &Db, item_id: i64) -> (i64, Option<String>, String, Option<String>) {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT probe_revision, probed_at, probe_status, scan_error
+                   FROM media_items WHERE id = ?1",
+                params![item_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    /// Raw audio inventory as `(probe_revision, stream_index, codec, is_default)`.
+    fn audio_inventory(db: &Db, item_id: i64) -> Vec<(i64, i64, String, i64)> {
+        db.with_conn(|c| {
+            c.prepare(
+                "SELECT probe_revision, stream_index, codec, is_default
+                   FROM media_item_audio_tracks
+                  WHERE media_item_id = ?1 ORDER BY stream_index",
+            )
+            .map_err(|e| e.to_string())?
+            .query_map([item_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    /// Raw subtitle `probe_revision`s ordered by absolute stream index.
+    fn subtitle_revisions(db: &Db, item_id: i64) -> Vec<i64> {
+        db.with_conn(|c| {
+            c.prepare(
+                "SELECT probe_revision FROM media_item_subtitle_tracks
+                  WHERE media_item_id = ?1 ORDER BY stream_index",
+            )
+            .map_err(|e| e.to_string())?
+            .query_map([item_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<i64>, _>>()
             .map_err(|e| e.to_string())
         })
         .unwrap()
@@ -2424,8 +2859,13 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let lib = revision_library(&db, "/films");
         let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
-        record_probe(&db, id);
-        set_probed_media_revision(&db, id, 1);
+        assert_eq!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published {
+                media_revision: 1,
+                probe_revision: 1,
+            }
+        );
 
         upsert_observed(&db, lib, "clip.mkv", 2, Some("1-aaa-bbb"));
 
@@ -2443,8 +2883,10 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let lib = revision_library(&db, "/films");
         let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
-        record_probe(&db, id);
-        set_probed_media_revision(&db, id, 1);
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
 
         upsert_observed(&db, lib, "clip.mkv", 2, Some("2-ccc-ddd"));
 
@@ -2453,7 +2895,7 @@ mod tests {
         assert_eq!(row.probed_media_revision, None);
         assert_eq!(row.probed_content_id, None);
         assert_eq!(
-            row.probe_revision, 0,
+            row.probe_revision, 1,
             "identity change is not a publication"
         );
 
@@ -2473,7 +2915,10 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let lib = revision_library(&db, "/films");
         let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
-        record_probe(&db, id);
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
 
         upsert_observed(&db, lib, "clip.mkv", 2, Some("2-ccc-ddd"));
 
@@ -2494,8 +2939,10 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let lib = revision_library(&db, "/films");
         let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
-        record_probe(&db, id);
-        set_probed_media_revision(&db, id, 1);
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
 
         db.update_library_path(lib, "/films2").unwrap();
 
@@ -2555,8 +3002,10 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let lib = revision_library(&db, "/films");
         let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
-        record_probe(&db, id);
-        set_probed_media_revision(&db, id, 1);
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
 
         assert!(
             db.replace_item_sidecars(id, &[sidecar(id, "s-en")])
@@ -2565,7 +3014,7 @@ mod tests {
 
         let row = db.get_item(id).unwrap().unwrap();
         assert_eq!(row.media_revision, 1);
-        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probe_revision, 1);
         assert_eq!(row.probed_media_revision, Some(1));
         assert_eq!(row.probed_content_id.as_deref(), Some("1-aaa-bbb"));
     }
@@ -2612,5 +3061,529 @@ mod tests {
         let row = db.get_item(id).unwrap().unwrap();
         assert_eq!(row.media_revision, i64::MAX, "the abort rolls back");
         assert_eq!(row.content_id.as_deref(), Some("1-aaa-bbb"));
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0058 atomic probe publication
+    // ------------------------------------------------------------------
+
+    /// One transaction writes every scalar and both inventories at one new
+    /// revision, and certifies the captured identity.
+    #[test]
+    fn success_publishes_all_scalars_and_children_at_one_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        assert_eq!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published {
+                media_revision: 1,
+                probe_revision: 1,
+            }
+        );
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "probed");
+        assert_eq!(row.probe_revision, 1);
+        assert_eq!(row.probed_media_revision, Some(1));
+        assert_eq!(row.probed_content_id.as_deref(), Some("1-aaa-bbb"));
+        assert_eq!(row.video_stream_index, Some(0));
+        assert_eq!(row.duration_ms, Some(1000));
+        assert_eq!(row.container.as_deref(), Some("matroska"));
+        assert_eq!(row.video_codec.as_deref(), Some("h264"));
+        assert_eq!(row.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(row.audio_channels, Some(2));
+        assert_eq!(row.width, Some(1920));
+        assert_eq!(row.height, Some(1080));
+        assert_eq!(row.video_bitrate_bps, Some(5_000_000));
+        assert_eq!(row.video_frame_rate_num, Some(24));
+        assert_eq!(row.video_frame_rate_den, Some(1));
+        assert_eq!(row.hdr.as_deref(), Some("none"));
+        assert_eq!(row.subtitle_status, "eligible");
+        assert_eq!(row.scan_error, None);
+
+        // Both children carry the same new revision as the item.
+        assert_eq!(
+            audio_inventory(&db, id),
+            vec![(1, 1, "aac".to_string(), 1)],
+            "audio inventory is written at the publication revision"
+        );
+        assert_eq!(
+            subtitle_revisions(&db, id),
+            vec![1],
+            "subtitle inventory is written at the publication revision"
+        );
+        let tracks = db.list_item_subtitle_tracks(id).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].stream_index, 2);
+        assert_eq!(tracks[0].kind, "text");
+    }
+
+    /// A held expectation must not overwrite a newer publication, nor cross a
+    /// media-identity change: both are CAS misses that write nothing.
+    #[test]
+    fn held_expectation_cannot_overwrite_a_newer_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        // A is captured, then B publishes against the same media revision.
+        let held_a = expectation_of(&db, id);
+        assert_eq!(held_a.probe_revision, 0);
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published {
+                probe_revision: 1,
+                ..
+            }
+        ));
+
+        let stale = db
+            .publish_probe(
+                &held_a,
+                &ProbeOutcome::Success(Box::new(complete_snapshot(id))),
+            )
+            .unwrap();
+        assert_eq!(stale, ProbePublication::Stale, "A names an old revision");
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_revision, 1);
+        assert_eq!(row.probed_content_id.as_deref(), Some("1-aaa-bbb"));
+
+        // A held expectation also cannot cross a media-identity change.
+        let held_b = expectation_of(&db, id);
+        assert_eq!(held_b.media_revision, 1);
+        upsert_observed(&db, lib, "clip.mkv", 2, Some("2-ccc-ddd"));
+        assert_eq!(raw_media_revision(&db, id), 2);
+
+        let stale = db
+            .publish_probe(
+                &held_b,
+                &ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "late failure".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(stale, ProbePublication::Stale);
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(
+            row.probe_status, "indexed",
+            "the stale failure wrote nothing"
+        );
+        assert_eq!(row.scan_error, None);
+    }
+
+    /// A stale success is a complete no-op: no scalar, child, stamp, or
+    /// timestamp moves.
+    #[test]
+    fn stale_success_is_a_complete_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+
+        let before = db.get_item(id).unwrap().unwrap();
+        let stamps = probe_stamps(&db, id);
+        let audio_before = audio_inventory(&db, id);
+        let subtitles_before = subtitle_revisions(&db, id);
+
+        // A held expectation, then one CAS field moves under it.
+        let held = expectation_of(&db, id);
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET mtime_ms = mtime_ms + 1 WHERE id = ?1",
+                [id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let stale = db
+            .publish_probe(
+                &held,
+                &ProbeOutcome::Success(Box::new(complete_snapshot(id))),
+            )
+            .unwrap();
+        assert_eq!(stale, ProbePublication::Stale);
+
+        let after = db.get_item(id).unwrap().unwrap();
+        assert_eq!(after.duration_ms, before.duration_ms);
+        assert_eq!(after.container, before.container);
+        assert_eq!(after.video_stream_index, before.video_stream_index);
+        assert_eq!(after.subtitle_status, before.subtitle_status);
+        assert_eq!(after.probed_content_id, before.probed_content_id);
+        assert_eq!(
+            probe_stamps(&db, id),
+            stamps,
+            "probe_revision, probed_at, status and error must not move"
+        );
+        assert_eq!(audio_inventory(&db, id), audio_before);
+        assert_eq!(subtitle_revisions(&db, id), subtitles_before);
+    }
+
+    /// A stale failure is likewise a strict no-op: the diagnostics are not
+    /// written and the validity stamps are not cleared.
+    #[test]
+    fn stale_failure_is_a_complete_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+
+        let stamps = probe_stamps(&db, id);
+        let held = expectation_of(&db, id);
+        upsert_observed(&db, lib, "clip.mkv", 2, Some("2-ccc-ddd"));
+
+        let stale = db
+            .publish_probe(
+                &held,
+                &ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "stale".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(stale, ProbePublication::Stale);
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed");
+        assert_eq!(row.scan_error, None);
+        assert_eq!(row.probed_content_id, None);
+        assert_eq!(probe_stamps(&db, id).0, 1, "probe_revision is unchanged");
+        assert_eq!(stamps.2, "probed", "the prior status was 'probed'");
+        assert_eq!(
+            subtitle_revisions(&db, id),
+            vec![1],
+            "the inventory is untouched"
+        );
+    }
+
+    /// An empty inventory deletes the prior rows: a publication is a complete
+    /// replacement, never an append.
+    #[test]
+    fn empty_inventory_replacement_deletes_old_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        assert_eq!(audio_inventory(&db, id).len(), 1);
+        assert_eq!(subtitle_revisions(&db, id).len(), 1);
+
+        let mut empty = complete_snapshot(id);
+        empty.audio_tracks.clear();
+        empty.subtitle_tracks.clear();
+        empty.subtitle_status = "none".into();
+        let published = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Success(Box::new(empty)),
+            )
+            .unwrap();
+        assert_eq!(
+            published,
+            ProbePublication::Published {
+                media_revision: 1,
+                probe_revision: 2,
+            }
+        );
+
+        assert!(audio_inventory(&db, id).is_empty());
+        assert!(subtitle_revisions(&db, id).is_empty());
+        assert_eq!(db.get_item(id).unwrap().unwrap().subtitle_status, "none");
+    }
+
+    /// A failure keeps the prior facts and inventories for diagnostics, clears
+    /// both validity stamps, and leaves `probe_revision` alone.
+    #[test]
+    fn failure_retains_diagnostics_and_clears_validity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+
+        let recorded = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Failure {
+                    probe_status: "unavailable".into(),
+                    scan_error: "unavailable: mount gone".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(recorded, ProbePublication::FailureRecorded);
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "unavailable");
+        assert_eq!(row.scan_error.as_deref(), Some("unavailable: mount gone"));
+        assert_eq!(row.probed_media_revision, None, "validity stamp cleared");
+        assert_eq!(row.probed_content_id, None, "validity stamp cleared");
+        assert_eq!(row.probe_revision, 1, "a failure is not a publication");
+        assert_eq!(row.duration_ms, Some(1000), "facts retained");
+        assert_eq!(row.video_stream_index, Some(0));
+        assert_eq!(audio_inventory(&db, id).len(), 1, "inventory retained");
+        assert_eq!(subtitle_revisions(&db, id), vec![1]);
+    }
+
+    /// A failure outcome may carry only `error` or `unavailable`. Any other
+    /// status — including the valid-but-non-failure `indexed` and `probed`, and
+    /// the unknown `other` — is rejected before any write.
+    #[test]
+    fn failure_rejects_non_failure_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        for status in ["indexed", "probed", "other"] {
+            let result = db.publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Failure {
+                    probe_status: status.into(),
+                    scan_error: format!("failure with status {status}"),
+                },
+            );
+            assert!(result.is_err(), "status '{status}' must be rejected");
+
+            let row = db.get_item(id).unwrap().unwrap();
+            assert_eq!(row.probe_status, "indexed", "status '{status}'");
+            assert_eq!(row.scan_error, None, "status '{status}'");
+            assert_eq!(probe_stamps(&db, id).0, 0, "status '{status}'");
+            assert!(audio_inventory(&db, id).is_empty(), "status '{status}'");
+            assert!(subtitle_revisions(&db, id).is_empty(), "status '{status}'");
+        }
+    }
+
+    /// At the maximum probe revision the increment cannot wrap: the
+    /// publication aborts and writes nothing.
+    #[test]
+    fn probe_revision_overflow_aborts_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET probe_revision = ?2 WHERE id = ?1",
+                params![id, i64::MAX],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let err = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Success(Box::new(complete_snapshot(id))),
+            )
+            .unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_revision, i64::MAX);
+        assert_eq!(row.probe_status, "indexed");
+        assert_eq!(row.duration_ms, None, "no scalar was written");
+        assert_eq!(row.probed_content_id, None);
+        assert!(audio_inventory(&db, id).is_empty());
+        assert!(subtitle_revisions(&db, id).is_empty());
+    }
+
+    /// A child-row constraint fault rolls the whole publication back, scalars
+    /// included.
+    #[test]
+    fn child_constraint_fault_rolls_back_the_whole_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        // PRIMARY KEY (media_item_id, stream_index): the second row collides.
+        let mut snapshot = complete_snapshot(id);
+        snapshot.audio_tracks = vec![
+            AudioTrackRow {
+                stream_index: 1,
+                codec: "aac".into(),
+                language: None,
+                channels: Some(2),
+                channel_layout: None,
+                title: None,
+                is_default: true,
+            },
+            AudioTrackRow {
+                stream_index: 1,
+                codec: "ac3".into(),
+                language: None,
+                channels: Some(6),
+                channel_layout: None,
+                title: None,
+                is_default: false,
+            },
+        ];
+
+        let err = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Success(Box::new(snapshot)),
+            )
+            .unwrap_err();
+        assert!(err.contains("insert audio track"), "{err}");
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed");
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.duration_ms, None, "the scalar write rolled back too");
+        assert_eq!(row.video_stream_index, None);
+        assert_eq!(row.probed_content_id, None);
+        assert!(audio_inventory(&db, id).is_empty());
+        assert!(subtitle_revisions(&db, id).is_empty());
+    }
+
+    /// NULL or empty identity cannot certify a success; the result is stale and
+    /// nothing is written.
+    #[test]
+    fn success_without_content_identity_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, None);
+
+        let result = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Success(Box::new(complete_snapshot(id))),
+            )
+            .unwrap();
+        assert_eq!(result, ProbePublication::Stale, "NULL identity");
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed");
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.duration_ms, None);
+
+        db.with_conn(|c| {
+            c.execute("UPDATE media_items SET content_id = '' WHERE id = ?1", [id])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let result = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Success(Box::new(complete_snapshot(id))),
+            )
+            .unwrap();
+        assert_eq!(result, ProbePublication::Stale, "empty identity");
+        assert_eq!(db.get_item(id).unwrap().unwrap().probe_status, "indexed");
+    }
+
+    /// A failure does not need an identity to be worth recording.
+    #[test]
+    fn failure_without_content_identity_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, None);
+
+        let recorded = db
+            .publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "no identity".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(recorded, ProbePublication::FailureRecorded);
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "error");
+        assert_eq!(row.scan_error.as_deref(), Some("no identity"));
+        assert_eq!(row.probe_revision, 0);
+    }
+
+    /// A database write fault stays an error and leaves the row untouched.
+    #[test]
+    fn failure_write_fault_returns_err_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        let expectation = expectation_of(&db, id);
+
+        // Reads still work; every write on this connection now fails.
+        db.with_conn(|c| {
+            c.execute_batch("PRAGMA query_only = ON")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let err = db
+            .publish_probe(
+                &expectation,
+                &ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "fault".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(!err.is_empty());
+
+        // The read side still shows the untouched row.
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed");
+        assert_eq!(row.scan_error, None);
+        assert_eq!(row.probe_revision, 0);
+    }
+
+    /// The legacy fact-only writer can no longer certify a snapshot.
+    #[test]
+    fn legacy_fact_writer_does_not_certify_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        db.apply_probe_update(&ProbeUpdate {
+            item_id: id,
+            duration_ms: Some(1000),
+            container: Some("matroska".into()),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            audio_channels: Some(2),
+            width: Some(1920),
+            height: Some(1080),
+            video_bitrate_bps: Some(5_000_000),
+            video_frame_rate_num: Some(24),
+            video_frame_rate_den: Some(1),
+            hdr: Some("none".into()),
+            probe_status: "probed".into(),
+            scan_error: None,
+        })
+        .unwrap();
+
+        let row = db.get_item(id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "probed");
+        assert_eq!(row.duration_ms, Some(1000));
+        assert_eq!(row.probed_content_id, None, "no certification");
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probe_revision, 0);
     }
 }

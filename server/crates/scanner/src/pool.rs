@@ -1,8 +1,9 @@
 use crate::probe;
 use crate::reachability::{self, Availability, Reachability, message_looks_unavailable};
-use crate::walk::WalkCache;
+use crate::walk::{WalkCache, mtime_ms_from};
 use nightjar_db::{
-    Db, ProbeUpdate, SidecarPresence, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
+    AudioTrackRow, Db, ProbeExpectation, ProbeOutcome, ProbePublication, ProbeSnapshot,
+    SidecarPresence, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
 };
 use nightjar_transcode::{
     ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles, is_burn_in_sidecar_format,
@@ -987,37 +988,21 @@ impl LibraryPool {
             Self::finish_batch(&item);
             return;
         }
-        // Prefer DB-stored path (relpath) so WorkItem can carry either form (ADR-0030).
-        let stored = self
-            .db
-            .get_item(item.item_id)
-            .ok()
-            .flatten()
-            .map(|r| r.path)
-            .unwrap_or_else(|| item.path.to_string_lossy().into_owned());
-        let abs = match self.abs_media_path(item.library_id, &stored) {
-            Ok(p) => p,
+        // Capture the expectation before probing (ADR-0058). Everything below
+        // publishes against exactly these fields or not at all.
+        let (expectation, abs) = match self.probe_expectation(&item) {
+            Ok(Some(pair)) => pair,
+            // The item or its library row is gone; there is nothing to publish.
+            Ok(None) => {
+                Self::finish_batch(&item);
+                return;
+            }
             Err(e) => {
-                tracing::warn!(item_id = item.item_id, error = %e, "resolve path for probe");
-                let _ = self.db.apply_probe_update(&ProbeUpdate {
-                    item_id: item.item_id,
-                    duration_ms: None,
-                    container: None,
-                    video_codec: None,
-                    audio_codec: None,
-                    audio_channels: None,
-                    width: None,
-                    height: None,
-                    video_bitrate_bps: None,
-                    video_frame_rate_num: None,
-                    video_frame_rate_den: None,
-                    hdr: None,
-                    probe_status: "unavailable".into(),
-                    scan_error: Some(e),
-                });
-                if let Some(job_id) = item.scan_job_id {
-                    let _ = self.db.bump_scan_job_probe(job_id, false);
-                }
+                tracing::warn!(
+                    item_id = item.item_id,
+                    error = %e,
+                    "capture probe expectation failed"
+                );
                 Self::finish_batch(&item);
                 return;
             }
@@ -1026,29 +1011,22 @@ impl LibraryPool {
         // same pause set that blocks new starts aborts a running probe
         // (ADR-0041 Decision 8.7 amendment, 2026-08-07).
         let should_cancel = || self.availability.pause.is_paused(item.library_id);
-        let update = match probe::ffprobe(&abs, Some(&should_cancel)) {
-            Ok(p) => {
-                // ADR-0041: classify at probe time, not by a later extract pass.
-                if let Err(e) = self.apply_subtitle_classification(item.item_id, &p) {
-                    tracing::warn!(item_id = item.item_id, error = %e, "subtitle classification failed");
+        let outcome = match probe::ffprobe(&abs, Some(&should_cancel)) {
+            Ok(p) => match self.probe_snapshot(item.item_id, &p) {
+                Ok(snapshot) => ProbeOutcome::Success(Box::new(snapshot)),
+                Err(e) => {
+                    // A complete snapshot could not be built, and a partial
+                    // success is not a publication (ADR-0058). Leave the item
+                    // for a later pass rather than certify less than the whole.
+                    tracing::warn!(
+                        item_id = item.item_id,
+                        error = %e,
+                        "build probe snapshot failed"
+                    );
+                    Self::finish_batch(&item);
+                    return;
                 }
-                ProbeUpdate {
-                    item_id: item.item_id,
-                    duration_ms: p.duration_ms,
-                    container: p.container,
-                    video_codec: p.video_codec,
-                    audio_codec: p.audio_codec,
-                    audio_channels: p.audio_channels,
-                    width: p.width,
-                    height: p.height,
-                    video_bitrate_bps: p.video_bitrate_bps,
-                    video_frame_rate_num: p.video_frame_rate.map(|(n, _)| n),
-                    video_frame_rate_den: p.video_frame_rate.map(|(_, d)| d),
-                    hdr: p.hdr,
-                    probe_status: "probed".into(),
-                    scan_error: None,
-                }
-            }
+            },
             Err(e) => {
                 let unavailable = self.availability.pause.is_paused(item.library_id)
                     || message_looks_unavailable(&e)
@@ -1072,70 +1050,139 @@ impl LibraryPool {
                         error = %e,
                         "ffprobe unavailable"
                     );
-                    ProbeUpdate {
-                        item_id: item.item_id,
-                        duration_ms: None,
-                        container: None,
-                        video_codec: None,
-                        audio_codec: None,
-                        audio_channels: None,
-                        width: None,
-                        height: None,
-                        video_bitrate_bps: None,
-                        video_frame_rate_num: None,
-                        video_frame_rate_den: None,
-                        hdr: None,
-                        probe_status: "unavailable".into(),
-                        scan_error: Some(e),
-                    }
                 } else {
                     tracing::warn!(path = %abs.display(), error = %e, "ffprobe failed");
-                    ProbeUpdate {
-                        item_id: item.item_id,
-                        duration_ms: None,
-                        container: None,
-                        video_codec: None,
-                        audio_codec: None,
-                        audio_channels: None,
-                        width: None,
-                        height: None,
-                        video_bitrate_bps: None,
-                        video_frame_rate_num: None,
-                        video_frame_rate_den: None,
-                        hdr: None,
-                        probe_status: "error".into(),
-                        scan_error: Some(e),
-                    }
+                }
+                ProbeOutcome::Failure {
+                    probe_status: if unavailable {
+                        "unavailable".into()
+                    } else {
+                        "error".into()
+                    },
+                    scan_error: e,
                 }
             }
         };
-        let failed = update.probe_status == "error";
-        if let Err(e) = self.db.apply_probe_update(&update) {
-            tracing::warn!(item_id = item.item_id, error = %e, "probe update failed");
-        }
-        if let Some(job_id) = item.scan_job_id
-            && let Err(e) = self.db.bump_scan_job_probe(job_id, failed)
-        {
-            tracing::warn!(job_id, error = %e, "probe counter bump failed");
+        // Final filesystem validation outside the transaction (ADR-0058). It
+        // runs for BOTH a success and a failure: a probe result may publish
+        // only while the source still matches the captured expectation. A
+        // source that cannot be stat'ed is `unavailable`, never the ffprobe
+        // result, even when the probe was administratively cancelled
+        // (ADR-0041 Decision 8.7); a cancelled probe whose source is still
+        // valid publishes nothing, and a changed source is stale.
+        let final_stat = std::fs::metadata(&abs).map(|m| (mtime_ms_from(&m), m.len() as i64));
+        let administratively_cancelled = self.availability.pause.is_paused(item.library_id);
+        let outcome = match decide_probe_publication(
+            &expectation,
+            outcome,
+            final_stat,
+            administratively_cancelled,
+            &abs,
+        ) {
+            ProbeDecision::Publish(outcome) => outcome,
+            ProbeDecision::NoOp => {
+                tracing::debug!(
+                    item_id = item.item_id,
+                    path = %abs.display(),
+                    "probe result not published"
+                );
+                Self::finish_batch(&item);
+                return;
+            }
+        };
+        let failed = matches!(
+            &outcome,
+            ProbeOutcome::Failure { probe_status, .. } if probe_status == "error"
+        );
+        let publication = match self.db.publish_probe(&expectation, &outcome) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(item_id = item.item_id, error = %e, "publish probe failed");
+                Self::finish_batch(&item);
+                return;
+            }
+        };
+        if let Some(job_id) = item.scan_job_id {
+            // `Published` counts a success; a recorded failure counts probed
+            // and counts the error column only for a terminal `error`; a stale
+            // result counts nothing (ADR-0058).
+            let counted = match publication {
+                ProbePublication::Published { .. } => Some(false),
+                ProbePublication::FailureRecorded => Some(failed),
+                ProbePublication::Stale => None,
+            };
+            if let Some(error) = counted
+                && let Err(e) = self.db.bump_scan_job_probe(job_id, error)
+            {
+                tracing::warn!(job_id, error = %e, "probe counter bump failed");
+            }
         }
         Self::finish_batch(&item);
     }
 
-    /// ADR-0041 Decisions 1–2: persist the probe's subtitle-stream inventory
-    /// and derive `subtitle_status` from it plus sidecar presence. Only runs
-    /// on a successful probe; a failed probe leaves the prior status (a fresh
-    /// item stays `pending`), so classification never guesses an outcome.
-    fn apply_subtitle_classification(
+    /// Capture the expectation a probe result must still match to publish
+    /// (ADR-0058): the item's DB fields plus the library-root binding.
+    ///
+    /// `None` when the item or its library row is gone. The absolute media path
+    /// comes from the same read, so the probe cannot observe a different row
+    /// than the one it will publish against.
+    fn probe_expectation(
+        &self,
+        item: &WorkItem,
+    ) -> Result<Option<(ProbeExpectation, PathBuf)>, String> {
+        let Some(row) = self.db.get_item(item.item_id)? else {
+            return Ok(None);
+        };
+        let Some(lib) = self.db.get_library(row.library_id)? else {
+            return Ok(None);
+        };
+        let abs = nightjar_db::resolve_media_path(&lib.path, &row.path);
+        Ok(Some((
+            ProbeExpectation {
+                item_id: row.id,
+                library_id: row.library_id,
+                library_root: lib.path,
+                path: row.path,
+                media_revision: row.media_revision,
+                probe_revision: row.probe_revision,
+                content_id: row.content_id,
+                mtime_ms: row.mtime_ms,
+                size_bytes: row.size_bytes,
+            },
+            abs,
+        )))
+    }
+
+    /// Build the complete success payload for one ffprobe result (ADR-0058):
+    /// every scalar, both inventories, and the ADR-0041 subtitle
+    /// classification. The classifier stays single-implementation in
+    /// `nightjar_db` (Rule 4.11).
+    fn probe_snapshot(
         &self,
         item_id: i64,
         p: &probe::ProbeResult,
-    ) -> Result<(), String> {
+    ) -> Result<ProbeSnapshot, String> {
         let kinds: Vec<SubtitleTrackKind> = p
             .subtitle_streams
             .iter()
             .map(|s| subtitle_codec_kind(&s.codec))
             .collect();
-        let rows: Vec<SubtitleTrackRow> = p
+        let subtitle_status =
+            classify_subtitle_status(&kinds, self.subtitle_sidecar_presence(item_id)?).to_string();
+        let audio_tracks = p
+            .audio_streams
+            .iter()
+            .map(|s| AudioTrackRow {
+                stream_index: i64::from(s.stream_index),
+                codec: s.codec.clone(),
+                language: s.language.clone(),
+                channels: s.channels,
+                channel_layout: s.channel_layout.clone(),
+                title: s.title.clone(),
+                is_default: s.is_default,
+            })
+            .collect();
+        let subtitle_tracks = p
             .subtitle_streams
             .iter()
             .map(|s| SubtitleTrackRow {
@@ -1149,9 +1196,23 @@ impl LibraryPool {
                 kind: subtitle_codec_kind(&s.codec).as_str().to_string(),
             })
             .collect();
-        self.db.replace_item_subtitle_tracks(item_id, &rows)?;
-        let status = classify_subtitle_status(&kinds, self.subtitle_sidecar_presence(item_id)?);
-        self.db.set_subtitle_status(item_id, status)
+        Ok(ProbeSnapshot {
+            duration_ms: p.duration_ms,
+            container: p.container.clone(),
+            video_codec: p.video_codec.clone(),
+            video_stream_index: p.video_stream_index.map(i64::from),
+            audio_codec: p.audio_codec.clone(),
+            audio_channels: p.audio_channels,
+            width: p.width,
+            height: p.height,
+            video_bitrate_bps: p.video_bitrate_bps,
+            video_frame_rate_num: p.video_frame_rate.map(|(n, _)| n),
+            video_frame_rate_den: p.video_frame_rate.map(|(_, d)| d),
+            hdr: p.hdr.clone(),
+            audio_tracks,
+            subtitle_tracks,
+            subtitle_status,
+        })
     }
 
     /// Sidecar verdict for the classifier from the index-pass sidecar rows.
@@ -1442,6 +1503,49 @@ impl LibraryPool {
         }
         finish();
     }
+}
+
+/// What the pool does with one finished probe after the final filesystem
+/// validation (ADR-0058).
+#[derive(Debug)]
+enum ProbeDecision {
+    Publish(ProbeOutcome),
+    NoOp,
+}
+
+/// Decide whether one finished probe may publish against its expectation
+/// (ADR-0058; Astra ruling 2026-09-14).
+///
+/// The final stat is required for both outcomes. When it is `Err` the source
+/// cannot be validated at all, so the result is `unavailable` with the stat
+/// error — never the ffprobe error, even for an administratively cancelled
+/// probe. A stat that still matches the captured tuple publishes; a differing
+/// tuple is stale. `administratively_cancelled` is the reachability pause
+/// signal only (ADR-0041 Decision 8.7), so a cancelled probe whose source is
+/// still valid is a no-op for both a success and a failure.
+fn decide_probe_publication(
+    expectation: &ProbeExpectation,
+    ffprobe_outcome: ProbeOutcome,
+    final_stat: std::io::Result<(i64, i64)>,
+    administratively_cancelled: bool,
+    abs: &std::path::Path,
+) -> ProbeDecision {
+    let observed = match final_stat {
+        Ok(observed) => observed,
+        Err(e) => {
+            return ProbeDecision::Publish(ProbeOutcome::Failure {
+                probe_status: "unavailable".into(),
+                scan_error: format!("unavailable: stat {}: {e}", abs.display()),
+            });
+        }
+    };
+    if observed != (expectation.mtime_ms, expectation.size_bytes) {
+        return ProbeDecision::NoOp;
+    }
+    if administratively_cancelled {
+        return ProbeDecision::NoOp;
+    }
+    ProbeDecision::Publish(ffprobe_outcome)
 }
 
 /// Drop completion timestamps older than [`RATE_WINDOW`] (ADR-0041 8.8).
@@ -1905,5 +2009,500 @@ mod tests {
             waited >= Duration::from_millis(50),
             "waiter elapsed {waited:?} too short to have blocked"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0058 atomic probe publication
+    // ------------------------------------------------------------------
+
+    fn require_ffprobe() -> bool {
+        if std::env::var_os("NIGHTJAR_TEST_REQUIRE_FFMPEG").is_some() {
+            return true;
+        }
+        std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn corpus_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files")
+            .join(name)
+    }
+
+    /// A library, a media file copied from the corpus, and the item row the
+    /// index pass would have written for it: the file's real stat and its real
+    /// content identity, so the probe expectation describes the file on disk.
+    fn seeded_item(
+        dir: &std::path::Path,
+        fixture: &str,
+    ) -> (Arc<Db>, Arc<LibraryPool>, i64, i64, PathBuf) {
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let abs = media.join("clip.mkv");
+        std::fs::copy(corpus_fixture(fixture), &abs).unwrap();
+        let meta = std::fs::metadata(&abs).unwrap();
+        let (mtime_ms, size_bytes) = (mtime_ms_from(&meta), meta.len() as i64);
+        let content_id = nightjar_db::content_id_for_path(&abs).unwrap();
+
+        let (db, pool) = test_pool(dir);
+        let library_id = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+        let item_id = db
+            .upsert_items_indexed(
+                library_id,
+                &[nightjar_db::UpsertItem {
+                    path: "clip.mkv".into(),
+                    mtime_ms,
+                    size_bytes,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some(content_id),
+                }],
+            )
+            .unwrap()[0];
+        (db, pool, library_id, item_id, abs)
+    }
+
+    fn broken_item(dir: &std::path::Path) -> (Arc<Db>, Arc<LibraryPool>, i64, i64, PathBuf) {
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let abs = media.join("broken.mp4");
+        std::fs::write(&abs, b"not a real mp4").unwrap();
+        let meta = std::fs::metadata(&abs).unwrap();
+        let (mtime_ms, size_bytes) = (mtime_ms_from(&meta), meta.len() as i64);
+
+        let (db, pool) = test_pool(dir);
+        let library_id = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+        let item_id = db
+            .upsert_items_indexed(
+                library_id,
+                &[nightjar_db::UpsertItem {
+                    path: "broken.mp4".into(),
+                    mtime_ms,
+                    size_bytes,
+                    title: "broken".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some("1-aaa-bbb".into()),
+                }],
+            )
+            .unwrap()[0];
+        (db, pool, library_id, item_id, abs)
+    }
+
+    /// A successful probe publishes the whole snapshot in one revision and
+    /// counts as a success.
+    #[test]
+    fn probe_publishes_a_complete_snapshot() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let job_id = db.create_scan_job(library_id).unwrap();
+
+        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "probed");
+        assert_eq!(row.probe_revision, 1);
+        assert_eq!(row.probed_media_revision, Some(1));
+        assert_eq!(row.probed_content_id, row.content_id);
+        assert!(row.probed_content_id.is_some());
+        assert_eq!(row.video_stream_index, Some(0));
+        assert_eq!(row.video_codec.as_deref(), Some("h264"));
+        assert_eq!(row.duration_ms, Some(2021));
+        assert_eq!(row.subtitle_status, "eligible");
+        assert_eq!(
+            db.list_item_subtitle_tracks(item_id).unwrap().len(),
+            1,
+            "the complete subtitle inventory is published"
+        );
+
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(job.probed, 1);
+        assert_eq!(job.errors, 0);
+    }
+
+    /// A terminal ffprobe failure records `error`, counts probed+error, and
+    /// certifies nothing.
+    #[test]
+    fn probe_failure_counts_probed_and_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = broken_item(dir.path());
+        let job_id = db.create_scan_job(library_id).unwrap();
+
+        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "error");
+        assert!(row.scan_error.is_some());
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probed_content_id, None);
+
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(job.probed, 1);
+        assert_eq!(job.errors, 1);
+    }
+
+    /// A success whose input changed under it publishes nothing and counts
+    /// nothing.
+    #[test]
+    fn probe_stale_success_counts_nothing_and_writes_nothing() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        // The stored stamp no longer describes the file on disk.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET mtime_ms = mtime_ms + 1 WHERE id = ?1",
+                [item_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let job_id = db.create_scan_job(library_id).unwrap();
+
+        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed", "nothing was published");
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probed_content_id, None);
+        assert_eq!(row.duration_ms, None);
+        assert!(db.list_item_subtitle_tracks(item_id).unwrap().is_empty());
+
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(job.probed, 0, "a stale success is not counted");
+        assert_eq!(job.errors, 0);
+    }
+
+    /// A failure whose source changed under it is stale: it publishes nothing
+    /// and counts nothing, exactly like a stale success (ADR-0058).
+    #[test]
+    fn probe_failure_on_a_changed_path_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = broken_item(dir.path());
+        // The stored stamp no longer describes the file on disk.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET mtime_ms = mtime_ms + 1 WHERE id = ?1",
+                [item_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let job_id = db.create_scan_job(library_id).unwrap();
+
+        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed", "nothing was published");
+        assert!(row.scan_error.is_none());
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probed_content_id, None);
+
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(job.probed, 0, "a stale failure is not counted");
+        assert_eq!(job.errors, 0);
+    }
+
+    fn audio_track_count(db: &Db, item_id: i64) -> i64 {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM media_item_audio_tracks WHERE media_item_id = ?1",
+                [item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    /// A source that cannot be stat'ed after probing records `unavailable`
+    /// with the stat error, never the ffprobe error, and retains the prior
+    /// certified facts and inventories (ADR-0058).
+    #[test]
+    fn probe_unvalidatable_source_records_unavailable_and_retains_facts() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let first_job = db.create_scan_job(library_id).unwrap();
+        pool.probe(WorkItem::probe(
+            item_id,
+            library_id,
+            abs.clone(),
+            Some(first_job),
+        ));
+
+        let first = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(first.probe_status, "probed");
+        assert_eq!(first.probe_revision, 1);
+        assert_eq!(first.probed_media_revision, Some(1));
+        assert_eq!(first.probed_content_id, first.content_id);
+        let first_subtitles = db.list_item_subtitle_tracks(item_id).unwrap();
+        let first_audio_rows = audio_track_count(&db, item_id);
+        assert!(!first_subtitles.is_empty());
+        assert!(first_audio_rows > 0);
+        assert!(first.duration_ms.is_some());
+
+        // The source disappears between the capture and the final stat.
+        std::fs::remove_file(&abs).unwrap();
+        let job_id = db.create_scan_job(library_id).unwrap();
+        pool.probe(WorkItem::probe(
+            item_id,
+            library_id,
+            abs.clone(),
+            Some(job_id),
+        ));
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "unavailable");
+        let error = row.scan_error.expect("a failure records its error");
+        assert!(
+            error.contains("stat"),
+            "the stat error is recorded, not the ffprobe error: {error}"
+        );
+        assert!(
+            error.contains(&abs.display().to_string()),
+            "the stat error names the source: {error}"
+        );
+        assert!(
+            !error.contains("ffprobe"),
+            "the ffprobe error must not publish when the source cannot be validated: {error}"
+        );
+        assert_eq!(row.probe_revision, 1, "a failure is not a publication");
+        assert_eq!(row.probed_media_revision, None, "validity stamp cleared");
+        assert_eq!(row.probed_content_id, None, "validity stamp cleared");
+        assert_eq!(row.duration_ms, first.duration_ms, "prior facts retained");
+        assert_eq!(row.video_codec, first.video_codec, "prior facts retained");
+        assert_eq!(
+            db.list_item_subtitle_tracks(item_id).unwrap().len(),
+            first_subtitles.len(),
+            "prior subtitle inventory retained"
+        );
+        assert_eq!(
+            audio_track_count(&db, item_id),
+            first_audio_rows,
+            "prior audio inventory retained"
+        );
+
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(job.probed, 1);
+        assert_eq!(job.errors, 0, "unavailable is not a terminal error");
+    }
+
+    fn stat_expectation() -> ProbeExpectation {
+        ProbeExpectation {
+            item_id: 1,
+            library_id: 2,
+            library_root: "/media".into(),
+            path: "clip.mkv".into(),
+            media_revision: 1,
+            probe_revision: 0,
+            content_id: Some("1-aaa-bbb".into()),
+            mtime_ms: 100,
+            size_bytes: 200,
+        }
+    }
+
+    fn empty_snapshot() -> ProbeSnapshot {
+        ProbeSnapshot {
+            duration_ms: None,
+            container: None,
+            video_codec: None,
+            video_stream_index: None,
+            audio_codec: None,
+            audio_channels: None,
+            width: None,
+            height: None,
+            video_bitrate_bps: None,
+            video_frame_rate_num: None,
+            video_frame_rate_den: None,
+            hdr: None,
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+            subtitle_status: "none".into(),
+        }
+    }
+
+    fn probe_failure(status: &str, error: &str) -> ProbeOutcome {
+        ProbeOutcome::Failure {
+            probe_status: status.into(),
+            scan_error: error.into(),
+        }
+    }
+
+    #[test]
+    fn decide_publishes_success_when_the_stat_matches() {
+        let expectation = stat_expectation();
+        let decision = decide_probe_publication(
+            &expectation,
+            ProbeOutcome::Success(Box::new(empty_snapshot())),
+            Ok((expectation.mtime_ms, expectation.size_bytes)),
+            false,
+            std::path::Path::new("/media/clip.mkv"),
+        );
+        assert!(matches!(
+            decision,
+            ProbeDecision::Publish(ProbeOutcome::Success(_))
+        ));
+    }
+
+    #[test]
+    fn decide_is_stale_when_the_stat_differs() {
+        let expectation = stat_expectation();
+        let decision = decide_probe_publication(
+            &expectation,
+            ProbeOutcome::Success(Box::new(empty_snapshot())),
+            Ok((expectation.mtime_ms + 1, expectation.size_bytes)),
+            false,
+            std::path::Path::new("/media/clip.mkv"),
+        );
+        assert!(matches!(decision, ProbeDecision::NoOp));
+    }
+
+    #[test]
+    fn decide_is_stale_for_a_failure_when_the_stat_differs() {
+        let expectation = stat_expectation();
+        let decision = decide_probe_publication(
+            &expectation,
+            probe_failure("error", "ffprobe failed"),
+            Ok((expectation.mtime_ms, expectation.size_bytes + 1)),
+            false,
+            std::path::Path::new("/media/clip.mkv"),
+        );
+        assert!(matches!(decision, ProbeDecision::NoOp));
+    }
+
+    #[test]
+    fn decide_publishes_a_failure_when_the_stat_matches_and_not_cancelled() {
+        let expectation = stat_expectation();
+        let decision = decide_probe_publication(
+            &expectation,
+            probe_failure("unavailable", "ffprobe failed: I/O error"),
+            Ok((expectation.mtime_ms, expectation.size_bytes)),
+            false,
+            std::path::Path::new("/media/clip.mkv"),
+        );
+        match decision {
+            ProbeDecision::Publish(ProbeOutcome::Failure {
+                probe_status,
+                scan_error,
+            }) => {
+                assert_eq!(probe_status, "unavailable");
+                assert_eq!(scan_error, "ffprobe failed: I/O error");
+            }
+            other => panic!("expected a published failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_is_noop_for_a_cancelled_failure_when_the_stat_matches() {
+        let expectation = stat_expectation();
+        let decision = decide_probe_publication(
+            &expectation,
+            probe_failure(
+                "unavailable",
+                "unavailable: ffprobe cancelled (library unreachable)",
+            ),
+            Ok((expectation.mtime_ms, expectation.size_bytes)),
+            true,
+            std::path::Path::new("/media/clip.mkv"),
+        );
+        assert!(matches!(decision, ProbeDecision::NoOp));
+    }
+
+    #[test]
+    fn decide_is_noop_for_a_cancelled_success_when_the_stat_matches() {
+        let expectation = stat_expectation();
+        let decision = decide_probe_publication(
+            &expectation,
+            ProbeOutcome::Success(Box::new(empty_snapshot())),
+            Ok((expectation.mtime_ms, expectation.size_bytes)),
+            true,
+            std::path::Path::new("/media/clip.mkv"),
+        );
+        assert!(matches!(decision, ProbeDecision::NoOp));
+    }
+
+    #[test]
+    fn decide_records_unavailable_from_the_stat_error_for_any_outcome() {
+        let expectation = stat_expectation();
+        let abs = std::path::Path::new("/media/clip.mkv");
+        let stat_error = format!(
+            "unavailable: stat {}: No such file or directory",
+            abs.display()
+        );
+        for ffprobe_outcome in [
+            ProbeOutcome::Success(Box::new(empty_snapshot())),
+            probe_failure(
+                "error",
+                "ffprobe failed for /media/clip.mkv (exit 1): Invalid data",
+            ),
+        ] {
+            // A cancelled probe that cannot stat its source still records
+            // `unavailable`: the failed stat proves a real access failure.
+            for cancelled in [false, true] {
+                let decision = decide_probe_publication(
+                    &expectation,
+                    ffprobe_outcome.clone(),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "No such file or directory",
+                    )),
+                    cancelled,
+                    abs,
+                );
+                match decision {
+                    ProbeDecision::Publish(ProbeOutcome::Failure {
+                        probe_status,
+                        scan_error,
+                    }) => {
+                        assert_eq!(probe_status, "unavailable");
+                        assert_eq!(
+                            scan_error, stat_error,
+                            "the stat error must replace the ffprobe error"
+                        );
+                        assert!(
+                            !scan_error.contains("ffprobe"),
+                            "the ffprobe error must never publish without a stat"
+                        );
+                    }
+                    other => panic!("expected a published unavailable, got {other:?}"),
+                }
+            }
+        }
     }
 }

@@ -458,7 +458,7 @@ fn process_dir(dir: &Path, prev_dirs: Option<&HashMap<PathBuf, CachedDir>>) -> D
     }
 }
 
-fn mtime_ms_from(meta: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_ms_from(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())

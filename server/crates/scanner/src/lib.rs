@@ -4052,6 +4052,9 @@ mod tests {
     /// ADR-0041 Decision 8.7 (amended 2026-08-07) for the probe side: marking
     /// a library unreachable while a probe is in flight kills the ffprobe
     /// child and the item lands `unavailable`, never `probed` or `error`.
+    /// The source is removed as the library goes away, so the final stat
+    /// proves a real access failure (ADR-0058); a cancellation whose source is
+    /// still readable publishes nothing.
     /// The fixture is an MKV carrying a large attachment: ffprobe reads the
     /// whole Segment header (attachments live there), so the probe stays
     /// observably in flight for hundreds of milliseconds instead of the few
@@ -4161,6 +4164,9 @@ mod tests {
             "probe never started"
         );
 
+        // The mount goes away with the cancel: the source can no longer be
+        // stat'ed, which is what makes the result `unavailable` (ADR-0058).
+        fs::remove_dir_all(&media).unwrap();
         pool.set_library_reachability(lib.id, &lib.path, false)
             .unwrap();
         for _ in 0..400 {
