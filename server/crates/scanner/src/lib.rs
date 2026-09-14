@@ -563,7 +563,19 @@ pub fn hint_ingest(
         episode: parsed.episode,
         content_id,
     };
-    let ids = db.upsert_items_indexed(library_id, &[item])?;
+    let ids = {
+        // If a full walk is in flight, mark dirty_add so that job skips
+        // delete_missing (would otherwise drop this row). The marker and the
+        // upsert are one critical section with the walk's marker read and
+        // delete_missing, so the walk either sees the marker or reads its
+        // delete candidates before this row exists. Poll heals deletes later;
+        // do not schedule a follow-up full walk for the hint alone.
+        let mut guard = pool.dirty_add_guard(library_id);
+        if db.active_scan_job(library_id)?.is_some() {
+            guard.mark();
+        }
+        db.upsert_items_indexed(library_id, &[item])?
+    };
     let item_id = ids
         .into_iter()
         .next()
@@ -586,12 +598,6 @@ pub fn hint_ingest(
             error = %e,
             "hint sidecar association failed"
         );
-    }
-    // If a full walk is in flight, mark dirty_add so that job skips
-    // delete_missing (would otherwise drop this row). Poll heals deletes later;
-    // do not schedule a follow-up full walk for the hint alone.
-    if db.active_scan_job(library_id)?.is_some() {
-        pool.mark_dirty_add(library_id);
     }
     tracing::info!(
         library_id,
@@ -1108,7 +1114,15 @@ fn run_index_pass(
             .map(|j| j.kind)
             .unwrap_or_else(|| "scan".into());
         let defer_repoint = job_kind == "repoint";
-        let dirty_add = pool.take_dirty_add(library_id);
+        #[cfg(test)]
+        pool.hold_delete_if_armed(library_id);
+        // The marker read and the delete it authorizes are one critical section
+        // (ADR-0014 §2): a hint that upserts while this pass is active either
+        // marks before this read — and the delete is skipped — or upserts after
+        // `delete_missing_fold` read its candidates, and its row is not among
+        // them. The pass cannot drop a row a hint added mid-scan.
+        let mut dirty_add_guard = pool.dirty_add_guard(library_id);
+        let dirty_add = dirty_add_guard.take();
         let manual_dirty = pool.is_scan_dirty(library_id);
         let skip_delete_hint_or_manual = dirty_add || manual_dirty;
         let allow_delete = !defer_repoint
@@ -1127,11 +1141,6 @@ fn run_index_pass(
         };
         let (removed, deleted_ids) = if allow_delete {
             let deleted_ids = db.delete_missing_fold(library_id, &keep_folds)?;
-            for item_id in &deleted_ids {
-                if let Err(e) = pool.remove_item_subtitles(*item_id) {
-                    tracing::warn!(item_id, error = %e, "remove deleted subtitle directory failed");
-                }
-            }
             (deleted_ids.len() as u32, deleted_ids)
         } else {
             if defer_repoint {
@@ -1165,6 +1174,14 @@ fn run_index_pass(
             }
             (0, Vec::new())
         };
+        // The critical section ends with the delete itself: a hint may mark and
+        // upsert from here on, and its row is no longer a delete candidate.
+        drop(dirty_add_guard);
+        for item_id in &deleted_ids {
+            if let Err(e) = pool.remove_item_subtitles(*item_id) {
+                tracing::warn!(item_id, error = %e, "remove deleted subtitle directory failed");
+            }
+        }
         let _ = db.set_scan_job_skipped_outside_root(job_id, skipped_outside_root);
         let _ = db.set_scan_job_deferred_remove(job_id, deferred_remove);
         if defer_repoint && deferred_remove > 0 {
@@ -1182,7 +1199,6 @@ fn run_index_pass(
             .map(|l| l.paths_unresolved)
             .unwrap_or(0);
         let _ = db.set_library_path_counters(library_id, unresolved, skipped_outside_root);
-        let _ = deleted_ids;
         if let Err(e) = pool.cleanup_orphan_subtitles() {
             tracing::warn!(error = %e, "subtitle orphan cleanup failed");
         }
@@ -2606,6 +2622,13 @@ mod tests {
         assert_eq!(paths.len(), 3);
     }
 
+    /// A hint that upserts while a walk is active must set `dirty_add`, so that
+    /// walk skips `delete_missing` (the row is outside its keep-set) and the row
+    /// survives; it must not schedule a follow-up walk. The delete hold parks
+    /// the walk at its delete decision, so the hint lands while the walk is
+    /// provably active and before the walk reads the marker. Without the hold
+    /// the test races the walk's completion: the hint's own `active_scan_job`
+    /// read can see a job that already finished.
     #[test]
     fn hint_during_active_scan_sets_dirty_add_not_follow_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -2625,6 +2648,7 @@ mod tests {
             })
             .unwrap();
 
+        let hold = pool.arm_delete_hold();
         let job1 = request_scan(
             Arc::clone(&db),
             Arc::clone(&pool),
@@ -2632,51 +2656,45 @@ mod tests {
             ScanTrigger::Manual,
         )
         .unwrap();
-        let mut overlapped = false;
-        for _ in 0..400 {
-            if db.active_scan_job(lib.id).unwrap() == Some(job1) {
-                let late = media.join("late.mp4");
-                fs::write(&late, b"late").unwrap();
-                let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &late).unwrap();
-                assert!(
-                    matches!(
-                        out,
-                        HintIngestOutcome::Upserted { .. } | HintIngestOutcome::Unchanged { .. }
-                    ),
-                    "hint during scan: {out:?}"
-                );
-                if matches!(out, HintIngestOutcome::Upserted { .. }) {
-                    assert!(
-                        pool.is_dirty_add(lib.id),
-                        "upsert hint during active scan must set dirty_add"
-                    );
-                    assert!(
-                        !pool.is_scan_dirty(lib.id),
-                        "hint must not set manual follow-up dirty"
-                    );
-                }
-                // Poll while active is a dirty no-op.
-                assert_eq!(
-                    request_scan(
-                        Arc::clone(&db),
-                        Arc::clone(&pool),
-                        lib.id,
-                        ScanTrigger::Poll
-                    )
-                    .unwrap(),
-                    job1
-                );
-                assert!(
-                    !pool.is_scan_dirty(lib.id),
-                    "poll while active must not set scan_dirty"
-                );
-                overlapped = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(overlapped, "scan finished before hint overlap");
+        assert_eq!(
+            hold.entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the walk must reach its delete decision"),
+            lib.id,
+            "the held walk is this library's"
+        );
 
+        let late = media.join("late.mp4");
+        fs::write(&late, b"late").unwrap();
+        let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &late).unwrap();
+        let HintIngestOutcome::Upserted { .. } = out else {
+            panic!("the hint must upsert the new file: {out:?}");
+        };
+        assert!(
+            pool.is_dirty_add(lib.id),
+            "upsert hint during active scan must set dirty_add"
+        );
+        assert!(
+            !pool.is_scan_dirty(lib.id),
+            "hint must not set manual follow-up dirty"
+        );
+        // Poll while active is a dirty no-op.
+        assert_eq!(
+            request_scan(
+                Arc::clone(&db),
+                Arc::clone(&pool),
+                lib.id,
+                ScanTrigger::Poll
+            )
+            .unwrap(),
+            job1
+        );
+        assert!(
+            !pool.is_scan_dirty(lib.id),
+            "poll while active must not set scan_dirty"
+        );
+
+        hold.release_tx.send(()).unwrap();
         wait_job(&db, job1);
         // No automatic follow-up from hint-only dirt.
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2694,6 +2712,66 @@ mod tests {
             paths.iter().any(|p| p == "late.mp4"),
             "hinted file must survive: {paths:?}"
         );
+    }
+
+    /// The dirty_add marker is set before the hint's probe is enqueued, so an
+    /// active walk's delete_missing cannot race the upsert-to-marker window.
+    /// The armed hold proves the marker is already set when the probe reports
+    /// that it started.
+    #[test]
+    fn hint_marks_dirty_add_before_probe_capture() {
+        let fixture = corpus_fixture("h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&fixture) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let late = media.join("late.mkv");
+        fs::copy(&fixture, &late).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        // A queued job is active for `active_scan_job`; no walk needs to run.
+        let _job = db.create_scan_job(lib.id).unwrap();
+
+        let hold = pool.arm_probe_hold();
+        let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &late).unwrap();
+        let HintIngestOutcome::Upserted { item_id } = out else {
+            panic!("the hint must upsert the new file: {out:?}");
+        };
+        let entered = hold
+            .entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the hinted probe must report that it started");
+        assert_eq!(entered, item_id, "the held probe is the hinted item");
+        assert!(
+            pool.is_dirty_add(lib.id),
+            "the dirty_add marker must precede the captured probe"
+        );
+        assert!(
+            !pool.is_scan_dirty(lib.id),
+            "the hint must not set manual follow-up dirty"
+        );
+
+        hold.release_tx.send(()).unwrap();
+        let mut released = false;
+        for _ in 0..400 {
+            if pool.probe_slot_count() == 0 {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(released, "the hinted probe must release its slot");
+        assert_eq!(pool.probe_slot_count(), 0);
     }
 
     #[test]

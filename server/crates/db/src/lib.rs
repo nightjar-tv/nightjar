@@ -36,8 +36,9 @@ pub use status::{
 };
 pub use store::{
     AudioTrackRow, Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary,
-    ProbeExpectation, ProbeOutcome, ProbePublication, ProbeSnapshot, ProbeUpdate, ScanJobRow,
-    ScanProgressCounts, SidecarRow, SubtitleTrackRow, UpsertItem, with_write_tx, write_tx,
+    ProbeAccounting, ProbeExpectation, ProbeOutcome, ProbePublication, ProbeSnapshot, ProbeUpdate,
+    ScanJobRow, ScanProgressCounts, SidecarRow, SubtitleTrackRow, UpsertItem, with_write_tx,
+    write_tx,
 };
 pub use track_choice::{
     SubtitleChoiceRow, TrackChoiceRow, TrackDescription, load_track_choice, upsert_track_choice,

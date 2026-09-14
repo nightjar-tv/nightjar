@@ -373,6 +373,29 @@ pub enum ProbePublication {
     Stale,
 }
 
+/// How one finished physical probe counts toward the scan job that demanded it
+/// (ADR-0058 terminal classes).
+///
+/// One physical probe can serve many logical demands. It is classified once and
+/// this same class is applied to every waiter, so joined demands can never
+/// disagree about what the one child did. `ErrorOnly` exists because a
+/// publisher database error is an error with no probe behind it: it must not
+/// inflate `probed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAccounting {
+    /// A certified publication: one probe, no error.
+    Published,
+    /// A recorded failure carrying a terminal media error: one probe, one error.
+    Error,
+    /// A recorded failure without a terminal error (`unavailable`): one probe.
+    Unavailable,
+    /// No result could be written: a publisher database error, or a failed
+    /// snapshot build after a successful ffprobe. One error, no probe.
+    ErrorOnly,
+    /// Stale, superseded, or cancelled work: no count.
+    None,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -1691,20 +1714,36 @@ impl Db {
         Ok(())
     }
 
-    pub fn bump_scan_job_probe(&self, job_id: i64, error: bool) -> Result<(), String> {
+    /// Apply one physical probe's terminal class to the scan job that demanded
+    /// it (ADR-0058).
+    ///
+    /// `Published` and `Unavailable` count one probe; `Error` counts one probe
+    /// and one error; `ErrorOnly` counts one error with no probe; `None`
+    /// writes nothing. Joined demands call this once each, so a single child
+    /// can account for several logical demands without ever counting a probe
+    /// that did not run.
+    pub fn record_scan_job_probe(
+        &self,
+        job_id: i64,
+        accounting: ProbeAccounting,
+    ) -> Result<(), String> {
         let conn = self.lock()?;
-        if error {
-            conn.execute(
-                "UPDATE scan_jobs SET probed = probed + 1, errors = errors + 1 WHERE id = ?1",
-                [job_id],
-            )
-        } else {
-            conn.execute(
+        match accounting {
+            ProbeAccounting::Published | ProbeAccounting::Unavailable => conn.execute(
                 "UPDATE scan_jobs SET probed = probed + 1 WHERE id = ?1",
                 [job_id],
-            )
+            ),
+            ProbeAccounting::Error => conn.execute(
+                "UPDATE scan_jobs SET probed = probed + 1, errors = errors + 1 WHERE id = ?1",
+                [job_id],
+            ),
+            ProbeAccounting::ErrorOnly => conn.execute(
+                "UPDATE scan_jobs SET errors = errors + 1 WHERE id = ?1",
+                [job_id],
+            ),
+            ProbeAccounting::None => return Ok(()),
         }
-        .map_err(|e| format!("bump scan job probe: {e}"))?;
+        .map_err(|e| format!("record scan job probe: {e}"))?;
         Ok(())
     }
 

@@ -2,8 +2,8 @@ use crate::probe;
 use crate::reachability::{self, Availability, Reachability, message_looks_unavailable};
 use crate::walk::{WalkCache, mtime_ms_from};
 use nightjar_db::{
-    AudioTrackRow, Db, ProbeExpectation, ProbeOutcome, ProbePublication, ProbeSnapshot,
-    SidecarPresence, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
+    AudioTrackRow, Db, ProbeAccounting, ProbeExpectation, ProbeOutcome, ProbePublication,
+    ProbeSnapshot, SidecarPresence, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
 };
 use nightjar_transcode::{
     ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles, is_burn_in_sidecar_format,
@@ -52,6 +52,10 @@ pub struct WorkItem {
     /// First-play bump: may run while an index walk holds SMB (ADR-0013 §11).
     pub priority: bool,
     batch: Option<Arc<ProbeBatchState>>,
+    /// Set on the one physical probe WorkItem a [`ProbeSlot`] owns. The
+    /// coalescing state lives on the slot; every other probe field here is
+    /// carried for the queue's own bookkeeping only.
+    probe_slot: Option<Arc<ProbeSlot>>,
 }
 
 impl WorkItem {
@@ -64,6 +68,7 @@ impl WorkItem {
             scan_job_id,
             priority: false,
             batch: None,
+            probe_slot: None,
         }
     }
 
@@ -76,6 +81,7 @@ impl WorkItem {
             scan_job_id: None,
             priority: false,
             batch: None,
+            probe_slot: None,
         }
     }
 
@@ -88,6 +94,7 @@ impl WorkItem {
             scan_job_id: None,
             priority: false,
             batch: None,
+            probe_slot: None,
         }
     }
 }
@@ -193,6 +200,113 @@ impl ProbeBatch {
     }
 }
 
+/// The revision and identity a physical probe is keyed by (ADR-0058).
+///
+/// `content_id` is part of the key because the identity can change at one
+/// media revision (the map path writes `content_id` without bumping it), so a
+/// newer identity is a newer demand even when the revision is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeKey {
+    media_revision: i64,
+    content_id: Option<String>,
+}
+
+impl ProbeKey {
+    fn of(expectation: &ProbeExpectation) -> Self {
+        Self {
+            media_revision: expectation.media_revision,
+            content_id: expectation.content_id.clone(),
+        }
+    }
+
+    /// A NULL or empty identity cannot certify a successful snapshot
+    /// (ADR-0058), so a changed demand that carries one must not start a child.
+    fn identity_missing(&self) -> bool {
+        self.content_id.as_deref().is_none_or(str::is_empty)
+    }
+
+    fn is_newer_than(&self, other: &ProbeKey) -> bool {
+        self.media_revision > other.media_revision
+            || (self.media_revision == other.media_revision && self.content_id != other.content_id)
+    }
+}
+
+/// One logical demand for a physical probe: the scan job it accounts to and
+/// the batch barrier it completes. A physical probe can serve many of these.
+struct ProbeWaiter {
+    scan_job_id: Option<i64>,
+    batch: Option<Arc<ProbeBatchState>>,
+}
+
+/// One physical probe's captured expectation.
+///
+/// `expectation` is `None` for a promoted successor, which re-reads the current
+/// database row before it starts (ADR-0058) rather than reusing the old
+/// path/root/stat tuple.
+struct ProbeRun {
+    expectation: Option<(ProbeExpectation, PathBuf)>,
+    waiters: Vec<ProbeWaiter>,
+}
+
+/// Where one item's physical probe is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePhase {
+    /// In the queue; the worker has not started it. A newer demand replaces
+    /// the queued expectation in place.
+    Queued,
+    /// The worker has captured its expectation and a child may be running.
+    InFlight,
+    /// The child is reaped and its class is being applied. A demand that
+    /// arrives here is completed with that class rather than left waiting.
+    Promoting,
+    /// Removed from the map.
+    Idle,
+}
+
+struct ProbeSlotState {
+    phase: ProbePhase,
+    /// The run that owns the slot, queued or in flight.
+    current: ProbeRun,
+    /// The key the in-flight run was captured against, for newer/older
+    /// comparisons while it runs.
+    current_key: Option<ProbeKey>,
+    /// At most one desired successor: every newer demand that arrived while the
+    /// current revision was in flight collapses into this one list. It starts
+    /// only after the current child is reaped.
+    successor: Option<Vec<ProbeWaiter>>,
+    /// The class of the run that just finished, so a demand arriving while it
+    /// is applied still completes exactly once.
+    last_accounting: Option<ProbeAccounting>,
+}
+
+/// One item's coalescing state (ADR-0058): at most one physical ffprobe at a
+/// time, every logical demand joined to it, and one successor slot.
+struct ProbeSlot {
+    item_id: i64,
+    library_id: i64,
+    state: Mutex<ProbeSlotState>,
+}
+
+/// Test-only hold that makes an in-flight physical probe deterministic. The
+/// worker reports that it is about to start the child and then parks until the
+/// test releases it, so a join, a successor, or a reachability flip always
+/// lands while the child is provably still outstanding. `#[cfg(test)]` only:
+/// a release build has no field, no arming method and no park site.
+#[cfg(test)]
+struct ProbeHold {
+    /// Worker → test: "the physical probe for this item has started".
+    entered_tx: std::sync::mpsc::Sender<i64>,
+    /// Worker ← test: block here until the test sends the release.
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test half of [`ProbeHold`].
+#[cfg(test)]
+pub(crate) struct ProbeHoldTest {
+    pub entered_rx: std::sync::mpsc::Receiver<i64>,
+    pub release_tx: std::sync::mpsc::Sender<()>,
+}
+
 /// Test-only hold that makes an in-flight keyframe-map walk deterministic
 /// (ADR-0041 Decision 8.7 cancellation test). `#[cfg(test)]` only: a release
 /// build has no field, no arming method and no park site.
@@ -218,6 +332,27 @@ struct MapWalkHold {
 /// reachability, then sends on `release_tx` to let the parked walk run.
 #[cfg(test)]
 pub(crate) struct MapWalkHoldTest {
+    pub entered_rx: std::sync::mpsc::Receiver<i64>,
+    pub release_tx: std::sync::mpsc::Sender<()>,
+}
+
+/// Test-only hold that parks an index pass at its `delete_missing` decision.
+/// The pass reports that it has built its keep-set and is about to read the
+/// hint marker, then parks until the test releases it, so a hint always lands
+/// while that pass is provably active and before it reads the marker.
+/// `#[cfg(test)]` only: a release build has no field, no arming method and no
+/// park site.
+#[cfg(test)]
+struct DeleteHold {
+    /// Worker → test: "this library's index pass reached its delete decision".
+    entered_tx: std::sync::mpsc::Sender<i64>,
+    /// Worker ← test: block here until the test sends the release.
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test half of [`DeleteHold`].
+#[cfg(test)]
+pub(crate) struct DeleteHoldTest {
     pub entered_rx: std::sync::mpsc::Receiver<i64>,
     pub release_tx: std::sync::mpsc::Sender<()>,
 }
@@ -261,7 +396,56 @@ pub struct LibraryPool {
     /// the map worker consumes it exactly once at the park site.
     #[cfg(test)]
     map_walk_hold: Mutex<Option<MapWalkHold>>,
+    /// Per-item physical probe coalescing (ADR-0058). The map holds a slot
+    /// only while that item has queued or in-flight probe work.
+    probe_slots: Mutex<HashMap<i64, Arc<ProbeSlot>>>,
+    /// Physical probe executions. In production each one is one ffprobe child;
+    /// the counter is the positive instrument that proves joined demands share
+    /// a child rather than each starting their own.
+    probe_invocations: AtomicU64,
+    /// Test-only in-flight hold for a physical probe ([`ProbeHold`]).
+    #[cfg(test)]
+    probe_hold: Mutex<Option<ProbeHold>>,
+    /// Test-only one-shot fault for [`Self::probe_snapshot`]: the next snapshot
+    /// build fails after its ffprobe succeeded.
+    #[cfg(test)]
+    probe_snapshot_fault: AtomicBool,
+    /// Test-only in-flight hold for an index pass's `delete_missing` decision
+    /// ([`DeleteHold`]).
+    #[cfg(test)]
+    delete_hold: Mutex<Option<DeleteHold>>,
     pub availability: Arc<Availability>,
+}
+
+/// Held across the database write a hint marker must be ordered against
+/// (ADR-0015 decision 5 / ADR-0014 §2).
+///
+/// One library's marker is read by a walk before its `delete_missing` and
+/// written by a hint before its upsert. Taking this guard makes that read and
+/// that write one critical section: the walk either sees the marker (and skips
+/// the delete) or reads its delete candidates before the hinted row exists.
+/// Both sides acquire it before any database work, so neither can hold the
+/// connection while waiting for it.
+pub struct DirtyAddGuard<'a> {
+    library_id: i64,
+    marker: std::sync::MutexGuard<'a, HashSet<i64>>,
+}
+
+impl DirtyAddGuard<'_> {
+    /// Whether this library's hint marker is currently set.
+    pub fn is_marked(&self) -> bool {
+        self.marker.contains(&self.library_id)
+    }
+
+    /// Set this library's hint marker.
+    pub fn mark(&mut self) {
+        self.marker.insert(self.library_id);
+    }
+
+    /// Clear this library's hint marker, reporting whether it was set.
+    pub fn take(&mut self) -> bool {
+        self.marker.remove(&self.library_id)
+    }
 }
 
 /// RAII permit for one process-wide index/walk epoch (ADR-0015).
@@ -307,6 +491,14 @@ impl LibraryPool {
             completion_times: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             map_walk_hold: Mutex::new(None),
+            probe_slots: Mutex::new(HashMap::new()),
+            probe_invocations: AtomicU64::new(0),
+            #[cfg(test)]
+            probe_hold: Mutex::new(None),
+            #[cfg(test)]
+            probe_snapshot_fault: AtomicBool::new(false),
+            #[cfg(test)]
+            delete_hold: Mutex::new(None),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -439,27 +631,28 @@ impl LibraryPool {
             .remove(&library_id)
     }
 
-    /// Hint upsert while a walk is active (ADR-0015 B′). Skips delete_missing
-    /// on that job only; does not schedule a follow-up walk.
-    pub fn mark_dirty_add(&self, library_id: i64) {
-        self.dirty_add
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(library_id);
+    /// Hold this library's hint marker across the database write it must be
+    /// ordered against: a hint's upsert on one side, a walk's `delete_missing`
+    /// on the other (ADR-0015 decision 5). Every marker read and write goes
+    /// through this guard, so there is one implementation of the marker.
+    pub fn dirty_add_guard(&self, library_id: i64) -> DirtyAddGuard<'_> {
+        DirtyAddGuard {
+            library_id,
+            marker: self.dirty_add.lock().unwrap_or_else(|e| e.into_inner()),
+        }
     }
 
+    /// Hint dirt recorded for a library: a walk that starts now must skip
+    /// `delete_missing` (ADR-0015 B′). Setting it does not schedule a
+    /// follow-up walk; the caller marks it through [`Self::dirty_add_guard`]
+    /// so the mark and its upsert are one critical section.
     pub fn is_dirty_add(&self, library_id: i64) -> bool {
-        self.dirty_add
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&library_id)
+        self.dirty_add_guard(library_id).is_marked()
     }
 
+    /// Clear a library's hint dirt, reporting whether it was set.
     pub fn take_dirty_add(&self, library_id: i64) -> bool {
-        self.dirty_add
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&library_id)
+        self.dirty_add_guard(library_id).take()
     }
 
     /// Arm poll holdoff after repoint deferred deletes (default 1 h in product).
@@ -571,16 +764,32 @@ impl LibraryPool {
     }
 
     fn purge_queue_for_library(&self, library_id: i64) {
+        // A queued physical probe is cancelled here. Every logical demand
+        // joined to it completes once without a count, and the slot is
+        // released, so nothing is left waiting on work that will never run
+        // (ADR-0058). In-flight probes are not in the queue; the pause signal
+        // cancels them and their own run releases the slot.
+        let mut slots = self.probe_slots.lock().unwrap_or_else(|e| e.into_inner());
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         let mut kept_probes = VecDeque::new();
         while let Some(item) = queue.probes.pop_front() {
             if item.library_id == library_id {
-                if let Some(batch) = item.batch {
-                    let mut remaining = batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
-                    *remaining = remaining.saturating_sub(1);
-                    if *remaining == 0 {
-                        batch.ready.notify_all();
+                if let Some(slot) = &item.probe_slot {
+                    let waiters = {
+                        let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut waiters = std::mem::take(&mut st.current.waiters);
+                        if let Some(successor) = st.successor.take() {
+                            waiters.extend(successor);
+                        }
+                        st.phase = ProbePhase::Idle;
+                        waiters
+                    };
+                    slots.remove(&slot.item_id);
+                    for waiter in waiters {
+                        self.finish_probe_waiter(waiter, ProbeAccounting::None);
                     }
+                } else {
+                    Self::finish_batch(&item);
                 }
             } else {
                 kept_probes.push_back(item);
@@ -600,14 +809,148 @@ impl LibraryPool {
         if self.availability.pause.is_paused(item.library_id) {
             return;
         }
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         match item.kind {
-            WorkKind::Probe => queue.probes.push_back(item),
+            WorkKind::Probe => self.enqueue_probe_demand(item, None),
             WorkKind::Extract | WorkKind::Map => {
+                let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
                 Self::enqueue_background_unique(&mut queue, item);
+                drop(queue);
+                self.available.notify_one();
             }
         }
+    }
+
+    /// Queue one logical probe demand, joined to its item's physical probe
+    /// (ADR-0058). At most one child runs per item; every demand that arrives
+    /// while it is queued or in flight joins it, and a newer revision while it
+    /// is in flight records the one desired successor.
+    fn enqueue_probe_demand(&self, item: WorkItem, batch: Option<Arc<ProbeBatchState>>) {
+        // Capture the demand's expectation before it can join any run: this is
+        // the tuple the physical probe publishes against, and its revision and
+        // identity order the demand against work already queued or in flight.
+        let captured = match self.capture_probe_expectation(item.item_id) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    item_id = item.item_id,
+                    error = %e,
+                    "capture probe expectation failed"
+                );
+                None
+            }
+        };
+        let waiter = ProbeWaiter {
+            scan_job_id: item.scan_job_id,
+            batch,
+        };
+        let mut slots = self.probe_slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.get(&item.item_id).map(Arc::clone) {
+            let immediate = Self::join_probe_slot(self, &slot, captured, waiter);
+            drop(slots);
+            if let Some((waiter, accounting)) = immediate {
+                self.finish_probe_waiter(waiter, accounting);
+            }
+            self.available.notify_one();
+            return;
+        }
+        // No work for this item: create the slot and its one physical probe.
+        // The logical demand is counted before the item is poppable, so a
+        // worker cannot finish the batch before the count exists.
+        if let Some(b) = &waiter.batch {
+            b.push();
+        }
+        let slot = Arc::new(ProbeSlot {
+            item_id: item.item_id,
+            library_id: item.library_id,
+            state: Mutex::new(ProbeSlotState {
+                phase: ProbePhase::Queued,
+                current: ProbeRun {
+                    expectation: captured,
+                    waiters: vec![waiter],
+                },
+                current_key: None,
+                successor: None,
+                last_accounting: None,
+            }),
+        });
+        slots.insert(item.item_id, Arc::clone(&slot));
+        drop(slots);
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut probe_item = WorkItem::probe(item.item_id, item.library_id, item.path, None);
+        probe_item.probe_slot = Some(slot);
+        queue.probes.push_back(probe_item);
+        drop(queue);
         self.available.notify_one();
+    }
+
+    /// Join one logical demand to a slot that already owns physical work.
+    ///
+    /// Returns the waiter for the caller to complete immediately when this
+    /// demand does not join the run: it is newer with a missing identity (which
+    /// must not start a child), or it arrived while the finished run's class is
+    /// being applied.
+    fn join_probe_slot(
+        &self,
+        slot: &Arc<ProbeSlot>,
+        captured: Option<(ProbeExpectation, PathBuf)>,
+        waiter: ProbeWaiter,
+    ) -> Option<(ProbeWaiter, ProbeAccounting)> {
+        let demand_key = captured.as_ref().map(|(e, _)| ProbeKey::of(e));
+        let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Count the logical demand before a run can complete it.
+        if let Some(b) = &waiter.batch {
+            b.push();
+        }
+        let current_key = match st.phase {
+            ProbePhase::Queued => st
+                .current
+                .expectation
+                .as_ref()
+                .map(|(e, _)| ProbeKey::of(e)),
+            ProbePhase::InFlight | ProbePhase::Promoting => st.current_key.clone(),
+            ProbePhase::Idle => None,
+        };
+        let newer = match (&demand_key, &current_key) {
+            (Some(d), Some(cur)) => d.is_newer_than(cur),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if newer && demand_key.as_ref().is_some_and(ProbeKey::identity_missing) {
+            // A changed revision with missing or empty identity cannot certify
+            // and must not start ffprobe (ADR-0058). Complete this demand
+            // without a count and leave any existing work untouched.
+            return Some((waiter, ProbeAccounting::None));
+        }
+        match st.phase {
+            ProbePhase::Queued => {
+                // The worker has not started, so a newer demand replaces the
+                // queued expectation in place and every waiter still shares
+                // the one child.
+                if newer && let Some(pair) = captured {
+                    st.current.expectation = Some(pair);
+                }
+                st.current.waiters.push(waiter);
+                None
+            }
+            ProbePhase::InFlight => {
+                if newer {
+                    st.successor.get_or_insert_with(Vec::new).push(waiter);
+                } else {
+                    st.current.waiters.push(waiter);
+                }
+                None
+            }
+            ProbePhase::Promoting => {
+                if newer {
+                    st.successor.get_or_insert_with(Vec::new).push(waiter);
+                    None
+                } else {
+                    let accounting = st.last_accounting.unwrap_or(ProbeAccounting::None);
+                    Some((waiter, accounting))
+                }
+            }
+            ProbePhase::Idle => Some((waiter, ProbeAccounting::None)),
+        }
     }
 
     fn enqueue_background_unique(queue: &mut Queue, item: WorkItem) {
@@ -677,6 +1020,110 @@ impl LibraryPool {
             return;
         }
         let _ = handle.release_rx.recv();
+    }
+
+    /// Arm the test-only in-flight hold for the next physical probe on this
+    /// pool and return its test half ([`ProbeHold`]). The test waits on
+    /// `entered_rx` for the probe to report, then issues the join or successor
+    /// it wants to observe, then sends on `release_tx`. Probes that start
+    /// while no hold is armed pass through untouched.
+    #[cfg(test)]
+    pub(crate) fn arm_probe_hold(&self) -> ProbeHoldTest {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.probe_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(ProbeHold {
+            entered_tx,
+            release_rx,
+        });
+        ProbeHoldTest {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    /// Park the probe worker just before it starts its ffprobe child when a
+    /// hold is armed. Consumes the armed hold, so **exactly one** probe per arm
+    /// parks and every later probe passes through. A test that gave up before
+    /// the probe arrived unparks the worker immediately via the channel error.
+    #[cfg(test)]
+    fn hold_probe_if_armed(&self, item_id: i64) {
+        let handle = self
+            .probe_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if handle.entered_tx.send(item_id).is_err() {
+            return;
+        }
+        let _ = handle.release_rx.recv();
+    }
+
+    /// Arm the test-only one-shot snapshot-build fault: the next physical
+    /// probe's snapshot build fails after its ffprobe has succeeded.
+    #[cfg(test)]
+    pub(crate) fn arm_probe_snapshot_fault(&self) {
+        self.probe_snapshot_fault.store(true, Ordering::SeqCst);
+    }
+
+    /// Arm the test-only hold for the next index pass's `delete_missing`
+    /// decision on this pool and return its test half ([`DeleteHoldTest`]). The
+    /// test waits on `entered_rx` for the pass to report, runs the hint it wants
+    /// to observe, then sends on `release_tx`. Passes that reach the decision
+    /// while no hold is armed pass through untouched.
+    #[cfg(test)]
+    pub(crate) fn arm_delete_hold(&self) -> DeleteHoldTest {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.delete_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeleteHold {
+            entered_tx,
+            release_rx,
+        });
+        DeleteHoldTest {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    /// Park the index pass at its `delete_missing` decision when a hold is
+    /// armed. Consumes the armed hold, so **exactly one** pass per arm parks and
+    /// every later pass passes through. A test that gave up before the pass
+    /// arrived (dropped its half) unparks the worker immediately via the
+    /// channel error.
+    #[cfg(test)]
+    pub(crate) fn hold_delete_if_armed(&self, library_id: i64) {
+        let handle = self
+            .delete_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if handle.entered_tx.send(library_id).is_err() {
+            return;
+        }
+        let _ = handle.release_rx.recv();
+    }
+
+    /// Physical probe executions observed by this pool. In production each one
+    /// is one ffprobe child, so this is the instrument that proves joined
+    /// demands share a child.
+    #[cfg(test)]
+    pub(crate) fn probe_invocations(&self) -> u64 {
+        self.probe_invocations.load(Ordering::SeqCst)
+    }
+
+    /// Items with queued or in-flight physical probe work. Zero after every
+    /// demand has completed proves no slot was stranded (ADR-0058).
+    #[cfg(test)]
+    pub(crate) fn probe_slot_count(&self) -> usize {
+        self.probe_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Move an item's extract to the front of the queue (first-play path).
@@ -792,14 +1239,8 @@ impl LibraryPool {
         if self.availability.pause.is_paused(item.library_id) {
             return;
         }
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        // Counted before it is poppable, under the queue lock.
-        batch.state.push();
         item.kind = WorkKind::Probe;
-        item.batch = Some(Arc::clone(&batch.state));
-        queue.probes.push_back(item);
-        drop(queue);
-        self.available.notify_one();
+        self.enqueue_probe_demand(item, Some(Arc::clone(&batch.state)));
     }
 
     pub fn drain_pending_probes(&self) -> Result<usize, String> {
@@ -939,17 +1380,9 @@ impl LibraryPool {
                         }
                     }
                     if let Some(item) = queue.probes.pop_front() {
-                        if self.availability.pause.is_paused(item.library_id) {
-                            if let Some(batch) = &item.batch {
-                                let mut remaining =
-                                    batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
-                                *remaining = remaining.saturating_sub(1);
-                                if *remaining == 0 {
-                                    batch.ready.notify_all();
-                                }
-                            }
-                            continue;
-                        }
+                        // A paused library is handled by the run itself, so
+                        // every demand joined to this physical probe is still
+                        // released (ADR-0058).
                         break (item, None);
                     }
                     queue = self
@@ -973,8 +1406,9 @@ impl LibraryPool {
         }
     }
 
-    fn finish_batch(item: &WorkItem) {
-        if let Some(batch) = &item.batch {
+    /// Decrement one batch barrier for a finished logical demand.
+    fn finish_batch_state(batch: &Option<Arc<ProbeBatchState>>) {
+        if let Some(batch) = batch {
             let mut remaining = batch.remaining.lock().unwrap_or_else(|e| e.into_inner());
             *remaining -= 1;
             if *remaining == 0 {
@@ -983,57 +1417,133 @@ impl LibraryPool {
         }
     }
 
-    fn probe(&self, item: WorkItem) {
-        if self.availability.pause.is_paused(item.library_id) {
-            Self::finish_batch(&item);
-            return;
+    fn finish_batch(item: &WorkItem) {
+        Self::finish_batch_state(&item.batch);
+    }
+
+    /// Complete one logical demand exactly once: account its scan job with the
+    /// physical probe's terminal class and release its batch barrier.
+    fn finish_probe_waiter(&self, waiter: ProbeWaiter, accounting: ProbeAccounting) {
+        if accounting != ProbeAccounting::None
+            && let Some(job_id) = waiter.scan_job_id
+            && let Err(e) = self.db.record_scan_job_probe(job_id, accounting)
+        {
+            tracing::warn!(job_id, error = %e, "probe counter bump failed");
         }
-        // Capture the expectation before probing (ADR-0058). Everything below
-        // publishes against exactly these fields or not at all.
-        let (expectation, abs) = match self.probe_expectation(&item) {
-            Ok(Some(pair)) => pair,
-            // The item or its library row is gone; there is nothing to publish.
-            Ok(None) => {
-                Self::finish_batch(&item);
+        Self::finish_batch_state(&waiter.batch);
+    }
+
+    /// Run one item's physical probe and its successor, if any (ADR-0058).
+    ///
+    /// The worker owns the slot for the whole loop, so at most one ffprobe for
+    /// an item runs at once and a desired successor starts only after the
+    /// previous child has been reaped and classified.
+    fn run_probe_slot(&self, slot: Arc<ProbeSlot>) {
+        loop {
+            let accounting = match self.begin_probe_run(&slot) {
+                ProbeBegin::Probe { expectation, abs } => {
+                    self.execute_probe_run(&slot, &expectation, &abs)
+                }
+                // Paused, or the item or its library is gone, or a successor
+                // whose changed revision carries no certifiable identity:
+                // nothing starts, and every joined demand still completes.
+                ProbeBegin::Skip => ProbeAccounting::None,
+            };
+            // Detach this run's demands, hand the slot on (successor) or
+            // release it, and only then release the demands' completion
+            // barriers. A caller that observes a batch as complete therefore
+            // also observes the slot gone: the slot map never outlives the
+            // barrier of the run it belonged to.
+            let waiters = self.complete_probe_run(&slot, accounting);
+            let promoted = self.promote_probe_successor(&slot);
+            for waiter in waiters {
+                self.finish_probe_waiter(waiter, accounting);
+            }
+            if !promoted {
                 return;
             }
+        }
+    }
+
+    /// Claim the slot's current run for one physical probe.
+    ///
+    /// The expectation is captured here, before ffprobe begins (ADR-0058). A
+    /// successor run has none yet and re-reads the current database row, never
+    /// the tuple the previous run used.
+    fn begin_probe_run(&self, slot: &Arc<ProbeSlot>) -> ProbeBegin {
+        let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.availability.pause.is_paused(slot.library_id) {
+            return ProbeBegin::Skip;
+        }
+        st.phase = ProbePhase::InFlight;
+        st.current_key = None;
+        st.last_accounting = None;
+        // A successor is a run whose expectation was not captured at enqueue.
+        let is_successor = st.current.expectation.is_none();
+        let captured = match st.current.expectation.take() {
+            Some(pair) => Ok(Some(pair)),
+            None => self.capture_probe_expectation(slot.item_id),
+        };
+        match captured {
+            Ok(Some((expectation, abs))) => {
+                let key = ProbeKey::of(&expectation);
+                st.current_key = Some(key.clone());
+                if is_successor && key.identity_missing() {
+                    // A changed revision with missing or empty identity cannot
+                    // certify and must not start a child (ADR-0058).
+                    return ProbeBegin::Skip;
+                }
+                ProbeBegin::Probe { expectation, abs }
+            }
+            Ok(None) => ProbeBegin::Skip,
             Err(e) => {
                 tracing::warn!(
-                    item_id = item.item_id,
+                    item_id = slot.item_id,
                     error = %e,
                     "capture probe expectation failed"
                 );
-                Self::finish_batch(&item);
-                return;
+                ProbeBegin::Skip
             }
-        };
+        }
+    }
+
+    /// Run one ffprobe and classify its terminal outcome once (ADR-0058).
+    fn execute_probe_run(
+        &self,
+        slot: &Arc<ProbeSlot>,
+        expectation: &ProbeExpectation,
+        abs: &std::path::Path,
+    ) -> ProbeAccounting {
         // ADR-0014 reachability signal reused as the in-flight cancel: the
         // same pause set that blocks new starts aborts a running probe
         // (ADR-0041 Decision 8.7 amendment, 2026-08-07).
-        let should_cancel = || self.availability.pause.is_paused(item.library_id);
-        let outcome = match probe::ffprobe(&abs, Some(&should_cancel)) {
-            Ok(p) => match self.probe_snapshot(item.item_id, &p) {
+        let should_cancel = || self.availability.pause.is_paused(slot.library_id);
+        #[cfg(test)]
+        self.hold_probe_if_armed(slot.item_id);
+        self.probe_invocations.fetch_add(1, Ordering::SeqCst);
+        let outcome = match probe::ffprobe(abs, Some(&should_cancel)) {
+            Ok(p) => match self.probe_snapshot(slot.item_id, &p) {
                 Ok(snapshot) => ProbeOutcome::Success(Box::new(snapshot)),
                 Err(e) => {
-                    // A complete snapshot could not be built, and a partial
-                    // success is not a publication (ADR-0058). Leave the item
-                    // for a later pass rather than certify less than the whole.
+                    // A complete snapshot could not be built after a successful
+                    // ffprobe, so nothing is published: the item stays probed-
+                    // unchanged and the failure is an error with no probe
+                    // behind it (ADR-0058).
                     tracing::warn!(
-                        item_id = item.item_id,
+                        item_id = slot.item_id,
                         error = %e,
                         "build probe snapshot failed"
                     );
-                    Self::finish_batch(&item);
-                    return;
+                    return ProbeAccounting::ErrorOnly;
                 }
             },
             Err(e) => {
-                let unavailable = self.availability.pause.is_paused(item.library_id)
+                let unavailable = self.availability.pause.is_paused(slot.library_id)
                     || message_looks_unavailable(&e)
                     || {
                         // Re-check root: mid-pass unmount.
                         self.db
-                            .get_library(item.library_id)
+                            .get_library(slot.library_id)
                             .ok()
                             .flatten()
                             .map(|lib| {
@@ -1070,54 +1580,97 @@ impl LibraryPool {
         // result, even when the probe was administratively cancelled
         // (ADR-0041 Decision 8.7); a cancelled probe whose source is still
         // valid publishes nothing, and a changed source is stale.
-        let final_stat = std::fs::metadata(&abs).map(|m| (mtime_ms_from(&m), m.len() as i64));
-        let administratively_cancelled = self.availability.pause.is_paused(item.library_id);
+        let final_stat = std::fs::metadata(abs).map(|m| (mtime_ms_from(&m), m.len() as i64));
+        let administratively_cancelled = self.availability.pause.is_paused(slot.library_id);
         let outcome = match decide_probe_publication(
-            &expectation,
+            expectation,
             outcome,
             final_stat,
             administratively_cancelled,
-            &abs,
+            abs,
         ) {
             ProbeDecision::Publish(outcome) => outcome,
             ProbeDecision::NoOp => {
                 tracing::debug!(
-                    item_id = item.item_id,
+                    item_id = slot.item_id,
                     path = %abs.display(),
                     "probe result not published"
                 );
-                Self::finish_batch(&item);
-                return;
+                return ProbeAccounting::None;
             }
         };
         let failed = matches!(
             &outcome,
             ProbeOutcome::Failure { probe_status, .. } if probe_status == "error"
         );
-        let publication = match self.db.publish_probe(&expectation, &outcome) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(item_id = item.item_id, error = %e, "publish probe failed");
-                Self::finish_batch(&item);
-                return;
+        match self.db.publish_probe(expectation, &outcome) {
+            Ok(ProbePublication::Published { .. }) => ProbeAccounting::Published,
+            Ok(ProbePublication::FailureRecorded) => {
+                if failed {
+                    ProbeAccounting::Error
+                } else {
+                    ProbeAccounting::Unavailable
+                }
             }
-        };
-        if let Some(job_id) = item.scan_job_id {
-            // `Published` counts a success; a recorded failure counts probed
-            // and counts the error column only for a terminal `error`; a stale
-            // result counts nothing (ADR-0058).
-            let counted = match publication {
-                ProbePublication::Published { .. } => Some(false),
-                ProbePublication::FailureRecorded => Some(failed),
-                ProbePublication::Stale => None,
-            };
-            if let Some(error) = counted
-                && let Err(e) = self.db.bump_scan_job_probe(job_id, error)
-            {
-                tracing::warn!(job_id, error = %e, "probe counter bump failed");
+            // A stale result counts nothing (ADR-0058).
+            Ok(ProbePublication::Stale) => ProbeAccounting::None,
+            // The result could not be written: an error with no probe behind
+            // it, so it must not inflate `probed`.
+            Err(e) => {
+                tracing::warn!(item_id = slot.item_id, error = %e, "publish probe failed");
+                ProbeAccounting::ErrorOnly
             }
         }
-        Self::finish_batch(&item);
+    }
+
+    /// Classify the finished run once and detach every demand joined to it
+    /// (ADR-0058). The slot moves to `Promoting`, so a demand that arrives
+    /// during the hand-off is completed with the same class by
+    /// [`Self::join_probe_slot`] rather than left waiting or starting another
+    /// child. The caller releases the returned demands **after** the slot has
+    /// been handed on or removed, so a caller that observes a batch as complete
+    /// also observes the slot gone.
+    fn complete_probe_run(
+        &self,
+        slot: &Arc<ProbeSlot>,
+        accounting: ProbeAccounting,
+    ) -> Vec<ProbeWaiter> {
+        let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.phase = ProbePhase::Promoting;
+        st.last_accounting = Some(accounting);
+        std::mem::take(&mut st.current.waiters)
+    }
+
+    /// Start the one desired successor, or release the slot. Returns whether
+    /// the worker must loop again.
+    fn promote_probe_successor(&self, slot: &Arc<ProbeSlot>) -> bool {
+        let mut slots = self.probe_slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        match st.successor.take() {
+            Some(waiters) => {
+                st.current = ProbeRun {
+                    expectation: None,
+                    waiters,
+                };
+                st.current_key = None;
+                st.last_accounting = None;
+                st.phase = ProbePhase::Queued;
+                true
+            }
+            None => {
+                st.phase = ProbePhase::Idle;
+                slots.remove(&slot.item_id);
+                false
+            }
+        }
+    }
+
+    /// Run one item's physical probe. The coalescing slot owns every logical
+    /// demand, so a probe WorkItem without one has nothing to run.
+    fn probe(&self, item: WorkItem) {
+        if let Some(slot) = item.probe_slot {
+            self.run_probe_slot(slot);
+        }
     }
 
     /// Capture the expectation a probe result must still match to publish
@@ -1126,11 +1679,11 @@ impl LibraryPool {
     /// `None` when the item or its library row is gone. The absolute media path
     /// comes from the same read, so the probe cannot observe a different row
     /// than the one it will publish against.
-    fn probe_expectation(
+    fn capture_probe_expectation(
         &self,
-        item: &WorkItem,
+        item_id: i64,
     ) -> Result<Option<(ProbeExpectation, PathBuf)>, String> {
-        let Some(row) = self.db.get_item(item.item_id)? else {
+        let Some(row) = self.db.get_item(item_id)? else {
             return Ok(None);
         };
         let Some(lib) = self.db.get_library(row.library_id)? else {
@@ -1162,6 +1715,10 @@ impl LibraryPool {
         item_id: i64,
         p: &probe::ProbeResult,
     ) -> Result<ProbeSnapshot, String> {
+        #[cfg(test)]
+        if self.probe_snapshot_fault.swap(false, Ordering::SeqCst) {
+            return Err("injected snapshot build failure".into());
+        }
         let kinds: Vec<SubtitleTrackKind> = p
             .subtitle_streams
             .iter()
@@ -1513,6 +2070,17 @@ enum ProbeDecision {
     NoOp,
 }
 
+/// What one [`LibraryPool::begin_probe_run`] decided.
+enum ProbeBegin {
+    /// Run ffprobe against this captured expectation.
+    Probe {
+        expectation: ProbeExpectation,
+        abs: PathBuf,
+    },
+    /// Nothing to probe; complete the joined demands without a count.
+    Skip,
+}
+
 /// Decide whether one finished probe may publish against its expectation
 /// (ADR-0058; Astra ruling 2026-09-14).
 ///
@@ -1593,6 +2161,23 @@ mod tests {
         let subs = Arc::new(SubsStore::new(dir.join("subs")).unwrap());
         let pool = LibraryPool::spawn(Arc::clone(&db), subs);
         (db, pool)
+    }
+
+    /// Enqueue one probe through the coalescing path and block until its
+    /// logical demand completes, exactly as the scan pass does.
+    fn probe_now(
+        pool: &Arc<LibraryPool>,
+        item_id: i64,
+        library_id: i64,
+        abs: PathBuf,
+        scan_job_id: Option<i64>,
+    ) {
+        let batch = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs, scan_job_id),
+            &batch,
+        );
+        batch.wait();
     }
 
     /// The counter starting at zero and rising with the walk means it can also
@@ -2123,7 +2708,7 @@ mod tests {
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
         let job_id = db.create_scan_job(library_id).unwrap();
 
-        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+        probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
         let row = db.get_item(item_id).unwrap().unwrap();
         assert_eq!(row.probe_status, "probed");
@@ -2154,7 +2739,7 @@ mod tests {
         let (db, pool, library_id, item_id, abs) = broken_item(dir.path());
         let job_id = db.create_scan_job(library_id).unwrap();
 
-        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+        probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
         let row = db.get_item(item_id).unwrap().unwrap();
         assert_eq!(row.probe_status, "error");
@@ -2166,6 +2751,46 @@ mod tests {
         let job = db.get_scan_job(job_id).unwrap().unwrap();
         assert_eq!(job.probed, 1);
         assert_eq!(job.errors, 1);
+    }
+
+    /// A successful ffprobe whose snapshot build then fails publishes nothing
+    /// and counts an error with no probe: the item stays probed-unchanged and
+    /// the slot is released (ADR-0058).
+    #[test]
+    fn probe_snapshot_build_failure_counts_error_only_and_releases_slot() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let job_id = db.create_scan_job(library_id).unwrap();
+
+        pool.arm_probe_snapshot_fault();
+        let batch = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs, Some(job_id)),
+            &batch,
+        );
+        batch.wait();
+
+        assert_eq!(pool.probe_invocations(), 1, "ffprobe still ran");
+        assert_eq!(
+            job_counts(&db, job_id),
+            (0, 1),
+            "probed unchanged, errors plus one"
+        );
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "indexed", "nothing was published");
+        assert_eq!(row.probe_revision, 0);
+        assert_eq!(row.probed_media_revision, None);
+        assert_eq!(row.probed_content_id, None);
+        assert!(row.scan_error.is_none(), "no probe failure was recorded");
+        assert!(
+            db.list_item_subtitle_tracks(item_id).unwrap().is_empty(),
+            "no inventory was published"
+        );
+        assert_eq!(pool.probe_slot_count(), 0, "no stranded slot");
     }
 
     /// A success whose input changed under it publishes nothing and counts
@@ -2190,7 +2815,7 @@ mod tests {
         .unwrap();
         let job_id = db.create_scan_job(library_id).unwrap();
 
-        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+        probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
         let row = db.get_item(item_id).unwrap().unwrap();
         assert_eq!(row.probe_status, "indexed", "nothing was published");
@@ -2222,7 +2847,7 @@ mod tests {
         .unwrap();
         let job_id = db.create_scan_job(library_id).unwrap();
 
-        pool.probe(WorkItem::probe(item_id, library_id, abs, Some(job_id)));
+        probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
         let row = db.get_item(item_id).unwrap().unwrap();
         assert_eq!(row.probe_status, "indexed", "nothing was published");
@@ -2259,12 +2884,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
         let first_job = db.create_scan_job(library_id).unwrap();
-        pool.probe(WorkItem::probe(
-            item_id,
-            library_id,
-            abs.clone(),
-            Some(first_job),
-        ));
+        probe_now(&pool, item_id, library_id, abs.clone(), Some(first_job));
 
         let first = db.get_item(item_id).unwrap().unwrap();
         assert_eq!(first.probe_status, "probed");
@@ -2280,12 +2900,7 @@ mod tests {
         // The source disappears between the capture and the final stat.
         std::fs::remove_file(&abs).unwrap();
         let job_id = db.create_scan_job(library_id).unwrap();
-        pool.probe(WorkItem::probe(
-            item_id,
-            library_id,
-            abs.clone(),
-            Some(job_id),
-        ));
+        probe_now(&pool, item_id, library_id, abs.clone(), Some(job_id));
 
         let row = db.get_item(item_id).unwrap().unwrap();
         assert_eq!(row.probe_status, "unavailable");
@@ -2504,5 +3119,525 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0058 revision-aware coalescing (PROBE-R1.4)
+    // ------------------------------------------------------------------
+
+    /// Replace the seeded file with another corpus fixture and upsert the row
+    /// as the index pass does when the observed bytes change: this bumps
+    /// `media_revision` and refreshes the identity. Returns the new revision.
+    fn replace_item_media(
+        db: &Db,
+        library_id: i64,
+        item_id: i64,
+        abs: &std::path::Path,
+        fixture: &str,
+    ) -> i64 {
+        std::fs::copy(corpus_fixture(fixture), abs).unwrap();
+        let meta = std::fs::metadata(abs).unwrap();
+        let (mtime_ms, size_bytes) = (mtime_ms_from(&meta), meta.len() as i64);
+        let content_id = nightjar_db::content_id_for_path(abs).unwrap();
+        let row = db.get_item(item_id).unwrap().unwrap();
+        db.upsert_items_indexed(
+            library_id,
+            &[nightjar_db::UpsertItem {
+                path: row.path,
+                mtime_ms,
+                size_bytes,
+                title: row.title,
+                kind: row.kind,
+                year: row.year,
+                season: row.season,
+                episode: row.episode,
+                content_id: Some(content_id),
+            }],
+        )
+        .unwrap();
+        db.get_item(item_id).unwrap().unwrap().media_revision
+    }
+
+    fn job_counts(db: &Db, job_id: i64) -> (i64, i64) {
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        (job.probed, job.errors)
+    }
+
+    fn demand_expectation(revision: i64, content_id: Option<&str>) -> (ProbeExpectation, PathBuf) {
+        (
+            ProbeExpectation {
+                item_id: 1,
+                library_id: 1,
+                library_root: "/media".into(),
+                path: "clip.mkv".into(),
+                media_revision: revision,
+                probe_revision: 0,
+                content_id: content_id.map(str::to_string),
+                mtime_ms: 100,
+                size_bytes: 200,
+            },
+            PathBuf::from("/media/clip.mkv"),
+        )
+    }
+
+    fn plain_waiter() -> ProbeWaiter {
+        ProbeWaiter {
+            scan_job_id: None,
+            batch: None,
+        }
+    }
+
+    fn in_flight_slot(key: ProbeKey) -> Arc<ProbeSlot> {
+        Arc::new(ProbeSlot {
+            item_id: 1,
+            library_id: 1,
+            state: Mutex::new(ProbeSlotState {
+                phase: ProbePhase::InFlight,
+                current: ProbeRun {
+                    expectation: None,
+                    waiters: Vec::new(),
+                },
+                current_key: Some(key),
+                successor: None,
+                last_accounting: None,
+            }),
+        })
+    }
+
+    /// Same-revision demands join one physical probe: two logical demands, one
+    /// ffprobe child, each demand counted and completed exactly once.
+    #[test]
+    fn same_revision_demands_join_one_child() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let job_a = db.create_scan_job(library_id).unwrap();
+        let job_b = db.create_scan_job(library_id).unwrap();
+
+        let hold = pool.arm_probe_hold();
+        let batch_a = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_a)),
+            &batch_a,
+        );
+        assert_eq!(
+            hold.entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the first physical probe must report that it started"),
+            item_id
+        );
+        assert!(
+            pool.probe_slot_count() > 0,
+            "the held probe must hold its slot"
+        );
+        assert_eq!(
+            pool.probe_invocations(),
+            0,
+            "the held probe must not have run its child yet"
+        );
+
+        // The second demand arrives while the first child is outstanding and
+        // for the same revision, so it joins rather than starts a child.
+        let batch_b = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_b)),
+            &batch_b,
+        );
+        assert_eq!(
+            pool.probe_invocations(),
+            0,
+            "a joined same-revision demand must not start a second child"
+        );
+
+        hold.release_tx.send(()).unwrap();
+        batch_a.wait();
+        batch_b.wait();
+
+        assert_eq!(pool.probe_invocations(), 1, "one child for two demands");
+        assert_eq!(job_counts(&db, job_a), (1, 0));
+        assert_eq!(job_counts(&db, job_b), (1, 0));
+        assert_eq!(
+            db.get_item(item_id).unwrap().unwrap().probe_status,
+            "probed"
+        );
+        assert_eq!(pool.probe_slot_count(), 0, "the slot must be released");
+    }
+
+    /// A newer revision while the old one is in flight records one successor.
+    /// Many newer demands collapse into it, the old child's stale result counts
+    /// nothing and cannot overwrite the successor's publication, and the
+    /// successor starts only after the old child is reaped.
+    #[test]
+    fn newer_revisions_collapse_into_one_successor() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let job_a = db.create_scan_job(library_id).unwrap();
+        let job_b = db.create_scan_job(library_id).unwrap();
+        let job_c = db.create_scan_job(library_id).unwrap();
+
+        let hold = pool.arm_probe_hold();
+        let batch_a = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_a)),
+            &batch_a,
+        );
+        hold.entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first physical probe must start");
+        assert!(
+            pool.probe_slot_count() > 0,
+            "the held probe must hold its slot"
+        );
+
+        // The source changes under the in-flight probe, so A's result is stale.
+        let revision = replace_item_media(&db, library_id, item_id, &abs, "h264_aac_mkv.mkv");
+        assert_eq!(
+            revision, 2,
+            "a changed observation bumps media_revision once"
+        );
+
+        // Two newer demands for revision 2 collapse into the one successor.
+        let batch_b = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_b)),
+            &batch_b,
+        );
+        let batch_c = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_c)),
+            &batch_c,
+        );
+        assert_eq!(
+            pool.probe_invocations(),
+            0,
+            "the successor must not start before the old child is reaped"
+        );
+
+        hold.release_tx.send(()).unwrap();
+        batch_a.wait();
+        batch_b.wait();
+        batch_c.wait();
+
+        // A's run is stale (the source moved), so it counts nothing and writes
+        // nothing; B and C share the one successor child and both count.
+        assert_eq!(job_counts(&db, job_a), (0, 0), "a stale run counts nothing");
+        assert_eq!(job_counts(&db, job_b), (1, 0));
+        assert_eq!(job_counts(&db, job_c), (1, 0));
+        assert_eq!(
+            pool.probe_invocations(),
+            2,
+            "one stale child plus one collapsed successor child"
+        );
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "probed");
+        assert_eq!(row.probed_media_revision, Some(2));
+        assert_eq!(
+            row.probe_revision, 1,
+            "only the successor published; the stale run must not have moved it"
+        );
+        assert_eq!(pool.probe_slot_count(), 0);
+    }
+
+    /// Sequential demands across a revision change: A publishes revision 1,
+    /// the media then changes, and B publishes revision 2 from a fresh child.
+    /// A's slot is released before B starts, so the two children are serial and
+    /// each logical job completes exactly once.
+    #[test]
+    fn sequential_success_then_changed_revision_success() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let job_a = db.create_scan_job(library_id).unwrap();
+        probe_now(&pool, item_id, library_id, abs.clone(), Some(job_a));
+
+        let after_a = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(after_a.probe_status, "probed");
+        assert_eq!(after_a.probe_revision, 1);
+        assert_eq!(after_a.probed_media_revision, Some(1));
+        assert_eq!(job_counts(&db, job_a), (1, 0));
+        assert_eq!(pool.probe_slot_count(), 0, "A's slot is released");
+        assert_eq!(pool.probe_invocations(), 1);
+
+        let revision = replace_item_media(&db, library_id, item_id, &abs, "h264_aac_mkv.mkv");
+        assert_eq!(
+            revision, 2,
+            "a changed observation bumps media_revision once"
+        );
+        let job_b = db.create_scan_job(library_id).unwrap();
+        probe_now(&pool, item_id, library_id, abs.clone(), Some(job_b));
+
+        let after_b = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(after_b.probe_status, "probed");
+        assert_eq!(after_b.probe_revision, 2, "B publishes a second revision");
+        assert_eq!(after_b.probed_media_revision, Some(2));
+        assert_eq!(job_counts(&db, job_a), (1, 0), "A's class is unchanged");
+        assert_eq!(job_counts(&db, job_b), (1, 0));
+        assert_eq!(
+            pool.probe_invocations(),
+            2,
+            "one child per sequential demand"
+        );
+        assert_eq!(pool.probe_slot_count(), 0);
+    }
+
+    /// A failed probe at revision 1, then a successful probe after the media
+    /// changes to revision 2. The failure counts probed+error once and certifies
+    /// nothing; B's child is a fresh capture that publishes revision 2.
+    #[test]
+    fn failure_then_changed_revision_success() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = broken_item(dir.path());
+        let job_a = db.create_scan_job(library_id).unwrap();
+        probe_now(&pool, item_id, library_id, abs.clone(), Some(job_a));
+
+        let after_a = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(after_a.probe_status, "error");
+        assert_eq!(after_a.probe_revision, 0, "a failure is not a publication");
+        assert_eq!(job_counts(&db, job_a), (1, 1));
+        assert_eq!(pool.probe_slot_count(), 0, "the failed slot is released");
+        assert_eq!(pool.probe_invocations(), 1);
+
+        let revision = replace_item_media(&db, library_id, item_id, &abs, "h264_aac_srt_mkv.mkv");
+        assert_eq!(
+            revision, 2,
+            "a changed observation bumps media_revision once"
+        );
+        let job_b = db.create_scan_job(library_id).unwrap();
+        probe_now(&pool, item_id, library_id, abs.clone(), Some(job_b));
+
+        let after_b = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(after_b.probe_status, "probed");
+        assert_eq!(after_b.probe_revision, 1, "the first publication");
+        assert_eq!(after_b.probed_media_revision, Some(2));
+        assert_eq!(job_counts(&db, job_a), (1, 1), "A's class is unchanged");
+        assert_eq!(job_counts(&db, job_b), (1, 0));
+        assert_eq!(
+            pool.probe_invocations(),
+            2,
+            "one child per sequential demand"
+        );
+        assert_eq!(pool.probe_slot_count(), 0);
+    }
+
+    /// Many newer demands collapse into the one successor, and the successor
+    /// re-reads the current row rather than reusing the first newer demand's
+    /// tuple: B (revision 2) and C (revision 3) both join, but the one child
+    /// probes and publishes the latest revision, and both jobs count it once.
+    #[test]
+    fn many_newer_demands_pick_the_latest_revision_for_the_one_successor() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        let job_a = db.create_scan_job(library_id).unwrap();
+        let job_b = db.create_scan_job(library_id).unwrap();
+        let job_c = db.create_scan_job(library_id).unwrap();
+
+        let hold = pool.arm_probe_hold();
+        let batch_a = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_a)),
+            &batch_a,
+        );
+        hold.entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first physical probe must start");
+        assert!(
+            pool.probe_slot_count() > 0,
+            "the held probe must hold its slot"
+        );
+
+        // B arrives for revision 2 while A is in flight.
+        assert_eq!(
+            replace_item_media(&db, library_id, item_id, &abs, "h264_aac_mkv.mkv"),
+            2
+        );
+        let batch_b = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_b)),
+            &batch_b,
+        );
+        // C arrives for the newer revision 3 before the successor starts.
+        assert_eq!(
+            replace_item_media(
+                &db,
+                library_id,
+                item_id,
+                &abs,
+                "h264_aac_commentary_mkv.mkv"
+            ),
+            3
+        );
+        let batch_c = pool.start_probe_batch();
+        pool.enqueue_probe_in_batch(
+            WorkItem::probe(item_id, library_id, abs.clone(), Some(job_c)),
+            &batch_c,
+        );
+        assert_eq!(
+            pool.probe_invocations(),
+            0,
+            "the successor must not start before the old child is reaped"
+        );
+
+        hold.release_tx.send(()).unwrap();
+        batch_a.wait();
+        batch_b.wait();
+        batch_c.wait();
+
+        assert_eq!(job_counts(&db, job_a), (0, 0), "a stale run counts nothing");
+        assert_eq!(job_counts(&db, job_b), (1, 0));
+        assert_eq!(job_counts(&db, job_c), (1, 0));
+        assert_eq!(
+            pool.probe_invocations(),
+            2,
+            "one stale child plus one collapsed successor child"
+        );
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(row.probe_status, "probed");
+        assert_eq!(
+            row.probed_media_revision,
+            Some(3),
+            "the successor publishes the latest revision, not B's"
+        );
+        assert_eq!(row.probe_revision, 1, "one publication");
+        assert_eq!(pool.probe_slot_count(), 0);
+    }
+
+    /// A publisher database error counts an error with no probe: `probed` must
+    /// not move when the result could not be written (ADR-0058).
+    #[test]
+    fn publisher_error_counts_error_only() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
+        // Probe-revision overflow makes the publisher fail after the CAS and
+        // before any write; the ffprobe child still ran.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET probe_revision = ?2 WHERE id = ?1",
+                [item_id, i64::MAX],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let job_id = db.create_scan_job(library_id).unwrap();
+
+        probe_now(&pool, item_id, library_id, abs, Some(job_id));
+
+        assert_eq!(pool.probe_invocations(), 1, "the child ran");
+        assert_eq!(job_counts(&db, job_id), (0, 1), "an error with no probe");
+        assert_eq!(
+            db.get_item(item_id).unwrap().unwrap().probe_status,
+            "indexed",
+            "nothing was published"
+        );
+        assert_eq!(pool.probe_slot_count(), 0);
+    }
+
+    /// A newer demand while the old revision is queued replaces the queued
+    /// expectation in place and keeps every logical waiter on the one child.
+    #[test]
+    fn newer_demand_replaces_queued_expectation_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(dir.path());
+        let slot = Arc::new(ProbeSlot {
+            item_id: 1,
+            library_id: 1,
+            state: Mutex::new(ProbeSlotState {
+                phase: ProbePhase::Queued,
+                current: ProbeRun {
+                    expectation: Some(demand_expectation(1, Some("a"))),
+                    waiters: vec![plain_waiter()],
+                },
+                current_key: None,
+                successor: None,
+                last_accounting: None,
+            }),
+        });
+        let immediate = pool.join_probe_slot(
+            &slot,
+            Some(demand_expectation(2, Some("b"))),
+            plain_waiter(),
+        );
+        assert!(immediate.is_none(), "the newer demand joins the one child");
+        let st = slot.state.lock().unwrap();
+        assert!(
+            st.successor.is_none(),
+            "a queued run is replaced, not succeeded"
+        );
+        assert_eq!(st.current.waiters.len(), 2, "every waiter is retained");
+        assert_eq!(
+            st.current.expectation.as_ref().unwrap().0.media_revision,
+            2,
+            "the queued work now probes the newer expectation"
+        );
+    }
+
+    /// An older demand while a newer revision is in flight joins it and does
+    /// not create a successor.
+    #[test]
+    fn older_demand_cannot_displace_newer_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(dir.path());
+        let slot = in_flight_slot(ProbeKey {
+            media_revision: 2,
+            content_id: Some("b".into()),
+        });
+        let immediate = pool.join_probe_slot(
+            &slot,
+            Some(demand_expectation(1, Some("a"))),
+            plain_waiter(),
+        );
+        assert!(immediate.is_none(), "the older demand joins the run");
+        let st = slot.state.lock().unwrap();
+        assert!(
+            st.successor.is_none(),
+            "an older demand must not displace newer work"
+        );
+        assert_eq!(st.current.waiters.len(), 1);
+    }
+
+    /// A changed revision with a missing identity must not start a child; its
+    /// logical demand completes without a count and does not join the run.
+    #[test]
+    fn newer_demand_without_identity_does_not_start_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(dir.path());
+        let slot = in_flight_slot(ProbeKey {
+            media_revision: 1,
+            content_id: Some("a".into()),
+        });
+        let immediate =
+            pool.join_probe_slot(&slot, Some(demand_expectation(2, None)), plain_waiter());
+        assert!(
+            matches!(immediate, Some((_, ProbeAccounting::None))),
+            "the demand completes without a count"
+        );
+        let st = slot.state.lock().unwrap();
+        assert!(st.successor.is_none(), "no successor is recorded");
+        assert!(
+            st.current.waiters.is_empty(),
+            "it does not join the run either"
+        );
     }
 }
