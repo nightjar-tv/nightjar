@@ -568,6 +568,14 @@ pub fn hint_ingest(
         .into_iter()
         .next()
         .ok_or_else(|| "hint upsert returned no id".to_string())?;
+    // If a full walk is in flight, mark dirty_add so that job skips
+    // delete_missing (would otherwise drop this row). Set the marker before the
+    // probe enqueue/capture so an active walk's delete_missing cannot race the
+    // upsert-to-marker window. Poll heals deletes later; do not schedule a
+    // follow-up full walk for the hint alone.
+    if db.active_scan_job(library_id)?.is_some() {
+        pool.mark_dirty_add(library_id);
+    }
     let abs = resolve_media_path(&library_root, &store_path);
     pool.enqueue(pool::WorkItem::probe(
         item_id,
@@ -586,12 +594,6 @@ pub fn hint_ingest(
             error = %e,
             "hint sidecar association failed"
         );
-    }
-    // If a full walk is in flight, mark dirty_add so that job skips
-    // delete_missing (would otherwise drop this row). Poll heals deletes later;
-    // do not schedule a follow-up full walk for the hint alone.
-    if db.active_scan_job(library_id)?.is_some() {
-        pool.mark_dirty_add(library_id);
     }
     tracing::info!(
         library_id,
@@ -2694,6 +2696,66 @@ mod tests {
             paths.iter().any(|p| p == "late.mp4"),
             "hinted file must survive: {paths:?}"
         );
+    }
+
+    /// The dirty_add marker is set before the hint's probe is enqueued, so an
+    /// active walk's delete_missing cannot race the upsert-to-marker window.
+    /// The armed hold proves the marker is already set when the probe reports
+    /// that it started.
+    #[test]
+    fn hint_marks_dirty_add_before_probe_capture() {
+        let fixture = corpus_fixture("h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&fixture) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let late = media.join("late.mkv");
+        fs::copy(&fixture, &late).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        // A queued job is active for `active_scan_job`; no walk needs to run.
+        let _job = db.create_scan_job(lib.id).unwrap();
+
+        let hold = pool.arm_probe_hold();
+        let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &late).unwrap();
+        let HintIngestOutcome::Upserted { item_id } = out else {
+            panic!("the hint must upsert the new file: {out:?}");
+        };
+        let entered = hold
+            .entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the hinted probe must report that it started");
+        assert_eq!(entered, item_id, "the held probe is the hinted item");
+        assert!(
+            pool.is_dirty_add(lib.id),
+            "the dirty_add marker must precede the captured probe"
+        );
+        assert!(
+            !pool.is_scan_dirty(lib.id),
+            "the hint must not set manual follow-up dirty"
+        );
+
+        hold.release_tx.send(()).unwrap();
+        let mut released = false;
+        for _ in 0..400 {
+            if pool.probe_slot_count() == 0 {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(released, "the hinted probe must release its slot");
+        assert_eq!(pool.probe_slot_count(), 0);
     }
 
     #[test]
