@@ -304,8 +304,7 @@ fn start_blocking(
         });
     }
     let piggyback = match state.db.list_item_subtitle_tracks(row.id) {
-        Ok(tracks) => piggyback_track_for(&row.subtitle_status, &tracks)
-            .map(|track_id| PiggybackExtract { track_id }),
+        Ok(tracks) => piggyback_track_for(&row.subtitle_status, &tracks),
         Err(e) => {
             tracing::warn!(item_id, error = %e, "piggyback eligibility read failed");
             None
@@ -787,24 +786,30 @@ fn stored_channels(row: &MediaItemRow) -> u32 {
 }
 
 /// ADR-0041 Decision 7: piggyback target for a session on an `eligible` item.
-/// The session's ffmpeg side output (`-map 0:s?` + `-c:s webvtt`) is only
-/// safe when the source holds exactly one embedded text or ASS track: the
-/// HLS muxer accepts a single WebVTT subtitle stream — a second subtitle
-/// output, an image stream (PGS/VobSub), or an unknown codec fails the whole
-/// session. Every other `eligible` item stays `eligible` for a standalone or
-/// later pass. Returns the library track id to publish on completion.
-fn piggyback_track_for(status: &str, tracks: &[SubtitleTrackRow]) -> Option<String> {
+/// The session's ffmpeg side output maps exactly one absolute input stream
+/// (`-map 0:{stream_index}` + `-c:s webvtt`): a broad `0:s?` selector, an
+/// image or unknown stream, or a second text stream would fail the whole
+/// session. Select the single embedded text or ASS track and fail closed when
+/// the inventory holds none, holds more than one text/ASS track, or its stream
+/// index is not a nonnegative absolute index. Every other `eligible` item
+/// stays `eligible` for a standalone or later pass. Returns the target to
+/// publish on completion.
+fn piggyback_track_for(status: &str, tracks: &[SubtitleTrackRow]) -> Option<PiggybackExtract> {
     if status != "eligible" {
         return None;
     }
-    if tracks.len() != 1 {
+    let mut texts = tracks
+        .iter()
+        .filter(|t| matches!(t.kind.as_str(), "text" | "ass"));
+    let t = texts.next()?;
+    if texts.next().is_some() {
         return None;
     }
-    let t = &tracks[0];
-    if !matches!(t.kind.as_str(), "text" | "ass") {
-        return None;
-    }
-    Some(format!("e{}", t.stream_index))
+    let stream_index = u32::try_from(t.stream_index).ok()?;
+    Some(PiggybackExtract {
+        track_id: format!("e{stream_index}"),
+        stream_index,
+    })
 }
 
 fn snapshot_hls_tracks(
@@ -1580,28 +1585,55 @@ mod tests {
 
     /// ADR-0041 Decision 7 gate, table-driven: the piggyback fires only for
     /// an `eligible` item holding exactly one embedded text or ASS track.
+    /// Image and unknown streams do not block the selection; they are simply
+    /// never mapped. More than one text/ASS track (or a negative index) fails
+    /// closed rather than falling back to a broad subtitle map.
     #[test]
     fn piggyback_track_gate() {
-        let cases: &[(&str, &[SubtitleTrackRow], Option<&str>)] = &[
+        type GateCase<'a> = (&'a str, &'a [SubtitleTrackRow], Option<(&'a str, u32)>);
+        let cases: &[GateCase] = &[
             // Not eligible: no piggyback, whatever the inventory says.
             ("ready", &[row(2, "text")], None),
             ("none", &[row(2, "text")], None),
             ("pending", &[row(2, "text")], None),
             // Eligible with exactly one text track → piggyback it.
-            ("eligible", &[row(2, "text")], Some("e2")),
-            ("eligible", &[row(7, "ass")], Some("e7")),
-            // Multi-track eligible items stay on a standalone/later pass
-            // (the HLS muxer accepts one WebVTT subtitle stream per session).
+            ("eligible", &[row(2, "text")], Some(("e2", 2))),
+            ("eligible", &[row(7, "ass")], Some(("e7", 7))),
+            // Image and unknown streams never enter the map, and they do not
+            // hide the one text track beside them.
+            (
+                "eligible",
+                &[row(2, "text"), row(3, "image")],
+                Some(("e2", 2)),
+            ),
+            (
+                "eligible",
+                &[
+                    row(2, "text"),
+                    row(3, "image"),
+                    row(4, "image"),
+                    row(5, "image"),
+                ],
+                Some(("e2", 2)),
+            ),
+            // Two text tracks are ambiguous: fail closed, never map both.
             ("eligible", &[row(2, "text"), row(3, "text")], None),
-            ("eligible", &[row(2, "text"), row(3, "image")], None),
+            (
+                "eligible",
+                &[row(2, "text"), row(3, "image"), row(4, "ass")],
+                None,
+            ),
             ("eligible", &[row(2, "unknown")], None),
             ("eligible", &[row(2, "image")], None),
+            // A negative stream index cannot name an absolute input stream.
+            ("eligible", &[row(-1, "text")], None),
             // Eligible with no embedded rows (sidecar-only) has no side output.
             ("eligible", &[], None),
         ];
         for (status, tracks, expected) in cases {
+            let got = piggyback_track_for(status, tracks).map(|p| (p.track_id, p.stream_index));
             assert_eq!(
-                piggyback_track_for(status, tracks).as_deref(),
+                got.as_ref().map(|(id, i)| (id.as_str(), *i)),
                 *expected,
                 "status={status} tracks={tracks:?}"
             );

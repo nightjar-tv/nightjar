@@ -410,16 +410,20 @@ pub struct HlsSessionRegistry {
 }
 
 /// ADR-0041 Decision 7: a piggyback target for a session on an `eligible`
-/// item. When set, the session's ffmpeg gains `-map 0:s?` + `-c:s webvtt`
-/// (a WebVTT side output alongside the video/audio maps); on a natural run
-/// EOF that started at title 0 the assembled WebVTT is published to
-/// `{subs}/{itemId}/{track_id}.vtt` and the item flips to `ready`. A killed
+/// item. When set, the session's ffmpeg gains `-map 0:{stream_index}` +
+/// `-c:s webvtt` (a WebVTT side output alongside the video/audio maps); on a
+/// natural run EOF that started at title 0 the assembled WebVTT is published
+/// to `{subs}/{itemId}/{track_id}.vtt` and the item flips to `ready`. A killed
 /// or offset run never publishes and leaves the item `eligible` for a later
 /// pass (standalone or another piggyback) to finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiggybackExtract {
     /// Library track id (`e{stream_index}`) the side output is published as.
     pub track_id: String,
+    /// Validated nonnegative absolute input stream index. The caller
+    /// establishes it before the session starts, so the map names one exact
+    /// text stream and never a broad `0:s?` selector.
+    pub stream_index: u32,
 }
 
 /// Serveable text track snapshot taken at session create (ADR-0010 / ADR-0013).
@@ -1862,7 +1866,7 @@ impl HlsSessionRegistry {
             &self.encode_leg,
             burn_in.as_ref(),
             rung_plan,
-            piggyback.is_some(),
+            piggyback.as_ref(),
         )
         .map_err(StartSessionError::Spawn)?;
         map_binding.bound = plan.virtual_input.take();
@@ -3295,7 +3299,7 @@ fn restart_at(
         &session.encode_leg,
         session.burn_in.as_ref(),
         rung_encode_plan(rung, session.encode_plan),
-        session.piggyback.is_some(),
+        session.piggyback.as_ref(),
     )
     .map_err(PlaylistError::Failed)?;
     session.map_binding.bound = plan.virtual_input.take();
@@ -4189,6 +4193,22 @@ fn wait_for_map_build(
     }
 }
 
+/// ADR-0041 Decision 7: append the exact subtitle side output for
+/// `piggyback`. The session's ffmpeg is already open on the file, so the
+/// rendition is a free side output; the HLS muxer writes WebVTT segments
+/// (`index{N}.vtt` + `index_vtt.m3u8`) into the run dir. The absolute input
+/// stream index was validated at session start, so this names one text stream
+/// and never a broad `0:s?` selector that could pull in image or unknown
+/// streams and fail the whole session. `-c:s webvtt` overrides the global
+/// `-c copy` in Copy mode for subtitle streams only. With no target this
+/// appends nothing: the session carries no WebVTT output.
+fn push_piggyback_map(cmd: &mut Command, piggyback: Option<&PiggybackExtract>) {
+    if let Some(extract) = piggyback {
+        let map = format!("0:{}", extract.stream_index);
+        cmd.args(["-map", map.as_str(), "-c:s", "webvtt"]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_ffmpeg(
     input: &StartPlan,
@@ -4198,7 +4218,7 @@ fn spawn_ffmpeg(
     encode_leg: &crate::EncodeLeg,
     burn_in: Option<&BurnInSelection>,
     encode_plan: VideoEncodePlan,
-    piggyback_subs: bool,
+    piggyback: Option<&PiggybackExtract>,
 ) -> Result<Child, String> {
     let start_ms = input.window_start_ms;
     let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
@@ -4384,16 +4404,7 @@ fn spawn_ffmpeg(
             push_audio_encode(&mut cmd, downmix.as_deref());
         }
     }
-    if piggyback_subs {
-        // ADR-0041 Decision 7: the session's ffmpeg is already open on the
-        // file, so the subtitle rendition is a free side output. The HLS
-        // muxer writes WebVTT segments (`index{N}.vtt` + `index_vtt.m3u8`)
-        // into the run dir; it accepts a single subtitle stream, which the
-        // caller's gate guarantees (an image/unknown stream or a second
-        // subtitle output fails the whole session). `-c:s webvtt` overrides
-        // the global `-c copy` in Copy mode for subtitle streams only.
-        cmd.args(["-map", "0:s?", "-c:s", "webvtt"]);
-    }
+    push_piggyback_map(&mut cmd, piggyback);
     cmd.args([
         "-f",
         "hls",
@@ -8822,7 +8833,7 @@ mod tests {
                 &crate::EncodeLeg::software(),
                 None,
                 plan,
-                false,
+                None,
             )
             .unwrap_or_else(|e| panic!("spawn tonemap session for {name}: {e}"));
             let deadline = Instant::now() + Duration::from_secs(45);
@@ -10203,6 +10214,47 @@ mod tests {
         );
     }
 
+    /// ADR-0041 Decision 7 containment: the side output names exactly the one
+    /// absolute input stream the Rust plan selected, and never a broad `0:s?`
+    /// selector. Model a mixed SRT + PGS + PGS + PGS inventory: the SRT wins
+    /// the selection and the image streams stay out of the WebVTT rendition.
+    /// A broad selector would pull them in and fail the whole session.
+    #[test]
+    fn piggyback_map_names_exactly_one_selected_stream() {
+        let inventory: [(u32, &str); 4] = [(2, "text"), (3, "image"), (4, "image"), (5, "image")];
+        let (selected, _) = *inventory
+            .iter()
+            .find(|(_, kind)| *kind == "text")
+            .expect("one text stream");
+        let extract = PiggybackExtract {
+            track_id: format!("e{selected}"),
+            stream_index: selected,
+        };
+        let mut cmd = Command::new("ffmpeg");
+        push_piggyback_map(&mut cmd, Some(&extract));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.as_slice(), ["-map", "0:2", "-c:s", "webvtt"]);
+        assert!(
+            !args.iter().any(|a| a == "0:s?"),
+            "broad subtitle selector must be absent: {args:?}"
+        );
+        for (index, kind) in inventory {
+            if kind == "image" {
+                assert!(
+                    !args.contains(&format!("0:{index}")),
+                    "image stream {index} must not be mapped: {args:?}"
+                );
+            }
+        }
+        // No target: no subtitle map at all.
+        let mut none = Command::new("ffmpeg");
+        push_piggyback_map(&mut none, None);
+        assert_eq!(none.get_args().count(), 0);
+    }
+
     /// ADR-0041 Decision 7 acceptance (remux and transcode): a session on an
     /// `eligible` item writes the subtitle WebVTT under `{subs}/{itemId}/`
     /// with no standalone extract job in the loop — the session's own ffmpeg
@@ -10252,6 +10304,7 @@ mod tests {
                     VideoEncodePlan::default(),
                     Some(PiggybackExtract {
                         track_id: track_id.clone(),
+                        stream_index: streams[0].stream_index,
                     }),
                 )
                 .unwrap();
@@ -10331,6 +10384,7 @@ mod tests {
             for piggyback in [
                 Some(PiggybackExtract {
                     track_id: track_id.clone(),
+                    stream_index: streams[0].stream_index,
                 }),
                 None,
             ] {
@@ -10442,6 +10496,7 @@ mod tests {
                 VideoEncodePlan::default(),
                 Some(PiggybackExtract {
                     track_id: track_id.clone(),
+                    stream_index: streams[0].stream_index,
                 }),
             )
             .unwrap();
@@ -10703,7 +10758,7 @@ mod tests {
             &leg,
             None,
             VideoEncodePlan::default(),
-            false,
+            None,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -11048,7 +11103,7 @@ mod tests {
                 &crate::EncodeLeg::software(),
                 None,
                 VideoEncodePlan::default(),
-                false,
+                None,
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);

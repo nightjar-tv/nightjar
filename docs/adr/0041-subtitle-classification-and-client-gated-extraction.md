@@ -119,10 +119,14 @@ waste:
    other paths (e.g. a title already fully extracted). `subtitle_progress_ms`
    was never shipped as a column for this path and is not added.
 
-7. **Piggyback on a session that starts near zero.** Add `-map 0:s?`
-   outputs to a remux/transcode session's ffmpeg invocation when it is
-   already running and the item is `eligible` — free bytes, since the
-   process is already open on the file (Decision 4). Opportunistic only:
+7. **Piggyback on a session that starts near zero.** Add one exact
+   `-map 0:{absolute_stream_index}` WebVTT output to a remux/transcode
+   session's ffmpeg invocation when it is already running, the item is
+   `eligible`, and exactly one embedded text/ASS track is eligible — free
+   bytes, since the process is already open on the file (Decision 4). Image,
+   unknown, and unselected subtitle streams are never mapped to WebVTT. If a
+   safe exact stream cannot be established, omit piggyback extraction; never
+   fall back to a broad optional subtitle map. Opportunistic only:
    ADR-0007 kills the process on seek and ADR-0023 sessions can start at an
    offset, so a piggybacked extract may yield a prefix rather than the
    complete file. A prefix is still useful (the extraction remains
