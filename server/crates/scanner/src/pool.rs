@@ -336,6 +336,27 @@ pub(crate) struct MapWalkHoldTest {
     pub release_tx: std::sync::mpsc::Sender<()>,
 }
 
+/// Test-only hold that parks an index pass at its `delete_missing` decision.
+/// The pass reports that it has built its keep-set and is about to read the
+/// hint marker, then parks until the test releases it, so a hint always lands
+/// while that pass is provably active and before it reads the marker.
+/// `#[cfg(test)]` only: a release build has no field, no arming method and no
+/// park site.
+#[cfg(test)]
+struct DeleteHold {
+    /// Worker → test: "this library's index pass reached its delete decision".
+    entered_tx: std::sync::mpsc::Sender<i64>,
+    /// Worker ← test: block here until the test sends the release.
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test half of [`DeleteHold`].
+#[cfg(test)]
+pub(crate) struct DeleteHoldTest {
+    pub entered_rx: std::sync::mpsc::Receiver<i64>,
+    pub release_tx: std::sync::mpsc::Sender<()>,
+}
+
 pub struct LibraryPool {
     db: Arc<Db>,
     subs: Arc<SubsStore>,
@@ -389,7 +410,42 @@ pub struct LibraryPool {
     /// build fails after its ffprobe succeeded.
     #[cfg(test)]
     probe_snapshot_fault: AtomicBool,
+    /// Test-only in-flight hold for an index pass's `delete_missing` decision
+    /// ([`DeleteHold`]).
+    #[cfg(test)]
+    delete_hold: Mutex<Option<DeleteHold>>,
     pub availability: Arc<Availability>,
+}
+
+/// Held across the database write a hint marker must be ordered against
+/// (ADR-0015 decision 5 / ADR-0014 §2).
+///
+/// One library's marker is read by a walk before its `delete_missing` and
+/// written by a hint before its upsert. Taking this guard makes that read and
+/// that write one critical section: the walk either sees the marker (and skips
+/// the delete) or reads its delete candidates before the hinted row exists.
+/// Both sides acquire it before any database work, so neither can hold the
+/// connection while waiting for it.
+pub struct DirtyAddGuard<'a> {
+    library_id: i64,
+    marker: std::sync::MutexGuard<'a, HashSet<i64>>,
+}
+
+impl DirtyAddGuard<'_> {
+    /// Whether this library's hint marker is currently set.
+    pub fn is_marked(&self) -> bool {
+        self.marker.contains(&self.library_id)
+    }
+
+    /// Set this library's hint marker.
+    pub fn mark(&mut self) {
+        self.marker.insert(self.library_id);
+    }
+
+    /// Clear this library's hint marker, reporting whether it was set.
+    pub fn take(&mut self) -> bool {
+        self.marker.remove(&self.library_id)
+    }
 }
 
 /// RAII permit for one process-wide index/walk epoch (ADR-0015).
@@ -441,6 +497,8 @@ impl LibraryPool {
             probe_hold: Mutex::new(None),
             #[cfg(test)]
             probe_snapshot_fault: AtomicBool::new(false),
+            #[cfg(test)]
+            delete_hold: Mutex::new(None),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -573,27 +631,28 @@ impl LibraryPool {
             .remove(&library_id)
     }
 
-    /// Hint upsert while a walk is active (ADR-0015 B′). Skips delete_missing
-    /// on that job only; does not schedule a follow-up walk.
-    pub fn mark_dirty_add(&self, library_id: i64) {
-        self.dirty_add
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(library_id);
+    /// Hold this library's hint marker across the database write it must be
+    /// ordered against: a hint's upsert on one side, a walk's `delete_missing`
+    /// on the other (ADR-0015 decision 5). Every marker read and write goes
+    /// through this guard, so there is one implementation of the marker.
+    pub fn dirty_add_guard(&self, library_id: i64) -> DirtyAddGuard<'_> {
+        DirtyAddGuard {
+            library_id,
+            marker: self.dirty_add.lock().unwrap_or_else(|e| e.into_inner()),
+        }
     }
 
+    /// Hint dirt recorded for a library: a walk that starts now must skip
+    /// `delete_missing` (ADR-0015 B′). Setting it does not schedule a
+    /// follow-up walk; the caller marks it through [`Self::dirty_add_guard`]
+    /// so the mark and its upsert are one critical section.
     pub fn is_dirty_add(&self, library_id: i64) -> bool {
-        self.dirty_add
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&library_id)
+        self.dirty_add_guard(library_id).is_marked()
     }
 
+    /// Clear a library's hint dirt, reporting whether it was set.
     pub fn take_dirty_add(&self, library_id: i64) -> bool {
-        self.dirty_add
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&library_id)
+        self.dirty_add_guard(library_id).take()
     }
 
     /// Arm poll holdoff after repoint deferred deletes (default 1 h in product).
@@ -1009,6 +1068,46 @@ impl LibraryPool {
         self.probe_snapshot_fault.store(true, Ordering::SeqCst);
     }
 
+    /// Arm the test-only hold for the next index pass's `delete_missing`
+    /// decision on this pool and return its test half ([`DeleteHoldTest`]). The
+    /// test waits on `entered_rx` for the pass to report, runs the hint it wants
+    /// to observe, then sends on `release_tx`. Passes that reach the decision
+    /// while no hold is armed pass through untouched.
+    #[cfg(test)]
+    pub(crate) fn arm_delete_hold(&self) -> DeleteHoldTest {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.delete_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeleteHold {
+            entered_tx,
+            release_rx,
+        });
+        DeleteHoldTest {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    /// Park the index pass at its `delete_missing` decision when a hold is
+    /// armed. Consumes the armed hold, so **exactly one** pass per arm parks and
+    /// every later pass passes through. A test that gave up before the pass
+    /// arrived (dropped its half) unparks the worker immediately via the
+    /// channel error.
+    #[cfg(test)]
+    pub(crate) fn hold_delete_if_armed(&self, library_id: i64) {
+        let handle = self
+            .delete_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if handle.entered_tx.send(library_id).is_err() {
+            return;
+        }
+        let _ = handle.release_rx.recv();
+    }
+
     /// Physical probe executions observed by this pool. In production each one
     /// is one ffprobe child, so this is the instrument that proves joined
     /// demands share a child.
@@ -1350,8 +1449,17 @@ impl LibraryPool {
                 // nothing starts, and every joined demand still completes.
                 ProbeBegin::Skip => ProbeAccounting::None,
             };
-            self.complete_probe_run(&slot, accounting);
-            if !self.promote_probe_successor(&slot) {
+            // Detach this run's demands, hand the slot on (successor) or
+            // release it, and only then release the demands' completion
+            // barriers. A caller that observes a batch as complete therefore
+            // also observes the slot gone: the slot map never outlives the
+            // barrier of the run it belonged to.
+            let waiters = self.complete_probe_run(&slot, accounting);
+            let promoted = self.promote_probe_successor(&slot);
+            for waiter in waiters {
+                self.finish_probe_waiter(waiter, accounting);
+            }
+            if !promoted {
                 return;
             }
         }
@@ -1515,19 +1623,22 @@ impl LibraryPool {
         }
     }
 
-    /// Classify once and apply the class to every demand joined to the run
-    /// (ADR-0058). A demand that arrives while the class is applied is
-    /// completed with it by [`Self::join_probe_slot`].
-    fn complete_probe_run(&self, slot: &Arc<ProbeSlot>, accounting: ProbeAccounting) {
-        let waiters = {
-            let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.phase = ProbePhase::Promoting;
-            st.last_accounting = Some(accounting);
-            std::mem::take(&mut st.current.waiters)
-        };
-        for waiter in waiters {
-            self.finish_probe_waiter(waiter, accounting);
-        }
+    /// Classify the finished run once and detach every demand joined to it
+    /// (ADR-0058). The slot moves to `Promoting`, so a demand that arrives
+    /// during the hand-off is completed with the same class by
+    /// [`Self::join_probe_slot`] rather than left waiting or starting another
+    /// child. The caller releases the returned demands **after** the slot has
+    /// been handed on or removed, so a caller that observes a batch as complete
+    /// also observes the slot gone.
+    fn complete_probe_run(
+        &self,
+        slot: &Arc<ProbeSlot>,
+        accounting: ProbeAccounting,
+    ) -> Vec<ProbeWaiter> {
+        let mut st = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.phase = ProbePhase::Promoting;
+        st.last_accounting = Some(accounting);
+        std::mem::take(&mut st.current.waiters)
     }
 
     /// Start the one desired successor, or release the slot. Returns whether
