@@ -124,6 +124,36 @@ pub fn walk_media_files_cached_with_concurrency(
     }
 }
 
+/// Walk `root` re-listing every directory, ignoring the per-directory mtime
+/// cache, and replace `cache` with the fresh listing.
+///
+/// An explicit manual scan uses this. The operator asked for a scan, so the
+/// walk must observe the tree as it is now even where a directory's mtime did
+/// not move: an in-place file edit leaves the parent mtime alone, so the cached
+/// path would never re-read that file. The refreshed cache keeps the next
+/// automatic poll warm (ADR-0015).
+///
+/// `relisted_dirs` keeps the warm-walk meaning — the directories whose mtime
+/// moved or whose cached listing was incomplete. Sidecar rediscovery keys off
+/// that set, so a manual scan revisits only directories that changed instead of
+/// re-paying a readdir for the whole library.
+pub fn walk_media_files_fresh(root: &Path, cache: &mut WalkCache) -> Result<WalkOutcome, String> {
+    let prev = cache.dirs.clone();
+    let mut fresh = WalkCache::new();
+    let mut outcome = walk_media_files_cached(root, Some(&mut fresh))?;
+    outcome.relisted_dirs = fresh
+        .dirs
+        .iter()
+        .filter(|(dir, entry)| match prev.get(*dir) {
+            Some(prior) => prior.incomplete || prior.mtime_ms != entry.mtime_ms,
+            None => true,
+        })
+        .map(|(dir, _)| dir.clone())
+        .collect();
+    *cache = fresh;
+    Ok(outcome)
+}
+
 fn walk_serial(root: &Path, mut cache: Option<&mut WalkCache>) -> Result<WalkOutcome, String> {
     let mut out = Vec::new();
     let mut relisted_dirs = HashSet::new();
@@ -506,6 +536,66 @@ mod tests {
             !third.relisted_dirs.contains(root.path()),
             "unchanged ancestors must not be re-listed"
         );
+    }
+
+    /// SCAN-D2A: an in-place edit keeps the parent directory mtime, so the
+    /// cached walk never re-reads the file. A fresh walk must re-list anyway
+    /// and report the new size, and it must leave the cache warm for the next
+    /// automatic pass. The parent mtime is restored explicitly so the scenario
+    /// holds on filesystems that do bump it on a content write.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_walk_relist_unchanged_dir_and_sees_in_place_edit() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("clip.mp4");
+        File::create(&file).unwrap();
+
+        let mut cache = WalkCache::new();
+        let first =
+            walk_media_files_cached_with_concurrency(root.path(), Some(&mut cache), 1).unwrap();
+        assert_eq!(first.files.len(), 1);
+        assert_eq!(first.files[0].size_bytes, 0, "empty file is zero bytes");
+
+        let dir_mtime = fs::metadata(root.path()).unwrap().modified().unwrap();
+        thread::sleep(Duration::from_millis(1100));
+        fs::write(&file, b"longer content").unwrap();
+        File::open(root.path())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(dir_mtime))
+            .unwrap();
+
+        // Cached walk: parent mtime unchanged, so the stale listing is reused.
+        let cached =
+            walk_media_files_cached_with_concurrency(root.path(), Some(&mut cache), 1).unwrap();
+        assert!(
+            cached.relisted_dirs.is_empty(),
+            "unchanged parent mtime must reuse the cached listing"
+        );
+        assert_eq!(cached.files[0].size_bytes, 0, "cached listing stays stale");
+
+        // Fresh walk: re-lists the directory and reports the new size. The
+        // parent mtime did not move, so `relisted_dirs` stays empty — that set
+        // only drives sidecar rediscovery, which the media change already
+        // handles through the index flush.
+        let fresh = walk_media_files_fresh(root.path(), &mut cache).unwrap();
+        assert!(
+            fresh.relisted_dirs.is_empty(),
+            "an unchanged parent mtime is not a sidecar-rediscovery trigger"
+        );
+        assert_eq!(
+            fresh.files[0].size_bytes,
+            fs::metadata(&file).unwrap().len() as i64,
+            "fresh walk must observe the in-place edit"
+        );
+
+        // The fresh listing replaced the cache, so the next cached walk is warm.
+        let after =
+            walk_media_files_cached_with_concurrency(root.path(), Some(&mut cache), 1).unwrap();
+        assert!(
+            after.relisted_dirs.is_empty(),
+            "the fresh listing must leave the cache warm"
+        );
+        assert_eq!(after.files[0].size_bytes, fresh.files[0].size_bytes);
     }
 
     /// R4 storage bounds (SCAN-D1): a listing that lost an entry to a stat
