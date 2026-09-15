@@ -1203,15 +1203,16 @@ fn run_index_pass(
             tracing::warn!(error = %e, "subtitle orphan cleanup failed");
         }
 
-        // Rediscover sidecars beside unchanged media when the parent was
-        // re-listed (new .srt bumps dir mtime). The cold-cache skip is the
-        // automatic-poll rule (ADR-0013 §3): a cold cache would mark every dir
-        // relisted and re-pay ~20 min of SMB readdir, and existing sidecar rows
-        // stay in the DB across restarts. It does not apply to a fresh/manual
-        // scan the operator asked for (ADR-0013 amendment): after a restart
-        // that path must reconcile supported sidecars for unchanged media, and
-        // the shared `sidecar_dirs` cache keeps siblings to one listing. This
-        // adds no per-item listing and no automatic-poll policy change.
+        // Rediscover sidecars beside media whose parent the walk re-listed.
+        // The automatic poll re-lists only a directory whose mtime moved (a new
+        // .srt bumps it), and a cold cache skips the bulk pass so it does not
+        // re-pay ~20 min of SMB readdir; existing sidecar rows stay in the DB
+        // across restarts. A fresh/manual scan the operator asked for re-lists
+        // every directory, so `relisted_dirs` holds each one and this path
+        // reconciles supported sidecars for unchanged media too (ADR-0013 §3.5
+        // amendment). The shared `sidecar_dirs` cache keeps siblings to one
+        // listing: no per-item directory listing and no automatic-poll policy
+        // change.
         let mut sidecar_checked = 0u32;
         if (cache_warm || fresh) && allow_delete {
             for file in &files {
@@ -1811,6 +1812,125 @@ mod tests {
         let changed = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
         assert_eq!(changed.sidecar_generation, Some(2));
         assert_ne!(changed.content_id, first.content_id);
+    }
+
+    /// D2B.1 relist gap: a manual scan must reconcile sidecars for every
+    /// directory it re-listed, not only the ones whose mtime moved. The pool's
+    /// walk cache is warm from the first scan, and every edit below restores
+    /// both parent directory mtimes, so only the fresh walk's relist can
+    /// surface the change.
+    ///
+    /// One pass covers the four cases plan step 1 names: in-place edit, add,
+    /// remove, and a nested `Subs/` change. The unchanged sidecar proves the
+    /// pass leaves a row it did not need to touch alone.
+    #[cfg(unix)]
+    #[test]
+    fn manual_scan_with_warm_cache_reconciles_edited_added_removed_and_nested_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let subs = media.join("Subs");
+        fs::create_dir_all(&subs).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+        let edited = media.join("Movie.en.srt");
+        fs::write(&edited, b"1\n00:00:00,000 --> 00:00:01,000\nHi\n").unwrap();
+        let removed = media.join("Movie.es.srt");
+        fs::write(&removed, b"1\n00:00:00,000 --> 00:00:01,000\nHola\n").unwrap();
+        let nested_edited = subs.join("Movie.fr.srt");
+        fs::write(&nested_edited, b"1\n00:00:00,000 --> 00:00:01,000\nSalut\n").unwrap();
+        fs::write(
+            media.join("Movie.de.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nHallo\n",
+        )
+        .unwrap();
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        wait_job(
+            &db,
+            start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap(),
+        );
+        let item_id = db.list_items(lib.id).unwrap()[0].id;
+        assert_eq!(
+            db.list_item_sidecars(item_id).unwrap().len(),
+            4,
+            "setup: four sidecars associated"
+        );
+        let untouched_before = db.get_item_sidecar(item_id, "s-de").unwrap().unwrap();
+        let untouched_generation = untouched_before.sidecar_generation.unwrap();
+
+        // Mutate with both parent directory mtimes restored, so nothing but the
+        // fresh relist can surface the change.
+        let media_mtime = fs::metadata(&media).unwrap().modified().unwrap();
+        let subs_mtime = fs::metadata(&subs).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(&edited, b"1\n00:00:00,000 --> 00:00:02,000\nYo\n").unwrap();
+        fs::remove_file(&removed).unwrap();
+        fs::write(
+            media.join("Movie.it.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nCiao\n",
+        )
+        .unwrap();
+        fs::write(
+            &nested_edited,
+            b"1\n00:00:00,000 --> 00:00:02,000\nBonjour\n",
+        )
+        .unwrap();
+        fs::write(
+            subs.join("Movie.nl.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nHoi\n",
+        )
+        .unwrap();
+        fs::File::open(&media)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(media_mtime))
+            .unwrap();
+        fs::File::open(&subs)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(subs_mtime))
+            .unwrap();
+
+        // The second scan reuses the first scan's warm walk cache.
+        wait_job(
+            &db,
+            start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap(),
+        );
+
+        let mut rows: Vec<(String, i64)> = db
+            .list_item_sidecars(item_id)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.track_id, s.sidecar_generation.expect("generation")))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["s-Subs.fr", "s-Subs.nl", "s-de", "s-en", "s-it"],
+            "one manual scan must produce the exact current track set"
+        );
+        let generation_of = |want: &str| rows.iter().find(|(id, _)| id == want).unwrap().1;
+        for changed in ["s-en", "s-Subs.fr", "s-it", "s-Subs.nl"] {
+            assert!(
+                generation_of(changed) > untouched_generation,
+                "{changed} must receive a new generation"
+            );
+        }
+        assert_eq!(
+            db.get_item_sidecar(item_id, "s-de").unwrap().unwrap(),
+            untouched_before,
+            "an unchanged sidecar keeps its row and generation"
+        );
+        assert!(
+            db.get_item_sidecar(item_id, "s-es").unwrap().is_none(),
+            "a removed sidecar leaves no row"
+        );
     }
 
     #[test]
