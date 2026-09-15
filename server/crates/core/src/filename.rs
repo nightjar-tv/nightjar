@@ -2283,6 +2283,8 @@ fn claimed_kind(otherwise: MediaKind, absolute: Option<i32>) -> MediaKind {
     }
 }
 
+// CONTROL RUN — comment only, no behaviour. Delete with this branch.
+
 /// Strip a file extension, and only a file extension.
 ///
 /// **A release name is not a filename.** Cutting at the last dot whatever
