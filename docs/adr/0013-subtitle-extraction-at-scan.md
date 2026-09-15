@@ -3,11 +3,13 @@
 - Status: accepted; **§1 and §2 superseded 2026-08-06 by
   [ADR-0041](0041-subtitle-classification-and-client-gated-extraction.md)**
   (probe-time classification and client/method-gated on-demand trigger,
-  replacing the unconditional scan-time enqueue below). §3–§12 stand, with
+  replacing the unconditional scan-time enqueue below). §3–§13 stand, with
   one exception marked in place: **§4's mtime/size validity stamps are
   superseded by [ADR-0023](0023-cluster-map-byte-offset-start.md) §6**
   (columns dropped in migration `019`; `subtitle_content_id` is the sole
-  stamp). Marker added 2026-08-30.
+  stamp). Marker added 2026-08-30. **§13 added 2026-09-15 (D2B.2 standalone
+  immutable artifact contract); §13.2–§13.5 amended 2026-09-15 to add the
+  per-item artifact-revision candidate layout and finalize-without-overwrite.**
 - Date: 2026-07-26
 - Supersedes: ADR-0010 §7 (byte-capped subtitle cache and playback-time extract)
 
@@ -410,6 +412,145 @@ longer runs.
     across startMs so rapid seeked events are not swallowed. Full
     rapid-scrub soak of inject under chaotic encode restarts remains a
     separate dogfood check from land-accuracy verify.
+
+13. **Standalone immutable subtitle artifacts (D2B.2).** This section fixes
+    the contract that D2B.2 implements and D2B.3 extends. It composes the
+    [ADR-0058](0058-revision-safe-probe-snapshots.md) coherent probe snapshot
+    with the [ADR-0010](0010-text-subs-webvtt.md) §4 serveable sidecar
+    membership and generations. It does not adopt
+    [ADR-0042](0042-derived-artifact-versioning-and-reconciliation.md)
+    wholesale: there is no second fingerprint, no history table, no eager
+    backfill, and no playback-time probe.
+
+    1. **Per-track identity and the bounded generation token.** An artifact
+       belongs to exactly one track. The URL is
+       `GET /api/v0/items/{itemId}/subtitles/{trackId}.vtt?g={token}`. The
+       server mints `g`; clients treat it as opaque and never construct it.
+       The token is versioned and bounded by this grammar:
+
+       ```text
+       token := "v1" "-m" media_rev "-p" probe_rev [ "-s" sidecar_gen ]
+       rev   := "0" | [1-9][0-9]*     (unsigned decimal, no leading zero)
+       ```
+
+       - `media_rev` and `probe_rev` are the ADR-0058 revisions of the
+         certified snapshot.
+       - `sidecar_gen` is present only for a sidecar track, and is that
+         track's own ADR-0010 §4 durable generation. It is never the
+         complete sidecar set, and no other track id enters the token.
+       - The token is at most 65 ASCII bytes and matches `[a-z0-9-]`. It is
+         validated by grammar before it is used as a path segment or
+         compared. Embedded tracks of one certified snapshot share a token;
+         sidecar tracks differ when their generations differ.
+
+    2. **On-disk layout and artifact revision.** The immutable artifact for
+       `(itemId, trackId, token)` is
+       `{NIGHTJAR_DATA_DIR}/subs/{itemId}/{token}/{trackId}.r{artifactRevision}.vtt`.
+       `artifactRevision` is a positive decimal integer allocated
+       monotonically per item by the DB from
+       `media_items.subtitle_artifact_sequence`. Allocation reserves a
+       candidate identity; it does not publish readiness. The filename is
+       resolved exclusively from the committed publication row of §13.4, so
+       no caller constructs it. The token is the only source-derived path
+       component; track ids keep their ADR-0010 shape. A candidate is
+       finalized without overwrite: an attempt never renames over an
+       existing final artifact. A generation directory is immutable once
+       complete: no later attempt overwrites its bytes, and a different
+       generation is a different directory. For D2B.2 artifacts this
+       replaces the mutable §4 path `subs/{itemId}/{trackId}.vtt`.
+
+    3. **Publication.** For one captured certified source, the worker:
+
+       1. captures item, media, probe, and track revisions and, for a
+          sidecar, its generation;
+       2. validates embedded and sidecar source identity before extraction,
+          after extraction, and before final publication;
+       3. reserves an `artifact_revision` of §13.2, writes a complete
+          artifact to a temporary file, fsyncs the file, finalizes it into
+          the generation directory without overwriting an existing final
+          artifact, then fsyncs every newly created ancestor directory entry
+          — the generation directory and the item directory — before any DB
+          publication;
+       4. publishes readiness and the URL through one DB compare-and-swap
+          that commits the reserved `artifact_revision` and requires the
+          captured certification, membership, revisions, and generation
+          still to match.
+
+       A CAS mismatch, or a source identity check that fails, preserves the
+       old committed reference and bytes and leaves only the temporary or
+       finalized candidate bytes unreferenced. A finalized but uncommitted
+       artifact is an orphan: it is never partial or servable, including
+       after restart.
+
+    4. **Committed per-track publication reference.** Serving requires a
+       committed per-track publication reference for the requested
+       `(itemId, trackId, token)` that matches the current coherent
+       certification and membership. The reference is one row keyed by
+       `(itemId, trackId, token)`, written only by the source CAS of
+       §13.3.4. It records the captured certification `content_id`, the media
+       and probe revisions, the track's own sidecar generation when it has
+       one, the allocated `artifact_revision` of §13.2, the per-track
+       `revision` of §11, and the partial/complete state. The CAS commits the
+       row to that exact `artifact_revision`; `revision` remains the
+       client-visible update counter. A listed track that has no such
+       committed reference is never given a URL, and readiness is never
+       inferred from a file on disk.
+
+       `partial` and `complete` are keyed by that same identity and become
+       visible only through the committed reference. A `partial` row is
+       written by a progressive publication that passed the source CAS; a
+       `complete` row is written per track, only after that track's extraction
+       reached successful EOF. A cancelled or failed embedded demux may
+       salvage the cues it already flushed only as `partial`, and must still
+       report the cancellation or unavailability. The coarse item-level
+       `subtitle_status` becomes `ready` only after every serveable track of
+       the captured source is durable. Complete immutable bytes are never
+       overwritten by another attempt: a run skips a track whose complete
+       reference already exists for the token, so one sidecar edit cannot
+       re-demux or overwrite an unrelated track under its unchanged URL. A
+       partial-to-complete transition may reference the identical finalized
+       bytes and must not rewrite them. A failure, `none`, or `partial` write
+       from stale work cannot mutate newer subtitle state.
+
+       The item-level `subtitle_status` keeps its §6 meaning as the coarse
+       preparing/lifecycle field. It is not the serving gate, and
+       reconciliation does not clear it item-wide: only the affected per-track
+       references are invalidated, so unchanged rows and their committed
+       artifacts remain serveable.
+
+    5. **Progressive output.** A growing sidecar VTT is published under the
+       same captured source checks and the same CAS as the complete
+       artifact. Each progressive publication is keyed by the complete
+       per-track generation identity. Every changed partial or complete body
+       reserves its own `artifact_revision`, validates the source before and
+       after conversion, finalizes without overwrite, and CASes the
+       publication to that exact revision. A CAS or fault failure preserves
+       the old reference and bytes and leaves only an unreferenced
+       candidate. Stale progressive work is rejected by the CAS and cannot
+       become ready for a newer generation.
+
+    6. **Single-flight.** Combined-generation single-flight identity includes
+       the captured source generations. A work item executes only the
+       generation it captured; it cannot silently re-read and execute as
+       another generation. When a newer generation arrives during older
+       work, the newer demand is preserved as a successor and runs after
+       the older item.
+
+    7. **Serving and stale URLs.** A request is served only when it names a
+       current certified member at matching generations. A stale URL, or a
+       URL whose generation no longer matches the current token, is rejected
+       on cache miss even if cleanup has not run. Old artifacts are not
+       served after restart.
+
+    8. **D2B.3 gating, bounds, and API.** Until D2B.3, piggyback and
+       HLS/session subtitle writers fail closed for subtitle publication.
+       They cannot expose legacy mutable artifacts through this contract.
+       AV playback remains available, and the exact D2C mapping is
+       preserved. The existing global extraction and conversion limits
+       stand. No automatic polling change, per-item relisting, playback
+       probe or retry, piggyback migration, or cleanup dependency is
+       introduced. `g` is a required opaque query parameter documented in
+       the OpenAPI spec.
 
 ## Consequences
 

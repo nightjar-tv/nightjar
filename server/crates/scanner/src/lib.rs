@@ -1371,6 +1371,168 @@ mod tests {
         LibraryPool::spawn(Arc::clone(db), subs)
     }
 
+    /// An `ObservedSidecar` whose mtime/size come from the file on disk, so the
+    /// D2B.2 before/after recheck matches the captured tuple.
+    fn observed_sidecar(
+        abs: &Path,
+        relpath: &str,
+        track_id: &str,
+        format: &str,
+    ) -> nightjar_db::ObservedSidecar {
+        let meta = fs::metadata(abs).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        nightjar_db::ObservedSidecar {
+            track_id: track_id.to_string(),
+            path: relpath.to_string(),
+            mtime_ms,
+            size_bytes: meta.len() as i64,
+            format: format.to_string(),
+            language: Some("en".to_string()),
+            forced: false,
+            sdh: false,
+            content_id: format!("{}-disk", meta.len()),
+        }
+    }
+
+    /// Publish a certified probe snapshot (ADR-0058) so a D2B.2 standalone
+    /// extract has a certified source. `subtitle_streams` are
+    /// `(stream_index, codec)`; the snapshot classifies the item `eligible`.
+    ///
+    /// The item row's `mtime_ms`/`size_bytes` are aligned to the file on disk
+    /// first, because D2B.2 rechecks the captured media identity before
+    /// extraction and before final publication (ADR-0013 §13.3.2).
+    fn certify_item(db: &Arc<Db>, item_id: i64, subtitle_streams: &[(i64, &str)]) {
+        let row = db.get_item(item_id).unwrap().expect("item row");
+        let lib = db.get_library(row.library_id).unwrap().expect("library");
+        let abs = nightjar_db::resolve_media_path(&lib.path, &row.path);
+        let (mtime_ms, size_bytes) = match fs::metadata(&abs) {
+            Ok(meta) => {
+                let mtime_ms = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                (mtime_ms, meta.len() as i64)
+            }
+            // A fixture whose media file is absent on purpose keeps the row's
+            // tuple; the extract then reports the access failure itself.
+            Err(_) => (row.mtime_ms, row.size_bytes),
+        };
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_items SET mtime_ms = ?2, size_bytes = ?3 WHERE id = ?1",
+                [item_id, mtime_ms, size_bytes],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let row = db.get_item(item_id).unwrap().expect("item row");
+        let content_id = format!("{}-{}-cert", row.size_bytes, row.mtime_ms);
+        db.set_content_id(item_id, &content_id).unwrap();
+        let expectation = nightjar_db::ProbeExpectation {
+            item_id,
+            library_id: row.library_id,
+            library_root: lib.path.clone(),
+            path: row.path.clone(),
+            media_revision: row.media_revision,
+            probe_revision: row.probe_revision,
+            content_id: Some(content_id),
+            mtime_ms: row.mtime_ms,
+            size_bytes: row.size_bytes,
+        };
+        let subtitle_tracks = subtitle_streams
+            .iter()
+            .map(|(stream_index, codec)| nightjar_db::SubtitleTrackRow {
+                media_item_id: item_id,
+                stream_index: *stream_index,
+                codec: (*codec).to_string(),
+                language: None,
+                title: None,
+                forced: false,
+                sdh: false,
+                kind: nightjar_transcode::subtitle_codec_kind(codec)
+                    .as_str()
+                    .to_string(),
+            })
+            .collect();
+        let snapshot = nightjar_db::ProbeSnapshot {
+            duration_ms: Some(4000),
+            container: Some("mkv".into()),
+            video_codec: Some("h264".into()),
+            video_stream_index: Some(0),
+            audio_codec: Some("aac".into()),
+            audio_channels: Some(2),
+            width: Some(160),
+            height: Some(120),
+            video_bitrate_bps: None,
+            video_frame_rate_num: Some(10),
+            video_frame_rate_den: Some(1),
+            hdr: None,
+            audio_tracks: vec![],
+            subtitle_tracks,
+            subtitle_status: "eligible".into(),
+        };
+        let publication = db
+            .publish_probe(
+                &expectation,
+                &nightjar_db::ProbeOutcome::Success(Box::new(snapshot)),
+            )
+            .unwrap();
+        assert!(
+            matches!(publication, nightjar_db::ProbePublication::Published { .. }),
+            "test fixture probe must certify, got {publication:?}"
+        );
+    }
+
+    /// The finalized artifact path of one track, resolved from the committed
+    /// publication row exactly the way serving resolves it (ADR-0013 §13.2).
+    fn committed_artifact_path(
+        db: &Arc<Db>,
+        store: &SubsStore,
+        item_id: i64,
+        track_id: &str,
+    ) -> PathBuf {
+        let source = db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        let token = source.token_for_track(track_id).expect("member token");
+        let artifact = source
+            .artifact_for(track_id)
+            .expect("committed publication reference");
+        store.artifact_path(item_id, &token, track_id, artifact.artifact_revision)
+    }
+
+    /// `subtitle_attempt_count` straight from the row, so a test can prove a
+    /// deferral consumed no failure backoff.
+    fn subtitle_attempt_count(db: &Arc<Db>, item_id: i64) -> i64 {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT subtitle_attempt_count FROM media_items WHERE id = ?1",
+                [item_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    /// `(stream_index, codec)` pairs for the text subtitle streams of a file.
+    fn text_streams(path: &Path) -> Vec<(i64, &'static str)> {
+        nightjar_transcode::list_text_subtitles(path)
+            .unwrap()
+            .into_iter()
+            .map(|s| (i64::from(s.stream_index), "subrip"))
+            .collect()
+    }
+
     #[test]
     fn index_pass_lists_before_probe_and_broken_moov_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -1980,23 +2142,24 @@ mod tests {
         let item_id = ids[0];
         db.reconcile_item_sidecars(
             item_id,
-            &[nightjar_db::ObservedSidecar {
-                track_id: "s-en".into(),
-                path: "Movie.en.srt".into(),
-                mtime_ms: 1,
-                size_bytes: 39,
-                format: "srt".into(),
-                language: Some("en".into()),
-                forced: false,
-                sdh: false,
-                content_id: "39-first-last".into(),
-            }],
+            &[observed_sidecar(
+                &media.join("Movie.en.srt"),
+                "Movie.en.srt",
+                "s-en",
+                "srt",
+            )],
         )
         .unwrap();
+        certify_item(&db, item_id, &[]);
         db.set_subtitle_status(item_id, "eligible").unwrap();
 
         fs::set_permissions(&subs_root, fs::Permissions::from_mode(0o500)).unwrap();
-        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video.clone()));
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            video.clone(),
+            None,
+        ));
 
         let mut status = String::new();
         for _ in 0..200 {
@@ -2014,7 +2177,7 @@ mod tests {
 
         // Recovery: the same item extracts once the volume is writable.
         db.set_subtitle_status(item_id, "eligible").unwrap();
-        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video));
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video, None));
         let mut ready = false;
         for _ in 0..200 {
             if db.get_item(item_id).unwrap().unwrap().subtitle_status == "ready" {
@@ -2081,6 +2244,11 @@ mod tests {
             )
             .unwrap();
         let item_id = ids[0];
+        certify_item(
+            &db,
+            item_id,
+            &text_streams(&media.join("h264_aac_srt_mkv.mkv")),
+        );
         db.set_subtitle_status(item_id, "eligible").unwrap();
 
         // The item dir exists but is read-only, so the failure is the child's
@@ -2089,7 +2257,12 @@ mod tests {
         fs::create_dir_all(&item_dir).unwrap();
         fs::set_permissions(&item_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, media.join("x")));
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            media.join("x"),
+            None,
+        ));
         let mut status = String::new();
         for _ in 0..200 {
             status = db.get_item(item_id).unwrap().unwrap().subtitle_status;
@@ -2106,7 +2279,12 @@ mod tests {
 
         // Recovery: the same item extracts once the dir is writable.
         db.set_subtitle_status(item_id, "eligible").unwrap();
-        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, media.join("x")));
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            media.join("x"),
+            None,
+        ));
         let mut ready = false;
         for _ in 0..400 {
             if db.get_item(item_id).unwrap().unwrap().subtitle_status == "ready" {
@@ -2190,6 +2368,7 @@ mod tests {
                 item.id,
                 lib.id,
                 PathBuf::from(&item.path),
+                None,
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3754,12 +3933,14 @@ mod tests {
             }],
         )
         .unwrap();
+        certify_item(&db, item_id, &[]);
         db.set_subtitle_status(item_id, "eligible").unwrap();
 
         pool.enqueue(pool::WorkItem::extract(
             item_id,
             lib.id,
             media.join("Video.mp4"),
+            None,
         ));
 
         let mut status = String::new();
@@ -3839,7 +4020,12 @@ mod tests {
 
         // On-demand extract (the ADR-0013 §11 path step 3 gates): the sidecar
         // converts in-process and the item flips to ready.
-        pool.enqueue(pool::WorkItem::extract(item.id, lib.id, video.clone()));
+        pool.enqueue(pool::WorkItem::extract(
+            item.id,
+            lib.id,
+            video.clone(),
+            None,
+        ));
         let mut ready = false;
         for _ in 0..200 {
             if db.get_item(item.id).unwrap().unwrap().subtitle_status == "ready" {
@@ -3850,12 +4036,13 @@ mod tests {
         }
         assert!(ready, "sidecar extract never reached ready");
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let artifact = committed_artifact_path(&db, &store, item.id, "s-en");
         assert!(
-            store.has_vtt(item.id, "s-en"),
+            artifact.is_file(),
             "sidecar webvtt missing under {}",
-            store.vtt_path(item.id, "s-en").display()
+            artifact.display()
         );
-        let body = fs::read_to_string(store.vtt_path(item.id, "s-en")).unwrap();
+        let body = fs::read_to_string(&artifact).unwrap();
         assert!(body.contains("WEBVTT"), "not webvtt: {body}");
 
         // Source video never opened: a fake "video" + sidecar still converts
@@ -3883,20 +4070,23 @@ mod tests {
             fake.id,
             lib.id,
             media.join("Fake.mp4"),
+            None,
         ));
         let mut fake_ready = false;
-        for _ in 0..200 {
+        for _ in 0..20 {
             if db.get_item(fake.id).unwrap().unwrap().subtitle_status == "ready" {
                 fake_ready = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        // D2B.2 acceptance 1: a failed probe leaves the source uncertified, so
+        // the extract defers. The item is not marked ready and nothing is
+        // published; AV playback is unaffected.
         assert!(
-            fake_ready,
-            "sidecar must convert without reading the fake source video"
+            !fake_ready,
+            "an uncertified source must defer, never publish"
         );
-        assert!(store.has_vtt(fake.id, "s-en"));
     }
 
     /// ≥3 embedded text tracks including one unrecognised codec → all rows
@@ -4061,6 +4251,11 @@ mod tests {
             })
             .collect();
         let ids = db.upsert_items_indexed(lib.id, &items).unwrap();
+        // A certified source with one embedded text stream: the junk fixtures
+        // make the extract fail, which is what these gate tests exercise.
+        for id in &ids {
+            certify_item(&db, *id, &[(2, "subrip")]);
+        }
         (db, pool, lib, ids)
     }
 
@@ -4107,7 +4302,12 @@ mod tests {
 
         // Hold the gate exactly as an in-flight reader would.
         let _gate = pool.bulk_reader.lock().unwrap();
-        pool.enqueue(crate::pool::WorkItem::extract(ids[0], lib.id, a.clone()));
+        pool.enqueue(crate::pool::WorkItem::extract(
+            ids[0],
+            lib.id,
+            a.clone(),
+            None,
+        ));
         pool.enqueue_map_rebuild(ids[1], lib.id, b.clone());
         std::thread::sleep(std::time::Duration::from_millis(250));
 
@@ -4147,7 +4347,12 @@ mod tests {
         let b = media.join("B.mp4");
 
         let _epoch = pool.enter_index_epoch(lib.id);
-        pool.enqueue(crate::pool::WorkItem::extract(ids[0], lib.id, a.clone()));
+        pool.enqueue(crate::pool::WorkItem::extract(
+            ids[0],
+            lib.id,
+            a.clone(),
+            None,
+        ));
         pool.enqueue_map_rebuild(ids[1], lib.id, b.clone());
         std::thread::sleep(std::time::Duration::from_millis(250));
 
@@ -4220,11 +4425,14 @@ mod tests {
             )
             .unwrap();
         let item_id = ids[0];
+        certify_item(&db, item_id, &text_streams(&stored));
 
-        pool.enqueue(crate::pool::WorkItem::extract(item_id, lib.id, stored));
+        pool.enqueue(crate::pool::WorkItem::extract(
+            item_id, lib.id, stored, None,
+        ));
         for _ in 0..400 {
             let row = db.get_item(item_id).unwrap().unwrap();
-            if row.subtitle_status != "pending" {
+            if row.subtitle_status == "ready" {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -4327,8 +4535,9 @@ mod tests {
             )
             .unwrap();
         let item_id = ids[0];
+        certify_item(&db, item_id, &text_streams(&mkv));
 
-        pool.enqueue(crate::pool::WorkItem::extract(item_id, lib.id, mkv));
+        pool.enqueue(crate::pool::WorkItem::extract(item_id, lib.id, mkv, None));
         // Wait until the worker has popped the extract: it is now in flight.
         for _ in 0..400 {
             if pool.background_progress().queued_extracts == 0 {
@@ -4346,7 +4555,7 @@ mod tests {
             .unwrap();
         for _ in 0..400 {
             let row = db.get_item(item_id).unwrap().unwrap();
-            if row.subtitle_status != "pending" {
+            if row.subtitle_status == "unavailable" {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -4800,6 +5009,539 @@ mod tests {
         assert!(
             !pool.map_build_pending(item_id),
             "build done, nothing pending"
+        );
+    }
+
+    /// D2B.2 acceptance 1: an uncertified source defers promptly. The item keeps
+    /// its status, nothing is published, no probe is started, and no failure
+    /// backoff is consumed.
+    #[test]
+    fn uncertified_source_defers_without_probing_or_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Movie.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+
+        // Rendezvous: arm the extract hold, wait until the worker has claimed
+        // the item, release it, then wait on the pool's deferral counter. No
+        // fixed sleep is needed to know the worker reached the deferral.
+        let hold = pool.arm_extract_hold();
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            media.join("Movie.mp4"),
+            None,
+        ));
+        assert_eq!(
+            hold.entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            item_id,
+            "the extract worker must claim the item"
+        );
+        hold.release_tx.send(()).unwrap();
+        pool.wait_unverified_deferrals(1);
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(
+            row.subtitle_status, "pending",
+            "a deferral must not write a subtitle status"
+        );
+        assert_eq!(
+            row.probe_status, "indexed",
+            "a deferral must not start a probe"
+        );
+        let attempts: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT subtitle_attempt_count FROM media_items WHERE id = ?1",
+                    [item_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(attempts, 0, "a deferral must not consume failure backoff");
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        assert!(
+            !store.item_dir(item_id).exists(),
+            "a deferral must publish nothing"
+        );
+        assert_eq!(pool.background_progress().completed, 0);
+    }
+
+    /// D2B.2 acceptance 2/6: combined-generation single-flight. A newer
+    /// generation that arrives while the older run is in flight is preserved as
+    /// a successor and runs after it; the older run never executes as the newer
+    /// generation.
+    #[test]
+    fn newer_generation_is_preserved_as_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mkv");
+        fs::write(&video, b"not a real mkv").unwrap();
+        let sidecar_path = media.join("Movie.en.srt");
+        let sidecar_src = corpus_fixture("sidecar_beside/Movie.en.srt");
+        if !sidecar_src.is_file() {
+            eprintln!("skipping: missing {}", sidecar_src.display());
+            return;
+        }
+        fs::copy(&sidecar_src, &sidecar_path).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Movie.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.reconcile_item_sidecars(
+            item_id,
+            &[observed_sidecar(
+                &sidecar_path,
+                "Movie.en.srt",
+                "s-en",
+                "srt",
+            )],
+        )
+        .unwrap();
+        certify_item(&db, item_id, &[]);
+        let first = db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        let first_identity = first.source_identity();
+        let first_token = first.token_for_track("s-en").expect("first token");
+
+        // The older run is in flight and parked. While it is parked the sidecar
+        // changes, which allocates a new generation: the same item now demands
+        // different work.
+        let hold = pool.arm_extract_hold();
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            video.clone(),
+            Some(first_identity.clone()),
+        ));
+        assert_eq!(
+            hold.entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            item_id,
+            "the older extract must be in flight"
+        );
+
+        fs::write(
+            &sidecar_path,
+            "1\n00:00:00,000 --> 00:00:02,000\nA longer replacement body\n",
+        )
+        .unwrap();
+        db.reconcile_item_sidecars(
+            item_id,
+            &[observed_sidecar(
+                &sidecar_path,
+                "Movie.en.srt",
+                "s-en",
+                "srt",
+            )],
+        )
+        .unwrap();
+        let second = db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        let second_identity = second.source_identity();
+        assert_ne!(first_identity, second_identity, "a new generation exists");
+        assert_ne!(
+            first_token,
+            second.token_for_track("s-en").expect("second token")
+        );
+
+        // The newer demand while the older run is active is queued, not dropped.
+        pool.prioritize_extract(item_id, lib.id, video);
+        assert_eq!(
+            pool.background_progress().queued_extracts,
+            1,
+            "a newer generation must be preserved as a successor"
+        );
+
+        hold.release_tx.send(()).unwrap();
+
+        // The successor runs after the older item and publishes the new
+        // generation. The older run could not execute as the newer generation:
+        // it defers, so only the second token can ever become ready.
+        pool.wait_extract_finishes(2);
+        assert_eq!(
+            db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready",
+            "the successor must publish"
+        );
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let published = committed_artifact_path(&db, &store, item_id, "s-en");
+        assert_eq!(
+            published.parent(),
+            Some(
+                store
+                    .generation_dir(item_id, &second.token_for_track("s-en").unwrap())
+                    .as_path()
+            ),
+            "the successor's generation must hold the committed artifact"
+        );
+        assert!(
+            !store.generation_dir(item_id, &first_token).exists(),
+            "the older generation must never be written by the successor's work"
+        );
+    }
+
+    /// Round-1 item 8: an actual media replacement while the extract is
+    /// provably in flight defers the run. Nothing is published, no status is
+    /// written, and no failure backoff is consumed.
+    #[test]
+    fn media_replaced_while_extract_is_blocked_defers_without_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video_src = corpus_fixture("h264_aac_srt_mkv.mkv");
+        if !video_src.is_file() {
+            eprintln!("skipping: missing {}", video_src.display());
+            return;
+        }
+        let video = media.join("Movie.mkv");
+        fs::copy(&video_src, &video).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Movie.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        certify_item(&db, item_id, &text_streams(&video));
+        let status_before = db.get_item(item_id).unwrap().unwrap().subtitle_status;
+        let attempts_before = subtitle_attempt_count(&db, item_id);
+
+        // Park the worker after it claimed the item, then replace the media.
+        let hold = pool.arm_extract_hold();
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            video.clone(),
+            None,
+        ));
+        assert_eq!(
+            hold.entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            item_id,
+            "the extract worker must claim the item"
+        );
+        fs::write(&video, b"a different, longer replacement body").unwrap();
+        hold.release_tx.send(()).unwrap();
+        pool.wait_extract_finishes(1);
+
+        let row = db.get_item(item_id).unwrap().unwrap();
+        assert_eq!(
+            row.subtitle_status, status_before,
+            "a media replacement must defer without writing a status"
+        );
+        assert_eq!(
+            subtitle_attempt_count(&db, item_id),
+            attempts_before,
+            "a deferral must not consume failure backoff"
+        );
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        assert!(
+            !store.item_dir(item_id).exists(),
+            "a deferred run must publish nothing"
+        );
+        assert_eq!(pool.background_progress().completed, 0);
+    }
+
+    /// Round-2 item 1 / D2B.2 acceptance 3: a completed artifact is immutable.
+    /// A second run for the same `(item, track, token)` skips the committed
+    /// track, so it never re-demuxes or renames over the finished bytes.
+    #[test]
+    fn same_token_second_run_never_overwrites_a_completed_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let sidecar_path = media.join("Movie.en.srt");
+        let sidecar_src = corpus_fixture("sidecar_beside/Movie.en.srt");
+        if !sidecar_src.is_file() {
+            eprintln!("skipping: missing {}", sidecar_src.display());
+            return;
+        }
+        fs::copy(&sidecar_src, &sidecar_path).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Movie.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.reconcile_item_sidecars(
+            item_id,
+            &[observed_sidecar(
+                &sidecar_path,
+                "Movie.en.srt",
+                "s-en",
+                "srt",
+            )],
+        )
+        .unwrap();
+        certify_item(&db, item_id, &[]);
+
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            video.clone(),
+            None,
+        ));
+        pool.wait_extract_finishes(1);
+        let source = db.certified_subtitle_source(item_id).unwrap().unwrap();
+        assert!(source.is_complete("s-en"), "the first run must commit");
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let artifact = committed_artifact_path(&db, &store, item_id, "s-en");
+        assert!(artifact.is_file(), "the first run must write the artifact");
+
+        // The committed bytes are immutable. Overwrite them with a marker a
+        // re-demux could never produce, then run again for the same token.
+        fs::write(&artifact, "COMMITTED").unwrap();
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video, None));
+        pool.wait_complete_skips(1);
+
+        assert_eq!(
+            fs::read_to_string(&artifact).unwrap(),
+            "COMMITTED",
+            "a second run must not overwrite a completed artifact"
+        );
+        assert_eq!(
+            db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready",
+            "the committed reference must survive the skipped run"
+        );
+    }
+
+    /// Round-2 item 1: one sidecar edit must not re-demux or overwrite the
+    /// unrelated embedded and sidecar tracks under their unchanged URLs.
+    #[test]
+    fn one_sidecar_edit_leaves_unrelated_artifacts_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let video_src = corpus_fixture("h264_aac_srt_mkv.mkv");
+        let sidecar_src = corpus_fixture("sidecar_beside/Movie.en.srt");
+        if !video_src.is_file() || !sidecar_src.is_file() {
+            eprintln!("skipping: missing D2B.2 fixtures");
+            return;
+        }
+        let video = media.join("Movie.mkv");
+        fs::copy(&video_src, &video).unwrap();
+        let english = media.join("Movie.en.srt");
+        let french = media.join("Movie.fr.srt");
+        fs::copy(&sidecar_src, &english).unwrap();
+        fs::copy(&sidecar_src, &french).unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let ids = db
+            .upsert_items_indexed(
+                lib.id,
+                &[UpsertItem {
+                    path: "Movie.mkv".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap();
+        let item_id = ids[0];
+        db.reconcile_item_sidecars(
+            item_id,
+            &[
+                observed_sidecar(&english, "Movie.en.srt", "s-en", "srt"),
+                observed_sidecar(&french, "Movie.fr.srt", "s-fr", "srt"),
+            ],
+        )
+        .unwrap();
+        certify_item(&db, item_id, &text_streams(&video));
+
+        pool.enqueue(pool::WorkItem::extract(
+            item_id,
+            lib.id,
+            video.clone(),
+            None,
+        ));
+        pool.wait_extract_finishes(1);
+        let first = db.certified_subtitle_source(item_id).unwrap().unwrap();
+        let embedded_token = first.token_for_track("e2").expect("embedded token");
+        let french_token = first.token_for_track("s-fr").expect("french token");
+        let english_token = first.token_for_track("s-en").expect("english token");
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let embedded_artifact = committed_artifact_path(&db, &store, item_id, "e2");
+        let french_artifact = committed_artifact_path(&db, &store, item_id, "s-fr");
+        assert!(embedded_artifact.is_file(), "embedded artifact");
+        assert!(french_artifact.is_file(), "french artifact");
+
+        // Mark the two tracks that must survive the next run untouched with
+        // bytes a re-demux could never produce.
+        fs::write(&embedded_artifact, "COMMITTED-E2").unwrap();
+        fs::write(&french_artifact, "COMMITTED-FR").unwrap();
+
+        // Edit only the English sidecar and reconcile the change.
+        fs::write(
+            &english,
+            "1\n00:00:00,000 --> 00:00:02,000\nA longer replacement body\n",
+        )
+        .unwrap();
+        db.reconcile_item_sidecars(
+            item_id,
+            &[
+                observed_sidecar(&english, "Movie.en.srt", "s-en", "srt"),
+                observed_sidecar(&french, "Movie.fr.srt", "s-fr", "srt"),
+            ],
+        )
+        .unwrap();
+        let second = db.certified_subtitle_source(item_id).unwrap().unwrap();
+        let english_second = second.token_for_track("s-en").expect("new english token");
+        assert_ne!(english_token, english_second);
+        assert_eq!(
+            second.token_for_track("e2").as_deref(),
+            Some(embedded_token.as_str()),
+            "the embedded token is unchanged"
+        );
+        assert_eq!(
+            second.token_for_track("s-fr").as_deref(),
+            Some(french_token.as_str()),
+            "the unrelated sidecar token is unchanged"
+        );
+
+        pool.enqueue(pool::WorkItem::extract(item_id, lib.id, video, None));
+        pool.wait_extract_finishes(2);
+
+        // The edited sidecar published under its new token; the unchanged
+        // tracks were never re-demuxed or overwritten.
+        assert_eq!(
+            fs::read_to_string(&embedded_artifact).unwrap(),
+            "COMMITTED-E2",
+            "the embedded artifact must be untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(&french_artifact).unwrap(),
+            "COMMITTED-FR",
+            "the unrelated sidecar artifact must be untouched"
+        );
+        let english_artifact = committed_artifact_path(&db, &store, item_id, "s-en");
+        assert_eq!(
+            english_artifact.parent(),
+            Some(store.generation_dir(item_id, &english_second).as_path()),
+            "the edited sidecar publishes under its new generation"
+        );
+        let body = fs::read_to_string(&english_artifact).unwrap();
+        assert!(body.contains("A longer replacement body"), "{body}");
+        assert_eq!(
+            db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready"
         );
     }
 }
