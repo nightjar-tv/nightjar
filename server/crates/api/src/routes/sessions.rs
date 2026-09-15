@@ -18,6 +18,7 @@ use nightjar_core::{
     select_subtitle_track, video_encode_plan,
 };
 use nightjar_db::MediaItemRow;
+use nightjar_db::SubtitleListingSource;
 use nightjar_db::SubtitleTrackRow;
 use nightjar_db::{SubtitleChoiceRow, TrackDescription, resolve_media_path};
 use nightjar_transcode::{
@@ -257,6 +258,7 @@ fn start_blocking(
         &row,
         &lib_root,
         &tracks,
+        subtitle_source.as_ref(),
         &prefs,
         audio.language.as_deref(),
     ) {
@@ -307,13 +309,22 @@ fn start_blocking(
             code: "unsupported_media_type",
         });
     }
-    let piggyback = match state.db.list_item_subtitle_tracks(row.id) {
-        Ok(tracks) => piggyback_track_for(&row.subtitle_status, &tracks),
-        Err(e) => {
-            tracing::warn!(item_id, error = %e, "piggyback eligibility read failed");
-            None
-        }
-    };
+    // The piggyback target comes from the same coherent subtitle-source read
+    // that certified the capture: the embedded inventory, the coarse lifecycle
+    // and the certified revisions are one observation, never a second listing
+    // (ADR-0013 §13.4, Rule 4.11). The certified source is captured before the
+    // run starts, so the run EOF publishes through this exact capture or not at
+    // all (ADR-0013 §13.3.1). An `Unverified` source arms no target: the
+    // piggyback defers instead of publishing over newer state.
+    let piggyback = subtitle_source.as_ref().and_then(|listing| {
+        let source = listing.certified()?;
+        let mut target = piggyback_track_for(
+            &listing.subtitle_status,
+            &source.snapshot.snapshot.subtitle_tracks,
+        )?;
+        target.source = Some(source);
+        Some(target)
+    });
     let hls = Arc::clone(&state.hls);
     let src = abs_path(&lib_root, &row.path);
     let started = hls.start(
@@ -825,6 +836,9 @@ fn piggyback_track_for(status: &str, tracks: &[SubtitleTrackRow]) -> Option<Pigg
     Some(PiggybackExtract {
         track_id: format!("e{stream_index}"),
         stream_index,
+        // The certified capture is attached by the session-start caller, which
+        // is where the coherent subtitle-source read already happens.
+        source: None,
     })
 }
 
@@ -833,18 +847,93 @@ fn snapshot_hls_tracks(
     row: &MediaItemRow,
     library_root: &str,
     tracks: &[crate::routes::items::SubtitleTrackDto],
+    source: Option<&SubtitleListingSource>,
     prefs: &TrackPreferences,
     audio_language: Option<&str>,
 ) -> Result<(Vec<HlsSubtitleTrack>, String), String> {
-    // D2B.2 fails HLS/session subtitle publication closed until D2B.3: declare
-    // no subtitle rendition, so no session subtitle writer runs and no legacy
-    // mutable artifact can be exposed through the new contract. AV playback is
-    // unaffected (D2B.2 acceptance 6).
-    let _ = (state, row, library_root, tracks, prefs, audio_language);
-    Ok((
-        Vec::new(),
-        "hls subtitle renditions are disabled until D2B.3".to_string(),
-    ))
+    let certified = source.and_then(|source| source.certified());
+    // HLS MEDIA only for a track whose complete immutable artifact is already
+    // committed for the current certified source (ADR-0013 §12, §13.4). A
+    // partial track is omitted so a cold URI cannot hang start; captions appear
+    // on the next session once complete. The declared URI is the
+    // generation-addressed artifact this create resolved, so the session
+    // serves one immutable generation for its whole life.
+    let ready: Vec<&crate::routes::items::SubtitleTrackDto> = tracks
+        .iter()
+        .filter(|t| t.readiness == Some("complete") && t.url.is_some())
+        .collect();
+    let sub_cands: Vec<TrackCandidate> = ready
+        .iter()
+        .map(|t| TrackCandidate {
+            track_id: t.track_id.clone(),
+            language: t.language.clone(),
+            title: t.label.clone(),
+            is_default: false,
+            is_forced: t.forced,
+            is_image: false,
+            stream_index: t.stream_index.unwrap_or(u32::MAX),
+        })
+        .collect();
+    // The selected audio track's language decides the forced rule, so it is the
+    // language the session actually chose, not a second guess (ADR-0024 §2.3).
+    let sub_sel = choose_subtitle_track(&sub_cands, prefs, audio_language);
+    tracing::info!(
+        item_id = row.id,
+        track_id = sub_sel.track_id.as_deref().unwrap_or("-"),
+        reason = %sub_sel.reason,
+        "subtitle track selected"
+    );
+    let default_id = sub_sel.track_id.as_deref();
+    let mut out = Vec::new();
+    for t in ready {
+        // The artifact path comes exclusively from the committed per-track
+        // publication row of the captured source; no caller constructs the
+        // filename from a request (ADR-0013 §13.2, §13.4).
+        let Some(source) = certified.as_ref() else {
+            continue;
+        };
+        let (Some(token), Some(artifact)) = (
+            source.token_for_track(&t.track_id),
+            source.artifact_for(&t.track_id),
+        ) else {
+            continue;
+        };
+        let name = t
+            .label
+            .clone()
+            .or_else(|| t.language.clone())
+            .unwrap_or_else(|| t.track_id.clone());
+        let is_default = default_id == Some(t.track_id.as_str());
+        let (stream_index, sidecar_path) = if t.source == "sidecar" {
+            let path = source
+                .sidecars
+                .iter()
+                .find(|s| s.track_id == t.track_id)
+                .map(|s| resolve_media_path(library_root, &s.path));
+            (None, path)
+        } else {
+            (t.stream_index, None)
+        };
+        out.push(HlsSubtitleTrack {
+            track_id: t.track_id.clone(),
+            language: t.language.clone(),
+            name,
+            is_default,
+            forced: t.forced,
+            sdh: t.sdh,
+            item_id: row.id,
+            stream_index,
+            sidecar_path,
+            codec: t.codec.clone(),
+            item_vtt_path: Some(state.subs.artifact_path(
+                row.id,
+                &token,
+                &t.track_id,
+                artifact.artifact_revision,
+            )),
+        });
+    }
+    Ok((out, sub_sel.reason))
 }
 
 pub async fn get(
@@ -2420,6 +2509,119 @@ mod ownership_tests {
         assert!(body.contains("First ever body"), "{body}");
     }
 
+    /// D2B.3: an HLS session declares a subtitle rendition only from a track
+    /// whose complete immutable artifact is already committed for the current
+    /// certified source, and the declared path is the generation-addressed
+    /// artifact of that exact committed revision. A track with no committed
+    /// reference, or only a committed partial one, declares no rendition, so the
+    /// session never exposes a mutable, uncommitted or incomplete artifact
+    /// (ADR-0013 §13.4, §13.7, §13.8).
+    #[test]
+    fn hls_declares_only_committed_complete_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let sidecar_path = dir.path().join("subs").join("clip.en.srt");
+        std::fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar_path, "1\n00:00:00,000 --> 00:00:02,000\nhi\n").unwrap();
+        let item_id = certified_item_with_streams(
+            &state,
+            dir.path(),
+            "clip.mkv",
+            &[],
+            &[observed_sidecar_on_disk(
+                "s-en",
+                "subs/clip.en.srt",
+                &sidecar_path,
+            )],
+        );
+        let row = state.db.get_item(item_id).unwrap().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+
+        // Not committed: no rendition and no path are declared.
+        let listing = state.db.subtitle_listing_source(item_id).unwrap();
+        let tracks = crate::routes::items::subtitle_tracks_for(&row, listing.as_ref());
+        let (declared, _) = super::snapshot_hls_tracks(
+            &state,
+            &row,
+            &root,
+            &tracks,
+            listing.as_ref(),
+            &super::TrackPreferences::none(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            declared.is_empty(),
+            "an uncommitted artifact must declare no rendition"
+        );
+
+        // A committed partial artifact is still not a complete immutable
+        // generation: it must declare no rendition either.
+        publish_partial(
+            &state,
+            item_id,
+            "s-en",
+            "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhi\n",
+        );
+        let listing = state.db.subtitle_listing_source(item_id).unwrap();
+        let tracks = crate::routes::items::subtitle_tracks_for(&row, listing.as_ref());
+        let (declared, _) = super::snapshot_hls_tracks(
+            &state,
+            &row,
+            &root,
+            &tracks,
+            listing.as_ref(),
+            &super::TrackPreferences::none(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            declared.is_empty(),
+            "a committed partial artifact must declare no rendition"
+        );
+
+        // Commit a complete artifact. The declared path is exactly the
+        // committed generation-addressed artifact, never a mutable one.
+        let revision = publish_complete(
+            &state,
+            item_id,
+            "s-en",
+            "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhi\n",
+        );
+        let listing = state.db.subtitle_listing_source(item_id).unwrap();
+        let token = listing
+            .as_ref()
+            .and_then(|s| s.certified())
+            .and_then(|s| s.token_for_track("s-en"))
+            .expect("sidecar token");
+        let tracks = crate::routes::items::subtitle_tracks_for(&row, listing.as_ref());
+        let (declared, _) = super::snapshot_hls_tracks(
+            &state,
+            &row,
+            &root,
+            &tracks,
+            listing.as_ref(),
+            &super::TrackPreferences::none(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            declared.len(),
+            1,
+            "one committed sidecar declares one track"
+        );
+        assert_eq!(
+            declared[0].item_vtt_path.as_deref(),
+            Some(
+                state
+                    .subs
+                    .artifact_path(item_id, &token, "s-en", revision)
+                    .as_path()
+            ),
+            "the rendition must name the committed immutable artifact"
+        );
+    }
+
     /// Wait, bounded, until `track_id` has a complete committed publication
     /// under a token other than `previous`, and return that token.
     fn wait_for_token(state: &AppState, item_id: i64, track_id: &str, previous: &str) -> String {
@@ -2466,6 +2668,35 @@ mod ownership_tests {
     /// the bytes there, then commit the per-track reference. Returns the
     /// revision.
     fn publish_complete(state: &AppState, item_id: i64, track_id: &str, body: &str) -> u64 {
+        publish_track(
+            state,
+            item_id,
+            track_id,
+            body,
+            SubtitleArtifactState::Complete,
+        )
+    }
+
+    /// Commit one `partial` reference for a track the same way the progressive
+    /// writer does. Returns the revision.
+    fn publish_partial(state: &AppState, item_id: i64, track_id: &str, body: &str) -> u64 {
+        publish_track(
+            state,
+            item_id,
+            track_id,
+            body,
+            SubtitleArtifactState::Partial,
+        )
+    }
+
+    /// Reserve, finalize and commit one per-track reference in the given state.
+    fn publish_track(
+        state: &AppState,
+        item_id: i64,
+        track_id: &str,
+        body: &str,
+        artifact_state: SubtitleArtifactState,
+    ) -> u64 {
         let source = state
             .db
             .certified_subtitle_source(item_id)
@@ -2489,7 +2720,7 @@ mod ownership_tests {
                         track_id: track_id.to_string(),
                         token,
                         artifact_revision: revision,
-                        state: SubtitleArtifactState::Complete,
+                        state: artifact_state,
                     },
                 )
                 .unwrap(),

@@ -36,8 +36,8 @@ pub use subs::{
     extract_embedded_ass, extract_item_subtitles, io_error_is_availability, is_burn_in_codec,
     is_burn_in_sidecar_format, is_serveable_sidecar_format, is_text_subtitle_codec,
     list_burn_in_subtitles, list_text_subtitles, message_is_source_changed, normalize_language,
-    prepare_session_subtitles, slice_webvtt, srt_to_webvtt, stored_webvtt, subtitle_codec_kind,
-    webvtt_max_cue_end_ms,
+    prepare_session_subtitles, publish_captured_track, slice_webvtt, srt_to_webvtt, stored_webvtt,
+    subtitle_codec_kind, webvtt_max_cue_end_ms,
 };
 pub use virtual_input::{KeyframeEntry, KeyframeMap, MapContainerKind};
 
