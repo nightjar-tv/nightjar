@@ -133,23 +133,16 @@ pub fn walk_media_files_cached_with_concurrency(
 /// path would never re-read that file. The refreshed cache keeps the next
 /// automatic poll warm (ADR-0015).
 ///
-/// `relisted_dirs` keeps the warm-walk meaning — the directories whose mtime
-/// moved or whose cached listing was incomplete. Sidecar rediscovery keys off
-/// that set, so a manual scan revisits only directories that changed instead of
-/// re-paying a readdir for the whole library.
+/// Every directory this pass readdir'd is in `relisted_dirs`, because the fresh
+/// walk lists each one. Sidecar rediscovery keys off that set, so a manual scan
+/// reconciles the supported sidecars beside every media file it saw — including
+/// unchanged parents — through the caller's shared per-directory listing cache
+/// (ADR-0013 §3.5 amendment). The automatic poll keeps the mtime-only meaning.
 pub fn walk_media_files_fresh(root: &Path, cache: &mut WalkCache) -> Result<WalkOutcome, String> {
-    let prev = cache.dirs.clone();
     let mut fresh = WalkCache::new();
-    let mut outcome = walk_media_files_cached(root, Some(&mut fresh))?;
-    outcome.relisted_dirs = fresh
-        .dirs
-        .iter()
-        .filter(|(dir, entry)| match prev.get(*dir) {
-            Some(prior) => prior.incomplete || prior.mtime_ms != entry.mtime_ms,
-            None => true,
-        })
-        .map(|(dir, _)| dir.clone())
-        .collect();
+    // The empty cache makes the inner walk list every directory, so its
+    // `relisted_dirs` already holds each one.
+    let outcome = walk_media_files_cached(root, Some(&mut fresh))?;
     *cache = fresh;
     Ok(outcome)
 }
@@ -574,13 +567,13 @@ mod tests {
         assert_eq!(cached.files[0].size_bytes, 0, "cached listing stays stale");
 
         // Fresh walk: re-lists the directory and reports the new size. The
-        // parent mtime did not move, so `relisted_dirs` stays empty — that set
-        // only drives sidecar rediscovery, which the media change already
-        // handles through the index flush.
+        // directory is in `relisted_dirs` even though its mtime did not move,
+        // because a fresh/manual walk re-lists every directory and so triggers
+        // sidecar rediscovery beside each media file it saw (ADR-0013 §3.5).
         let fresh = walk_media_files_fresh(root.path(), &mut cache).unwrap();
         assert!(
-            fresh.relisted_dirs.is_empty(),
-            "an unchanged parent mtime is not a sidecar-rediscovery trigger"
+            fresh.relisted_dirs.contains(root.path()),
+            "a fresh walk lists every directory, so each is a rediscovery trigger"
         );
         assert_eq!(
             fresh.files[0].size_bytes,
