@@ -308,7 +308,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** WebVTT for one text subtitle track (ADR-0010) */
+        /**
+         * WebVTT for one text subtitle track (ADR-0010)
+         * @description Serves an immutable, generation-addressed subtitle artifact (ADR-0013 §13). The `g` query parameter is required and opaque: the server mints it and clients must pass back exactly the `url` from `playbackInfo` without constructing or editing it. A URL whose `g` no longer matches the current certified source, or that names a track which is not a current member, returns 404 even if an older artifact is still on disk.
+         */
         get: operations["getSubtitleVtt"];
         put?: never;
         post?: never;
@@ -2386,7 +2389,10 @@ export interface operations {
     };
     getSubtitleVtt: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Opaque, versioned, bounded generation token minted by the server (ADR-0013 §13.1). Clients treat it as an uninterpreted string and never construct one. */
+                g: string;
+            };
             header?: never;
             path: {
                 itemId: components["parameters"]["ItemId"];
@@ -2406,7 +2412,7 @@ export interface operations {
                     "text/vtt": string;
                 };
             };
-            /** @description Item or serveable subtitle track not found */
+            /** @description Item, current certified member, matching generation, or published artifact not found. */
             404: {
                 headers: {
                     [name: string]: unknown;

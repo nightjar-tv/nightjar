@@ -23,7 +23,7 @@ use nightjar_db::{SubtitleChoiceRow, TrackDescription, resolve_media_path};
 use nightjar_transcode::{
     AudioSelection, BurnInKind, BurnInSelection, HlsSubtitleTrack, KeyframeMap, PiggybackExtract,
     PlaylistError, SessionMode, SessionOwner, StartSessionError, VideoRung, burn_in_kind_for_codec,
-    list_audio_tracks, list_burn_in_subtitles, parse_time_keyed_segment_name,
+    list_audio_tracks, parse_time_keyed_segment_name,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -242,24 +242,28 @@ fn start_blocking(
     }
 
     let lib_root = library_root(&state, row.library_id)?;
-    let (subtitle_tracks, subtitle_reason) = match subtitle_tracks_for(&state, &row, &lib_root) {
-        Ok(tracks) => match snapshot_hls_tracks(
-            &state,
-            &row,
-            &lib_root,
-            &tracks,
-            &prefs,
-            audio.language.as_deref(),
-        ) {
-            Ok((snap, reason)) => (snap, reason),
-            Err(e) => {
-                tracing::warn!(item_id, error = %e, "subtitle snapshot failed at session start");
-                (Vec::new(), "subtitle snapshot failed".to_string())
-            }
-        },
+    // One coherent subtitle-source read for the session's listing and burn-in
+    // resolution (ADR-0013 §13.4).
+    let subtitle_source = state
+        .db
+        .subtitle_listing_source(row.id)
+        .unwrap_or_else(|e| {
+            tracing::warn!(item_id, error = %e, "subtitle source read failed at session start");
+            None
+        });
+    let tracks = subtitle_tracks_for(&row, subtitle_source.as_ref());
+    let (subtitle_tracks, subtitle_reason) = match snapshot_hls_tracks(
+        &state,
+        &row,
+        &lib_root,
+        &tracks,
+        &prefs,
+        audio.language.as_deref(),
+    ) {
+        Ok((snap, reason)) => (snap, reason),
         Err(e) => {
-            tracing::warn!(item_id, error = %e, "subtitle list failed at session start");
-            (Vec::new(), "subtitle list failed".to_string())
+            tracing::warn!(item_id, error = %e, "subtitle snapshot failed at session start");
+            (Vec::new(), "subtitle snapshot failed".to_string())
         }
     };
     // An explicit burn-in track is the selection, whatever the soft default
@@ -723,7 +727,13 @@ fn resolve_burn_in(
         return Ok(None);
     };
     let root = library_root(state, row.library_id)?;
-    let tracks = subtitle_tracks_for(state, row, &root).map_err(ApiError::internal)?;
+    // One coherent read for the listing and the burn-in path, so the sidecar
+    // set is never reloaded separately (ADR-0013 §13.4).
+    let source = state
+        .db
+        .subtitle_listing_source(row.id)
+        .map_err(ApiError::internal)?;
+    let tracks = subtitle_tracks_for(row, source.as_ref());
     let track = tracks.iter().find(|t| t.track_id == id).ok_or_else(|| {
         ApiError::not_found(format!("subtitle track {id} not found for item {}", row.id))
     })?;
@@ -739,13 +749,9 @@ fn resolve_burn_in(
         ))
     })?;
     if track.source == "sidecar" {
-        let sidecars = state
-            .db
-            .list_item_sidecars(row.id)
-            .map_err(ApiError::internal)?;
-        let path = sidecars
-            .iter()
-            .find(|s| s.track_id == id)
+        let path = source
+            .as_ref()
+            .and_then(|source| source.sidecars.iter().find(|s| s.track_id == id))
             .map(|s| resolve_media_path(&root, &s.path))
             .ok_or_else(|| {
                 ApiError::not_found(format!("sidecar path for burn-in track {id} missing"))
@@ -758,19 +764,29 @@ fn resolve_burn_in(
             sidecar_path: Some(path),
         }));
     }
-    let embedded =
-        list_burn_in_subtitles(&abs_path(&root, &row.path)).map_err(ApiError::internal)?;
+    let embedded = source
+        .as_ref()
+        .and_then(|source| source.snapshot.as_ref())
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "embedded burn-in track {id} has no certified subtitle inventory"
+            ))
+        })?;
     let stream = embedded
+        .snapshot
+        .subtitle_tracks
         .iter()
-        .find(|s| s.track_id() == id)
+        .enumerate()
+        .find(|(_, s)| format!("e{}", s.stream_index) == id)
+        .map(|(ordinal, s)| (u32::try_from(ordinal).unwrap_or(0), s))
         .ok_or_else(|| {
             ApiError::not_found(format!("embedded burn-in track {id} missing from probe"))
         })?;
     Ok(Some(BurnInSelection {
         track_id: id.to_string(),
         kind,
-        stream_index: Some(stream.stream_index),
-        subtitle_ordinal: Some(stream.subtitle_ordinal),
+        stream_index: Some(u32::try_from(stream.1.stream_index).unwrap_or(u32::MAX)),
+        subtitle_ordinal: Some(stream.0),
         sidecar_path: None,
     }))
 }
@@ -820,70 +836,15 @@ fn snapshot_hls_tracks(
     prefs: &TrackPreferences,
     audio_language: Option<&str>,
 ) -> Result<(Vec<HlsSubtitleTrack>, String), String> {
-    let sidecars = state.db.list_item_sidecars(row.id)?;
-    let ready: Vec<&crate::routes::items::SubtitleTrackDto> = tracks
-        .iter()
-        // HLS MEDIA only for fully extracted tracks. Declaring a cold
-        // session-inline rendition re-demuxes the source beside the encode
-        // and can block Safari start when seg000.vtt never lands (ADR-0013).
-        // Pending/partial stay on play-priority extract + preparing UI;
-        // captions appear on the next session once complete.
-        .filter(|t| t.readiness == Some("complete") && t.url.is_some())
-        .collect();
-    let sub_cands: Vec<TrackCandidate> = ready
-        .iter()
-        .map(|t| TrackCandidate {
-            track_id: t.track_id.clone(),
-            language: t.language.clone(),
-            title: t.label.clone(),
-            is_default: false,
-            is_forced: t.forced,
-            is_image: false,
-            stream_index: t.stream_index.unwrap_or(u32::MAX),
-        })
-        .collect();
-    // The selected audio track's language decides the forced rule, so it is the
-    // language the session actually chose, not a second guess (ADR-0024 §2.3).
-    let sub_sel = choose_subtitle_track(&sub_cands, prefs, audio_language);
-    tracing::info!(
-        item_id = row.id,
-        track_id = sub_sel.track_id.as_deref().unwrap_or("-"),
-        reason = %sub_sel.reason,
-        "subtitle track selected"
-    );
-    let default_id = sub_sel.track_id.as_deref();
-    let mut out = Vec::new();
-    for t in ready {
-        let name = t
-            .label
-            .clone()
-            .or_else(|| t.language.clone())
-            .unwrap_or_else(|| t.track_id.clone());
-        let is_default = default_id == Some(t.track_id.as_str());
-        let (stream_index, sidecar_path) = if t.source == "sidecar" {
-            let path = sidecars
-                .iter()
-                .find(|s| s.track_id == t.track_id)
-                .map(|s| resolve_media_path(library_root, &s.path));
-            (None, path)
-        } else {
-            (t.stream_index, None)
-        };
-        out.push(HlsSubtitleTrack {
-            track_id: t.track_id.clone(),
-            language: t.language.clone(),
-            name,
-            is_default,
-            forced: t.forced,
-            sdh: t.sdh,
-            item_id: row.id,
-            stream_index,
-            sidecar_path,
-            codec: t.codec.clone(),
-            item_vtt_path: Some(state.subs.vtt_path(row.id, &t.track_id)),
-        });
-    }
-    Ok((out, sub_sel.reason))
+    // D2B.2 fails HLS/session subtitle publication closed until D2B.3: declare
+    // no subtitle rendition, so no session subtitle writer runs and no legacy
+    // mutable artifact can be exposed through the new contract. AV playback is
+    // unaffected (D2B.2 acceptance 6).
+    let _ = (state, row, library_root, tracks, prefs, audio_language);
+    Ok((
+        Vec::new(),
+        "hls subtitle renditions are disabled until D2B.3".to_string(),
+    ))
 }
 
 pub async fn get(
@@ -1656,7 +1617,10 @@ mod ownership_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use nightjar_auth::{mint_profile_ref, mint_session_token};
-    use nightjar_db::{NewLibrary, ObservedSidecar, ProbeUpdate, UpsertItem};
+    use nightjar_db::{
+        NewLibrary, ObservedSidecar, ProbeUpdate, SubtitleArtifactPublication,
+        SubtitleArtifactState, SubtitlePublication, UpsertItem,
+    };
     use tower::ServiceExt;
 
     struct Actor {
@@ -1860,7 +1824,9 @@ mod ownership_tests {
             .subs
             .publish_item_vtt(
                 item_id,
+                "seed-gen",
                 "s-en",
+                1,
                 "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhi\n",
             )
             .unwrap();
@@ -1923,6 +1889,803 @@ mod ownership_tests {
             + 4;
         let end = json[at..].find('"').unwrap() + at;
         &json[at..end]
+    }
+
+    /// D2B.2 acceptance 4: the item URL carries an opaque generation, and a
+    /// stale generation is rejected on cache miss even though the old artifact
+    /// is still on disk.
+    #[tokio::test]
+    async fn subtitle_vtt_serves_only_the_current_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner-a");
+        let token = token_for(&state, &owner);
+        let item_id = certified_item(
+            &state,
+            dir.path(),
+            "clip.mkv",
+            &[observed_sidecar("s-en", "clip.en.srt", "7-aaa-bbb", 7)],
+        );
+        let (name, value) = bearer(&token);
+
+        // The sidecar's first generation. Its artifact is finalized into place
+        // but the publication CAS has not run: an orphan, never served.
+        let first = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let first_token = first.token_for_track("s-en").expect("first token");
+        place_artifact(
+            &state,
+            item_id,
+            "s-en",
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n",
+        );
+        let first_url = format!("/api/v0/items/{item_id}/subtitles/s-en.vtt?g={first_token}");
+        let (status, _) = send(state.clone(), "GET", &first_url, Some((&name, &value)), "").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a finalized but uncommitted artifact must not be served"
+        );
+
+        // Commit the first generation: the same URL now serves.
+        publish_complete(
+            &state,
+            item_id,
+            "s-en",
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n",
+        );
+        let (status, body) =
+            send(state.clone(), "GET", &first_url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK, "committed generation: {body}");
+        assert!(body.contains("hi"), "{body}");
+
+        // A changed sidecar allocates a new generation. The old URL is stale,
+        // and its artifact is still on disk.
+        state
+            .db
+            .reconcile_item_sidecars(
+                item_id,
+                &[observed_sidecar("s-en", "clip.en.srt", "9-ccc-ddd", 9)],
+            )
+            .unwrap();
+        let second = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let second_token = second.token_for_track("s-en").expect("second token");
+        assert_ne!(first_token, second_token, "a new generation exists");
+        assert!(
+            state
+                .subs
+                .generation_dir(item_id, &first_token)
+                .read_dir()
+                .is_ok_and(|mut entries| entries.any(
+                    |e| e.is_ok_and(|e| { e.file_name().to_string_lossy().ends_with(".vtt") })
+                )),
+            "the old artifact must still be on disk for this test to mean anything"
+        );
+        let (status, _) = send(state.clone(), "GET", &first_url, Some((&name, &value)), "").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a stale URL must 404 while its old artifact is present"
+        );
+
+        // A token for a track that is not a member of the current source is
+        // rejected too.
+        let not_a_member = format!("/api/v0/items/{item_id}/subtitles/s-fr.vtt?g={second_token}");
+        let (status, _) = send(
+            state.clone(),
+            "GET",
+            &not_a_member,
+            Some((&name, &value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// D2B.2 acceptance 3/4: the two sides of the rename/publication boundary.
+    /// A missing artifact is never served even when the committed reference is
+    /// present; a present artifact is served only once committed.
+    #[tokio::test]
+    async fn artifact_is_served_only_when_committed_and_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner-a");
+        let token = token_for(&state, &owner);
+        let item_id = certified_item(
+            &state,
+            dir.path(),
+            "clip.mkv",
+            &[observed_sidecar("s-en", "clip.en.srt", "7-aaa-bbb", 7)],
+        );
+        let (name, value) = bearer(&token);
+
+        let source = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let generation = source.token_for_track("s-en").expect("sidecar token");
+        let url = format!("/api/v0/items/{item_id}/subtitles/s-en.vtt?g={generation}");
+
+        // (a) Before the finalize: no bytes, not committed.
+        let (status, _) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no artifact yet");
+
+        // (b) After the finalize, before the DB publication: an orphan.
+        let revision = place_artifact(
+            &state,
+            item_id,
+            "s-en",
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n",
+        );
+        let (status, _) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "uncommitted bytes");
+
+        // (c) The committed reference without the artifact: a torn state is
+        // never served from the database alone.
+        state
+            .db
+            .publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: generation.clone(),
+                    artifact_revision: revision,
+                    state: SubtitleArtifactState::Complete,
+                },
+            )
+            .unwrap();
+        state
+            .subs
+            .remove_item(item_id)
+            .expect("remove the artifact for the torn-state case");
+        let (status, _) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "committed but absent");
+
+        // (d) Both sides present again: the committed revision is served.
+        state
+            .subs
+            .publish_item_vtt(
+                item_id,
+                &generation,
+                "s-en",
+                revision,
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n",
+            )
+            .unwrap();
+        let (status, body) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("hi"), "{body}");
+    }
+
+    /// Round-2 item 4 / D2B.2 acceptance 4: serving never combines an old
+    /// item-level `ready` with a new certified source. After one sidecar
+    /// changes, the item-level field is unchanged (the decision forbids
+    /// clearing it item-wide) yet neither the old nor the new generation is
+    /// serveable until the new one is committed.
+    #[tokio::test]
+    async fn mixed_read_serving_rejects_a_new_source_under_an_old_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner-a");
+        let token = token_for(&state, &owner);
+        let item_id = certified_item(
+            &state,
+            dir.path(),
+            "clip.mkv",
+            &[observed_sidecar("s-en", "clip.en.srt", "7-aaa-bbb", 7)],
+        );
+        let (name, value) = bearer(&token);
+
+        let first = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let first_token = first.token_for_track("s-en").unwrap();
+        // Every serveable member needs a complete reference before the coarse
+        // lifecycle becomes `ready` (ADR-0013 §13.4).
+        for (track, body) in [
+            ("e2", "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\ne2\n"),
+            ("s-en", "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n"),
+        ] {
+            publish_complete(&state, item_id, track, body);
+        }
+        assert_eq!(
+            state.db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready"
+        );
+
+        // The sidecar changes. The item-level `ready` is deliberately left
+        // alone, so a serving read that mixed it with the new source would
+        // hand out a URL the new generation never published.
+        state
+            .db
+            .reconcile_item_sidecars(
+                item_id,
+                &[observed_sidecar("s-en", "clip.en.srt", "9-ccc-ddd", 9)],
+            )
+            .unwrap();
+        let second = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let second_token = second.token_for_track("s-en").unwrap();
+        assert_eq!(
+            state.db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready",
+            "the coarse item-level field is not cleared item-wide"
+        );
+
+        // The old URL is stale, and the new one has no committed reference yet.
+        for stale in [&first_token, &second_token] {
+            let url = format!("/api/v0/items/{item_id}/subtitles/s-en.vtt?g={stale}");
+            let (status, _) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "an item-level ready must not serve a generation without its own reference"
+            );
+        }
+        // And the item detail does not hand out a URL for either generation.
+        let (status, body) = send(
+            state.clone(),
+            "GET",
+            &format!("/api/v0/items/{item_id}/playback-info"),
+            Some((&name, &value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains(&second_token) && !body.contains(&first_token),
+            "no URL may be minted without a committed per-track reference: {body}"
+        );
+
+        // Committing the new generation makes exactly that URL serve.
+        publish_complete(
+            &state,
+            item_id,
+            "s-en",
+            "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nnew\n",
+        );
+        let url = format!("/api/v0/items/{item_id}/subtitles/s-en.vtt?g={second_token}");
+        let (status, body) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("new"), "{body}");
+    }
+
+    /// Round-2 item 1/5: one sidecar edit must not withdraw unrelated tracks.
+    /// The unchanged embedded track and the unchanged sidecar keep their URLs
+    /// and their artifacts; only the edited sidecar loses its reference.
+    #[tokio::test]
+    async fn one_sidecar_edit_preserves_unrelated_urls_and_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner-a");
+        let token = token_for(&state, &owner);
+        let item_id = certified_item(
+            &state,
+            dir.path(),
+            "clip.mkv",
+            &[
+                observed_sidecar("s-en", "clip.en.srt", "7-aaa-bbb", 7),
+                observed_sidecar("s-fr", "clip.fr.srt", "6-aaa-bbb", 6),
+            ],
+        );
+        let (name, value) = bearer(&token);
+
+        let first = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let embedded_token = first.token_for_track("e2").expect("embedded token");
+        let english_token = first.token_for_track("s-en").unwrap();
+        let french_token = first.token_for_track("s-fr").unwrap();
+        for track in ["e2", "s-en", "s-fr"] {
+            publish_complete(
+                &state,
+                item_id,
+                track,
+                &format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n{track}\n"),
+            );
+        }
+
+        // Only the English sidecar changes.
+        state
+            .db
+            .reconcile_item_sidecars(
+                item_id,
+                &[
+                    observed_sidecar("s-en", "clip.en.srt", "9-ccc-ddd", 9),
+                    observed_sidecar("s-fr", "clip.fr.srt", "6-aaa-bbb", 6),
+                ],
+            )
+            .unwrap();
+        let second = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .unwrap();
+        let english_second = second.token_for_track("s-en").unwrap();
+        assert_ne!(english_token, english_second);
+
+        // The unchanged tracks keep their exact tokens and serve their bytes.
+        for (track, token, body_marker) in [
+            ("e2", &embedded_token, "e2"),
+            ("s-fr", &french_token, "s-fr"),
+        ] {
+            assert_eq!(
+                second.token_for_track(track).as_deref(),
+                Some(token.as_str()),
+                "{track} keeps its unchanged URL"
+            );
+            let url = format!("/api/v0/items/{item_id}/subtitles/{track}.vtt?g={token}");
+            let (status, body) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+            assert_eq!(status, StatusCode::OK, "{track}: {body}");
+            assert!(body.contains(body_marker), "{track}: {body}");
+        }
+
+        // The edited sidecar's old URL is stale; the new one has no reference.
+        for stale in [&english_token, &english_second] {
+            let url = format!("/api/v0/items/{item_id}/subtitles/s-en.vtt?g={stale}");
+            let (status, _) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "s-en {stale}");
+        }
+
+        // The item detail keeps the two unchanged URLs and withholds s-en's.
+        let (status, body) = send(
+            state.clone(),
+            "GET",
+            &format!("/api/v0/items/{item_id}/playback-info"),
+            Some((&name, &value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(&embedded_token), "{body}");
+        assert!(body.contains(&french_token), "{body}");
+        assert!(!body.contains(&english_second), "{body}");
+    }
+
+    /// D2B.2 corrective reset item 4: real playback-info demand is driven by the
+    /// missing per-track publication, not the coarse lifecycle field. A formerly
+    /// `ready` item whose sidecar was edited and a formerly `none` item that
+    /// gained its first sidecar both repair through the endpoint, and the
+    /// repaired artifact serves.
+    #[tokio::test]
+    async fn playback_info_demand_repairs_an_edited_sidecar_and_a_first_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_support::state(dir.path());
+        let owner = actor(&state, "owner-a");
+        let token = token_for(&state, &owner);
+        let (name, value) = bearer(&token);
+
+        // A browser direct-plays mp4/h264/aac, which is the client gate for a
+        // standalone extract (ADR-0041 Decision 3/5).
+        let media = dir.path().join("edited.mp4");
+        std::fs::write(&media, b"not a real mp4").unwrap();
+        let sidecar_path = dir.path().join("edited.en.srt");
+        std::fs::write(
+            &sidecar_path,
+            "1\n00:00:00,000 --> 00:00:01,000\nFirst body\n",
+        )
+        .unwrap();
+
+        // Case A: certified with the sidecar, so the probe classified it
+        // `eligible`. The endpoint's first demand publishes it complete.
+        let edited_item = certified_item_with_streams(
+            &state,
+            dir.path(),
+            "edited.mp4",
+            &[],
+            &[observed_sidecar_on_disk(
+                "s-en",
+                "edited.en.srt",
+                &sidecar_path,
+            )],
+        );
+        let info_uri = format!("/api/v0/items/{edited_item}/playback-info");
+        let (status, _) = send(state.clone(), "GET", &info_uri, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            wait_until(|| state
+                .db
+                .get_item(edited_item)
+                .unwrap()
+                .unwrap()
+                .subtitle_status
+                == "ready"),
+            "the first demand must publish the sidecar"
+        );
+        let first_token = state
+            .db
+            .certified_subtitle_source(edited_item)
+            .unwrap()
+            .unwrap()
+            .token_for_track("s-en")
+            .expect("first token");
+
+        // Edit the sidecar. Reconciliation withdraws only its reference; the
+        // coarse `ready` stays, so only the content signal can demand a repair.
+        std::fs::write(
+            &sidecar_path,
+            "1\n00:00:00,000 --> 00:00:02,000\nA longer replacement body\n",
+        )
+        .unwrap();
+        state
+            .db
+            .reconcile_item_sidecars(
+                edited_item,
+                &[observed_sidecar_on_disk(
+                    "s-en",
+                    "edited.en.srt",
+                    &sidecar_path,
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .get_item(edited_item)
+                .unwrap()
+                .unwrap()
+                .subtitle_status,
+            "ready",
+            "the coarse field is not cleared item-wide"
+        );
+        assert!(
+            state
+                .db
+                .subtitle_listing_source(edited_item)
+                .unwrap()
+                .unwrap()
+                .needs_publication(),
+            "the edited sidecar must still demand work under a stale `ready`"
+        );
+
+        let (status, body) = send(state.clone(), "GET", &info_uri, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let second_token = wait_for_token(&state, edited_item, "s-en", &first_token);
+        let url = format!("/api/v0/items/{edited_item}/subtitles/s-en.vtt?g={second_token}");
+        let (status, body) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK, "repaired artifact: {body}");
+        assert!(body.contains("A longer replacement body"), "{body}");
+
+        // Case B: an item that had no subtitle at all is `none` and gains its
+        // first sidecar. The coarse field never moves, yet the demand repairs it.
+        // A separate library root: one root hosts one library row.
+        let second_root = dir.path().join("second");
+        std::fs::create_dir_all(&second_root).unwrap();
+        std::fs::write(second_root.join("silent.mp4"), b"not a real mp4").unwrap();
+        let first_sidecar_path = second_root.join("silent.en.srt");
+        let silent_item = certified_item_with_streams(&state, &second_root, "silent.mp4", &[], &[]);
+        assert_eq!(
+            state
+                .db
+                .get_item(silent_item)
+                .unwrap()
+                .unwrap()
+                .subtitle_status,
+            "none"
+        );
+        std::fs::write(
+            &first_sidecar_path,
+            "1\n00:00:00,000 --> 00:00:01,000\nFirst ever body\n",
+        )
+        .unwrap();
+        state
+            .db
+            .reconcile_item_sidecars(
+                silent_item,
+                &[observed_sidecar_on_disk(
+                    "s-en",
+                    "silent.en.srt",
+                    &first_sidecar_path,
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .get_item(silent_item)
+                .unwrap()
+                .unwrap()
+                .subtitle_status,
+            "none",
+            "reconciliation leaves the coarse field alone"
+        );
+        let (status, _) = send(
+            state.clone(),
+            "GET",
+            &format!("/api/v0/items/{silent_item}/playback-info"),
+            Some((&name, &value)),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let silent_token = wait_for_token(&state, silent_item, "s-en", "never-published");
+        let url = format!("/api/v0/items/{silent_item}/subtitles/s-en.vtt?g={silent_token}");
+        let (status, body) = send(state.clone(), "GET", &url, Some((&name, &value)), "").await;
+        assert_eq!(status, StatusCode::OK, "first sidecar artifact: {body}");
+        assert!(body.contains("First ever body"), "{body}");
+    }
+
+    /// Wait, bounded, until `track_id` has a complete committed publication
+    /// under a token other than `previous`, and return that token.
+    fn wait_for_token(state: &AppState, item_id: i64, track_id: &str, previous: &str) -> String {
+        let published = || {
+            state
+                .db
+                .certified_subtitle_source(item_id)
+                .ok()
+                .flatten()
+                .filter(|source| source.is_complete(track_id))
+                .and_then(|source| source.token_for_track(track_id))
+        };
+        assert!(
+            wait_until(|| published()
+                .as_deref()
+                .is_some_and(|token| token != previous)),
+            "the demand must publish a complete artifact for {track_id}"
+        );
+        published().expect("published token")
+    }
+
+    /// Finalize one track's artifact bytes at a freshly reserved revision
+    /// without committing a publication reference. That is the orphan state of
+    /// ADR-0013 §13.3: never serveable. Returns the revision.
+    fn place_artifact(state: &AppState, item_id: i64, track_id: &str, body: &str) -> u64 {
+        let source = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        let token = source.token_for_track(track_id).expect("member token");
+        let revision = state
+            .db
+            .reserve_subtitle_artifact_revision(item_id)
+            .unwrap();
+        state
+            .subs
+            .publish_item_vtt(item_id, &token, track_id, revision, body)
+            .unwrap();
+        revision
+    }
+
+    /// Publish one track the way the worker does: reserve a revision, finalize
+    /// the bytes there, then commit the per-track reference. Returns the
+    /// revision.
+    fn publish_complete(state: &AppState, item_id: i64, track_id: &str, body: &str) -> u64 {
+        let source = state
+            .db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        let token = source.token_for_track(track_id).expect("member token");
+        let revision = state
+            .db
+            .reserve_subtitle_artifact_revision(item_id)
+            .unwrap();
+        state
+            .subs
+            .publish_item_vtt(item_id, &token, track_id, revision, body)
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .publish_subtitle_artifact(
+                    &source,
+                    &SubtitleArtifactPublication {
+                        track_id: track_id.to_string(),
+                        token,
+                        artifact_revision: revision,
+                        state: SubtitleArtifactState::Complete,
+                    },
+                )
+                .unwrap(),
+            SubtitlePublication::Published
+        );
+        revision
+    }
+
+    /// A serveable sidecar observation whose mtime/size come from the file on
+    /// disk, so the D2B.2 recheck before publication matches the captured tuple
+    /// (ADR-0013 §13.3.2).
+    fn observed_sidecar_on_disk(
+        track_id: &str,
+        relpath: &str,
+        abs: &std::path::Path,
+    ) -> ObservedSidecar {
+        let meta = std::fs::metadata(abs).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        ObservedSidecar {
+            track_id: track_id.into(),
+            path: relpath.into(),
+            mtime_ms,
+            size_bytes: meta.len() as i64,
+            format: "srt".into(),
+            language: Some("eng".into()),
+            forced: false,
+            sdh: false,
+            content_id: format!("{}-{mtime_ms}", meta.len()),
+        }
+    }
+
+    /// Wait, bounded, until `predicate` holds. A background worker's completion
+    /// has no in-crate rendezvous the API tests can observe, so the wait polls
+    /// the durable state the worker commits.
+    fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if predicate() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// One serveable sidecar observation with a durable identity.
+    fn observed_sidecar(
+        track_id: &str,
+        path: &str,
+        content_id: &str,
+        size_bytes: i64,
+    ) -> ObservedSidecar {
+        ObservedSidecar {
+            track_id: track_id.into(),
+            path: path.into(),
+            mtime_ms: 5,
+            size_bytes,
+            format: "srt".into(),
+            language: Some(if track_id == "s-fr" { "fra" } else { "eng" }.into()),
+            forced: false,
+            sdh: false,
+            content_id: content_id.into(),
+        }
+    }
+
+    /// One item with a certified probe snapshot (one embedded text stream) and
+    /// the given serveable sidecars. Returns the item id.
+    fn certified_item(
+        state: &AppState,
+        library_root: &std::path::Path,
+        item_path: &str,
+        sidecars: &[ObservedSidecar],
+    ) -> i64 {
+        certified_item_with_streams(
+            state,
+            library_root,
+            item_path,
+            &[(2, "subrip", "text")],
+            sidecars,
+        )
+    }
+
+    /// The same certified item with an explicit embedded subtitle inventory.
+    /// The item row's mtime/size come from the file on disk when it exists,
+    /// because the D2B.2 extract rechecks that captured tuple before it
+    /// publishes (ADR-0013 §13.3.2).
+    fn certified_item_with_streams(
+        state: &AppState,
+        library_root: &std::path::Path,
+        item_path: &str,
+        streams: &[(i64, &str, &str)],
+        sidecars: &[ObservedSidecar],
+    ) -> i64 {
+        let library = state
+            .db
+            .create_library(&NewLibrary {
+                name: "movies".into(),
+                path: library_root.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let (mtime_ms, size_bytes) = match std::fs::metadata(library_root.join(item_path)) {
+            Ok(meta) => (
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+                meta.len() as i64,
+            ),
+            Err(_) => (1, 1),
+        };
+        let item_id = state
+            .db
+            .upsert_items_indexed(
+                library.id,
+                &[UpsertItem {
+                    path: item_path.into(),
+                    mtime_ms,
+                    size_bytes,
+                    title: "clip".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some("1-aaa-bbb".into()),
+                }],
+            )
+            .unwrap()[0];
+        let expectation = {
+            let row = state.db.get_item(item_id).unwrap().unwrap();
+            let lib = state.db.get_library(row.library_id).unwrap().unwrap();
+            nightjar_db::ProbeExpectation {
+                item_id,
+                library_id: row.library_id,
+                library_root: lib.path,
+                path: row.path,
+                media_revision: row.media_revision,
+                probe_revision: row.probe_revision,
+                content_id: row.content_id,
+                mtime_ms: row.mtime_ms,
+                size_bytes: row.size_bytes,
+            }
+        };
+        state
+            .db
+            .publish_probe(
+                &expectation,
+                &nightjar_db::ProbeOutcome::Success(Box::new(nightjar_db::ProbeSnapshot {
+                    duration_ms: Some(4000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("h264".into()),
+                    video_stream_index: Some(0),
+                    audio_codec: Some("aac".into()),
+                    audio_channels: Some(2),
+                    width: Some(160),
+                    height: Some(120),
+                    video_bitrate_bps: None,
+                    video_frame_rate_num: Some(10),
+                    video_frame_rate_den: Some(1),
+                    hdr: None,
+                    audio_tracks: vec![],
+                    subtitle_tracks: streams
+                        .iter()
+                        .map(
+                            |(stream_index, codec, kind)| nightjar_db::SubtitleTrackRow {
+                                media_item_id: item_id,
+                                stream_index: *stream_index,
+                                codec: (*codec).into(),
+                                language: Some("eng".into()),
+                                title: None,
+                                forced: false,
+                                sdh: false,
+                                kind: (*kind).into(),
+                            },
+                        )
+                        .collect(),
+                    subtitle_status: if streams.is_empty() && sidecars.is_empty() {
+                        "none".into()
+                    } else {
+                        "eligible".into()
+                    },
+                })),
+            )
+            .unwrap();
+        if !sidecars.is_empty() {
+            state.db.reconcile_item_sidecars(item_id, sidecars).unwrap();
+        }
+        item_id
     }
 
     /// Creates a session as `owner` and returns its id.
@@ -2080,7 +2843,10 @@ mod ownership_tests {
             format!("/api/v0/sessions/{session_id}/v/single/index.m3u8"),
             format!("/api/v0/sessions/{session_id}/runs/0/init.mp4"),
             format!("/api/v0/sessions/{session_id}/init.mp4"),
-            format!("/api/v0/sessions/{session_id}/subs/s-en.m3u8"),
+            // D2B.2 disables HLS subtitle renditions until D2B.3, so the
+            // playlist is 404 for the owner too and is not an owned resource
+            // that can be read. The subtitle segment ownership boundary is
+            // covered below.
         ]
     }
 

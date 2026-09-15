@@ -505,6 +505,14 @@ paths:
       security: [{ bearerAuth: [] }, { cookieAuth: [] }]
       operationId: getSubtitleVtt
       summary: WebVTT for one text subtitle track (ADR-0010)
+      description: >
+        Serves an immutable, generation-addressed subtitle artifact
+        (ADR-0013 §13). The `g` query parameter is required and opaque:
+        the server mints it and clients must pass back exactly the `url`
+        from `playbackInfo` without constructing or editing it. A URL whose
+        `g` no longer matches the current certified source, or that names a
+        track which is not a current member, returns 404 even if an older
+        artifact is still on disk.
       parameters:
         - $ref: "#/components/parameters/ItemId"
         - name: trackId
@@ -516,6 +524,17 @@ paths:
           schema:
             type: string
             pattern: '^[es]([A-Za-z0-9._-]*)$'
+        - name: g
+          in: query
+          required: true
+          description: >
+            Opaque, versioned, bounded generation token minted by the server
+            (ADR-0013 §13.1). Clients treat it as an uninterpreted string and
+            never construct one.
+          schema:
+            type: string
+            maxLength: 65
+            pattern: '^v1-m(0|[1-9][0-9]*)-p(0|[1-9][0-9]*)(-s(0|[1-9][0-9]*))?$'
       responses:
         "200":
           description: WebVTT body
@@ -524,7 +543,9 @@ paths:
               schema:
                 type: string
         "404":
-          description: Item or serveable subtitle track not found
+          description: >
+            Item, current certified member, matching generation, or published
+            artifact not found.
           content:
             application/json:
               schema:

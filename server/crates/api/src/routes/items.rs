@@ -14,11 +14,14 @@ use nightjar_core::{
     decide_playback, known_profile, needs_standalone_subtitle_extract, resolve_profile_bag,
     title_looks_forced, title_looks_sdh,
 };
-use nightjar_db::{MediaItemRow, SidecarRow, resolve_media_path};
+use nightjar_db::{
+    CertifiedSubtitleSource, MediaItemRow, SidecarRow, SubtitleArtifactState,
+    SubtitleListingSource, is_valid_generation_token, resolve_media_path,
+};
 use nightjar_metadata::{ArtworkKind, ItemMetadata, item_metadata, rating_max};
 use nightjar_transcode::{
-    TrackReadiness, is_burn_in_sidecar_format, is_serveable_sidecar_format, list_audio_tracks,
-    list_burn_in_subtitles, list_text_subtitles, stored_webvtt,
+    TrackReadiness, burn_in_kind_for_codec, is_burn_in_sidecar_format, is_serveable_sidecar_format,
+    list_audio_tracks, stored_webvtt,
 };
 use serde::{Deserialize, Serialize};
 
@@ -388,8 +391,9 @@ pub async fn playback_info(
     Path(item_id): Path<i64>,
     Query(query): Query<ProfileQuery>,
 ) -> ApiResult<Json<PlaybackInfoDto>> {
-    // Every step below blocks: two DB reads, and `subtitle_tracks_for` /
-    // `audio_tracks_for` each wait on an ffprobe child reading over SMB.
+    // Every step below blocks: DB reads, and `audio_tracks_for` waits on an
+    // ffprobe child reading over SMB. `subtitle_tracks_for` reads the ADR-0058
+    // coherent stored inventory and does not probe (D2B.2 acceptance 6).
     blocking(move || {
         crate::authority::require_item_visible(&state, &caller, item_id)?;
         playback_info_blocking(
@@ -426,10 +430,19 @@ fn playback_info_blocking(
     let decision = decide(&row, &profile, state.tonemap_available);
     let root = library_root(&state, row.library_id)?;
     let abs = abs_path(&root, &row.path);
-    let subtitle_tracks = subtitle_tracks_for(&state, &row, &root).unwrap_or_else(|e| {
-        tracing::warn!(item_id, error = %e, "subtitle list failed");
-        Vec::new()
-    });
+    // One coherent read obtains the certification, the durable sidecar
+    // membership, the committed per-track publications and the coarse
+    // lifecycle fields (ADR-0013 §13.4). Listing and demand both read it, so
+    // neither can combine an observation of one generation with another's
+    // publication state.
+    let subtitle_source = state
+        .db
+        .subtitle_listing_source(row.id)
+        .unwrap_or_else(|e| {
+            tracing::warn!(item_id, error = %e, "subtitle source read failed");
+            None
+        });
+    let subtitle_tracks = subtitle_tracks_for(&row, subtitle_source.as_ref());
     // Listed the same for every method: the client asks for a track and never
     // reasons about delivery to find one (ADR-0012).
     let audio_tracks = audio_tracks_for(&row, &root).unwrap_or_else(|e| {
@@ -458,12 +471,19 @@ fn playback_info_blocking(
     };
 
     // ADR-0041 Decision 5: the on-demand trigger. Standalone extraction runs
-    // only for an `eligible` item on a client that cannot read embedded
-    // container subtitles (Decision 3) via a method that will not produce the
-    // rendition as a side output (Decision 4). Replaces ADR-0013 §11's
-    // unconditional `pending` bump; remux/transcode sessions get subtitles as
-    // a side output instead (ADR-0041 Decision 7, step 4).
-    if row.subtitle_status == "eligible"
+    // only on a client that cannot read embedded container subtitles
+    // (Decision 3) via a method that will not produce the rendition as a side
+    // output (Decision 4). Replaces ADR-0013 §11's unconditional `pending`
+    // bump; remux/transcode sessions get subtitles as a side output instead
+    // (ADR-0041 Decision 7, step 4).
+    //
+    // ADR-0013 §13.4: the demand comes from the per-track publications, not the
+    // coarse lifecycle field. A formerly `ready` item whose sidecar was edited
+    // and a formerly `none` item that gained its first sidecar both still have a
+    // member without a complete committed publication, and both must repair.
+    if subtitle_source
+        .as_ref()
+        .is_some_and(|source| source.needs_publication() && subtitle_extract_allowed(source))
         && needs_standalone_subtitle_extract(query.profile_id.as_deref(), decision.method)
     {
         state
@@ -540,34 +560,79 @@ fn playback_info_blocking(
     }))
 }
 
+/// Generation query for a subtitle artifact URL (D2B.2). Clients receive the
+/// URL from `playbackInfo`; they never construct it.
+#[derive(Deserialize)]
+pub struct SubtitleAssetQuery {
+    #[serde(default)]
+    pub g: Option<String>,
+}
+
 pub async fn subtitle_vtt(
     State(state): State<AppState>,
     caller: Caller,
     Path((item_id, asset)): Path<(i64, String)>,
+    Query(query): Query<SubtitleAssetQuery>,
 ) -> ApiResult<Response> {
     let track_id = asset
         .strip_suffix(".vtt")
         .filter(|id| super::track_ids::is_valid_track_id(id))
         .ok_or_else(|| ApiError::not_found(format!("subtitle asset {asset} not found")))?
         .to_string();
+    let token = query
+        .g
+        .filter(|g| is_valid_generation_token(g))
+        .ok_or_else(|| ApiError::not_found("subtitle URL has no current generation"))?;
     // The DB read and the subs-store lookups block; the body read does not.
     let (path, cache) = blocking(move || {
         crate::authority::require_item_visible(&state, &caller, item_id)?;
-        let row = state
+
+        // One coherent DB read obtains the certification, membership, token,
+        // per-track publication state and `subtitle_content_id` (ADR-0013
+        // §13.4). Serving never combines an older item-level observation with a
+        // newer certified source.
+        let source = state
             .db
-            .get_item(item_id)
+            .certified_subtitle_source(item_id)
             .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::not_found(format!("item {item_id} not found")))?;
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "item {item_id} not found or its subtitle source is not certified"
+                ))
+            })?;
+        if source.token_for_track(&track_id).as_deref() != Some(token.as_str()) {
+            return Err(ApiError::not_found(
+                "subtitle generation is stale or the track is not a current member",
+            ));
+        }
 
-        // ADR-0013: playback never extracts; serve a stored file or 404.
-        let path = stored_webvtt(&state.subs, item_id, &track_id).map_err(ApiError::not_found)?;
+        // A track is served only through its committed per-track publication
+        // reference. A file on disk is never enough: an artifact renamed but
+        // not committed is an orphan, and a stale URL is rejected even when
+        // cleanup has not run (ADR-0013 §13.4/§13.7).
+        let Some(artifact) = source.artifact_for(&track_id) else {
+            return Err(ApiError::not_found("subtitle artifact is not published"));
+        };
+        let readiness = match artifact.state {
+            SubtitleArtifactState::Complete => TrackReadiness::Complete,
+            SubtitleArtifactState::Partial => TrackReadiness::Partial,
+        };
 
-        let (readiness, _) = state
-            .subs
-            .track_readiness(item_id, &track_id, &row.subtitle_status);
+        // ADR-0013 §13.2: the filename comes exclusively from the committed
+        // publication row's artifact revision, never from the request.
+        // Playback never extracts; serve the stored file or 404.
+        let path = stored_webvtt(
+            &state.subs,
+            item_id,
+            &token,
+            &track_id,
+            artifact.artifact_revision,
+        )
+        .map_err(ApiError::not_found)?;
+
         // A growing partial must not be cached: the next GET needs the newer body.
         let cache = match readiness {
-            TrackReadiness::Complete if row.subtitle_status == "ready" => "private, max-age=3600",
+            TrackReadiness::Complete => "private, max-age=3600",
             _ => "private, no-cache",
         };
         Ok((path, cache))
@@ -608,50 +673,80 @@ pub(crate) fn audio_tracks_for(
     Ok(tracks)
 }
 
+/// ADR-0013 §13.4: whether a missing per-track publication may start a
+/// standalone extract. The coarse lifecycle and its backoff gate new work, but
+/// they never decide whether there is work to do.
+///
+/// `error` is a permanent failure until the source row is re-upserted, and
+/// `unavailable` is refused until the scan-time requeue moves it back to
+/// `pending` past its retry deadline. Every other state — including a stale
+/// `ready` or `none` — still demands the publications its members are missing.
+fn subtitle_extract_allowed(source: &SubtitleListingSource) -> bool {
+    !matches!(source.subtitle_status.as_str(), "error" | "unavailable")
+}
+
+/// List an item's subtitle tracks from one coherent subtitle-source read
+/// (ADR-0013 §13.4).
+///
+/// D2B.2 acceptance 6: the embedded inventory comes from the ADR-0058 coherent
+/// stored snapshot, never a playback-time ffprobe. An item whose snapshot is not
+/// certified lists no embedded tracks; its durable sidecar rows still come from
+/// the same read and are listed without delivery. The sidecar set is never
+/// reloaded separately, so a listing cannot mix two generations.
 pub(crate) fn subtitle_tracks_for(
-    state: &AppState,
     row: &MediaItemRow,
-    library_root: &str,
-) -> Result<Vec<SubtitleTrackDto>, String> {
+    source: Option<&SubtitleListingSource>,
+) -> Vec<SubtitleTrackDto> {
     let mut tracks = Vec::new();
-    let src_buf = abs_path(library_root, &row.path);
-    let src = src_buf.as_path();
-    for s in list_text_subtitles(src)? {
-        let forced = s.is_forced || title_looks_forced(s.title.as_deref());
-        let sdh = title_looks_sdh(s.title.as_deref());
-        tracks.push(serveable_track_dto(
-            state,
-            row,
-            ServeableTrack {
-                track_id: s.track_id(),
+    let certified = source.and_then(|source| source.certified());
+    if let Some(snapshot) = source.and_then(|source| source.snapshot.as_ref()) {
+        for t in &snapshot.snapshot.subtitle_tracks {
+            if t.kind != "text" {
+                continue;
+            }
+            let Some(stream_index) = u32::try_from(t.stream_index).ok() else {
+                continue;
+            };
+            tracks.push(serveable_track_dto(
+                row,
+                certified.as_ref(),
+                ServeableTrack {
+                    track_id: format!("e{stream_index}"),
+                    source: "embedded",
+                    codec: t.codec.clone(),
+                    language: t.language.clone(),
+                    label: t.title.clone(),
+                    forced: t.forced || title_looks_forced(t.title.as_deref()),
+                    sdh: t.sdh || title_looks_sdh(t.title.as_deref()),
+                    stream_index: Some(stream_index),
+                },
+            ));
+        }
+        for t in &snapshot.snapshot.subtitle_tracks {
+            if t.kind == "text" || burn_in_kind_for_codec(&t.codec).is_none() {
+                continue;
+            }
+            let Some(stream_index) = u32::try_from(t.stream_index).ok() else {
+                continue;
+            };
+            tracks.push(burn_in_track_dto(ServeableTrack {
+                track_id: format!("e{stream_index}"),
                 source: "embedded",
-                codec: s.codec,
-                language: s.language,
-                label: s.title,
-                forced,
-                sdh,
-                stream_index: Some(s.stream_index),
-            },
-        ));
+                codec: t.codec.clone(),
+                language: t.language.clone(),
+                label: t.title.clone(),
+                forced: t.forced || title_looks_forced(t.title.as_deref()),
+                sdh: t.sdh || title_looks_sdh(t.title.as_deref()),
+                stream_index: Some(stream_index),
+            }));
+        }
     }
-    for s in list_burn_in_subtitles(src)? {
-        let forced = title_looks_forced(s.title.as_deref());
-        let sdh = title_looks_sdh(s.title.as_deref());
-        tracks.push(burn_in_track_dto(ServeableTrack {
-            track_id: s.track_id(),
-            source: "embedded",
-            codec: s.codec,
-            language: s.language,
-            label: s.title,
-            forced,
-            sdh,
-            stream_index: Some(s.stream_index),
-        }));
+    if let Some(source) = source {
+        for s in &source.sidecars {
+            tracks.push(sidecar_to_dto(row, certified.as_ref(), s));
+        }
     }
-    for s in state.db.list_item_sidecars(row.id)? {
-        tracks.push(sidecar_to_dto(state, row, &s));
-    }
-    Ok(tracks)
+    tracks
 }
 
 struct ServeableTrack {
@@ -668,19 +763,45 @@ struct ServeableTrack {
 /// Readiness-aware DTO for a track the server can actually serve (embedded
 /// text or a convertible sidecar). `url` only appears once cues exist.
 fn serveable_track_dto(
-    state: &AppState,
     row: &MediaItemRow,
+    certified: Option<&CertifiedSubtitleSource>,
     t: ServeableTrack,
 ) -> SubtitleTrackDto {
-    let (readiness, revision) =
-        state
-            .subs
-            .track_readiness(row.id, &t.track_id, &row.subtitle_status);
+    // No certified source, or a track the current source does not mint a token
+    // for, gets no URL: the server never hands out a URL a client could
+    // construct or that names a non-generation artifact (D2B.2 acceptance 4).
+    let Some(token) = certified.and_then(|source| source.token_for_track(&t.track_id)) else {
+        return SubtitleTrackDto {
+            url: None,
+            readiness: Some(TrackReadiness::Preparing.as_str()),
+            revision: Some(0),
+            track_id: t.track_id,
+            source: t.source,
+            codec: t.codec,
+            language: t.language,
+            label: t.label,
+            forced: t.forced,
+            sdh: t.sdh,
+            stream_index: t.stream_index,
+            render: "soft",
+        };
+    };
+    let (readiness, revision) = match certified.and_then(|source| source.artifact_for(&t.track_id))
+    {
+        Some(artifact) => (
+            match artifact.state {
+                SubtitleArtifactState::Complete => TrackReadiness::Complete,
+                SubtitleArtifactState::Partial => TrackReadiness::Partial,
+            },
+            artifact.revision,
+        ),
+        None => (TrackReadiness::Preparing, 0),
+    };
     let url = match readiness {
         TrackReadiness::Preparing => None,
         TrackReadiness::Partial | TrackReadiness::Complete => Some(format!(
-            "/api/v0/items/{}/subtitles/{}.vtt",
-            row.id, t.track_id
+            "/api/v0/items/{}/subtitles/{}.vtt?g={}",
+            row.id, t.track_id, token
         )),
     };
     SubtitleTrackDto {
@@ -716,11 +837,15 @@ fn burn_in_track_dto(t: ServeableTrack) -> SubtitleTrackDto {
     }
 }
 
-fn sidecar_to_dto(state: &AppState, row: &MediaItemRow, s: &SidecarRow) -> SubtitleTrackDto {
+fn sidecar_to_dto(
+    row: &MediaItemRow,
+    certified: Option<&CertifiedSubtitleSource>,
+    s: &SidecarRow,
+) -> SubtitleTrackDto {
     if is_serveable_sidecar_format(&s.format) {
         return serveable_track_dto(
-            state,
             row,
+            certified,
             ServeableTrack {
                 track_id: s.track_id.clone(),
                 source: "sidecar",

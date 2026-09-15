@@ -97,6 +97,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         33,
         include_str!("../migrations/033_sidecar_identity_generation.sql"),
     ),
+    (
+        34,
+        include_str!("../migrations/034_subtitle_publications.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -483,7 +487,43 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 33);
+        assert_eq!(v, 34);
+        // 034 (ADR-0013 §13.4): the committed per-track publication reference
+        // exists on a fresh install, keyed by (item, track, token), with the
+        // partial/complete state check and the item index.
+        let has_publications: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'subtitle_publications'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_publications, 1);
+        let has_publications_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_subtitle_publications_item'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_publications_index, 1);
+        // 034 (ADR-0013 §13.2): the positive immutable artifact revision and the
+        // per-item monotonic allocator exist on a fresh install.
+        for (table, col) in [
+            ("subtitle_publications", "artifact_revision"),
+            ("media_items", "subtitle_artifact_sequence"),
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    [table, col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{table}.{col}");
+        }
         // 033 (ADR-0010 §4 amendment): the sidecar identity and generation
         // columns and the durable allocator exist on a fresh install.
         for col in ["content_id", "sidecar_generation"] {
@@ -2350,7 +2390,7 @@ mod tests {
     }
 
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migrations 26 through 33
+    /// way a real install upgrading into it looks. Migrations 26 through 34
     /// and their schema are removed with it, so `migrate` sees a database at
     /// version 24 and applies all of them in order.
     ///
@@ -2415,8 +2455,10 @@ mod tests {
              DROP TABLE media_item_sidecars;
              ALTER TABLE media_item_sidecars_rewind RENAME TO media_item_sidecars;
              CREATE INDEX idx_media_item_sidecars_item ON media_item_sidecars(media_item_id);
+             DROP TABLE IF EXISTS subtitle_publications;
+             ALTER TABLE media_items DROP COLUMN subtitle_artifact_sequence;
              DELETE FROM schema_migrations
-             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33);",
+             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33, 34);",
         )
         .unwrap();
     }

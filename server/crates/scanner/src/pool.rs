@@ -3,11 +3,13 @@ use crate::reachability::{self, Availability, Reachability, message_looks_unavai
 use crate::walk::{WalkCache, mtime_ms_from};
 use nightjar_db::{
     AudioTrackRow, Db, ProbeAccounting, ProbeExpectation, ProbeOutcome, ProbePublication,
-    ProbeSnapshot, SidecarPresence, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
+    ProbeSnapshot, SidecarPresence, SubtitleArtifactPublication, SubtitleArtifactState,
+    SubtitlePublication, SubtitleTrackKind, SubtitleTrackRow, classify_subtitle_status,
 };
 use nightjar_transcode::{
-    ExtractOutcome, SidecarInput, SubsStore, extract_item_subtitles, is_burn_in_sidecar_format,
-    is_serveable_sidecar_format, subtitle_codec_kind,
+    ExtractOutcome, ExtractSource, SidecarInput, SubsStore, TextSubtitleStream,
+    extract_item_subtitles, is_burn_in_sidecar_format, is_serveable_sidecar_format,
+    message_is_source_changed, subtitle_codec_kind,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -51,6 +53,11 @@ pub struct WorkItem {
     pub scan_job_id: Option<i64>,
     /// First-play bump: may run while an index walk holds SMB (ADR-0013 §11).
     pub priority: bool,
+    /// Captured certified-source generation for an extract (D2B.2). Part of the
+    /// background single-flight identity: two demands for the same generation
+    /// collapse, a newer generation is distinct work. `None` for probe/map and
+    /// for an uncapturable source.
+    generation: Option<String>,
     batch: Option<Arc<ProbeBatchState>>,
     /// Set on the one physical probe WorkItem a [`ProbeSlot`] owns. The
     /// coalescing state lives on the slot; every other probe field here is
@@ -67,12 +74,18 @@ impl WorkItem {
             path,
             scan_job_id,
             priority: false,
+            generation: None,
             batch: None,
             probe_slot: None,
         }
     }
 
-    pub fn extract(item_id: i64, library_id: i64, path: PathBuf) -> Self {
+    pub fn extract(
+        item_id: i64,
+        library_id: i64,
+        path: PathBuf,
+        generation: Option<String>,
+    ) -> Self {
         Self {
             kind: WorkKind::Extract,
             item_id,
@@ -80,6 +93,7 @@ impl WorkItem {
             path,
             scan_job_id: None,
             priority: false,
+            generation,
             batch: None,
             probe_slot: None,
         }
@@ -93,6 +107,7 @@ impl WorkItem {
             path,
             scan_job_id: None,
             priority: false,
+            generation: None,
             batch: None,
             probe_slot: None,
         }
@@ -357,6 +372,27 @@ pub(crate) struct DeleteHoldTest {
     pub release_tx: std::sync::mpsc::Sender<()>,
 }
 
+/// Test-only hold that parks an extract worker after it has claimed the item
+/// and before it reads the certified source. It makes "a newer generation
+/// arrives during older work" deterministic (ADR-0013 §13.6): the test sees the
+/// worker inside `extracting`, issues the newer demand, then releases.
+/// `#[cfg(test)]` only: a release build has no field, no arming method and no
+/// park site.
+#[cfg(test)]
+struct ExtractHold {
+    /// Worker → test: "the extract for this item has claimed the item".
+    entered_tx: std::sync::mpsc::Sender<i64>,
+    /// Worker ← test: block here until the test sends the release.
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test half of [`ExtractHold`].
+#[cfg(test)]
+pub(crate) struct ExtractHoldTest {
+    pub entered_rx: std::sync::mpsc::Receiver<i64>,
+    pub release_tx: std::sync::mpsc::Sender<()>,
+}
+
 pub struct LibraryPool {
     db: Arc<Db>,
     subs: Arc<SubsStore>,
@@ -377,8 +413,10 @@ pub struct LibraryPool {
     /// is the only way to run a tree walk or index upsert pass.
     index_epoch: Mutex<()>,
     index_active: AtomicUsize,
-    /// Item ids whose extract worker is running (not merely queued).
-    extracting: Mutex<HashSet<i64>>,
+    /// Item ids whose extract worker is running, mapped to the captured source
+    /// identity it is executing (ADR-0013 §13.6). A newer generation arriving
+    /// during older work is distinct work, not a join.
+    extracting: Mutex<HashMap<i64, Option<String>>>,
     /// Item ids whose map worker is running (not merely queued).
     mapping: Mutex<HashSet<i64>>,
     /// One bulk-reader gate (ADR-0041 Decision 8.6 / ADR-0023 §2 amendment):
@@ -414,6 +452,24 @@ pub struct LibraryPool {
     /// ([`DeleteHold`]).
     #[cfg(test)]
     delete_hold: Mutex<Option<DeleteHold>>,
+    /// Test-only in-flight hold for an extract worker ([`ExtractHold`]).
+    #[cfg(test)]
+    extract_hold: Mutex<Option<ExtractHold>>,
+    /// Test-only count of extract runs that deferred because the certified
+    /// source was unverified (D2B.2 acceptance 1). The counter and the queue
+    /// condvar are the rendezvous the deferral test waits on, so it needs no
+    /// sleep.
+    #[cfg(test)]
+    unverified_deferrals: AtomicU64,
+    /// Test-only count of extract runs that finished for any reason. Bumped
+    /// before the queue condvar is notified, so a test can wait for a run to
+    /// complete without a sleep.
+    #[cfg(test)]
+    extract_finishes: AtomicU64,
+    /// Test-only count of extract runs that skipped every track because its
+    /// complete artifact was already committed (round-2 item 1).
+    #[cfg(test)]
+    complete_skips: AtomicU64,
     pub availability: Arc<Availability>,
 }
 
@@ -484,7 +540,7 @@ impl LibraryPool {
             repoint_holdoff_until: Mutex::new(HashMap::new()),
             index_epoch: Mutex::new(()),
             index_active: AtomicUsize::new(0),
-            extracting: Mutex::new(HashSet::new()),
+            extracting: Mutex::new(HashMap::new()),
             mapping: Mutex::new(HashSet::new()),
             bulk_reader: Mutex::new(()),
             completed_background: AtomicU64::new(0),
@@ -499,6 +555,14 @@ impl LibraryPool {
             probe_snapshot_fault: AtomicBool::new(false),
             #[cfg(test)]
             delete_hold: Mutex::new(None),
+            #[cfg(test)]
+            extract_hold: Mutex::new(None),
+            #[cfg(test)]
+            unverified_deferrals: AtomicU64::new(0),
+            #[cfg(test)]
+            extract_finishes: AtomicU64::new(0),
+            #[cfg(test)]
+            complete_skips: AtomicU64::new(0),
             availability,
         });
         let workers = std::thread::available_parallelism()
@@ -955,11 +1019,9 @@ impl LibraryPool {
 
     fn enqueue_background_unique(queue: &mut Queue, item: WorkItem) {
         // Same-pass enqueue + drain can otherwise queue the same item twice.
-        if queue
-            .background
-            .iter()
-            .any(|w| w.item_id == item.item_id && w.kind == item.kind)
-        {
+        if queue.background.iter().any(|w| {
+            w.item_id == item.item_id && w.kind == item.kind && w.generation == item.generation
+        }) {
             return;
         }
         queue.background.push_back(item);
@@ -1068,11 +1130,92 @@ impl LibraryPool {
         self.probe_snapshot_fault.store(true, Ordering::SeqCst);
     }
 
+    /// Arm the test-only hold for the next extract worker on this pool and
+    /// return its test half ([`ExtractHoldTest`]). The worker parks after it
+    /// has claimed the item and before it reads the certified source, so a test
+    /// can issue a newer-generation demand while the older run is provably
+    /// active. Holds are one-shot: extracts that start with no hold armed pass
+    /// through untouched.
+    #[cfg(test)]
+    pub(crate) fn arm_extract_hold(&self) -> ExtractHoldTest {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.extract_hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(ExtractHold {
+            entered_tx,
+            release_rx,
+        });
+        ExtractHoldTest {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    /// Park the extract worker at the in-flight hold when one is armed.
+    /// Consumes the armed hold, so exactly one extract per arm parks and every
+    /// later one passes through.
+    #[cfg(test)]
+    fn hold_extract_if_armed(&self, item_id: i64) {
+        let handle = self
+            .extract_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if handle.entered_tx.send(item_id).is_err() {
+            return;
+        }
+        let _ = handle.release_rx.recv();
+    }
+
+    /// Wait, without a fixed sleep, until `want` extract runs have deferred
+    /// because the certified source was unverified. The count is bumped before
+    /// the queue condvar is notified, so a waiter never misses the transition.
+    #[cfg(test)]
+    pub(crate) fn wait_unverified_deferrals(&self, want: u64) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while self.unverified_deferrals.load(Ordering::SeqCst) < want {
+            let (guard, _) = self
+                .available
+                .wait_timeout(queue, Duration::from_secs(10))
+                .unwrap_or_else(|e| e.into_inner());
+            queue = guard;
+        }
+    }
+
+    /// Wait, without a fixed sleep, until `want` extract runs have finished.
+    #[cfg(test)]
+    pub(crate) fn wait_extract_finishes(&self, want: u64) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while self.extract_finishes.load(Ordering::SeqCst) < want {
+            let (guard, _) = self
+                .available
+                .wait_timeout(queue, Duration::from_secs(10))
+                .unwrap_or_else(|e| e.into_inner());
+            queue = guard;
+        }
+    }
+
+    /// Wait, without a fixed sleep, until `want` extract runs have skipped every
+    /// track because its complete artifact was already committed.
+    #[cfg(test)]
+    pub(crate) fn wait_complete_skips(&self, want: u64) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while self.complete_skips.load(Ordering::SeqCst) < want {
+            let (guard, _) = self
+                .available
+                .wait_timeout(queue, Duration::from_secs(10))
+                .unwrap_or_else(|e| e.into_inner());
+            queue = guard;
+        }
+    }
+
     /// Arm the test-only hold for the next index pass's `delete_missing`
-    /// decision on this pool and return its test half ([`DeleteHoldTest`]). The
-    /// test waits on `entered_rx` for the pass to report, runs the hint it wants
-    /// to observe, then sends on `release_tx`. Passes that reach the decision
-    /// while no hold is armed pass through untouched.
+    /// decision on this pool and return its test half ([`DeleteHoldTest`]).
+    /// The test waits on `entered_rx` for the pass to report, runs the hint it
+    /// wants to observe, then sends on `release_tx`. Passes that reach the
+    /// decision while no hold is armed pass through untouched.
     #[cfg(test)]
     pub(crate) fn arm_delete_hold(&self) -> DeleteHoldTest {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1127,28 +1270,41 @@ impl LibraryPool {
     }
 
     /// Move an item's extract to the front of the queue (first-play path).
-    /// No-op when already extracting or already at the front. Does not
-    /// interrupt an in-flight demux. Priority extracts may run while an
-    /// index walk is active so the title being watched is not stuck behind
-    /// a multi-day backfill (ADR-0013 §11).
+    ///
+    /// Single-flight identity is the combined captured source identity
+    /// (ADR-0013 §13.6). A demand for the generation already extracting is a
+    /// join and does nothing; a demand for a newer generation while older work
+    /// is in flight is preserved as a successor and runs after the older item.
+    /// Does not interrupt an in-flight demux. Priority extracts may run while an
+    /// index walk is active so the title being watched is not stuck behind a
+    /// multi-day backfill (ADR-0013 §11).
     pub fn prioritize_extract(&self, item_id: i64, library_id: i64, path: PathBuf) {
         if self.availability.pause.is_paused(library_id) {
             return;
         }
+        // Capture the certified source generation at enqueue so the queue's
+        // single-flight identity includes it (D2B.2 acceptance 2). A source that
+        // cannot certify yields `None`; the worker defers such a job.
+        let generation = self
+            .db
+            .certified_subtitle_source(item_id)
+            .ok()
+            .flatten()
+            .map(|source| source.source_identity());
         if self
             .extracting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&item_id)
+            .get(&item_id)
+            .is_some_and(|active| *active == generation)
         {
+            // Same captured generation already in flight: one physical run.
             return;
         }
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = queue
-            .background
-            .iter()
-            .position(|w| w.item_id == item_id && w.kind == WorkKind::Extract)
-        {
+        if let Some(pos) = queue.background.iter().position(|w| {
+            w.item_id == item_id && w.kind == WorkKind::Extract && w.generation == generation
+        }) {
             if pos == 0 {
                 if let Some(front) = queue.background.front_mut() {
                     front.priority = true;
@@ -1161,7 +1317,7 @@ impl LibraryPool {
                 queue.background.push_front(item);
             }
         } else {
-            let mut item = WorkItem::extract(item_id, library_id, path);
+            let mut item = WorkItem::extract(item_id, library_id, path, generation);
             item.priority = true;
             queue.background.push_front(item);
         }
@@ -1796,33 +1952,74 @@ impl LibraryPool {
         let item_id = item.item_id;
         {
             let mut extracting = self.extracting.lock().unwrap_or_else(|e| e.into_inner());
-            extracting.insert(item_id);
+            extracting.insert(item_id, item.generation.clone());
         }
+        let captured_identity = item.generation.clone();
         let finish = || {
-            self.extracting
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&item_id);
+            let mut extracting = self.extracting.lock().unwrap_or_else(|e| e.into_inner());
+            // A successor's entry must not be removed by the older run that is
+            // finishing (ADR-0013 §13.6).
+            if extracting
+                .get(&item_id)
+                .is_some_and(|active| *active == captured_identity)
+            {
+                extracting.remove(&item_id);
+            }
+            drop(extracting);
+            #[cfg(test)]
+            {
+                // Bump under the queue lock the waiter holds while it checks,
+                // so the wakeup cannot be missed.
+                let _guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                self.extract_finishes.fetch_add(1, Ordering::SeqCst);
+                self.available.notify_all();
+            }
         };
-        let row = match self.db.get_item(item_id) {
-            Ok(Some(row)) => row,
+        // Test-only: prove the older run is active before a newer demand is
+        // issued (ADR-0013 §13.6 successor test).
+        #[cfg(test)]
+        self.hold_extract_if_armed(item_id);
+        // Technical state comes only from the coherent certified probe snapshot
+        // plus the durable sidecar rows (D2B.2 acceptance 1). An uncertified
+        // source defers promptly: no probe, no status write, no failure
+        // backoff, and no effect on AV playback.
+        let source = match self.db.certified_subtitle_source(item_id) {
+            Ok(Some(source)) => source,
             Ok(None) => {
+                tracing::info!(item_id, "subtitle extract deferred: source is unverified");
+                #[cfg(test)]
+                {
+                    // Bump under the queue lock the waiter holds while it
+                    // checks, so the wakeup cannot be missed.
+                    let _guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    self.unverified_deferrals.fetch_add(1, Ordering::SeqCst);
+                    self.available.notify_all();
+                }
                 finish();
                 return;
             }
             Err(e) => {
-                tracing::warn!(item_id, error = %e, "load subtitle item failed");
+                tracing::warn!(item_id, error = %e, "read certified subtitle source failed");
                 finish();
                 return;
             }
         };
-        // Permanent failure: no path to success until the source row is
-        // re-upserted (mtime/size change resets status to pending).
-        if row.subtitle_status == "error" {
+        // A work item executes only the generation it captured (ADR-0013
+        // §13.6). When the source has moved on, this run defers; the newer
+        // demand is already queued as a successor.
+        if let Some(captured) = &captured_identity
+            && source.source_identity() != *captured
+        {
+            tracing::info!(
+                item_id,
+                captured,
+                current = source.source_identity(),
+                "subtitle extract deferred: captured generation is no longer current"
+            );
             finish();
             return;
         }
-        let lib_root = match self.db.get_library(item.library_id) {
+        let lib_root = match self.db.get_library(source.snapshot.library_id) {
             Ok(Some(lib)) => lib.path,
             Ok(None) => {
                 tracing::warn!(
@@ -1839,67 +2036,150 @@ impl LibraryPool {
                 return;
             }
         };
-        let media_path = nightjar_db::resolve_media_path(&lib_root, &row.path);
-        let sidecars = match self.db.list_item_sidecars(item.item_id) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|s| SidecarInput {
-                    track_id: s.track_id,
-                    path: nightjar_db::resolve_media_path(&lib_root, &s.path),
-                    format: s.format,
+        let media_path = nightjar_db::resolve_media_path(&lib_root, &source.snapshot.path);
+        // Completed artifacts are immutable (ADR-0013 §13.2/§13.4): a track
+        // whose complete artifact is already committed for this token is
+        // skipped, so a later pass never re-demuxes it and never overwrites
+        // its bytes. One sidecar edit therefore cannot touch unrelated
+        // embedded or sidecar tracks under their unchanged tokens.
+        let embedded: Vec<TextSubtitleStream> = source
+            .snapshot
+            .snapshot
+            .subtitle_tracks
+            .iter()
+            .filter(|t| t.kind == "text")
+            .filter_map(|t| {
+                Some(TextSubtitleStream {
+                    stream_index: u32::try_from(t.stream_index).ok()?,
+                    codec: t.codec.clone(),
+                    language: t.language.clone(),
+                    title: t.title.clone(),
+                    is_default: false,
+                    is_forced: t.forced,
                 })
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::warn!(item_id = item.item_id, error = %e, "load subtitle sidecars failed");
-                finish();
-                return;
+            })
+            .filter(|s| !source.is_complete(&s.track_id()))
+            .collect();
+        let sidecars: Vec<SidecarInput> = source
+            .sidecars
+            .iter()
+            .filter(|s| !source.is_complete(&s.track_id))
+            .map(|s| SidecarInput {
+                track_id: s.track_id.clone(),
+                path: nightjar_db::resolve_media_path(&lib_root, &s.path),
+                format: s.format.clone(),
+                mtime_ms: s.mtime_ms,
+                size_bytes: s.size_bytes,
+            })
+            .collect();
+        let members = source.members();
+        if !members.is_empty() && embedded.is_empty() && sidecars.is_empty() {
+            // Every serveable track of the captured source is already committed
+            // complete: there is no work to do and nothing may be rewritten.
+            tracing::info!(
+                item_id,
+                tracks = members.len(),
+                "subtitle extract skipped: every track is already committed"
+            );
+            #[cfg(test)]
+            {
+                // Bump under the queue lock the waiter holds while it checks,
+                // so the wakeup cannot be missed.
+                let _guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                self.complete_skips.fetch_add(1, Ordering::SeqCst);
+                self.available.notify_all();
             }
-        };
+            finish();
+            return;
+        }
         // ADR-0014 reachability signal reused as the in-flight cancel: the
         // same pause set that blocks new starts aborts a running demux
         // (ADR-0041 Decision 8.7).
         let should_cancel = || self.availability.pause.is_paused(item.library_id);
+        // Per-track tokens and the source CAS both come from the captured
+        // certified source, so a track can only be written under the token the
+        // captured source mints for it (ADR-0013 §13.1/§13.2).
+        let token_for = |track_id: &str| source.token_for_track(track_id);
+        let is_current = || self.db.subtitle_source_is_current(&source).unwrap_or(false);
+        // ADR-0013 §13.2: the immutable artifact revision comes from the DB's
+        // monotonic per-item sequence. Allocation reserves identity only.
+        let reserve_revision = || self.db.reserve_subtitle_artifact_revision(item_id).ok();
+        // ADR-0013 §13.3.4: the publication CAS commits one track's reference at
+        // its exact reserved revision while the captured certification and
+        // membership still match. `false` means the source was superseded.
+        let publish = |track_id: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            matches!(
+                self.db.publish_subtitle_artifact(
+                    &source,
+                    &SubtitleArtifactPublication {
+                        track_id: track_id.to_string(),
+                        token: token.to_string(),
+                        artifact_revision: revision,
+                        state,
+                    },
+                ),
+                Ok(SubtitlePublication::Published)
+            )
+        };
+        let extract_source = ExtractSource {
+            media_path: media_path.clone(),
+            mtime_ms: source.snapshot.mtime_ms,
+            size_bytes: source.snapshot.size_bytes,
+            token_for: &token_for,
+            is_current: &is_current,
+            reserve_revision: &reserve_revision,
+            publish: &publish,
+        };
         match extract_item_subtitles(
             &self.subs,
-            item.item_id,
-            &media_path,
+            item_id,
+            &extract_source,
+            &embedded,
             &sidecars,
             &should_cancel,
         ) {
             Ok(ExtractOutcome::Ready) => {
-                if let Err(e) = self.db.set_subtitle_status(item.item_id, "ready") {
-                    tracing::warn!(item_id = item.item_id, error = %e, "set subtitle ready failed");
-                }
-                // Only successful runs count toward the 8.8 progress counter:
-                // a cancelled / failed / refused pass must not look productive.
+                // Every serveable track of the captured source now has a
+                // committed complete reference; the per-track CAS set the
+                // coarse lifecycle to `ready` when the last one landed. Only a
+                // successful run counts toward the 8.8 progress counter.
                 self.record_background_completion();
             }
-            Ok(ExtractOutcome::None) => {
-                if let Err(e) = self.db.set_subtitle_status(item.item_id, "none") {
-                    tracing::warn!(item_id = item.item_id, error = %e, "set subtitle none failed");
+            Ok(ExtractOutcome::None) => match self.db.record_subtitle_status(&source, "none") {
+                Ok(SubtitlePublication::Published) => self.record_background_completion(),
+                Ok(SubtitlePublication::Stale) => tracing::warn!(
+                    item_id = item.item_id,
+                    "subtitle none from stale work was rejected"
+                ),
+                Err(e) => {
+                    tracing::warn!(item_id = item.item_id, error = %e, "record subtitle none failed");
                 }
-                self.record_background_completion();
-            }
+            },
             Ok(ExtractOutcome::Partial { written, failed }) => {
                 // ADR-0041 Decision 8.4 / 6: never claim full `ready` for a
                 // partial result. The item stays eligible so a later pass can
-                // finish the missing tracks; the landed tracks are serveable.
+                // finish the missing tracks; the landed tracks keep their own
+                // committed per-track references.
                 tracing::warn!(
                     item_id = item.item_id,
                     written,
                     failed,
                     "subtitle extract partial; item stays eligible"
                 );
-                if let Err(e) = self.db.set_subtitle_status(item.item_id, "eligible") {
-                    tracing::warn!(
+                match self.db.record_subtitle_status(&source, "eligible") {
+                    Ok(SubtitlePublication::Published) => self.record_background_completion(),
+                    Ok(SubtitlePublication::Stale) => tracing::warn!(
                         item_id = item.item_id,
-                        error = %e,
-                        "set subtitle eligible failed"
-                    );
+                        "subtitle partial from stale work was rejected"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(item_id = item.item_id, error = %e, "record subtitle eligible failed");
+                    }
                 }
-                self.record_background_completion();
             }
-            Err(e) if e.starts_with("subtitle extract refused:") => {
+            Err(e)
+                if e.starts_with("subtitle extract refused:") || message_is_source_changed(&e) =>
+            {
                 tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract deferred");
             }
             Err(e) => {
@@ -1917,21 +2197,28 @@ impl LibraryPool {
                             )
                         })
                         .unwrap_or(false);
+                let status = if unavailable { "unavailable" } else { "error" };
                 if unavailable {
                     tracing::warn!(
                         item_id = item.item_id,
                         error = %e,
                         "subtitle extract unavailable"
                     );
-                    if let Err(status_err) =
-                        self.db.set_subtitle_status(item.item_id, "unavailable")
-                    {
-                        tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle unavailable failed");
-                    }
                 } else {
                     tracing::warn!(item_id = item.item_id, error = %e, "subtitle extract failed");
-                    if let Err(status_err) = self.db.set_subtitle_status(item.item_id, "error") {
-                        tracing::warn!(item_id = item.item_id, error = %status_err, "set subtitle error failed");
+                }
+                // Round-2 item 3: the failure status is written only while the
+                // captured source is still current, so a stale worker cannot
+                // mutate the subtitle state of a newer source.
+                match self.db.record_subtitle_status(&source, status) {
+                    Ok(SubtitlePublication::Published) => {}
+                    Ok(SubtitlePublication::Stale) => tracing::warn!(
+                        item_id = item.item_id,
+                        status,
+                        "subtitle failure from stale work was rejected"
+                    ),
+                    Err(status_err) => {
+                        tracing::warn!(item_id = item.item_id, error = %status_err, "record subtitle failure failed");
                     }
                 }
             }
@@ -2356,8 +2643,8 @@ mod tests {
             probes: VecDeque::new(),
             background: VecDeque::new(),
         };
-        let first = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"));
-        let second = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"));
+        let first = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"), None);
+        let second = WorkItem::extract(42, 1, PathBuf::from("/tmp/a.mkv"), None);
         let map = WorkItem::map(42, 1, PathBuf::from("/tmp/a.mkv"));
 
         LibraryPool::enqueue_background_unique(&mut queue, first);
@@ -2377,11 +2664,11 @@ mod tests {
         };
         LibraryPool::enqueue_background_unique(
             &mut queue,
-            WorkItem::extract(1, 1, PathBuf::from("/a")),
+            WorkItem::extract(1, 1, PathBuf::from("/a"), None),
         );
         LibraryPool::enqueue_background_unique(
             &mut queue,
-            WorkItem::extract(2, 1, PathBuf::from("/b")),
+            WorkItem::extract(2, 1, PathBuf::from("/b"), None),
         );
         let pos = queue
             .background

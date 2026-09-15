@@ -18,8 +18,8 @@
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
-    BurnInKind, BurnInSelection, SessionSubInput, SubsStore, concat_webvtt_segments,
-    extract_embedded_ass, prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms,
+    BurnInKind, BurnInSelection, SessionSubInput, SubsStore, extract_embedded_ass,
+    prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms,
 };
 use crate::hls_grid::{GridCadence, grid_cadence_ms};
 use crate::hls_master::VideoRung;
@@ -527,7 +527,9 @@ struct Session {
     /// Piggyback target when this session runs on an `eligible` item
     /// (ADR-0041 Decision 7); `None` once the side output is published.
     piggyback: Option<PiggybackExtract>,
-    /// Library subtitle store + item store for the piggyback publish.
+    /// Library subtitle store for the piggyback publish. D2B.2 fails that
+    /// writer closed until D2B.3, so the session only carries it.
+    #[allow(dead_code)]
     subs: Option<Arc<SubsStore>>,
     db: Option<Arc<Db>>,
     /// ADR-0023 §9.3: whether a keyframe-map build for this item is queued or
@@ -3609,88 +3611,16 @@ fn publish_piggyback_if_complete(session: &mut Session) {
     let Some(piggyback) = &session.piggyback else {
         return;
     };
-    // A run that started at an offset only demuxed a suffix of the title.
-    if session.start_ms != 0 {
-        return;
-    }
-    let (Some(subs), Some(db)) = (&session.subs, &session.db) else {
-        return;
-    };
-    let segments = vtt_segments_in(&run_dir(session, SINGLE_VIDEO_RUNG));
-    if segments.is_empty() {
-        return;
-    }
-    let mut bodies = Vec::with_capacity(segments.len());
-    for path in &segments {
-        match fs::read_to_string(path) {
-            Ok(body) => bodies.push(body),
-            Err(e) => {
-                tracing::warn!(
-                    item_id = session.item_id,
-                    track_id = %piggyback.track_id,
-                    path = %path.display(),
-                    error = %e,
-                    "piggyback subtitle segment read failed; item stays eligible"
-                );
-                return;
-            }
-        }
-    }
-    let body = concat_webvtt_segments(&bodies);
-    if body.trim() == "WEBVTT" {
-        tracing::warn!(
-            item_id = session.item_id,
-            track_id = %piggyback.track_id,
-            "piggyback produced no cues; item stays eligible"
-        );
-        return;
-    }
-    if let Err(e) = subs.publish_item_vtt(session.item_id, &piggyback.track_id, &body) {
-        tracing::warn!(
-            item_id = session.item_id,
-            track_id = %piggyback.track_id,
-            error = %e,
-            "piggyback publish failed; item stays eligible"
-        );
-        return;
-    }
-    if let Err(e) = db.set_subtitle_status(session.item_id, "ready") {
-        tracing::warn!(
-            item_id = session.item_id,
-            track_id = %piggyback.track_id,
-            error = %e,
-            "piggyback ready flip failed; item stays eligible"
-        );
-        return;
-    }
+    // D2B.2 fails piggyback subtitle publication closed until D2B.3. The exact
+    // D2C stream mapping still runs as a side output, but its bytes are never
+    // published and the item never flips `ready` from this path. AV playback is
+    // unaffected (D2B.2 acceptance 6).
     tracing::info!(
         item_id = session.item_id,
         track_id = %piggyback.track_id,
-        segment_count = segments.len(),
-        cue_bytes = body.len(),
-        run_id = session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
-        "piggyback extract published and item marked ready"
+        "piggyback subtitle publication is disabled until D2B.3; item stays eligible"
     );
     session.piggyback = None;
-}
-
-/// WebVTT side-output segments (`index{N}.vtt`) the HLS muxer wrote next to
-/// `index.m3u8` in a run dir (ffmpeg names subtitle segments after the
-/// playlist). Empty when the session had no subtitle output.
-fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(run) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name.starts_with("index") && name.ends_with(".vtt")
-        })
-        .collect();
-    out.sort();
-    out
 }
 
 /// Milliseconds of media in one segment this leg will actually produce.
@@ -10255,13 +10185,12 @@ mod tests {
         assert_eq!(none.get_args().count(), 0);
     }
 
-    /// ADR-0041 Decision 7 acceptance (remux and transcode): a session on an
-    /// `eligible` item writes the subtitle WebVTT under `{subs}/{itemId}/`
-    /// with no standalone extract job in the loop — the session's own ffmpeg
-    /// produced the rendition — and flips the item to `ready` only once the
-    /// run reaches natural EOF from title 0.
+    /// D2B.2 acceptance 6: piggyback subtitle publication fails closed until
+    /// D2B.3. A session on an `eligible` item still runs to natural EOF (AV
+    /// playback is unaffected) but the item never flips `ready` and no
+    /// artifact is published from this path.
     #[test]
-    fn piggyback_session_publishes_item_vtt_and_flips_ready() {
+    fn piggyback_session_fails_closed_and_never_flips_ready() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -10308,31 +10237,37 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            // Drive to natural EOF: view/playlist polls observe the child
-            // exit, which triggers the publish + ready flip.
+            // Drive to natural EOF: the playlist gains ENDLIST when the run
+            // finishes, which is when the publish used to happen.
             let deadline = Instant::now() + Duration::from_secs(60);
-            let mut status = String::new();
             loop {
-                if let Some(row) = db.get_item(1).unwrap() {
-                    status = row.subtitle_status;
-                }
-                if status == "ready" && subs.has_vtt(1, &track_id) {
+                let text = reg
+                    .playlist(&id)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                if text.contains("#EXT-X-ENDLIST") {
                     break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "piggyback never published; status={status}"
+                    "piggyback session never reached EOF"
                 );
-                let _ = reg.playlist(&id);
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let body = fs::read_to_string(subs.vtt_path(1, &track_id)).unwrap();
-            assert!(body.contains("Nightjar SRT sample"), "{body}");
+            // One more poll observes the child exit and would have published
+            // before D2B.2.
+            let _ = reg.playlist(&id);
+            std::thread::sleep(Duration::from_millis(100));
             assert_eq!(
                 db.get_item(1).unwrap().unwrap().subtitle_status,
-                "ready",
-                "complete piggyback run flips the item to ready"
+                "eligible",
+                "a complete piggyback run must not flip the item to ready"
             );
+            assert!(
+                !subs.item_dir(1).exists(),
+                "piggyback must not publish a subtitle artifact"
+            );
+            let _ = track_id;
             reg.stop(&id);
         }
     }
@@ -10466,7 +10401,9 @@ mod tests {
         // A previously-good track the killed piggyback must not touch.
         subs.publish_item_vtt(
             1,
+            "prior-gen",
             &track_id,
+            1,
             "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior ready cue\n",
         )
         .unwrap();
@@ -10511,9 +10448,12 @@ mod tests {
             row.subtitle_status, "eligible",
             "killed piggyback must not flip the item to ready"
         );
-        assert!(subs.has_vtt(1, &track_id), "prior track must survive");
+        assert!(
+            subs.has_artifact(1, "prior-gen", &track_id, 1),
+            "prior track must survive"
+        );
         assert_eq!(
-            fs::read_to_string(subs.vtt_path(1, &track_id)).unwrap(),
+            fs::read_to_string(subs.artifact_path(1, "prior-gen", &track_id, 1)).unwrap(),
             "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior ready cue\n",
             "killed piggyback must not overwrite the prior track"
         );

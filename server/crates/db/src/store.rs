@@ -407,6 +407,9 @@ pub struct ProbeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedProbeSnapshot {
     pub item_id: i64,
+    pub library_id: i64,
+    /// Stored `media_items.path`, so a consumer never re-reads the row.
+    pub path: String,
     /// The media revision the snapshot was certified against; equal to the
     /// row's `probed_media_revision`.
     pub media_revision: i64,
@@ -414,6 +417,11 @@ pub struct CertifiedProbeSnapshot {
     pub probe_revision: i64,
     /// The nonempty identity the snapshot was certified against.
     pub content_id: String,
+    /// The source mtime the snapshot was captured against. D2B.2 rechecks it
+    /// before extraction and before final publication (ADR-0013 §13.3).
+    pub mtime_ms: i64,
+    /// The source size the snapshot was captured against.
+    pub size_bytes: i64,
     pub snapshot: ProbeSnapshot,
 }
 
@@ -475,6 +483,386 @@ pub enum ProbeAccounting {
     ErrorOnly,
     /// Stale, superseded, or cancelled work: no count.
     None,
+}
+
+/// One serveable sidecar member with its durable generation (ADR-0010 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedSidecar {
+    pub track_id: String,
+    pub path: String,
+    pub format: String,
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+    pub generation: i64,
+}
+
+/// State of one committed per-track subtitle publication (ADR-0013 §13.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleArtifactState {
+    /// Growing bytes are committed and serveable, but the run is not finished.
+    Partial,
+    /// The complete immutable artifact is committed and serveable.
+    Complete,
+}
+
+impl SubtitleArtifactState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Complete => "complete",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "partial" => Ok(Self::Partial),
+            "complete" => Ok(Self::Complete),
+            other => Err(format!("unknown subtitle publication state {other}")),
+        }
+    }
+}
+
+/// One committed per-track subtitle publication reference (ADR-0013 §13.4).
+///
+/// It is keyed by `(item_id, track_id, token)` and records the captured
+/// certification, revisions and sidecar generation for that one track, plus
+/// the certification `content_id` and the partial/complete state. A row is
+/// written only by the source compare-and-swap, and serving requires a row
+/// whose recorded identity still matches the current certified source. It is
+/// never inferred from a file on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleArtifact {
+    pub track_id: String,
+    pub token: String,
+    pub state: SubtitleArtifactState,
+    /// ADR-0013 §13.2 immutable artifact revision. It names the artifact file
+    /// inside the generation directory; serving resolves the filename from this
+    /// value and never constructs it.
+    pub artifact_revision: u64,
+    /// ADR-0013 §11 server-declared per-track revision. Every committed
+    /// publication for this `(item, track, token)` bumps it by one.
+    pub revision: u64,
+    pub media_revision: i64,
+    pub probe_revision: i64,
+    /// The track's own ADR-0010 §4 generation; `None` for an embedded track.
+    pub sidecar_generation: Option<i64>,
+    /// The captured certification stamp (ADR-0058 `content_id`). Serving
+    /// compares it against the current certified source, so a certification
+    /// change that moved no revision still invalidates the reference.
+    pub subtitle_content_id: String,
+}
+
+/// One per-track publication the source compare-and-swap commits
+/// (ADR-0013 §13.3.4, §13.5).
+///
+/// The caller reserves `artifact_revision` from
+/// [`Db::reserve_subtitle_artifact_revision`], finalizes that exact revision's
+/// bytes on disk, and only then asks the database to commit this reference. A
+/// mismatch preserves the previous reference and bytes: the finalized candidate
+/// stays unreferenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleArtifactPublication {
+    pub track_id: String,
+    /// The bounded per-track token of the captured source (ADR-0013 §13.1).
+    pub token: String,
+    /// The reserved `artifact_revision` of the bytes just finalized.
+    pub artifact_revision: u64,
+    pub state: SubtitleArtifactState,
+}
+
+/// One coherent read of an item's subtitle source for playback-info listing and
+/// demand (ADR-0013 §13.4).
+///
+/// Certification, the durable sidecar membership, the committed per-track
+/// publications and the coarse lifecycle fields all come from one transaction,
+/// so a listing never combines an observation of one generation with the
+/// publication state of another. Unlike [`CertifiedSubtitleSource`] it does not
+/// require certification: an item whose probe snapshot is not certified still
+/// lists its durable sidecar rows (without delivery).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleListingSource {
+    pub item_id: i64,
+    /// The certified probe snapshot, when the item has one. `None` means the
+    /// embedded inventory is unknown for this item, so it is not listed.
+    pub snapshot: Option<CertifiedProbeSnapshot>,
+    /// Every durable sidecar row, ordered by `track_id`.
+    pub sidecars: Vec<SidecarRow>,
+    /// Committed per-track publication references, ordered by
+    /// `(track_id, token)`.
+    pub artifacts: Vec<SubtitleArtifact>,
+    /// Coarse item-level lifecycle fields (ADR-0013 §6). Not the serving gate.
+    pub subtitle_status: String,
+    pub subtitle_next_retry_at: Option<String>,
+}
+
+impl SubtitleListingSource {
+    /// The certified view of this read, or `None` when the item's probe
+    /// snapshot is not certified or a serveable sidecar lacks a durable
+    /// generation (ADR-0010 §4). Serving and publication use this view, so the
+    /// certification rule has one implementation.
+    pub fn certified(&self) -> Option<CertifiedSubtitleSource> {
+        let snapshot = self.snapshot.clone()?;
+        let mut sidecars = Vec::new();
+        for row in &self.sidecars {
+            if !sidecar_format_is_serveable(&row.format) {
+                continue;
+            }
+            let generation = row.sidecar_generation?;
+            sidecars.push(CertifiedSidecar {
+                track_id: row.track_id.clone(),
+                path: row.path.clone(),
+                format: row.format.clone(),
+                mtime_ms: row.mtime_ms,
+                size_bytes: row.size_bytes,
+                generation,
+            });
+        }
+        Some(CertifiedSubtitleSource {
+            snapshot,
+            sidecars,
+            artifacts: self.artifacts.clone(),
+        })
+    }
+
+    /// Whether a standalone extract is still needed for this item's content
+    /// (ADR-0013 §13.4): some serveable member of the current certified source
+    /// has no complete committed publication.
+    ///
+    /// This is a content signal only. It does not depend on the coarse
+    /// item-level `subtitle_status`, so a formerly `ready` item whose sidecar
+    /// was edited, or a formerly `none` item that just gained its first
+    /// sidecar, still reports demand. The caller applies the eligibility and
+    /// backoff rules.
+    pub fn needs_publication(&self) -> bool {
+        self.certified()
+            .is_some_and(|source| source.needs_publication())
+    }
+}
+
+/// The certified source of one standalone subtitle artifact (D2B.2).
+///
+/// It composes the ADR-0058 certified probe snapshot with the ADR-0010 §4
+/// serveable sidecar membership and generations and the committed per-track
+/// publication references. Every part is read in one transaction, so the source
+/// describes exactly one consistent observation: serving can never combine an
+/// item-level observation with a newer certified source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedSubtitleSource {
+    pub snapshot: CertifiedProbeSnapshot,
+    /// Serveable sidecar members, ordered by `track_id`. Empty when the item
+    /// has no serveable sidecar.
+    pub sidecars: Vec<CertifiedSidecar>,
+    /// Committed per-track publication references, ordered by
+    /// `(track_id, token)`.
+    pub artifacts: Vec<SubtitleArtifact>,
+}
+
+impl CertifiedSubtitleSource {
+    pub fn item_id(&self) -> i64 {
+        self.snapshot.item_id
+    }
+
+    /// The committed publication reference that makes `track_id` serveable, or
+    /// `None` when there is none (ADR-0013 §13.4).
+    ///
+    /// A reference counts only when it is keyed by the token this source
+    /// currently mints for the track *and* its recorded certification still
+    /// equals the source's. The token carries the media/probe revisions and the
+    /// track's own sidecar generation, so a reference from another generation
+    /// can never match; the explicit `content_id` comparison catches a
+    /// certification change that moved no revision.
+    pub fn artifact_for(&self, track_id: &str) -> Option<&SubtitleArtifact> {
+        let token = self.token_for_track(track_id)?;
+        self.artifacts.iter().find(|a| {
+            a.track_id == track_id
+                && a.token == token
+                && a.subtitle_content_id == self.snapshot.content_id
+        })
+    }
+
+    /// Whether `track_id`'s complete immutable artifact is already committed.
+    /// A run skips such a track: complete bytes are never overwritten
+    /// (ADR-0013 §13.2, §13.4).
+    pub fn is_complete(&self, track_id: &str) -> bool {
+        self.artifact_for(track_id)
+            .is_some_and(|a| a.state == SubtitleArtifactState::Complete)
+    }
+
+    /// Whether some serveable member still lacks a complete committed
+    /// publication (ADR-0013 §13.4). This is the demand signal for a standalone
+    /// extract.
+    pub fn needs_publication(&self) -> bool {
+        self.members()
+            .iter()
+            .any(|track_id| !self.is_complete(track_id))
+    }
+
+    /// Whether every serveable member of this source has a complete committed
+    /// publication, counting `pending` as the row a publication is about to
+    /// commit. Only then does the coarse item-level lifecycle become `ready`
+    /// (ADR-0013 §6).
+    fn all_members_complete(&self, pending: &SubtitleArtifactPublication) -> bool {
+        self.members().iter().all(|track_id| {
+            (pending.track_id == *track_id && pending.state == SubtitleArtifactState::Complete)
+                || self.is_complete(track_id)
+        })
+    }
+
+    /// Every serveable track of this source, ordered by track id. Embedded
+    /// text streams and serveable sidecars are both members.
+    pub fn members(&self) -> Vec<String> {
+        let mut members: Vec<String> = Vec::new();
+        for track in &self.snapshot.snapshot.subtitle_tracks {
+            if track.kind != "text" {
+                continue;
+            }
+            if let Ok(index) = u32::try_from(track.stream_index) {
+                members.push(format!("e{index}"));
+            }
+        }
+        for sidecar in &self.sidecars {
+            members.push(sidecar.track_id.clone());
+        }
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    /// The opaque, bounded, versioned generation token for one track
+    /// (ADR-0013 §13.1):
+    ///
+    /// ```text
+    /// token := "v1" "-m" media_rev "-p" probe_rev [ "-s" sidecar_gen ]
+    /// rev   := "0" | [1-9][0-9]*     (unsigned decimal, no leading zero)
+    /// ```
+    ///
+    /// The media and probe revisions are the certified snapshot's; `-s` is the
+    /// track's own ADR-0010 §4 durable generation and appears only for a
+    /// sidecar member. No other track id enters the token, and the complete
+    /// sidecar set is never concatenated. Returns `None` for a track that is
+    /// not a serveable member of this source.
+    ///
+    /// The token is at most 65 ASCII bytes: `v1-m` + 19 + `-p` + 19 + `-s` + 19.
+    pub fn token_for_track(&self, track_id: &str) -> Option<String> {
+        let mut token = format!(
+            "v1-m{}-p{}",
+            self.snapshot.media_revision, self.snapshot.probe_revision
+        );
+        if let Some(sidecar) = self.sidecars.iter().find(|s| s.track_id == track_id) {
+            token.push_str(&format!("-s{}", sidecar.generation));
+            return Some(token);
+        }
+        // An embedded member is a text track in the certified inventory.
+        if embedded_stream_index(track_id).is_some_and(|index| {
+            self.snapshot
+                .snapshot
+                .subtitle_tracks
+                .iter()
+                .any(|t| t.stream_index == index && t.kind == "text")
+        }) {
+            return Some(token);
+        }
+        None
+    }
+
+    /// Whether `track_id` is a serveable member of this source: an embedded
+    /// text stream or a serveable sidecar row.
+    pub fn is_member(&self, track_id: &str) -> bool {
+        self.token_for_track(track_id).is_some()
+    }
+
+    /// Internal single-flight identity of the captured source (ADR-0013 §13.6).
+    ///
+    /// It is a deterministic function of the revisions and the per-sidecar
+    /// generations, so a newer generation is distinct work. It is never a URL
+    /// or a path component: the on-wire/on-disk identity is the per-track
+    /// [`Self::token_for_track`].
+    pub fn source_identity(&self) -> String {
+        let mut identity = format!(
+            "m{}.p{}",
+            self.snapshot.media_revision, self.snapshot.probe_revision
+        );
+        for sidecar in &self.sidecars {
+            identity.push('.');
+            identity.push_str(&sidecar.track_id);
+            identity.push('=');
+            identity.push_str(&sidecar.generation.to_string());
+        }
+        identity
+    }
+
+    /// Whether `other` describes the same certified source: the same
+    /// certification, revisions, membership, sidecar generations, and sidecar
+    /// identity tuples. This is the publication compare-and-swap comparison.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.snapshot.media_revision == other.snapshot.media_revision
+            && self.snapshot.probe_revision == other.snapshot.probe_revision
+            && self.snapshot.content_id == other.snapshot.content_id
+            && self.snapshot.item_id == other.snapshot.item_id
+            && self.sidecars == other.sidecars
+    }
+}
+
+/// The absolute stream index encoded in an embedded `e{index}` track id.
+fn embedded_stream_index(track_id: &str) -> Option<i64> {
+    let digits = track_id.strip_prefix('e')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether a sidecar format is one the pipeline converts to WebVTT.
+///
+/// `nightjar-transcode::is_serveable_sidecar_format` is the canonical rule; the
+/// db crate stays free of that dependency, so this is the same two-extension
+/// set the certified-source read already applies. It decides only whether a
+/// reconciliation delta invalidates the committed artifact reference.
+fn sidecar_format_is_serveable(format: &str) -> bool {
+    matches!(format.to_ascii_lowercase().as_str(), "srt" | "vtt")
+}
+
+/// Whether `token` matches the ADR-0013 §13.1 grammar exactly and is within the
+/// 65-byte bound. The server mints every token, so this is the gate that stops
+/// a client-supplied string from being used as a path segment or compared
+/// against a minted one.
+pub fn is_valid_generation_token(token: &str) -> bool {
+    if token.len() > 65 || !token.is_ascii() {
+        return false;
+    }
+    let Some(rest) = token.strip_prefix("v1-m") else {
+        return false;
+    };
+    let Some((media, rest)) = rest.split_once("-p") else {
+        return false;
+    };
+    if !is_revision(media) {
+        return false;
+    }
+    let Some((probe, sidecar)) = rest.split_once("-s") else {
+        return is_revision(rest);
+    };
+    is_revision(probe) && is_revision(sidecar)
+}
+
+/// `0` or `[1-9][0-9]*`: unsigned decimal with no leading zero.
+fn is_revision(value: &str) -> bool {
+    if value == "0" {
+        return true;
+    }
+    let mut bytes = value.bytes();
+    match bytes.next() {
+        Some(b'1'..=b'9') => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_digit())
+}
+
+/// What a subtitle artifact publication did (D2B.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitlePublication {
+    Published,
+    Stale,
 }
 
 // Test-only rendezvous inside [`Db::coherent_probe_read`].
@@ -1085,7 +1473,19 @@ impl Db {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("begin probe read for item {item_id}: {e}"))?;
+        let read = Self::coherent_probe_read_tx(&tx, item_id)?;
+        tx.commit()
+            .map_err(|e| format!("end probe read for item {item_id}: {e}"))?;
+        Ok(read)
+    }
 
+    /// The body of [`Self::coherent_probe_read`] inside an already-open
+    /// transaction. Shared with the D2B.2 certified subtitle source so the
+    /// certification rule has one implementation (Rule 4.11).
+    fn coherent_probe_read_tx(
+        tx: &Transaction<'_>,
+        item_id: i64,
+    ) -> Result<Option<CoherentProbeRead>, String> {
         let item = tx
             .query_row(
                 "SELECT id, library_id, path, mtime_ms, size_bytes, title, kind,
@@ -1175,9 +1575,6 @@ impl Db {
             .map_err(|e| format!("read subtitle inventory for item {item_id}: {e}"))?
         };
 
-        tx.commit()
-            .map_err(|e| format!("end probe read for item {item_id}: {e}"))?;
-
         let Some(content_id) = item.content_id.as_deref().filter(|id| !id.is_empty()) else {
             return Ok(Some(CoherentProbeRead::Unverified));
         };
@@ -1199,9 +1596,13 @@ impl Db {
         Ok(Some(CoherentProbeRead::Ready(Box::new(
             CertifiedProbeSnapshot {
                 item_id: item.id,
+                library_id: item.library_id,
+                path: item.path,
                 media_revision: item.media_revision,
                 probe_revision: item.probe_revision,
                 content_id,
+                mtime_ms: item.mtime_ms,
+                size_bytes: item.size_bytes,
                 snapshot: ProbeSnapshot {
                     duration_ms: item.duration_ms,
                     container: item.container,
@@ -1223,50 +1624,238 @@ impl Db {
         ))))
     }
 
+    /// Read one item's certified subtitle source in one transaction (D2B.2).
+    ///
+    /// Returns `Ok(None)` for an unknown item, an item whose probe snapshot is
+    /// not certified, or an item that carries a serveable sidecar without a
+    /// durable generation (a legacy unverified row). A partially trusted source
+    /// is never returned.
+    pub fn certified_subtitle_source(
+        &self,
+        item_id: i64,
+    ) -> Result<Option<CertifiedSubtitleSource>, String> {
+        Ok(self
+            .subtitle_listing_source(item_id)?
+            .and_then(|listing| listing.certified()))
+    }
+
+    /// Read one item's subtitle source for playback-info listing and demand in
+    /// one transaction (ADR-0013 §13.4).
+    ///
+    /// Returns `Ok(None)` for an unknown item. Every part — certification, the
+    /// durable sidecar membership, the committed per-track publications and the
+    /// coarse lifecycle fields — comes from one read snapshot, so a caller
+    /// never combines an observation of one generation with another's
+    /// publication state.
+    pub fn subtitle_listing_source(
+        &self,
+        item_id: i64,
+    ) -> Result<Option<SubtitleListingSource>, String> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin subtitle source read for item {item_id}: {e}"))?;
+        let source = Self::read_listing_source_tx(&tx, item_id)?;
+        tx.commit()
+            .map_err(|e| format!("end subtitle source read for item {item_id}: {e}"))?;
+        Ok(source)
+    }
+
+    /// The body of [`Self::subtitle_listing_source`] inside an already-open
+    /// transaction. [`Self::read_certified_source_tx`] is the certified
+    /// projection of it, so the certification rule has one implementation
+    /// (Rule 4.11).
+    fn read_listing_source_tx(
+        tx: &Transaction<'_>,
+        item_id: i64,
+    ) -> Result<Option<SubtitleListingSource>, String> {
+        let Some(read) = Self::coherent_probe_read_tx(tx, item_id)? else {
+            return Ok(None);
+        };
+        let snapshot = match read {
+            CoherentProbeRead::Ready(snapshot) => Some(*snapshot),
+            CoherentProbeRead::Unverified => None,
+        };
+        let (subtitle_status, subtitle_next_retry_at) = tx
+            .query_row(
+                "SELECT subtitle_status, subtitle_next_retry_at
+                 FROM media_items WHERE id = ?1",
+                [item_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(|e| format!("read subtitle lifecycle for item {item_id}: {e}"))?;
+        Ok(Some(SubtitleListingSource {
+            item_id,
+            snapshot,
+            sidecars: load_sidecars(tx, item_id)?,
+            artifacts: load_subtitle_artifacts(tx, item_id)?,
+            subtitle_status,
+            subtitle_next_retry_at,
+        }))
+    }
+
+    /// The certified projection of one listing read (ADR-0013 §13.4).
+    ///
+    /// `None` when the item's probe snapshot is not certified, or when it
+    /// carries a serveable sidecar without a durable generation (a legacy
+    /// unverified row). A partially trusted source is never returned.
+    fn read_certified_source_tx(
+        tx: &Transaction<'_>,
+        item_id: i64,
+    ) -> Result<Option<CertifiedSubtitleSource>, String> {
+        Ok(Self::read_listing_source_tx(tx, item_id)?.and_then(|listing| listing.certified()))
+    }
+
+    /// Reserve the next immutable artifact revision for one item
+    /// (ADR-0013 §13.2).
+    ///
+    /// The allocation is monotonic per item and reserves candidate identity
+    /// only: nothing becomes serveable until the source compare-and-swap
+    /// commits a publication at this revision. A candidate that is never
+    /// committed leaves a gap in the sequence, which is harmless because
+    /// serving resolves the filename from the committed publication row alone.
+    pub fn reserve_subtitle_artifact_revision(&self, item_id: i64) -> Result<u64, String> {
+        let conn = self.lock()?;
+        let revision: i64 = conn
+            .query_row(
+                "UPDATE media_items
+                 SET subtitle_artifact_sequence = subtitle_artifact_sequence + 1
+                 WHERE id = ?1
+                 RETURNING subtitle_artifact_sequence",
+                [item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("reserve subtitle artifact revision for item {item_id}: {e}"))?;
+        u64::try_from(revision)
+            .map_err(|_| format!("negative subtitle artifact revision {revision}"))
+    }
+
+    /// Commit one changed body's publication at its exact reserved artifact
+    /// revision (D2B.2 acceptance 3/5, ADR-0013 §13.3.4, §13.4, §13.5).
+    ///
+    /// One `BEGIN IMMEDIATE` transaction re-reads the certified source and
+    /// requires the captured certification and this track's membership to still
+    /// match: the token carries the media and probe revisions and the track's
+    /// own sidecar generation, and the recorded `subtitle_content_id` catches a
+    /// certification that moved no revision. On a mismatch it returns
+    /// [`SubtitlePublication::Stale`] and writes nothing, so bytes finalized by
+    /// work the database did not accept stay unreferenced.
+    ///
+    /// A committed `complete` reference is never replaced or downgraded
+    /// (ADR-0013 §13.2, §13.4): a later `partial` or `complete` write for the
+    /// same track and token is a no-op. The item-level coarse lifecycle becomes
+    /// `ready` only once every serveable member has a complete reference.
+    pub fn publish_subtitle_artifact(
+        &self,
+        captured: &CertifiedSubtitleSource,
+        publication: &SubtitleArtifactPublication,
+    ) -> Result<SubtitlePublication, String> {
+        let item_id = captured.item_id();
+        let conn = self.lock()?;
+        with_write_tx(&conn, |tx| {
+            let Some(current) = Self::read_certified_source_tx(tx, item_id)? else {
+                return Ok(SubtitlePublication::Stale);
+            };
+            if current.snapshot.content_id != captured.snapshot.content_id {
+                return Ok(SubtitlePublication::Stale);
+            }
+            if current.token_for_track(&publication.track_id).as_deref()
+                != Some(publication.token.as_str())
+            {
+                return Ok(SubtitlePublication::Stale);
+            }
+            // Complete immutable bytes are never replaced or downgraded.
+            if current.is_complete(&publication.track_id) {
+                return Ok(SubtitlePublication::Published);
+            }
+            let revision = current
+                .artifacts
+                .iter()
+                .find(|a| a.track_id == publication.track_id && a.token == publication.token)
+                .map(|a| a.revision.saturating_add(1))
+                .unwrap_or(1);
+            let sidecar_generation = current
+                .sidecars
+                .iter()
+                .find(|s| s.track_id == publication.track_id)
+                .map(|s| s.generation);
+            insert_subtitle_artifact(
+                tx,
+                item_id,
+                &SubtitleArtifact {
+                    track_id: publication.track_id.clone(),
+                    token: publication.token.clone(),
+                    state: publication.state,
+                    artifact_revision: publication.artifact_revision,
+                    revision,
+                    media_revision: current.snapshot.media_revision,
+                    probe_revision: current.snapshot.probe_revision,
+                    sidecar_generation,
+                    subtitle_content_id: current.snapshot.content_id.clone(),
+                },
+            )?;
+            if publication.state == SubtitleArtifactState::Complete
+                && current.all_members_complete(publication)
+            {
+                set_subtitle_status_tx(tx, item_id, "ready")?;
+            }
+            Ok(SubtitlePublication::Published)
+        })
+    }
+
+    /// Record a non-serveable outcome (`none`/`partial`/`error`/`unavailable`)
+    /// for the captured source (D2B.2 acceptance 3, round-2 item 3).
+    ///
+    /// The same source compare-and-swap gates it: a worker whose captured source
+    /// has been superseded writes nothing, so stale work can never mutate the
+    /// subtitle state of a newer source. A `partial` outcome leaves the item
+    /// `eligible` for a later pass; the landed tracks keep their own committed
+    /// per-track references.
+    pub fn record_subtitle_status(
+        &self,
+        captured: &CertifiedSubtitleSource,
+        status: &str,
+    ) -> Result<SubtitlePublication, String> {
+        let status = parse_subtitle_status(status)?;
+        let item_id = captured.item_id();
+        let conn = self.lock()?;
+        with_write_tx(&conn, |tx| {
+            let Some(current) = Self::read_certified_source_tx(tx, item_id)? else {
+                return Ok(SubtitlePublication::Stale);
+            };
+            if !current.matches(captured) {
+                return Ok(SubtitlePublication::Stale);
+            }
+            set_subtitle_status_tx(tx, item_id, status)?;
+            Ok(SubtitlePublication::Published)
+        })
+    }
+
+    /// Whether the captured certified source is still the current one.
+    ///
+    /// Progressive publication runs this before every growing write (ADR-0013
+    /// §13.5): stale work is rejected by the same source comparison the final
+    /// publication CAS uses, so it cannot become ready for a newer generation.
+    pub fn subtitle_source_is_current(
+        &self,
+        captured: &CertifiedSubtitleSource,
+    ) -> Result<bool, String> {
+        Ok(self
+            .certified_subtitle_source(captured.item_id())?
+            .is_some_and(|current| current.matches(captured)))
+    }
+
+    /// Write the item-level coarse subtitle lifecycle field unconditionally
+    /// (ADR-0013 §6).
+    ///
+    /// This is the administrative/fixture writer. A subtitle worker must not
+    /// use it: it has no source compare-and-swap, so a stale run could mutate a
+    /// newer source's state. Workers use [`Self::record_subtitle_status`], which
+    /// is the same SQL behind the captured-source CAS.
     pub fn set_subtitle_status(&self, item_id: i64, status: &str) -> Result<(), String> {
         let status = parse_subtitle_status(status)?;
         let conn = self.lock()?;
-        if status == "unavailable" {
-            // ADR-0041 Decision 8.3: every availability failure increments the
-            // attempt count and pushes the re-queue deadline out on the
-            // ADR-0026 §3 schedule (1d/7d/30d/90d cap), so a flapping mount
-            // cannot re-drain an unfinishable title on every reachability
-            // transition. `requeue_unavailable_for_library` gates on
-            // `subtitle_next_retry_at`.
-            let attempts: i64 = conn
-                .query_row(
-                    "SELECT subtitle_attempt_count FROM media_items WHERE id = ?1",
-                    params![item_id],
-                    |r| r.get(0),
-                )
-                .map_err(|e| format!("read subtitle attempts for item {item_id}: {e}"))?;
-            let days = backoff_days(attempts.saturating_add(1));
-            conn.execute(
-                "UPDATE media_items SET
-                    subtitle_status = 'unavailable',
-                    subtitle_content_id = NULL,
-                    subtitle_attempt_count = subtitle_attempt_count + 1,
-                    subtitle_next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
-                 WHERE id = ?1",
-                params![item_id, format!("+{days} days")],
-            )
-            .map_err(|e| format!("set subtitle unavailable for item {item_id}: {e}"))?;
-            return Ok(());
-        }
-        conn.execute(
-            "UPDATE media_items SET
-                subtitle_status = ?2,
-                subtitle_content_id = CASE
-                    WHEN ?2 IN ('ready', 'none') THEN content_id
-                    ELSE NULL
-                END,
-                subtitle_attempt_count = 0,
-                subtitle_next_retry_at = NULL
-             WHERE id = ?1",
-            params![item_id, status],
-        )
-        .map_err(|e| format!("set subtitle status for item {item_id}: {e}"))?;
-        Ok(())
+        set_subtitle_status_tx(&conn, item_id, status)
     }
 
     /// Persist a built keyframe map under `content_id` (ADR-0023).
@@ -1717,6 +2306,42 @@ impl Db {
                     params![media_item_id, last_generation],
                 )
                 .map_err(|e| format!("record sidecar generation for item {media_item_id}: {e}"))?;
+            }
+
+            // ADR-0013 §13.4: reconciliation invalidates only the affected
+            // per-track publication references. A changed, added or removed
+            // serveable sidecar loses its reference; every unchanged track keeps
+            // its reference and its committed artifact serveable, and the coarse
+            // item-level lifecycle field is not cleared item-wide.
+            let mut invalidated: Vec<&str> = Vec::new();
+            for s in delta
+                .added
+                .iter()
+                .chain(delta.changed.iter().map(|c| &c.after))
+                .chain(delta.removed.iter())
+            {
+                if sidecar_format_is_serveable(&s.format) {
+                    invalidated.push(s.track_id.as_str());
+                }
+            }
+            for change in &delta.changed {
+                if sidecar_format_is_serveable(&change.before.format) {
+                    invalidated.push(change.before.track_id.as_str());
+                }
+            }
+            invalidated.sort_unstable();
+            invalidated.dedup();
+            for track_id in invalidated {
+                tx.execute(
+                    "DELETE FROM subtitle_publications
+                      WHERE media_item_id = ?1 AND track_id = ?2",
+                    params![media_item_id, track_id],
+                )
+                .map_err(|e| {
+                    format!(
+                        "invalidate subtitle publication {track_id} for item {media_item_id}: {e}"
+                    )
+                })?;
             }
 
             Ok(delta)
@@ -2237,6 +2862,160 @@ fn load_sidecars(conn: &Connection, media_item_id: i64) -> Result<Vec<SidecarRow
         out.push(row.map_err(|e| format!("map sidecar: {e}"))?);
     }
     Ok(out)
+}
+
+/// Apply one already-validated subtitle lifecycle status inside an open
+/// transaction.
+///
+/// `unavailable` keeps ADR-0041 Decision 8.3's backoff: every availability
+/// failure increments the attempt count and pushes the re-queue deadline out on
+/// the ADR-0026 §3 schedule (1d/7d/30d/90d cap), so a flapping mount cannot
+/// re-drain an unfinishable title on every reachability transition.
+/// `requeue_unavailable_for_library` gates on `subtitle_next_retry_at`.
+fn set_subtitle_status_tx(conn: &Connection, item_id: i64, status: &str) -> Result<(), String> {
+    if status == "unavailable" {
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT subtitle_attempt_count FROM media_items WHERE id = ?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("read subtitle attempts for item {item_id}: {e}"))?;
+        let days = backoff_days(attempts.saturating_add(1));
+        conn.execute(
+            "UPDATE media_items SET
+                subtitle_status = 'unavailable',
+                subtitle_content_id = NULL,
+                subtitle_attempt_count = subtitle_attempt_count + 1,
+                subtitle_next_retry_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
+             WHERE id = ?1",
+            params![item_id, format!("+{days} days")],
+        )
+        .map_err(|e| format!("set subtitle unavailable for item {item_id}: {e}"))?;
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE media_items SET
+            subtitle_status = ?2,
+            subtitle_content_id = CASE
+                WHEN ?2 IN ('ready', 'none') THEN content_id
+                ELSE NULL
+            END,
+            subtitle_attempt_count = 0,
+            subtitle_next_retry_at = NULL
+         WHERE id = ?1",
+        params![item_id, status],
+    )
+    .map_err(|e| format!("set subtitle status for item {item_id}: {e}"))?;
+    Ok(())
+}
+
+/// Load an item's committed per-track publication references, ordered by
+/// `(track_id, token)`.
+fn load_subtitle_artifacts(
+    conn: &Connection,
+    media_item_id: i64,
+) -> Result<Vec<SubtitleArtifact>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT track_id, token, state, artifact_revision, revision,
+                    media_revision, probe_revision, sidecar_generation,
+                    subtitle_content_id
+             FROM subtitle_publications
+             WHERE media_item_id = ?1
+             ORDER BY track_id, token",
+        )
+        .map_err(|e| format!("prepare subtitle publications for item {media_item_id}: {e}"))?;
+    let rows = stmt
+        .query_map([media_item_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(|e| format!("read subtitle publications for item {media_item_id}: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read subtitle publications for item {media_item_id}: {e}"))?;
+    rows.into_iter()
+        .map(
+            |(
+                track_id,
+                token,
+                state,
+                artifact_revision,
+                revision,
+                media_revision,
+                probe_revision,
+                sidecar_generation,
+                content_id,
+            )| {
+                Ok(SubtitleArtifact {
+                    track_id,
+                    token,
+                    state: SubtitleArtifactState::parse(&state)?,
+                    artifact_revision: u64::try_from(artifact_revision)
+                        .map_err(|_| format!("invalid artifact revision {artifact_revision}"))?,
+                    revision: u64::try_from(revision)
+                        .map_err(|_| format!("negative subtitle revision {revision}"))?,
+                    media_revision,
+                    probe_revision,
+                    sidecar_generation,
+                    subtitle_content_id: content_id,
+                })
+            },
+        )
+        .collect()
+}
+
+/// Upsert one committed per-track publication reference.
+fn insert_subtitle_artifact(
+    conn: &Connection,
+    media_item_id: i64,
+    artifact: &SubtitleArtifact,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO subtitle_publications (
+            media_item_id, track_id, token, state, artifact_revision, revision,
+            media_revision, probe_revision, sidecar_generation,
+            subtitle_content_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                   strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(media_item_id, track_id, token) DO UPDATE SET
+            state = excluded.state,
+            artifact_revision = excluded.artifact_revision,
+            revision = excluded.revision,
+            media_revision = excluded.media_revision,
+            probe_revision = excluded.probe_revision,
+            sidecar_generation = excluded.sidecar_generation,
+            subtitle_content_id = excluded.subtitle_content_id,
+            updated_at = excluded.updated_at",
+        params![
+            media_item_id,
+            artifact.track_id,
+            artifact.token,
+            artifact.state.as_str(),
+            i64::try_from(artifact.artifact_revision).unwrap_or(i64::MAX),
+            i64::try_from(artifact.revision).unwrap_or(i64::MAX),
+            artifact.media_revision,
+            artifact.probe_revision,
+            artifact.sidecar_generation,
+            artifact.subtitle_content_id,
+        ],
+    )
+    .map_err(|e| {
+        format!(
+            "write subtitle publication {} for item {media_item_id}: {e}",
+            artifact.track_id
+        )
+    })?;
+    Ok(())
 }
 
 /// A stored row as the reconciliation will leave it.
@@ -3486,6 +4265,20 @@ mod tests {
         db.with_conn(|c| {
             c.query_row(
                 "SELECT media_revision FROM media_items WHERE id = ?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    /// `subtitle_attempt_count` straight from the row, so a test can prove a
+    /// stale write consumed no failure backoff.
+    fn subtitle_attempts(db: &Db, item_id: i64) -> i64 {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT subtitle_attempt_count FROM media_items WHERE id = ?1",
                 params![item_id],
                 |r| r.get(0),
             )
@@ -4771,5 +5564,1008 @@ mod tests {
         assert_eq!(new.snapshot.duration_ms, Some(2000));
         assert_eq!(new.snapshot.audio_tracks[0].codec, "opus");
         assert_eq!(new.snapshot.subtitle_tracks[0].codec, "ass");
+    }
+
+    // ------------------------------------------------------------------
+    // D2B.2 certified subtitle source and readiness publication
+    // ------------------------------------------------------------------
+
+    fn observed_srt(content_id: &str, size_bytes: i64) -> ObservedSidecar {
+        ObservedSidecar {
+            track_id: "s-en".into(),
+            path: "clip.en.srt".into(),
+            mtime_ms: 5,
+            size_bytes,
+            format: "srt".into(),
+            language: Some("eng".into()),
+            forced: false,
+            sdh: false,
+            content_id: content_id.into(),
+        }
+    }
+
+    /// A certified source needs both the ADR-0058 probe certification and a
+    /// durable generation on every serveable sidecar (D2B.2 acceptance 1).
+    #[test]
+    fn certified_subtitle_source_requires_certification_and_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+
+        // Unprobed: nothing certifies.
+        assert!(db.certified_subtitle_source(id).unwrap().is_none());
+
+        // A legacy unverified sidecar has no generation, so the source stays
+        // uncertified even after a successful probe.
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE media_item_sidecars SET sidecar_generation = NULL, content_id = NULL
+                  WHERE media_item_id = ?1",
+                [id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        assert!(
+            db.certified_subtitle_source(id).unwrap().is_none(),
+            "an unverified sidecar cannot certify"
+        );
+
+        // Re-verifying the sidecar certifies, and each track's token is a
+        // stable bounded function of the captured source.
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(source.sidecars.len(), 1);
+        assert!(source.sidecars[0].generation >= 1);
+        let embedded = source.token_for_track("e2").expect("embedded token");
+        let sidecar = source.token_for_track("s-en").expect("sidecar token");
+        assert_eq!(
+            embedded,
+            db.certified_subtitle_source(id)
+                .unwrap()
+                .unwrap()
+                .token_for_track("e2")
+                .unwrap()
+        );
+        assert_eq!(embedded, "v1-m1-p1", "embedded token is revisions only");
+        assert_eq!(
+            sidecar,
+            format!("v1-m1-p1-s{}", source.sidecars[0].generation),
+            "a sidecar token carries only its own generation"
+        );
+        assert!(is_valid_generation_token(&embedded));
+        assert!(is_valid_generation_token(&sidecar));
+        assert!(source.token_for_track("e9").is_none());
+        assert!(source.token_for_track("s-fr").is_none());
+        assert_eq!(
+            source.source_identity(),
+            db.certified_subtitle_source(id)
+                .unwrap()
+                .unwrap()
+                .source_identity()
+        );
+    }
+
+    /// ADR-0013 §13.1: the token grammar is exact, bounded to 65 bytes, and
+    /// rejects an out-of-grammar string before it can be a path segment.
+    #[test]
+    fn generation_token_grammar_is_exact_and_bounded() {
+        for good in ["v1-m1-p0", "v1-m1-p0-s1", "v1-m10-p20-s300", "v1-m0-p0"] {
+            assert!(is_valid_generation_token(good), "{good} must be valid");
+        }
+        for bad in [
+            "",
+            "v1-m1-p0-s",
+            "v1-m1-p0-s1-s2",
+            "v1-m1-p",
+            "v1-m-p0",
+            "v1-m01-p0",
+            "v1-m1-p00",
+            "v1-m1-p0-s01",
+            "m1-p0",
+            "v1-m1-p0-s1-x",
+            "v1-m1-p0 ",
+            "v1-m1-p0/S",
+            "v2-m1-p0",
+        ] {
+            assert!(!is_valid_generation_token(bad), "{bad:?} must be invalid");
+        }
+        // The grammar's own worst case is exactly the 65-byte bound.
+        let widest = format!("v1-m{}-p{}-s{}", i64::MAX, i64::MAX, i64::MAX);
+        assert_eq!(widest.len(), 65);
+        assert!(is_valid_generation_token(&widest));
+        let too_long = format!("v1-m{}-p0", "9".repeat(64));
+        assert!(too_long.len() > 65);
+        assert!(!is_valid_generation_token(&too_long));
+    }
+
+    /// Commit a `complete` publication for every serveable member of the item's
+    /// current certified source, the way the worker does: reserve an artifact
+    /// revision for each changed body, then CAS the reference to it.
+    fn publish_all_complete(db: &Db, id: i64) -> SubtitlePublication {
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        let mut outcome = SubtitlePublication::Stale;
+        for track_id in source.members() {
+            let Some(token) = source.token_for_track(&track_id) else {
+                continue;
+            };
+            let revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+            outcome = db
+                .publish_subtitle_artifact(
+                    &source,
+                    &SubtitleArtifactPublication {
+                        track_id,
+                        token,
+                        artifact_revision: revision,
+                        state: SubtitleArtifactState::Complete,
+                    },
+                )
+                .unwrap();
+        }
+        outcome
+    }
+
+    /// Commit one `partial` publication for one track of the current certified
+    /// source, with a freshly reserved artifact revision.
+    fn publish_partial(db: &Db, id: i64, track_id: &str) -> SubtitlePublication {
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        let token = source.token_for_track(track_id).unwrap();
+        let revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        db.publish_subtitle_artifact(
+            &source,
+            &SubtitleArtifactPublication {
+                track_id: track_id.to_string(),
+                token,
+                artifact_revision: revision,
+                state: SubtitleArtifactState::Partial,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The publication CAS commits complete per-track references only while the
+    /// captured certification, membership, revisions, and generations still
+    /// match (D2B.2 acceptance 3, ADR-0013 §13.4).
+    #[test]
+    fn publish_subtitle_artifact_cas_requires_the_captured_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(source.members(), vec!["e2".to_string(), "s-en".to_string()]);
+
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        assert_eq!(db.get_item(id).unwrap().unwrap().subtitle_status, "ready");
+        let published = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert!(published.is_complete("e2"));
+        assert!(published.is_complete("s-en"));
+        assert_eq!(
+            published.artifact_for("s-en").unwrap().state,
+            SubtitleArtifactState::Complete
+        );
+        assert!(
+            published.artifact_for("s-en").unwrap().artifact_revision > 0,
+            "a committed reference names a positive artifact revision"
+        );
+        assert_eq!(
+            published.artifact_for("s-en").unwrap().subtitle_content_id,
+            published.snapshot.content_id
+        );
+
+        // Certification loss without a revision increment: a failed probe
+        // clears the validity stamps but leaves `probe_revision` unchanged.
+        let expectation = expectation_of(&db, id);
+        let revision = expectation.probe_revision;
+        assert!(matches!(
+            db.publish_probe(
+                &expectation,
+                &ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "boom".into(),
+                },
+            )
+            .unwrap(),
+            ProbePublication::FailureRecorded
+        ));
+        assert_eq!(db.get_item(id).unwrap().unwrap().probe_revision, revision);
+        db.set_subtitle_status(id, "eligible").unwrap();
+        let revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: source.token_for_track("s-en").unwrap(),
+                    artifact_revision: revision,
+                    state: SubtitleArtifactState::Complete,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale,
+            "lost certification must reject the publication"
+        );
+        assert_eq!(
+            db.get_item(id).unwrap().unwrap().subtitle_status,
+            "eligible"
+        );
+        // The reference is unreachable too: the source cannot certify, so
+        // serving has no source to match against.
+        assert!(db.certified_subtitle_source(id).unwrap().is_none());
+    }
+
+    /// A sidecar that changes after the artifact was built receives a new
+    /// generation, which invalidates the captured source (D2B.2 acceptance 5).
+    #[test]
+    fn publish_subtitle_artifact_is_stale_when_a_sidecar_generation_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+
+        // The sidecar's bytes changed, so reconciliation allocates a new
+        // generation for the same track id.
+        db.reconcile_item_sidecars(id, &[observed_srt("8-bbb-ccc", 8)])
+            .unwrap();
+        let current = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert!(current.sidecars[0].generation > source.sidecars[0].generation);
+
+        let revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: source.token_for_track("s-en").unwrap(),
+                    artifact_revision: revision,
+                    state: SubtitleArtifactState::Complete,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale
+        );
+        assert!(
+            current.artifact_for("s-en").is_none(),
+            "the changed sidecar has no committed reference for its new generation"
+        );
+    }
+
+    /// D2B.2 acceptance 4 / round-2 item 5 / ADR-0013 §13.4: reconciliation
+    /// invalidates only the affected per-track references. Unchanged embedded
+    /// and sidecar tracks keep their committed references and their tokens, the
+    /// coarse item-level lifecycle field is not cleared item-wide, and a
+    /// burn-in-only sidecar change invalidates nothing.
+    #[test]
+    fn reconciliation_invalidates_only_affected_track_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(
+            id,
+            &[
+                observed_srt("7-aaa-bbb", 7),
+                ObservedSidecar {
+                    track_id: "s-fr".into(),
+                    path: "clip.fr.srt".into(),
+                    mtime_ms: 6,
+                    size_bytes: 6,
+                    format: "srt".into(),
+                    language: Some("fra".into()),
+                    forced: false,
+                    sdh: false,
+                    content_id: "6-aaa-bbb".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        let embedded_token = source.token_for_track("e2").unwrap();
+        let french_token = source.token_for_track("s-fr").unwrap();
+
+        // The English sidecar's bytes change: a new generation for s-en only.
+        db.reconcile_item_sidecars(
+            id,
+            &[
+                observed_srt("8-bbb-ccc", 8),
+                ObservedSidecar {
+                    track_id: "s-fr".into(),
+                    path: "clip.fr.srt".into(),
+                    mtime_ms: 6,
+                    size_bytes: 6,
+                    format: "srt".into(),
+                    language: Some("fra".into()),
+                    forced: false,
+                    sdh: false,
+                    content_id: "6-aaa-bbb".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let after = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert!(
+            after.is_complete("e2"),
+            "the unchanged embedded track keeps its committed reference"
+        );
+        assert_eq!(after.token_for_track("e2").unwrap(), embedded_token);
+        assert!(
+            after.is_complete("s-fr"),
+            "an unchanged sidecar keeps its committed reference"
+        );
+        assert_eq!(after.token_for_track("s-fr").unwrap(), french_token);
+        assert!(
+            after.artifact_for("s-en").is_none(),
+            "only the changed track loses its reference"
+        );
+        assert_eq!(
+            db.get_item(id).unwrap().unwrap().subtitle_status,
+            "ready",
+            "the item-level lifecycle field is not cleared item-wide"
+        );
+        let revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: source.token_for_track("s-en").unwrap(),
+                    artifact_revision: revision,
+                    state: SubtitleArtifactState::Complete,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale
+        );
+
+        // A burn-in-only sidecar change invalidates nothing at all.
+        db.reconcile_item_sidecars(
+            id,
+            &[
+                observed_srt("8-bbb-ccc", 8),
+                ObservedSidecar {
+                    track_id: "s-fr".into(),
+                    path: "clip.fr.srt".into(),
+                    mtime_ms: 6,
+                    size_bytes: 6,
+                    format: "srt".into(),
+                    language: Some("fra".into()),
+                    forced: false,
+                    sdh: false,
+                    content_id: "6-aaa-bbb".into(),
+                },
+                ObservedSidecar {
+                    track_id: "s-ass".into(),
+                    path: "clip.ass".into(),
+                    mtime_ms: 3,
+                    size_bytes: 3,
+                    format: "ass".into(),
+                    language: None,
+                    forced: false,
+                    sdh: false,
+                    content_id: "3-eee-fff".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let after = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert!(after.is_complete("e2"));
+        assert!(after.is_complete("s-fr"));
+        assert_eq!(db.get_item(id).unwrap().unwrap().subtitle_status, "ready");
+    }
+
+    /// D2B.2 acceptance 3/5 / round-2 item 2: progressive publication is a
+    /// committed per-track reference gated by the same source CAS. A stale
+    /// progressive write changes nothing and cannot become serveable for a
+    /// newer generation; a progressive write never downgrades a complete
+    /// reference.
+    #[test]
+    fn progressive_publication_is_gated_by_the_source_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        let token = source.token_for_track("s-en").unwrap();
+        let partial_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: token.clone(),
+                    artifact_revision: partial_revision,
+                    state: SubtitleArtifactState::Partial,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Published
+        );
+        let partial = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            partial.artifact_for("s-en").unwrap().state,
+            SubtitleArtifactState::Partial
+        );
+        assert_eq!(
+            partial.artifact_for("s-en").unwrap().artifact_revision,
+            partial_revision,
+            "the committed reference names the reserved revision"
+        );
+        assert!(!partial.is_complete("s-en"));
+
+        // A progressive write for a complete track must not downgrade it, and
+        // complete bytes are never replaced.
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        let complete_revision = db
+            .certified_subtitle_source(id)
+            .unwrap()
+            .unwrap()
+            .artifact_for("s-en")
+            .unwrap()
+            .artifact_revision;
+        assert_eq!(
+            publish_partial(&db, id, "s-en"),
+            SubtitlePublication::Published
+        );
+        let after_complete = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert!(after_complete.is_complete("s-en"));
+        assert_eq!(
+            after_complete
+                .artifact_for("s-en")
+                .unwrap()
+                .artifact_revision,
+            complete_revision,
+            "a partial write must not replace a complete reference"
+        );
+
+        // The sidecar changes: the captured source is stale, so the growing
+        // write is rejected and the old reference is gone.
+        db.reconcile_item_sidecars(id, &[observed_srt("8-bbb-ccc", 8)])
+            .unwrap();
+        let stale_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: token.clone(),
+                    artifact_revision: stale_revision,
+                    state: SubtitleArtifactState::Partial,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale,
+            "a stale progressive write must be rejected by the CAS"
+        );
+        let after = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert!(after.artifact_for("s-en").is_none());
+        assert!(!after.is_complete("s-en"));
+
+        // A token the captured source does not mint for the track is rejected
+        // even when the source itself still matches.
+        let current = db.certified_subtitle_source(id).unwrap().unwrap();
+        let current_token = current.token_for_track("s-en").unwrap();
+        let wrong_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &current,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: "v1-m1-p0".into(),
+                    artifact_revision: wrong_revision,
+                    state: SubtitleArtifactState::Partial,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale
+        );
+        assert!(current.artifact_for("s-en").is_none());
+        assert_eq!(
+            publish_partial(&db, id, "s-en"),
+            SubtitlePublication::Published
+        );
+        let landed = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(landed.token_for_track("s-en").unwrap(), current_token);
+    }
+
+    /// Round-2 item 3: a stale worker cannot mutate the subtitle state of a
+    /// newer source through `none`/`eligible`/`error`/`unavailable`. Every
+    /// outcome is written only when the captured source is still current.
+    #[test]
+    fn stale_worker_status_writes_are_rejected_by_the_source_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        let source = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            db.record_subtitle_status(&source, "none").unwrap(),
+            SubtitlePublication::Published
+        );
+        assert_eq!(db.get_item(id).unwrap().unwrap().subtitle_status, "none");
+
+        // The sidecar changes under the worker: the captured source is stale.
+        db.reconcile_item_sidecars(id, &[observed_srt("8-bbb-ccc", 8)])
+            .unwrap();
+        for status in ["none", "eligible", "error", "unavailable"] {
+            assert_eq!(
+                db.record_subtitle_status(&source, status).unwrap(),
+                SubtitlePublication::Stale,
+                "{status} from stale work must be rejected"
+            );
+            let row = db.get_item(id).unwrap().unwrap();
+            assert_eq!(
+                row.subtitle_status, "none",
+                "{status} must not mutate a newer source's state"
+            );
+            assert_eq!(
+                subtitle_attempts(&db, id),
+                0,
+                "{status} must not consume failure backoff"
+            );
+        }
+
+        // The current source still writes its own outcome.
+        let current = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            db.record_subtitle_status(&current, "eligible").unwrap(),
+            SubtitlePublication::Published
+        );
+        assert_eq!(
+            db.get_item(id).unwrap().unwrap().subtitle_status,
+            "eligible"
+        );
+    }
+
+    /// Round-1 item 7 (removal/re-add ABA): a removed and re-added sidecar gets
+    /// a fresh generation, so the old publication reference is never serveable
+    /// again and the old captured source is stale.
+    #[test]
+    fn remove_then_readd_cannot_serve_the_old_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        let first = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        let first_token = first.token_for_track("s-en").unwrap();
+
+        // Remove the sidecar, then re-add the very same bytes.
+        db.reconcile_item_sidecars(id, &[]).unwrap();
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        let readded = db.certified_subtitle_source(id).unwrap().unwrap();
+        let readded_token = readded.token_for_track("s-en").unwrap();
+        assert_ne!(
+            first_token, readded_token,
+            "a re-add must not reuse the deleted generation"
+        );
+        assert!(
+            readded.artifact_for("s-en").is_none(),
+            "the re-added track has no committed reference"
+        );
+        let revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &first,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: first_token,
+                    artifact_revision: revision,
+                    state: SubtitleArtifactState::Complete,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale
+        );
+    }
+
+    /// D2B.2 corrective reset item 1/2: artifact revisions are allocated
+    /// monotonically per item and a reserved revision is never reused, even
+    /// when a candidate is never committed.
+    #[test]
+    fn artifact_revisions_are_monotonic_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let a = upsert_observed(&db, lib, "a.mkv", 1, Some("1-aaa-bbb"));
+        let b = upsert_observed(&db, lib, "b.mkv", 2, Some("2-aaa-bbb"));
+
+        let first = db.reserve_subtitle_artifact_revision(a).unwrap();
+        let second = db.reserve_subtitle_artifact_revision(a).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 2, "allocation is monotonic per item");
+        assert_eq!(
+            db.reserve_subtitle_artifact_revision(b).unwrap(),
+            1,
+            "each item allocates from its own sequence"
+        );
+    }
+
+    /// D2B.2 corrective reset item 5: the listing read returns certification,
+    /// sidecar membership, publication state and the coarse lifecycle fields
+    /// from one transaction, so an uncertified item still lists its durable
+    /// sidecar rows.
+    #[test]
+    fn listing_source_reads_sidecars_and_publications_coherently() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+
+        // Not certified yet: no embedded inventory, but the durable sidecar row
+        // is still listed and nothing is serveable.
+        let listing = db.subtitle_listing_source(id).unwrap().unwrap();
+        assert!(listing.snapshot.is_none());
+        assert_eq!(listing.sidecars.len(), 1);
+        assert!(listing.artifacts.is_empty());
+        assert!(!listing.needs_publication());
+        assert!(listing.certified().is_none());
+
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        let listing = db.subtitle_listing_source(id).unwrap().unwrap();
+        assert!(listing.snapshot.is_some());
+        assert_eq!(listing.sidecars.len(), 1);
+        assert_eq!(listing.artifacts.len(), 2, "one row per serveable member");
+        assert_eq!(listing.subtitle_status, "ready");
+        assert!(!listing.needs_publication());
+    }
+
+    /// D2B.2 corrective reset item 4: demand is a content signal. A formerly
+    /// `ready` item whose sidecar was edited, and a formerly `none` item that
+    /// gained its first sidecar, both report demand even though the coarse
+    /// item-level status did not move.
+    #[test]
+    fn demand_does_not_depend_on_the_coarse_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        assert_eq!(db.get_item(id).unwrap().unwrap().subtitle_status, "ready");
+
+        // The sidecar is edited: reconciliation withdraws only its reference,
+        // and the coarse `ready` stays. Demand must still report true.
+        db.reconcile_item_sidecars(id, &[observed_srt("9-ccc-ddd", 9)])
+            .unwrap();
+        assert_eq!(
+            db.get_item(id).unwrap().unwrap().subtitle_status,
+            "ready",
+            "the coarse field is not cleared item-wide"
+        );
+        assert!(
+            db.subtitle_listing_source(id)
+                .unwrap()
+                .unwrap()
+                .needs_publication(),
+            "an edited sidecar must keep demanding work under a stale `ready`"
+        );
+
+        // The other direction: an item that had no subtitle at all is `none`
+        // and gains its first sidecar.
+        let none_item = upsert_observed(&db, lib, "silent.mkv", 3, Some("3-aaa-bbb"));
+        let mut snapshot = complete_snapshot(none_item);
+        snapshot.subtitle_tracks.clear();
+        snapshot.subtitle_status = "none".into();
+        assert!(matches!(
+            db.publish_probe(
+                &expectation_of(&db, none_item),
+                &ProbeOutcome::Success(Box::new(snapshot)),
+            )
+            .unwrap(),
+            ProbePublication::Published { .. }
+        ));
+        assert_eq!(
+            db.get_item(none_item).unwrap().unwrap().subtitle_status,
+            "none"
+        );
+        assert!(
+            !db.subtitle_listing_source(none_item)
+                .unwrap()
+                .unwrap()
+                .needs_publication()
+        );
+        db.reconcile_item_sidecars(none_item, &[observed_srt("4-ddd-eee", 4)])
+            .unwrap();
+        assert_eq!(
+            db.get_item(none_item).unwrap().unwrap().subtitle_status,
+            "none",
+            "reconciliation leaves the coarse field alone"
+        );
+        assert!(
+            db.subtitle_listing_source(none_item)
+                .unwrap()
+                .unwrap()
+                .needs_publication(),
+            "a first sidecar under a stale `none` must demand work"
+        );
+    }
+
+    /// D2B.2 corrective reset item 1/2: a per-track publication never deletes an
+    /// unrelated track's committed reference, and a complete reference is not
+    /// replaced by a later write.
+    #[test]
+    fn per_track_publication_preserves_unrelated_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+        assert_eq!(
+            publish_all_complete(&db, id),
+            SubtitlePublication::Published
+        );
+        let embedded = db
+            .certified_subtitle_source(id)
+            .unwrap()
+            .unwrap()
+            .artifact_for("e2")
+            .unwrap()
+            .clone();
+
+        let english = db
+            .certified_subtitle_source(id)
+            .unwrap()
+            .unwrap()
+            .artifact_for("s-en")
+            .unwrap()
+            .clone();
+
+        // A second, unrelated publication for s-en leaves the embedded
+        // reference byte-identical and never replaces the complete reference.
+        assert_eq!(
+            publish_partial(&db, id, "s-en"),
+            SubtitlePublication::Published
+        );
+        let after = db.certified_subtitle_source(id).unwrap().unwrap();
+        assert_eq!(
+            after.artifact_for("e2").unwrap(),
+            &embedded,
+            "an unrelated track's reference must not move"
+        );
+        assert_eq!(
+            after.artifact_for("s-en").unwrap(),
+            &english,
+            "a later write must not replace a committed complete reference"
+        );
+        assert_eq!(
+            after.artifact_for("s-en").unwrap().state,
+            SubtitleArtifactState::Complete
+        );
+    }
+
+    /// D2B.2 corrective reset item 2/6: a rejected publication CAS preserves the
+    /// committed reference and its artifact revision exactly. The rejected
+    /// candidate is never referenced.
+    #[test]
+    fn a_rejected_publication_preserves_the_committed_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let lib = revision_library(&db, "/films");
+        let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+        db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+            .unwrap();
+        assert!(matches!(
+            publish_complete_success(&db, id),
+            ProbePublication::Published { .. }
+        ));
+
+        // Commit A: a partial reference at its own reserved revision.
+        let a_source = db.certified_subtitle_source(id).unwrap().unwrap();
+        let a_token = a_source.token_for_track("s-en").unwrap();
+        let a_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &a_source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: a_token.clone(),
+                    artifact_revision: a_revision,
+                    state: SubtitleArtifactState::Partial,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Published
+        );
+
+        // B is rejected: the item loses its certification without a revision
+        // increment (a failed probe clears the validity stamps). This is the
+        // fault that leaves a finalized candidate unreferenced.
+        assert!(matches!(
+            db.publish_probe(
+                &expectation_of(&db, id),
+                &ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "boom".into(),
+                },
+            )
+            .unwrap(),
+            ProbePublication::FailureRecorded
+        ));
+        let b_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+        assert_ne!(b_revision, a_revision, "B reserves its own revision");
+        assert_eq!(
+            db.publish_subtitle_artifact(
+                &a_source,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: a_token.clone(),
+                    artifact_revision: b_revision,
+                    state: SubtitleArtifactState::Complete,
+                },
+            )
+            .unwrap(),
+            SubtitlePublication::Stale
+        );
+
+        // A survives, exactly: same token, same revision, same partial state.
+        // The listing read is not certification-gated, so it shows the row the
+        // rejected write must not have touched.
+        let listing = db.subtitle_listing_source(id).unwrap().unwrap();
+        let stored = listing
+            .artifacts
+            .iter()
+            .find(|a| a.track_id == "s-en")
+            .expect("A is still committed");
+        assert_eq!(stored.token, a_token);
+        assert_eq!(stored.artifact_revision, a_revision);
+        assert_eq!(stored.state, SubtitleArtifactState::Partial);
+        assert!(
+            listing.certified().is_none(),
+            "an uncertified item has no serveable source, so A is unreachable"
+        );
+    }
+
+    /// D2B.2 corrective reset item 6: the committed reference is durable. After
+    /// a restart, serving resolves the committed revision, not a process-local
+    /// observation and not the previous generation.
+    #[test]
+    fn committed_publication_is_selected_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let (id, b_revision) = {
+            let db = Db::open(&path).unwrap();
+            let lib = revision_library(&db, "/films");
+            let id = upsert_observed(&db, lib, "clip.mkv", 1, Some("1-aaa-bbb"));
+            db.reconcile_item_sidecars(id, &[observed_srt("7-aaa-bbb", 7)])
+                .unwrap();
+            assert!(matches!(
+                publish_complete_success(&db, id),
+                ProbePublication::Published { .. }
+            ));
+
+            // Generation A is committed, then the sidecar is edited and
+            // generation B is committed at its own revision.
+            let a = db.certified_subtitle_source(id).unwrap().unwrap();
+            let a_token = a.token_for_track("s-en").unwrap();
+            let a_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+            db.publish_subtitle_artifact(
+                &a,
+                &SubtitleArtifactPublication {
+                    track_id: "s-en".into(),
+                    token: a_token,
+                    artifact_revision: a_revision,
+                    state: SubtitleArtifactState::Partial,
+                },
+            )
+            .unwrap();
+
+            db.reconcile_item_sidecars(id, &[observed_srt("9-ccc-ddd", 9)])
+                .unwrap();
+            let b = db.certified_subtitle_source(id).unwrap().unwrap();
+            let b_token = b.token_for_track("s-en").unwrap();
+            let b_revision = db.reserve_subtitle_artifact_revision(id).unwrap();
+            assert_eq!(
+                db.publish_subtitle_artifact(
+                    &b,
+                    &SubtitleArtifactPublication {
+                        track_id: "s-en".into(),
+                        token: b_token.clone(),
+                        artifact_revision: b_revision,
+                        state: SubtitleArtifactState::Complete,
+                    },
+                )
+                .unwrap(),
+                SubtitlePublication::Published
+            );
+            assert_ne!(a_revision, b_revision);
+            (id, b_revision)
+        };
+
+        let reopened = Db::open(&path).unwrap();
+        let source = reopened.certified_subtitle_source(id).unwrap().unwrap();
+        let artifact = source.artifact_for("s-en").expect("committed reference");
+        assert_eq!(artifact.state, SubtitleArtifactState::Complete);
+        assert_eq!(
+            artifact.artifact_revision, b_revision,
+            "the restarted server resolves the committed revision, not the prior one"
+        );
+        assert!(
+            !source.is_complete("e2"),
+            "the embedded member of the newer source has no committed reference"
+        );
     }
 }

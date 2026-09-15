@@ -1,7 +1,8 @@
 //! Text subtitle → WebVTT (ADR-0010 / ADR-0013).
 //!
-//! Extraction runs at scan time into derived library data under
-//! `{NIGHTJAR_DATA_DIR}/subs/{itemId}/{trackId}.vtt`. Playback only reads.
+//! Extraction writes immutable, generation-addressed derived library data under
+//! `{NIGHTJAR_DATA_DIR}/subs/{itemId}/{token}/{trackId}.r{artifactRevision}.vtt`
+//! (ADR-0013 §13.2). Playback only reads.
 
 mod discover;
 mod lang;
@@ -15,6 +16,7 @@ pub use lang::{container_stream_language, normalize_language};
 pub use slice::{slice_webvtt, webvtt_max_cue_end_ms};
 pub use srt::{decode_subtitle_bytes, srt_to_webvtt};
 
+use nightjar_db::SubtitleArtifactState;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -22,7 +24,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Codecs we can convert to WebVTT without burn-in.
 const TEXT_SUB_CODECS: &[&str] = &["subrip", "srt", "webvtt", "mov_text", "text"];
@@ -144,12 +146,6 @@ impl TrackReadiness {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TrackProgress {
-    readiness: TrackReadiness,
-    revision: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSubtitleStream {
     /// Absolute ffprobe stream index (`-map 0:N`).
@@ -220,19 +216,54 @@ impl BurnInSubtitleStream {
     }
 }
 
-/// Filesystem sidecar input for a scan-time extract job.
+/// One serveable sidecar input for an extract job, with its captured identity.
 #[derive(Debug, Clone)]
 pub struct SidecarInput {
     pub track_id: String,
     pub path: PathBuf,
     pub format: String,
+    /// Captured sidecar mtime and size (ADR-0010 §4). Rechecked before
+    /// conversion and before the rename so a changed file never publishes
+    /// under the old generation (D2B.2 acceptance 5).
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+}
+
+/// Captured source identity and the DB source checks for one extract run
+/// (ADR-0013 §13.3).
+///
+/// `media_path`/`mtime_ms`/`size_bytes` are the ADR-0058 capture's media tuple.
+/// Progressive work revalidates them before it converts or reads and again
+/// before it publishes, so a media replacement under a running extract never
+/// publishes (ADR-0013 §13.3.2, §13.5). `token_for` mints the bounded per-track
+/// generation token that names the artifact directory (ADR-0013 §13.1/§13.2);
+/// `None` means the track is not a serveable member of the captured source.
+/// `is_current` answers whether the captured certified source still matches.
+/// `reserve_revision` allocates the next immutable artifact revision from the
+/// DB (ADR-0013 §13.2). `publish` commits one changed body at its exact
+/// revision through the DB source compare-and-swap (ADR-0013 §13.3.4/§13.5) and
+/// returns `false` when the captured source has been superseded.
+pub struct ExtractSource<'a> {
+    pub media_path: PathBuf,
+    pub mtime_ms: i64,
+    pub size_bytes: i64,
+    pub token_for: &'a dyn Fn(&str) -> Option<String>,
+    pub is_current: &'a dyn Fn() -> bool,
+    pub reserve_revision: &'a dyn Fn() -> Option<u64>,
+    pub publish: &'a dyn Fn(&str, &str, u64, SubtitleArtifactState) -> bool,
+}
+
+/// True when `err` marks a source that changed under a running extract. The
+/// pool defers such a run without writing a status (D2B.2 acceptance 5).
+pub fn message_is_source_changed(err: &str) -> bool {
+    err.starts_with("source-changed:")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractOutcome {
     /// No serveable text tracks (embedded or sidecar).
     None,
-    /// All serveable tracks written under the item directory.
+    /// Every requested serveable track is written under its generation token.
     Ready,
     /// Some tracks landed, the rest did not (ADR-0041 Decision 8.4). The item
     /// must not claim `ready`; a later pass finishes the missing tracks and
@@ -456,18 +487,17 @@ pub struct SubsStore {
     root: PathBuf,
     /// Serialises extracts so two workers never share the same item tmp paths.
     extract_lock: Mutex<()>,
-    /// In-flight per-track readiness while demux runs (ADR-0013 §11).
-    progress: Mutex<HashMap<(i64, String), TrackProgress>>,
 }
 
 impl SubsStore {
     pub fn new(root: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&root)
-            .map_err(|e| format!("create subs dir {}: {e}", root.display()))?;
+        // A newly created root directory entry, and every newly created
+        // ancestor entry above it, is made durable before anything under it is
+        // published (ADR-0013 §13.3.3). An existing root is left untouched.
+        create_dir_durable(&root)?;
         Ok(Self {
             root,
             extract_lock: Mutex::new(()),
-            progress: Mutex::new(HashMap::new()),
         })
     }
 
@@ -479,99 +509,123 @@ impl SubsStore {
         self.root.join(item_id.to_string())
     }
 
-    pub fn vtt_path(&self, item_id: i64, track_id: &str) -> PathBuf {
-        self.item_dir(item_id).join(format!("{track_id}.vtt"))
+    /// The directory holding one immutable, generation-addressed artifact set
+    /// (ADR-0013 §13.2). The generation token is minted by the DB from a
+    /// certified source and is an opaque path segment here.
+    pub fn generation_dir(&self, item_id: i64, generation: &str) -> PathBuf {
+        self.item_dir(item_id).join(generation)
     }
 
-    pub fn has_vtt(&self, item_id: i64, track_id: &str) -> bool {
-        let path = self.vtt_path(item_id, track_id);
-        path.exists() && fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0
-    }
-
-    /// Server-declared readiness for a serveable track. `None` means the track
-    /// is listed but not served (ASS/SSA, image) — caller decides that from
-    /// codec/format before asking.
-    pub fn track_readiness(
+    /// The finalized immutable artifact of one `(track, token, revision)`
+    /// (ADR-0013 §13.2). Serving resolves this from the committed publication
+    /// row; no caller constructs it from a request.
+    pub fn artifact_path(
         &self,
         item_id: i64,
+        generation: &str,
         track_id: &str,
-        item_subtitle_status: &str,
-    ) -> (TrackReadiness, u64) {
-        if let Some(p) = self
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(item_id, track_id.to_string()))
-            .copied()
-        {
-            return (p.readiness, p.revision);
-        }
-        if self.has_vtt(item_id, track_id) {
-            // Prefer Complete once the item is marked ready; a pending item
-            // with a file on disk is a partial left mid-extract (or after a
-            // crash), which is still serveable.
-            if item_subtitle_status == "ready" {
-                (TrackReadiness::Complete, 1)
-            } else {
-                (TrackReadiness::Partial, 1)
+        artifact_revision: u64,
+    ) -> PathBuf {
+        self.generation_dir(item_id, generation)
+            .join(format!("{track_id}.r{artifact_revision}.vtt"))
+    }
+
+    /// Whether the finalized artifact exists with bytes.
+    pub fn has_artifact(
+        &self,
+        item_id: i64,
+        generation: &str,
+        track_id: &str,
+        artifact_revision: u64,
+    ) -> bool {
+        let path = self.artifact_path(item_id, generation, track_id, artifact_revision);
+        fs::metadata(&path)
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
+    }
+
+    /// Write and fsync one complete candidate body for `artifact_revision`
+    /// without publishing it (ADR-0013 §13.3.3).
+    ///
+    /// The candidate is a temporary file in the generation directory. It is
+    /// never serveable: only [`Self::finalize_candidate`] gives it its
+    /// immutable name, and only the DB source compare-and-swap makes it
+    /// visible.
+    ///
+    /// Creation is exclusive (`create_new`). A crash between
+    /// [`Self::finalize_candidate`]'s hard link and its candidate unlink leaves
+    /// a candidate that shares an inode with the finalized artifact; truncating
+    /// it would corrupt committed bytes, so a collision is an error instead
+    /// (ADR-0013 §13.2).
+    fn write_candidate(
+        &self,
+        item_id: i64,
+        generation: &str,
+        track_id: &str,
+        artifact_revision: u64,
+        body: &str,
+    ) -> Result<PathBuf, String> {
+        let dir = self.generation_dir(item_id, generation);
+        create_dir_durable(&dir)?;
+        let candidate = dir.join(format!("{track_id}.r{artifact_revision}.candidate"));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .map_err(|e| {
+                io_failure_message(
+                    &format!("write subtitle candidate {}", candidate.display()),
+                    &e,
+                )
+            })?;
+        file.write_all(body.as_bytes()).map_err(|e| {
+            io_failure_message(
+                &format!("write subtitle candidate {}", candidate.display()),
+                &e,
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            io_failure_message(
+                &format!("fsync subtitle candidate {}", candidate.display()),
+                &e,
+            )
+        })?;
+        drop(file);
+        Ok(candidate)
+    }
+
+    /// Finalize a candidate into its immutable artifact name without
+    /// overwriting an existing final artifact, then fsync the generation
+    /// directory so the new entry is durable (ADR-0013 §13.3.3).
+    ///
+    /// A hard link refuses an existing destination; `rename(2)` would replace
+    /// it silently, which the contract forbids.
+    fn finalize_candidate(&self, candidate: &Path, final_path: &Path) -> Result<(), String> {
+        match fs::hard_link(candidate, final_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(candidate);
+                return Err(format!(
+                    "subtitle artifact {} already exists and is never overwritten",
+                    final_path.display()
+                ));
             }
-        } else {
-            (TrackReadiness::Preparing, 0)
+            Err(e) => {
+                let _ = fs::remove_file(candidate);
+                return Err(io_failure_message(
+                    &format!("finalize subtitle artifact {}", final_path.display()),
+                    &e,
+                ));
+            }
         }
-    }
-
-    fn set_progress(&self, item_id: i64, track_id: &str, readiness: TrackReadiness, revision: u64) {
-        self.progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                (item_id, track_id.to_string()),
-                TrackProgress {
-                    readiness,
-                    revision,
-                },
-            );
-    }
-
-    fn clear_item_progress(&self, item_id: i64) {
-        self.progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(id, _), _| *id != item_id);
-    }
-
-    /// Write a growing WebVTT and bump revision when the body grew.
-    fn publish_partial_vtt(&self, item_id: i64, track_id: &str, body: &str) -> Result<(), String> {
-        let dest = self.vtt_path(item_id, track_id);
-        let prev_len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-        if (body.len() as u64) <= prev_len && prev_len > 0 {
-            return Ok(());
+        let _ = fs::remove_file(candidate);
+        if let Some(parent) = final_path.parent() {
+            fsync_dir(parent)?;
         }
-        write_webvtt(&dest, body)?;
-        let next_rev = self
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(item_id, track_id.to_string()))
-            .map(|p| p.revision.saturating_add(1))
-            .unwrap_or(1);
-        self.set_progress(item_id, track_id, TrackReadiness::Partial, next_rev);
         Ok(())
     }
 
-    fn mark_complete(&self, item_id: i64, track_id: &str) {
-        let next_rev = self
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(item_id, track_id.to_string()))
-            .map(|p| p.revision.saturating_add(1))
-            .unwrap_or(1);
-        self.set_progress(item_id, track_id, TrackReadiness::Complete, next_rev);
-    }
-
     pub fn remove_item(&self, item_id: i64) -> Result<(), String> {
-        self.clear_item_progress(item_id);
         let dir = self.item_dir(item_id);
         if !dir.exists() {
             return Ok(());
@@ -621,50 +675,27 @@ impl SubsStore {
         Ok(removed)
     }
 
-    /// Publish one track's completed WebVTT without touching any other file
-    /// in the item directory (ADR-0041 Decision 7 / 8.5 share this invariant:
-    /// a piggyback or a failed pass never deletes a previously-good track).
-    /// The item directory is created on demand; existing tracks stay intact.
-    pub fn publish_item_vtt(&self, item_id: i64, track_id: &str, body: &str) -> Result<(), String> {
-        write_webvtt(&self.vtt_path(item_id, track_id), body)
-    }
-
-    /// Drop WebVTT files in the item directory whose track id is not in
-    /// `keep`. Runs only after a fully successful pass replaces the prior
-    /// generation; a failed or partial pass never deletes (ADR-0041 Decision
-    /// 8.5 — the old code wiped the whole item dir up front, which a failed
-    /// retry could turn into data loss).
-    pub fn sweep_item_vtts(&self, item_id: i64, keep: &[String]) -> Result<usize, String> {
-        let dir = self.item_dir(item_id);
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(format!("read subtitle dir {}: {e}", dir.display())),
-        };
-        let mut removed = 0usize;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.ends_with(".vtt") {
-                continue;
-            }
-            let track_id = name.trim_end_matches(".vtt");
-            if keep.iter().any(|k| k == track_id) {
-                continue;
-            }
-            match fs::remove_file(entry.path()) {
-                Ok(()) => removed += 1,
-                Err(e) => tracing::warn!(
-                    item_id,
-                    path = %entry.path().display(),
-                    error = %e,
-                    "stale subtitle track cleanup failed"
-                ),
-            }
-        }
-        Ok(removed)
+    /// Finalize one track's artifact body at `artifact_revision`, the way the
+    /// production pipeline does: write and fsync a candidate, then finalize it
+    /// without overwrite (ADR-0013 §13.3.3).
+    ///
+    /// This is the same two primitives the extract uses; it exists so a caller
+    /// that already holds a reserved revision (a test, or D2B.3's piggyback
+    /// writer) does not need a second write path.
+    pub fn publish_item_vtt(
+        &self,
+        item_id: i64,
+        generation: &str,
+        track_id: &str,
+        artifact_revision: u64,
+        body: &str,
+    ) -> Result<(), String> {
+        let candidate =
+            self.write_candidate(item_id, generation, track_id, artifact_revision, body)?;
+        self.finalize_candidate(
+            &candidate,
+            &self.artifact_path(item_id, generation, track_id, artifact_revision),
+        )
     }
 }
 
@@ -697,9 +728,7 @@ pub fn concat_webvtt_segments(bodies: &[String]) -> String {
 
 fn write_webvtt(dest: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            io_failure_message(&format!("create subtitle dir {}", parent.display()), &e)
-        })?;
+        create_dir_durable(parent)?;
     }
     // Temp write + fsync + atomic rename per track: a reader never sees a
     // half-written WebVTT, and a crash mid-write cannot corrupt a
@@ -716,7 +745,52 @@ fn write_webvtt(dest: &Path, body: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         io_failure_message(&format!("rename subtitle {}", dest.display()), &e)
     })?;
+    // Persist the directory entry before readiness is published (ADR-0013
+    // §13.3.3): without the parent fsync a crash can lose the rename even
+    // though the file bytes were synced.
+    if let Some(parent) = dest.parent() {
+        fsync_dir(parent)?;
+    }
     Ok(())
+}
+
+/// Create `dir` and every missing ancestor, fsyncing each newly created
+/// directory's parent so the new entry survives a crash (ADR-0013 §13.3.3:
+/// "fsync every newly created ancestor directory entry"). The leaf directory's
+/// own entry for the renamed file is fsynced by [`write_webvtt`] after the
+/// rename.
+fn create_dir_durable(dir: &Path) -> Result<(), String> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(path) = cursor {
+        if path.is_dir() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        cursor = path.parent();
+    }
+    fs::create_dir_all(dir)
+        .map_err(|e| io_failure_message(&format!("create subtitle dir {}", dir.display()), &e))?;
+    // Shallowest first: a new directory's entry lives in its parent, so syncing
+    // the parent persists that entry.
+    for path in missing.iter().rev() {
+        if let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// fsync one directory so a completed rename survives a crash.
+fn fsync_dir(dir: &Path) -> Result<(), String> {
+    let handle = fs::File::open(dir)
+        .map_err(|e| io_failure_message(&format!("open subtitle dir {}", dir.display()), &e))?;
+    handle
+        .sync_all()
+        .map_err(|e| io_failure_message(&format!("fsync subtitle dir {}", dir.display()), &e))
 }
 
 fn srt_bytes_to_webvtt(bytes: &[u8]) -> String {
@@ -909,10 +983,12 @@ fn demux_embedded_into_session(
 /// turns true the demux child is killed and the run reports `unavailable`,
 /// never `ready` (ADR-0041 Decision 8.7 — cancel in flight, not just block
 /// new starts). The same signal already gates job *start* at the pool.
+#[allow(clippy::too_many_arguments)]
 pub fn extract_item_subtitles(
     store: &SubsStore,
     item_id: i64,
-    src: &Path,
+    source: &ExtractSource<'_>,
+    embedded: &[TextSubtitleStream],
     sidecars: &[SidecarInput],
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<ExtractOutcome, String> {
@@ -920,43 +996,55 @@ pub fn extract_item_subtitles(
         .extract_lock
         .lock()
         .map_err(|_| "subtitle extract lock poisoned".to_string())?;
+    extract_item_subtitles_inner(store, item_id, source, embedded, sidecars, should_cancel)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn extract_item_subtitles_inner(
+    store: &SubsStore,
+    item_id: i64,
+    source: &ExtractSource<'_>,
+    embedded: &[TextSubtitleStream],
+    sidecars: &[SidecarInput],
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<ExtractOutcome, String> {
     ensure_free_space(store.root())?;
+    let src = source.media_path.as_path();
 
     let serveable_sidecars: Vec<&SidecarInput> = sidecars
         .iter()
         .filter(|s| is_serveable_sidecar_format(&s.format))
         .collect();
-    // Sidecar-only titles still extract when the container probe fails (corrupt
-    // video, permission), so external .srt next to a bad file is not stranded.
-    let embedded = match list_text_subtitles(src) {
-        Ok(v) => v,
-        Err(e) if !serveable_sidecars.is_empty() => {
-            tracing::warn!(
-                path = %src.display(),
-                error = %e,
-                "embedded subtitle probe failed; continuing with sidecars"
-            );
-            Vec::new()
-        }
-        Err(e) => return Err(e),
-    };
+    // The embedded inventory comes from the caller's certified probe snapshot,
+    // never from a fresh probe of the source (D2B.2 acceptance 1).
     if embedded.is_empty() && serveable_sidecars.is_empty() {
-        store.remove_item(item_id)?;
         return Ok(ExtractOutcome::None);
     }
 
-    // The prior generation is NOT wiped up front: a pass that fails must not
-    // delete previously-good tracks (ADR-0041 Decision 8.5). Stale tracks from
-    // an older generation are swept only after a full success below.
-    fs::create_dir_all(store.item_dir(item_id))
-        .map_err(|e| io_failure_message(&format!("create subtitle dir for item {item_id}"), &e))?;
+    // ADR-0013 §13.3.2: validate the captured physical and DB source before
+    // extraction. A changed or unreadable source defers the whole run.
+    check_media_unchanged(src, source)?;
+    check_source_current(source)?;
 
-    for s in &embedded {
-        store.set_progress(item_id, &s.track_id(), TrackReadiness::Preparing, 0);
-    }
-    for s in &serveable_sidecars {
-        store.set_progress(item_id, &s.track_id, TrackReadiness::Preparing, 0);
+    // Embedded text tracks of one certified snapshot share one token
+    // (ADR-0013 §13.1), so they share one immutable generation directory.
+    let embedded_token = match embedded.first() {
+        Some(first) => Some((source.token_for)(&first.track_id()).ok_or_else(|| {
+            "source-changed: embedded track is not a member of the captured source".to_string()
+        })?),
+        None => None,
+    };
+
+    // This run's finalized bodies, keyed by track id. An unchanged body is
+    // never rewritten and never re-finalized: partial-to-complete may reference
+    // the identical finalized bytes (ADR-0013 §13.2).
+    let mut finalized: HashMap<String, (u64, String)> = HashMap::new();
+
+    // The prior generation is NOT wiped up front: a pass that fails must not
+    // delete previously-good tracks (ADR-0041 Decision 8.5), and every artifact
+    // revision is immutable (ADR-0013 §13.2).
+    if let Some(token) = &embedded_token {
+        create_dir_durable(&store.generation_dir(item_id, token))?;
     }
 
     // Per-file timeout budget from source size at the measured 55 MiB/s rate
@@ -967,14 +1055,24 @@ pub fn extract_item_subtitles(
         path = %src.display(),
         src_bytes,
         timeout_budget_ms = budget.as_millis() as u64,
+        embedded_token = embedded_token.as_deref().unwrap_or("-"),
         "subtitle extract timeout budget"
     );
 
     let mut written = 0usize;
     let mut failed = 0usize;
-    if !embedded.is_empty() {
+    if let Some(token) = &embedded_token {
         let refs: Vec<&TextSubtitleStream> = embedded.iter().collect();
-        let (w, f) = extract_embedded_srt_batch(store, item_id, src, &refs, budget, should_cancel)?;
+        let (w, f) = extract_embedded_srt_batch(
+            store,
+            item_id,
+            token,
+            &refs,
+            budget,
+            should_cancel,
+            source,
+            &mut finalized,
+        )?;
         written += w;
         failed += f;
     }
@@ -984,11 +1082,15 @@ pub fn extract_item_subtitles(
         if should_cancel() {
             return Err("unavailable: subtitle extract cancelled (library unreachable)".into());
         }
-        match write_sidecar_webvtt(store, item_id, s) {
-            Ok(()) => {
-                store.mark_complete(item_id, &s.track_id);
-                written += 1;
-            }
+        let Some(token) = (source.token_for)(&s.track_id) else {
+            failed += 1;
+            continue;
+        };
+        match write_sidecar_webvtt(store, item_id, &token, s, source, &mut finalized) {
+            Ok(()) => written += 1,
+            // A sidecar that changed under the run invalidates the whole
+            // generation; defer without publishing anything (D2B.2 acceptance 5).
+            Err(e) if message_is_source_changed(&e) => return Err(e),
             Err(e) => {
                 failed += 1;
                 if first_sidecar_err.is_none() {
@@ -1021,22 +1123,99 @@ pub fn extract_item_subtitles(
         return Ok(ExtractOutcome::Partial { written, failed });
     }
 
-    // Full success replaces the prior generation: drop vtt files whose track
-    // is no longer in the inventory (the old code wiped the whole item dir up
-    // front; only a success may delete — Decision 8.5).
-    let mut keep: Vec<String> = embedded.iter().map(|s| s.track_id()).collect();
-    keep.extend(sidecars.iter().map(|s| s.track_id.clone()));
-    if let Err(e) = store.sweep_item_vtts(item_id, &keep) {
-        tracing::warn!(item_id, error = %e, "stale subtitle sweep failed");
-    }
-
+    // No sweep: every artifact revision is immutable and unreferenced revisions
+    // are never served (ADR-0013 §13.2/§13.7), so a full success has nothing to
+    // delete and cannot touch an unrelated track.
     Ok(ExtractOutcome::Ready)
 }
 
-/// Path of an already-extracted WebVTT, or an error if missing.
-pub fn stored_webvtt(store: &SubsStore, item_id: i64, track_id: &str) -> Result<PathBuf, String> {
-    let path = store.vtt_path(item_id, track_id);
-    if store.has_vtt(item_id, track_id) {
+/// Publish one changed body as a per-track artifact (ADR-0013 §13.3.3,
+/// §13.3.4, §13.5).
+///
+/// Every changed partial or complete body: validate the captured physical and
+/// DB source, reserve an artifact revision, write and fsync a candidate,
+/// revalidate, finalize without overwrite, fsync the directory, then commit the
+/// reference through the DB source compare-and-swap at that exact revision. A
+/// validation or CAS failure preserves the previous reference and bytes and
+/// leaves only an unreferenced candidate.
+///
+/// A body identical to the one this run already finalized is not rewritten: a
+/// partial-to-complete transition references the identical finalized bytes.
+///
+/// The last physical identity check runs *after* the last potentially blocking
+/// DB check, immediately before the finalize or the CAS. A source that changes
+/// while the database is consulted is therefore still rejected before any
+/// finalized or committed bytes can name it. `sidecar` is the track's own
+/// source when the track is a sidecar, so both sources are covered.
+#[allow(clippy::too_many_arguments)]
+fn publish_artifact(
+    store: &SubsStore,
+    item_id: i64,
+    source: &ExtractSource<'_>,
+    track_id: &str,
+    token: &str,
+    body: &str,
+    state: SubtitleArtifactState,
+    sidecar: Option<&SidecarInput>,
+    finalized: &mut HashMap<String, (u64, String)>,
+) -> Result<(), String> {
+    check_source_physical(source, sidecar)?;
+    check_source_current(source)?;
+    let revision = match finalized.get(track_id) {
+        Some((revision, previous)) if previous == body => {
+            // Identical bytes are referenced, never rewritten. Revalidate the
+            // DB source and then the physical source before the CAS.
+            check_source_current(source)?;
+            check_source_physical(source, sidecar)?;
+            *revision
+        }
+        _ => {
+            let Some(revision) = (source.reserve_revision)() else {
+                return Err(format!(
+                    "source-changed: no artifact revision could be reserved for {track_id}"
+                ));
+            };
+            let candidate = store.write_candidate(item_id, token, track_id, revision, body)?;
+            // The last DB check, then the last physical check: a source that
+            // moved on while the database was consulted must not publish, and
+            // the candidate stays unreferenced (ADR-0013 §13.3.2, §13.5).
+            if let Err(e) =
+                check_source_current(source).and_then(|_| check_source_physical(source, sidecar))
+            {
+                let _ = fs::remove_file(&candidate);
+                return Err(e);
+            }
+            store.finalize_candidate(
+                &candidate,
+                &store.artifact_path(item_id, token, track_id, revision),
+            )?;
+            finalized.insert(track_id.to_string(), (revision, body.to_string()));
+            revision
+        }
+    };
+    // The bytes become serveable only through the committed per-track reference
+    // (ADR-0013 §13.3.4). A CAS that rejects leaves them unreferenced and the
+    // run defers.
+    if !(source.publish)(track_id, token, revision, state) {
+        return Err(format!(
+            "source-changed: subtitle artifact for {track_id} was superseded before publication"
+        ));
+    }
+    Ok(())
+}
+
+/// Path of the committed artifact, or an error if it is missing. The revision
+/// comes from the committed publication row, never from the request
+/// (ADR-0013 §13.2).
+pub fn stored_webvtt(
+    store: &SubsStore,
+    item_id: i64,
+    generation: &str,
+    track_id: &str,
+    artifact_revision: u64,
+) -> Result<PathBuf, String> {
+    let path = store.artifact_path(item_id, generation, track_id, artifact_revision);
+    if store.has_artifact(item_id, generation, track_id, artifact_revision) {
         Ok(path)
     } else {
         Err(format!(
@@ -1048,8 +1227,17 @@ pub fn stored_webvtt(store: &SubsStore, item_id: i64, track_id: &str) -> Result<
 fn write_sidecar_webvtt(
     store: &SubsStore,
     item_id: i64,
+    generation: &str,
     sidecar: &SidecarInput,
+    source: &ExtractSource<'_>,
+    finalized: &mut HashMap<String, (u64, String)>,
 ) -> Result<(), String> {
+    // Recheck the captured path/mtime/size before conversion, so a changed file
+    // never converts stale bytes (ADR-0013 §13.3.2). The publication path
+    // revalidates the physical and DB source again before it finalizes. The
+    // durable generation is checked by the DB CAS at publication; no digest is
+    // computed here.
+    check_sidecar_unchanged(sidecar)?;
     let bytes = fs::read(&sidecar.path).map_err(|e| {
         if io_error_is_availability(&e) {
             format!(
@@ -1070,22 +1258,119 @@ fn write_sidecar_webvtt(
     } else {
         srt_bytes_to_webvtt(&bytes)
     };
-    write_webvtt(&store.vtt_path(item_id, &sidecar.track_id), &body)
+    check_sidecar_unchanged(sidecar)?;
+    // A sidecar conversion completes in-process, so the track's bytes are
+    // complete; the publication path revalidates media *and* this sidecar.
+    publish_artifact(
+        store,
+        item_id,
+        source,
+        &sidecar.track_id,
+        generation,
+        &body,
+        SubtitleArtifactState::Complete,
+        Some(sidecar),
+        finalized,
+    )
+}
+
+/// Validate every physical source a track's bytes came from: the media file,
+/// and the track's own sidecar when it has one (ADR-0013 §13.3.2).
+fn check_source_physical(
+    source: &ExtractSource<'_>,
+    sidecar: Option<&SidecarInput>,
+) -> Result<(), String> {
+    check_media_unchanged(&source.media_path, source)?;
+    if let Some(sidecar) = sidecar {
+        check_sidecar_unchanged(sidecar)?;
+    }
+    Ok(())
+}
+
+/// Compare the media file's current mtime/size with the certified capture
+/// (ADR-0013 §13.3.2). A change marks the run stale; an inaccessible source is
+/// the availability failure ADR-0058 already defines.
+fn check_media_unchanged(src: &Path, source: &ExtractSource<'_>) -> Result<(), String> {
+    let meta = match fs::metadata(src) {
+        Ok(meta) => meta,
+        Err(e) => {
+            return Err(format!("unavailable: stat source {}: {e}", src.display()));
+        }
+    };
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    if mtime_ms != Some(source.mtime_ms) || meta.len() as i64 != source.size_bytes {
+        return Err(format!(
+            "source-changed: source {} changed during extract",
+            src.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the captured certified source is still the current one
+/// (ADR-0013 §13.3.3, §13.5). Stale work is rejected before it writes.
+fn check_source_current(source: &ExtractSource<'_>) -> Result<(), String> {
+    if (source.is_current)() {
+        Ok(())
+    } else {
+        Err("source-changed: certified source is no longer current".to_string())
+    }
+}
+
+/// Compare a sidecar's current mtime/size with the captured tuple. A change (or
+/// a lost stat) marks the whole run stale so nothing publishes under the old
+/// generation.
+fn check_sidecar_unchanged(sidecar: &SidecarInput) -> Result<(), String> {
+    let meta = match fs::metadata(&sidecar.path) {
+        Ok(meta) => meta,
+        Err(e) if io_error_is_availability(&e) => {
+            return Err(format!(
+                "unavailable: stat sidecar {}: {e}",
+                sidecar.path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "source-changed: stat sidecar {}: {e}",
+                sidecar.path.display()
+            ));
+        }
+    };
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    if mtime_ms != Some(sidecar.mtime_ms) || meta.len() as i64 != sidecar.size_bytes {
+        return Err(format!(
+            "source-changed: sidecar {} changed during extract",
+            sidecar.path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Demux every embedded text stream in one ffmpeg run, then publish each
 /// track's WebVTT independently (ADR-0041 Decision 8.4: one bad stream must
 /// not lose tracks that completed). Returns (written, failed) track counts;
 /// an `Err` means the demux failed AND no track produced usable output.
+#[allow(clippy::too_many_arguments)]
 fn extract_embedded_srt_batch(
     store: &SubsStore,
     item_id: i64,
-    src: &Path,
+    generation: &str,
     streams: &[&TextSubtitleStream],
     timeout: Duration,
     should_cancel: &dyn Fn() -> bool,
+    source: &ExtractSource<'_>,
+    finalized: &mut HashMap<String, (u64, String)>,
 ) -> Result<(usize, usize), String> {
-    let item_dir = store.item_dir(item_id);
+    let src = source.media_path.as_path();
+    let generation_dir = store.generation_dir(item_id, generation);
     let mut tmp_srts: Vec<(u32, PathBuf)> = Vec::with_capacity(streams.len());
     let mut cmd = Command::new("ffmpeg");
     cmd.stdin(Stdio::null())
@@ -1094,7 +1379,7 @@ fn extract_embedded_srt_batch(
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(src);
     for s in streams {
-        let tmp = item_dir.join(format!("e{}.tmp.srt", s.stream_index));
+        let tmp = generation_dir.join(format!("e{}.tmp.srt", s.stream_index));
         let map = format!("0:{}", s.stream_index);
         let encoder = srt_encoder_for_codec(&s.codec);
         // Growing files need bytes on disk promptly so partial-publish reads
@@ -1123,16 +1408,40 @@ fn extract_embedded_srt_batch(
 
     let mut last_sizes: HashMap<u32, u64> = HashMap::new();
     let demux = wait_extract_child(&mut child, timeout, should_cancel, || {
-        publish_growing_srts(store, item_id, &tmp_srts, &mut last_sizes);
+        publish_growing_srts(
+            store,
+            item_id,
+            generation,
+            &tmp_srts,
+            &mut last_sizes,
+            source,
+            finalized,
+        );
     });
 
     // Salvage each track's tmp independently. A failed demux leaves whatever
     // each track produced before the abort; tracks that produced nothing
-    // count as failed and the rest land (Decision 8.4).
+    // count as failed and the rest land (Decision 8.4). Only a demux that
+    // reached successful EOF may publish `Complete`; an aborted or failed run
+    // salvages cues as `Partial` (ADR-0013 §13.4).
+    let salvage_state = if demux.is_ok() {
+        SubtitleArtifactState::Complete
+    } else {
+        SubtitleArtifactState::Partial
+    };
     let mut written = 0usize;
     let mut failed = 0usize;
     for (stream_index, tmp_srt) in &tmp_srts {
-        match salvage_track_vtt(store, item_id, *stream_index, tmp_srt) {
+        match salvage_track_vtt(
+            store,
+            item_id,
+            generation,
+            *stream_index,
+            tmp_srt,
+            salvage_state,
+            source,
+            finalized,
+        ) {
             Ok(()) => written += 1,
             Err(e) => {
                 failed += 1;
@@ -1150,7 +1459,6 @@ fn extract_embedded_srt_batch(
     }
 
     if written == 0 {
-        store.clear_item_progress(item_id);
         let msg = match &demux {
             Err(e) => e.clone(),
             Ok(()) => format!(
@@ -1161,6 +1469,15 @@ fn extract_embedded_srt_batch(
         return Err(msg);
     }
     if let Err(e) = demux {
+        // A cancelled or unavailable demux never reports a partial success:
+        // the salvaged cues stay `partial` and the run still reports the
+        // cancellation or unavailability, so the pool stamps availability
+        // instead of treating the aborted run as a landed result
+        // (ADR-0013 §13.4). Any other ffmpeg failure is a per-track salvage
+        // outcome (ADR-0041 Decision 8.4).
+        if e.starts_with("unavailable:") {
+            return Err(e);
+        }
         tracing::warn!(
             path = %src.display(),
             error = %e,
@@ -1170,14 +1487,20 @@ fn extract_embedded_srt_batch(
     Ok((written, failed))
 }
 
-/// Publish one embedded track's completed WebVTT from its demux tmp. A tmp
-/// with no cue text (empty stream, or a stream whose packets were never
-/// reached) fails the track without touching any other file.
+/// Publish one embedded track's WebVTT from its demux tmp. A tmp with no cue
+/// text (empty stream, or a stream whose packets were never reached) fails the
+/// track without touching any other file. `state` is `Complete` only when the
+/// demux reached successful EOF; a salvaged aborted run is `Partial`.
+#[allow(clippy::too_many_arguments)]
 fn salvage_track_vtt(
     store: &SubsStore,
     item_id: i64,
+    generation: &str,
     stream_index: u32,
     tmp_srt: &Path,
+    state: SubtitleArtifactState,
+    source: &ExtractSource<'_>,
+    finalized: &mut HashMap<String, (u64, String)>,
 ) -> Result<(), String> {
     let bytes = fs::read(tmp_srt).map_err(|e| {
         format!(
@@ -1192,17 +1515,33 @@ fn salvage_track_vtt(
         ));
     }
     let track_id = format!("e{stream_index}");
-    write_webvtt(&store.vtt_path(item_id, &track_id), &body)?;
-    store.mark_complete(item_id, &track_id);
-    Ok(())
+    // The publication path revalidates the captured physical and DB source,
+    // finalizes without overwrite and CASes the reference (ADR-0013 §13.3).
+    // When the body is identical to this run's last progressive body, the
+    // finalized bytes are referenced again and never rewritten.
+    publish_artifact(
+        store, item_id, source, &track_id, generation, &body, state, None, finalized,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_growing_srts(
     store: &SubsStore,
     item_id: i64,
+    generation: &str,
     tmp_srts: &[(u32, PathBuf)],
     last_sizes: &mut HashMap<u32, u64>,
+    source: &ExtractSource<'_>,
+    finalized: &mut HashMap<String, (u64, String)>,
 ) {
+    // A source that moved on invalidates every remaining progressive write
+    // (ADR-0013 §13.5): stale work is rejected by the same checks the final
+    // publication CAS uses, so it cannot become ready for a newer generation.
+    if check_source_current(source).is_err()
+        || check_media_unchanged(&source.media_path, source).is_err()
+    {
+        return;
+    }
     for (stream_index, tmp_srt) in tmp_srts {
         let Ok(meta) = fs::metadata(tmp_srt) else {
             continue;
@@ -1226,13 +1565,28 @@ fn publish_growing_srts(
             continue;
         }
         let track_id = format!("e{stream_index}");
-        if let Err(e) = store.publish_partial_vtt(item_id, &track_id, &body) {
-            tracing::warn!(
+        // The committed per-track reference is what makes the growing bytes
+        // serveable; the DB CAS rejects a superseded source (ADR-0013 §13.5).
+        // When it rejects, the run stops publishing: nothing this worker writes
+        // may become visible for the newer source.
+        if let Err(e) = publish_artifact(
+            store,
+            item_id,
+            source,
+            &track_id,
+            generation,
+            &body,
+            SubtitleArtifactState::Partial,
+            None,
+            finalized,
+        ) {
+            tracing::info!(
                 item_id,
                 track_id = %track_id,
                 error = %e,
-                "partial subtitle publish failed"
+                "progressive subtitle publication stopped"
             );
+            return;
         }
     }
 }
@@ -1405,6 +1759,213 @@ mod tests {
         true
     }
 
+    /// Opaque generation token used by these store-level tests. Production
+    /// mints it from a certified source.
+    const GEN: &str = "g1";
+
+    /// Test double for the DB half of the publication contract (ADR-0013
+    /// §13.2/§13.3.4): a monotonic per-run artifact-revision allocator and a
+    /// publication compare-and-swap that records every call.
+    #[derive(Default)]
+    struct Publications {
+        next_revision: std::cell::Cell<u64>,
+        accepted: std::cell::Cell<bool>,
+        calls: Mutex<Vec<(String, String, u64, SubtitleArtifactState)>>,
+        /// The last revision each track published, so `vtt`/`has` can resolve
+        /// the immutable filename without threading it through every call.
+        latest: Mutex<HashMap<String, u64>>,
+    }
+
+    impl Publications {
+        fn new() -> Self {
+            Self {
+                accepted: std::cell::Cell::new(true),
+                ..Self::default()
+            }
+        }
+
+        /// A double whose CAS rejects every call, as a superseded source does.
+        fn rejecting() -> Self {
+            let publications = Self::new();
+            publications.accepted.set(false);
+            publications
+        }
+
+        fn reserve(&self) -> Option<u64> {
+            let next = self.next_revision.get() + 1;
+            self.next_revision.set(next);
+            Some(next)
+        }
+
+        fn publish(
+            &self,
+            track_id: &str,
+            token: &str,
+            revision: u64,
+            state: SubtitleArtifactState,
+        ) -> bool {
+            self.calls.lock().unwrap().push((
+                track_id.to_string(),
+                token.to_string(),
+                revision,
+                state,
+            ));
+            if !self.accepted.get() {
+                return false;
+            }
+            self.latest
+                .lock()
+                .unwrap()
+                .insert(track_id.to_string(), revision);
+            true
+        }
+
+        fn calls(&self) -> Vec<(String, String, u64, SubtitleArtifactState)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn latest_revision(&self, track_id: &str) -> u64 {
+            self.latest
+                .lock()
+                .unwrap()
+                .get(track_id)
+                .copied()
+                .unwrap_or(1)
+        }
+    }
+
+    thread_local! {
+        /// The publication double the last `extract` call in this thread used,
+        /// so `vtt`/`has` can resolve the immutable filename the run committed
+        /// without threading a revision through every call site.
+        static LAST_PUBLICATIONS: std::cell::RefCell<std::rc::Rc<Publications>> =
+            std::cell::RefCell::new(std::rc::Rc::new(Publications::new()));
+    }
+
+    /// Test-only extract that discovers embedded tracks from the file. The
+    /// production path always supplies the certified snapshot's inventory
+    /// (D2B.2 acceptance 1); this keeps the store-level tests focused. The
+    /// captured media identity comes from the file and the DB source check is
+    /// always current.
+    fn extract(
+        store: &SubsStore,
+        item_id: i64,
+        src: &Path,
+        sidecars: &[SidecarInput],
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<ExtractOutcome, String> {
+        let embedded = list_text_subtitles(src).unwrap_or_default();
+        let publications = std::rc::Rc::new(Publications::new());
+        LAST_PUBLICATIONS.with(|slot| *slot.borrow_mut() = publications.clone());
+        extract_with_publications(
+            store,
+            item_id,
+            src,
+            &embedded,
+            sidecars,
+            should_cancel,
+            || true,
+            &publications,
+        )
+    }
+
+    /// The full extract against an explicit publication double.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_with_publications(
+        store: &SubsStore,
+        item_id: i64,
+        src: &Path,
+        embedded: &[TextSubtitleStream],
+        sidecars: &[SidecarInput],
+        should_cancel: &dyn Fn() -> bool,
+        is_current: impl Fn() -> bool,
+        publications: &Publications,
+    ) -> Result<ExtractOutcome, String> {
+        let meta = fs::metadata(src).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let token_for = |_track: &str| Some(GEN.to_string());
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let source = ExtractSource {
+            media_path: src.to_path_buf(),
+            mtime_ms,
+            size_bytes: meta.len() as i64,
+            token_for: &token_for,
+            is_current: &is_current,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        extract_item_subtitles(store, item_id, &source, embedded, sidecars, should_cancel)
+    }
+
+    /// The final artifact path for the revision the last `extract` in this
+    /// thread committed for `track_id`.
+    fn vtt(store: &SubsStore, item_id: i64, track_id: &str) -> PathBuf {
+        let revision = LAST_PUBLICATIONS.with(|p| p.borrow().latest_revision(track_id));
+        store.artifact_path(item_id, GEN, track_id, revision)
+    }
+
+    fn has(store: &SubsStore, item_id: i64, track_id: &str) -> bool {
+        let revision = LAST_PUBLICATIONS.with(|p| p.borrow().latest_revision(track_id));
+        store.has_artifact(item_id, GEN, track_id, revision)
+    }
+
+    /// Whether a candidate file exists for this item/generation.
+    ///
+    /// The publication path writes its candidate before the last DB check and
+    /// the last physical check, so a test uses this as the rendezvous that
+    /// proves a source mutation landed *after* candidate creation.
+    fn candidate_exists(store: &SubsStore, item_id: i64, generation: &str) -> bool {
+        fs::read_dir(store.generation_dir(item_id, generation))
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "candidate")
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// The captured media identity of a real file on disk, as the ADR-0058
+    /// snapshot records it.
+    fn capture_media(path: &Path) -> (PathBuf, i64, i64) {
+        let meta = fs::metadata(path).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        (path.to_path_buf(), mtime_ms, meta.len() as i64)
+    }
+
+    /// Captured sidecar input from a real file on disk.
+    fn sidecar(track_id: &str, path: PathBuf, format: &str) -> SidecarInput {
+        let meta = fs::metadata(&path).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        SidecarInput {
+            track_id: track_id.into(),
+            path,
+            format: format.into(),
+            mtime_ms,
+            size_bytes: meta.len() as i64,
+        }
+    }
+
     #[test]
     fn text_codec_allowlist() {
         assert!(is_text_subtitle_codec("subrip"));
@@ -1482,8 +2043,8 @@ mod tests {
     fn vtt_path_keys_on_item_and_track_not_media_path() {
         let dir = tempfile::tempdir().unwrap();
         let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
-        let p = store.vtt_path(42, "e2");
-        assert_eq!(p, dir.path().join("42").join("e2.vtt"));
+        let p = vtt(&store, 42, "e2");
+        assert_eq!(p, dir.path().join("42").join(GEN).join("e2.r1.vtt"));
         // Reorganising media must not change the stored path.
         assert!(!p.to_string_lossy().contains("Movies"));
     }
@@ -1505,10 +2066,11 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
-        let outcome = extract_item_subtitles(&store, 1, &corpus, &[], &|| false).expect("extract");
+        let outcome = extract(&store, 1, &corpus, &[], &|| false).expect("extract");
         assert_eq!(outcome, ExtractOutcome::Ready);
         let track_id = streams[0].track_id();
-        let vtt = stored_webvtt(&store, 1, &track_id).unwrap();
+        let revision = LAST_PUBLICATIONS.with(|p| p.borrow().latest_revision(&track_id));
+        let vtt = stored_webvtt(&store, 1, GEN, &track_id, revision).unwrap();
         let body = fs::read_to_string(&vtt).unwrap();
         assert!(
             body.contains("WEBVTT") || body.starts_with("\u{feff}WEBVTT"),
@@ -1595,11 +2157,11 @@ mod tests {
             "expected two text subs, got {streams:?}"
         );
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
-        extract_item_subtitles(&store, 9, &mkv, &[], &|| false).expect("extract");
-        assert!(store.has_vtt(9, &streams[0].track_id()));
-        assert!(store.has_vtt(9, &streams[1].track_id()));
-        let a = fs::read_to_string(store.vtt_path(9, &streams[0].track_id())).unwrap();
-        let b = fs::read_to_string(store.vtt_path(9, &streams[1].track_id())).unwrap();
+        extract(&store, 9, &mkv, &[], &|| false).expect("extract");
+        assert!(has(&store, 9, &streams[0].track_id()));
+        assert!(has(&store, 9, &streams[1].track_id()));
+        let a = fs::read_to_string(vtt(&store, 9, &streams[0].track_id())).unwrap();
+        let b = fs::read_to_string(vtt(&store, 9, &streams[1].track_id())).unwrap();
         assert!(a.contains("Track A") || b.contains("Track A"));
         assert!(a.contains("Track B") || b.contains("Track B"));
     }
@@ -1710,31 +2272,30 @@ mod tests {
 
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
         let item_id = 21i64;
-        let outcome =
-            extract_item_subtitles(&store, item_id, &mkv, &[], &|| false).expect("extract");
+        let outcome = extract(&store, item_id, &mkv, &[], &|| false).expect("extract");
         let ExtractOutcome::Partial { written, failed } = outcome else {
             panic!("expected per-track partial success, got {outcome:?}");
         };
         assert_eq!((written, failed), (2, 1), "{outcome:?}");
         let landed: Vec<&TextSubtitleStream> = streams
             .iter()
-            .filter(|s| store.has_vtt(item_id, &s.track_id()))
+            .filter(|s| has(&store, item_id, &s.track_id()))
             .collect();
         let missing: Vec<&TextSubtitleStream> = streams
             .iter()
-            .filter(|s| !store.has_vtt(item_id, &s.track_id()))
+            .filter(|s| !has(&store, item_id, &s.track_id()))
             .collect();
         assert_eq!(landed.len(), 2, "{streams:?}");
         assert_eq!(missing.len(), 1, "{streams:?}");
-        let a = fs::read_to_string(store.vtt_path(item_id, &landed[0].track_id())).unwrap();
-        let b = fs::read_to_string(store.vtt_path(item_id, &landed[1].track_id())).unwrap();
+        let a = fs::read_to_string(vtt(&store, item_id, &landed[0].track_id())).unwrap();
+        let b = fs::read_to_string(vtt(&store, item_id, &landed[1].track_id())).unwrap();
         assert!(
             (a.contains("Good A") && b.contains("Good B"))
                 || (a.contains("Good B") && b.contains("Good A")),
             "{a}\n---\n{b}"
         );
         assert!(
-            !store.has_vtt(item_id, &missing[0].track_id()),
+            !has(&store, item_id, &missing[0].track_id()),
             "the unmappable track must not land"
         );
     }
@@ -1821,8 +2382,7 @@ mod tests {
         assert_eq!(streams.len(), 3, "{streams:?}");
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
         let item_id = 22i64;
-        let outcome =
-            extract_item_subtitles(&store, item_id, &truncated, &[], &|| false).expect("extract");
+        let outcome = extract(&store, item_id, &truncated, &[], &|| false).expect("extract");
         let ExtractOutcome::Partial { written, failed } = outcome else {
             panic!("expected per-track partial success, got {outcome:?}");
         };
@@ -1833,11 +2393,11 @@ mod tests {
         assert!(failed >= 1, "the cut-off track must not land: {outcome:?}");
         let landed: Vec<&TextSubtitleStream> = streams
             .iter()
-            .filter(|s| store.has_vtt(item_id, &s.track_id()))
+            .filter(|s| has(&store, item_id, &s.track_id()))
             .collect();
         assert_eq!(landed.len(), 2, "{streams:?}");
-        let a = fs::read_to_string(store.vtt_path(item_id, &landed[0].track_id())).unwrap();
-        let b = fs::read_to_string(store.vtt_path(item_id, &landed[1].track_id())).unwrap();
+        let a = fs::read_to_string(vtt(&store, item_id, &landed[0].track_id())).unwrap();
+        let b = fs::read_to_string(vtt(&store, item_id, &landed[1].track_id())).unwrap();
         assert!(
             (a.contains("Good A") && b.contains("Good B"))
                 || (a.contains("Good B") && b.contains("Good A")),
@@ -1845,26 +2405,109 @@ mod tests {
         );
     }
 
-    /// ADR-0041 Decision 8.5: a pass that fails after producing zero usable
-    /// output must not remove a previously-good track. The old code wiped the
-    /// whole item directory up front; now the prior vtt survives any failure.
+    /// Final correction 1: a *cancelled* demux may salvage the cues it already
+    /// flushed, but only as `Partial`, and the cancellation must still reach the
+    /// pool as `unavailable` instead of a partial success. The cancel signal is
+    /// a rendezvous on the demux's own output, so the abort provably lands
+    /// after cues exist (no fixed sleep).
+    #[test]
+    fn cancelled_demux_salvages_cues_as_partial_and_reports_unavailable() {
+        if skip_without_ffmpeg() {
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&corpus) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let streams = list_text_subtitles(&corpus).expect("list");
+        assert!(!streams.is_empty(), "fixture must carry a text track");
+        let item_id = 60i64;
+        // The demux writes `e{stream}.tmp.srt`; cancel only once one of those
+        // tmp files has cue bytes.
+        let generation_dir = store.generation_dir(item_id, GEN);
+        let should_cancel = || {
+            fs::read_dir(&generation_dir)
+                .map(|entries| {
+                    entries.flatten().any(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "srt")
+                            && entry.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let publications = Publications::new();
+        let (media_path, mtime_ms, size_bytes) = capture_media(&corpus);
+        let token_for = |_: &str| Some(GEN.to_string());
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let source = ExtractSource {
+            media_path,
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &|| true,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        let err = extract_item_subtitles(&store, item_id, &source, &streams, &[], &should_cancel)
+            .unwrap_err();
+        assert!(err.starts_with("unavailable:"), "{err}");
+        let calls = publications.calls();
+        assert!(
+            !calls.is_empty(),
+            "the cues flushed before the abort must be salvaged"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(_, _, _, state)| *state == SubtitleArtifactState::Partial),
+            "a cancelled demux must never publish Complete: {calls:?}"
+        );
+    }
+
+    /// ADR-0041 Decision 8.5: a pass that fails must not remove a
+    /// previously-good track. D2B.2 additionally makes the artifact
+    /// generation-addressed, so a failed pass never touches the prior
+    /// generation's directory at all.
     #[test]
     fn failed_pass_keeps_previously_good_tracks() {
         let dir = tempfile::tempdir().unwrap();
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
         let item_id = 31i64;
         let prior = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior cue\n";
-        write_webvtt(&store.vtt_path(item_id, "e2"), prior).unwrap();
-        let missing = dir.path().join("gone").join("Movie.mkv");
-        let err = extract_item_subtitles(&store, item_id, &missing, &[], &|| false)
-            .expect_err("probe must fail on a missing source");
+        write_webvtt(&vtt(&store, item_id, "e2"), prior).unwrap();
+        let video = dir.path().join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let missing = dir.path().join("gone").join("Movie.en.srt");
+        let err = extract(
+            &store,
+            item_id,
+            &video,
+            &[SidecarInput {
+                track_id: "s-en".into(),
+                path: missing,
+                format: "srt".into(),
+                mtime_ms: 0,
+                size_bytes: 0,
+            }],
+            &|| false,
+        )
+        .expect_err("a vanished sidecar must fail the pass");
         assert!(!err.is_empty(), "{err:?}");
         assert!(
-            store.has_vtt(item_id, "e2"),
+            has(&store, item_id, "e2"),
             "a failed pass must not delete a previously-good track"
         );
         assert_eq!(
-            fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap(),
+            fs::read_to_string(vtt(&store, item_id, "e2")).unwrap(),
             prior,
             "prior track body must be byte-identical"
         );
@@ -1876,12 +2519,16 @@ mod tests {
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
         let item_id = 7i64;
         fs::create_dir_all(store.item_dir(item_id)).unwrap();
-        write_webvtt(
-            &store.vtt_path(item_id, "e2"),
-            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nEmb\n",
-        )
-        .unwrap();
-        let embedded_before = fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap();
+        store
+            .publish_item_vtt(
+                item_id,
+                GEN,
+                "e2",
+                1,
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nEmb\n",
+            )
+            .unwrap();
+        let embedded_before = fs::read_to_string(vtt(&store, item_id, "e2")).unwrap();
 
         let srt_path = dir.path().join("Movie.en.srt");
         fs::write(
@@ -1891,25 +2538,38 @@ mod tests {
         .unwrap();
         // Simulate only writing the new sidecar track into an existing item dir
         // the way a mistaken ordinal scheme would collide; our namespaces must not.
-        write_sidecar_webvtt(
-            &store,
-            item_id,
-            &SidecarInput {
-                track_id: "s-en".into(),
-                path: srt_path,
-                format: "srt".into(),
-            },
-        )
-        .unwrap();
+        let captured = sidecar("s-en", srt_path, "srt");
+        let publications = Publications::new();
+        let mut finalized = HashMap::new();
+        let token_for = |_: &str| Some(GEN.to_string());
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let media = dir.path().join("Movie.mp4");
+        fs::write(&media, b"not a real mp4").unwrap();
+        let (media_path, mtime_ms, size_bytes) = capture_media(&media);
+        let source = ExtractSource {
+            media_path,
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &|| true,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        write_sidecar_webvtt(&store, item_id, GEN, &captured, &source, &mut finalized).unwrap();
 
-        assert!(store.has_vtt(item_id, "e2"));
-        assert!(store.has_vtt(item_id, "s-en"));
+        assert!(store.has_artifact(item_id, GEN, "e2", 1));
+        let side_revision = publications.latest_revision("s-en");
+        assert!(store.has_artifact(item_id, GEN, "s-en", side_revision));
         assert_eq!(
-            fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap(),
+            fs::read_to_string(store.artifact_path(item_id, GEN, "e2", 1)).unwrap(),
             embedded_before,
             "adding a sidecar must not renumber or overwrite embedded e2"
         );
-        let side = fs::read_to_string(store.vtt_path(item_id, "s-en")).unwrap();
+        let side =
+            fs::read_to_string(store.artifact_path(item_id, GEN, "s-en", side_revision)).unwrap();
         assert!(side.contains("Sidecar hello"));
     }
 
@@ -1925,20 +2585,16 @@ mod tests {
         )
         .unwrap();
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
-        let outcome = extract_item_subtitles(
+        let outcome = extract(
             &store,
             7,
             &video,
-            &[SidecarInput {
-                track_id: "s-en".into(),
-                path: srt_path,
-                format: "srt".into(),
-            }],
+            &[sidecar("s-en", srt_path, "srt")],
             &|| false,
         )
         .expect("sidecar-only extract");
         assert_eq!(outcome, ExtractOutcome::Ready);
-        let body = fs::read_to_string(store.vtt_path(7, "s-en")).unwrap();
+        let body = fs::read_to_string(vtt(&store, 7, "s-en")).unwrap();
         assert!(body.contains("WEBVTT"));
         assert!(body.contains("Sidecar hello"));
     }
@@ -1950,7 +2606,7 @@ mod tests {
         fs::write(&video, b"not a real mp4").unwrap();
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
         let missing = dir.path().join("gone").join("Movie.en.srt");
-        let err = extract_item_subtitles(
+        let err = extract(
             &store,
             8,
             &video,
@@ -1958,6 +2614,8 @@ mod tests {
                 track_id: "s-en".into(),
                 path: missing,
                 format: "srt".into(),
+                mtime_ms: 0,
+                size_bytes: 0,
             }],
             &|| false,
         )
@@ -2005,10 +2663,10 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
-        let err = extract_item_subtitles(&store, 51, &corpus, &[], &|| true).unwrap_err();
+        let err = extract(&store, 51, &corpus, &[], &|| true).unwrap_err();
         assert!(err.starts_with("unavailable:"), "{err}");
         // Killed before any cue was flushed: no track may land as complete.
-        let dir = store.item_dir(51);
+        let dir = store.generation_dir(51, GEN);
         let landed = fs::read_dir(&dir)
             .map(|it| {
                 it.flatten()
@@ -2028,16 +2686,20 @@ mod tests {
         let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
         fs::create_dir_all(store.item_dir(1)).unwrap();
         fs::create_dir_all(store.item_dir(2)).unwrap();
-        write_webvtt(&store.vtt_path(1, "e2"), "WEBVTT\n").unwrap();
-        write_webvtt(&store.vtt_path(2, "e2"), "WEBVTT\n").unwrap();
+        write_webvtt(&vtt(&store, 1, "e2"), "WEBVTT\n").unwrap();
+        write_webvtt(&vtt(&store, 2, "e2"), "WEBVTT\n").unwrap();
         let n = store.cleanup_orphans(&[1]).unwrap();
         assert_eq!(n, 1);
         assert!(store.item_dir(1).exists());
         assert!(!store.item_dir(2).exists());
     }
 
+    /// D2B.2 corrective reset item 1/2: a fresh extract reserves a new artifact
+    /// revision and finalizes new bytes there. The prior revision's bytes are
+    /// never overwritten (there is no mutable path and no sweep), and the new
+    /// revision is the one the run committed.
     #[test]
-    fn invalidation_rewrites_on_fresh_extract() {
+    fn fresh_extract_finalizes_a_new_revision_without_touching_the_old_one() {
         if skip_without_ffmpeg() {
             return;
         }
@@ -2048,74 +2710,228 @@ mod tests {
             return;
         }
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
-        extract_item_subtitles(&store, 3, &corpus, &[], &|| false).unwrap();
         let streams = list_text_subtitles(&corpus).unwrap();
         let track = streams[0].track_id();
-        let first = fs::read_to_string(store.vtt_path(3, &track)).unwrap();
-        // Stale marker file that must disappear when we re-extract into a fresh dir.
-        write_webvtt(&store.vtt_path(3, "e999"), "WEBVTT\n\nstale\n").unwrap();
-        assert!(store.has_vtt(3, "e999"));
-        extract_item_subtitles(&store, 3, &corpus, &[], &|| false).unwrap();
-        assert!(
-            !store.has_vtt(3, "e999"),
-            "re-extract must clear prior generation"
-        );
-        let second = fs::read_to_string(store.vtt_path(3, &track)).unwrap();
-        assert!(second.contains("WEBVTT"));
-        assert_eq!(first.lines().next(), second.lines().next());
-    }
 
-    #[test]
-    fn progressive_partial_bumps_revision_and_readiness() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
-        fs::create_dir_all(store.item_dir(7)).unwrap();
-        store.set_progress(7, "e2", TrackReadiness::Preparing, 0);
-        let (r0, rev0) = store.track_readiness(7, "e2", "pending");
-        assert_eq!(r0, TrackReadiness::Preparing);
-        assert_eq!(rev0, 0);
-
-        let partial = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n";
-        store.publish_partial_vtt(7, "e2", partial).unwrap();
-        let (r1, rev1) = store.track_readiness(7, "e2", "pending");
-        assert_eq!(r1, TrackReadiness::Partial);
-        assert_eq!(rev1, 1);
-        assert!(store.has_vtt(7, "e2"));
-
-        let grown = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n\n00:00:03.000 --> 00:00:04.000\nWorld\n";
-        store.publish_partial_vtt(7, "e2", grown).unwrap();
-        let (r2, rev2) = store.track_readiness(7, "e2", "pending");
-        assert_eq!(r2, TrackReadiness::Partial);
-        assert!(rev2 > rev1);
-
-        // Same length does not bump.
-        store.publish_partial_vtt(7, "e2", grown).unwrap();
-        let (_, rev3) = store.track_readiness(7, "e2", "pending");
-        assert_eq!(rev3, rev2);
-
-        store.mark_complete(7, "e2");
-        let (r4, rev4) = store.track_readiness(7, "e2", "pending");
-        assert_eq!(r4, TrackReadiness::Complete);
-        assert!(rev4 > rev3);
-    }
-
-    #[test]
-    fn readiness_without_progress_map_uses_disk_and_item_status() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
-        let (prep, _) = store.track_readiness(1, "e2", "pending");
-        assert_eq!(prep, TrackReadiness::Preparing);
-
-        fs::create_dir_all(store.item_dir(1)).unwrap();
-        write_webvtt(
-            &store.vtt_path(1, "e2"),
-            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n",
+        // One monotonic allocator across both runs, as the DB sequence is.
+        let publications = Publications::new();
+        extract_with_publications(
+            &store,
+            3,
+            &corpus,
+            &streams,
+            &[],
+            &|| false,
+            || true,
+            &publications,
         )
         .unwrap();
-        let (partial, _) = store.track_readiness(1, "e2", "pending");
-        assert_eq!(partial, TrackReadiness::Partial);
-        let (complete, _) = store.track_readiness(1, "e2", "ready");
-        assert_eq!(complete, TrackReadiness::Complete);
+        let first_revision = publications.latest_revision(&track);
+        let first_body =
+            fs::read_to_string(store.artifact_path(3, GEN, &track, first_revision)).unwrap();
+
+        extract_with_publications(
+            &store,
+            3,
+            &corpus,
+            &streams,
+            &[],
+            &|| false,
+            || true,
+            &publications,
+        )
+        .unwrap();
+        let second_revision = publications.latest_revision(&track);
+        assert_ne!(
+            first_revision, second_revision,
+            "a fresh run must reserve its own artifact revision"
+        );
+        assert_eq!(
+            fs::read_to_string(store.artifact_path(3, GEN, &track, first_revision)).unwrap(),
+            first_body,
+            "the prior revision's bytes are immutable"
+        );
+        let new_body =
+            fs::read_to_string(store.artifact_path(3, GEN, &track, second_revision)).unwrap();
+        assert!(new_body.contains("WEBVTT"));
+        assert_eq!(first_body.lines().next(), new_body.lines().next());
+    }
+
+    /// D2B.2 corrective reset item 2: every changed body reserves its own
+    /// artifact revision and finalizes new immutable bytes. An identical body
+    /// references the bytes already finalized and is never rewritten, and a
+    /// changed body never overwrites the revision that is already committed
+    /// (ADR-0013 §13.2, §13.5).
+    #[test]
+    fn every_changed_body_finalizes_its_own_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        let publications = Publications::new();
+        let mut finalized = HashMap::new();
+        let token_for = |_: &str| Some(GEN.to_string());
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let media = dir.path().join("Movie.mp4");
+        fs::write(&media, b"not a real mp4").unwrap();
+        let (media_path, mtime_ms, size_bytes) = capture_media(&media);
+        let source = ExtractSource {
+            media_path,
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &|| true,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        let partial = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n";
+        publish_artifact(
+            &store,
+            7,
+            &source,
+            "e2",
+            GEN,
+            partial,
+            SubtitleArtifactState::Partial,
+            None,
+            &mut finalized,
+        )
+        .unwrap();
+        let first = publications.latest_revision("e2");
+        assert_eq!(first, 1);
+        assert!(store.has_artifact(7, GEN, "e2", first));
+        assert_eq!(
+            fs::read_to_string(store.artifact_path(7, GEN, "e2", first)).unwrap(),
+            partial
+        );
+
+        // The identical body is referenced again: no new revision is reserved
+        // and the bytes are not rewritten.
+        let before = fs::metadata(store.artifact_path(7, GEN, "e2", first))
+            .unwrap()
+            .modified()
+            .unwrap();
+        publish_artifact(
+            &store,
+            7,
+            &source,
+            "e2",
+            GEN,
+            partial,
+            SubtitleArtifactState::Complete,
+            None,
+            &mut finalized,
+        )
+        .unwrap();
+        assert_eq!(
+            publications.latest_revision("e2"),
+            first,
+            "identical bytes are referenced, not rewritten"
+        );
+        assert_eq!(
+            fs::metadata(store.artifact_path(7, GEN, "e2", first))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before,
+            "the finalized artifact is not rewritten"
+        );
+        assert_eq!(
+            publications.calls().last().unwrap().3,
+            SubtitleArtifactState::Complete,
+            "the partial-to-complete transition commits the same revision"
+        );
+
+        // A changed body reserves a new revision. The committed revision's
+        // bytes stay exactly as they were: nothing truncates or overwrites.
+        let grown = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n\n00:00:03.000 --> 00:00:04.000\nWorld\n";
+        publish_artifact(
+            &store,
+            7,
+            &source,
+            "e2",
+            GEN,
+            grown,
+            SubtitleArtifactState::Partial,
+            None,
+            &mut finalized,
+        )
+        .unwrap();
+        let second = publications.latest_revision("e2");
+        assert_ne!(second, first, "a changed body gets its own revision");
+        assert_eq!(
+            fs::read_to_string(store.artifact_path(7, GEN, "e2", first)).unwrap(),
+            partial,
+            "the prior revision is never overwritten"
+        );
+        assert_eq!(
+            fs::read_to_string(store.artifact_path(7, GEN, "e2", second)).unwrap(),
+            grown
+        );
+    }
+
+    /// D2B.2 corrective reset item 2: an existing final artifact is never
+    /// overwritten. A finalize at an occupied revision fails and leaves the
+    /// committed bytes untouched.
+    #[test]
+    fn an_existing_artifact_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        let committed = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nCommitted\n";
+        store.publish_item_vtt(7, GEN, "e2", 4, committed).unwrap();
+        let err = store
+            .publish_item_vtt(
+                7,
+                GEN,
+                "e2",
+                4,
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNew\n",
+            )
+            .unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(store.artifact_path(7, GEN, "e2", 4)).unwrap(),
+            committed,
+            "the existing artifact must keep its exact bytes"
+        );
+    }
+
+    /// Final correction 2: candidate creation is exclusive. A crash between the
+    /// finalize's hard link and its candidate unlink leaves a candidate that
+    /// shares an inode with the committed artifact; a retry at the same
+    /// revision must fail instead of truncating the committed bytes.
+    #[test]
+    fn a_crash_left_candidate_never_truncates_a_final_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().to_path_buf()).unwrap();
+        let committed = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nCommitted\n";
+        store.publish_item_vtt(7, GEN, "e2", 4, committed).unwrap();
+        let final_path = store.artifact_path(7, GEN, "e2", 4);
+        // The crash-left candidate has the name `write_candidate` would reuse
+        // for the same revision and shares the finalized artifact's inode.
+        let candidate = store.generation_dir(7, GEN).join("e2.r4.candidate");
+        fs::hard_link(&final_path, &candidate).unwrap();
+
+        let err = store
+            .publish_item_vtt(
+                7,
+                GEN,
+                "e2",
+                4,
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNew\n",
+            )
+            .unwrap_err();
+        assert!(err.contains("candidate"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            committed,
+            "the finalized bytes must survive a colliding retry"
+        );
+        assert!(
+            candidate.exists(),
+            "the crash-left candidate is never truncated or renamed"
+        );
     }
 
     #[test]
@@ -2172,25 +2988,27 @@ mod tests {
         let store = SubsStore::new(dir.path().join("subs")).unwrap();
         let item_id = 17i64;
         write_webvtt(
-            &store.vtt_path(item_id, "e2"),
+            &vtt(&store, item_id, "e2"),
             "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior cue\n",
         )
         .unwrap();
         store
             .publish_item_vtt(
                 item_id,
+                GEN,
                 "s-en",
+                2,
                 "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNew cue\n",
             )
             .unwrap();
-        assert!(store.has_vtt(item_id, "e2"), "prior track must survive");
-        assert!(store.has_vtt(item_id, "s-en"));
+        assert!(has(&store, item_id, "e2"), "prior track must survive");
+        assert!(store.has_artifact(item_id, GEN, "s-en", 2));
         assert_eq!(
-            fs::read_to_string(store.vtt_path(item_id, "e2")).unwrap(),
+            fs::read_to_string(vtt(&store, item_id, "e2")).unwrap(),
             "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPrior cue\n",
             "prior track body must be byte-identical"
         );
-        let new = fs::read_to_string(store.vtt_path(item_id, "s-en")).unwrap();
+        let new = fs::read_to_string(store.artifact_path(item_id, GEN, "s-en", 2)).unwrap();
         assert!(new.contains("New cue"), "{new}");
     }
 
@@ -2217,6 +3035,374 @@ mod tests {
         assert!(
             seg0.contains("First cue") && !seg0.contains("Second cue"),
             "{seg0}"
+        );
+    }
+
+    /// D2B.2 acceptance 5, final correction 3: a sidecar that changes *after*
+    /// the candidate is written is rejected by the last physical check, which
+    /// runs after the last potentially blocking DB check. Nothing is finalized
+    /// or committed under the stale generation.
+    #[test]
+    fn sidecar_changed_during_extract_defers_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let srt_path = dir.path().join("Movie.en.srt");
+        fs::write(&srt_path, "1\n00:00:00,000 --> 00:00:01,000\nHi\n").unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let captured = sidecar("s-en", srt_path.clone(), "srt");
+
+        // Rendezvous: mutate the sidecar only once the publication path has
+        // written its candidate, while reporting the DB source still current.
+        // The mutation is therefore provably later than the candidate write,
+        // and only the last physical check can catch it.
+        let mutated = std::cell::Cell::new(false);
+        let srt_for_closure = srt_path.clone();
+        let store_for_closure = &store;
+        let is_current = || {
+            if !mutated.get() && candidate_exists(store_for_closure, 40, GEN) {
+                fs::write(
+                    &srt_for_closure,
+                    "1\n00:00:00,000 --> 00:00:03,000\nChanged\n",
+                )
+                .unwrap();
+                mutated.set(true);
+            }
+            true
+        };
+        let publications = Publications::new();
+        let err = extract_with_publications(
+            &store,
+            40,
+            &video,
+            &[],
+            &[captured],
+            &|| false,
+            is_current,
+            &publications,
+        )
+        .unwrap_err();
+        assert!(mutated.get(), "the mutation rendezvous must have run");
+        assert!(message_is_source_changed(&err), "{err}");
+        assert!(
+            publications.calls().is_empty(),
+            "a changed sidecar must not reach the publication CAS"
+        );
+        assert!(
+            !store.has_artifact(40, GEN, "s-en", 1),
+            "a changed sidecar must not finalize an artifact"
+        );
+        assert!(
+            !candidate_exists(&store, 40, GEN),
+            "the stale candidate must be removed"
+        );
+    }
+
+    /// D2B.2 acceptance 3: artifacts are written into a generation directory and
+    /// named by their artifact revision, so neither a later generation nor a
+    /// later revision overwrites the prior one.
+    #[test]
+    fn generations_address_immutable_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let first = store.artifact_path(1, "g1", "e2", 1);
+        let second = store.artifact_path(1, "g2", "e2", 1);
+        let third = store.artifact_path(1, "g1", "e2", 2);
+        assert_ne!(first, second, "different generations are different paths");
+        assert_ne!(first, third, "different revisions are different paths");
+        store
+            .publish_item_vtt(
+                1,
+                "g1",
+                "e2",
+                1,
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\ng1\n",
+            )
+            .unwrap();
+        store
+            .publish_item_vtt(
+                1,
+                "g2",
+                "e2",
+                1,
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\ng2\n",
+            )
+            .unwrap();
+        assert!(fs::read_to_string(&first).unwrap().contains("g1"));
+        assert!(fs::read_to_string(&second).unwrap().contains("g2"));
+    }
+
+    /// D2B.2 acceptance 3/5, final correction 3: the last physical source check
+    /// runs after the candidate is written and after the last potentially
+    /// blocking DB check, immediately before the finalize and the commit. A
+    /// media replacement during that window is detected, so no artifact is
+    /// finalized and no reference is committed.
+    #[test]
+    fn media_replaced_during_extract_leaves_no_renamed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let srt_path = dir.path().join("Movie.en.srt");
+        fs::write(&srt_path, "1\n00:00:00,000 --> 00:00:01,000\nHi\n").unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let sidecar = sidecar("s-en", srt_path, "srt");
+
+        // Rendezvous: replace the media only once the candidate exists on
+        // disk, while reporting the DB source still current. Only the physical
+        // check that follows the last DB check can catch it.
+        let mutated = std::cell::Cell::new(false);
+        let video_for_closure = video.clone();
+        let store_for_closure = &store;
+        let is_current = || {
+            if !mutated.get() && candidate_exists(store_for_closure, 41, GEN) {
+                fs::write(&video_for_closure, b"a different, longer body").unwrap();
+                mutated.set(true);
+            }
+            true
+        };
+        let publications = Publications::new();
+        let err = extract_with_publications(
+            &store,
+            41,
+            &video,
+            &[],
+            &[sidecar],
+            &|| false,
+            is_current,
+            &publications,
+        )
+        .unwrap_err();
+        assert!(mutated.get(), "the mutation rendezvous must have run");
+        assert!(message_is_source_changed(&err), "{err}");
+        assert!(
+            publications.calls().is_empty(),
+            "a failed revalidation must not reach the publication CAS"
+        );
+        assert!(
+            !store.has_artifact(41, GEN, "s-en", 1),
+            "a failed final source check must not finalize stale bytes"
+        );
+        assert!(
+            !candidate_exists(&store, 41, GEN),
+            "the stale candidate must be removed"
+        );
+    }
+
+    /// D2B.2 corrective reset item 3: progressive work revalidates the captured
+    /// media path plus mtime/size before it converts or reads and again before
+    /// it publishes. A media replacement under a running conversion therefore
+    /// publishes nothing, and the run stops rather than committing bytes for a
+    /// source that no longer exists.
+    #[test]
+    fn progressive_work_stops_when_the_media_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let media = dir.path().join("Movie.mkv");
+        fs::write(&media, b"the captured body").unwrap();
+        let (media_path, mtime_ms, size_bytes) = capture_media(&media);
+        let tmp = dir.path().join("e2.tmp.srt");
+        fs::write(
+            &tmp,
+            "1\n00:00:00,000 --> 00:00:01,000\nHi\n\n2\n00:00:02,000 --> 00:00:03,000\nThere\n",
+        )
+        .unwrap();
+        let tmp_srts = vec![(2u32, tmp)];
+
+        // Rendezvous: replace the media only once the candidate is written,
+        // while reporting the DB source still current. The last physical check
+        // must reject the work, so the progressive publication stops.
+        let mutated = std::cell::Cell::new(false);
+        let media_for_closure = media.clone();
+        let store_for_closure = &store;
+        let is_current = || {
+            if !mutated.get() && candidate_exists(store_for_closure, 7, "v1-m1-p0") {
+                fs::write(&media_for_closure, b"a different, longer replacement body").unwrap();
+                mutated.set(true);
+            }
+            true
+        };
+        let publications = Publications::new();
+        let token_for = |_: &str| Some("v1-m1-p0".to_string());
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let source = ExtractSource {
+            media_path,
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &is_current,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        let mut sizes = HashMap::new();
+        let mut finalized = HashMap::new();
+        publish_growing_srts(
+            &store,
+            7,
+            "v1-m1-p0",
+            &tmp_srts,
+            &mut sizes,
+            &source,
+            &mut finalized,
+        );
+
+        assert!(mutated.get(), "the mutation rendezvous must have run");
+        assert!(
+            publications.calls().is_empty(),
+            "a replaced media must not reach the publication CAS"
+        );
+        assert!(
+            !store.has_artifact(7, "v1-m1-p0", "e2", 1),
+            "a replaced media must not finalize an artifact"
+        );
+        assert!(
+            !candidate_exists(&store, 7, "v1-m1-p0"),
+            "the stale candidate must be removed, never finalized"
+        );
+    }
+
+    /// D2B.2 acceptance 3/4/5: progressive publication is gated by the same
+    /// source CAS as the final publication. A stale run writes no bytes and
+    /// commits nothing; a current run writes and commits under its own token.
+    #[test]
+    fn progressive_publication_is_gated_by_the_source_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let tmp = dir.path().join("e2.tmp.srt");
+        fs::write(
+            &tmp,
+            "1\n00:00:00,000 --> 00:00:01,000\nHi\n\n2\n00:00:02,000 --> 00:00:03,000\nThere\n",
+        )
+        .unwrap();
+        let (media_path, mtime_ms, size_bytes) = capture_media(&tmp);
+        let tmp_srts = vec![(2u32, tmp)];
+        let token_for = |_: &str| Some("v1-m1-p0".to_string());
+
+        // A stale DB source: no bytes are written and the CAS is never reached.
+        let stale_publications = Publications::new();
+        let stale_reserve = || stale_publications.reserve();
+        let stale_publish =
+            |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+                stale_publications.publish(track, token, revision, state)
+            };
+        let stale = ExtractSource {
+            media_path: media_path.clone(),
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &|| false,
+            reserve_revision: &stale_reserve,
+            publish: &stale_publish,
+        };
+        let mut sizes = HashMap::new();
+        let mut finalized = HashMap::new();
+        publish_growing_srts(
+            &store,
+            7,
+            "v1-m1-p0",
+            &tmp_srts,
+            &mut sizes,
+            &stale,
+            &mut finalized,
+        );
+        assert!(
+            !store.has_artifact(7, "v1-m1-p0", "e2", 1),
+            "stale progressive work must not write bytes"
+        );
+        assert!(
+            stale_publications.calls().is_empty(),
+            "stale progressive work must not reach the CAS"
+        );
+
+        // Current work: bytes land and the committed publication is keyed by
+        // the token. A CAS that rejects stops further publication.
+        let publications = Publications::new();
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let current = ExtractSource {
+            media_path: media_path.clone(),
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &|| true,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        let mut sizes = HashMap::new();
+        let mut finalized = HashMap::new();
+        publish_growing_srts(
+            &store,
+            7,
+            "v1-m1-p0",
+            &tmp_srts,
+            &mut sizes,
+            &current,
+            &mut finalized,
+        );
+        assert!(store.has_artifact(7, "v1-m1-p0", "e2", publications.latest_revision("e2")));
+        assert_eq!(
+            publications.calls().as_slice(),
+            &[(
+                "e2".to_string(),
+                "v1-m1-p0".to_string(),
+                1,
+                SubtitleArtifactState::Partial
+            )]
+        );
+        assert!(
+            !store.has_artifact(7, "v1-m1-p0-s2", "e2", 1),
+            "another generation's directory must never be written"
+        );
+
+        // A CAS that rejects mid-run stops the growing writes, so no later
+        // body can be committed for a superseded source.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = SubsStore::new(dir2.path().join("subs")).unwrap();
+        let tmp2 = dir2.path().join("e2.tmp.srt");
+        fs::write(
+            &tmp2,
+            "1\n00:00:00,000 --> 00:00:01,000\nHi\n\n2\n00:00:02,000 --> 00:00:03,000\nThere\n",
+        )
+        .unwrap();
+        let (media_path2, mtime_ms2, size_bytes2) = capture_media(&tmp2);
+        let tmp_srts2 = vec![(2u32, tmp2)];
+        let rejected = Publications::rejecting();
+        let rejected_reserve = || rejected.reserve();
+        let rejected_publish =
+            |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+                rejected.publish(track, token, revision, state)
+            };
+        let rejected_source = ExtractSource {
+            media_path: media_path2.clone(),
+            mtime_ms: mtime_ms2,
+            size_bytes: size_bytes2,
+            token_for: &token_for,
+            is_current: &|| true,
+            reserve_revision: &rejected_reserve,
+            publish: &rejected_publish,
+        };
+        let mut sizes = HashMap::new();
+        let mut finalized = HashMap::new();
+        publish_growing_srts(
+            &store2,
+            7,
+            "v1-m1-p0",
+            &tmp_srts2,
+            &mut sizes,
+            &rejected_source,
+            &mut finalized,
+        );
+        assert!(
+            rejected.calls().len() == 1,
+            "the first body is finalized before the CAS decides"
+        );
+        assert!(
+            store2.has_artifact(7, "v1-m1-p0", "e2", 1),
+            "the finalized candidate is unreferenced, never served"
         );
     }
 }
