@@ -9,7 +9,8 @@
   (columns dropped in migration `019`; `subtitle_content_id` is the sole
   stamp). Marker added 2026-08-30. **§13 added 2026-09-15 (D2B.2 standalone
   immutable artifact contract); §13.2–§13.5 amended 2026-09-15 to add the
-  per-item artifact-revision candidate layout and finalize-without-overwrite.**
+  per-item artifact-revision candidate layout and finalize-without-overwrite;
+  §13.8 amended 2026-09-15 (D2B.3 piggyback and HLS/session composition).**
 - Date: 2026-07-26
 - Supersedes: ADR-0010 §7 (byte-capped subtitle cache and playback-time extract)
 
@@ -551,6 +552,29 @@ longer runs.
        probe or retry, piggyback migration, or cleanup dependency is
        introduced. `g` is a required opaque query parameter documented in
        the OpenAPI spec.
+
+       **Amended 2026-09-15 (D2B.3).** The gating above is lifted; the
+       migrated writers obey the same §13.3 contract.
+
+       - **Piggyback.** The session captures the certified source at create
+         (§13.3.1) and the run EOF publishes the assembled side output
+         through the one publication path of §13.3.3–§13.3.4: the same
+         source revalidation, immutable finalize and per-track compare-and-
+         swap the standalone extract uses. A source that changed during the
+         run, or a track the capture does not mint a token for, publishes
+         nothing and the item stays `eligible`. The D2C exact one-stream
+         mapping is unchanged and regression-tested.
+       - **HLS/session.** A session declares a subtitle rendition only for a
+         track whose complete artifact is committed for the current certified
+         source, and the declared path is that committed generation-addressed
+         artifact. Session create is therefore the generation gate: the
+         session serves the one immutable generation it resolved, which is
+         the session snapshot ADR-0010 already decides. A partial track is
+         omitted so a cold URI cannot hang start. The session-inline mutable
+         copy is never declared as a rendition.
+
+       The existing global extraction and conversion limits stand, and no
+       playback-time probe, timer retry or failure backoff is added.
 
 ## Consequences
 

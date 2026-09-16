@@ -1204,6 +1204,38 @@ fn publish_artifact(
     Ok(())
 }
 
+/// Publish one already-converted body for one captured track through the
+/// shared per-track artifact path (ADR-0013 §13.3.3, §13.3.4).
+///
+/// This is the entry point for a body that was not produced by
+/// [`extract_item_subtitles`]: the ADR-0041 Decision 7 piggyback side output.
+/// It runs the same source validation, the same immutable finalize and the same
+/// DB compare-and-swap as the standalone extract, so there is one publication
+/// path (Rule 4.11). A source that moved on writes nothing and the run defers;
+/// the caller has already rejected a track the captured source does not mint a
+/// token for.
+pub fn publish_captured_track(
+    store: &SubsStore,
+    item_id: i64,
+    source: &ExtractSource<'_>,
+    track_id: &str,
+    token: &str,
+    body: &str,
+) -> Result<(), String> {
+    let mut finalized = HashMap::new();
+    publish_artifact(
+        store,
+        item_id,
+        source,
+        track_id,
+        token,
+        body,
+        SubtitleArtifactState::Complete,
+        None,
+        &mut finalized,
+    )
+}
+
 /// Path of the committed artifact, or an error if it is missing. The revision
 /// comes from the committed publication row, never from the request
 /// (ADR-0013 §13.2).
@@ -3259,6 +3291,91 @@ mod tests {
         );
         assert!(
             !candidate_exists(&store, 7, "v1-m1-p0"),
+            "the stale candidate must be removed, never finalized"
+        );
+    }
+
+    /// D2B.3: the piggyback/HLS entry point is the same publication path. A
+    /// current captured source publishes one complete artifact through the
+    /// source CAS; a source that changes after the candidate is written
+    /// publishes nothing. This is the deterministic concurrent
+    /// stale-publication race for the piggyback path.
+    #[test]
+    fn captured_track_publication_is_gated_by_the_source_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SubsStore::new(dir.path().join("subs")).unwrap();
+        let media = dir.path().join("Movie.mkv");
+        fs::write(&media, b"the captured body").unwrap();
+        let (media_path, mtime_ms, size_bytes) = capture_media(&media);
+        let body = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNightjar piggyback cue\n";
+        let token_for = |_: &str| Some("v1-m1-p0".to_string());
+
+        // Current: the body is finalized at its reserved revision and
+        // committed as one complete per-track reference.
+        let publications = Publications::new();
+        let reserve = || publications.reserve();
+        let publish = |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+            publications.publish(track, token, revision, state)
+        };
+        let source = ExtractSource {
+            media_path: media_path.clone(),
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &|| true,
+            reserve_revision: &reserve,
+            publish: &publish,
+        };
+        publish_captured_track(&store, 9, &source, "e2", "v1-m1-p0", body).unwrap();
+        assert_eq!(
+            publications.calls(),
+            vec![(
+                "e2".to_string(),
+                "v1-m1-p0".to_string(),
+                1,
+                SubtitleArtifactState::Complete,
+            )]
+        );
+        assert!(store.has_artifact(9, "v1-m1-p0", "e2", 1));
+
+        // The race: the captured source goes stale only after the candidate is
+        // on disk. The last revalidation must reject it, so the candidate is
+        // removed and the CAS is never reached.
+        let raced = std::cell::Cell::new(false);
+        let store_for_closure = &store;
+        let is_current = || {
+            if !raced.get() && candidate_exists(store_for_closure, 10, "v1-m1-p0") {
+                raced.set(true);
+                return false;
+            }
+            true
+        };
+        let raced_publications = Publications::new();
+        let raced_reserve = || raced_publications.reserve();
+        let raced_publish =
+            |track: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+                raced_publications.publish(track, token, revision, state)
+            };
+        let raced_source = ExtractSource {
+            media_path: media_path.clone(),
+            mtime_ms,
+            size_bytes,
+            token_for: &token_for,
+            is_current: &is_current,
+            reserve_revision: &raced_reserve,
+            publish: &raced_publish,
+        };
+        let err =
+            publish_captured_track(&store, 10, &raced_source, "e2", "v1-m1-p0", body).unwrap_err();
+        assert!(raced.get(), "the staleness rendezvous must have run");
+        assert!(message_is_source_changed(&err), "{err}");
+        assert!(
+            raced_publications.calls().is_empty(),
+            "a source that changed after the candidate was written must not reach the CAS"
+        );
+        assert!(!store.has_artifact(10, "v1-m1-p0", "e2", 1));
+        assert!(
+            !candidate_exists(&store, 10, "v1-m1-p0"),
             "the stale candidate must be removed, never finalized"
         );
     }

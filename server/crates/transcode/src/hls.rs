@@ -18,8 +18,9 @@
 
 use super::audio::stereo_downmix_filter;
 use super::subs::{
-    BurnInKind, BurnInSelection, SessionSubInput, SubsStore, extract_embedded_ass,
-    prepare_session_subtitles, slice_webvtt, webvtt_max_cue_end_ms,
+    BurnInKind, BurnInSelection, ExtractSource, SessionSubInput, SubsStore, concat_webvtt_segments,
+    extract_embedded_ass, prepare_session_subtitles, publish_captured_track, slice_webvtt,
+    webvtt_max_cue_end_ms,
 };
 use crate::hls_grid::{GridCadence, grid_cadence_ms};
 use crate::hls_master::VideoRung;
@@ -34,7 +35,10 @@ use crate::hls_policy::{
     prefetch_advances_pending, segment_miss_unreachable, serve_ok_after_pending_apply,
 };
 use nightjar_core::VideoEncodePlan;
-use nightjar_db::Db;
+use nightjar_db::{
+    CertifiedSubtitleSource, Db, SubtitleArtifactPublication, SubtitleArtifactState,
+    SubtitlePublication,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -413,9 +417,9 @@ pub struct HlsSessionRegistry {
 /// item. When set, the session's ffmpeg gains `-map 0:{stream_index}` +
 /// `-c:s webvtt` (a WebVTT side output alongside the video/audio maps); on a
 /// natural run EOF that started at title 0 the assembled WebVTT is published
-/// to `{subs}/{itemId}/{track_id}.vtt` and the item flips to `ready`. A killed
-/// or offset run never publishes and leaves the item `eligible` for a later
-/// pass (standalone or another piggyback) to finish.
+/// through the ADR-0013 §13.3 generation contract and the item flips to
+/// `ready`. A killed or offset run never publishes and leaves the item
+/// `eligible` for a later pass (standalone or another piggyback) to finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiggybackExtract {
     /// Library track id (`e{stream_index}`) the side output is published as.
@@ -424,6 +428,12 @@ pub struct PiggybackExtract {
     /// establishes it before the session starts, so the map names one exact
     /// text stream and never a broad `0:s?` selector.
     pub stream_index: u32,
+    /// The certified source captured before the run started (ADR-0013
+    /// §13.3.1). Publication at run EOF is gated on this exact capture, so a
+    /// media replacement or sidecar edit during the run cannot publish over
+    /// newer source state or resurrect a removed track. `None` means no
+    /// certified capture, so the run publishes nothing.
+    pub source: Option<CertifiedSubtitleSource>,
 }
 
 /// Serveable text track snapshot taken at session create (ADR-0010 / ADR-0013).
@@ -527,9 +537,7 @@ struct Session {
     /// Piggyback target when this session runs on an `eligible` item
     /// (ADR-0041 Decision 7); `None` once the side output is published.
     piggyback: Option<PiggybackExtract>,
-    /// Library subtitle store for the piggyback publish. D2B.2 fails that
-    /// writer closed until D2B.3, so the session only carries it.
-    #[allow(dead_code)]
+    /// Library subtitle store for the piggyback publish (ADR-0013 §13.3.3).
     subs: Option<Arc<SubsStore>>,
     db: Option<Arc<Db>>,
     /// ADR-0023 §9.3: whether a keyframe-map build for this item is queued or
@@ -1633,7 +1641,9 @@ impl HlsSessionRegistry {
     /// audio or burn-in does not: it starts a fresh session (ADR-0012 /
     /// ADR-0018). `subtitle_tracks` is snapshotted here and never revisited.
     /// `encode_plan` applies only in Transcode mode (ADR-0022). `piggyback`
-    /// arms the ADR-0041 Decision 7 side output for an `eligible` item.
+    /// arms the ADR-0041 Decision 7 side output for an `eligible` item and
+    /// carries the certified source captured at this moment; a later run EOF
+    /// publishes through that capture alone (ADR-0013 §13.3).
     ///
     /// `replaces_session_id` is the optional explicit replacement (ADR-0034
     /// item 8). It must name a live session of the same account and profile on
@@ -3607,20 +3617,148 @@ fn apply_run_eof(session: &mut Session) {
 /// item to `ready`. A run killed by seek (ADR-0007) or stopped mid-way never
 /// reaches this point, so the item stays `eligible` and no previously-good
 /// track is deleted (the same invariant as Decision 8.5).
+///
+/// The body goes through the one publication path (ADR-0013 §13.3.3/§13.3.4):
+/// the source captured at session start is revalidated, the bytes are finalized
+/// into their immutable generation directory, and the per-track reference is
+/// committed by the source compare-and-swap. A source that moved on during the
+/// run, or a track the captured source does not mint a token for, publishes
+/// nothing and the item stays `eligible` for a later pass.
 fn publish_piggyback_if_complete(session: &mut Session) {
-    let Some(piggyback) = &session.piggyback else {
+    let Some(piggyback) = session.piggyback.clone() else {
         return;
     };
-    // D2B.2 fails piggyback subtitle publication closed until D2B.3. The exact
-    // D2C stream mapping still runs as a side output, but its bytes are never
-    // published and the item never flips `ready` from this path. AV playback is
-    // unaffected (D2B.2 acceptance 6).
-    tracing::info!(
-        item_id = session.item_id,
-        track_id = %piggyback.track_id,
-        "piggyback subtitle publication is disabled until D2B.3; item stays eligible"
-    );
-    session.piggyback = None;
+    // A run that started at an offset only demuxed a suffix of the title.
+    if session.start_ms != 0 {
+        return;
+    }
+    let (Some(subs), Some(db)) = (session.subs.clone(), session.db.clone()) else {
+        return;
+    };
+    let Some(source) = piggyback.source.clone() else {
+        // An `Unverified` source defers promptly: no probe, no timer retry and
+        // no terminal subtitle failure (ADR-0013 §13.3).
+        tracing::info!(
+            item_id = session.item_id,
+            track_id = %piggyback.track_id,
+            "piggyback subtitle publication deferred: no certified source capture"
+        );
+        return;
+    };
+    let Some(token) = source.token_for_track(&piggyback.track_id) else {
+        tracing::info!(
+            item_id = session.item_id,
+            track_id = %piggyback.track_id,
+            "piggyback track is not a serveable member of the captured source; item stays eligible"
+        );
+        return;
+    };
+    if source.is_complete(&piggyback.track_id) {
+        // Complete immutable bytes are never rewritten (ADR-0013 §13.2).
+        session.piggyback = None;
+        return;
+    }
+    let segments = vtt_segments_in(&run_dir(session, SINGLE_VIDEO_RUNG));
+    if segments.is_empty() {
+        return;
+    }
+    let mut bodies = Vec::with_capacity(segments.len());
+    for path in &segments {
+        match fs::read_to_string(path) {
+            Ok(body) => bodies.push(body),
+            Err(e) => {
+                tracing::warn!(
+                    item_id = session.item_id,
+                    track_id = %piggyback.track_id,
+                    path = %path.display(),
+                    error = %e,
+                    "piggyback subtitle segment read failed; item stays eligible"
+                );
+                return;
+            }
+        }
+    }
+    let body = concat_webvtt_segments(&bodies);
+    if body.trim() == "WEBVTT" {
+        tracing::warn!(
+            item_id = session.item_id,
+            track_id = %piggyback.track_id,
+            "piggyback produced no cues; item stays eligible"
+        );
+        return;
+    }
+    let item_id = session.item_id;
+    let token_for = |track_id: &str| source.token_for_track(track_id);
+    let is_current = || db.subtitle_source_is_current(&source).unwrap_or(false);
+    let reserve_revision = || db.reserve_subtitle_artifact_revision(item_id).ok();
+    let publish = |track_id: &str, token: &str, revision: u64, state: SubtitleArtifactState| {
+        matches!(
+            db.publish_subtitle_artifact(
+                &source,
+                &SubtitleArtifactPublication {
+                    track_id: track_id.to_string(),
+                    token: token.to_string(),
+                    artifact_revision: revision,
+                    state,
+                },
+            ),
+            Ok(SubtitlePublication::Published)
+        )
+    };
+    let extract_source = ExtractSource {
+        media_path: session.src.clone(),
+        mtime_ms: source.snapshot.mtime_ms,
+        size_bytes: source.snapshot.size_bytes,
+        token_for: &token_for,
+        is_current: &is_current,
+        reserve_revision: &reserve_revision,
+        publish: &publish,
+    };
+    match publish_captured_track(
+        &subs,
+        item_id,
+        &extract_source,
+        &piggyback.track_id,
+        &token,
+        &body,
+    ) {
+        Ok(()) => {
+            tracing::info!(
+                item_id,
+                track_id = %piggyback.track_id,
+                segment_count = segments.len(),
+                cue_bytes = body.len(),
+                run_id = session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
+                "piggyback extract published"
+            );
+            session.piggyback = None;
+        }
+        Err(e) => tracing::warn!(
+            item_id,
+            track_id = %piggyback.track_id,
+            error = %e,
+            "piggyback publish deferred; item stays eligible"
+        ),
+    }
+}
+
+/// WebVTT side-output segments (`index{N}.vtt`) the HLS muxer wrote next to
+/// `index.m3u8` in a run dir (ffmpeg names subtitle segments after the
+/// playlist). Empty when the session had no subtitle output.
+fn vtt_segments_in(run: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(run) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.starts_with("index") && name.ends_with(".vtt")
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Milliseconds of media in one segment this leg will actually produce.
@@ -4909,6 +5047,7 @@ mod tests {
     use crate::BurnInKind;
     use crate::virtual_input::{KeyframeEntry, KeyframeMap, MapContainerKind};
     use std::process::Command;
+    use std::time::SystemTime;
 
     fn ffmpeg_available() -> bool {
         let ok = Command::new("ffmpeg")
@@ -10100,6 +10239,138 @@ mod tests {
         db
     }
 
+    /// One certified item whose media is `corpus`, with the fixture's real
+    /// mtime/size and its embedded text subtitle inventory. The item is
+    /// `eligible`: a piggyback session on it has work to publish.
+    fn certified_item_for_fixture(dir: &Path, corpus: &Path) -> (Arc<Db>, i64) {
+        let (db, item_id, _) = certified_item_with_expectation(dir, corpus);
+        (db, item_id)
+    }
+
+    /// The same certified item, plus the probe expectation a later re-probe
+    /// needs to publish against it.
+    fn certified_item_with_expectation(
+        dir: &Path,
+        corpus: &Path,
+    ) -> (Arc<Db>, i64, nightjar_db::ProbeExpectation) {
+        let db = Arc::new(nightjar_db::open(dir).unwrap());
+        let library = db
+            .create_library(&nightjar_db::NewLibrary {
+                name: "movies".into(),
+                path: corpus.parent().unwrap().to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let meta = fs::metadata(corpus).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let path = corpus.file_name().unwrap().to_string_lossy().into_owned();
+        let item_id = db
+            .upsert_items_indexed(
+                library.id,
+                &[nightjar_db::UpsertItem {
+                    path: path.clone(),
+                    mtime_ms,
+                    size_bytes: meta.len() as i64,
+                    title: "fixture".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: Some("1-aaa-bbb".into()),
+                }],
+            )
+            .unwrap()[0];
+        let expectation = nightjar_db::ProbeExpectation {
+            item_id,
+            library_id: library.id,
+            library_root: library.path.clone(),
+            path,
+            media_revision: 1,
+            probe_revision: 0,
+            content_id: Some("1-aaa-bbb".into()),
+            mtime_ms,
+            size_bytes: meta.len() as i64,
+        };
+        let subtitle_tracks = crate::list_text_subtitles(corpus)
+            .unwrap()
+            .into_iter()
+            .map(|t| nightjar_db::SubtitleTrackRow {
+                media_item_id: item_id,
+                stream_index: i64::from(t.stream_index),
+                codec: t.codec,
+                language: t.language,
+                title: t.title,
+                forced: t.is_forced,
+                sdh: false,
+                kind: "text".into(),
+            })
+            .collect();
+        db.publish_probe(
+            &expectation,
+            &nightjar_db::ProbeOutcome::Success(Box::new(nightjar_db::ProbeSnapshot {
+                duration_ms: Some(4000),
+                container: Some("mkv".into()),
+                video_codec: Some("h264".into()),
+                video_stream_index: Some(0),
+                audio_codec: Some("aac".into()),
+                audio_channels: Some(2),
+                width: Some(160),
+                height: Some(120),
+                video_bitrate_bps: None,
+                video_frame_rate_num: Some(10),
+                video_frame_rate_den: Some(1),
+                hdr: None,
+                audio_tracks: vec![],
+                subtitle_tracks,
+                subtitle_status: "eligible".into(),
+            })),
+        )
+        .unwrap();
+        (db, item_id, expectation)
+    }
+
+    /// A session whose piggyback run reached EOF with one WebVTT side-output
+    /// segment on disk, wired to the real subtitle store and database so the
+    /// publication compare-and-swap runs for real.
+    fn piggyback_eof_session(
+        dir: &Path,
+        db: Arc<Db>,
+        subs: Arc<SubsStore>,
+        item_id: i64,
+        corpus: &Path,
+        source: CertifiedSubtitleSource,
+    ) -> Session {
+        let streams = crate::list_text_subtitles(corpus).expect("fixture text track");
+        let stream = streams.first().expect("fixture text track");
+        let mut session = eof_test_session(dir, 4000);
+        session.item_id = item_id;
+        session.src = corpus.to_path_buf();
+        session.subs = Some(subs);
+        session.db = Some(db);
+        session.piggyback = Some(PiggybackExtract {
+            track_id: stream.track_id(),
+            stream_index: stream.stream_index,
+            source: Some(source),
+        });
+        let run = run_path(
+            dir,
+            SINGLE_VIDEO_RUNG,
+            session.encoder_state(SINGLE_VIDEO_RUNG).current_run_id,
+        );
+        fs::create_dir_all(&run).unwrap();
+        fs::write(
+            run.join("index0.vtt"),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNightjar piggyback cue\n",
+        )
+        .unwrap();
+        session
+    }
+
     /// Color+sine MKV with exactly one embedded SRT track.
     fn make_fixture_with_sub_secs(path: &Path, secs: u32) {
         let d = secs.to_string();
@@ -10159,6 +10430,7 @@ mod tests {
         let extract = PiggybackExtract {
             track_id: format!("e{selected}"),
             stream_index: selected,
+            source: None,
         };
         let mut cmd = Command::new("ffmpeg");
         push_piggyback_map(&mut cmd, Some(&extract));
@@ -10185,12 +10457,12 @@ mod tests {
         assert_eq!(none.get_args().count(), 0);
     }
 
-    /// D2B.2 acceptance 6: piggyback subtitle publication fails closed until
-    /// D2B.3. A session on an `eligible` item still runs to natural EOF (AV
-    /// playback is unaffected) but the item never flips `ready` and no
-    /// artifact is published from this path.
+    /// D2B.3: a piggyback target with no certified source capture publishes
+    /// nothing. A session on an `eligible` item still runs to natural EOF (AV
+    /// playback is unaffected) but the item never flips `ready` and no artifact
+    /// is published from this path.
     #[test]
-    fn piggyback_session_fails_closed_and_never_flips_ready() {
+    fn piggyback_session_without_capture_never_flips_ready() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -10234,6 +10506,7 @@ mod tests {
                     Some(PiggybackExtract {
                         track_id: track_id.clone(),
                         stream_index: streams[0].stream_index,
+                        source: None,
                     }),
                 )
                 .unwrap();
@@ -10254,22 +10527,289 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // One more poll observes the child exit and would have published
-            // before D2B.2.
+            // One more poll observes the child exit, where the publish runs.
             let _ = reg.playlist(&id);
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(
                 db.get_item(1).unwrap().unwrap().subtitle_status,
                 "eligible",
-                "a complete piggyback run must not flip the item to ready"
+                "no certified capture means the piggyback must not flip the item to ready"
             );
             assert!(
                 !subs.item_dir(1).exists(),
-                "piggyback must not publish a subtitle artifact"
+                "no certified capture means the piggyback must not publish an artifact"
             );
             let _ = track_id;
             reg.stop(&id);
         }
+    }
+
+    /// D2B.3: a piggyback run on an `eligible` item with a certified capture
+    /// publishes through the ADR-0013 §13.3 generation contract. The run EOF
+    /// commits one complete per-track reference under the captured token, the
+    /// artifact is finalized at the committed revision, and the coarse
+    /// lifecycle flips to `ready` only through that CAS.
+    #[test]
+    fn piggyback_session_publishes_through_the_captured_generation() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&corpus) {
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        assert_eq!(streams.len(), 1, "piggyback gate expects one text track");
+        let track_id = streams[0].track_id();
+
+        for mode in [SessionMode::Copy, SessionMode::Transcode] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, item_id) = certified_item_for_fixture(dir.path(), &corpus);
+            let source = db
+                .certified_subtitle_source(item_id)
+                .unwrap()
+                .expect("certified source");
+            let token = source.token_for_track(&track_id).expect("member token");
+            let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+            let reg = HlsSessionRegistry::with_cap(
+                dir.path().join("hls"),
+                2,
+                "libx264",
+                Some(subs.clone()),
+                Some(db.clone()),
+            )
+            .unwrap();
+            let id = reg
+                .start(
+                    SessionOwner::new("test"),
+                    0,
+                    None,
+                    None,
+                    item_id,
+                    &corpus,
+                    0,
+                    4000,
+                    mode,
+                    stereo(),
+                    vec![],
+                    None,
+                    None,
+                    VideoEncodePlan::default(),
+                    Some(PiggybackExtract {
+                        track_id: track_id.clone(),
+                        stream_index: streams[0].stream_index,
+                        source: Some(source),
+                    }),
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let text = reg
+                    .playlist(&id)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                if text.contains("#EXT-X-ENDLIST") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "piggyback session never reached EOF"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Poll until the run EOF publication lands; the run's exit is
+            // observed by a later playlist fetch.
+            let published = || {
+                let _ = reg.playlist(&id);
+                db.get_item(item_id).unwrap().unwrap().subtitle_status == "ready"
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !published() {
+                assert!(
+                    Instant::now() < deadline,
+                    "a complete piggyback run must publish and flip the item to ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let committed = db
+                .certified_subtitle_source(item_id)
+                .unwrap()
+                .expect("certified source")
+                .artifact_for(&track_id)
+                .cloned()
+                .expect("committed publication");
+            assert_eq!(
+                committed.state,
+                SubtitleArtifactState::Complete,
+                "the piggyback must commit a complete reference"
+            );
+            assert_eq!(committed.token, token, "the committed token is the capture");
+            assert!(
+                subs.has_artifact(item_id, &token, &track_id, committed.artifact_revision),
+                "the committed artifact must be on disk at its committed revision"
+            );
+            // The bytes the item route resolves and serves for this committed
+            // generation: the serve-time resolution re-checks that the exact
+            // committed revision exists, so this asserts the served body rather
+            // than a path the test built itself.
+            let served = crate::stored_webvtt(
+                &subs,
+                item_id,
+                &token,
+                &track_id,
+                committed.artifact_revision,
+            )
+            .expect("the committed generation must be serveable");
+            let body = fs::read_to_string(served).unwrap();
+            assert!(
+                body.contains("Nightjar SRT sample"),
+                "the published bytes must be the side output: {body}"
+            );
+            reg.stop(&id);
+        }
+    }
+
+    /// D2B.3 plan step 5: the piggyback entry point cannot resurrect a removed
+    /// track. The capture still mints a token for the track, and the current
+    /// source still certifies, but the track is no longer a member, so the DB
+    /// compare-and-swap rejects the publication: no reference is committed, no
+    /// URL becomes serveable, and the run stays armed to defer.
+    #[test]
+    fn piggyback_publication_defers_when_the_track_was_removed() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&corpus) {
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        assert_eq!(streams.len(), 1, "piggyback gate expects one text track");
+        let track_id = streams[0].track_id();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, item_id) = certified_item_for_fixture(dir.path(), &corpus);
+        let source = db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        assert!(source.is_member(&track_id));
+        // Remove the embedded track while the item stays certified: the
+        // captured source is still current, so only the membership check in the
+        // publication CAS can reject the work.
+        db.replace_item_subtitle_tracks(item_id, &[]).unwrap();
+        let current = db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("the item still certifies without the track");
+        assert!(!current.is_member(&track_id));
+        assert!(db.subtitle_source_is_current(&source).unwrap());
+
+        let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+        let mut session = piggyback_eof_session(
+            dir.path(),
+            db.clone(),
+            subs.clone(),
+            item_id,
+            &corpus,
+            source,
+        );
+        publish_piggyback_if_complete(&mut session);
+
+        assert!(
+            session.piggyback.is_some(),
+            "a rejected publication must leave the piggyback armed to defer"
+        );
+        assert_ne!(
+            db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready"
+        );
+        let current = db.certified_subtitle_source(item_id).unwrap().unwrap();
+        assert!(
+            current.artifacts.iter().all(|a| a.track_id != track_id),
+            "a removed track must not gain a committed reference"
+        );
+    }
+
+    /// D2B.3 plan step 5: certification loss without a revision increment
+    /// defers the piggyback entry point. The probe failure clears certification
+    /// but moves no counter, so no reference is committed, nothing is finalized
+    /// and the item never flips `ready` from this run.
+    #[test]
+    fn piggyback_publication_defers_when_certification_is_lost() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../testdata/files/h264_aac_srt_mkv.mkv");
+        if skip_without_fixture(&corpus) {
+            return;
+        }
+        let streams = crate::list_text_subtitles(&corpus).expect("list");
+        assert_eq!(streams.len(), 1, "piggyback gate expects one text track");
+        let track_id = streams[0].track_id();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, item_id, expectation) = certified_item_with_expectation(dir.path(), &corpus);
+        let source = db
+            .certified_subtitle_source(item_id)
+            .unwrap()
+            .expect("certified source");
+        assert!(
+            source.is_member(&track_id),
+            "the capture must name the fixture's text track"
+        );
+        let captured_probe_revision = source.snapshot.probe_revision;
+        // The failure must publish against the row the success just wrote.
+        let failure_expectation = nightjar_db::ProbeExpectation {
+            item_id,
+            library_id: source.snapshot.library_id,
+            library_root: expectation.library_root.clone(),
+            path: source.snapshot.path.clone(),
+            media_revision: source.snapshot.media_revision,
+            probe_revision: source.snapshot.probe_revision,
+            content_id: Some(source.snapshot.content_id.clone()),
+            mtime_ms: source.snapshot.mtime_ms,
+            size_bytes: source.snapshot.size_bytes,
+        };
+        assert!(matches!(
+            db.publish_probe(
+                &failure_expectation,
+                &nightjar_db::ProbeOutcome::Failure {
+                    probe_status: "error".into(),
+                    scan_error: "boom".into(),
+                },
+            )
+            .unwrap(),
+            nightjar_db::ProbePublication::FailureRecorded
+        ));
+        assert_eq!(
+            db.get_item(item_id).unwrap().unwrap().probe_revision,
+            captured_probe_revision,
+            "a failed probe clears certification without incrementing the revision"
+        );
+        assert!(db.certified_subtitle_source(item_id).unwrap().is_none());
+
+        let subs = Arc::new(SubsStore::new(dir.path().join("subs")).unwrap());
+        let mut session = piggyback_eof_session(
+            dir.path(),
+            db.clone(),
+            subs.clone(),
+            item_id,
+            &corpus,
+            source,
+        );
+        publish_piggyback_if_complete(&mut session);
+
+        assert!(
+            session.piggyback.is_some(),
+            "lost certification must leave the piggyback armed to defer"
+        );
+        assert_ne!(
+            db.get_item(item_id).unwrap().unwrap().subtitle_status,
+            "ready"
+        );
+        assert!(
+            !subs.item_dir(item_id).exists(),
+            "an uncertified run must finalize no artifact"
+        );
     }
 
     /// Counts `trak` boxes in an fMP4 init: one per track in `moov`.
@@ -10320,6 +10860,7 @@ mod tests {
                 Some(PiggybackExtract {
                     track_id: track_id.clone(),
                     stream_index: streams[0].stream_index,
+                    source: None,
                 }),
                 None,
             ] {
@@ -10434,6 +10975,7 @@ mod tests {
                 Some(PiggybackExtract {
                     track_id: track_id.clone(),
                     stream_index: streams[0].stream_index,
+                    source: None,
                 }),
             )
             .unwrap();
