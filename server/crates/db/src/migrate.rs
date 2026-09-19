@@ -2969,4 +2969,214 @@ mod tests {
         // Repeat safety: a second migrate is a no-op and leaves the columns.
         migrate(&conn).unwrap();
     }
+
+    /// Ordered primary-key identity of one table, captured as a typed row so a
+    /// row dropped and recreated under a new key fails even when the count is
+    /// unchanged. `sql` must order deterministically.
+    fn identities<T, F>(conn: &Connection, sql: &str, map: F) -> Vec<T>
+    where
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([], map)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// 034 (ADR-0013 §13.2/§13.4). The migration is additive — one column on
+    /// `media_items` and one new table — so a populated install must reach it
+    /// with every existing row identity intact. This is the populated-copy
+    /// clause the 2026-09-17 audit found unproven (CHK-AUD Finding A): the
+    /// identities are asserted as primary keys, not only counts, so a row
+    /// dropped and recreated under a new key fails even when the count holds.
+    #[test]
+    fn migration_34_preserves_populated_row_identities_and_counts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, 33);
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO media_items (id, library_id, path, mtime_ms, size_bytes, title, kind)
+             VALUES (1, 1, 'a.mkv', 1, 2, 'A', 'movie'),
+                    (2, 1, 'b.mkv', 3, 4, 'B', 'movie');
+             INSERT INTO media_item_sidecars (
+                media_item_id, track_id, path, mtime_ms, size_bytes, format, language
+             ) VALUES
+                (1, 's-en', 'a.en.srt', 1, 2, 'srt', 'en'),
+                (2, 's', 'b.srt', 3, 4, 'srt', NULL);
+             INSERT INTO media_item_links (media_item_id, item_key)
+             VALUES (1, 'tmdb:movie:1'), (2, 'tmdb:movie:2');
+             INSERT INTO media_item_subtitle_tracks
+                (id, media_item_id, stream_index, codec, kind)
+             VALUES (1, 1, 0, 'subrip', 'text'), (2, 2, 0, 'subrip', 'text');
+             INSERT INTO accounts (id, username, password_hash, role)
+             VALUES (1, 'a', 'h', 'owner');
+             INSERT INTO profiles (id, account_id, profile_ref, name)
+             VALUES (1, 1, 'aa', 'P');
+             INSERT INTO watch_state
+                (profile_id, item_key, position_ms, duration_ms, played, hidden,
+                 first_played_at, last_played_at)
+             VALUES (1, 'path:1:a.mkv', 1, 2, 0, 0,
+                     '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        let items_before: Vec<(i64, String)> =
+            identities(&conn, "SELECT id, path FROM media_items ORDER BY id", |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            });
+        let sidecars_before: Vec<(i64, String)> = identities(
+            &conn,
+            "SELECT media_item_id, track_id FROM media_item_sidecars
+             ORDER BY media_item_id, track_id",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let links_before: Vec<(i64, String)> = identities(
+            &conn,
+            "SELECT media_item_id, item_key FROM media_item_links
+             ORDER BY media_item_id, item_key",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let subtitles_before: Vec<(i64, i64)> = identities(
+            &conn,
+            "SELECT id, media_item_id FROM media_item_subtitle_tracks ORDER BY id",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let watch_before: Vec<(i64, String)> = identities(
+            &conn,
+            "SELECT profile_id, item_key FROM watch_state ORDER BY profile_id, item_key",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+
+        migrate(&conn).unwrap();
+
+        let items_after: Vec<(i64, String)> =
+            identities(&conn, "SELECT id, path FROM media_items ORDER BY id", |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            });
+        let sidecars_after: Vec<(i64, String)> = identities(
+            &conn,
+            "SELECT media_item_id, track_id FROM media_item_sidecars
+             ORDER BY media_item_id, track_id",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let links_after: Vec<(i64, String)> = identities(
+            &conn,
+            "SELECT media_item_id, item_key FROM media_item_links
+             ORDER BY media_item_id, item_key",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let subtitles_after: Vec<(i64, i64)> = identities(
+            &conn,
+            "SELECT id, media_item_id FROM media_item_subtitle_tracks ORDER BY id",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let watch_after: Vec<(i64, String)> = identities(
+            &conn,
+            "SELECT profile_id, item_key FROM watch_state ORDER BY profile_id, item_key",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+
+        assert_eq!(
+            items_after, items_before,
+            "media_items identities must hold"
+        );
+        assert_eq!(
+            sidecars_after, sidecars_before,
+            "media_item_sidecars identities must hold"
+        );
+        assert_eq!(
+            links_after, links_before,
+            "media_item_links identities must hold"
+        );
+        assert_eq!(
+            subtitles_after, subtitles_before,
+            "media_item_subtitle_tracks identities must hold"
+        );
+        assert_eq!(
+            watch_after, watch_before,
+            "watch_state identities must hold"
+        );
+
+        // The additive shape: the new table arrives empty (ADR-0013 §13.2 says
+        // no backfill), and the new per-item allocator column reads 0 on every
+        // existing row rather than NULL.
+        assert_eq!(
+            count(&conn, "subtitle_publications"),
+            0,
+            "the migration backfills no publication"
+        );
+        let sequence_rows: Vec<(i64, i64)> = identities(
+            &conn,
+            "SELECT id, subtitle_artifact_sequence FROM media_items ORDER BY id",
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        let sequences: Vec<i64> = sequence_rows
+            .into_iter()
+            .map(|(_, sequence)| sequence)
+            .collect();
+        assert_eq!(sequences, vec![0, 0], "the allocator starts at 0");
+    }
+
+    /// CHK-AUD Finding A: the refusal test above proves the step does not
+    /// half-apply. This is the other half of the checkpoint clause — the error
+    /// names migration 25, and after the refusal the source is still a working
+    /// database. The later schema is absent only because 25 refused; this test
+    /// does not prove the later migrations' own non-partial behaviour. Without
+    /// it, "refused" could mean "wedged".
+    #[test]
+    fn migration_25_refusal_leaves_the_source_usable() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        rewind_to_24(&conn);
+        conn.execute_batch(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (1, 'Root', 'h', 'owner'), (2, 'root', 'h', 'member');",
+        )
+        .unwrap();
+
+        let err = migrate(&conn).expect_err("a colliding install must refuse");
+        assert!(err.contains("migration 25 refused"), "{err}");
+
+        // No partial step is visible: the refused version is unrecorded and the
+        // index it would build is absent. The later schema is absent only
+        // because 25 refused, not because this test exercises those steps.
+        assert_eq!(count_where(&conn, "schema_migrations", "version >= 25"), 0);
+        assert_eq!(
+            count_where(
+                &conn,
+                "sqlite_master",
+                "name = 'idx_accounts_username_nocase'"
+            ),
+            0
+        );
+        assert_eq!(
+            count_where(&conn, "sqlite_master", "name = 'watch_state'"),
+            0
+        );
+        assert_eq!(
+            count_where(&conn, "sqlite_master", "name = 'subtitle_publications'"),
+            0
+        );
+
+        // The source is still usable: both rows the refusal named are readable
+        // and a non-colliding write still lands.
+        let usernames: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT username FROM accounts ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(usernames, vec!["Root".to_string(), "root".to_string()]);
+        conn.execute(
+            "INSERT INTO accounts (id, username, password_hash, role)
+                 VALUES (3, 'other', 'h', 'member')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "accounts"), 3);
+    }
 }
