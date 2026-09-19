@@ -95,9 +95,11 @@ pub fn walk_concurrency() -> usize {
 /// Permission errors are skipped.
 ///
 /// When `cache` is provided, directories whose mtime matches the previous walk are not
-/// re-listed: their prior file list and child set are reused. That is the cheap
-/// poll path (ADR-0013). Immediate-parent mtime updates when a file is added;
-/// ancestors need not.
+/// re-listed: their prior file list and child set are reused. That mtime shortcut
+/// cannot see an in-place edit or a sidecar change under an unchanged parent
+/// mtime, so the scan path does not use it: [`walk_media_files_fresh`] passes an
+/// empty cache and re-lists every directory (CHK-FC). This cache-aware primitive
+/// remains for the repoint dry-run and for tests.
 ///
 /// A cached directory is reused only when its previous listing was complete. A
 /// listing that lost an entry to a readdir/stat failure is re-listed, so a
@@ -127,17 +129,19 @@ pub fn walk_media_files_cached_with_concurrency(
 /// Walk `root` re-listing every directory, ignoring the per-directory mtime
 /// cache, and replace `cache` with the fresh listing.
 ///
-/// An explicit manual scan uses this. The operator asked for a scan, so the
-/// walk must observe the tree as it is now even where a directory's mtime did
-/// not move: an in-place file edit leaves the parent mtime alone, so the cached
-/// path would never re-read that file. The refreshed cache keeps the next
-/// automatic poll warm (ADR-0015).
+/// Every full scan uses this — automatic poll, explicit manual scan, library
+/// create, and internal follow-up (CHK-FC). The operator and the poll both need
+/// the tree as it is now, even where a directory's mtime did not move: an
+/// in-place file edit or a sidecar change leaves the parent mtime alone, so a
+/// cached listing would never re-read it. One fresh enumeration path is the
+/// authority; the refreshed cache is kept for the repoint dry-run and tests,
+/// not to let a later scan skip a directory.
 ///
 /// Every directory this pass readdir'd is in `relisted_dirs`, because the fresh
-/// walk lists each one. Sidecar rediscovery keys off that set, so a manual scan
+/// walk lists each one. Sidecar rediscovery keys off that set, so a pass
 /// reconciles the supported sidecars beside every media file it saw — including
 /// unchanged parents — through the caller's shared per-directory listing cache
-/// (ADR-0013 §3.5 amendment). The automatic poll keeps the mtime-only meaning.
+/// (ADR-0013 §3.5 amendment).
 pub fn walk_media_files_fresh(root: &Path, cache: &mut WalkCache) -> Result<WalkOutcome, String> {
     let mut fresh = WalkCache::new();
     // The empty cache makes the inner walk list every directory, so its
