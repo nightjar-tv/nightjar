@@ -101,6 +101,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         34,
         include_str!("../migrations/034_subtitle_publications.sql"),
     ),
+    (
+        35,
+        include_str!("../migrations/035_atomic_scan_admission.sql"),
+    ),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), String> {
@@ -172,6 +176,15 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         // row. Refuse first and name them.
         if version == 25 {
             refuse_colliding_usernames(conn)?;
+        }
+        // Migration 35 adds a partial unique index over the active
+        // (`queued`, `indexing`, `probing`) rows of `scan_jobs`, one per
+        // library. If an install already holds two active rows for one
+        // library the index cannot be built, and SQLite would say so as
+        // `UNIQUE constraint failed: scan_jobs.library_id`, which names
+        // neither row. Refuse first and name them.
+        if version == 35 {
+            refuse_duplicate_active_scan_jobs(conn)?;
         }
 
         // Migration 27 rebuilds `series`, which `series_entity_bindings`
@@ -455,6 +468,48 @@ fn refuse_colliding_usernames(conn: &Connection) -> Result<(), String> {
     ))
 }
 
+/// Refuse migration 35 when an install already holds more than one active
+/// (`queued`, `indexing`, `probing`) `scan_jobs` row for one library, and name
+/// the library and every colliding job id (ADR-0059).
+///
+/// **Choosing which active job to keep is not this migration's call.** A
+/// queued row can own a worker that is already running, and dropping one
+/// silently would leave that worker writing into a row the index no longer
+/// admits. The invariant is a product decision, so boot stops and an operator
+/// decides which job is real.
+fn refuse_duplicate_active_scan_jobs(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT library_id, group_concat(id, ', ')
+             FROM scan_jobs
+             WHERE state IN ('queued', 'indexing', 'probing')
+             GROUP BY library_id
+             HAVING COUNT(*) > 1
+             ORDER BY library_id",
+        )
+        .map_err(|e| format!("prepare active scan job check: {e}"))?;
+    let groups: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| format!("active scan job check: {e}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("active scan job check row: {e}"))?;
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = groups
+        .iter()
+        .map(|(library_id, ids)| format!("library {library_id}: jobs {ids}"))
+        .collect();
+    Err(format!(
+        "migration 35 refused: {} library(ies) hold more than one active scan \
+         job, and this migration will not choose which job keeps running. \
+         Finish or fail the extra jobs, then start again. Colliding rows \
+         (library: job ids): {}",
+        groups.len(),
+        named.join("; ")
+    ))
+}
+
 fn count_table(conn: &Connection, table: &str) -> Result<i64, String> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
         .map_err(|e| format!("count {table}: {e}"))
@@ -487,7 +542,18 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 34);
+        assert_eq!(v, 35);
+        // 035 (ADR-0059): the partial unique index over active scan jobs
+        // exists on a fresh install.
+        let has_active_scan_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_scan_jobs_active_library'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_active_scan_index, 1);
         // 034 (ADR-0013 §13.4): the committed per-track publication reference
         // exists on a fresh install, keyed by (item, track, token), with the
         // partial/complete state check and the item index.
@@ -2390,7 +2456,7 @@ mod tests {
     }
 
     /// Rewind an already-migrated database to just before migration 25, the
-    /// way a real install upgrading into it looks. Migrations 26 through 34
+    /// way a real install upgrading into it looks. Migrations 26 through 35
     /// and their schema are removed with it, so `migrate` sees a database at
     /// version 24 and applies all of them in order.
     ///
@@ -2403,6 +2469,7 @@ mod tests {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_accounts_username_nocase;
              DROP INDEX IF EXISTS idx_watch_state_recent;
+             DROP INDEX IF EXISTS idx_scan_jobs_active_library;
              DROP TABLE IF EXISTS watch_state;
              DROP TABLE IF EXISTS profile_track_choice;
              CREATE TABLE profiles_rewind (
@@ -2458,7 +2525,7 @@ mod tests {
              DROP TABLE IF EXISTS subtitle_publications;
              ALTER TABLE media_items DROP COLUMN subtitle_artifact_sequence;
              DELETE FROM schema_migrations
-             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33, 34);",
+             WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);",
         )
         .unwrap();
     }
@@ -2968,5 +3035,176 @@ mod tests {
 
         // Repeat safety: a second migrate is a no-op and leaves the columns.
         migrate(&conn).unwrap();
+    }
+
+    /// 035 (ADR-0059). On a fresh install the partial unique index admits one
+    /// active job per library and refuses a second. A terminal row is outside
+    /// the index, so the next active job for the same library is admitted.
+    #[test]
+    fn migration_35_fresh_db_admits_one_active_scan_job_per_library() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO scan_jobs (library_id, state, kind)
+             VALUES (1, 'queued', 'scan');",
+        )
+        .unwrap();
+
+        let second = conn.execute(
+            "INSERT INTO scan_jobs (library_id, state, kind) VALUES (1, 'indexing', 'scan')",
+            [],
+        );
+        assert!(
+            second.is_err(),
+            "a second active row for one library must be refused"
+        );
+
+        // The partial index excludes terminal states, so finishing the first
+        // job frees the library for the next.
+        conn.execute(
+            "UPDATE scan_jobs SET state = 'completed' WHERE library_id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_jobs (library_id, state, kind) VALUES (1, 'probing', 'scan')",
+            [],
+        )
+        .unwrap();
+
+        // A different library is unaffected.
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('u', '/tmp/u', 'shows');
+             INSERT INTO scan_jobs (library_id, state, kind) VALUES (2, 'queued', 'scan');",
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "scan_jobs"), 3);
+    }
+
+    /// 035 (ADR-0059). A populated install that already holds two active rows
+    /// for one library cannot satisfy the index. The migration refuses before
+    /// its transaction, names the library and both job ids, records no version
+    /// 035, and creates no index. The control below proves the same database
+    /// migrates once the duplicate is resolved.
+    #[test]
+    fn migration_35_refuses_duplicate_active_jobs_without_recording() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, 34);
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES ('t', '/tmp/t', 'movies');
+             INSERT INTO scan_jobs (library_id, state, kind) VALUES
+                (1, 'queued', 'scan'),
+                (1, 'probing', 'scan');",
+        )
+        .unwrap();
+
+        let err = migrate(&conn).expect_err("a duplicate-active install must refuse");
+        assert!(err.contains("migration 35 refused"), "{err}");
+        assert!(
+            err.contains("library 1"),
+            "the library must be named: {err}"
+        );
+        assert!(err.contains("1, 2"), "both job ids must be named: {err}");
+
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 35",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 0, "the refused migration must not record itself");
+        let index_built: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_scan_jobs_active_library'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_built, 0,
+            "the refused migration must not build the index"
+        );
+
+        // Control: resolve the duplicate and the same database upgrades.
+        conn.execute("UPDATE scan_jobs SET state = 'failed' WHERE id = 2", [])
+            .unwrap();
+        migrate(&conn).expect("a resolved install must migrate");
+        let applied_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 35",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied_after, 1);
+    }
+
+    /// 035 (ADR-0059). A populated install with one active row per library
+    /// reaches the index in place: every `scan_jobs` row survives with its
+    /// state, and the new constraint refuses only a second active row.
+    #[test]
+    fn migration_35_preserves_rows_and_adds_the_index_on_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through(&conn, 34);
+        conn.execute_batch(
+            "INSERT INTO libraries (name, path, kind) VALUES
+                ('t', '/tmp/t', 'movies'), ('u', '/tmp/u', 'shows');
+             INSERT INTO scan_jobs (library_id, state, kind) VALUES
+                (1, 'completed', 'scan'),
+                (1, 'failed', 'scan'),
+                (1, 'queued', 'scan'),
+                (2, 'indexing', 'repoint');",
+        )
+        .unwrap();
+        let before = count(&conn, "scan_jobs");
+        let states: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, state FROM scan_jobs ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(count(&conn, "scan_jobs"), before, "no scan_jobs row lost");
+        let states_after: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, state FROM scan_jobs ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(states, states_after, "states unchanged by the migration");
+
+        let index_built: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_scan_jobs_active_library'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_built, 1);
+
+        // The index refuses a second active row for library 1 but leaves its
+        // terminal rows and library 2's active row alone.
+        let dup = conn.execute(
+            "INSERT INTO scan_jobs (library_id, state, kind) VALUES (1, 'queued', 'scan')",
+            [],
+        );
+        assert!(dup.is_err(), "one active row per library after 035");
+        conn.execute(
+            "INSERT INTO scan_jobs (library_id, state, kind) VALUES (1, 'completed', 'scan')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "scan_jobs"), before + 1);
     }
 }

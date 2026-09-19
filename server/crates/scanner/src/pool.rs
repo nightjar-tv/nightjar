@@ -2993,7 +2993,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
 
         probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
@@ -3024,7 +3024,7 @@ mod tests {
     fn probe_failure_counts_probed_and_error() {
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = broken_item(dir.path());
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
 
         probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
@@ -3051,7 +3051,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
 
         pool.arm_probe_snapshot_fault();
         let batch = pool.start_probe_batch();
@@ -3100,7 +3100,7 @@ mod tests {
             .map_err(|e| e.to_string())
         })
         .unwrap();
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
 
         probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
@@ -3132,7 +3132,7 @@ mod tests {
             .map_err(|e| e.to_string())
         })
         .unwrap();
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
 
         probe_now(&pool, item_id, library_id, abs, Some(job_id));
 
@@ -3170,7 +3170,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let first_job = db.create_scan_job(library_id).unwrap();
+        let first_job = accounting_job(&db, library_id);
         probe_now(&pool, item_id, library_id, abs.clone(), Some(first_job));
 
         let first = db.get_item(item_id).unwrap().unwrap();
@@ -3186,7 +3186,7 @@ mod tests {
 
         // The source disappears between the capture and the final stat.
         std::fs::remove_file(&abs).unwrap();
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
         probe_now(&pool, item_id, library_id, abs.clone(), Some(job_id));
 
         let row = db.get_item(item_id).unwrap().unwrap();
@@ -3450,6 +3450,18 @@ mod tests {
         (job.probed, job.errors)
     }
 
+    /// A distinct id for probe accounting, created terminal.
+    ///
+    /// ADR-0059 allows one active scan job per library, and these probe tests
+    /// need several job ids to attribute one child's accounting to several
+    /// logical demands — not several running jobs. A completed row is outside
+    /// the active partial index and still accepts `record_scan_job_probe`.
+    fn accounting_job(db: &Db, library_id: i64) -> i64 {
+        let id = db.create_scan_job(library_id).unwrap();
+        db.complete_scan_job(id, 0).unwrap();
+        id
+    }
+
     fn demand_expectation(revision: i64, content_id: Option<&str>) -> (ProbeExpectation, PathBuf) {
         (
             ProbeExpectation {
@@ -3501,8 +3513,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let job_a = db.create_scan_job(library_id).unwrap();
-        let job_b = db.create_scan_job(library_id).unwrap();
+        let job_a = accounting_job(&db, library_id);
+        let job_b = accounting_job(&db, library_id);
 
         let hold = pool.arm_probe_hold();
         let batch_a = pool.start_probe_batch();
@@ -3565,9 +3577,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let job_a = db.create_scan_job(library_id).unwrap();
-        let job_b = db.create_scan_job(library_id).unwrap();
-        let job_c = db.create_scan_job(library_id).unwrap();
+        let job_a = accounting_job(&db, library_id);
+        let job_b = accounting_job(&db, library_id);
+        let job_c = accounting_job(&db, library_id);
 
         let hold = pool.arm_probe_hold();
         let batch_a = pool.start_probe_batch();
@@ -3644,7 +3656,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let job_a = db.create_scan_job(library_id).unwrap();
+        let job_a = accounting_job(&db, library_id);
         probe_now(&pool, item_id, library_id, abs.clone(), Some(job_a));
 
         let after_a = db.get_item(item_id).unwrap().unwrap();
@@ -3660,7 +3672,7 @@ mod tests {
             revision, 2,
             "a changed observation bumps media_revision once"
         );
-        let job_b = db.create_scan_job(library_id).unwrap();
+        let job_b = accounting_job(&db, library_id);
         probe_now(&pool, item_id, library_id, abs.clone(), Some(job_b));
 
         let after_b = db.get_item(item_id).unwrap().unwrap();
@@ -3688,7 +3700,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = broken_item(dir.path());
-        let job_a = db.create_scan_job(library_id).unwrap();
+        let job_a = accounting_job(&db, library_id);
         probe_now(&pool, item_id, library_id, abs.clone(), Some(job_a));
 
         let after_a = db.get_item(item_id).unwrap().unwrap();
@@ -3703,7 +3715,7 @@ mod tests {
             revision, 2,
             "a changed observation bumps media_revision once"
         );
-        let job_b = db.create_scan_job(library_id).unwrap();
+        let job_b = accounting_job(&db, library_id);
         probe_now(&pool, item_id, library_id, abs.clone(), Some(job_b));
 
         let after_b = db.get_item(item_id).unwrap().unwrap();
@@ -3732,9 +3744,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (db, pool, library_id, item_id, abs) = seeded_item(dir.path(), "h264_aac_srt_mkv.mkv");
-        let job_a = db.create_scan_job(library_id).unwrap();
-        let job_b = db.create_scan_job(library_id).unwrap();
-        let job_c = db.create_scan_job(library_id).unwrap();
+        let job_a = accounting_job(&db, library_id);
+        let job_b = accounting_job(&db, library_id);
+        let job_c = accounting_job(&db, library_id);
 
         let hold = pool.arm_probe_hold();
         let batch_a = pool.start_probe_batch();
@@ -3827,7 +3839,7 @@ mod tests {
             .map_err(|e| e.to_string())
         })
         .unwrap();
-        let job_id = db.create_scan_job(library_id).unwrap();
+        let job_id = accounting_job(&db, library_id);
 
         probe_now(&pool, item_id, library_id, abs, Some(job_id));
 

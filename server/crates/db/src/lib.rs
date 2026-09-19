@@ -38,8 +38,8 @@ pub use store::{
     AudioTrackRow, CertifiedProbeSnapshot, CertifiedSidecar, CertifiedSubtitleSource,
     CoherentProbeRead, Db, ItemPathRow, KeyframeMapRows, LibraryRow, MediaItemRow, NewLibrary,
     ObservedSidecar, ProbeAccounting, ProbeExpectation, ProbeOutcome, ProbePublication,
-    ProbeSnapshot, ProbeUpdate, ScanJobRow, ScanProgressCounts, SidecarChange, SidecarDelta,
-    SidecarRow, SubtitleArtifact, SubtitleArtifactPublication, SubtitleArtifactState,
+    ProbeSnapshot, ProbeUpdate, ScanAdmission, ScanJobRow, ScanProgressCounts, SidecarChange,
+    SidecarDelta, SidecarRow, SubtitleArtifact, SubtitleArtifactPublication, SubtitleArtifactState,
     SubtitleListingSource, SubtitlePublication, SubtitleTrackRow, UpsertItem,
     is_valid_generation_token, with_write_tx, write_tx,
 };
