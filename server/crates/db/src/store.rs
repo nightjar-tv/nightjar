@@ -892,6 +892,18 @@ fn run_probe_read_after_item_hook() {
     });
 }
 
+/// Result of one atomic scan admission (ADR-0059).
+///
+/// The outcome tags ownership as well as state: only [`Self::Created`] inserted
+/// a row and may start the worker; [`Self::Existing`] coalesces onto a job
+/// another caller owns; [`Self::Skipped`] started nothing and inserted nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanAdmission {
+    Created(i64),
+    Existing(i64),
+    Skipped,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -2481,6 +2493,66 @@ impl Db {
         )
         .optional()
         .map_err(|e| format!("active scan job: {e}"))
+    }
+
+    /// Admit a scan job for a library, atomically (ADR-0059).
+    ///
+    /// The active-row lookup and any insert are one `BEGIN IMMEDIATE`
+    /// transaction, so two callers on different connections cannot both see no
+    /// active job and both insert. The order is fixed: return
+    /// [`ScanAdmission::Existing`] when an active row is present; otherwise,
+    /// for a poll, evaluate `holdoff_check` and return [`ScanAdmission::Skipped`]
+    /// when it is active; otherwise insert, commit and return
+    /// [`ScanAdmission::Created`].
+    ///
+    /// `holdoff_check` is `Some` for a poll and `None` for every other trigger.
+    /// It is a live check, not a precomputed boolean: the caller closes over the
+    /// pool's synchronized holdoff state, and it is called after the lookup and
+    /// before a possible insert. A holdoff observed after the lookup therefore
+    /// never leaves an inserted row. A failed insert or commit rolls back and
+    /// leaves no active orphan.
+    ///
+    /// `holdoff_check` runs while the connection is held. It must not call back
+    /// into [`Db`], or it will deadlock on the connection mutex.
+    pub fn admit_scan_job<F>(
+        &self,
+        library_id: i64,
+        holdoff_check: Option<F>,
+    ) -> Result<ScanAdmission, String>
+    where
+        F: FnOnce() -> bool,
+    {
+        let conn = self.lock()?;
+        let tx = write_tx(&conn)?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM scan_jobs
+                 WHERE library_id = ?1
+                   AND state IN ('queued', 'indexing', 'probing')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [library_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("active scan job: {e}"))?;
+        if let Some(job_id) = existing {
+            return Ok(ScanAdmission::Existing(job_id));
+        }
+        if let Some(check) = holdoff_check
+            && check()
+        {
+            return Ok(ScanAdmission::Skipped);
+        }
+        tx.execute(
+            "INSERT INTO scan_jobs (library_id, state, kind) VALUES (?1, 'queued', 'scan')",
+            [library_id],
+        )
+        .map_err(|e| format!("insert scan job: {e}"))?;
+        let job_id = tx.last_insert_rowid();
+        tx.commit()
+            .map_err(|e| format!("commit scan admission: {e}"))?;
+        Ok(ScanAdmission::Created(job_id))
     }
 
     /// Mark in-flight scan jobs failed. A process exit leaves rows in
@@ -6567,5 +6639,205 @@ mod tests {
             !source.is_complete("e2"),
             "the embedded member of the newer source has no committed reference"
         );
+    }
+}
+
+/// Atomic scan admission (ADR-0059). The lookup, the live holdoff check and the
+/// insert are one `BEGIN IMMEDIATE` transaction, and the outcome tags who owns
+/// the job.
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, mpsc};
+
+    fn open_db(dir: &Path) -> Db {
+        Db::open(&dir.join("t.db")).unwrap()
+    }
+
+    fn library(db: &Db, name: &str) -> i64 {
+        db.create_library(&NewLibrary {
+            name: name.into(),
+            path: format!("/media/{name}"),
+            kind: "movies".into(),
+        })
+        .unwrap()
+        .id
+    }
+
+    fn active_jobs(db: &Db, library_id: i64) -> i64 {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM scan_jobs
+                 WHERE library_id = ?1 AND state IN ('queued', 'indexing', 'probing')",
+                [library_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn admit_creates_then_coalesces_on_the_shared_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let lib = library(&db, "a");
+
+        let created = db.admit_scan_job(lib, None::<fn() -> bool>).unwrap();
+        let id = match created {
+            ScanAdmission::Created(id) => id,
+            other => panic!("first admission must create, got {other:?}"),
+        };
+        assert_eq!(active_jobs(&db, lib), 1);
+
+        let again = db.admit_scan_job(lib, None::<fn() -> bool>).unwrap();
+        assert_eq!(
+            again,
+            ScanAdmission::Existing(id),
+            "a second admission coalesces onto the active job"
+        );
+        assert_eq!(active_jobs(&db, lib), 1, "coalescing inserts nothing");
+    }
+
+    /// The lookup runs before the holdoff check: an active row short-circuits
+    /// and the check is never evaluated.
+    #[test]
+    fn admit_returns_existing_without_evaluating_holdoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let lib = library(&db, "a");
+        let existing = match db.admit_scan_job(lib, None::<fn() -> bool>).unwrap() {
+            ScanAdmission::Created(id) => id,
+            other => panic!("setup admission must create, got {other:?}"),
+        };
+
+        let calls = AtomicUsize::new(0);
+        let admission = db
+            .admit_scan_job(
+                lib,
+                Some(|| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    false
+                }),
+            )
+            .unwrap();
+        assert_eq!(admission, ScanAdmission::Existing(existing));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an active row must be returned before the holdoff check runs"
+        );
+    }
+
+    /// The check runs before the insert, and it is live: the holdoff is armed
+    /// after the lookup (the closure is only reached once the lookup found
+    /// nothing) and the admission still skips with no row inserted.
+    #[test]
+    fn admit_holdoff_armed_after_lookup_skips_without_inserting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(open_db(dir.path()));
+        let lib = library(&db, "a");
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let db_worker = Arc::clone(&db);
+        let armed_worker = Arc::clone(&armed);
+        let handle = std::thread::spawn(move || {
+            db_worker.admit_scan_job(
+                lib,
+                Some(move || {
+                    reached_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    armed_worker.load(Ordering::SeqCst)
+                }),
+            )
+        });
+
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the holdoff check must be reached after the lookup");
+        // The lookup has finished; arm the holdoff now, before the check reads.
+        armed.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+
+        let admission = handle.join().unwrap().unwrap();
+        assert_eq!(admission, ScanAdmission::Skipped);
+        assert_eq!(
+            active_jobs(&db, lib),
+            0,
+            "a holdoff observed after the lookup must leave no inserted row"
+        );
+    }
+
+    /// An insert failure rolls the whole admission back: no active orphan.
+    #[test]
+    fn admit_insert_failure_leaves_no_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let lib = library(&db, "a");
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER refuse_scan_job_insert
+                 BEFORE INSERT ON scan_jobs
+                 BEGIN SELECT RAISE(ABORT, 'insert refused'); END;",
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let err = db
+            .admit_scan_job(lib, None::<fn() -> bool>)
+            .expect_err("a refused insert must surface the error");
+        assert!(err.contains("insert refused"), "{err}");
+        assert_eq!(
+            active_jobs(&db, lib),
+            0,
+            "a failed insert must leave no active orphan"
+        );
+
+        db.with_conn(|c| {
+            c.execute_batch("DROP TRIGGER refuse_scan_job_insert;")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(matches!(
+            db.admit_scan_job(lib, None::<fn() -> bool>).unwrap(),
+            ScanAdmission::Created(_)
+        ));
+    }
+
+    /// Two synchronized admissions through independent connections to one
+    /// database produce one creation, one coalescence, one active row and equal
+    /// returned ids (ADR-0059).
+    #[test]
+    fn admit_independent_connections_race_to_one_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db_a = Arc::new(Db::open(&path).unwrap());
+        let db_b = Arc::new(Db::open(&path).unwrap());
+        let lib = library(&db_a, "a");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |db: Arc<Db>| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.admit_scan_job(lib, None::<fn() -> bool>)
+            })
+        };
+        let first = spawn(Arc::clone(&db_a));
+        let second = spawn(Arc::clone(&db_b));
+        let r1 = first.join().unwrap().unwrap();
+        let r2 = second.join().unwrap().unwrap();
+
+        let (created, existing) = match (r1, r2) {
+            (ScanAdmission::Created(c), ScanAdmission::Existing(e))
+            | (ScanAdmission::Existing(e), ScanAdmission::Created(c)) => (c, e),
+            other => panic!("expected one creation and one coalescence, got {other:?}"),
+        };
+        assert_eq!(created, existing, "the coalesced id is the created id");
+        assert_eq!(active_jobs(&db_a, lib), 1, "exactly one active row");
     }
 }

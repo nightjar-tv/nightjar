@@ -19,8 +19,8 @@ pub use watch::spawn_library_watcher;
 
 use nightjar_core::MediaKind;
 use nightjar_db::{
-    Db, ItemPathRow, UpsertItem, fold_path, resolve_media_path, season_number_for_path,
-    show_folder_relpath, to_relpath, under_numbered_season_directory,
+    Db, ItemPathRow, ScanAdmission, UpsertItem, fold_path, resolve_media_path,
+    season_number_for_path, show_folder_relpath, to_relpath, under_numbered_season_directory,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -353,7 +353,9 @@ pub enum ScanTrigger {
 /// Request a full-library scan (ADR-0015). Entry for poll, manual scan, library
 /// create, and internal follow-up — not for notify creates ([`hint_ingest`]).
 ///
-/// Returns the active or newly accepted job id.
+/// Returns the active or newly accepted job id. Returns `0` when a poll meets an
+/// active repoint-delete holdoff: nothing is inserted and no worker starts
+/// (ADR-0059).
 pub fn request_scan(
     db: Arc<Db>,
     pool: Arc<LibraryPool>,
@@ -372,25 +374,39 @@ pub fn request_scan(
         // finding — do not refuse the scan on it).
         Reachability::Reachable | Reachability::CheckFailed => {}
     }
-    if let Some(existing) = db.active_scan_job(library_id)? {
-        match trigger {
-            // Running walk is this poll; do not suppress delete_missing.
-            ScanTrigger::Poll | ScanTrigger::FollowUp => {}
-            ScanTrigger::Manual | ScanTrigger::Create => {
-                pool.mark_scan_dirty(library_id);
-            }
+    // ADR-0059: the active-row lookup and any insert are one BEGIN IMMEDIATE
+    // transaction. A poll's holdoff check runs inside it, after the lookup and
+    // immediately before a possible insert, so a holdoff observed after the
+    // lookup never leaves an inserted row. The check closes over the pool's
+    // synchronized holdoff state, so it reads the state at admission time
+    // rather than a snapshot taken before it.
+    let holdoff_check = match trigger {
+        ScanTrigger::Poll => {
+            let pool = Arc::clone(&pool);
+            Some(move || pool.repoint_delete_holdoff_active(library_id))
         }
-        return Ok(existing);
-    }
-    // Poll must not apply deferred_remove until holdoff ends or manual scan.
-    if matches!(trigger, ScanTrigger::Poll) && pool.repoint_delete_holdoff_active(library_id) {
-        tracing::info!(
-            library_id,
-            "poll skipped; repoint deferred_remove holdoff active"
-        );
-        return Ok(0);
-    }
-    let job_id = db.create_scan_job(library_id)?;
+        _ => None,
+    };
+    let job_id = match db.admit_scan_job(library_id, holdoff_check)? {
+        ScanAdmission::Existing(existing) => {
+            match trigger {
+                // Running walk is this poll; do not suppress delete_missing.
+                ScanTrigger::Poll | ScanTrigger::FollowUp => {}
+                ScanTrigger::Manual | ScanTrigger::Create => {
+                    pool.mark_scan_dirty(library_id);
+                }
+            }
+            return Ok(existing);
+        }
+        ScanAdmission::Skipped => {
+            tracing::info!(
+                library_id,
+                "poll skipped; repoint deferred_remove holdoff active"
+            );
+            return Ok(0);
+        }
+        ScanAdmission::Created(job_id) => job_id,
+    };
     let db_worker = Arc::clone(&db);
     let pool_worker = Arc::clone(&pool);
     spawn_job_worker(&db, job_id, "scan", None, move || {
@@ -3954,6 +3970,146 @@ mod tests {
         .unwrap();
         assert!(after > 0, "poll works again after holdoff clear");
         wait_job(&db, after);
+    }
+
+    /// ADR-0059: every trigger coalesces onto a held active job, and only
+    /// Manual/Create set the dirty bit. The held row is inserted directly, so
+    /// the test is deterministic and no worker runs.
+    #[test]
+    fn each_trigger_coalesces_onto_a_held_active_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("a.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let held = db.create_scan_job(lib.id).unwrap();
+
+        for (trigger, marks_dirty) in [
+            (ScanTrigger::Poll, false),
+            (ScanTrigger::FollowUp, false),
+            (ScanTrigger::Manual, true),
+            (ScanTrigger::Create, true),
+        ] {
+            let _ = pool.take_scan_dirty(lib.id);
+            let id = request_scan(Arc::clone(&db), Arc::clone(&pool), lib.id, trigger).unwrap();
+            assert_eq!(id, held, "{trigger:?} must coalesce onto the active job");
+            assert_eq!(
+                pool.is_scan_dirty(lib.id),
+                marks_dirty,
+                "{trigger:?} dirty-bit behavior"
+            );
+        }
+        assert_eq!(
+            db.latest_scan_job(lib.id).unwrap().unwrap().id,
+            held,
+            "no trigger may insert a second row while one is active"
+        );
+    }
+
+    /// ADR-0059: a poll under holdoff inserts no row, and a row is the only
+    /// thing that can spawn a worker, so it starts none.
+    #[test]
+    fn poll_holdoff_inserts_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("a.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        assert!(db.latest_scan_job(lib.id).unwrap().is_none());
+        pool.set_repoint_delete_holdoff(lib.id, Duration::from_secs(3600));
+
+        let polled = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        assert_eq!(polled, 0, "poll must no-op under holdoff");
+        assert!(
+            db.latest_scan_job(lib.id).unwrap().is_none(),
+            "a held-off poll must insert no row (and so start no worker)"
+        );
+    }
+
+    /// ADR-0059: the scanner's holdoff check is live, not a precomputed
+    /// snapshot. Another connection holds the write lock, so the poll blocks
+    /// inside `BEGIN IMMEDIATE`; the holdoff is armed while it is blocked and
+    /// the poll still observes it.
+    #[test]
+    fn poll_observes_holdoff_armed_while_admission_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("a.mp4"), b"data").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap()
+            .id;
+
+        let blocker_db =
+            Arc::new(nightjar_db::Db::open(&nightjar_db::db_path(dir.path())).unwrap());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            blocker_db
+                .with_conn(|c| {
+                    let tx = nightjar_db::write_tx(c)?;
+                    tx.execute("UPDATE libraries SET name = name WHERE id = ?1", [lib])
+                        .map_err(|e| e.to_string())?;
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocker must hold the write lock");
+
+        let poll_db = Arc::clone(&db);
+        let poll_pool = Arc::clone(&pool);
+        let poll =
+            std::thread::spawn(move || request_scan(poll_db, poll_pool, lib, ScanTrigger::Poll));
+
+        // The poll cannot pass BEGIN IMMEDIATE while the blocker holds the
+        // write lock, so the holdoff is armed before its live check runs.
+        pool.set_repoint_delete_holdoff(lib, Duration::from_secs(3600));
+        release_tx.send(()).unwrap();
+
+        let id = poll.join().unwrap().unwrap();
+        blocker.join().unwrap();
+        assert_eq!(id, 0, "the blocked poll must observe the armed holdoff");
+        assert!(
+            db.latest_scan_job(lib).unwrap().is_none(),
+            "no row inserted by a held-off poll"
+        );
     }
 
     #[test]
