@@ -331,6 +331,11 @@ const INDEX_BATCH: usize = 200;
 
 /// Who asked for a full-library walk (ADR-0015). Notify creates use
 /// [`hint_ingest`] alone and do not go through this entry.
+///
+/// Every trigger walks fresh. The trigger shapes scheduling and coalescing
+/// only; it no longer selects a cached walk. Poll and manual both observe the
+/// tree as it is now (CHK-FC), so a trigger must not be the reason a directory
+/// is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanTrigger {
     /// Periodic poll. While a scan is already active, no-op on the dirty bit
@@ -343,17 +348,6 @@ pub enum ScanTrigger {
     Create,
     /// Internal follow-up after a manual dirty bit.
     FollowUp,
-}
-
-impl ScanTrigger {
-    /// Manual intent: the operator (or library create) asked for the walk, so
-    /// it must observe the tree as it is now instead of reusing the
-    /// per-directory mtime cache. A `FollowUp` exists only because a manual
-    /// request coalesced onto a running job, so it carries the same intent.
-    /// The periodic poll keeps the cache (ADR-0015).
-    fn is_fresh_walk(self) -> bool {
-        !matches!(self, ScanTrigger::Poll)
-    }
 }
 
 /// Request a full-library scan (ADR-0015). Entry for poll, manual scan, library
@@ -399,9 +393,8 @@ pub fn request_scan(
     let job_id = db.create_scan_job(library_id)?;
     let db_worker = Arc::clone(&db);
     let pool_worker = Arc::clone(&pool);
-    let fresh = trigger.is_fresh_walk();
     spawn_job_worker(&db, job_id, "scan", None, move || {
-        let outcome = match run_scan_job(&db_worker, &pool_worker, job_id, library_id, fresh) {
+        let outcome = match run_scan_job(&db_worker, &pool_worker, job_id, library_id) {
             Ok(probe_duration_ms) => Some(probe_duration_ms),
             Err(e) => {
                 tracing::error!(job_id, library_id, error = %e, "scan job failed");
@@ -753,7 +746,7 @@ fn run_repoint_job(
         let _ = db.repair_library_paths(library_id)?;
         let _ = pool.set_library_reachability(library_id, &candidate, true);
         pool.replace_walk_cache(library_id, dry_cache);
-        run_index_pass(db, pool, job_id, library_id, Some(outcome), false, &probes)?;
+        run_index_pass(db, pool, job_id, library_id, Some(outcome), &probes)?;
     }
     finish_scan_probes(pool, library_id, probes)
 }
@@ -763,10 +756,9 @@ fn run_scan_job(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
-    fresh: bool,
 ) -> Result<u64, String> {
     db.set_scan_job_state(job_id, "indexing")?;
-    run_index_and_probe(db, pool, job_id, library_id, fresh)
+    run_index_and_probe(db, pool, job_id, library_id)
 }
 
 fn run_index_and_probe(
@@ -774,12 +766,11 @@ fn run_index_and_probe(
     pool: &Arc<LibraryPool>,
     job_id: i64,
     library_id: i64,
-    fresh: bool,
 ) -> Result<u64, String> {
     let probes = pool.start_probe_batch();
     {
         let _epoch = pool.enter_index_epoch(library_id);
-        run_index_pass(db, pool, job_id, library_id, None, fresh, &probes)?;
+        run_index_pass(db, pool, job_id, library_id, None, &probes)?;
     }
     finish_scan_probes(pool, library_id, probes)
 }
@@ -826,10 +817,14 @@ fn complete_job(db: &Db, job_id: i64, library_id: i64, probe_duration_ms: u64) {
 /// When `prewalked` is `Some`, the file list is reused (repoint: same cold walk
 /// as the retain dry-run). Caller must have reseeded WalkCache for the new root.
 ///
-/// When `fresh` is true (manual scan), every directory is re-listed and the
-/// shared walk cache is refreshed from that pass, so a file edited in place
-/// under an unchanged parent mtime is still observed. Automatic scans reuse the
-/// cache (ADR-0015).
+/// Otherwise the pass re-lists every directory through
+/// [`walk::walk_media_files_fresh`]. Poll, manual, and create share that one
+/// authoritative enumeration, so an unchanged parent mtime cannot hide a media
+/// size change or an adjacent/nested sidecar add/edit/remove (CHK-FC). The
+/// fresh listing replaces the shared walk cache; the cache is retained for
+/// repoint seeding but no longer decides which directories a scan may skip.
+/// Probes stay keyed to the observed `(mtime, size)` tuple, so unchanged media
+/// enqueues none.
 ///
 /// Probes are pushed into `probes` as they are discovered rather than returned
 /// as a batch for the caller to enqueue afterwards (ADR-0004 §2.4). Returns how
@@ -842,7 +837,6 @@ fn run_index_pass(
     job_id: i64,
     library_id: i64,
     prewalked: Option<walk::WalkOutcome>,
-    fresh: bool,
     probes: &pool::ProbeBatch,
 ) -> Result<usize, String> {
     let lib = db
@@ -886,26 +880,18 @@ fn run_index_pass(
     let index_result = (|| -> Result<(u32, u32, u32, u32, usize, u64), String> {
         let reused = prewalked.is_some();
         let walk_started = Instant::now();
-        let (cache_warm, outcome) = if let Some(outcome) = prewalked {
-            // Repoint reseeded cache from the dry-run; treat as warm for next poll.
-            (true, outcome)
-        } else if fresh {
-            // Manual scan: re-list every directory so an in-place edit under an
-            // unchanged parent mtime is observed, then keep the refreshed cache
-            // for the next automatic poll. `cache_warm` still reports whether
-            // the library had a prior index, which is what gates sidecar
-            // rediscovery on the directories whose mtime moved.
-            let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
-            let outcome = pool.with_walk_cache(library_id, |cache| {
-                walk::walk_media_files_fresh(root, cache)
-            })?;
-            (cache_warm, outcome)
+        let outcome = if let Some(outcome) = prewalked {
+            // Repoint reseeded cache from the dry-run; reuse that cold walk.
+            outcome
         } else {
-            let cache_warm = pool.with_walk_cache(library_id, |cache| !cache.is_empty());
-            let outcome = pool.with_walk_cache(library_id, |cache| {
-                walk::walk_media_files_cached(root, Some(cache))
-            })?;
-            (cache_warm, outcome)
+            // One authoritative fresh enumeration for poll, manual, and create:
+            // re-list every directory so an unchanged parent mtime cannot hide
+            // a media or sidecar change, then keep the fresh listing in the
+            // shared cache. Sidecar reconciliation below keys off
+            // `relisted_dirs`, which a fresh walk fills with every directory.
+            pool.with_walk_cache(library_id, |cache| {
+                walk::walk_media_files_fresh(root, cache)
+            })?
         };
         // `index_duration_ms` covers readdir and upsert together, which is why
         // no run so far can say which of the two the cold-scan minutes were
@@ -1204,17 +1190,15 @@ fn run_index_pass(
         }
 
         // Rediscover sidecars beside media whose parent the walk re-listed.
-        // The automatic poll re-lists only a directory whose mtime moved (a new
-        // .srt bumps it), and a cold cache skips the bulk pass so it does not
-        // re-pay ~20 min of SMB readdir; existing sidecar rows stay in the DB
-        // across restarts. A fresh/manual scan the operator asked for re-lists
-        // every directory, so `relisted_dirs` holds each one and this path
-        // reconciles supported sidecars for unchanged media too (ADR-0013 §3.5
-        // amendment). The shared `sidecar_dirs` cache keeps siblings to one
-        // listing: no per-item directory listing and no automatic-poll policy
-        // change.
+        // Every full pass now walks fresh, so `relisted_dirs` holds each
+        // directory and this path reconciles supported sidecars for unchanged
+        // media too — adjacent and nested add/edit/remove included (CHK-FC,
+        // ADR-0013 §3.5 amendment). Existing sidecar rows stay in the DB across
+        // restarts, and the shared `sidecar_dirs` cache keeps siblings to one
+        // listing: no per-item directory listing. Deletion doubt still gates
+        // the pass, so an incomplete listing reconciles nothing.
         let mut sidecar_checked = 0u32;
-        if (cache_warm || fresh) && allow_delete {
+        if allow_delete {
             for file in &files {
                 let Some(parent) = file.path.parent() else {
                     continue;
@@ -2047,13 +2031,14 @@ mod tests {
         let _ = before;
     }
 
-    /// R4 storage bounds (SCAN-D1): an incomplete listing cached by the walk
-    /// must not authorize `delete_missing` on a later unchanged-directory pass.
-    /// Scan 1 lists A and B. B then becomes a dangling symlink, so scan 2
-    /// caches a partial listing and skips delete under doubt. Scan 3 sees the
-    /// same directory mtime: the partial cache entry must not be reused, so B's
-    /// row survives. Restoring B gives a clean listing, and only then does
-    /// removing B delete it by the ordinary path. Unfixed, scan 3 loses B.
+    /// R4 storage bounds (SCAN-D1, preserved by CHK-FC): an incomplete listing
+    /// must not authorize `delete_missing`. Scan 1 lists A and B. B then becomes
+    /// a dangling symlink, so scan 2 reports a partial listing and skips delete
+    /// under doubt. Scan 3 sees the same directory mtime; the partial listing
+    /// must not become authoritative, so B's row survives. Restoring B gives a
+    /// clean listing, and only then does removing B delete it by the ordinary
+    /// path. Unfixed, scan 3 loses B. The polls now walk fresh (CHK-FC), so the
+    /// doubt comes from the fresh listing itself, not a reused cache entry.
     #[cfg(unix)]
     #[test]
     fn incomplete_cached_listing_never_authorizes_deletion() {
@@ -2079,17 +2064,14 @@ mod tests {
             })
             .unwrap();
 
-        // Scan 1: complete listing. Both rows exist and the cache is complete.
+        // Scan 1: complete listing. Both rows exist.
         let job0 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
         wait_job(&db, job0);
         assert_eq!(db.count_items(lib.id).unwrap(), 2, "setup: A and B indexed");
 
-        // Scans 2-5 use the automatic poll: manual scans now walk fresh
-        // (SCAN-D2A), and this regression is about the cached path, so the
-        // poll is the trigger that exercises it.
+        // Scans 2-5 use the automatic poll, which now walks fresh.
         //
-        // Scan 2: B's stat fails, so the fresh listing is partial. The dir mtime
-        // moved, so this pass re-lists and caches the partial result.
+        // Scan 2: B's stat fails, so the fresh listing is partial.
         thread::sleep(Duration::from_millis(1100));
         fs::remove_file(&b).unwrap();
         symlink("missing-target.mkv", &b).unwrap();
@@ -2107,8 +2089,8 @@ mod tests {
             "a partial listing must not delete the unreadable entry's row"
         );
 
-        // Scan 3: same directory mtime. The cached partial listing must not be
-        // reused, so the doubt persists and B's row is kept.
+        // Scan 3: same directory mtime. The partial listing must stay doubtful,
+        // so B's row is kept.
         let job2 = request_scan(
             Arc::clone(&db),
             Arc::clone(&pool),
@@ -3449,13 +3431,14 @@ mod tests {
         assert_eq!(completed, 2, "manual dirty must spawn one follow-up");
     }
 
-    /// SCAN-D2A: an in-place edit keeps the parent directory mtime, so the
-    /// automatic poll reuses its cached listing and misses the change. A manual
-    /// scan must re-list and observe it. The poll is the negative control: it
-    /// proves the cache is still the automatic path.
+    /// CHK-FC: an in-place edit keeps the parent directory mtime, so a
+    /// cache-mtime poll would reuse its listing and miss the change. The poll
+    /// now re-lists every directory, so it must observe the new size. The
+    /// restored parent mtime is asserted, so the test cannot pass because the
+    /// directory happened to bump.
     #[cfg(unix)]
     #[test]
-    fn manual_scan_observes_in_place_edit_with_unchanged_parent_mtime() {
+    fn poll_observes_in_place_edit_with_unchanged_parent_mtime() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3484,6 +3467,11 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(dir_mtime))
             .unwrap();
+        assert_eq!(
+            fs::metadata(&media).unwrap().modified().unwrap(),
+            dir_mtime,
+            "setup: the parent mtime must be unchanged"
+        );
 
         let poll = request_scan(
             Arc::clone(&db),
@@ -3495,19 +3483,167 @@ mod tests {
         wait_job(&db, poll);
         let poll_row = db.get_scan_job(poll).unwrap().unwrap();
         assert_eq!(
-            poll_row.updated, 0,
-            "the cached poll must not observe the in-place edit"
-        );
-        assert_eq!(db.list_items(lib.id).unwrap()[0].size_bytes, 2);
-
-        let manual = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
-        wait_job(&db, manual);
-        let manual_row = db.get_scan_job(manual).unwrap().unwrap();
-        assert_eq!(
-            manual_row.updated, 1,
-            "the manual scan must observe the edit"
+            poll_row.updated, 1,
+            "a fresh poll must observe the in-place edit"
         );
         assert_eq!(db.list_items(lib.id).unwrap()[0].size_bytes, 9);
+    }
+
+    /// CHK-FC: a poll must reconcile sidecar membership for unchanged media
+    /// even when the parent directory mtimes are preserved. Adjacent add/edit/
+    /// remove and a nested add are all observed by the one fresh poll.
+    #[cfg(unix)]
+    #[test]
+    fn poll_reconciles_sidecar_membership_under_unchanged_parent_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let subs = media.join("Subs");
+        fs::create_dir_all(&subs).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+        let edited = media.join("Movie.en.srt");
+        fs::write(&edited, b"1\n00:00:00,000 --> 00:00:01,000\nHi\n").unwrap();
+        let removed = media.join("Movie.es.srt");
+        fs::write(&removed, b"1\n00:00:00,000 --> 00:00:01,000\nHola\n").unwrap();
+        fs::write(
+            subs.join("Movie.fr.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nSalut\n",
+        )
+        .unwrap();
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        wait_job(
+            &db,
+            start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap(),
+        );
+        let item_id = db.list_items(lib.id).unwrap()[0].id;
+        assert_eq!(
+            db.list_item_sidecars(item_id).unwrap().len(),
+            3,
+            "setup: three sidecars associated"
+        );
+        let en_before = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+
+        // Mutate with both parent directory mtimes restored, so only the fresh
+        // poll's relist can surface the change.
+        let media_mtime = fs::metadata(&media).unwrap().modified().unwrap();
+        let subs_mtime = fs::metadata(&subs).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(&edited, b"1\n00:00:00,000 --> 00:00:02,000\nYo\n").unwrap();
+        fs::remove_file(&removed).unwrap();
+        fs::write(
+            media.join("Movie.it.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nCiao\n",
+        )
+        .unwrap();
+        fs::write(
+            subs.join("Movie.nl.srt"),
+            b"1\n00:00:00,000 --> 00:00:01,000\nHoi\n",
+        )
+        .unwrap();
+        fs::File::open(&media)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(media_mtime))
+            .unwrap();
+        fs::File::open(&subs)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(subs_mtime))
+            .unwrap();
+
+        let poll = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        wait_job(&db, poll);
+
+        let mut ids: Vec<String> = db
+            .list_item_sidecars(item_id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.track_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["s-Subs.fr", "s-Subs.nl", "s-en", "s-it"],
+            "one poll must reconcile the exact current sidecar set"
+        );
+        assert!(
+            db.get_item_sidecar(item_id, "s-es").unwrap().is_none(),
+            "a removed sidecar leaves no row"
+        );
+        let en_after = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_ne!(
+            en_after.content_id, en_before.content_id,
+            "the edited sidecar must persist its new content identity"
+        );
+        assert_ne!(
+            en_after.mtime_ms, en_before.mtime_ms,
+            "the edited sidecar must persist its new mtime"
+        );
+        assert!(
+            en_after.sidecar_generation.unwrap() > en_before.sidecar_generation.unwrap(),
+            "the edited sidecar must receive a new generation"
+        );
+    }
+
+    /// CHK-FC: the fresh poll still compares the observed `(mtime, size)` tuple,
+    /// so an unchanged repeat enqueues no probe. The first pass is the positive
+    /// control: it enqueued one.
+    #[test]
+    fn unchanged_poll_enqueues_zero_probes() {
+        if !require_ffprobe() {
+            eprintln!("skip: ffprobe not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let first = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, first);
+        let first_row = db.get_scan_job(first).unwrap().unwrap();
+        assert!(
+            first_row.probed >= 1,
+            "the first pass must probe the new item"
+        );
+
+        let second = request_scan(
+            Arc::clone(&db),
+            Arc::clone(&pool),
+            lib.id,
+            ScanTrigger::Poll,
+        )
+        .unwrap();
+        wait_job(&db, second);
+        let second_row = db.get_scan_job(second).unwrap().unwrap();
+        assert_eq!(second_row.unchanged, 1, "the tuple is unchanged");
+        assert_eq!(
+            second_row.probed, 0,
+            "an unchanged tuple must enqueue no probe"
+        );
     }
 
     /// SCAN-D2A: a replacement that restores the file mtime but changes the
@@ -3575,12 +3711,13 @@ mod tests {
         assert_eq!(row.unchanged, 1);
     }
 
-    /// SCAN-D2A: a manual request that coalesces onto an active automatic scan
-    /// must produce a follow-up that walks fresh. The active poll is a warm
-    /// cached walk, so it cannot see the in-place edit; the follow-up must.
+    /// CHK-FC: a manual request that coalesces onto an active poll must still
+    /// produce one follow-up job. The active poll now walks fresh, so it
+    /// observes the in-place edit; the follow-up then runs and confirms the
+    /// tuple unchanged. Coalescing must not drop the dirty bit.
     #[cfg(unix)]
     #[test]
-    fn manual_during_active_scan_follow_up_observes_in_place_edit() {
+    fn manual_during_active_scan_coalesces_follow_up() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         fs::create_dir_all(&media).unwrap();
@@ -3638,16 +3775,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(coalesced, job1, "manual during active must coalesce");
+        assert!(
+            pool.is_scan_dirty(lib.id),
+            "coalescing must arm the dirty bit"
+        );
         drop(epoch);
 
         wait_job(&db, job1);
         let job1_row = db.get_scan_job(job1).unwrap().unwrap();
         assert_eq!(
-            job1_row.updated, 0,
-            "the cached poll must not observe the in-place edit"
+            job1_row.updated, 1,
+            "the fresh poll must observe the in-place edit"
         );
 
-        // The coalesced follow-up is a fresh walk and must observe it.
+        // The coalesced follow-up must exist and complete, proving the dirty
+        // bit was consumed rather than dropped.
         let follow = job1 + 1;
         let mut follow_row = None;
         for _ in 0..400 {
@@ -3666,8 +3808,8 @@ mod tests {
             follow_row.error_message
         );
         assert_eq!(
-            follow_row.updated, 1,
-            "the fresh follow-up must observe the in-place edit"
+            follow_row.updated, 0,
+            "the follow-up re-observes an already-updated tuple as unchanged"
         );
         assert_eq!(
             db.list_items(lib.id)
