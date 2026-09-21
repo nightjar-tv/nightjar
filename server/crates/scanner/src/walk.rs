@@ -5,11 +5,16 @@
 //! bounded worker pool issues them concurrently. That is the opposite of
 //! parallel *file reads* (extract), which saturate the share — keep extract
 //! serial (ADR-0013).
+//!
+//! Cancellation is cooperative and observed at directory boundaries only
+//! (ADR-0014 §2 pause). A `readdir` or `stat` already inside the kernel cannot
+//! be interrupted, so a cancelled walk finishes the directory it started and
+//! stops before the next one.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::SystemTime;
@@ -79,6 +84,27 @@ pub struct WalkOutcome {
     pub relisted_dirs: HashSet<PathBuf>,
     /// Metadata/readdir failures skipped during the walk (ADR-0014 doubt signal).
     pub listing_errors: u32,
+    /// True when the cancellation check returned true at a directory boundary
+    /// and the walk stopped early. `files` and `relisted_dirs` are then a
+    /// partial listing, so the caller must not treat them as the whole tree:
+    /// no `delete_missing`, no sidecar reconciliation (ADR-0014 §2).
+    pub cancelled: bool,
+}
+
+/// Cooperative cancellation check for one walk pass.
+///
+/// The scan path passes the ADR-0014 §2 reachability pause:
+/// `Availability::pause.is_paused(library_id)`. The check runs once per
+/// directory, before that directory is listed; a `readdir` or `stat` already
+/// in the kernel cannot be interrupted, so cancellation is cooperative at
+/// directory boundaries only. It is shared with the worker threads, so it
+/// owns its state and carries no borrow.
+pub type CancelCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Cancellation check for callers with no cancellation signal: the repoint
+/// dry-run and unit tests. It never cancels.
+fn never_cancelled() -> CancelCheck {
+    Arc::new(|| false)
 }
 
 /// Walk concurrency from `NIGHTJAR_WALK_CONCURRENCY`, default 8, clamped to 1..=256.
@@ -118,11 +144,21 @@ pub fn walk_media_files_cached_with_concurrency(
     cache: Option<&mut WalkCache>,
     concurrency: usize,
 ) -> Result<WalkOutcome, String> {
+    walk_with_concurrency(root, cache, concurrency, never_cancelled())
+}
+
+/// Both walk modes behind one dispatcher, with an explicit cancellation check.
+fn walk_with_concurrency(
+    root: &Path,
+    cache: Option<&mut WalkCache>,
+    concurrency: usize,
+    cancel: CancelCheck,
+) -> Result<WalkOutcome, String> {
     let concurrency = concurrency.clamp(1, 256);
     if concurrency == 1 {
-        walk_serial(root, cache)
+        walk_serial(root, cache, &cancel)
     } else {
-        walk_parallel(root, cache, concurrency)
+        walk_parallel(root, cache, concurrency, cancel)
     }
 }
 
@@ -142,24 +178,50 @@ pub fn walk_media_files_cached_with_concurrency(
 /// reconciles the supported sidecars beside every media file it saw — including
 /// unchanged parents — through the caller's shared per-directory listing cache
 /// (ADR-0013 §3.5 amendment).
-pub fn walk_media_files_fresh(root: &Path, cache: &mut WalkCache) -> Result<WalkOutcome, String> {
+///
+/// `cancel` is the cooperative stop check (CHK-WC). The scan path passes the
+/// ADR-0014 §2 reachability pause, so a library that goes unreachable mid-walk
+/// stops before the next directory. A cancelled outcome is a partial listing:
+/// the caller must abandon the pass rather than reconcile against it
+/// (ADR-0014 §2). A partial listing is also not written back as the library's
+/// cache — it is not the tree.
+pub fn walk_media_files_fresh(
+    root: &Path,
+    cache: &mut WalkCache,
+    cancel: CancelCheck,
+) -> Result<WalkOutcome, String> {
     let mut fresh = WalkCache::new();
     // The empty cache makes the inner walk list every directory, so its
     // `relisted_dirs` already holds each one.
-    let outcome = walk_media_files_cached(root, Some(&mut fresh))?;
-    *cache = fresh;
+    let outcome = walk_with_concurrency(root, Some(&mut fresh), walk_concurrency(), cancel)?;
+    if !outcome.cancelled {
+        *cache = fresh;
+    }
     Ok(outcome)
 }
 
-fn walk_serial(root: &Path, mut cache: Option<&mut WalkCache>) -> Result<WalkOutcome, String> {
+fn walk_serial(
+    root: &Path,
+    mut cache: Option<&mut WalkCache>,
+    cancel: &CancelCheck,
+) -> Result<WalkOutcome, String> {
     let mut out = Vec::new();
     let mut relisted_dirs = HashSet::new();
     let mut listing_errors = 0u32;
     let mut stack = vec![root.to_path_buf()];
     let mut seen = HashSet::new();
     let mut next_dirs: HashMap<PathBuf, CachedDir> = HashMap::new();
+    let mut cancelled = false;
 
     while let Some(dir) = stack.pop() {
+        // Cooperative cancellation at a directory boundary (ADR-0014 §2): the
+        // popped directory is dropped unlisted and no further directory work
+        // starts. The in-kernel readdir/stat of an earlier directory already
+        // ran to completion.
+        if cancel() {
+            cancelled = true;
+            break;
+        }
         let canon = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         if !seen.insert(canon) {
             continue;
@@ -187,7 +249,9 @@ fn walk_serial(root: &Path, mut cache: Option<&mut WalkCache>) -> Result<WalkOut
         }
     }
 
-    if let Some(cache) = cache.as_mut() {
+    // A cancelled pass listed only part of the tree: its directory set is not
+    // the library's listing, so it must not replace the cache.
+    if !cancelled && let Some(cache) = cache.as_mut() {
         cache.dirs = next_dirs;
     }
 
@@ -196,6 +260,7 @@ fn walk_serial(root: &Path, mut cache: Option<&mut WalkCache>) -> Result<WalkOut
         files: out,
         relisted_dirs,
         listing_errors,
+        cancelled,
     })
 }
 
@@ -203,6 +268,7 @@ fn walk_parallel(
     root: &Path,
     mut cache: Option<&mut WalkCache>,
     workers: usize,
+    cancel: CancelCheck,
 ) -> Result<WalkOutcome, String> {
     let prev_dirs: Arc<HashMap<PathBuf, CachedDir>> =
         Arc::new(cache.as_ref().map(|c| c.dirs.clone()).unwrap_or_default());
@@ -216,16 +282,18 @@ fn walk_parallel(
         relisted: Mutex::new(HashSet::new()),
         listing_errors: AtomicUsize::new(0),
         inflight: AtomicUsize::new(0),
+        cancelled: AtomicBool::new(false),
     });
 
     let mut handles = Vec::with_capacity(workers);
     for i in 0..workers {
         let state = Arc::clone(&state);
         let prev_dirs = Arc::clone(&prev_dirs);
+        let cancel = Arc::clone(&cancel);
         handles.push(
             thread::Builder::new()
                 .name(format!("walk-{i}"))
-                .spawn(move || parallel_worker(state, prev_dirs))
+                .spawn(move || parallel_worker(state, prev_dirs, cancel))
                 .map_err(|e| format!("spawn walk worker: {e}"))?,
         );
     }
@@ -238,8 +306,11 @@ fn walk_parallel(
     let relisted_dirs =
         std::mem::take(&mut *state.relisted.lock().unwrap_or_else(|e| e.into_inner()));
     let listing_errors = state.listing_errors.load(Ordering::Relaxed) as u32;
+    let cancelled = state.cancelled.load(Ordering::SeqCst);
 
-    if let Some(cache) = cache.as_mut() {
+    // A cancelled pass listed only part of the tree: its directory set is not
+    // the library's listing, so it must not replace the cache.
+    if !cancelled && let Some(cache) = cache.as_mut() {
         cache.dirs = next_dirs;
     }
 
@@ -248,6 +319,7 @@ fn walk_parallel(
         files: std::mem::take(&mut *out),
         relisted_dirs,
         listing_errors,
+        cancelled,
     })
 }
 
@@ -260,11 +332,28 @@ struct ParallelState {
     relisted: Mutex<HashSet<PathBuf>>,
     listing_errors: AtomicUsize,
     inflight: AtomicUsize,
+    /// Set when a worker observes the cancellation check and stops.
+    cancelled: AtomicBool,
+}
+
+/// Release one claimed directory slot and wake the other workers.
+///
+/// The pending lock is held across the decrement and the notify, so a worker
+/// between its empty-queue check and its `wait` cannot miss the wakeup. `children`
+/// are queued first: the pop path uses this to publish the directories it found.
+fn release_slot(state: &ParallelState, children: Vec<PathBuf>) {
+    let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
+    for child in children {
+        pending.push_back(child);
+    }
+    state.inflight.fetch_sub(1, Ordering::SeqCst);
+    state.pending_cv.notify_all();
 }
 
 fn parallel_worker(
     state: Arc<ParallelState>,
     prev_dirs: Arc<HashMap<PathBuf, CachedDir>>,
+    cancel: CancelCheck,
 ) -> Result<(), String> {
     loop {
         let dir = {
@@ -286,14 +375,24 @@ fn parallel_worker(
             }
         };
 
+        // Cooperative cancellation at a directory boundary (ADR-0014 §2): the
+        // claimed directory is released unlisted, no further directory work
+        // starts, and the other workers stop at their own next claim. The
+        // in-kernel readdir/stat of an earlier directory already ran to
+        // completion.
+        if cancel() {
+            state.cancelled.store(true, Ordering::SeqCst);
+            release_slot(&state, Vec::new());
+            return Ok(());
+        }
+
         let canon = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         let first_visit = {
             let mut seen = state.seen.lock().unwrap_or_else(|e| e.into_inner());
             seen.insert(canon)
         };
         if !first_visit {
-            state.inflight.fetch_sub(1, Ordering::SeqCst);
-            state.pending_cv.notify_all();
+            release_slot(&state, Vec::new());
             continue;
         }
 
@@ -348,14 +447,7 @@ fn parallel_worker(
             }
         }
 
-        {
-            let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-            for child in children {
-                pending.push_back(child);
-            }
-            state.inflight.fetch_sub(1, Ordering::SeqCst);
-            state.pending_cv.notify_all();
-        }
+        release_slot(&state, children);
     }
 }
 
@@ -574,7 +666,7 @@ mod tests {
         // directory is in `relisted_dirs` even though its mtime did not move,
         // because a fresh/manual walk re-lists every directory and so triggers
         // sidecar rediscovery beside each media file it saw (ADR-0013 §3.5).
-        let fresh = walk_media_files_fresh(root.path(), &mut cache).unwrap();
+        let fresh = walk_media_files_fresh(root.path(), &mut cache, never_cancelled()).unwrap();
         assert!(
             fresh.relisted_dirs.contains(root.path()),
             "a fresh walk lists every directory, so each is a rediscovery trigger"
@@ -834,5 +926,146 @@ mod tests {
         assert_eq!(outcome.files.len(), 1);
         let outcome_par = walk_media_files_cached_with_concurrency(root.path(), None, 4).unwrap();
         assert_eq!(outcome_par.files.len(), 1);
+    }
+
+    /// A cancellation check that answers false five times and true after that,
+    /// so the walk it is given claims at most five directories. The counter is
+    /// the positive control: it proves the check was consulted.
+    fn cancel_after_five() -> (CancelCheck, Arc<AtomicUsize>) {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let cancel: CancelCheck = {
+            let checks = Arc::clone(&checks);
+            Arc::new(move || checks.fetch_add(1, Ordering::SeqCst) >= 5)
+        };
+        (cancel, checks)
+    }
+
+    /// A bushy tree: `shows` show directories under the root, one file each.
+    fn show_tree(root: &Path, shows: usize) {
+        for i in 0..shows {
+            let d = root.join(format!("show{i:02}"));
+            fs::create_dir_all(&d).unwrap();
+            File::create(d.join("E01.mkv")).unwrap();
+        }
+    }
+
+    /// CHK-WC: a cancellation check that trips partway stops the walk at the
+    /// next directory boundary, in both walk modes. The cancelled pass lists at
+    /// least one directory (positive control: the walk was genuinely active)
+    /// and no more than the five directories its check allowed (negative
+    /// control: it stopped). The clean control lists the whole tree, so the
+    /// stop is the check's doing, not an empty fixture.
+    #[test]
+    fn cancellation_stops_walk_at_a_directory_boundary() {
+        let root = tempdir().unwrap();
+        show_tree(root.path(), 24);
+        // Root plus 24 show directories; 24 media files.
+        let total_dirs = 25;
+
+        let clean = walk_with_concurrency(root.path(), None, 1, never_cancelled()).unwrap();
+        assert!(
+            !clean.cancelled,
+            "an uncancelled walk must not report cancellation"
+        );
+        assert_eq!(
+            clean.files.len(),
+            24,
+            "control: the tree holds 24 media files"
+        );
+        assert_eq!(
+            clean.relisted_dirs.len(),
+            total_dirs,
+            "control: the tree holds {total_dirs} listable directories"
+        );
+
+        for concurrency in [1usize, 8] {
+            let (cancel, checks) = cancel_after_five();
+            let outcome =
+                walk_with_concurrency(root.path(), None, concurrency, Arc::clone(&cancel)).unwrap();
+
+            assert!(
+                outcome.cancelled,
+                "conc={concurrency}: a tripped check must be reported"
+            );
+            assert!(
+                checks.load(Ordering::SeqCst) >= 6,
+                "conc={concurrency}: the check must have been consulted"
+            );
+            assert!(
+                !outcome.relisted_dirs.is_empty(),
+                "conc={concurrency}: positive control: the cancelled walk listed a directory"
+            );
+            assert!(
+                outcome.relisted_dirs.len() <= 5,
+                "conc={concurrency}: the walk may only list the directories its check allowed, listed {}",
+                outcome.relisted_dirs.len()
+            );
+            assert!(
+                outcome.files.len() < clean.files.len(),
+                "conc={concurrency}: the walk must stop before every file, found {}",
+                outcome.files.len()
+            );
+            // Every worker holds a clone of the check, so a worker left running
+            // would keep the count above one. The cancelled walk must join them.
+            assert_eq!(
+                Arc::strong_count(&cancel),
+                1,
+                "conc={concurrency}: the cancelled walk must join every worker"
+            );
+        }
+    }
+
+    /// CHK-WC: a cancelled pass is a partial listing, so it must not replace
+    /// the library's cache. Both the cached walk (which owns the per-pass
+    /// directory map) and the fresh entry point (which publishes that map) keep
+    /// the previous complete listing.
+    #[test]
+    fn cancelled_walk_does_not_publish_a_partial_cache() {
+        let root = tempdir().unwrap();
+        show_tree(root.path(), 24);
+        let total_dirs = 25;
+
+        for concurrency in [1usize, 8] {
+            let mut cache = WalkCache::new();
+            let complete = walk_with_concurrency(
+                root.path(),
+                Some(&mut cache),
+                concurrency,
+                never_cancelled(),
+            )
+            .unwrap();
+            assert!(!complete.cancelled);
+            assert_eq!(
+                cache.dir_count(),
+                total_dirs,
+                "conc={concurrency}: the complete pass primes the cache"
+            );
+
+            let (cancel, _) = cancel_after_five();
+            let outcome =
+                walk_with_concurrency(root.path(), Some(&mut cache), concurrency, cancel).unwrap();
+            assert!(outcome.cancelled, "conc={concurrency}");
+            assert_eq!(
+                cache.dir_count(),
+                total_dirs,
+                "conc={concurrency}: a cancelled pass must not replace the cache"
+            );
+        }
+
+        // The fresh entry point keeps the previous listing on a cancelled pass
+        // and replaces it on a clean one.
+        let mut fresh_cache = WalkCache::new();
+        let clean =
+            walk_media_files_fresh(root.path(), &mut fresh_cache, never_cancelled()).unwrap();
+        assert!(!clean.cancelled);
+        assert_eq!(fresh_cache.dir_count(), total_dirs);
+        let (cancel, _) = cancel_after_five();
+        let cancelled = walk_media_files_fresh(root.path(), &mut fresh_cache, cancel).unwrap();
+        assert!(cancelled.cancelled);
+        assert_eq!(
+            fresh_cache.dir_count(),
+            total_dirs,
+            "a cancelled fresh walk must keep the previous listing"
+        );
     }
 }
