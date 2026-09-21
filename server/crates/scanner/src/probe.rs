@@ -144,10 +144,9 @@ const CANCEL_POLL: Duration = Duration::from_millis(50);
 /// buffer, and a drain-after-exit loop would let ffprobe block on a full pipe
 /// forever (same shape as `keymap::packet_walk::walk`).
 ///
-/// The wait wakes on the readers' EOF signal rather than sleeping a fixed
-/// interval, so a completed probe is reported as soon as ffprobe closes its
-/// output. The cancellation signal is still re-checked every `CANCEL_POLL`
-/// while the child runs.
+/// Reader completion converges on a short interval after both results arrive;
+/// cancellation and deadline observation retain the 50 ms caller policy while
+/// the child remains active.
 pub fn ffprobe(
     path: &Path,
     should_cancel: Option<&dyn Fn() -> bool>,
@@ -192,11 +191,9 @@ pub fn ffprobe(
     parse_probe_json(completed.stdout.as_slice(), path)
 }
 
-/// Fixed-size storage makes the requested 16 MiB allocation explicit and
-/// avoids a geometric `Vec` capacity crossing the retention policy.
 #[derive(Debug)]
 struct LimitedBytes {
-    storage: Box<[u8]>,
+    storage: Vec<u8>,
     len: usize,
 }
 
@@ -207,12 +204,12 @@ impl LimitedBytes {
 }
 
 fn read_limited<R: Read>(mut reader: R, limit: usize) -> Result<LimitedBytes, ChildFailure> {
-    let mut storage = vec![0_u8; limit].into_boxed_slice();
+    let mut storage = Vec::new();
     let mut len = 0usize;
+    let mut chunk = [0_u8; 4096];
     loop {
         if len == limit {
-            let mut extra = [0_u8; 1];
-            return match reader.read(&mut extra)? {
+            return match reader.read(&mut chunk[..1])? {
                 0 => Ok(LimitedBytes { storage, len }),
                 _ => Err(ChildFailure::new(
                     ChildFailureKind::OutputBudget,
@@ -220,10 +217,30 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> Result<LimitedBytes, Ch
                 )),
             };
         }
-        let read = reader.read(&mut storage[len..])?;
+        let read_len = (limit - len).min(chunk.len());
+        let read = reader.read(&mut chunk[..read_len])?;
         if read == 0 {
             return Ok(LimitedBytes { storage, len });
         }
+        let target = len.checked_add(read).ok_or_else(|| {
+            ChildFailure::new(
+                ChildFailureKind::OutputBudget,
+                "ffprobe metadata length overflow",
+            )
+        })?;
+        if storage.capacity() < target {
+            let doubled = storage.capacity().max(1).saturating_mul(2);
+            let requested = doubled.min(limit).max(target);
+            storage
+                .try_reserve_exact(requested - storage.len())
+                .map_err(|_| {
+                    ChildFailure::new(
+                        ChildFailureKind::OutputBudget,
+                        format!("ffprobe metadata allocation exceeds {limit} byte policy"),
+                    )
+                })?;
+        }
+        storage.extend_from_slice(&chunk[..read]);
         len += read;
     }
 }
@@ -441,10 +458,16 @@ mod tests {
     fn metadata_retention_accepts_the_limit_and_rejects_one_extra_byte() {
         let below_limit = read_limited(Cursor::new(b"123"), 4).unwrap();
         assert_eq!(below_limit.as_slice(), b"123");
-        assert_eq!(below_limit.storage.len(), 4);
+        assert_eq!(below_limit.storage.len(), 3);
+        assert!(below_limit.storage.capacity() < 4);
         let at_limit = read_limited(Cursor::new(b"1234"), 4).expect("exact limit is retained");
         assert_eq!(at_limit.as_slice(), b"1234");
-        assert_eq!(at_limit.storage.len(), 4, "requested allocation high-water");
+        assert_eq!(at_limit.storage.len(), 4);
+        assert_eq!(
+            at_limit.storage.capacity(),
+            4,
+            "requested allocation high-water"
+        );
 
         let error = read_limited(Cursor::new(b"12345"), 4).expect_err("one extra byte fails");
         assert_eq!(error.kind, ChildFailureKind::OutputBudget);
@@ -456,6 +479,15 @@ mod tests {
             at_limit.storage.len(),
             error.kind
         );
+    }
+
+    #[test]
+    fn metadata_storage_grows_geometrically_across_chunks() {
+        let retained = read_limited(Cursor::new(vec![b'x'; 9_000]), 16 * 1024)
+            .expect("bounded metadata should be retained");
+        assert_eq!(retained.len, 9_000);
+        assert!(retained.storage.capacity() >= 8_192);
+        assert!(retained.storage.capacity() <= 16 * 1024);
     }
 
     #[test]

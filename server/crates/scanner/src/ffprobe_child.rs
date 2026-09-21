@@ -132,6 +132,7 @@ where
     ReadStdout: FnOnce(ChildStdout) -> Result<Stdout, ChildFailure> + Send + 'static,
     ReadStderr: FnOnce(ChildStderr) -> Result<Stderr, ChildFailure> + Send + 'static,
 {
+    let started = Instant::now();
     let (events_tx, events_rx) = mpsc::channel();
     let stdout = match start_reader(
         "ffprobe-stdout",
@@ -156,8 +157,8 @@ where
     };
     drop(events_tx);
 
-    let started = Instant::now();
     let mut finished_readers = 0usize;
+    let mut readers_disconnected = false;
     let mut child_status = None;
     let status = loop {
         if should_cancel.is_some_and(|cancel| cancel()) {
@@ -195,7 +196,16 @@ where
         }
 
         let remaining = deadline.saturating_sub(started.elapsed());
-        let wait = poll_interval.min(remaining);
+        let completion_pending = finished_readers == 2 && child_status.is_some();
+        let wait = if completion_pending {
+            Duration::from_millis(1).min(remaining)
+        } else {
+            poll_interval.min(remaining)
+        };
+        if readers_disconnected {
+            thread::park_timeout(Duration::from_millis(1).min(remaining));
+            continue;
+        }
         match events_rx.recv_timeout(wait) {
             Ok(ReaderEvent::Finished) => finished_readers += 1,
             Ok(ReaderEvent::Failed(kind, detail)) => {
@@ -203,14 +213,19 @@ where
                 return Err(finish_after_failure(error, &mut child, stdout, stderr));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) if finished_readers < 2 => {
-                let error = ChildFailure::new(
-                    ChildFailureKind::ReaderPanic,
-                    "ffprobe reader ended without reporting completion",
-                );
-                return Err(finish_after_failure(error, &mut child, stdout, stderr));
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if finished_readers < 2 {
+                    let error = ChildFailure::new(
+                        ChildFailureKind::ReaderPanic,
+                        "ffprobe reader ended without reporting completion",
+                    );
+                    return Err(finish_after_failure(error, &mut child, stdout, stderr));
+                }
+                if let Some(status) = child_status {
+                    break status;
+                }
+                readers_disconnected = true;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(wait),
         }
     };
 
@@ -683,6 +698,26 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_readers_do_not_add_a_poll_interval_after_child_exit() {
+        let started = Instant::now();
+        let completed = supervise(
+            child("exec 1>&- 2>&-; exec sleep 0.01"),
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            None,
+            drained,
+            drained,
+        )
+        .expect("disconnected readers must still reap a child that exits");
+        assert!(completed.status.unwrap().success());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "disconnected-reader supervision took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn joins_both_readers_and_keeps_known_pipe_bytes() {
         let done = supervise(
             child("printf stdout; printf stderr >&2"),
@@ -711,6 +746,89 @@ mod tests {
         .expect_err("cancellation wins after EOF");
         assert_eq!(error.kind, ChildFailureKind::Cancelled);
         assert!(error.message().contains("child killed and reaped"));
+    }
+
+    #[test]
+    fn cancellation_wins_after_eof_and_child_exit_rendezvous() {
+        let child = child("printf out; printf err >&2; exit 0");
+        let pid = child.id();
+        let eof = Arc::new(AtomicUsize::new(0));
+        let stdout_eof = Arc::clone(&eof);
+        let stderr_eof = Arc::clone(&eof);
+        let cancel = || eof.load(Ordering::Acquire) == 2;
+        let error = supervise(
+            child,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+            Some(&cancel),
+            move |pipe| {
+                let bytes = drained(pipe)?;
+                stdout_eof.fetch_add(1, Ordering::Release);
+                Ok(bytes)
+            },
+            move |pipe| {
+                let bytes = drained(pipe)?;
+                stderr_eof.fetch_add(1, Ordering::Release);
+                Ok(bytes)
+            },
+        )
+        .expect_err("cancellation must be observed after the EOF/exit rendezvous");
+        assert_eq!(error.kind, ChildFailureKind::Cancelled);
+        assert!(error.message().contains("child killed and reaped"));
+        assert!(
+            !Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("probe child liveness")
+                .success()
+        );
+    }
+
+    #[test]
+    fn finished_events_precede_reader_thread_return() {
+        let ready = Arc::new(AtomicUsize::new(0));
+        let returned = Arc::new(AtomicUsize::new(0));
+        let stdout_ready = Arc::clone(&ready);
+        let stderr_ready = Arc::clone(&ready);
+        let stdout_returned = Arc::clone(&returned);
+        let stderr_returned = Arc::clone(&returned);
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let stdout_release = Arc::clone(&release_rx);
+        let stderr_release = Arc::clone(&release_rx);
+        let release = thread::spawn(move || {
+            while ready.load(Ordering::Acquire) != 2 {
+                thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+            release_tx.send(()).unwrap();
+        });
+        let completed = supervise(
+            child("printf out; printf err >&2"),
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+            None,
+            move |pipe| {
+                let bytes = drained(pipe)?;
+                stdout_ready.fetch_add(1, Ordering::Release);
+                stdout_release.lock().unwrap().recv().unwrap();
+                stdout_returned.fetch_add(1, Ordering::Release);
+                Ok(bytes)
+            },
+            move |pipe| {
+                let bytes = drained(pipe)?;
+                stderr_ready.fetch_add(1, Ordering::Release);
+                stderr_release.lock().unwrap().recv().unwrap();
+                stderr_returned.fetch_add(1, Ordering::Release);
+                Ok(bytes)
+            },
+        )
+        .expect("owner must converge after both reader threads return");
+        release.join().unwrap();
+        assert!(completed.status.unwrap().success());
+        assert_eq!(returned.load(Ordering::Acquire), 2);
     }
 
     #[test]

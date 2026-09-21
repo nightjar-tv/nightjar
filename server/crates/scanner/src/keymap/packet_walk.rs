@@ -101,9 +101,7 @@ fn read_packet_entries<R: Read>(
             "keyframe storage policy cannot retain one entry",
         ));
     }
-    // Allocate the approved requested storage once. There is no geometric
-    // growth path that can ask for capacity beyond the policy.
-    let mut entries = Vec::with_capacity(max_entries);
+    let mut entries = Vec::new();
     let mut record = Vec::with_capacity(record_budget);
     #[cfg(test)]
     {
@@ -161,6 +159,21 @@ fn append_packet_record(
             ChildFailureKind::OutputBudget,
             format!("ffprobe keyframe map exceeds {storage_budget} byte policy"),
         ));
+    }
+    let target = entries.len().checked_add(1).ok_or_else(|| {
+        ChildFailure::new(ChildFailureKind::OutputBudget, "keyframe count overflow")
+    })?;
+    if entries.capacity() < target {
+        let growth = entries.capacity().max(1).saturating_mul(2);
+        let requested = growth.min(max_entries).max(target);
+        entries
+            .try_reserve_exact(requested - entries.len())
+            .map_err(|_| {
+                ChildFailure::new(
+                    ChildFailureKind::OutputBudget,
+                    format!("keyframe map allocation exceeds {storage_budget} byte policy"),
+                )
+            })?;
     }
     entries.push(entry);
     Ok(())
