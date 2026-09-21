@@ -1,5 +1,6 @@
 //! Library scanner: index pass, then bounded ffprobe pool (ADR-0004).
 
+mod ffprobe_child;
 mod keymap;
 mod pool;
 mod probe;

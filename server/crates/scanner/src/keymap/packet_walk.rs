@@ -6,11 +6,23 @@
 //! cancels it in flight (Decision 8.7).
 
 use super::KeyframeEntry;
+use crate::ffprobe_child::{ChildFailure, ChildFailureKind, StderrTail, spawn, supervise};
+use std::io::Read;
+use std::mem::size_of;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const STDERR_TAIL: usize = 512;
+/// Approved diagnostic retention policy. Excess stderr is discarded while the
+/// pipe continues draining, so diagnostic overflow never kills a packet walk.
+const STDERR_TAIL: usize = 4 * 1024;
+/// Approved parser working-buffer policy, counted before the newline byte.
+const PACKET_RECORD_BUDGET: usize = 4 * 1024;
+/// Approved retained keyframe storage policy. The entry count is derived from
+/// the actual entry shape rather than a separately maintained magic count.
+const KEYFRAME_STORAGE_BUDGET: usize = 64 * 1024 * 1024;
+/// Approved maximum occupancy of a whole-file packet walk.
+const PACKET_WALK_DEADLINE: Duration = Duration::from_secs(1_800);
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Demux the whole file and return every video keyframe (PTS, byte offset).
@@ -26,7 +38,8 @@ pub fn walk(
     path: &Path,
     should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<KeyframeEntry>, String> {
-    let mut child = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -40,81 +53,130 @@ pub fn walk(
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "spawn ffprobe: not found on PATH".to_string()
-            } else {
-                format!("spawn ffprobe for {}: {e}", path.display())
-            }
-        })?;
-
-    // Drain both pipes now, not after exit: ffprobe blocks once a pipe fills,
-    // and the packet CSV of a real title is far larger than the pipe buffer.
-    // The threads finish at EOF, which is guaranteed once the child exits or
-    // is killed below.
-    let stdout_reader = spawn_pipe_reader("packet-walk-stdout", child.stdout.take())?;
-    let stderr_reader = spawn_pipe_reader("packet-walk-stderr", child.stderr.take())?;
-
-    let status = loop {
-        // Cancel wins over a just-finished walk: once the library is
-        // unreachable the run is aborted, never reported ready (ADR-0041
-        // Decision 8.7). Stamped "unavailable:" for the pool's classifier.
-        if should_cancel.is_some_and(|c| c()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("unavailable: keyframe packet walk cancelled (library unreachable)".into());
+        .stderr(Stdio::piped());
+    let child = spawn(&mut command)
+        .map_err(|error| format!("{} for {}", error.message(), path.display()))?;
+    let completed = supervise(
+        child,
+        PACKET_WALK_DEADLINE,
+        CANCEL_POLL,
+        should_cancel,
+        |reader| read_packet_entries(reader, PACKET_RECORD_BUDGET, KEYFRAME_STORAGE_BUDGET),
+        |reader| StderrTail::read(reader, STDERR_TAIL),
+    )
+    .map_err(|error| {
+        if error.kind == ChildFailureKind::Cancelled {
+            format!("unavailable: keyframe packet walk: {}", error.message())
+        } else {
+            format!(
+                "ffprobe packet walk for {}: {}",
+                path.display(),
+                error.message()
+            )
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(CANCEL_POLL),
-            Err(e) => {
-                return Err(format!(
-                    "wait ffprobe packet walk for {}: {e}",
-                    path.display()
-                ));
-            }
-        }
-    };
+    })?;
 
-    // The child has exited, so both pipes are at EOF and the readers are done.
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-
-    if !status.success() {
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let tail = stderr_tail(stderr.trim());
+    if let Err(error) = completed.status {
+        let tail = completed.stderr.display();
         return Err(format!(
-            "ffprobe packet walk failed for {} (exit {code}): {tail}",
+            "{error} during packet walk for {}: {tail}",
             path.display()
         ));
     }
-    let mut entries: Vec<KeyframeEntry> = stdout.lines().filter_map(parse_packet_line).collect();
+    let mut entries = completed.stdout;
     entries.sort_by_key(|e| e.pts_ms);
     Ok(entries)
 }
 
-/// Drain one of ffprobe's pipes on a reader thread so the child can never
-/// block on a full pipe while the walk polls for exit or cancel.
-fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
-    name: &str,
-    pipe: Option<R>,
-) -> Result<std::thread::JoinHandle<String>, String> {
-    let Some(mut pipe) = pipe else {
-        return Err(format!("{name}: child pipe missing"));
+fn read_packet_entries<R: Read>(
+    mut reader: R,
+    record_budget: usize,
+    storage_budget: usize,
+) -> Result<Vec<KeyframeEntry>, ChildFailure> {
+    let entry_size = size_of::<KeyframeEntry>();
+    let max_entries = storage_budget / entry_size;
+    if max_entries == 0 {
+        return Err(ChildFailure::new(
+            ChildFailureKind::OutputBudget,
+            "keyframe storage policy cannot retain one entry",
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut record = Vec::with_capacity(record_budget);
+    #[cfg(test)]
+    {
+        assert!(entries.capacity() * entry_size <= storage_budget);
+        assert!(record.capacity() <= record_budget);
+        eprintln!(
+            "packet allocation record={} keyframes={} budget={storage_budget}",
+            record.capacity(),
+            entries.capacity() * entry_size
+        );
+    }
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            if !record.is_empty() {
+                append_packet_record(&mut entries, &record, max_entries, storage_budget)?;
+            }
+            return Ok(entries);
+        }
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                append_packet_record(&mut entries, &record, max_entries, storage_budget)?;
+                record.clear();
+            } else {
+                if record.len() == record_budget {
+                    return Err(ChildFailure::new(
+                        ChildFailureKind::OutputBudget,
+                        format!("ffprobe packet record exceeds {record_budget} byte policy"),
+                    ));
+                }
+                record.push(*byte);
+            }
+        }
+    }
+}
+
+fn append_packet_record(
+    entries: &mut Vec<KeyframeEntry>,
+    record: &[u8],
+    max_entries: usize,
+    storage_budget: usize,
+) -> Result<(), ChildFailure> {
+    let record = std::str::from_utf8(record).map_err(|error| {
+        ChildFailure::new(
+            ChildFailureKind::Read,
+            format!("ffprobe packet record is not UTF-8: {error}"),
+        )
+    })?;
+    let Some(entry) = parse_packet_line(record) else {
+        return Ok(());
     };
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            let mut buf = String::new();
-            let _ = pipe.read_to_string(&mut buf);
-            buf
-        })
-        .map_err(|e| format!("spawn {name} reader: {e}"))
+    if entries.len() == max_entries {
+        return Err(ChildFailure::new(
+            ChildFailureKind::OutputBudget,
+            format!("ffprobe keyframe map exceeds {storage_budget} byte policy"),
+        ));
+    }
+    let target = entries.len().checked_add(1).ok_or_else(|| {
+        ChildFailure::new(ChildFailureKind::OutputBudget, "keyframe count overflow")
+    })?;
+    if entries.capacity() < target {
+        let growth = entries.capacity().max(1).saturating_mul(2);
+        let requested = growth.min(max_entries).max(target);
+        entries
+            .try_reserve_exact(requested - entries.len())
+            .map_err(|_| {
+                ChildFailure::new(
+                    ChildFailureKind::OutputBudget,
+                    format!("keyframe map allocation exceeds {storage_budget} byte policy"),
+                )
+            })?;
+    }
+    entries.push(entry);
+    Ok(())
 }
 
 /// Parses one `csv=p=0` line of `pts_time,pos,flags`, keeping only keyframes
@@ -135,20 +197,10 @@ fn parse_packet_line(line: &str) -> Option<KeyframeEntry> {
     })
 }
 
-fn stderr_tail(s: &str) -> String {
-    if s.is_empty() {
-        return "(no stderr)".into();
-    }
-    if s.len() <= STDERR_TAIL {
-        return s.to_string();
-    }
-    let start = s.len() - STDERR_TAIL;
-    format!("…{}", &s[start..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     #[test]
@@ -174,6 +226,120 @@ mod tests {
     fn parse_packet_line_rounds_pts_to_nearest_ms() {
         let e = parse_packet_line("0.041667,0,K__").unwrap();
         assert_eq!(e.pts_ms, 42);
+    }
+
+    #[test]
+    fn packet_stream_preserves_unterminated_final_records() {
+        let entries = read_packet_entries(
+            Cursor::new(b"1.5,10,K__\n2.0,20,___\n3.0,30,K__"),
+            PACKET_RECORD_BUDGET,
+            KEYFRAME_STORAGE_BUDGET,
+        )
+        .expect("streamed records");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].pts_ms, 1_500);
+        assert_eq!(entries[1].pts_ms, 3_000);
+    }
+
+    #[test]
+    fn packet_record_and_keyframe_storage_boundaries_are_exact() {
+        let size = size_of::<KeyframeEntry>();
+        for length in [3, 4, 5] {
+            for newline in [false, true] {
+                let mut record = vec![b'x'; length];
+                if newline {
+                    record.push(b'\n');
+                }
+                let result = read_packet_entries(Cursor::new(record), 4, 2 * size);
+                if length <= 4 {
+                    assert!(result.unwrap().is_empty());
+                } else {
+                    assert_eq!(result.unwrap_err().kind, ChildFailureKind::OutputBudget);
+                }
+            }
+        }
+        let below = read_packet_entries(Cursor::new(b"1,1,K"), 16, 2 * size).unwrap();
+        assert_eq!(below.len(), 1);
+        assert_eq!(below.capacity() * size, 2 * size);
+        for budget in [2 * size - 1, 2 * size, 2 * size + 1] {
+            let result = read_packet_entries(Cursor::new(b"1,1,K\n2,2,K"), 16, budget);
+            if budget < 2 * size {
+                assert_eq!(result.unwrap_err().kind, ChildFailureKind::OutputBudget);
+            } else {
+                let entries = result.unwrap();
+                assert_eq!(entries.len(), 2);
+                assert!(entries.capacity() * size <= budget);
+            }
+        }
+        let entries = read_packet_entries(
+            Cursor::new(vec![b'x'; 4]),
+            4,
+            2 * size_of::<KeyframeEntry>(),
+        )
+        .expect("a final record at the byte limit is accepted");
+        assert!(entries.is_empty());
+        let error = read_packet_entries(
+            Cursor::new(vec![b'x'; 5]),
+            4,
+            2 * size_of::<KeyframeEntry>(),
+        )
+        .expect_err("record limit plus one is rejected");
+        assert_eq!(error.kind, ChildFailureKind::OutputBudget);
+        assert!(error.message().contains("exceeds 4 byte policy"), "{error}");
+
+        let entries = read_packet_entries(
+            Cursor::new(b"1,1,K\n2,2,K"),
+            16,
+            2 * size_of::<KeyframeEntry>(),
+        )
+        .expect("two entries fit exactly");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.capacity(), 2, "requested allocation high-water");
+        let error = read_packet_entries(
+            Cursor::new(b"1,1,K\n2,2,K\n3,3,K"),
+            16,
+            2 * size_of::<KeyframeEntry>(),
+        )
+        .expect_err("keyframe budget plus one entry is rejected");
+        assert_eq!(error.kind, ChildFailureKind::OutputBudget);
+        assert!(error.message().contains("keyframe map exceeds"), "{error}");
+    }
+
+    #[test]
+    fn packet_records_are_parsed_across_actual_read_boundaries() {
+        struct Fragmented<'a> {
+            remaining: &'a [u8],
+            chunk: usize,
+            calls: usize,
+        }
+        impl Read for Fragmented<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                let count = self.chunk.min(output.len()).min(self.remaining.len());
+                output[..count].copy_from_slice(&self.remaining[..count]);
+                self.remaining = &self.remaining[count..];
+                Ok(count)
+            }
+        }
+        let csv = "1.5,10,K__\r\nbad\n2.0,20,___\nN/A,4,K\n3.0,30,K__";
+        let expected: Vec<_> = csv.lines().filter_map(parse_packet_line).collect();
+        for chunk in [1, 2, 3, 7] {
+            let mut input = Fragmented {
+                remaining: csv.as_bytes(),
+                chunk,
+                calls: 0,
+            };
+            let entries = read_packet_entries(
+                &mut input,
+                PACKET_RECORD_BUDGET,
+                4 * size_of::<KeyframeEntry>(),
+            )
+            .unwrap();
+            assert_eq!(entries, expected);
+            assert_eq!(entries.len(), 2);
+            assert!(input.calls > 2);
+            eprintln!("packet fragmented chunk={chunk} read_calls={}", input.calls);
+        }
     }
 
     fn ffprobe_available() -> bool {
