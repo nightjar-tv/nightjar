@@ -906,10 +906,35 @@ fn run_index_pass(
             // a media or sidecar change, then keep the fresh listing in the
             // shared cache. Sidecar reconciliation below keys off
             // `relisted_dirs`, which a fresh walk fills with every directory.
+            //
+            // The cancellation check is the ADR-0014 §2 reachability pause: the
+            // walk stops at the next directory boundary when the library goes
+            // unreachable, so a dead mount cannot make the scan keep reading it
+            // (CHK-WC). The handle is owned so the parallel walk can share it.
+            let availability = Arc::clone(&pool.availability);
             pool.with_walk_cache(library_id, |cache| {
-                walk::walk_media_files_fresh(root, cache)
+                walk::walk_media_files_fresh(
+                    root,
+                    cache,
+                    Arc::new(move || availability.pause.is_paused(library_id)),
+                )
             })?
         };
+        // A cancelled walk is a partial listing. The keep-set is incomplete, so
+        // `delete_missing` must not run (ADR-0014 §2), and the upsert/sidecar
+        // block is abandoned with it: the catalog rows stay as they were. The
+        // caller's worker reports this error through `fail_scan_job` and its
+        // own `tracing::error!`.
+        if outcome.cancelled {
+            tracing::warn!(
+                library_id,
+                job_id,
+                "walk cancelled; index pass abandoned, catalog left intact"
+            );
+            return Err(format!(
+                "walk cancelled: library {library_id} paused mid-walk"
+            ));
+        }
         // `index_duration_ms` covers readdir and upsert together, which is why
         // no run so far can say which of the two the cold-scan minutes were
         // spent in. Split here; the scan-job row and the Gate 1 harness keep
@@ -2046,6 +2071,84 @@ mod tests {
         }
         assert_eq!(db.count_items(lib.id).unwrap(), 1);
         let _ = before;
+    }
+
+    /// CHK-WC: the ADR-0014 §2 reachability pause is the walk's cancel signal.
+    /// A scan started while the library is paused abandons the pass at its
+    /// first directory boundary: the job fails with the cancellation message
+    /// and every catalog row stays as it was. The unpaused control then removes
+    /// a file and shows the ordinary path still deletes it, so cancellation
+    /// changed nothing about clean-walk deletion.
+    #[test]
+    fn paused_library_cancels_the_walk_and_leaves_catalog_rows_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        let a = media.join("A.mp4");
+        let b = media.join("B.mkv");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        let db = Arc::new(nightjar_db::open(dir.path()).unwrap());
+        let pool = test_pool(&db, dir.path());
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let setup = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, setup);
+        assert_eq!(
+            db.count_items(lib.id).unwrap(),
+            2,
+            "setup: both rows indexed"
+        );
+
+        // Pause before the job starts, so the walk cannot race the test: it
+        // begins, observes the pause at its first directory boundary, and stops.
+        pool.availability.pause.set_paused(lib.id, true);
+        let cancelled_job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        let mut terminal = None;
+        for _ in 0..200 {
+            let job = db.get_scan_job(cancelled_job).unwrap().unwrap();
+            if job.state == "completed" || job.state == "failed" {
+                terminal = Some(job);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let job = terminal.expect("cancelled scan job did not finish");
+        assert_eq!(
+            job.state, "failed",
+            "a cancelled walk must fail its job, not complete it"
+        );
+        let message = job.error_message.unwrap_or_default();
+        assert!(
+            message.contains("walk cancelled"),
+            "the cancellation must be visible on the job: {message:?}"
+        );
+        assert_eq!(job.removed, 0, "a cancelled walk must not delete");
+        assert_eq!(
+            db.count_items(lib.id).unwrap(),
+            2,
+            "a cancelled walk must leave every catalog row intact"
+        );
+
+        // Positive control: the same fixture, unpaused, still deletes a removed
+        // file. The cancellation above did not change the clean-walk path.
+        pool.availability.pause.set_paused(lib.id, false);
+        fs::remove_file(&b).unwrap();
+        let clean_job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, clean_job);
+        assert_eq!(
+            db.get_scan_job(clean_job).unwrap().unwrap().removed,
+            1,
+            "a clean walk must still delete the removed row"
+        );
+        assert_eq!(db.count_items(lib.id).unwrap(), 1);
     }
 
     /// R4 storage bounds (SCAN-D1, preserved by CHK-FC): an incomplete listing
