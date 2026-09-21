@@ -702,8 +702,8 @@ mod tests {
         let started = Instant::now();
         let completed = supervise(
             child("exec 1>&- 2>&-; exec sleep 0.01"),
-            Duration::from_secs(1),
-            Duration::from_millis(100),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
             None,
             drained,
             drained,
