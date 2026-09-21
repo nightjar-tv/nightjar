@@ -1,7 +1,8 @@
+use crate::ffprobe_child::{ChildFailure, ChildFailureKind, StderrTail, spawn, supervise};
 use serde::Deserialize;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[derive(Debug, Default, Clone)]
@@ -117,30 +118,20 @@ struct FfSideData {
     dv_profile: Option<u64>,
 }
 
-/// How much of ffprobe's stderr survives into the failure string for a broken
-/// file. The error reaches the UI as `scanError`, so this is the
-/// operator-facing size bound on the diagnostic an operator sees.
-///
-/// **GUESS (Rule 4.14).** ADR-0014 item 7 says why a truncated tail exists —
-/// so `ffprobe failed for path:` cannot end with nothing after the colon —
-/// but nothing in that ADR, the git history, or any note derives the length.
-/// It landed with the Phase 2 stack (#7) and is copied verbatim into
-/// `keymap::packet_walk`. No measurement of real ffprobe stderr length
-/// produced it.
-const STDERR_TAIL: usize = 512;
+/// Approved diagnostic retention policy. Excess stderr is discarded while the
+/// pipe keeps draining; this is not a cap on ffprobe's stderr delivery.
+const STDERR_TAIL: usize = 4 * 1024;
 
-/// How often the probe wait loop re-checks the cancellation signal while
-/// ffprobe runs. Completion arrives on the pipe-EOF signal, so this interval
-/// bounds only how quickly an unmounted library kills an in-flight ffprobe
-/// (ADR-0041 Decision 8.7); it no longer delays a finished probe.
-///
-/// **GUESS (Rule 4.14).** No derivation exists. The value was added in the
-/// scanner audit (#77) as a direct copy of the identical constant in
-/// `keymap::packet_walk` (added there in #74). That same 50 ms is the
-/// standing wait-loop tick across the tree — the extract-wait loop in
-/// `transcode/src/subs/mod.rs` has slept 50 ms inline since the Phase 2
-/// stack (#7) — and nothing records why the tick is 50 ms rather than
-/// another interval.
+/// Approved structured-output retention policy. It is an operational refusal
+/// policy, not a measured maximum or a promise that every valid media file
+/// fits the allowance.
+const METADATA_OUTPUT_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Approved maximum occupancy of a metadata operation.
+const METADATA_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Cancellation/deadline observation granularity; it does not govern output
+/// retention or operation lifetime.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Probe a media file with ffprobe. `should_cancel` is the library
@@ -161,7 +152,8 @@ pub fn ffprobe(
     path: &Path,
     should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<ProbeResult, String> {
-    let mut child = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -173,47 +165,67 @@ pub fn ffprobe(
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "spawn ffprobe: not found on PATH".into()
-            } else {
-                format!("spawn ffprobe for {}: {e}", path.display())
-            }
-        })?;
+        .stderr(Stdio::piped());
+    let child = spawn(&mut command)
+        .map_err(|error| format!("{} for {}", error.message(), path.display()))?;
+    let completed = supervise(
+        child,
+        METADATA_DEADLINE,
+        CANCEL_POLL,
+        should_cancel,
+        |reader| read_limited(reader, METADATA_OUTPUT_BUDGET),
+        |reader| StderrTail::read(reader, STDERR_TAIL),
+    )
+    .map_err(|error| {
+        if error.kind == ChildFailureKind::Cancelled {
+            format!("unavailable: {}", error.message())
+        } else {
+            format!("ffprobe for {}: {}", path.display(), error.message())
+        }
+    })?;
 
-    // Drain both pipes now, not after exit: ffprobe blocks once a pipe fills,
-    // and the JSON of a many-stream title is far larger than the pipe buffer.
-    // Each reader signals EOF on `drained_tx`, which is what the wait below
-    // wakes on: a probe that finishes is reported at once, not on the next
-    // fixed tick.
-    let (drained_tx, drained_rx) = mpsc::channel();
-    let stdout_reader =
-        spawn_pipe_reader("ffprobe-stdout", child.stdout.take(), drained_tx.clone())?;
-    let stderr_reader =
-        spawn_pipe_reader("ffprobe-stderr", child.stderr.take(), drained_tx.clone())?;
-    drop(drained_tx);
-
-    let status = wait_for_exit(&mut child, &drained_rx, path, CANCEL_POLL, should_cancel)?;
-
-    // The child has exited, so both pipes are at EOF and the readers are done.
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-
-    if !status.success() {
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let tail = stderr_tail(stderr.trim());
-        return Err(format!(
-            "ffprobe failed for {} (exit {code}): {tail}",
-            path.display()
-        ));
+    if let Err(error) = completed.status {
+        let tail = completed.stderr.display();
+        return Err(format!("{error} for {}: {tail}", path.display()));
     }
 
-    parse_probe_json(stdout.as_bytes(), path)
+    parse_probe_json(completed.stdout.as_slice(), path)
+}
+
+/// Fixed-size storage makes the requested 16 MiB allocation explicit and
+/// avoids a geometric `Vec` capacity crossing the retention policy.
+#[derive(Debug)]
+struct LimitedBytes {
+    storage: Box<[u8]>,
+    len: usize,
+}
+
+impl LimitedBytes {
+    fn as_slice(&self) -> &[u8] {
+        &self.storage[..self.len]
+    }
+}
+
+fn read_limited<R: Read>(mut reader: R, limit: usize) -> Result<LimitedBytes, ChildFailure> {
+    let mut storage = vec![0_u8; limit].into_boxed_slice();
+    let mut len = 0usize;
+    loop {
+        if len == limit {
+            let mut extra = [0_u8; 1];
+            return match reader.read(&mut extra)? {
+                0 => Ok(LimitedBytes { storage, len }),
+                _ => Err(ChildFailure::new(
+                    ChildFailureKind::OutputBudget,
+                    format!("ffprobe metadata stdout exceeds {limit} byte policy"),
+                )),
+            };
+        }
+        let read = reader.read(&mut storage[len..])?;
+        if read == 0 {
+            return Ok(LimitedBytes { storage, len });
+        }
+        len += read;
+    }
 }
 
 /// Parse one `-show_format -show_streams` JSON document into a `ProbeResult`
@@ -377,73 +389,6 @@ fn parse_frame_rate(raw: Option<&str>) -> Option<(i64, i64)> {
     Some((num, den))
 }
 
-/// Wait for ffprobe to close both output pipes, then reap it. Each reader
-/// thread signals EOF on `drained_rx`, so a finished probe is reported as
-/// soon as ffprobe closes its output instead of on the next fixed tick.
-///
-/// `cancel_tick` bounds only how often `should_cancel` is re-checked while
-/// the child runs (ADR-0041 Decision 8.7). It is a parameter rather than the
-/// `CANCEL_POLL` constant so the tests can show that completion does not
-/// depend on it (Rule 4.15).
-///
-/// Cancel wins over a just-finished probe: once the library is unreachable
-/// the run is aborted, never reported probed. The error is stamped
-/// `unavailable:` for the pool's classifier.
-fn wait_for_exit(
-    child: &mut std::process::Child,
-    drained_rx: &mpsc::Receiver<()>,
-    path: &Path,
-    cancel_tick: Duration,
-    should_cancel: Option<&dyn Fn() -> bool>,
-) -> Result<ExitStatus, String> {
-    let mut drained = 0usize;
-    loop {
-        if should_cancel.is_some_and(|c| c()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("unavailable: ffprobe cancelled (library unreachable)".into());
-        }
-        // Both pipes are at EOF once both readers have signalled. ffprobe
-        // closes its output only as it exits, so the wait reaps the child
-        // without sleeping a poll tick.
-        if drained == 2 {
-            return child
-                .wait()
-                .map_err(|e| format!("wait ffprobe for {}: {e}", path.display()));
-        }
-        match drained_rx.recv_timeout(cancel_tick) {
-            Ok(()) => drained += 1,
-            Err(RecvTimeoutError::Timeout) => {}
-            // Both readers ended without reaching EOF (their send was
-            // dropped). Nothing more will arrive, so reap the child.
-            Err(RecvTimeoutError::Disconnected) => drained = 2,
-        }
-    }
-}
-
-/// Drain one of ffprobe's pipes on a reader thread so the child can never
-/// block on a full pipe while the wait loop checks exit and cancel. Each
-/// reader signals EOF on `drained_tx`; the wait loop treats both signals as
-/// "ffprobe has closed its output".
-fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
-    name: &str,
-    pipe: Option<R>,
-    drained_tx: Sender<()>,
-) -> Result<std::thread::JoinHandle<String>, String> {
-    let Some(mut pipe) = pipe else {
-        return Err(format!("{name}: child pipe missing"));
-    };
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            let mut buf = String::new();
-            let _ = pipe.read_to_string(&mut buf);
-            let _ = drained_tx.send(());
-            buf
-        })
-        .map_err(|e| format!("spawn {name} reader: {e}"))
-}
-
 fn classify_hdr(color_transfer: Option<&str>, side_data: &[FfSideData]) -> String {
     for side in side_data {
         let Some(t) = side.side_data_type.as_deref() else {
@@ -464,140 +409,11 @@ fn classify_hdr(color_transfer: Option<&str>, side_data: &[FfSideData]) -> Strin
     }
 }
 
-fn stderr_tail(s: &str) -> String {
-    if s.is_empty() {
-        return "(no stderr)".into();
-    }
-    if s.len() <= STDERR_TAIL {
-        return s.to_string();
-    }
-    let start = s.len() - STDERR_TAIL;
-    format!("…{}", &s[start..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::PathBuf;
-    use std::thread::JoinHandle;
-    use std::time::Instant;
-
-    /// Spawn `cmd` with both pipes drained on reader threads, exactly as
-    /// `ffprobe` does, and hand the wait loop the same EOF signal channel.
-    fn spawn_drained(
-        cmd: &mut Command,
-    ) -> (
-        std::process::Child,
-        mpsc::Receiver<()>,
-        JoinHandle<String>,
-        JoinHandle<String>,
-    ) {
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn test child");
-        let (drained_tx, drained_rx) = mpsc::channel();
-        let stdout = spawn_pipe_reader("test-stdout", child.stdout.take(), drained_tx.clone())
-            .expect("spawn test stdout reader");
-        let stderr = spawn_pipe_reader("test-stderr", child.stderr.take(), drained_tx.clone())
-            .expect("spawn test stderr reader");
-        drop(drained_tx);
-        (child, drained_rx, stdout, stderr)
-    }
-
-    /// The regression this slice fixes: a finished probe is reported when
-    /// ffprobe closes its output, not on the next fixed poll tick. The cancel
-    /// tick is 30 s, far longer than the command; a fixed-delay wait would
-    /// sleep the whole tick before it looked at the exit, so the bound below
-    /// fails on that behaviour while staying loose enough for a loaded
-    /// machine (Rule 4.15).
-    #[test]
-    fn completion_is_reported_without_waiting_for_a_cancel_tick() {
-        let (mut child, drained_rx, stdout, stderr) = spawn_drained(
-            Command::new("sh").args(["-c", "printf done; printf failed 1>&2; exit 0"]),
-        );
-
-        let started = Instant::now();
-        let status = wait_for_exit(
-            &mut child,
-            &drained_rx,
-            Path::new("probe-completion-test"),
-            Duration::from_secs(30),
-            None,
-        )
-        .expect("a clean exit is not a wait error");
-        let elapsed = started.elapsed();
-
-        assert!(status.success(), "status: {status:?}");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "completion waited on the 30 s cancel tick: {elapsed:?}"
-        );
-        assert_eq!(stdout.join().unwrap_or_default(), "done");
-        assert_eq!(stderr.join().unwrap_or_default(), "failed");
-    }
-
-    /// ADR-0041 Decision 8.7: the reachability signal kills the in-flight
-    /// ffprobe child and stamps the run `unavailable`, never `probed`. The
-    /// child must be reaped, not left running: the 30 s tick proves the
-    /// cancel path does not wait for it, and `try_wait` returning a status
-    /// proves the child is gone rather than still executing.
-    #[test]
-    fn cancellation_kills_and_reaps_the_child() {
-        let (mut child, drained_rx, stdout, stderr) =
-            spawn_drained(Command::new("sleep").arg("30"));
-
-        let started = Instant::now();
-        let message = wait_for_exit(
-            &mut child,
-            &drained_rx,
-            Path::new("probe-cancel-test"),
-            Duration::from_secs(30),
-            Some(&|| true),
-        )
-        .expect_err("a cancelled probe must not return Ok");
-        let elapsed = started.elapsed();
-
-        assert!(message.starts_with("unavailable:"), "{message}");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "cancel waited on the 30 s tick: {elapsed:?}"
-        );
-        let reaped = child.try_wait().expect("try_wait after cancel");
-        assert!(
-            reaped.is_some(),
-            "the cancelled child was not reaped: {reaped:?}"
-        );
-        let _ = stdout.join();
-        let _ = stderr.join();
-    }
-
-    /// The reader threads are what keep ffprobe from blocking on a full pipe.
-    /// Each stream carries more than the pipe buffer (256 KiB > the 16 KiB
-    /// macOS and 64 KiB Linux pipes), so a wait that drained only after exit
-    /// would hang here forever; both streams must arrive whole.
-    #[test]
-    fn both_pipes_drain_past_the_pipe_buffer() {
-        let (mut child, drained_rx, stdout, stderr) = spawn_drained(Command::new("sh").args([
-            "-c",
-            "head -c 262144 /dev/zero; head -c 262144 /dev/zero 1>&2",
-        ]));
-
-        let status = wait_for_exit(
-            &mut child,
-            &drained_rx,
-            Path::new("probe-drain-test"),
-            Duration::from_secs(30),
-            None,
-        )
-        .expect("a clean exit is not a wait error");
-
-        assert!(status.success(), "status: {status:?}");
-        assert_eq!(stdout.join().unwrap_or_default().len(), 262144);
-        assert_eq!(stderr.join().unwrap_or_default().len(), 262144);
-    }
 
     #[test]
     fn process_failure_includes_exit_code() {
@@ -619,6 +435,27 @@ mod tests {
         if err.starts_with("ffprobe failed") {
             assert!(!err.ends_with(": "), "empty body after colon: {err}");
         }
+    }
+
+    #[test]
+    fn metadata_retention_accepts_the_limit_and_rejects_one_extra_byte() {
+        let below_limit = read_limited(Cursor::new(b"123"), 4).unwrap();
+        assert_eq!(below_limit.as_slice(), b"123");
+        assert_eq!(below_limit.storage.len(), 4);
+        let at_limit = read_limited(Cursor::new(b"1234"), 4).expect("exact limit is retained");
+        assert_eq!(at_limit.as_slice(), b"1234");
+        assert_eq!(at_limit.storage.len(), 4, "requested allocation high-water");
+
+        let error = read_limited(Cursor::new(b"12345"), 4).expect_err("one extra byte fails");
+        assert_eq!(error.kind, ChildFailureKind::OutputBudget);
+        assert!(error.message().contains("exceeds 4 byte policy"), "{error}");
+        eprintln!(
+            "metadata below={} exact={} allocation={} above={:?}",
+            below_limit.len,
+            at_limit.len,
+            at_limit.storage.len(),
+            error.kind
+        );
     }
 
     #[test]
