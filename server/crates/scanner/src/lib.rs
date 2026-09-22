@@ -601,13 +601,24 @@ pub fn hint_ingest(
     // Sidecar association stays index-time; extraction is no longer enqueued
     // at scan (ADR-0041 Decision 10 — the probe classifies this item and the
     // on-demand path in ADR-0013 §11 / ADR-0041 Decision 5 triggers extracts).
-    if let Err(e) = associate_sidecars(db, item_id, &library_root, &abs, &mut sidecar_dirs) {
-        tracing::warn!(
+    match associate_sidecars(db, item_id, &library_root, &abs, &mut sidecar_dirs) {
+        Ok((_, skipped)) if skipped > 0 => {
+            // No scan job here, so the rejection lands on the library's visible
+            // counter instead of a job counter (ADR-0030 §1).
+            let current = db
+                .get_library(library_id)?
+                .map(|l| l.skipped_outside_root)
+                .unwrap_or(0);
+            let _ =
+                db.set_library_path_counters(library_id, lib.paths_unresolved, current + skipped);
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
             item_id,
             path = %abs.display(),
             error = %e,
             "hint sidecar association failed"
-        );
+        ),
     }
     tracing::info!(
         library_id,
@@ -968,6 +979,7 @@ fn run_index_pass(
             by_fold.entry(fold_path(&row.path)).or_default().push(row);
         }
 
+        #[allow(clippy::too_many_arguments)]
         let flush = |db: &Db,
                      library_id: i64,
                      library_root: &str,
@@ -976,7 +988,8 @@ fn run_index_pass(
                      to_probe: &mut usize,
                      added: &mut u32,
                      updated: &mut u32,
-                     sidecar_dirs: &mut nightjar_transcode::SidecarDirCache|
+                     sidecar_dirs: &mut nightjar_transcode::SidecarDirCache,
+                     skipped_outside_root: &mut i64|
          -> Result<(), String> {
             if pending.is_empty() {
                 return Ok(());
@@ -997,15 +1010,14 @@ fn run_index_pass(
                     probes,
                 );
                 *to_probe += 1;
-                if let Err(e) =
-                    associate_sidecars(db, id, library_root, &abs_paths[i], sidecar_dirs)
-                {
-                    tracing::warn!(
+                match associate_sidecars(db, id, library_root, &abs_paths[i], sidecar_dirs) {
+                    Ok((_, skipped)) => *skipped_outside_root += skipped,
+                    Err(e) => tracing::warn!(
                         item_id = id,
                         path = %abs_paths[i].display(),
                         error = %e,
                         "sidecar association failed"
-                    );
+                    ),
                 }
             }
             pending.clear();
@@ -1104,6 +1116,7 @@ fn run_index_pass(
                             &mut added,
                             &mut updated,
                             &mut sidecar_dirs,
+                            &mut skipped_outside_root,
                         )?;
                     }
                 }
@@ -1120,6 +1133,7 @@ fn run_index_pass(
             &mut added,
             &mut updated,
             &mut sidecar_dirs,
+            &mut skipped_outside_root,
         )?;
 
         let _ = fold_collisions;
@@ -1210,7 +1224,6 @@ fn run_index_pass(
                 tracing::warn!(item_id, error = %e, "remove deleted subtitle directory failed");
             }
         }
-        let _ = db.set_scan_job_skipped_outside_root(job_id, skipped_outside_root);
         let _ = db.set_scan_job_deferred_remove(job_id, deferred_remove);
         if defer_repoint && deferred_remove > 0 {
             pool.set_repoint_delete_holdoff(library_id, REPOINT_DELETE_HOLDOFF);
@@ -1222,11 +1235,6 @@ fn run_index_pass(
                 "repoint deferred_remove holdoff armed; poll will skip until clear or expiry"
             );
         }
-        let unresolved = db
-            .get_library(library_id)?
-            .map(|l| l.paths_unresolved)
-            .unwrap_or(0);
-        let _ = db.set_library_path_counters(library_id, unresolved, skipped_outside_root);
         if let Err(e) = pool.cleanup_orphan_subtitles() {
             tracing::warn!(error = %e, "subtitle orphan cleanup failed");
         }
@@ -1270,18 +1278,27 @@ fn run_index_pass(
                 // Sidecar rows stay fresh at index time; a re-probe of the item
                 // (mtime change, operator pass) reclassifies it — no extract is
                 // enqueued at scan (ADR-0041 Decision 10).
-                if let Err(e) =
-                    associate_sidecars(db, item_id, &library_root, &file.path, &mut sidecar_dirs)
+                match associate_sidecars(db, item_id, &library_root, &file.path, &mut sidecar_dirs)
                 {
-                    tracing::warn!(
+                    Ok((_, skipped)) => skipped_outside_root += skipped,
+                    Err(e) => tracing::warn!(
                         item_id,
                         path = %file.path.display(),
                         error = %e,
                         "sidecar association failed"
-                    );
+                    ),
                 }
             }
         }
+        // Written after sidecar reconciliation: a rejected sidecar symlink
+        // discovered for unchanged media lands here, and the visible counters
+        // must include it (ADR-0030 §1).
+        let _ = db.set_scan_job_skipped_outside_root(job_id, skipped_outside_root);
+        let unresolved = db
+            .get_library(library_id)?
+            .map(|l| l.paths_unresolved)
+            .unwrap_or(0);
+        let _ = db.set_library_path_counters(library_id, unresolved, skipped_outside_root);
 
         let index_duration_ms = index_started.elapsed().as_millis() as u64;
         // Everything after the readdir: stat comparison, upsert batches,
@@ -1333,8 +1350,20 @@ fn run_index_pass(
     Ok(to_probe)
 }
 
+/// True when `target` is component-wise beneath `root`, both canonical.
+///
+/// Component comparison, not a string prefix: `/tmp/Library/x` is not under
+/// `/tmp/library`. `to_relpath`'s ASCII-case-folded fallback cannot tell those
+/// apart, so confinement is decided here before any relative-path conversion
+/// (ADR-0030 §1, §2).
+fn is_beneath(root: &Path, target: &Path) -> bool {
+    target != root && target.starts_with(root)
+}
+
 /// Reconcile the stored sidecar set for one media item against a successful
-/// discovery (ADR-0010 §4).
+/// discovery (ADR-0010 §4). Returns the applied delta and the count of
+/// discovered sidecars whose canonical target was not confined to the library
+/// root.
 ///
 /// Discovery reuses the caller's shared per-directory listing cache, so
 /// siblings cost one listing. The bounded identity read is the only additional
@@ -1342,17 +1371,36 @@ fn run_index_pass(
 /// never on playback or an unchanged-media probe. A sidecar whose identity
 /// cannot be read fails the whole item: the prior set is preserved rather than
 /// a row written without identity.
+///
+/// A sidecar symlink inside the library can target a file outside it. Each
+/// discovered candidate is therefore canonicalized and required to be
+/// component-wise beneath the canonical library root before `to_relpath` or
+/// the identity read. A rejected candidate is dropped, never read, and counted
+/// into the caller's visible `skipped_outside_root`. The discovered in-root
+/// path is stored, not the resolved target, so the association keeps the name
+/// the operator placed beside the media.
 fn associate_sidecars(
     db: &Db,
     item_id: i64,
     library_root: &str,
     video_path: &Path,
     cache: &mut nightjar_transcode::SidecarDirCache,
-) -> Result<nightjar_db::SidecarDelta, String> {
+) -> Result<(nightjar_db::SidecarDelta, i64), String> {
     let found = nightjar_transcode::discover_sidecars_cached(video_path, Some(cache))?;
+    let canonical_root = std::fs::canonicalize(library_root).ok();
     let mut observed = Vec::with_capacity(found.len());
+    let mut skipped_outside_root = 0i64;
     for s in found {
+        let confined = match (canonical_root.as_deref(), std::fs::canonicalize(&s.path)) {
+            (Some(root), Ok(target)) => is_beneath(root, &target),
+            _ => false,
+        };
+        if !confined {
+            skipped_outside_root += 1;
+            continue;
+        }
         let Some(path) = to_relpath(library_root, &s.path) else {
+            skipped_outside_root += 1;
             continue;
         };
         let content_id = nightjar_db::content_id_for_path(&s.path)?;
@@ -1378,7 +1426,7 @@ fn associate_sidecars(
             "sidecar set reconciled"
         );
     }
-    Ok(delta)
+    Ok((delta, skipped_outside_root))
 }
 
 pub fn version() -> &'static str {
@@ -1738,7 +1786,7 @@ mod tests {
             .unwrap()[0];
         let root = media.to_string_lossy().into_owned();
 
-        let first = associate_sidecars(
+        let (first, _) = associate_sidecars(
             &db,
             item_id,
             &root,
@@ -1759,7 +1807,7 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
 
-        let delta = associate_sidecars(
+        let (delta, _) = associate_sidecars(
             &db,
             item_id,
             &root,
@@ -2027,6 +2075,441 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("list subtitle dir"), "{error}");
         assert_eq!(db.list_item_sidecars(item_id).unwrap(), before);
+    }
+
+    /// Component-wise, not a string prefix. `to_relpath`'s case-folded fallback
+    /// would call `/tmp/Library/x` in-root for `/tmp/library`; this must not.
+    #[test]
+    fn is_beneath_is_component_wise() {
+        assert!(is_beneath(
+            Path::new("/tmp/library"),
+            Path::new("/tmp/library/a.srt")
+        ));
+        assert!(!is_beneath(
+            Path::new("/tmp/library"),
+            Path::new("/tmp/Library/a.srt")
+        ));
+        assert!(!is_beneath(
+            Path::new("/tmp/library"),
+            Path::new("/tmp/library")
+        ));
+        assert!(!is_beneath(
+            Path::new("/tmp/library"),
+            Path::new("/tmp/library-other/a.srt")
+        ));
+    }
+
+    /// True when `dir`'s filesystem keeps `X` and `x` as distinct names.
+    #[cfg(unix)]
+    fn case_sensitive_fs(dir: &Path) -> bool {
+        let upper = dir.join("CaseProbe");
+        if fs::create_dir(&upper).is_err() {
+            return false;
+        }
+        let distinct = !dir.join("caseprobe").exists();
+        let _ = fs::remove_dir(&upper);
+        distinct
+    }
+
+    #[cfg(unix)]
+    fn write_sidecar(path: &Path, text: &str) {
+        fs::write(path, format!("1\n00:00:00,000 --> 00:00:01,000\n{text}\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn sidecar_track_ids(db: &Db, item_id: i64) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .list_item_sidecars(item_id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.track_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A sidecar symlink whose canonical target leaves the library root is
+    /// rejected before `to_relpath` and before the content-identity read.
+    ///
+    /// The directory cache is primed while the link points at a regular file,
+    /// then the link is retargeted to an external directory, so the candidate
+    /// still reaches `associate_sidecars`. Bypassing confinement would make
+    /// `content_id_for_path` fail the whole item (a directory read); correct
+    /// rejection is per-candidate, so the ordinary in-root sidecar still
+    /// associates. That association is the live control: the test fails if
+    /// discovery ever stops returning the candidate.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_symlink_outside_root_is_rejected_before_the_identity_read() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&media).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        write_sidecar(&media.join("Movie.fr.srt"), "Salut");
+        let source = media.join("escape-source.srt");
+        write_sidecar(&source, "En");
+        let link = media.join("Movie.en.srt");
+        symlink(&source, &link).unwrap();
+
+        let db = nightjar_db::open(&dir).unwrap();
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let item_id = db
+            .upsert_items_indexed(
+                lib.id,
+                &[nightjar_db::UpsertItem {
+                    path: "Movie.mp4".into(),
+                    mtime_ms: 1,
+                    size_bytes: 15,
+                    title: "Movie".into(),
+                    kind: "movie".into(),
+                    year: None,
+                    season: None,
+                    episode: None,
+                    content_id: None,
+                }],
+            )
+            .unwrap()[0];
+        let root = media.to_string_lossy().into_owned();
+
+        let mut cache = nightjar_transcode::SidecarDirCache::default();
+        let primed =
+            nightjar_transcode::discover_sidecars_cached(&video, Some(&mut cache)).unwrap();
+        assert_eq!(primed.len(), 2, "setup: both candidates must be cached");
+
+        fs::remove_file(&link).unwrap();
+        symlink(&outside, &link).unwrap();
+
+        let (delta, skipped) = associate_sidecars(&db, item_id, &root, &video, &mut cache).unwrap();
+        assert_eq!(skipped, 1, "the external-directory target must be counted");
+        assert_eq!(
+            sidecar_track_ids(&db, item_id),
+            vec!["s-fr"],
+            "the in-root sidecar must still associate, proving per-candidate rejection"
+        );
+        assert!(
+            delta.added.len() == 1,
+            "the delta must contain only the in-root sidecar"
+        );
+    }
+
+    /// A full scan rejects an in-library sidecar symlink whose target is
+    /// outside the root, associates the ordinary in-root sidecar, and counts
+    /// the rejection in the visible job and library counters.
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_sidecar_symlink_outside_root_and_counts_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&media).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+        write_sidecar(&media.join("Movie.fr.srt"), "Salut");
+        let secret = outside.join("secret.srt");
+        write_sidecar(&secret, "Secret");
+        symlink(&secret, media.join("Movie.en.srt")).unwrap();
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job_id);
+
+        let item = db
+            .list_items(lib.id)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.path == "Movie.mp4")
+            .expect("media item");
+        assert_eq!(
+            sidecar_track_ids(&db, item.id),
+            vec!["s-fr"],
+            "the external target must not associate"
+        );
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert!(
+            job.skipped_outside_root >= 1,
+            "the scan job must count the rejection, got {}",
+            job.skipped_outside_root
+        );
+        let lib = db.get_library(lib.id).unwrap().unwrap();
+        assert!(
+            lib.skipped_outside_root >= 1,
+            "the library must count the rejection, got {}",
+            lib.skipped_outside_root
+        );
+    }
+
+    /// The path-hint association path shares the same confinement and counts
+    /// the rejection on the library counter, because a hint has no scan job.
+    #[cfg(unix)]
+    #[test]
+    fn hint_ingest_rejects_sidecar_symlink_outside_root_and_counts_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&media).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        write_sidecar(&media.join("Movie.fr.srt"), "Salut");
+        write_sidecar(&outside.join("secret.srt"), "Secret");
+        symlink(outside.join("secret.srt"), media.join("Movie.en.srt")).unwrap();
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+
+        let out = hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &video).unwrap();
+        let HintIngestOutcome::Upserted { item_id } = out else {
+            panic!("expected Upserted, got {out:?}");
+        };
+        assert_eq!(
+            sidecar_track_ids(&db, item_id),
+            vec!["s-fr"],
+            "the external target must not associate on the hint path"
+        );
+        let lib = db.get_library(lib.id).unwrap().unwrap();
+        assert!(
+            lib.skipped_outside_root >= 1,
+            "the hint must count the rejection on the library, got {}",
+            lib.skipped_outside_root
+        );
+    }
+
+    /// An in-root symlinked sidecar keeps associating, and the stored path is
+    /// the discovered name beside the media, not the resolved target.
+    #[cfg(unix)]
+    #[test]
+    fn in_root_symlinked_sidecar_associates_under_its_discovered_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+        let target = media.join("source.srt");
+        write_sidecar(&target, "En");
+        symlink(&target, media.join("Movie.en.srt")).unwrap();
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job_id);
+
+        let item_id = db.list_items(lib.id).unwrap()[0].id;
+        let row = db.get_item_sidecar(item_id, "s-en").unwrap().unwrap();
+        assert_eq!(
+            row.path, "Movie.en.srt",
+            "the discovered in-root path is stored, not the resolved target"
+        );
+        assert!(row.content_id.is_some(), "the in-root target is read");
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert_eq!(
+            job.skipped_outside_root, 0,
+            "an in-root symlink is not a rejection"
+        );
+    }
+
+    /// Retargeting an associated in-root sidecar symlink outside the root is
+    /// reconciled by the next full scan: the prior association is removed and
+    /// the rejection is visible in the counters.
+    #[cfg(unix)]
+    #[test]
+    fn scan_removes_prior_sidecar_association_after_symlink_retarget_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&media).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(media.join("Movie.mp4"), b"not a real mp4").unwrap();
+        let in_root = media.join("source.srt");
+        write_sidecar(&in_root, "En");
+        let link = media.join("Movie.en.srt");
+        symlink(&in_root, &link).unwrap();
+        write_sidecar(&outside.join("secret.srt"), "Secret");
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job1 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job1);
+        let item_id = db.list_items(lib.id).unwrap()[0].id;
+        assert_eq!(sidecar_track_ids(&db, item_id), vec!["s-en"]);
+
+        fs::remove_file(&link).unwrap();
+        symlink(outside.join("secret.srt"), &link).unwrap();
+
+        let job2 = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job2);
+        assert!(
+            sidecar_track_ids(&db, item_id).is_empty(),
+            "the prior association must be removed without reading the external target"
+        );
+        let job = db.get_scan_job(job2).unwrap().unwrap();
+        assert!(
+            job.skipped_outside_root >= 1,
+            "the retarget rejection must be counted, got {}",
+            job.skipped_outside_root
+        );
+        let lib = db.get_library(lib.id).unwrap().unwrap();
+        assert!(lib.skipped_outside_root >= 1);
+    }
+
+    /// The same retarget, reconciled by a path hint instead of a full scan. The
+    /// media mtime changes so the hint takes its upsert branch, which is the
+    /// only branch that reconciles sidecars.
+    #[cfg(unix)]
+    #[test]
+    fn hint_ingest_removes_prior_sidecar_association_after_symlink_retarget_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(tmp.path()).unwrap();
+        let media = dir.join("media");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&media).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let video = media.join("Movie.mp4");
+        fs::write(&video, b"not a real mp4").unwrap();
+        let in_root = media.join("source.srt");
+        write_sidecar(&in_root, "En");
+        let link = media.join("Movie.en.srt");
+        symlink(&in_root, &link).unwrap();
+        write_sidecar(&outside.join("secret.srt"), "Secret");
+
+        let db = Arc::new(nightjar_db::open(&dir).unwrap());
+        let pool = test_pool(&db, &dir);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: media.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job);
+        let item_id = db.list_items(lib.id).unwrap()[0].id;
+        assert_eq!(sidecar_track_ids(&db, item_id), vec!["s-en"]);
+
+        fs::remove_file(&link).unwrap();
+        symlink(outside.join("secret.srt"), &link).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&video, b"not a real mp4 but longer").unwrap();
+
+        hint_ingest(db.as_ref(), pool.as_ref(), lib.id, &video).unwrap();
+        assert!(
+            sidecar_track_ids(&db, item_id).is_empty(),
+            "the hint must remove the prior association without reading the external target"
+        );
+        let lib = db.get_library(lib.id).unwrap().unwrap();
+        assert!(
+            lib.skipped_outside_root >= 1,
+            "the hint must count the rejection on the library, got {}",
+            lib.skipped_outside_root
+        );
+    }
+
+    /// Confinement is component-wise on canonical paths, so a target under a
+    /// case-distinct sibling root is rejected even though `to_relpath`'s
+    /// case-folded fallback would accept it. Skipped on case-insensitive
+    /// filesystems, where the two roots are one directory.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_symlink_under_case_distinct_sibling_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let root = base.join("library");
+        fs::create_dir_all(&root).unwrap();
+        if !case_sensitive_fs(&base) {
+            eprintln!("skipping: filesystem is case-insensitive");
+            return;
+        }
+        let sibling = base.join("Library");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(root.join("Movie.mp4"), b"not a real mp4").unwrap();
+        write_sidecar(&root.join("Movie.fr.srt"), "Salut");
+        write_sidecar(&sibling.join("secret.srt"), "Secret");
+        symlink(sibling.join("secret.srt"), root.join("Movie.en.srt")).unwrap();
+
+        let db = Arc::new(nightjar_db::open(&base).unwrap());
+        let pool = test_pool(&db, &base);
+        let lib = db
+            .create_library(&NewLibrary {
+                name: "t".into(),
+                path: root.to_string_lossy().into_owned(),
+                kind: "movies".into(),
+            })
+            .unwrap();
+        let job_id = start_scan_job(Arc::clone(&db), Arc::clone(&pool), lib.id).unwrap();
+        wait_job(&db, job_id);
+
+        let item = db
+            .list_items(lib.id)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.path == "Movie.mp4")
+            .expect("media item");
+        assert_eq!(
+            sidecar_track_ids(&db, item.id),
+            vec!["s-fr"],
+            "a case-distinct sibling root is not beneath the library root"
+        );
+        let job = db.get_scan_job(job_id).unwrap().unwrap();
+        assert!(
+            job.skipped_outside_root >= 1,
+            "the case-distinct rejection must be counted, got {}",
+            job.skipped_outside_root
+        );
     }
 
     #[test]
