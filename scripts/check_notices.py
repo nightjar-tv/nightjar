@@ -33,7 +33,8 @@ REGISTRY_SOURCE_PREFIX = "registry+"
 RUNTIME_PACKAGES = (
     "ca-certificates",
     "ffmpeg",
-    "intel-media-va-driver",
+    "intel-media-va-driver-non-free",
+    "libmfx-gen1.2",
     "mesa-va-drivers",
     "i965-va-driver",
 )
@@ -42,9 +43,21 @@ RUNTIME_PACKAGES = (
 SOURCE_PACKAGES = {
     "ca-certificates": "ca-certificates",
     "ffmpeg": "ffmpeg",
-    "intel-media-va-driver": "intel-media-driver",
+    "intel-media-va-driver-non-free": "intel-media-driver-non-free",
+    "libmfx-gen1.2": "onevpl-intel-gpu",
     "mesa-va-drivers": "mesa",
     "i965-va-driver": "intel-vaapi-driver",
+}
+
+# The Debian archive component that holds each source package. The Intel media
+# driver is non-free; the other five come from main.
+SOURCE_COMPONENTS = {
+    "ca-certificates": "main",
+    "ffmpeg": "main",
+    "intel-media-va-driver-non-free": "non-free",
+    "libmfx-gen1.2": "main",
+    "mesa-va-drivers": "main",
+    "i965-va-driver": "main",
 }
 
 # The one production npm dependency compiled into the delivered web assets.
@@ -66,7 +79,8 @@ NOTICE_MARKERS = (
     "ffmpeg",
     "ffprobe",
     "ca-certificates",
-    "intel-media-va-driver",
+    "intel-media-va-driver-non-free",
+    "libmfx-gen1.2",
     "mesa-va-drivers",
     "i965-va-driver",
 )
@@ -104,7 +118,8 @@ CI_RECORD_MARKERS = (
 # Literal strings docs/RELEASE.md must state about the generic record route.
 RECORD_MARKERS = (
     INSTALLED_RECORD_PATH,
-    "pool/updates/main",
+    "pool/<component>",
+    "pool/updates/<component>",
     "apt-get source <source package>=<source version>",
     "not a license conclusion or a legal",
 )
@@ -310,9 +325,10 @@ def check_tree(root):
             f"docs/RELEASE.md does not name Debian source package {source_package}",
         )
         if debian_timestamp:
+            component = SOURCE_COMPONENTS[package]
             pool_route = (
                 f"snapshot.debian.org/archive/debian/{debian_timestamp}"
-                f"/pool/main/{source_package[0]}/{source_package}/"
+                f"/pool/{component}/{source_package[0]}/{source_package}/"
             )
             require(
                 pool_route in release,
@@ -448,6 +464,13 @@ def selftest_mutations():
             "snapshot.debian.org/archive/debian/19990101T000000Z",
         )
 
+    def change_source_component(root):
+        mutate_text(
+            root / "docs" / "RELEASE.md",
+            "pool/non-free/i/intel-media-driver-non-free/",
+            "pool/main/i/intel-media-driver-non-free/",
+        )
+
     def drop_docker_copy(root):
         mutate_text(
             root / "Dockerfile",
@@ -462,7 +485,7 @@ def selftest_mutations():
         mutate_text(root / "NOTICE", "hls.js 1.6.16", "hls.js")
 
     def change_notice_version(root):
-        mutate_text(root / "NOTICE", "7:5.1.9-0+deb12u1", "0:0")
+        mutate_text(root / "NOTICE", "7:7.1.5-0+deb13u1", "0:0")
 
     def drop_record_generation(root):
         mutate_text(root / "Dockerfile", "RUN dpkg-query -W", "RUN true")
@@ -497,6 +520,7 @@ def selftest_mutations():
         ("drop web runtime dependency", drop_web_runtime),
         ("drift generated notice", drift_notice),
         ("change snapshot route", change_route),
+        ("change source component", change_source_component),
         ("drop Docker COPY", drop_docker_copy),
         ("drop Apache text", drop_apache_text),
         ("drop NOTICE marker", drop_notice_marker),

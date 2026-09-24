@@ -246,14 +246,14 @@ jobs:
             test -f /usr/share/doc/nightjar/notices/THIRD-PARTY.md
             test -f /usr/share/doc/nightjar/notices/Apache-2.0.txt
             test -f /usr/share/doc/nightjar/notices/hls.js-1.6.16.txt
-            for pkg in ca-certificates ffmpeg intel-media-va-driver mesa-va-drivers i965-va-driver; do
+            for pkg in ca-certificates ffmpeg intel-media-va-driver-non-free libmfx-gen1.2 mesa-va-drivers i965-va-driver; do
               test -f "/usr/share/doc/nightjar/debian/$pkg/copyright"
             done
             grep -q "hls.js 1.6.16" /usr/share/doc/nightjar/NOTICE
             record=/usr/share/doc/nightjar/debian/installed-packages.txt
             test -s "$record"
             LC_ALL=C sort -c "$record"
-            for pkg in ca-certificates ffmpeg intel-media-va-driver mesa-va-drivers i965-va-driver; do
+            for pkg in ca-certificates ffmpeg intel-media-va-driver-non-free libmfx-gen1.2 mesa-va-drivers i965-va-driver; do
               grep -q "^$pkg[[:space:]]" "$record"
             done
             while read -r binary version source source_version architecture; do
