@@ -3,7 +3,7 @@
 #
 # FFmpeg is Debian trixie's package, invoked as an external process (not
 # linked). Intel VAAPI/QSV need the media drivers in the image and
-# --device=/dev/dri at run time. We do not vendor a competitor's FFmpeg build.
+# --device=/dev/dri at run time.
 #
 # Every release input is pinned: the three base images by readable tag and
 # digest, the Debian packages by snapshot timestamp and exact version. ADR-0056
