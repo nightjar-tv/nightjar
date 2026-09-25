@@ -47,9 +47,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 		mesa-va-drivers=25.0.7-2+deb13u1 \
 		i965-va-driver=2.4.1+dfsg1-2 \
 	&& rm -rf /var/lib/apt/lists/*
-# Ship the notice set, the corresponding-source route and the installed Debian
-# copyright files for the packages this image redistributes. This adds files
-# only; it changes no runtime behaviour and vendors no third-party binary.
+# Keep the notice set, source route and Debian copyright files in the image.
 RUN mkdir -p /usr/share/doc/nightjar/debian
 COPY NOTICE /usr/share/doc/nightjar/NOTICE
 COPY notices/ /usr/share/doc/nightjar/notices/

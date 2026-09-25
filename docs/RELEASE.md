@@ -114,8 +114,7 @@ drifts from the `Dockerfile` pins.
 
 ### The complete installed-package record
 
-The six packages above are the top-level summary, not the boundary. The image
-also writes a record of every installed binary package to
+The image writes a record of every installed binary package to
 `/usr/share/doc/nightjar/debian/installed-packages.txt`. The `Dockerfile`
 builds it with `dpkg-query` after installation and sorts it, so the same pinned
 inputs produce the same record. Each line is tab-separated:

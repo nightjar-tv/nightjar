@@ -33,7 +33,7 @@ binary. The image keeps their installed Debian copyright files under
 - ca-certificates 20250419, GPL-2+ packaging and MPL-2.0 CA data.
 - intel-media-va-driver-non-free 25.2.3+ds1-1, Expat and BSD-3-clause
   components. Debian places this package in non-free because it carries Intel
-  media kernels without source; its copyright file records that.
+  media kernels without source.
 - libmfx-gen1.2 25.1.4-1, MIT.
 - mesa-va-drivers 25.0.7-2+deb13u1, MIT, Apache-2.0, BSD, SGI and Khronos
   components.
