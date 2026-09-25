@@ -27,11 +27,12 @@ notarizing a macOS package is not decided here.
 The `Dockerfile` pins:
 
 - the three base images by readable tag and digest: `node:22-bookworm`,
-  `rust:bookworm` and `debian:bookworm-slim`;
+  `rust:bookworm` and `debian:trixie-slim`;
 - the Debian and Debian-security snapshot timestamps, so `apt` resolves the
   package set from an immutable archive;
-- the five installed packages by exact version: `ca-certificates`, `ffmpeg`,
-  `intel-media-va-driver`, `mesa-va-drivers` and `i965-va-driver`;
+- the six installed packages by exact version: `ca-certificates`, `ffmpeg`,
+  `intel-media-va-driver-non-free`, `libmfx-gen1.2`, `mesa-va-drivers` and
+  `i965-va-driver`;
 - the build commands: `npm ci` in the web stage and
   `cargo build --release --locked` in the server stage.
 
@@ -97,11 +98,12 @@ image installs from:
 
 | Binary package | Source package | Version | Snapshot source route |
 |---|---|---|---|
-| `ca-certificates` | `ca-certificates` | `20250419~deb12u1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/c/ca-certificates/` |
-| `ffmpeg` | `ffmpeg` | `7:5.1.9-0+deb12u1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/f/ffmpeg/` |
-| `intel-media-va-driver` | `intel-media-driver` | `23.1.1+dfsg1-1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/i/intel-media-driver/` |
-| `mesa-va-drivers` | `mesa` | `22.3.6-1+deb12u2` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/m/mesa/` |
-| `i965-va-driver` | `intel-vaapi-driver` | `2.4.1+dfsg1-1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/i/intel-vaapi-driver/` |
+| `ca-certificates` | `ca-certificates` | `20250419` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/c/ca-certificates/` |
+| `ffmpeg` | `ffmpeg` | `7:7.1.5-0+deb13u1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/f/ffmpeg/` |
+| `intel-media-va-driver-non-free` | `intel-media-driver-non-free` | `25.2.3+ds1-1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/non-free/i/intel-media-driver-non-free/` |
+| `libmfx-gen1.2` | `onevpl-intel-gpu` | `25.1.4-1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/o/onevpl-intel-gpu/` |
+| `mesa-va-drivers` | `mesa` | `25.0.7-2+deb13u1` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/m/mesa/` |
+| `i965-va-driver` | `intel-vaapi-driver` | `2.4.1+dfsg1-2` | `snapshot.debian.org/archive/debian/20260901T000000Z/pool/main/i/intel-vaapi-driver/` |
 
 The Debian archive is pinned at
 `snapshot.debian.org/archive/debian/20260901T000000Z` and the security archive
@@ -112,8 +114,7 @@ drifts from the `Dockerfile` pins.
 
 ### The complete installed-package record
 
-The five packages above are the top-level summary, not the boundary. The image
-also writes a record of every installed binary package to
+The image writes a record of every installed binary package to
 `/usr/share/doc/nightjar/debian/installed-packages.txt`. The `Dockerfile`
 builds it with `dpkg-query` after installation and sorts it, so the same pinned
 inputs produce the same record. Each line is tab-separated:
@@ -137,8 +138,8 @@ pinned snapshots and needs no live mirror:
 2. Point `deb-src` at both pinned snapshots:
 
    ```text
-   deb-src http://snapshot.debian.org/archive/debian/20260901T000000Z bookworm main
-   deb-src http://snapshot.debian.org/archive/debian-security/20260901T000000Z bookworm-security main
+   deb-src http://snapshot.debian.org/archive/debian/20260901T000000Z trixie main non-free
+   deb-src http://snapshot.debian.org/archive/debian-security/20260901T000000Z trixie-security main non-free
    ```
 
 3. Fetch the exact version:
@@ -150,17 +151,18 @@ pinned snapshots and needs no live mirror:
 
 4. If `apt-get source` cannot serve the exact version, fetch the matching
    `.dsc`, `.orig.tar.*` and `.debian.tar.*` files from the archive pool. The
-   main archive serves `pool/main` and the security archive serves
-   `pool/updates/main`:
+   main archive serves `pool/<component>` and the security archive serves
+   `pool/updates/<component>`:
 
    ```text
-   snapshot.debian.org/archive/debian/<timestamp>/pool/main/<letter>/<source package>/
-   snapshot.debian.org/archive/debian-security/<timestamp>/pool/updates/main/<letter>/<source package>/
+   snapshot.debian.org/archive/debian/<timestamp>/pool/<component>/<letter>/<source package>/
+   snapshot.debian.org/archive/debian-security/<timestamp>/pool/updates/<component>/<letter>/<source package>/
    ```
 
-   `<letter>` is the first letter of the source package name. `<timestamp>` is
-   the matching pinned timestamp. Fetch only the exact version the record
-   names; a pool directory can hold more than one version.
+   `<component>` is the archive component that holds the source package: `main`
+   or `non-free`. `<letter>` is the first letter of the source package name.
+   `<timestamp>` is the matching pinned timestamp. Fetch only the exact version
+   the record names; a pool directory can hold more than one version.
 
 This procedure is a retrieval route. It is not a license conclusion or a legal
 clearance, and it states no public release.
